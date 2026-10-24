@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_pkt_field
+
+export {
+    CombatFx, cfx_new, cfx_speed_x10, cfx_use_repeats, cfx_set_held, cfx_cooldown_ms, cfx_strength_permille, cfx_attack_ready,
+    cfx_attacked, cfx_hold_due, cfx_on_hurt, cfx_mark_use, cfx_mark_place, cfx_reset_cooldown, cfx_on_packet,
+    cfx_hit_age, cfx_hurt_age, cfx_knock_age,
+    HIT_WINDOW_MS, HOLD_INTERVAL_MS, DEFAULT_SPEED_X10,
+}
+
+const HIT_WINDOW_MS: u64 = 1500 as u64
+const HOLD_INTERVAL_MS: u64 = 200 as u64
+const DEDUPE_MS: u64 = 100 as u64
+const DEFAULT_SPEED_X10: i32 = 40
+const NEVER: u64 = 0 as u64
+
+struct CombatFx {
+    attack_ms: u64,
+    has_attacked: bool,
+    speed_x10: i32,
+    held_id: i32,
+    repeats_use: bool,
+    last_target: i32,
+    hurt_id: i32,
+    hurt_ms: u64,
+    hit_ms: u64,
+    self_hurt_ms: u64,
+    knock_ms: u64,
+    use_ms: u64,
+    place_ms: u64,
+    n_hurts: u64,
+    n_hits: u64,
+    n_self_hurts: u64,
+    n_knocks: u64,
+}
+
+fn cfx_new() -> CombatFx {
+    return CombatFx {
+        attack_ms: NEVER, has_attacked: false, speed_x10: DEFAULT_SPEED_X10, held_id: 0 - 2, repeats_use: false, last_target: 0 - 1,
+        hurt_id: 0 - 1, hurt_ms: NEVER, hit_ms: NEVER, self_hurt_ms: NEVER, knock_ms: NEVER, use_ms: NEVER, place_ms: NEVER,
+        n_hurts: NEVER, n_hits: NEVER, n_self_hurts: NEVER, n_knocks: NEVER,
+    }
+}
+
+fn name_has(p: u64, n: usize, needle: str) -> bool {
+    if needle.n > n { return false }
+    var i: usize = 0
+    while i + needle.n <= n {
+        var j: usize = 0
+        while j < needle.n && rt.ld8(p, i + j) == rt.ld8(needle.p as u64, j) { j = j + 1 }
+        if j == needle.n { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn axe_speed_x10(p: u64, n: usize) -> i32 {
+    if name_has(p, n, "wooden_") || name_has(p, n, "stone_") { return 8 }
+    if name_has(p, n, "iron_") { return 9 }
+    return 10
+}
+
+fn hoe_speed_x10(p: u64, n: usize) -> i32 {
+    if name_has(p, n, "wooden_") || name_has(p, n, "golden_") { return 10 }
+    if name_has(p, n, "stone_") { return 20 }
+    if name_has(p, n, "iron_") { return 30 }
+    return 40
+}
+
+fn cfx_speed_x10(p: u64, n: usize) -> i32 {
+    if p == 0 as u64 { return DEFAULT_SPEED_X10 }
+    if name_has(p, n, "_sword") { return 16 }
+    if name_has(p, n, "_pickaxe") { return 12 }
+    if name_has(p, n, "_shovel") { return 10 }
+    if name_has(p, n, "_axe") { return axe_speed_x10(p, n) }
+    if name_has(p, n, "_hoe") { return hoe_speed_x10(p, n) }
+    if name_has(p, n, "trident") { return 11 }
+    if name_has(p, n, "mace") { return 6 }
+    return DEFAULT_SPEED_X10
+}
+
+fn cfx_use_repeats(p: u64, n: usize) -> bool {
+    if p == 0 as u64 { return false }
+    return name_has(p, n, "snowball") || name_has(p, n, "egg") || name_has(p, n, "ender_pearl") || name_has(p, n, "splash_potion")
+        || name_has(p, n, "lingering_potion") || name_has(p, n, "experience_bottle") || name_has(p, n, "wind_charge")
+}
+
+fn cfx_cooldown_ms(fx: *mut CombatFx) -> u64 {
+    return (10000 / (*fx).speed_x10) as u64
+}
+
+fn cfx_strength_permille(fx: *mut CombatFx, now: u64) -> i32 {
+    if !(*fx).has_attacked { return 1000 }
+    if now < (*fx).attack_ms { return 0 }
+    let cd: u64 = cfx_cooldown_ms(fx)
+    let el: u64 = now - (*fx).attack_ms
+    if el >= cd { return 1000 }
+    return ((el * 1000 as u64) / cd) as i32
+}
+
+fn cfx_attack_ready(fx: *mut CombatFx, now: u64) -> bool {
+    return cfx_strength_permille(fx, now) >= 1000
+}
+
+fn cfx_reset_cooldown(fx: *mut CombatFx, now: u64) {
+    (*fx).attack_ms = now
+    (*fx).has_attacked = true
+}
+
+fn cfx_attacked(fx: *mut CombatFx, target: i32, now: u64) {
+    cfx_reset_cooldown(fx, now)
+    (*fx).last_target = target
+}
+
+fn cfx_set_held(fx: *mut CombatFx, item: i32, p: u64, n: usize, now: u64) {
+    if item == (*fx).held_id { return }
+    (*fx).held_id = item
+    (*fx).speed_x10 = cfx_speed_x10(p, n)
+    (*fx).repeats_use = cfx_use_repeats(p, n)
+    if (*fx).has_attacked { cfx_reset_cooldown(fx, now) }
+}
+
+fn cfx_hold_due(last: u64, now: u64, interval: u64) -> bool {
+    return last == NEVER || now < last || now - last >= interval
+}
+
+fn cfx_mark_use(fx: *mut CombatFx, now: u64) { (*fx).use_ms = now }
+
+fn cfx_mark_place(fx: *mut CombatFx, now: u64) { (*fx).place_ms = now }
+
+fn age_of(t: u64, now: u64) -> i64 {
+    if t == NEVER || now < t { return 0 - 1 }
+    return (now - t) as i64
+}
+
+fn cfx_hit_age(fx: *mut CombatFx, now: u64) -> i64 { return age_of((*fx).hit_ms, now) }
+fn cfx_hurt_age(fx: *mut CombatFx, now: u64) -> i64 { return age_of((*fx).self_hurt_ms, now) }
+fn cfx_knock_age(fx: *mut CombatFx, now: u64) -> i64 { return age_of((*fx).knock_ms, now) }
+
+fn recent_target(fx: *mut CombatFx, eid: i32, now: u64) -> bool {
+    return (*fx).has_attacked && eid == (*fx).last_target && now >= (*fx).attack_ms && now - (*fx).attack_ms <= HIT_WINDOW_MS
+}
+
+fn status_is_hurt(st: i32) -> bool {
+    return st == 2 || st == 33 || st == 36 || st == 37 || st == 44 || st == 57
+}
+
+fn cfx_on_hurt(fx: *mut CombatFx, eid: i32, own_id: i32, now: u64) {
+    if eid == (*fx).hurt_id && (*fx).hurt_ms != NEVER && now >= (*fx).hurt_ms && now - (*fx).hurt_ms < DEDUPE_MS { return }
+    (*fx).hurt_id = eid
+    (*fx).hurt_ms = now
+    (*fx).n_hurts = (*fx).n_hurts + 1 as u64
+    if eid == own_id {
+        (*fx).self_hurt_ms = now
+        (*fx).n_self_hurts = (*fx).n_self_hurts + 1 as u64
+    } else if recent_target(fx, eid, now) {
+        (*fx).hit_ms = now
+        (*fx).n_hits = (*fx).n_hits + 1 as u64
+    }
+}
+
+fn cfx_on_packet(fx: *mut CombatFx, cl: *mut mc_client.Client, own_id: i32, id: i32, now: u64) -> bool {
+    var eid: i32 = 0 - 1
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_DAMAGE_EVENT) || mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_HURT_ANIMATION) {
+        if !mc_pkt_field.pkt_varint(cl, id, "entityId", &eid) { return false }
+        cfx_on_hurt(fx, eid, own_id, now)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_ENTITY_STATUS) {
+        var st: i32 = 0
+        if !mc_pkt_field.pkt_i32(cl, id, "entityId", &eid) || !mc_pkt_field.pkt_i8(cl, id, "entityStatus", &st) { return false }
+        if !status_is_hurt(st) { return false }
+        cfx_on_hurt(fx, eid, own_id, now)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_ENTITY_VELOCITY) {
+        if !mc_pkt_field.pkt_varint(cl, id, "entityId", &eid) { return false }
+        if recent_target(fx, eid, now) {
+            (*fx).knock_ms = now
+            (*fx).n_knocks = (*fx).n_knocks + 1 as u64
+        }
+        return false
+    }
+    return false
+}

@@ -94,6 +94,8 @@ import mc.mc_chat_net
 import mc.mc_health
 import mc.mc_health_ui
 import mc.mc_combat
+import mc.mc_combat_fx
+import mc.mc_combat_ui
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_packsnd
@@ -461,6 +463,7 @@ struct Ctx {
     chat_net: mc_chat_net.ChatNet,
     health: mc_health.Health,
     combat: mc_combat.Combat,
+    cfx: mc_combat_fx.CombatFx,
     tgt: mc_combat.Target,
     tgt_hit: bool, // an attackable entity is under the crosshair and nearer than the block pick
     combat_log: bool,
@@ -802,9 +805,18 @@ fn on_health(c: *mut Ctx, id: i32) {
     say(f"mcplay: health hp={(*h).hp} food={(*h).food} dead={(*h).dead} deaths={(*h).n_deaths} alive={(*h).n_alive} respawn_sent={(*h).n_respawn_sent} msg={msg}\n")
 }
 
+fn on_combat_fx(c: *mut Ctx, id: i32) {
+    let fx: *mut mc_combat_fx.CombatFx = &(*c).cfx
+    let before: u64 = (*fx).n_hurts + (*fx).n_knocks
+    mc_combat_fx.cfx_on_packet(fx, &(*c).cl, (*c).fx.own, id, now_ms())
+    if (*fx).n_hurts + (*fx).n_knocks == before || !(*c).combat_log { return }
+    say(f"mcplay: combat fx hurts={(*fx).n_hurts} hits={(*fx).n_hits} self_hurts={(*fx).n_self_hurts} knocks={(*fx).n_knocks}\n")
+}
+
 fn on_packet(c: *mut Ctx, id: i32) {
     let cl: *mut mc_client.Client = &(*c).cl
     on_health(c, id)
+    on_combat_fx(c, id)
     if mc_client.client_auto_reply(cl, id) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_JOIN_GAME) {
         if !(*c).join {
@@ -1097,6 +1109,14 @@ fn run_tests(c: *mut Ctx, tf: i32) {
     if (tf & 256) != 0 { combat_test(c) }
 }
 
+fn track_held(c: *mut Ctx) {
+    let item: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
+    var n: usize = 0
+    var p: u64 = 0
+    if item >= 0 { p = mc_registry.reg_item_name(&(*c).reg, item, &n) }
+    mc_combat_fx.cfx_set_held(&(*c).cfx, item, p, n, now_ms())
+}
+
 fn handle_hotbar(c: *mut Ctx) {
     var sc: u32 = 2 as u32
     while sc <= 10 as u32 {
@@ -1117,15 +1137,18 @@ fn handle_hotbar(c: *mut Ctx) {
     }
     ui_sync(c)
     if raw.key_pressed(&(*c).rw, 16 as u32) && !(*c).show_inv {
-        // Q drops one item of the held stack (Ctrl+Q the whole stack): player action 4 / 3
         let all: bool = raw.key_down(&(*c).rw, 29 as u32)
         let hs: i32 = mc_inv.INV_HOTBAR0 + (*c).pl.slot
         if mc_inv.inv_local_drop(&(*c).inv, hs, all) {
-            var st: i32 = 4
-            if all { st = 3 }
-            mc_play.send_dig(&(*c).cl, st, 0, 0, 0, 0, 0)
+            let sent: bool = mc_play.send_drop(&(*c).cl, all)
+            if (*c).combat_log { say(f"mcplay: combat drop all={all} sent={sent}\n") }
         }
     }
+    if raw.key_pressed(&(*c).rw, SC_F as u32) && !(*c).creative && !(*c).show_inv && (*c).have_pos {
+        let sent2: bool = mc_play.send_swap_hands(&(*c).cl)
+        if (*c).combat_log { say(f"mcplay: combat swap sent={sent2}\n") }
+    }
+    track_held(c)
     if (*c).have_pos { give_items(c) }
     if (*c).have_pos { chat_test(c) }
     if (*c).have_pos {
@@ -1256,6 +1279,7 @@ fn draw_inventory(c: *mut Ctx, r: *mut mc_raster.Raster) {
     let s: i32 = mc_hud.hud_scale((*c).w, (*c).h)
     mc_health_ui.health_ui_draw(&(*c).health, r, s)
     mc_chat_ui.chat_ui_draw(&(*c).chat, r, s, now_ms())
+    mc_combat_ui.combat_ui_draw(&(*c).cfx, r, s, now_ms())
     let bx: i32 = ((*r).w - 181 * s) / 2
     let by: i32 = (*r).h - 23 * s
     var k: i32 = 0
@@ -2025,6 +2049,7 @@ fn pick_entity(c: *mut Ctx) {
 fn attack_target(c: *mut Ctx) {
     (*c).seq = (*c).seq + 1
     let ok: bool = mc_combat.combat_attack(&(*c).combat, &(*c).cl, (*c).tgt.id, (*c).pl.sneaking, (*c).seq, now_ms())
+    mc_combat_fx.cfx_attacked(&(*c).cfx, (*c).tgt.id, now_ms())
     if (*c).combat_log { say(f"mcplay: combat attack target={(*c).tgt.id} dist_mm={((*c).tgt.dist * 1000.0) as i64} sent={ok} n={(*c).combat.n_attacks}\n") }
 }
 
@@ -2082,6 +2107,19 @@ fn combat_test(c: *mut Ctx) {
     (*c).cbt_t = now
 }
 
+fn use_hold_due(c: *mut Ctx, rdown: bool, now: u64) -> bool {
+    if !rdown || (*c).tgt_hit { return false }
+    let fx: *mut mc_combat_fx.CombatFx = &(*c).cfx
+    if (*c).hit {
+        let held: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
+        let placeable: bool = held >= 0 && mc_combat.held_is_block(&(*c).reg, held)
+        if !placeable && !(*fx).repeats_use { return false }
+        return mc_combat_fx.cfx_hold_due((*fx).place_ms, now, mc_combat_fx.HOLD_INTERVAL_MS)
+    }
+    if !(*fx).repeats_use { return false }
+    return mc_combat_fx.cfx_hold_due((*fx).use_ms, now, mc_combat_fx.HOLD_INTERVAL_MS)
+}
+
 fn handle_mouse(c: *mut Ctx) {
     if (*c).chat.open || (*c).health.dead { return }
     if (*c).show_inv && (*c).have_pos {
@@ -2091,6 +2129,7 @@ fn handle_mouse(c: *mut Ctx) {
     let lmb: bool = raw.mouse_down(&(*c).rw, raw.MB_LEFT)
     let lp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_LEFT)
     let rp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT)
+    let rdown: bool = raw.mouse_down(&(*c).rw, raw.MB_RIGHT)
     if !(*c).grab {
         if lp { grab_mouse(c, true) }
         return
@@ -2099,7 +2138,9 @@ fn handle_mouse(c: *mut Ctx) {
     if (*c).show_inv { return }
     let cl: *mut mc_client.Client = &(*c).cl
     if raw.mouse_released(&(*c).rw, raw.MB_RIGHT) { release_held_item(c) }
-    if lp && (*c).tgt_hit { attack_target(c) }
+    let now: u64 = now_ms()
+    let atk_hold: bool = lmb && (*c).tgt_hit && mc_combat_fx.cfx_attack_ready(&(*c).cfx, now)
+    if (lp || atk_hold) && (*c).tgt_hit { attack_target(c) }
     if lp && !(*c).tgt_hit && (*c).hit {
         let face: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
@@ -2136,9 +2177,14 @@ fn handle_mouse(c: *mut Ctx) {
             (*c).digging = false
         }
     }
+    let rfire: bool = rp || use_hold_due(c, rdown, now)
     if rp && (*c).tgt_hit { interact_target(c) }
-    if rp && !(*c).tgt_hit && !(*c).hit { use_held_item(c) }
-    if rp && !(*c).tgt_hit && (*c).hit {
+    if rfire && !(*c).tgt_hit && !(*c).hit {
+        mc_combat_fx.cfx_mark_use(&(*c).cfx, now)
+        use_held_item(c)
+    }
+    if rfire && !(*c).tgt_hit && (*c).hit {
+        mc_combat_fx.cfx_mark_place(&(*c).cfx, now)
         let face3: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
         mc_play.send_place(cl, (*c).pk.x, (*c).pk.y, (*c).pk.z, face3, (*c).seq)
@@ -3021,7 +3067,7 @@ fn main(start: u64) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
-        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), combat: mc_combat.combat_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
