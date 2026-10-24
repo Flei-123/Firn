@@ -42,7 +42,7 @@ echo "== 3. counter-checks =="
 ( cd tools/lint/cases && "$LINT" broken.fi > /dev/null 2>&1 ); [ $? -eq 3 ] || note "unscannable source must exit 3"
 "$LINT" tools/lint/nonexistent.fi > /dev/null 2>&1; [ $? -eq 2 ] || note "missing file must exit 2"
 ( cd tools/lint/cases && "$LINT" --rules unreachable-code unused_variable.fi > /dev/null 2>&1 ); [ $? -eq 0 ] || note "--rules must restrict the rules"
-"$LINT" --list | grep -c . | grep -qx 5 || note "--list must name 5 rules"
+"$LINT" --list | grep -c . | grep -qx 11 || note "--list must name 11 rules"
 echo "   done"
 
 echo "== 4. self-lint =="
@@ -68,7 +68,7 @@ while IFS= read -r rf; do
 done < "$T/tree.err"
 
 if [ "$FAST" -eq 0 ]; then
-    echo "== 6. oracle: removed unused imports still compile =="
+    echo "== 6. oracle: edits suggested by the rules still compile =="
     bash tools/lint/oracle.sh "$LINT" 8 || note "oracle found false positives"
 fi
 

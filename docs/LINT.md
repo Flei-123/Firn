@@ -11,11 +11,17 @@ Output: `path:line: rule: message`. Exit 0 = clean, 1 = findings, 2 = I/O, 3 = a
 
 | rule | finds |
 |---|---|
-| `unused-import` | import whose module name is never mentioned and none of whose exported names occurs in the file (`--lib` is the fallback search directory for the module) |
+| `unused-import` | import (except `pystr`, which the compiler needs for step slices) whose module name is never mentioned and none of whose exported names occurs in the file (`--lib` is the fallback search directory for the module) |
 | `duplicate-import` | two imports that bind the same name |
 | `unused-variable` | `let`/`var` without side effects (no call, `try`, `catch`) that is never read |
 | `shadowed-variable` | `let`/`var` that hides a live binding or parameter of the same function |
 | `unreachable-code` | statement directly after `return`/`break`/`continue` in the same block |
+| `unused-private-item` | top-level `fn`/`static` of a file with an `export { ... }` list that is neither exported nor mentioned anywhere in the file (also in strings); skipped: attributed items, `main`, names starting with `_`; files without an export list export everything and are not checked |
+| `var-never-mutated` | `var` with an initializer whose every use is a plain read (no `=`/`op=`, no `&x`/`&mut x`/`inout x`, no `.field`/`[i]`), so `let` would do |
+| `self-assignment` | statement `place = place` with identical token sequences and no call |
+| `constant-condition` | `if true`, `if false`, `while false` |
+| `bool-comparison` | `==`/`!=` against the literal `true`/`false` |
+| `empty-branch` | empty `else {}`; empty `if {}` without `else` whose condition has no call (a call may be kept for its side effect) |
 
 A name counts as used when it appears as a word anywhere after the declaration (also inside `f"..."` text); field access `.x` and keys `x:` do not count. The rules are conservative: a miss is possible, a wrong finding is a bug.
 
@@ -27,4 +33,4 @@ A name counts as used when it appears as a word anywhere after the declaration (
 
 ## Proof
 
-`bash tools/lint/run.sh [--fast]`: fixtures, exit-code counter-checks, self-lint of the tool, whole-tree run (every refused file must also be rejected by the compiler), and an oracle that deletes flagged imports from sample programs and checks they still compile.
+`bash tools/lint/run.sh [--fast]`: fixtures, exit-code counter-checks, self-lint of the tool, whole-tree run (every refused file must also be rejected by the compiler), and an oracle that deletes flagged imports and turns flagged `var` into `let` in sample programs and checks they still compile.
