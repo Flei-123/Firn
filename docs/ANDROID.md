@@ -265,8 +265,8 @@ all arm64, built from main with `build.sh` / `jarvis_build.sh`; own test package
 
 ## Open
 
-* fUi apps (apphost) get the soft keyboard through dex classes (r114, see below); the plain Firn window host
-  composes nothing yet (r70); hardware keys and the key events Android synthesises arrive.
+* fUi apps (apphost) get the soft keyboard through dex classes (r114, see below), with composition (underlined pre-edit word),
+  umlauts, emoji and Enter (r70); hardware keys and the key events Android synthesises arrive.
 * A finger drag does not scroll: fUi scrolls by scroll bar, wheel and keys.
 * Only tested in the emulator; the arm64 build still needs a real phone.
 * Push: one line = one message; the relay may be a host name (see above), TLS is not run end to end yet (r74).
@@ -326,6 +326,12 @@ focus; nothing is built before.
   `lib/plat/android/speech.fi` without `--speech` (or `camera.fi` without
   `--camera`) fails at build time instead of in `dlopen` on the phone
   (`cannot locate symbol AAudioStreamBuilder_setChannelCount`, roadmap r776).
+* **Composition, umlauts, emoji, Enter (r70).** `fui.render.draw_textfield` underlines the composing word (`TextBuf.comp_a..comp_b`; before,
+  only `draw_field` did). `tools/android/ime_inject_check.sh` runs `tools/android/imetest_app.fi`: its pump reads the property
+  `debug.firn.ime` (`<seq> comp|commit <hex code points>`, `finish`, `delsur|delcp <before> <after>`, `key <code>`, `enter`) and hands
+  each edit to `inputmethod.ime_inject` (`lib/android/imeinject.fi`), the same `serve_op` the keyboard's calls end in; the field text is
+  logged as hex octets (`imetext=`). Checked: commit, u-umlaut/a-umlaut/sharp s composing (cumulative, replaced word), underline pixels
+  vs. finished text, emoji as a surrogate pair, `deleteSurroundingText` / `...InCodePoints` over the pair, Backspace key, Enter.
 * **Not done:** a real phone (the emulator's AOSP keyboard is what was run),
   more than one line of text, the full-screen extract UI (the flags ask the
   keyboard not to use it).

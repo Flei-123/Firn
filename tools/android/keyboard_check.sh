@@ -96,8 +96,8 @@ PY
     echo $all | tr ' ' '\n' | sort -u | tr '\n' ',' | sed 's/,$//'
 }
 # keyboard up: where the two fields are (permille), the keys of LatinIME
-F1="100 255 900 310"        # first field box, keyboard up
-F2="100 315 900 365"        # second field box, keyboard up
+F1="100 255 900 289"        # first field box, keyboard up
+F2="100 315 900 343"        # second field box, keyboard up
 # keys: row 1 qwertyuiop at y 692, row 2 asdfghjkl at y 762, backspace at (930, 832)
 ROW1=692; ROW2=762
 key1() { tap $((50 + 100 * $1)) $ROW1; sleep 0.7; }   # index in qwertyuiop
