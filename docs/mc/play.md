@@ -23,7 +23,7 @@ NOT done (roadmap): the demo itself (demos/mcplay), packet senders/receivers glu
 
 ## mc-s2 (13.10.): demos/mcplay + lib/mc/mc_play.fi
 
-* `demos/mcplay/main.fi` (`mcplay <host-ipv4> <port> <name>`, options by environment, header of the file): offline login, CPU rasterizer
+* `demos/mcplay/main.fi` (`mcplay <host> <port> <name>`, options by environment, header of the file): offline login, CPU rasterizer
   (`mc_render_world` + `mc_raster`), X11 window (`window.image` + `present`), own event pump (EV_CONFIGURE / EV_CLOSED / raw keys /
   `cursor_delta`), 20 Hz ticks (`mc_input.player_tick` + position/look packet), pick + selection box, HUD with measured FPS.
   Resize rebuilds the raster; F11 fullscreen; frame cap `MCPLAY_FPS` (sleep via wait_event; CPU path has no vsync); Esc releases the mouse.
