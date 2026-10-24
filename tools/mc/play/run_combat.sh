@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_combat.sh [mc_version=1.20.1] -- combat against an official server: entity pick under the crosshair -> attack (cow loses 2 hp), interact, use item (snowball is consumed), release
 
+# Also: Q drops one snowball, F swaps it into the offhand, holding LMB repeats the attack (cooldown), hit feedback from the damage event.
 # Prints `RESULT mc-play-combat: ok|FAIL`. Env as run_inv.sh (FIRNC, JAVA, MC_VIEW, MCPLAY_KEEP_DIR).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -84,8 +85,22 @@ echo 'data get entity @e[tag=tgt,limit=1] Health' >&3
 wait_srv 'Cow has the following entity data: 8\.0f' 15 || { echo "  FAIL  cow health is not 8.0 (two attacks)"; grep 'entity data' "$W/server.log" | tail -2; ERR=1; }
 echo "clear CombatA minecraft:snowball 0" >&3
 wait_srv 'Found 4 matching item\(s\) on player CombatA' 15 || { echo "  FAIL  snowball was not consumed by use item"; grep -E 'matching|No items' "$W/server.log" | tail -2; ERR=1; }
+xdotool key q; sleep 1
+echo "clear CombatA minecraft:snowball 0" >&3
+wait_srv 'Found 3 matching item\(s\) on player CombatA' 15 || { echo "  FAIL  Q did not drop one snowball"; grep -E 'matching|No items' "$W/server.log" | tail -2; ERR=1; }
+grep -q 'combat drop all=false sent=true' "$W/a.out" || { echo "  FAIL  drop packet not sent"; ERR=1; }
+xdotool key f; sleep 1
+echo 'data get entity CombatA Inventory' >&3
+wait_srv 'Slot: -106b.{0,60}snowball|snowball.{0,60}Slot: -106b' 15 || { echo "  FAIL  F did not swap the snowballs into the offhand"; grep 'entity data' "$W/server.log" | tail -1 | cut -c1-300; ERR=1; }
+grep -q 'combat swap sent=true' "$W/a.out" || { echo "  FAIL  swap packet not sent"; ERR=1; }
+xdotool mousedown 1; sleep 1.7; xdotool mouseup 1; sleep 1
+echo 'data get entity @e[tag=tgt,limit=1] Health' >&3
+wait_srv 'Cow has the following entity data: [0-5]\.0f' 15 || { echo "  FAIL  holding LMB did not repeat the attack (cow health still >= 6)"; grep 'entity data' "$W/server.log" | tail -2; ERR=1; }
+[ "$(grep -c 'combat attack target=.* sent=true' "$W/a.out")" -ge 5 ] || { echo "  FAIL  hold-to-repeat sent fewer than 3 extra attacks"; ERR=1; }
+grep -Eq 'combat fx hurts=[0-9]+ hits=[1-9]' "$W/a.out" || { echo "  FAIL  no confirmed hit feedback (damage event / status) for the attacked cow"; ERR=1; }
+grep -E 'combat fx' "$W/a.out" | tail -1
 grep -qiE "invalid|disconnect|kicked|illegal|protocol error" "$W/server.log" && { grep -iE "invalid|disconnect|kicked|illegal|protocol error" "$W/server.log" | head -3; ERR=1; }
-grep 'mcplay: combat' "$W/a.out" | head -10
+grep 'mcplay: combat' "$W/a.out" | grep -v 'combat attack' | head -12
 echo stop >&3; sleep 1
 kill "$PP" 2>/dev/null
 [ $ERR -eq 0 ] && echo "RESULT mc-play-combat: ok" || echo "RESULT mc-play-combat: FAIL"
