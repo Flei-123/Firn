@@ -12,7 +12,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $port = 25599
 $rconPort = 25575
 $java17 = 'C:\Program Files\Java\jdk-17\bin\javaw.exe'
-$log = Join-Path $out ("run_{0}_{1}.log" -f $Target, $Tag)
+$logSuffix = if ($Target -eq 'mcplay') { "_$Gfx" } else { '' }
+$log = Join-Path $out ("run_{0}_{1}{2}.log" -f $Target, $Tag, $logSuffix)
 function L($m) { ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) | Add-Content -Path $log }
 
 Add-Type @'
