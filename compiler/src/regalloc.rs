@@ -2020,7 +2020,14 @@ pub fn allocate(f: &Func) -> Alloc {
                 // form; its whole group then moves to `p` (checked below).
                 let chain_ok = two_address
                     && std::env::var_os("FIRN_NO_COAL_CHAIN").is_none();
-                if t < np
+                let param_src_ok = t < np
+                    && p >= np
+                    && !two_address
+                    && !sse_class(f.val_ty(t))
+                    && !defsites.contains_key(&t)
+                    && !live.live_in.first().map_or(true, |l| l.get(p as usize).copied().unwrap_or(true))
+                    && std::env::var_os("FIRN_NO_COAL_PARAM").is_none();
+                if (t < np && !param_src_ok)
                     || coalesced.contains_key(&t)
                     || (sources.contains_key(&t) && !chain_ok)
                 {
@@ -3400,6 +3407,23 @@ impl Address {
     }
 }
 
+thread_local! {
+    static SYM_TEXT: std::cell::RefCell<crate::fx::HashMap<String, &'static str>> = std::cell::RefCell::new(crate::fx::HashMap::default());
+}
+
+/// Interned `'static` text for a symbolic address base (a handful of statics per program).
+fn intern_sym(s: String) -> &'static str {
+    SYM_TEXT.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(t) = m.get(&s) {
+            return *t;
+        }
+        let t: &'static str = Box::leak(s.clone().into_boxed_str());
+        m.insert(s, t);
+        t
+    })
+}
+
 /// Address computations that may move completely into the memory access.
 ///
 /// Up to round 43 this produced
@@ -3513,12 +3537,52 @@ fn foldable_addresses(
             Loc::Slot(_) => None,
         }
     };
+    // GAPS-GLOBAL: a `globaladdr` with ONE reader (after `addrsink` gave every access its own
+    // copy) needs no register: the access names the symbol itself. Without an index it is
+    // `[rip + sym + k]` (every target); with an index it is `[sym + idx*F + k]` -- an absolute
+    // 32-bit displacement, which only a non-PIC ELF target can link.
+    let mut gname: HashMap<Val, &'static str> = HashMap::default();
+    let mut gbase: HashMap<Val, Val> = HashMap::default();
+    let gfold = std::env::var_os("FIRN_NO_GFOLD").is_none();
+    let abs_ok = gfold && !crate::target::windows() && !crate::target::pic();
+    if gfold {
+        for b in &f.blocks {
+            for (idx, i) in b.insts.iter().enumerate() {
+                if let (Some(d), Op::GlobalAddr { name }) = (i.dst, &i.op) {
+                    if single(d) && read.get(d as usize).copied() == Some(1) && !f.is_secret(d) {
+                        let direct = match b.insts.get(idx + 1).map(|n| &n.op) {
+                            Some(Op::Load { addr }) => *addr == d,
+                            Some(Op::Store { addr, val }) => *addr == d && *val != d,
+                            _ => false,
+                        };
+                        if abs_ok || direct {
+                            gname.insert(d, intern_sym(crate::statics::label_of(name)));
+                        }
+                    }
+                }
+            }
+        }
+    }
     for b in &f.blocks {
         for (idx, i) in b.insts.iter().enumerate() {
             let d = match i.dst {
                 Some(d) => d,
                 None => continue,
             };
+            // (0) a global address read ONLY by the access right behind it
+            if let (Some(sym), Op::GlobalAddr { .. }) = (gname.get(&d), &i.op) {
+                if let Some(n) = b.insts.get(idx + 1) {
+                    let fits = match &n.op {
+                        Op::Load { addr } => *addr == d,
+                        Op::Store { addr, val } => *addr == d && *val != d,
+                        _ => false,
+                    };
+                    if fits {
+                        out.insert(d, Address { base: intern_sym(format!("rip + {}", sym)), index: None, offset: 0 });
+                    }
+                }
+                continue;
+            }
             // (1) address forming instruction
             let (base, off) = match &i.op {
                 Op::PtrAdd { base, off } => (*base, *off),
@@ -3569,26 +3633,137 @@ fn foldable_addresses(
                     && !a.frame_addr.contains_key(&v)
                     && a.imm(v).is_none()
             };
-            let (br, base_preload) = match pure_reg(base) {
-                Some(r) => (r, false),
-                None => match (a.loc(d), base_may_read(base)) {
-                    (Loc::Reg(dr), true) if Some(dr) != value_reg => (dr, true),
-                    _ => continue,
-                },
+            // GAPS-FRAME: a frame address (`alloca`) plus index or constant straight into the
+            // access: `[rbp + idx - N]` instead of `lea` + access.
+            if gfold {
+                if let Some(boff) = a.frame_addr.get(&base).copied() {
+                    if let Some(k) = a.imm(off) {
+                        let delta = k - boff as i64;
+                        if (i32::MIN as i64..=i32::MAX as i64).contains(&delta) && !f.is_secret(off) {
+                            out.insert(d, Address { base: "rbp", index: None, offset: delta });
+                        }
+                    } else if let Some(ir) = pure_reg(off) {
+                        if ir != "rbp" {
+                            out.insert(d, Address { base: "rbp", index: Some((ir, 1)), offset: -(boff as i64) });
+                        }
+                    }
+                    continue;
+                }
+            }
+            let gsym: Option<&'static str> = gname.get(&base).copied();
+            let (br, base_preload) = if let Some(sym) = gsym {
+                gbase.insert(d, base);
+                (sym, false)
+            } else {
+                match pure_reg(base) {
+                    Some(r) => (r, false),
+                    None => match (a.loc(d), base_may_read(base)) {
+                        (Loc::Reg(dr), true) if Some(dr) != value_reg => (dr, true),
+                        _ => continue,
+                    },
+                }
             };
             // (3a) constant offset
             if let Some(k) = a.imm(off) {
                 if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
-                    out.insert(d, Address { base: br, index: None, offset: k });
+                    let bt = if gsym.is_some() { intern_sym(format!("rip + {}", br)) } else { br };
+                    out.insert(d, Address { base: bt, index: None, offset: k });
                     if base_preload {
                         before.insert(d, base);
                     }
                 }
                 continue;
             }
+            // A symbolic base with an index needs the absolute form.
+            if gsym.is_some() && !abs_ok {
+                continue;
+            }
+            // (3a2) ROUND GAPS-IDX -- `base + (y + c) * F`: the constant add (and the
+            // scaling, if any) sit right in front of the address and have no other
+            // reader. The sum folds into the displacement: `[base + y*F + c*F]`.
+            // 64-bit wrap-around of the add and of the addressing are the same.
+            if std::env::var_os("FIRN_NO_IDXDISP").is_none() && idx > 0 {
+                let addc = |p: &Inst| -> Option<(Val, i64, Val)> {
+                    let pd = p.dst?;
+                    if p.ty.bits() != 64 {
+                        return None;
+                    }
+                    let (y, k) = match &p.op {
+                        Op::Bin(BinOp::Add, y, c) => (*y, a.imm(*c)?),
+                        Op::Bin(BinOp::Sub, y, c) => (*y, a.imm(*c)?.checked_neg()?),
+                        _ => return None,
+                    };
+                    if a.imm(y).is_some() {
+                        return None;
+                    }
+                    if read.get(pd as usize).copied() != Some(1)
+                        || !single(pd)
+                        || f.is_secret(pd)
+                        || a.alias.contains_key(&pd)
+                        || a.frame_addr.contains_key(&pd)
+                        || a.cell(pd).is_some()
+                    {
+                        return None;
+                    }
+                    Some((y, k, pd))
+                };
+                // a sunk `globaladdr` copy may stand between the chain and the address
+                let mut j1 = idx - 1;
+                while gsym.is_some() && j1 > 0 && b.insts[j1].dst.map_or(false, |x| gname.contains_key(&x)) {
+                    j1 -= 1;
+                }
+                let p1 = &b.insts[j1];
+                // scaled: add at j1-1, shl/mul at j1
+                let mut hit: Option<(Val, i64, i64, Val, Option<Val>)> = None; // (y, k, factor, add dst, scale dst)
+                if p1.dst == Some(off) && p1.ty.bits() == 64 && j1 > 0 && read.get(off as usize).copied() == Some(1) && single(off) && !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                    let skal = match &p1.op {
+                        Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
+                            Some(k) if (0..=3).contains(&k) => Some((*xi, 1i64 << k)),
+                            _ => None,
+                        },
+                        Op::Bin(BinOp::Mul, xi, ki) => match a.imm(*ki) {
+                            Some(k) if [1, 2, 4, 8].contains(&k) => Some((*xi, k)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((xi, fact)) = skal {
+                        let p2 = &b.insts[j1 - 1];
+                        if p2.dst == Some(xi) {
+                            if let Some((y, k, pd)) = addc(p2) {
+                                hit = Some((y, k, fact, pd, Some(off)));
+                            }
+                        }
+                    }
+                } else if let Some((y, k, pd)) = addc(p1) {
+                    // unscaled: the add at idx-1 is the index itself
+                    if pd == off {
+                        hit = Some((y, k, 1, pd, None));
+                    }
+                }
+                if let Some((y, k, fact, pd, sc)) = hit {
+                    if let (Some(yr), Some(disp)) = (pure_reg(y), k.checked_mul(fact)) {
+                        if (i32::MIN as i64..=i32::MAX as i64).contains(&disp) && (!base_preload || yr != br) && Some(yr) != None {
+                            out.insert(d, Address { base: br, index: Some((yr, fact)), offset: disp });
+                            away.insert(pd);
+                            if let Some(s2) = sc {
+                                away.insert(s2);
+                            }
+                            if base_preload {
+                                before.insert(d, base);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             // (3b) index with factor: the scaling sits right in front of it
             if read.get(off as usize).copied() == Some(1) && idx > 0 && single(off) {
-                let p = &b.insts[idx - 1];
+                let mut jb = idx - 1;
+                while gsym.is_some() && jb > 0 && b.insts[jb].dst.map_or(false, |x| gname.contains_key(&x)) {
+                    jb -= 1;
+                }
+                let p = &b.insts[jb];
                 let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
                     match &p.op {
                         Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
@@ -3862,6 +4037,12 @@ fn foldable_addresses(
                 scale.insert(d, (br, ir, fact));
                 away.insert(off);
             }
+        }
+    }
+    // The `globaladdr` behind a folded address is not emitted any more.
+    for (d, g) in gbase.iter() {
+        if out.contains_key(d) {
+            away.insert(*g);
         }
     }
     (out, away, before, scale)
@@ -4150,8 +4331,14 @@ fn interferes(
     // with several write sites at all. Simpler and
     // safe: a parameter is not merged.
     let np = f.params.len() as Val;
-    if a < np || b < np {
+    if a < np && b < np {
         return true;
+    }
+    if a < np || b < np {
+        let (pa, other) = if a < np { (a, b) } else { (b, a) };
+        if defsites.contains_key(&pa) || live.live_in.first().map_or(true, |l| l.get(other as usize).copied().unwrap_or(true)) {
+            return true;
+        }
     }
     for (x, y) in [(a, b), (b, a)] {
         for &(bi, ii) in defsites.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -4398,7 +4585,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(drop_redundant_zext(&descriptor_peephole(&text, a.value_slots)))
+    Ok(crate::retsink::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))
 }
 
 // ------------------------------------------------- Register descriptor ---
@@ -6111,6 +6298,9 @@ fn cmp_behind_copies(ra: &Ra, b: &Block) -> Option<Block> {
             if *src == cond {
                 return None;
             }
+            if ra.a.imm(*src).is_none() && ra.a.cell(*src).is_none() && ra.a.loc(*src) == ra.a.loc(d) {
+                continue;
+            }
         }
         if places.iter().any(|p| *p == ra.a.loc(d)) {
             return None;
@@ -7293,6 +7483,20 @@ fn emit_inst(
                 ra.fp_out(e, d, "xmm0", single);
             }
         }
+        Op::Un(UnOp::Bswap, x) => {
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
+            match ra.a.loc(d) {
+                Loc::Reg(r) => {
+                    ra.load_full(e, r, *x);
+                    e.line(&format!("bswap {}", rn(r, 32)));
+                }
+                Loc::Slot(_) => {
+                    ra.load_full(e, "rax", *x);
+                    e.line("bswap eax");
+                    ra.store_dst(e, d, "rax");
+                }
+            }
+        }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
@@ -7304,7 +7508,7 @@ fn emit_inst(
             ra.load_full(e, "rax", *x);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", rn("rax", bits))),
-                UnOp::Sqrt | UnOp::Bits => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits | UnOp::Bswap => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");
@@ -7793,6 +7997,9 @@ fn emit_inst(
         // Round 89 (statics.rs), like `FnRef`: a link time constant address.
         Op::GlobalAddr { name } => {
             let d = i.dst.ok_or("internal error: globaladdr without target")?;
+            if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
+                return Ok(()); // the symbol stands in the access
+            }
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::statics::label_of(name)

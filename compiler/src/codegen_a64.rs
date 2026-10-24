@@ -1503,7 +1503,7 @@ fn emit_inst(
             load_full(e, fr, A, *a);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}, {}", rw(A, bits), rw(A, bits))),
-                UnOp::Sqrt | UnOp::Bits => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits | UnOp::Bswap => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line(&format!("eor {}, {}, #1", w(A), w(A)));

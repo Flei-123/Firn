@@ -29,7 +29,10 @@ if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then
     NONE_T=""
     FREESTANDING_TARGET="nein"
 fi
-W="${W:-/tmp/fui-acceptance}"
+if [ -z "${W:-}" ]; then
+    W="$(mktemp -d)"
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W"
 
 build() {
