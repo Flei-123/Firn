@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -16,7 +16,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" chatplay "|" healthplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
+    "  "|" chatplay "|" healthplay "|" combatplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -138,6 +138,12 @@ if [ -z "$ONLY" ] || [ "$ONLY" = healthplay ]; then
     echo "== mc/healthplay =="
     bash tools/mc/play/run_health.sh 1.20.1 || ERR=$((ERR+1))
     bash tools/mc/play/run_health.sh 1.21.4 || ERR=$((ERR+1))
+fi
+# combat: entity pick under the crosshair -> attack (cow loses 2 hp), interact, use item (snowball consumed), release (1.20.1 + 1.21.4)
+if [ -z "$ONLY" ] || [ "$ONLY" = combatplay ]; then
+    echo "== mc/combatplay =="
+    bash tools/mc/play/run_combat.sh 1.20.1 || ERR=$((ERR+1))
+    bash tools/mc/play/run_combat.sh 1.21.4 || ERR=$((ERR+1))
 fi
 # sneak edge (maybeBackOffFromEdge): sneaking W / W+D on a platform never walks off, the control run without sneak falls; client == server: ~3 min per version.
 if [ -z "$ONLY" ] || [ "$ONLY" = edge ]; then

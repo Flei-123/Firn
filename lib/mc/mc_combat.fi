@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.math
+import mc.mc_entity
+import mc.mc_registry
+import mc.mc_client
+import mc.mc_play
+
+export {
+    Combat, Target, combat_new, combat_reach, combat_pick, combat_attack, combat_interact, combat_use_item, combat_release_use,
+    ray_box_dist, entity_size, entity_pickable, held_is_block, aim_angles, aim_nearest,
+    REACH_SURVIVAL, REACH_CREATIVE,
+}
+
+const REACH_SURVIVAL: f64 = 3.0
+const REACH_CREATIVE: f64 = 5.0
+const DEFAULT_WIDTH: f64 = 0.6
+const DEFAULT_HEIGHT: f64 = 1.8
+const NO_HIT: f64 = 0.0 - 1.0
+const EPS: f64 = 0.000000000001
+
+struct Target {
+    id: i32,
+    dist: f64,
+    hx: f64,
+    hy: f64,
+    hz: f64,
+}
+
+struct Combat {
+    n_attacks: u64,
+    n_interacts: u64,
+    n_uses: u64,
+    n_releases: u64,
+    last_target: i32,
+    using_item: bool,
+    last_attack_ms: u64,
+}
+
+fn combat_new() -> Combat {
+    return Combat { n_attacks: 0 as u64, n_interacts: 0 as u64, n_uses: 0 as u64, n_releases: 0 as u64, last_target: 0 - 1, using_item: false, last_attack_ms: 0 as u64 }
+}
+
+fn combat_reach(creative: bool) -> f64 {
+    if creative { return REACH_CREATIVE }
+    return REACH_SURVIVAL
+}
+
+fn target_none() -> Target {
+    return Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }
+}
+
+fn axis_range(o: f64, d: f64, lo: f64, hi: f64, t0: *mut f64, t1: *mut f64) -> bool {
+    if d < EPS && d > 0.0 - EPS {
+        return o >= lo && o <= hi
+    }
+    var a: f64 = (lo - o) / d
+    var b: f64 = (hi - o) / d
+    if a > b {
+        let tmp: f64 = a
+        a = b
+        b = tmp
+    }
+    if a > *t0 { *t0 = a }
+    if b < *t1 { *t1 = b }
+    return *t0 <= *t1
+}
+
+fn ray_box_dist(ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64, max_t: f64) -> f64 {
+    var t0: f64 = 0.0 - 1.0e30
+    var t1: f64 = 1.0e30
+    if !axis_range(ox, dx, x0, x1, &t0, &t1) { return NO_HIT }
+    if !axis_range(oy, dy, y0, y1, &t0, &t1) { return NO_HIT }
+    if !axis_range(oz, dz, z0, z1, &t0, &t1) { return NO_HIT }
+    if t1 < 0.0 { return NO_HIT }
+    var t: f64 = t0
+    if t < 0.0 { t = 0.0 }
+    if t > max_t { return NO_HIT }
+    return t
+}
+
+fn entity_size(reg: *mut mc_registry.Registry, e: *mut mc_entity.Entity, w: *mut f64, h: *mut f64) {
+    *w = DEFAULT_WIDTH
+    *h = DEFAULT_HEIGHT
+    if (e as u64) == 0 as u64 || (reg as u64) == 0 as u64 { return }
+    if (*e).kind == mc_entity.KIND_PLAYER || (*e).type_id < 0 { return }
+    let ri: i32 = mc_registry.reg_entity_find(reg, (*e).type_id)
+    if ri < 0 { return }
+    let rw: i32 = mc_registry.reg_entity_width_milli(reg, ri)
+    let rh: i32 = mc_registry.reg_entity_height_milli(reg, ri)
+    if rw > 0 { *w = (rw as f64) * 0.001 }
+    if rh > 0 { *h = (rh as f64) * 0.001 }
+}
+
+fn name_is(p: u64, n: usize, lit: str) -> bool {
+    return n == lit.n && rt.mem_eq(p, lit.p as u64, n)
+}
+
+fn entity_pickable(reg: *mut mc_registry.Registry, e: *mut mc_entity.Entity) -> bool {
+    if (e as u64) == 0 as u64 { return false }
+    if (*e).kind == mc_entity.KIND_PLAYER { return true }
+    if (reg as u64) == 0 as u64 || (*e).type_id < 0 { return true }
+    let ri: i32 = mc_registry.reg_entity_find(reg, (*e).type_id)
+    if ri < 0 { return true }
+    var kn: usize = 0
+    let kp: u64 = mc_registry.reg_entity_kind(reg, ri, &kn)
+    if name_is(kp, kn, "projectile") { return false }
+    var nn: usize = 0
+    let np: u64 = mc_registry.reg_entity_name(reg, ri, &nn)
+    if name_is(np, nn, "item") || name_is(np, nn, "experience_orb") || name_is(np, nn, "area_effect_cloud") { return false }
+    if name_is(np, nn, "marker") || name_is(np, nn, "lightning_bolt") || name_is(np, nn, "falling_block") { return false }
+    if name_is(np, nn, "block_display") || name_is(np, nn, "item_display") || name_is(np, nn, "text_display") { return false }
+    return true
+}
+
+// Nearest pickable entity along the ray within `reach`; a block hit nearer than the entity (block_dist >= 0) hides it.
+fn combat_pick(s: *mut mc_entity.Store, reg: *mut mc_registry.Registry, own_id: i32, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64,
+    reach: f64, block_dist: f64, out: *mut Target) -> bool {
+    *out = target_none()
+    var best: f64 = reach
+    if block_dist >= 0.0 && block_dist < best { best = block_dist }
+    let cap: usize = mc_entity.store_slot_cap(s)
+    var found: bool = false
+    var i: usize = 0
+    while i < cap {
+        let e: *mut mc_entity.Entity = mc_entity.store_at(s, i)
+        i = i + 1
+        if (e as u64) == 0 as u64 { continue }
+        if (*e).id == own_id { continue }
+        if !entity_pickable(reg, e) { continue }
+        var ex: f64 = (*e).x
+        var ey: f64 = (*e).y
+        var ez: f64 = (*e).z
+        if (*e).rinit {
+            ex = (*e).rx
+            ey = (*e).ry
+            ez = (*e).rz
+        }
+        var w: f64 = 0.0
+        var h: f64 = 0.0
+        entity_size(reg, e, &w, &h)
+        let hw: f64 = w * 0.5
+        let t: f64 = ray_box_dist(ox, oy, oz, dx, dy, dz, ex - hw, ey, ez - hw, ex + hw, ey + h, ez + hw, best)
+        if t < 0.0 { continue }
+        if found && t >= (*out).dist { continue }
+        found = true
+        (*out).id = (*e).id
+        (*out).dist = t
+        (*out).hx = ox + dx * t - ex
+        (*out).hy = oy + dy * t - ey
+        (*out).hz = oz + dz * t - ez
+        best = t
+    }
+    return found
+}
+
+fn held_is_block(reg: *mut mc_registry.Registry, item: i32) -> bool {
+    if item < 0 || (reg as u64) == 0 as u64 { return false }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_item_name(reg, item, &n)
+    if p == 0 as u64 { return false }
+    return mc_registry.reg_block_by_name(reg, p, n) >= 0
+}
+
+fn aim_angles(ox: f64, oy: f64, oz: f64, tx: f64, ty: f64, tz: f64, yaw: *mut f64, pitch: *mut f64) {
+    let dx: f64 = tx - ox
+    let dy: f64 = ty - oy
+    let dz: f64 = tz - oz
+    let flat: f64 = math.sqrt(dx * dx + dz * dz)
+    *yaw = math.atan2(0.0 - dx, dz) * 180.0 / math.PI()
+    *pitch = math.atan2(0.0 - dy, flat) * 180.0 / math.PI()
+}
+
+fn aim_nearest(s: *mut mc_entity.Store, reg: *mut mc_registry.Registry, own_id: i32, ox: f64, oy: f64, oz: f64, max_dist: f64,
+    yaw: *mut f64, pitch: *mut f64) -> bool {
+    let cap: usize = mc_entity.store_slot_cap(s)
+    var best: f64 = max_dist * max_dist
+    var found: bool = false
+    var i: usize = 0
+    while i < cap {
+        let e: *mut mc_entity.Entity = mc_entity.store_at(s, i)
+        i = i + 1
+        if (e as u64) == 0 as u64 || (*e).id == own_id || !entity_pickable(reg, e) { continue }
+        var w: f64 = 0.0
+        var h: f64 = 0.0
+        entity_size(reg, e, &w, &h)
+        let cy: f64 = (*e).y + h * 0.5
+        let dx: f64 = (*e).x - ox
+        let dy: f64 = cy - oy
+        let dz: f64 = (*e).z - oz
+        let d2: f64 = dx * dx + dy * dy + dz * dz
+        if d2 > best { continue }
+        best = d2
+        found = true
+        aim_angles(ox, oy, oz, (*e).x, cy, (*e).z, yaw, pitch)
+    }
+    return found
+}
+
+fn combat_attack(cb: *mut Combat, cl: *mut mc_client.Client, id: i32, sneaking: bool, seq: i32, now_ms: u64) -> bool {
+    let ok: bool = mc_play.send_attack(cl, id, sneaking)
+    mc_play.send_swing(cl, seq)
+    (*cb).n_attacks = (*cb).n_attacks + 1 as u64
+    (*cb).last_target = id
+    (*cb).last_attack_ms = now_ms
+    return ok
+}
+
+fn combat_interact(cb: *mut Combat, cl: *mut mc_client.Client, t: *mut Target, sneaking: bool, seq: i32) -> bool {
+    let ok: bool = mc_play.send_interact_at(cl, (*t).id, (*t).hx, (*t).hy, (*t).hz, sneaking)
+    let ok2: bool = mc_play.send_interact(cl, (*t).id, sneaking)
+    mc_play.send_swing(cl, seq)
+    (*cb).n_interacts = (*cb).n_interacts + 1 as u64
+    return ok && ok2
+}
+
+fn combat_use_item(cb: *mut Combat, cl: *mut mc_client.Client, seq: i32, yaw: f64, pitch: f64) -> bool {
+    let ok: bool = mc_play.send_use_item(cl, seq, yaw, pitch)
+    (*cb).n_uses = (*cb).n_uses + 1 as u64
+    (*cb).using_item = true
+    return ok
+}
+
+fn combat_release_use(cb: *mut Combat, cl: *mut mc_client.Client) -> bool {
+    if !(*cb).using_item { return true }
+    (*cb).using_item = false
+    (*cb).n_releases = (*cb).n_releases + 1 as u64
+    return mc_play.send_dig(cl, mc_play.DIG_RELEASE_USE, 0, 0, 0, 0, 0)
+}
