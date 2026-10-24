@@ -787,6 +787,10 @@ for th in light dark; do
 done
 "$W/fuiapp_settings" --theme dark --open --shot "$W/settings-open.png"
 [ "$(wc -c < "$W/settings-open.png")" -gt 15000 ] || { echo "  settings open-list shot too small"; exit 1; }
+"$W/fuiapp_settings" --theme dark --size 360x800 --shot "$W/settings-phone.png"
+[ "$(wc -c < "$W/settings-phone.png")" -gt 15000 ] || { echo "  settings phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/settings-phone.png" "$W/settings-dark.png"; echo $?)" = 1 ] || { echo "  settings phone shot equals desktop shot"; exit 1; }
+echo "  settings phone layout (360x800 tabs)  OK"
 echo "  settings 1100x700 shot, light + dark + open list   OK"
 build kitset
 "$W/kitset"
