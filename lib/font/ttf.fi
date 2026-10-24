@@ -45,13 +45,14 @@
 // readers below do the shifts by hand instead of casting a pointer; a
 // `*(p as *mut u16)` would read the machine's order and would be right on
 // nothing.
+import std.rt
 import font.raster
 
 export {
     Font,
     font_new, font_init, font_ok,
     font_upem, font_ascent, font_descent, font_line_gap, font_num_glyphs,
-    font_glyph_for, font_advance, font_lsb, font_kern, font_has_kern,
+    font_glyph_for, font_advance, font_lsb, font_kern, font_has_kern, font_kern_release, font_kern_raw,
     font_glyph_bbox, font_outline, font_outline_m,
     font_scratch_needed,
     font_cmap_format,
@@ -105,6 +106,7 @@ struct Font {
     // same `font_glyph_for`, so the answers are the same numbers.
     lat: [u32; 256],
     lat_ok: usize,
+    kc: u64,
 }
 
 // ------------------------------------------------------- Big endian reads
@@ -224,6 +226,7 @@ fn font_new() -> Font {
         line_gap: 0,
         lat: [0 as u32; 256],
         lat_ok: 0,
+        kc: 0 as u64,
     }
 }
 
@@ -260,6 +263,7 @@ fn find_table(f: *mut Font, a: u32, b: u32, c: u32, d: u32,
 
 #[no_gc]
 fn font_init(f: *mut Font, data: *mut u8, len: usize) -> bool {
+    kern_cache_release(f)
     (*f).data = data
     (*f).len = len
     (*f).ok = 0
@@ -844,12 +848,80 @@ fn gpos_kern(f: *mut Font, a: u32, b: u32) -> i32 {
 // Pair kerning in font units: the legacy `kern` table first, then GPOS.
 // Zero when there is neither or no pair.
 #[no_gc]
-fn font_kern(f: *mut Font, left: u32, right: u32) -> i32 {
+fn font_kern_raw(f: *mut Font, left: u32, right: u32) -> i32 {
     let k: i32 = kern_table(f, left, right)
     if k != 0 {
         return k
     }
     return gpos_kern(f, left, right)
+}
+
+const KC_SLOTS: usize = 4096
+const KC_VALS: usize = 32768
+const KC_BYTES: usize = 49152
+
+#[no_gc]
+fn kc_get64(p: u64, i: usize) -> u64 {
+    return *((p + (i * 8) as u64) as *mut u64)
+}
+
+#[no_gc]
+fn kc_set64(p: u64, i: usize, v: u64) {
+    *((p + (i * 8) as u64) as *mut u64) = v
+}
+
+#[no_gc]
+fn kc_get32(p: u64, i: usize) -> i32 {
+    return *((p + (i * 4) as u64) as *mut i32)
+}
+
+#[no_gc]
+fn kc_set32(p: u64, i: usize, v: i32) {
+    *((p + (i * 4) as u64) as *mut i32) = v
+}
+
+#[no_gc]
+fn kern_cache_release(f: *mut Font) {
+    if (*f).kc != 0 as u64 {
+        rt.heap_free((*f).kc, KC_BYTES)
+        (*f).kc = 0 as u64
+    }
+}
+
+#[no_gc]
+fn font_kern_release(f: *mut Font) {
+    kern_cache_release(f)
+}
+
+#[no_gc]
+fn kern_cache_slot(left: u32, right: u32) -> usize {
+    var h: u64 = (left as u64) *% 2654435761 as u64 +% (right as u64) *% 97531 as u64
+    h = h ^ (h >> 15)
+    return (h & 4095 as u64) as usize
+}
+
+#[no_gc]
+fn font_kern(f: *mut Font, left: u32, right: u32) -> i32 {
+    if (*f).kern_len == 0 && (*f).gk_n == 0 {
+        return 0
+    }
+    if (*f).kc == 0 as u64 {
+        let p: u64 = rt.heap_alloc(KC_BYTES)
+        if p == 0 as u64 {
+            return font_kern_raw(f, left, right)
+        }
+        (*f).kc = p
+    }
+    let kc: u64 = (*f).kc
+    let slot: usize = kern_cache_slot(left, right)
+    let key: u64 = (((left as u64) << 32) | (right as u64)) + 1 as u64
+    if kc_get64(kc, slot) == key {
+        return kc_get32(kc + KC_VALS as u64, slot)
+    }
+    let v: i32 = font_kern_raw(f, left, right)
+    kc_set64(kc, slot, key)
+    kc_set32(kc + KC_VALS as u64, slot, v)
+    return v
 }
 
 // ------------------------------------------------------------- Outlines
