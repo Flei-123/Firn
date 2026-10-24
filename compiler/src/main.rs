@@ -57,6 +57,7 @@ mod iface;
 mod impls;
 mod core;
 mod inline;
+mod inline_once;
 mod layout;
 mod lexer;
 mod licm;
