@@ -33,6 +33,11 @@ Tests: 70 unit tests in the scratch crate plus an end-to-end test (also reaps a 
 
 ## Signing and settings UI
 * `engine_release.sh` signs `manifest.json` with the raw ed25519 key `SIGN_KEY` (default `/root/.fleilauncher-engine-signing/engine_signing.pem`, never in a repo) and writes `manifest.json.sig` (128 hex chars). Set `ALLOW_UNSIGNED=1` only for local tests; the launcher rejects unsigned manifests. Upload all four files (two zips, `manifest.json`, `manifest.json.sig`).
-* Key rotation: add the new public key to `PUBLIC_KEYS` in `engine/verify.rs`, release a launcher, then switch `SIGN_KEY`.
+* Key rotation (tested by `rotation_*` unit tests in `engine/verify.rs`: manifest signed by old or new key accepted, unknown key rejected):
+  1. Generate a new ed25519 key outside the repo, derive its public key hex.
+  2. Append the public hex to `PUBLIC_KEYS` (keep the old one), release a launcher build.
+  3. After users updated, switch `SIGN_KEY` to the new key and publish a manifest signed with it.
+  4. In a later launcher release remove the old public key from `PUBLIC_KEYS`.
+* Key backup (Boss, off-server): `openssl rand -base64 33 > pass.txt` (store in a password manager), then `openssl enc -aes-256-cbc -pbkdf2 -salt -in /root/.fleilauncher-engine-signing/engine_signing.pem -out engine_signing.pem.enc -pass file:pass.txt`; restore with `openssl enc -d -aes-256-cbc -pbkdf2 -in engine_signing.pem.enc -out engine_signing.pem -pass file:pass.txt`. Never place the key or the backup in a public folder.
 * Settings page has a Flei Engine card (window size, fullscreen, view distance 2-32, sound mode, engine folder, download/update button with progress). Values are clamped in `AppConfig::normalize_engine`.
 * Profile editor lists only versions from `engine/versions.rs` when the loader is Flei Engine (`engine_supported_versions`).
