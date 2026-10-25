@@ -2,7 +2,7 @@
 # tools/mc/play/run_inv.sh [mc_version=1.21.4] -- mcplay inventory + survival dig against an official server of ANY version
 # (data components from 1.20.5: mc_inv reads Window Items / Set Slot through the packet schema, mc_dig uses the version's tool table).
 # One server, Xvfb, mcplay (CPU raster): /give an iron pickaxe + stone, look down, hold the left button.
-# Prints `RESULT mc-play-inv: ok|FAIL`. Env: RUN_INV_CMDS (extra server commands in the survival stage), MCPLAY_RAW_INV=1 (rawinv lines = real packet bodies for test fixtures), FIRNC, JAVA (1.21+ needs Java 21+; default /root/tools/jdk25/bin/java when present), MC_VIEW (3), MCPLAY_KEEP_DIR.
+# Prints `RESULT mc-play-inv: ok|FAIL`. Env: RUN_INV_CMDS (extra server commands in the survival stage), MCPLAY_RAW_INV=1 (rawinv lines = real packet bodies for test fixtures), FIRNC, JAVA (1.21+ needs Java 21+; default /root/tools/jdk25/bin/java when present), MC_VIEW (3), MCPLAY_KEEP_DIR, RUN_INV_ONLY=cont (only the anvil/enchanting stages, needs RUN_INV_CONT=1).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-/root/firn/compiler/target/release/firnc}
@@ -54,6 +54,7 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
+if [ "${RUN_INV_ONLY:-}" != cont ]; then
 # ---- creative: Set Creative Slot (MCPLAY_GIVE) and the server's Window Items / Set Slot
 MCPLAY_AUDIO=0 MCPLAY_GIVE="iron_pickaxe:1,stone:64" MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player > "$W/creative.out" 2>&1
@@ -349,6 +350,7 @@ print("  server chest (ui): " + " ".join("%d=%s" % (n, got[n]) for n in sorted(g
 ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",1) and got[6]==("stone",21) and got[7]==("stone",21) and got[8]==("stone",21) and hot[0]==("stone",30) and hot[1] is None
 sys.exit(0 if ok else 1)
 PY
+fi
 # ---- anvil + enchanting table UI (MCPLAY_CONT_UI=1|2): the block is set next to the player, mcplay opens it with a right click packet and prints the cell centres.
 # anvil: pickaxe into the input slot, type "Bo e1" into the name field (E and the digit must not close the panel / swap), the server's result slot must fill (rename accepted).
 # enchanting table: pickaxe + 3 lapis in, click the first option; the server must enchant the pickaxe and take one lapis
@@ -371,7 +373,7 @@ for i in $(seq 1 40); do grep -q 'contui cell hot1 ' "$W/an.out" 2>/dev/null && 
 if grep -q 'contui cell hot1 ' "$W/an.out"; then
     sleep 1
     cclick an hot0; cclick an ws=0
-    sleep 1; xdotool key ctrl+a; sleep 0.5
+    sleep 1; xdotool keydown ctrl; sleep 0.3; xdotool key a; sleep 0.3; xdotool keyup ctrl; sleep 0.5
     xdotool type --delay 250 "Bo e1"; sleep 2.5
     xdotool key Escape; sleep 1.5
 else
@@ -428,6 +430,7 @@ print("  server: pickaxe enchanted=%s lapis=%s" % (ench, cnt.group(1) if cnt els
 sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
 PY
 fi
+if [ "${RUN_INV_ONLY:-}" != cont ]; then
 # ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &
@@ -469,6 +472,7 @@ a,b=slot(t,0),slot(t,1)
 print("  server creative hotbar: 0=%s 1=%s" % (a,b))
 sys.exit(0 if a and b and a[1]==1 and b[1]==1 and a[0]!=b[0] else 1)
 PY
+fi
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR
