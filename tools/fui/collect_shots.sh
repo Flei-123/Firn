@@ -20,7 +20,10 @@
 # W and BELEGE act as in run.sh.
 set -e
 cd "$(dirname "$0")/../.."
-W="${W:-/tmp/fui-acceptance}"
+if [ -z "${BELEGE:-}" ] && [ -z "${W:-}" ]; then
+    echo "collect_shots: set BELEGE or W to the directory of a finished run."
+    exit 1
+fi
 Z="${BELEGE:-$W/belege}"
 TARGET=".gauntlet-shots"
 

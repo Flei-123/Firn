@@ -24,8 +24,10 @@ set -e
 cd "$(dirname "$0")/../.."
 ROOT="$(pwd)"
 FIRNC="${FIRNC:-$ROOT/compiler/target/release/firnc}"
-W="${W:-/tmp/fui-apptree}"
-rm -rf "$W"
+if [ -z "${W:-}" ]; then
+    W="$(mktemp -d)"
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W"
 
 FIRNLIB="$ROOT/lib" "$FIRNC" --opt-level=release-fast -o "$W/cap128" \

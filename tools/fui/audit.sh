@@ -21,7 +21,10 @@ set -u
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
-W="${W:-/tmp/fui-audit}"
+if [ -z "${W:-}" ]; then
+    W="$(mktemp -d)"
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W"
 fail=0
 

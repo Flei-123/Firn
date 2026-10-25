@@ -378,7 +378,7 @@ points, flex distribution in pixels, three box passes against the cubic
 B-spline `(1,3,6,7,6,3,1)/27`, known point images under the transform.
 
 The evidence pictures are written to `$W/belege` (with `W` defaulting to
-`/tmp/fui-acceptance`), that is: **inside the working directory**, never
+a fresh `mktemp -d` that is removed on exit; set `W` or `BELEGE` to keep them), that is: **inside the working directory**, never
 to a fixed system path -- a run that writes outside its own tree fails
 for anyone without rights there, and only after twenty passed sections.
 Set `BELEGE` to put them somewhere else. If that directory cannot be
