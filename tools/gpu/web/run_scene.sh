@@ -16,4 +16,4 @@ cp demos/mcweb/index.html demos/mcweb/glweb.js "$D/"
     || { echo "   FAIL: web_scene_main.fi does not compile for wasm32-browser"; head -5 "$D/err"; exit 1; }
 "$FIRNC" -o "$D/native" tools/gpu/web/native_scene_main.fi 2>"$D/err" || { echo "   FAIL: native_scene_main.fi does not compile"; head -5 "$D/err"; exit 1; }
 mkdir "$D/ref" && "$D/native" "$D/ref" >/dev/null || { echo "   FAIL: native reference run"; exit 1; }
-GATE_WASM=mcscene2.wasm GATE_CLEAR=102030 GATE_MIN_SCENES=7 GATE_LABEL=webgl2-scene GATE_CULL=1 python3 -I tools/gpu/web/check.py "$D" "$D/ref"
+GATE_WASM=mcscene2.wasm GATE_CLEAR=102030 GATE_MIN_SCENES=8 GATE_LABEL=webgl2-scene GATE_CULL=1 python3 -I tools/gpu/web/check.py "$D" "$D/ref"
