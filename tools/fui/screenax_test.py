@@ -88,7 +88,32 @@ def editor_checks():
     if after != "# From the reader\n\nBody":
         print("  WRONG editor text did not change: %r" % after[:30])
         errs += 1
-    print("%s editor node: name, Text/EditableText, SetTextContents" % ("  ok   " if errs == 0 else "  WRONG"))
+    def until(fn, secs=4.0):
+        end = time.time() + secs
+        while time.time() < end:
+            if fn():
+                return True
+            time.sleep(0.1)
+        return fn()
+
+    if int(c.call(ed, TEXT, "GetCaretOffset")) != 0:
+        print("  WRONG caret is not 0 after the text set")
+        errs += 1
+    if not bool(c.call(ed, TEXT, "SetCaretOffset", 5)) or not until(lambda: int(c.call(ed, TEXT, "GetCaretOffset")) == 5):
+        print("  WRONG editor caret did not move to 5")
+        errs += 1
+    if not bool(c.call(ed, TEXT, "SetSelection", 0, 2, 9)) or not until(lambda: int(c.call(ed, TEXT, "GetNSelections")) == 1):
+        print("  WRONG editor selection was not set")
+        errs += 1
+    else:
+        sel = c.call(ed, TEXT, "GetSelection", 0)
+        if (int(sel[0]), int(sel[1])) != (2, 9) or int(c.call(ed, TEXT, "GetCaretOffset")) != 9:
+            print("  WRONG selection reads %r" % ((int(sel[0]), int(sel[1])),))
+            errs += 1
+    if bool(c.call(pv, TEXT, "SetCaretOffset", 2)):
+        print("  WRONG preview accepted a caret")
+        errs += 1
+    print("%s editor node: name, Text/EditableText, SetTextContents, caret, selection" % ("  ok   " if errs == 0 else "  WRONG"))
     return errs
 
 
