@@ -1,0 +1,162 @@
+// expect_exit: 0
+import std.rt
+import std.io
+import zip.zip
+import audio.engine
+import audio.bank
+import mc.mc_audio
+import mc.mc_assets
+import mc.mc_packs
+import mc.mc_packsnd
+import mc.mc_lazysnd
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const OGG_A: str = "tests/data/vorbis/sine_m22k_q3.ogg"
+const OGG_B: str = "tests/data/vorbis/impulse_m44k_q4.ogg"
+const SOUNDS: str = "{\"ui.button.click\":{\"sounds\":[\"s/a1\"]},\"block.stone.step\":{\"sounds\":[\"s/a1\",\"s/b1\"]},\"ambient.cave\":{\"sounds\":[\"s/a1\",{\"name\":\"s/b1\",\"volume\":0.5},\"s/a2\",{\"name\":\"s/b2\",\"weight\":2}]},\"entity.cow.moo\":{\"sounds\":[\"s/missing\"]},\"entity.zombie.ambient\":{\"sounds\":[\"s/b2\"]}}"
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    let ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_file(w: *mut zip.ZipWriter, name: str, src: str) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, src.p as u64, src.length())
+    rt.buf_push(&p, 0 as u8)
+    var d: rt.Buf = rt.buf_new()
+    var ok: bool = rt.read_file(rt.buf_ptr(&p), &d)
+    if ok { ok = zip.zip_add(w, name, rt.buf_ptr(&d), rt.buf_len(&d), false) catch | e | (false) }
+    rt.buf_free(&p)
+    rt.buf_free(&d)
+    return ok
+}
+
+fn build_pack(b: *mut rt.Buf, stack: *mut mc_assets.PackStack) -> bool {
+    var w: zip.ZipWriter = zip.zip_writer_new(b)
+    var ok: bool = add_str(&w, "pack.mcmeta", META)
+    ok = add_str(&w, "assets/minecraft/sounds.json", SOUNDS) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/a1.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/a2.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/b1.ogg", OGG_B) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/b2.ogg", OGG_B) && ok
+    let n: usize = zip.zip_finish(&w) catch | e | (0)
+    zip.zip_writer_free(&w)
+    if n == 0 || !ok { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    return mc_assets.stack_push(stack, &pk) == mc_assets.ASSET_OK
+}
+
+fn distinct_slots(e: *mut engine.Engine, ev: i32) -> i32 {
+    let n: usize = (*engine.engine_event(e, ev)).sample_n as usize
+    var seen: [i32; 16] = [0 - 1; 16]
+    var d: i32 = 0
+    var k: usize = 0
+    while k < n {
+        let id: i32 = engine.engine_event_slot_sample(e, ev, k)
+        var j: i32 = 0
+        var dup: bool = false
+        while j < d {
+            if seen[j as usize] == id { dup = true }
+            j = j + 1
+        }
+        if !dup { seen[d as usize] = id; d = d + 1 }
+        k = k + 1
+    }
+    return d
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+    var raw: rt.Buf = rt.buf_new()
+    var stack: mc_assets.PackStack = mc_assets.stack_new()
+    check(&t, build_pack(&raw, &stack), "pack built")
+
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    mc_audio.mca_set_lazy_sounds(&m, true, 0 as u64, 0)
+    let lz: *mut mc_lazysnd.Lazy = mc_audio.mca_lazy(&m)
+    let n: i32 = mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH)
+    check(&t, n == 4, "4 events (missing-file event skipped)")
+    check(&t, engine.engine_sample_count(&e) == 1, "nothing decoded at start: only the silent placeholder")
+    check(&t, mc_lazysnd.lazy_pending(lz) == 4, "4 events wait for their first play")
+
+    let ev_ui: i32 = engine.engine_find_event(&e, "ui.button.click")
+    let ev_st: i32 = engine.engine_find_event(&e, "block.stone.step")
+    let ev_cv: i32 = engine.engine_find_event(&e, "ambient.cave")
+    check(&t, ev_ui >= 0 && ev_st >= 0 && ev_cv >= 0 && engine.engine_find_event(&e, "entity.cow.moo") < 0, "events exist, unusable one does not")
+    check(&t, (*engine.engine_event(&e, ev_cv)).sample_n == 5, "cave: 4 files, one with weight 2 = 5 slots")
+    check(&t, near_f(engine.engine_event_slot_volume(&e, ev_cv, 1), 0.5), "per-entry volume survives the lazy bank")
+    check(&t, distinct_slots(&e, ev_cv) == 1, "before the first play every slot is the placeholder")
+
+    check(&t, mc_audio.mca_play_ui(&m, "ui.button.click", 1.0, 1.0) != 0 as u32, "first play of ui click works")
+    check(&t, engine.engine_sample_count(&e) == 2 && distinct_slots(&e, ev_ui) == 1, "click: its one file is decoded now")
+    check(&t, engine.engine_event_slot_sample(&e, ev_ui, 0) != 0, "click slot no longer the placeholder")
+    check(&t, mc_lazysnd.lazy_pending(lz) == 3, "click is complete: 3 events pending")
+
+    mc_audio.mca_play_ui(&m, "ambient.cave", 1.0, 1.0)
+    check(&t, distinct_slots(&e, ev_cv) == 1 && engine.engine_sample_count(&e) == 2, "cave play 1: first file was decoded for the click already, all slots use it")
+    mc_audio.mca_play_ui(&m, "ambient.cave", 1.0, 1.0)
+    check(&t, distinct_slots(&e, ev_cv) == 2 && engine.engine_sample_count(&e) == 3, "cave play 2: second file")
+    mc_audio.mca_play_ui(&m, "ambient.cave", 1.0, 1.0)
+    mc_audio.mca_play_ui(&m, "ambient.cave", 1.0, 1.0)
+    check(&t, distinct_slots(&e, ev_cv) == 4 && engine.engine_sample_count(&e) == 5, "cave play 4: all 4 files")
+    mc_audio.mca_play_ui(&m, "ambient.cave", 1.0, 1.0)
+    check(&t, engine.engine_sample_count(&e) == 5, "cave play 5: nothing more to decode")
+    check(&t, mc_lazysnd.lazy_pending(lz) == 2, "cave complete: 2 events pending")
+    mc_audio.mca_play_ui(&m, "block.stone.step", 1.0, 1.0)
+    check(&t, distinct_slots(&e, ev_st) == 1 && engine.engine_sample_count(&e) == 5, "stone.step: file already decoded for another event is shared (same name)")
+    check(&t, (*lz).decoded == 4, "4 files decoded in total")
+
+    var e2: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b2: bank.Bank = bank.bank_new()
+    var m2: mc_audio.McAudio = mc_audio.mca_new(&e2)
+    mc_audio.mca_set_lazy_sounds(&m2, true, 60000 as u64, 0)
+    let n2: i32 = mc_packsnd.packsnd_apply(&m2, &b2, &e2, &stack, mc_packs.SOUNDS_BOTH)
+    check(&t, n2 == 4, "eager budget: 4 events")
+    check(&t, engine.engine_sample_count(&e2) == 3, "hot events (ui click, stone step) decoded at start: 2 files + placeholder")
+    check(&t, mc_lazysnd.lazy_pending(mc_audio.mca_lazy(&m2)) == 2, "only the cold events wait (cave, zombie)")
+    let ns: usize = engine.engine_sample_count(&e2)
+    let n3: i32 = mc_packsnd.packsnd_apply(&m2, &b2, &e2, &stack, mc_packs.SOUNDS_BOTH)
+    check(&t, n3 == 4 && engine.engine_sample_count(&e2) == ns, "re-apply reuses samples by hash")
+
+    var e3: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b3: bank.Bank = bank.bank_new()
+    var m3: mc_audio.McAudio = mc_audio.mca_new(&e3)
+    let n4: i32 = mc_packsnd.packsnd_apply(&m3, &b3, &e3, &stack, mc_packs.SOUNDS_BOTH)
+    check(&t, n4 == 4 && engine.engine_sample_count(&e3) == 4, "lazy off: everything decoded at start (4 distinct names), no placeholder")
+
+    var e4: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b4: bank.Bank = bank.bank_new()
+    var m4: mc_audio.McAudio = mc_audio.mca_new(&e4)
+    mc_audio.mca_set_lazy_sounds(&m4, true, 0 as u64, 256)
+    let n5: i32 = mc_packsnd.packsnd_apply(&m4, &b4, &e4, &stack, mc_packs.SOUNDS_BOTH)
+    check(&t, n5 == 4 && engine.engine_sample_count(&e4) == 4 && mc_lazysnd.lazy_pending(mc_audio.mca_lazy(&m4)) == 0, "small pack (below the event threshold) is decoded at start")
+
+    if t.fails != 0 {
+        io.fmt_print(f"mc_lazy_sounds FAIL {t.fails}\n")
+        return 1
+    }
+    io.fmt_print(f"mc_lazy_sounds ok\n")
+    return 0
+}
+
+fn near_f(a: f32, b: f32) -> bool {
+    return a > b - 0.002 && a < b + 0.002
+}

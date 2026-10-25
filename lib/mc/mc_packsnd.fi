@@ -39,13 +39,14 @@ import zip.zip
 import mc.mc_assets
 import mc.mc_audio
 import mc.mc_packs
+import mc.mc_lazysnd
 
 export {
-    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT, Acc, acc_new, acc_slots, acc_list, acc_list_factors, acc_has_factors,
+    packsnd_apply, packsnd_build_text, packsnd_build_text_lazy, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT, Acc, acc_new, acc_slots, acc_list, acc_list_factors, acc_has_factors,
 }
 
 const PS_MAX_EVENTS: usize = 1600
-const PS_MAX_FILES: usize = 1600
+const PS_MAX_FILES: usize = 4096
 const PS_PER_EVENT: usize = 16
 const SOUNDS_JSON: str = "assets/minecraft/sounds.json"
 
@@ -57,10 +58,12 @@ struct PackSnd {
     reused: i32, // files whose sample was reused from an earlier apply (same hash)
     replaced: i32, // files that changed since the earlier apply and took over their old sample slot
     decoded: i32, // files decoded in this apply
+    lazy_events: i32, // events whose files are decoded on first play
+    lazy_files: i32, // usable files left undecoded
 }
 
 fn ps_new() -> PackSnd {
-    return PackSnd { events: 0, files: 0, skipped_files: 0, skipped_events: 0, reused: 0, replaced: 0, decoded: 0 }
+    return PackSnd { events: 0, files: 0, skipped_files: 0, skipped_events: 0, reused: 0, replaced: 0, decoded: 0, lazy_events: 0, lazy_files: 0 }
 }
 
 fn starts(p: u64, n: usize, pre: str) -> bool {
@@ -129,21 +132,6 @@ fn sound_path(p: u64, n: usize, out: *mut rt.Buf) -> bool {
     return true
 }
 
-// Finds `path` in the packs (top first); extracts it into `raw`. false = absent.
-fn find_ogg(s: *mut mc_assets.PackStack, path: *mut rt.Buf, raw: *mut rt.Buf) -> bool {
-    var pi: usize = 0
-    while pi < (*s).n {
-        let idx: i64 = mc_assets.pack_find_bytes(&(*s).packs[pi], rt.buf_ptr(path), rt.buf_len(path))
-        if idx >= 0 {
-            let got: usize = zip.zip_extract(&(*s).packs[pi].z, idx as usize, raw) catch | e | (0)
-            if got > 0 { return true }
-            rt.buf_clear(raw)
-        }
-        pi = pi + 1
-    }
-    return false
-}
-
 // Already emitted event name? (names of this apply, one per line in `seen`)
 fn seen_has(seen: *mut rt.Buf, p: u64, n: usize) -> bool {
     let all: u64 = rt.buf_ptr(seen)
@@ -158,6 +146,35 @@ fn seen_has(seen: *mut rt.Buf, p: u64, n: usize) -> bool {
     return false
 }
 
+fn stack_has(s: *mut mc_assets.PackStack, p: u64, n: usize) -> bool {
+    var pi: usize = 0
+    while pi < (*s).n {
+        if mc_assets.pack_find_bytes(&(*s).packs[pi], p, n) >= 0 { return true }
+        pi = pi + 1
+    }
+    return false
+}
+
+fn ends_with(p: u64, n: usize, suf: str) -> bool {
+    if n < suf.length() { return false }
+    return rt.mem_eq(p + (n - suf.length()) as u64, suf.p as u64, suf.length())
+}
+
+fn hot_action(p: u64, n: usize) -> bool {
+    return ends_with(p, n, ".break") || ends_with(p, n, ".step") || ends_with(p, n, ".place") || ends_with(p, n, ".hit") || ends_with(p, n, ".fall")
+}
+
+fn common_block(p: u64, n: usize) -> bool {
+    return starts(p, n, "block.stone.") || starts(p, n, "block.grass.") || starts(p, n, "block.gravel.") || starts(p, n, "block.wood.") || starts(p, n, "block.sand.")
+}
+
+fn hot_rank(p: u64, n: usize) -> i32 {
+    if starts(p, n, "ui.") || starts(p, n, "entity.player.") { return 0 }
+    if !starts(p, n, "block.") || !hot_action(p, n) { return 2 }
+    if common_block(p, n) { return 0 }
+    return 1
+}
+
 // Everything one apply needs.
 struct Ctx {
     s: *mut mc_assets.PackStack,
@@ -166,6 +183,8 @@ struct Ctx {
     st: PackSnd,
     files: rt.Buf, // zip paths usable in this apply (one per line)
     room_samples: i32, // free sample slots in the engine at the start
+    lz: *mut mc_lazysnd.Lazy, // null = decode everything now
+    lazy_now: bool, // the current event is decoded on first play
 }
 
 // One event while its lists are merged.
@@ -212,6 +231,30 @@ fn acc_slots(a: *mut Acc) {
         if bc <= 1 { break }
         (*a).cnt[bi] = (*a).cnt[bi] - 1
         sum = sum - 1
+    }
+}
+
+// Lazy event: the bank text gets the silent placeholder once per slot; the real files are remembered in `lz` for the first play.
+fn acc_lazy(a: *mut Acc, lz: *mut mc_lazysnd.Lazy, name_p: u64, name_n: usize, out: *mut rt.Buf) {
+    let r: i32 = mc_lazysnd.lazy_begin(lz, name_p, name_n)
+    let all: u64 = rt.buf_ptr(&(*a).paths)
+    let tot: usize = rt.buf_len(&(*a).paths)
+    var i: usize = 0
+    var k: usize = 0
+    var first: bool = true
+    while i < tot && k < (*a).n {
+        var e: usize = i
+        while e < tot && rt.ld8(all, e) != 10 as u8 { e = e + 1 }
+        var q: i32 = 0
+        while q < (*a).cnt[k] {
+            if !first { rt.buf_push(out, 44 as u8) }
+            first = false
+            push_json_str(out, mc_lazysnd.LAZY_NAME.p as u64, mc_lazysnd.LAZY_NAME.length())
+            if r >= 0 { mc_lazysnd.lazy_add_slot(lz, r, all + i as u64, e - i) }
+            q = q + 1
+        }
+        k = k + 1
+        i = e + 1
     }
 }
 
@@ -265,12 +308,6 @@ fn acc_has_factors(a: *mut Acc, pitch: bool) -> bool {
     return false
 }
 
-fn file_hash(p: u64, n: usize) -> u64 {
-    let h: u64 = hash.fnv1a64(p, n)
-    if h == 0 as u64 { return 1 as u64 }
-    return h
-}
-
 // Makes `path` usable: decoded now, reused from an earlier apply (same hash) or moved into its old slot (changed). false = unusable.
 fn resolve_file(c: *mut Ctx, path: *mut rt.Buf) -> bool {
     let pp: u64 = rt.buf_ptr(path)
@@ -280,14 +317,25 @@ fn resolve_file(c: *mut Ctx, path: *mut rt.Buf) -> bool {
         (*c).st.skipped_files = (*c).st.skipped_files + 1
         return false
     }
+    if (*c).lazy_now {
+        if !stack_has((*c).s, pp, pn) {
+            (*c).st.skipped_files = (*c).st.skipped_files + 1
+            return false
+        }
+        rt.buf_push_bytes(&(*c).files, pp, pn)
+        rt.buf_push(&(*c).files, 10 as u8)
+        (*c).st.files = (*c).st.files + 1
+        (*c).st.lazy_files = (*c).st.lazy_files + 1
+        return true
+    }
     var og: rt.Buf = rt.buf_new()
-    if !find_ogg((*c).s, path, &og) {
+    if !mc_lazysnd.lazy_find_ogg((*c).s, pp, pn, &og) {
         rt.buf_free(&og)
         (*c).st.skipped_files = (*c).st.skipped_files + 1
         return false
     }
     let nm: str = str { p: rt.buf_data(path), n: pn }
-    let h: u64 = file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
+    let h: u64 = mc_lazysnd.lazy_file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
     var ok: bool = false
     let cached: i32 = bank.bank_cached_id((*c).b, nm, h)
     if cached >= 0 {
@@ -383,8 +431,14 @@ fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
 // Reads the sounds.json of every pack, decodes the OGG files into `e` (or reuses them), registers them in `b` (bank_provide_hashed, key =
 // zip path) and writes an Aulos bank text with one event per pack event into `text`. Returns the statistics.
 fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mut bank.Bank, text: *mut rt.Buf) -> PackSnd {
+    return packsnd_build_text_lazy(s, e, b, text, 0 as *mut mc_lazysnd.Lazy)
+}
+
+fn packsnd_build_text_lazy(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mut bank.Bank, text: *mut rt.Buf, lz: *mut mc_lazysnd.Lazy) -> PackSnd {
+    var use_lazy: bool = false
+    if (lz as u64) != 0 { use_lazy = mc_lazysnd.lazy_on(lz) }
     var c: Ctx = Ctx { s: s, e: e, b: b, st: ps_new(), files: rt.buf_new(),
-        room_samples: (engine.MAX_SAMPLES as i32) - (engine.engine_sample_count(e) as i32) }
+        room_samples: (engine.MAX_SAMPLES as i32) - (engine.engine_sample_count(e) as i32), lz: lz, lazy_now: false }
     var seen: rt.Buf = rt.buf_new()
     let room_events: i32 = (engine.MAX_EVENTS as i32) - (engine.engine_event_count(e) as i32)
     var new_events: i32 = 0
@@ -404,88 +458,114 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
         pi = pi + 1
     }
     let np: usize = pi
+    if use_lazy {
+        var total: usize = 0
+        var q0: usize = 0
+        while q0 < np {
+            if oks[q0] { total = total + json.json_count(&docs[q0], json.json_root(&docs[q0])) }
+            q0 = q0 + 1
+        }
+        if total < (*lz).min_events { use_lazy = false }
+    }
+    if use_lazy {
+        mc_lazysnd.lazy_begin_apply(lz, s, e, b)
+        if mc_lazysnd.lazy_placeholder(lz) < 0 { use_lazy = false }
+        c.room_samples = c.room_samples - 1
+    }
     push_s(text, "{\"events\":[")
     var first: bool = true
-    pi = 0
-    while pi < np {
-        if !oks[pi] { pi = pi + 1; continue }
-        let root: u32 = json.json_root(&docs[pi])
-        var ev: u32 = json.json_child(&docs[pi], root)
-        while ev != json.JSON_NONE {
-            let key: str.Span = json.json_key(&docs[pi], ev)
-            ev = json.json_next(&docs[pi], ev)
-            let kp: u64 = key.p as u64
-            let kn: usize = key.n
-            if kn == 0 || kn > 120 { c.st.skipped_events = c.st.skipped_events + 1; continue }
-            if seen_has(&seen, kp, kn) { continue } // already merged from a higher pack
-            rt.buf_push_bytes(&seen, kp, kn)
-            rt.buf_push(&seen, 10 as u8)
-            if (c.st.events as usize) >= PS_MAX_EVENTS { c.st.skipped_events = c.st.skipped_events + 1; continue }
-            var is_new: bool = true
-            if kn < 200 {
-                var nm: rt.Buf = rt.buf_new()
-                rt.buf_push_bytes(&nm, kp, kn)
-                rt.buf_push(&nm, 0 as u8)
-                is_new = engine.engine_find_event(e, str { p: rt.buf_data(&nm), n: kn }) < 0
-                rt.buf_free(&nm)
-            }
-            if is_new && new_events >= room_events { c.st.skipped_events = c.st.skipped_events + 1; continue } // engine event table full
-            var a: Acc = acc_new()
-            var pj: usize = pi
-            var any_list: bool = false
-            while pj < np {
-                if oks[pj] {
-                    let r2: u32 = json.json_root(&docs[pj])
-                    let obj: u32 = json.json_get(&docs[pj], r2, kp, kn)
-                    if obj != json.JSON_NONE && json.json_kind(&docs[pj], obj) == json.JSON_OBJECT {
-                        let arr: u32 = json.json_get(&docs[pj], obj, "sounds".p as u64, 6)
-                        if arr != json.JSON_NONE && json.json_kind(&docs[pj], arr) == json.JSON_ARRAY {
-                            any_list = true
-                            add_entries(&c, &docs[pj], arr, &a)
-                        }
-                        let rp: u32 = json.json_get(&docs[pj], obj, "replace".p as u64, 7)
-                        if rp != json.JSON_NONE && json.json_bool(&docs[pj], rp) { break } // cuts off the packs below
-                    }
+    var phase: i32 = 0
+    while phase < 3 {
+        if phase >= 1 && !use_lazy { break }
+        pi = 0
+        while pi < np {
+            if !oks[pi] { pi = pi + 1; continue }
+            let root: u32 = json.json_root(&docs[pi])
+            var ev: u32 = json.json_child(&docs[pi], root)
+            while ev != json.JSON_NONE {
+                let key: str.Span = json.json_key(&docs[pi], ev)
+                ev = json.json_next(&docs[pi], ev)
+                let kp: u64 = key.p as u64
+                let kn: usize = key.n
+                if use_lazy && hot_rank(kp, kn) != phase { continue }
+                if kn == 0 || kn > 120 { c.st.skipped_events = c.st.skipped_events + 1; continue }
+                if seen_has(&seen, kp, kn) { continue } // already merged from a higher pack
+                rt.buf_push_bytes(&seen, kp, kn)
+                rt.buf_push(&seen, 10 as u8)
+                if (c.st.events as usize) >= PS_MAX_EVENTS { c.st.skipped_events = c.st.skipped_events + 1; continue }
+                var is_new: bool = true
+                if kn < 200 {
+                    var nm: rt.Buf = rt.buf_new()
+                    rt.buf_push_bytes(&nm, kp, kn)
+                    rt.buf_push(&nm, 0 as u8)
+                    is_new = engine.engine_find_event(e, str { p: rt.buf_data(&nm), n: kn }) < 0
+                    rt.buf_free(&nm)
                 }
-                pj = pj + 1
-            }
-            if !any_list || a.n == 0 {
-                c.st.skipped_events = c.st.skipped_events + 1
+                if is_new && new_events >= room_events { c.st.skipped_events = c.st.skipped_events + 1; continue } // engine event table full
+                var a: Acc = acc_new()
+                c.lazy_now = use_lazy && !(phase < 2 && mc_lazysnd.lazy_eager_ok(lz))
+                var pj: usize = pi
+                var any_list: bool = false
+                while pj < np {
+                    if oks[pj] {
+                        let r2: u32 = json.json_root(&docs[pj])
+                        let obj: u32 = json.json_get(&docs[pj], r2, kp, kn)
+                        if obj != json.JSON_NONE && json.json_kind(&docs[pj], obj) == json.JSON_OBJECT {
+                            let arr: u32 = json.json_get(&docs[pj], obj, "sounds".p as u64, 6)
+                            if arr != json.JSON_NONE && json.json_kind(&docs[pj], arr) == json.JSON_ARRAY {
+                                any_list = true
+                                add_entries(&c, &docs[pj], arr, &a)
+                            }
+                            let rp: u32 = json.json_get(&docs[pj], obj, "replace".p as u64, 7)
+                            if rp != json.JSON_NONE && json.json_bool(&docs[pj], rp) { break } // cuts off the packs below
+                        }
+                    }
+                    pj = pj + 1
+                }
+                if !any_list || a.n == 0 {
+                    c.st.skipped_events = c.st.skipped_events + 1
+                    rt.buf_free(&a.paths)
+                    continue
+                }
+                if !first { rt.buf_push(text, 44 as u8) }
+                first = false
+                push_s(text, "{\"name\":")
+                push_json_str(text, kp, kn)
+                push_s(text, ",\"bus\":")
+                if starts(kp, kn, "ui.") {
+                    push_s(text, "\"ui\"")
+                } else if starts(kp, kn, "music.") || starts(kp, kn, "music_disc.") {
+                    push_s(text, "\"music\"")
+                } else {
+                    push_s(text, "\"sfx\"")
+                }
+                push_s(text, ",\"samples\":[")
+                acc_slots(&a)
+                if c.lazy_now {
+                    acc_lazy(&a, lz, kp, kn, text)
+                    c.st.lazy_events = c.st.lazy_events + 1
+                } else {
+                    acc_list(&a, text)
+                }
+                push_s(text, "]")
+                if acc_has_factors(&a, false) {
+                    push_s(text, ",\"sample_volume\":[")
+                    acc_list_factors(&a, false, text)
+                    push_s(text, "]")
+                }
+                if acc_has_factors(&a, true) {
+                    push_s(text, ",\"sample_pitch\":[")
+                    acc_list_factors(&a, true, text)
+                    push_s(text, "]")
+                }
+                push_s(text, "}")
+                if is_new { new_events = new_events + 1 }
+                c.st.events = c.st.events + 1
                 rt.buf_free(&a.paths)
-                continue
             }
-            if !first { rt.buf_push(text, 44 as u8) }
-            first = false
-            push_s(text, "{\"name\":")
-            push_json_str(text, kp, kn)
-            push_s(text, ",\"bus\":")
-            if starts(kp, kn, "ui.") {
-                push_s(text, "\"ui\"")
-            } else if starts(kp, kn, "music.") || starts(kp, kn, "music_disc.") {
-                push_s(text, "\"music\"")
-            } else {
-                push_s(text, "\"sfx\"")
-            }
-            push_s(text, ",\"samples\":[")
-            acc_slots(&a)
-            acc_list(&a, text)
-            push_s(text, "]")
-            if acc_has_factors(&a, false) {
-                push_s(text, ",\"sample_volume\":[")
-                acc_list_factors(&a, false, text)
-                push_s(text, "]")
-            }
-            if acc_has_factors(&a, true) {
-                push_s(text, ",\"sample_pitch\":[")
-                acc_list_factors(&a, true, text)
-                push_s(text, "]")
-            }
-            push_s(text, "}")
-            if is_new { new_events = new_events + 1 }
-            c.st.events = c.st.events + 1
-            rt.buf_free(&a.paths)
+            pi = pi + 1
         }
-        pi = pi + 1
+        phase = phase + 1
     }
     push_s(text, "]}")
     var q: usize = 0
@@ -502,13 +582,20 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
 // sounds= mode of the pack manager: SOUNDS_SYNTH (0) does nothing; ORIGINAL (1) and BOTH (2) load the pack events (the caller decides
 // whether a synth bank was loaded before). Returns the number of events created, -1 on a bank error (mc_audio keeps what it had).
 fn packsnd_apply(m: *mut mc_audio.McAudio, b: *mut bank.Bank, e: *mut engine.Engine, s: *mut mc_assets.PackStack, mode: i32) -> i32 {
+    let lz: *mut mc_lazysnd.Lazy = &(*m).lazy
+    if (lz as u64) != 0 { mc_lazysnd.lazy_reset(lz) }
     if mode == mc_packs.SOUNDS_SYNTH { return 0 }
     var text: rt.Buf = rt.buf_new()
-    let st: PackSnd = packsnd_build_text(s, e, b, &text)
+    let st: PackSnd = packsnd_build_text_lazy(s, e, b, &text, lz)
     var rc: i32 = 0 - 1
     if st.events > 0 {
         let r: i32 = mc_audio.mca_bank_load_text(m, b, rt.buf_ptr(&text), rt.buf_len(&text), "")
-        if r == bank.BANK_OK { rc = st.events }
+        if r == bank.BANK_OK {
+            rc = st.events
+            if st.lazy_events > 0 { mc_lazysnd.lazy_commit(lz) }
+        } else if (lz as u64) != 0 {
+            mc_lazysnd.lazy_reset(lz)
+        }
     } else {
         rc = 0
     }
