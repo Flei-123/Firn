@@ -371,6 +371,7 @@ for i in $(seq 1 40); do grep -q 'contui cell hot1 ' "$W/an.out" 2>/dev/null && 
 if grep -q 'contui cell hot1 ' "$W/an.out"; then
     sleep 1
     cclick an hot0; cclick an ws=0
+    sleep 1; xdotool key ctrl+a; sleep 0.5
     xdotool type --delay 250 "Bo e1"; sleep 2.5
     xdotool key Escape; sleep 1.5
 else
@@ -379,6 +380,7 @@ fi
 wait $PP
 ANS=$(grep 'mcplay: contui state' "$W/an.out" | head -1); ANE=$(grep 'mcplay: contui end' "$W/an.out" | head -1)
 echo "  $ANS"; echo "  $ANE"
+grep -q 'mcplay: anvil prefill n=12' "$W/an.out" || { echo "  FAIL  anvil ui: name field not prefilled with the item name"; ERR=1; }
 case "$ANS" in *"kind=5"*) ;; *) echo "  FAIL  anvil ui: no anvil state: $ANS"; ERR=1;; esac
 python3 - "$ANS" <<'PY' || { echo "  FAIL  anvil ui: local state $ANS"; ERR=1; }
 import re,sys
