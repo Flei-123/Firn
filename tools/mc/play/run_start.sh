@@ -5,6 +5,7 @@
 # C: empty config, form typed by xdotool (host, Tab, port, Tab, name, Return) -> the player joins and the config file is written.
 # F: ctrl+a replaces the port, Save writes the config without joining, a second instance exits 0 (MCPLAY_SINGLE=1).
 # D: Escape in the form -> exit 0, no connection.
+# The classic form is selected with MCPLAY_MENU=0 (the vanilla title menu is the default and has its own gates: run_menu.sh, run_startmouse.sh).
 # Env: FIRNC, START_KEEP_DIR (copy of outs + server.log). Start it via heavy (java server). Prints `RESULT mc-play-start: ok`.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -47,6 +48,7 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 export FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_LOG=-
+export MCPLAY_MENU=0
 wait_log() { local i; for i in $(seq 1 "$2"); do grep -qE "$1" "$W/server.log" && return 0; sleep 1; done; return 1; }
 ERR=0
 cfg() { printf 'host=127.0.0.1\nport=%s\nname=%s\nprotocol=763\nview=3\n' "$PORT" "$1"; }
