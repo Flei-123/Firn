@@ -883,6 +883,22 @@ NEG = [
     ('nogc_08', 'fn slow(a: i32) -> i32 {\n    return a\n}\n#[no_gc]\nfn b2(a: i32) -> i32 {\n    return slow(a)\n}\n#[no_gc]\nfn b1(a: i32) -> i32 {\n    return slow(a)\n}\nfn main() -> i32 {\n    return b1(0 as i32) + b2(0 as i32)\n}\n'),
     ('nogc_09', 'gc class C {\n    x: i32,\n    next: Gc[C],\n}\n#[no_gc]\nfn hot(a: Gc[C], b: Gc[C]) {\n    a.next = b\n    a.next = b\n}\nfn main() -> i32 {\n    return 0\n}\n'),
     ('nogc_10', 'fn slow(a: i32) -> i32 {\n    return a\n}\n#[no_gc]\nfn hot(a: i32) -> i32 {\n    var s: i32 = 0\n    var i: i32 = 0\n    while i < a {\n        s = s + slow(i)\n        i = i + 1 as i32\n    }\n    return s\n}\nfn main() -> i32 {\n    return hot(3 as i32)\n}\n'),
+    ('darg_unknown', 'fn f(a: i32, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return f(a: 1, c: 2)\n}\n'),
+    ('darg_twice', 'fn f(a: i32, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return f(a: 1, a: 2)\n}\n'),
+    ('darg_order', 'fn f(a: i32, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return f(a: 1, 2)\n}\n'),
+    ('darg_missing', 'fn f(a: i32, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return f(b: 1)\n}\n'),
+    ('darg_notconst', 'fn g() -> i32 {\n    return 1\n}\nfn f(a: i32, b: i32 = g()) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return f(1)\n}\n'),
+    ('darg_nofn', 'fn main() -> i32 {\n    return nope(a: 1)\n}\n'),
+    ('darg_extern', 'extern fn abs(a: i32 = 1) -> i32\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('darg_reqafter', 'fn f(a: i32 = 1, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('meth_noself', 'struct S {\n    x: i32,\n}\nimpl S {\n    fn m(a: i32) -> i32 {\n        return a\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('meth_gccopy', 'gc class K {\n    x: i32,\n}\nimpl K {\n    fn m(self) -> i32 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('nogc_closure', 'gc class Dummy {\n    v: i64,\n}\n#[no_gc]\nfn quick(n: i32) -> AllocError!i32 {\n    let f: fn(i32) -> i32 = try gc fn(a: i32) -> i32 { return a + n }\n    return f(1)\n}\nfn main() -> i32 {\n    return quick(2) catch 91\n}\n'),
+    ('fs_noimport', 'fn main() -> i32 {\n    let t: str = f"v={1}"\n    return 0\n}\n'),
+    ('fs_expr', 'import std.io\nfn main() -> i32 {\n    let t: str = f"v={1 +}"\n    return 0\n}\n'),
+    ('fs_spec_dot', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:>8.}"))\n    return 0\n}\n'),
+    ('fs_spec_type', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:q}"))\n    return 0\n}\n'),
+    ('fs_brace', 'import std.io\nfn main() -> i32 {\n    io.fmt_print(f"}")\n    return 0\n}\n'),
 ]
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)
