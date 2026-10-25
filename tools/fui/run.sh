@@ -1035,6 +1035,10 @@ rc=0
 FIRNC="$FIRNC" sh tools/fui/atspi.sh >"$W/atspi.log" 2>&1 || rc=$?
 tail -n 4 "$W/atspi.log"
 if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "atspi FAILED ($rc)"; exit 1; fi
+rc=0
+FIRNC="$FIRNC" sh tools/fui/atspiset.sh >"$W/atspiset.log" 2>&1 || rc=$?
+tail -n 3 "$W/atspiset.log"
+if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "atspiset FAILED ($rc)"; exit 1; fi
 # W23-c: the UIA COM glue (Windows-only program), cross-built and run under Wine; skipped without Wine
 if [ -x /usr/lib/wine/wine64 ]; then
     rc=0

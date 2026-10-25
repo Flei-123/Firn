@@ -44,12 +44,13 @@ import fui.a11y
 import fui.app
 import plat.fuiwirt
 import fui.control
+import fui.widget
 import std.env
 import std.hash
 
 export {
     Bridge, bridge_new, bridge_free, bridge_open, bridge_open_address, bridge_is_open,
-    bridge_fd, bridge_serve, bridge_set_actions, bridge_calls, bridge_node_total,
+    bridge_fd, bridge_serve, bridge_set_actions, bridge_set_setters, bridge_calls, bridge_node_total,
     bridge_role_number, bridge_state_bits, attach, enable_from_env, act_click,
     ATSPI_ROOT_PATH, bridge_poll, bridge_set_app, bridge_events, pump_fd, pump_ms, pump_step,
 }
@@ -109,6 +110,8 @@ struct Bridge {
     focus: fn(u64, usize) -> bool,
     // For Text/EditableText and the text events: the *mut app.App (0 = none).
     app: u64,
+    setnum: fn(u64, usize, i64) -> bool,
+    settext: fn(u64, usize, str) -> bool,
     // Events: the per-node record (heap, SCENE_MAX * 8 words), the signals sent, the text of the
     // focused field at the last poll.
     snap: u64,
@@ -121,12 +124,14 @@ struct Bridge {
 
 fn act_none(ud: u64, node: usize, row: usize) -> bool { return false }
 fn focus_none(ud: u64, node: usize) -> bool { return false }
+fn setnum_none(ud: u64, node: usize, v: i64) -> bool { return false }
+fn settext_none(ud: u64, node: usize, t: str) -> bool { return false }
 
 // `title` stays owned by the caller (like every text in fUi).
 fn bridge_new(sc: *mut scene.Scene, ax: *mut a11y.A11y, title: str) -> Bridge {
     return Bridge { bus: dbus.bus_new(), sc: sc, ax: ax, title: title, open: false,
         desk_name: [0; 64], desk_n: 0, calls: 0, ud: 0, act: act_none, focus: focus_none,
-        app: 0, snap: 0, snap_n: 0, primed: false, events: 0, prev_node: NONE, prev_text: rt.buf_new() }
+        app: 0, setnum: setnum_none, settext: settext_none, snap: 0, snap_n: 0, primed: false, events: 0, prev_node: NONE, prev_text: rt.buf_new() }
 }
 
 fn bridge_free(br: *mut Bridge) {
@@ -148,6 +153,11 @@ fn bridge_set_actions(br: *mut Bridge, ud: u64, act: fn(u64, usize, usize) -> bo
     (*br).ud = ud
     (*br).act = act
     (*br).focus = focus
+}
+
+fn bridge_set_setters(br: *mut Bridge, setnum: fn(u64, usize, i64) -> bool, settext: fn(u64, usize, str) -> bool) {
+    (*br).setnum = setnum
+    (*br).settext = settext
 }
 
 // ------------------------------------------------------------ connecting
@@ -1289,10 +1299,31 @@ fn handle_props(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
         }
         dbus.w_array_end(&body, at, 8)
         dbus.bus_reply(&(*br).bus, m, "a{sv}", &body)
+    } else if member == "Set" && iface == IF_VAL && has_value(br, r) {
+        let name: str = dbus.rd_str(&rd)
+        let sig: str = dbus.rd_sig(&rd)
+        if rd.ok && name == "CurrentValue" && sig == "d" {
+            let bits: u64 = dbus.rd_f64_bits(&rd)
+            if rd.ok && value_set(br, r, __f64_from_bits(bits)) {
+                dbus.bus_reply(&(*br).bus, m, "", &body)
+            } else {
+                dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.InvalidArgs", "value refused")
+            }
+        } else {
+            dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.PropertyReadOnly", "read only")
+        }
     } else {
         dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.PropertyReadOnly", "read only")
     }
     rt.buf_free(&body)
+}
+
+fn value_set(br: *mut Bridge, r: Ref, v: f64) -> bool {
+    if (a11y.a11y_state((*br).sc, (*br).ax, r.node) & a11y.ST_DISABLED) != 0 as u32 { return false }
+    var q: f64 = v
+    if q < 0.0 { q = 0.0 }
+    if q > a11y.a11y_max() as f64 { q = a11y.a11y_max() as f64 }
+    return ((*br).setnum)((*br).ud, r.node, q as i64)
 }
 
 fn unknown_method(br: *mut Bridge, m: *mut dbus.Msg) {
@@ -1618,8 +1649,11 @@ fn is_ws(b: u8) -> bool { return b == 32 as u8 || b == 9 as u8 || b == 10 as u8 
 
 // A text field node of a program (needs bridge_set_app): the Text interfaces apply.
 fn is_text(br: *mut Bridge, r: Ref) -> bool {
-    if (*br).app == 0 || r.kind != K_NODE || !node_ok(br, r.node) {
+    if r.kind != K_NODE || !node_ok(br, r.node) {
         return false
+    }
+    if (*br).app == 0 {
+        return a11y.a11y_role((*br).sc, (*br).ax, r.node) == a11y.ROLE_TEXTBOX
     }
     var c: usize = 0
     var an: usize = 0
@@ -1627,6 +1661,10 @@ fn is_text(br: *mut Bridge, r: Ref) -> bool {
 }
 
 fn node_text(br: *mut Bridge, r: Ref) -> str {
+    if (*br).app == 0 {
+        let e: *mut widget.Widget = scene.node_widget((*br).sc, r.node)
+        return str { p: widget.w_text(e) as *mut u8, n: widget.w_text_len(e) }
+    }
     return app.text((*br).app as *mut app.App, r.node)
 }
 
@@ -1638,6 +1676,7 @@ fn text_caret_cp(br: *mut Bridge, r: Ref, caret: *mut usize, anchor: *mut usize)
     var an: usize = 0
     *caret = 0
     *anchor = 0
+    if (*br).app == 0 { return }
     if app.text_caret((*br).app as *mut app.App, r.node, &c, &an) {
         let s: str = node_text(br, r)
         *caret = byte_cp(s, c)
@@ -1646,6 +1685,7 @@ fn text_caret_cp(br: *mut Bridge, r: Ref, caret: *mut usize, anchor: *mut usize)
 }
 
 fn put_caret_cp(br: *mut Bridge, r: Ref, anchor_cp: usize, caret_cp: usize) -> bool {
+    if (*br).app == 0 { return false }
     let s: str = node_text(br, r)
     return app.set_text_caret((*br).app as *mut app.App, r.node, cp_byte(s, anchor_cp), cp_byte(s, caret_cp))
 }
@@ -1808,20 +1848,25 @@ fn handle_text(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
 }
 
 #[allow_escape]
+fn put_text(br: *mut Bridge, r: Ref, t: str) -> bool {
+    if (*br).app == 0 { return ((*br).settext)((*br).ud, r.node, t) }
+    app.set_text((*br).app as *mut app.App, r.node, t)
+    return true
+}
+
+#[allow_escape]
 fn handle_etext(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
     let member: str = (*m).f.member
     var body: rt.Buf = rt.buf_new()
     var rd: dbus.Rd = dbus.msg_body(m)
     let s: str = node_text(br, r)
     let ro: bool = (a11y.a11y_state((*br).sc, (*br).ax, r.node) & a11y.ST_READONLY) != 0 as u32
-    let a: *mut app.App = (*br).app as *mut app.App
     var ok: bool = false
     var known: bool = true
     if member == "SetTextContents" {
         let t: str = dbus.rd_str(&rd)
         if !ro && rd.ok {
-            app.set_text(a, r.node, t)
-            ok = true
+            ok = put_text(br, r, t)
         }
     } else if member == "InsertText" {
         let pos: i32 = dbus.rd_i32(&rd)
@@ -1838,9 +1883,8 @@ fn handle_etext(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
             }
             rt.buf_push_bytes(&nb, (t.p) as u64, tn)
             rt.buf_push_bytes(&nb, ((s.p) as u64) + (at as u64), s.n - at)
-            app.set_text(a, r.node, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
+            ok = put_text(br, r, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
             rt.buf_free(&nb)
-            ok = true
         }
     } else if member == "DeleteText" {
         let a0: i32 = dbus.rd_i32(&rd)
@@ -1854,9 +1898,8 @@ fn handle_etext(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
                 var nb: rt.Buf = rt.buf_new()
                 rt.buf_push_bytes(&nb, (s.p) as u64, b0)
                 rt.buf_push_bytes(&nb, ((s.p) as u64) + (b1 as u64), s.n - b1)
-                app.set_text(a, r.node, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
+                ok = put_text(br, r, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
                 rt.buf_free(&nb)
-                ok = true
             }
         }
     } else {
