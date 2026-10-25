@@ -1425,6 +1425,18 @@ brackets a line break has never ended anything and still does not. Proof:
 * Conversions exclusively with `as`, lossless ones included.
 * **Struct layout (`P7`):** declaration order with natural alignment, **no**
   reordering. `#[packed]`, `#[align(n)]`.
+  `#[packed]` (in front of `struct`, no arguments) gives every field alignment 1:
+  no padding between fields, the struct has alignment 1 and size = sum of the
+  fields. `#[align(n)]` (`n` a power of two, 1 to 4096) raises the alignment of
+  the struct to at least `n` and rounds its size up to a multiple of `n`; both
+  attributes may be combined. Fields of a packed struct are read and written
+  with plain unaligned accesses (x86-64 and AArch64 allow them), so `&p.f` is an
+  ordinary pointer that may be misaligned for its type. A struct with
+  misaligned fields is passed in memory, as System V prescribes. Stack
+  variables of a type aligned above 16 get a manually aligned slot; heap and
+  GC allocation stay 16-aligned. Both compilers implement this; an invalid
+  `n` is an error. Tests: `tests/5020_layout_packed.fi`,
+  `tests/5021_layout_align.fi`, `tests/diff/layout_attr_*`.
 * **The calling convention:** System V AMD64 (`rdi, rsi, rdx, rcx, r8, r9`, the
   return value in `rax`, 16 byte alignment, `rbx, rbp, r12-r15` preserved).
   `extern "C"` is the same. **On `--target=x86_64-windows` this stays the
