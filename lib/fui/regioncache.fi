@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import paint.canvas
+
+export { begin, end, clear, hits, misses }
+
+const SLOTS: usize = 8
+const NONE: usize = 8
+const MAX_BYTES: usize = 16777216
+const NUM: usize = 8
+
+static mut K_KIND: [u64; 8] = [0; 8]
+static mut K_AUX: [u64; 8] = [0; 8]
+static mut K_MODE: [u64; 8] = [0; 8]
+static mut K_NUM: [f64; 64] = [0.0; 64]
+static mut R_X0: [usize; 8] = [0; 8]
+static mut R_Y0: [usize; 8] = [0; 8]
+static mut R_X1: [usize; 8] = [0; 8]
+static mut R_Y1: [usize; 8] = [0; 8]
+static mut C_W: [usize; 8] = [0; 8]
+static mut C_H: [usize; 8] = [0; 8]
+static mut B_BEFORE: [u64; 8] = [0; 8]
+static mut B_AFTER: [u64; 8] = [0; 8]
+static mut B_CAP: [usize; 8] = [0; 8]
+static mut B_USED: [u64; 8] = [0; 8]
+static mut B_FULL: [bool; 8] = [false; 8]
+static mut TICK: u64 = 0
+static mut PENDING: usize = 8
+static mut HITS: u64 = 0
+static mut MISSES: u64 = 0
+
+fn hits() -> u64 { return HITS }
+fn misses() -> u64 { return MISSES }
+
+fn clear() {
+    var i: usize = 0
+    while i < SLOTS {
+        B_FULL[i] = false
+        i = i + 1
+    }
+    PENDING = NONE
+}
+
+fn floor_pos(v: f64) -> usize {
+    if v <= 0.0 { return 0 }
+    return v as usize
+}
+
+fn ceil_pos(v: f64) -> usize {
+    if v <= 0.0 { return 0 }
+    let t: usize = v as usize
+    if (t as f64) < v { return t + 1 }
+    return t
+}
+
+fn same_key(i: usize, kind: u64, aux: u64, mode: u64, nums: *mut [f64; 8]) -> bool {
+    if !B_FULL[i] || K_KIND[i] != kind || K_AUX[i] != aux || K_MODE[i] != mode { return false }
+    var j: usize = 0
+    while j < NUM {
+        if K_NUM[i * NUM + j] != (*nums)[j] { return false }
+        j = j + 1
+    }
+    return true
+}
+
+fn words_equal(a: u64, b: u64, n: usize) -> bool {
+    var x: u64 = a
+    var y: u64 = b
+    var left: usize = n
+    while left >= 32 {
+        let d: u64 = (*(x as *mut u64) ^ *(y as *mut u64)) | (*((x + 8) as *mut u64) ^ *((y + 8) as *mut u64)) |
+            (*((x + 16) as *mut u64) ^ *((y + 16) as *mut u64)) | (*((x + 24) as *mut u64) ^ *((y + 24) as *mut u64))
+        if d != 0 { return false }
+        x = x + 32
+        y = y + 32
+        left = left - 32
+    }
+    return rt.mem_eq(x, y, left)
+}
+
+fn rows_equal(cv: *mut canvas.Canvas, i: usize, stored: u64) -> bool {
+    let stride: usize = canvas.canvas_width(cv) * 4
+    let rb: usize = (R_X1[i] - R_X0[i]) * 4
+    var y: usize = R_Y0[i]
+    var q: u64 = stored
+    while y < R_Y1[i] {
+        let p: u64 = (canvas.canvas_pixels(cv) as u64) + (y * stride + R_X0[i] * 4) as u64
+        if !words_equal(p, q, rb) { return false }
+        q = q + rb as u64
+        y = y + 1
+    }
+    return true
+}
+
+fn copy_rows(cv: *mut canvas.Canvas, i: usize, buf: u64, to_canvas: bool) {
+    let stride: usize = canvas.canvas_width(cv) * 4
+    let rb: usize = (R_X1[i] - R_X0[i]) * 4
+    var y: usize = R_Y0[i]
+    var q: u64 = buf
+    while y < R_Y1[i] {
+        let p: u64 = (canvas.canvas_pixels(cv) as u64) + (y * stride + R_X0[i] * 4) as u64
+        if to_canvas { rt.mem_copy(p, q, rb) } else { rt.mem_copy(q, p, rb) }
+        q = q + rb as u64
+        y = y + 1
+    }
+}
+
+fn ensure(i: usize, n: usize) {
+    if B_CAP[i] >= n && B_BEFORE[i] != 0 { return }
+    if B_BEFORE[i] != 0 {
+        rt.heap_free(B_BEFORE[i], B_CAP[i])
+        rt.heap_free(B_AFTER[i], B_CAP[i])
+    }
+    B_BEFORE[i] = rt.heap_alloc(n)
+    B_AFTER[i] = rt.heap_alloc(n)
+    B_CAP[i] = n
+}
+
+fn pick_slot(kind: u64, aux: u64, mode: u64, nums: *mut [f64; 8], x0: usize, y0: usize, x1: usize, y1: usize, cw: usize, ch: usize) -> usize {
+    var i: usize = 0
+    while i < SLOTS {
+        if same_key(i, kind, aux, mode, nums) && R_X0[i] == x0 && R_Y0[i] == y0 && R_X1[i] == x1 && R_Y1[i] == y1 && C_W[i] == cw && C_H[i] == ch {
+            return i
+        }
+        i = i + 1
+    }
+    var pick: usize = 0
+    var best: u64 = 18446744073709551615
+    i = 0
+    while i < SLOTS {
+        if !B_FULL[i] { return i }
+        if B_USED[i] < best {
+            best = B_USED[i]
+            pick = i
+        }
+        i = i + 1
+    }
+    return pick
+}
+
+fn begin(cv: *mut canvas.Canvas, kind: u64, aux: u64, nums: *mut [f64; 8], bx0: f64, by0: f64, bx1: f64, by1: f64) -> bool {
+    PENDING = NONE
+    if canvas.canvas_gpu(cv) != 0 || canvas.clip_depth(cv) != 0 || canvas.canvas_pixels(cv) as u64 == 0 { return false }
+    let cw: usize = canvas.canvas_width(cv)
+    let ch: usize = canvas.canvas_height(cv)
+    var x0: usize = floor_pos(bx0)
+    var y0: usize = floor_pos(by0)
+    var x1: usize = ceil_pos(bx1)
+    var y1: usize = ceil_pos(by1)
+    if x1 > cw { x1 = cw }
+    if y1 > ch { y1 = ch }
+    if x1 <= x0 || y1 <= y0 { return false }
+    let n: usize = (x1 - x0) * (y1 - y0) * 4
+    if n > MAX_BYTES { return false }
+    let mode: u64 = canvas.canvas_blend_mode(cv) as u64
+    let i: usize = pick_slot(kind, aux, mode, nums, x0, y0, x1, y1, cw, ch)
+    TICK = TICK + 1
+    B_USED[i] = TICK
+    if same_key(i, kind, aux, mode, nums) && R_X0[i] == x0 && R_Y0[i] == y0 && R_X1[i] == x1 && R_Y1[i] == y1 && C_W[i] == cw && C_H[i] == ch {
+        if rows_equal(cv, i, B_BEFORE[i]) {
+            copy_rows(cv, i, B_AFTER[i], true)
+            HITS = HITS + 1
+            return true
+        }
+    }
+    MISSES = MISSES + 1
+    B_FULL[i] = false
+    ensure(i, n)
+    K_KIND[i] = kind
+    K_AUX[i] = aux
+    K_MODE[i] = mode
+    var j: usize = 0
+    while j < NUM {
+        K_NUM[i * NUM + j] = (*nums)[j]
+        j = j + 1
+    }
+    R_X0[i] = x0
+    R_Y0[i] = y0
+    R_X1[i] = x1
+    R_Y1[i] = y1
+    C_W[i] = cw
+    C_H[i] = ch
+    copy_rows(cv, i, B_BEFORE[i], false)
+    PENDING = i
+    return false
+}
+
+fn end(cv: *mut canvas.Canvas) {
+    let i: usize = PENDING
+    if i >= SLOTS { return }
+    PENDING = NONE
+    copy_rows(cv, i, B_AFTER[i], false)
+    B_FULL[i] = true
+}

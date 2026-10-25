@@ -858,6 +858,8 @@ echo "  chat phone layout (360x800 contacts / conversation)  OK"
 echo "  chat messenger 1100x700 shot, light + dark   OK"
 build kitchat
 "$W/kitchat"
+build regioncache
+"$W/regioncache"
 build kitfx
 "$W/kitfx"
 build preset
