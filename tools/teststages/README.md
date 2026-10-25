@@ -13,3 +13,7 @@ Longest remaining pieces: section 16 (stage 10) and section 43 (stage 11).
 
 Known red on main (not regressions): sema_compare, fir_compare (tests/diff/layout_00.fi), ffi win_wgl_probe under Wine,
 aarch64 run.sh, tools/checked/run.sh (sub_i8 message), fixpoint, js run, english, fmt.
+
+Measured 25.10.2026 (12-stage layout, load 25-38, heavy queue waits included): stage 9: 1313 s (red: parser_compare, fixed; fmt/english are stage 12).
+Stages 6, 8, 10, 11, 12 ran 55+ min wall at this load (stage 8 section 3 shard 8: about 1180 s before section 34; stage 11 aarch64 974 of 999 identical).
+Stage 12 red: english (r59) and fmt (r48), both old.
