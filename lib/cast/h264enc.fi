@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.bits
+import cast.nal
+import cast.yuv
+
+export {
+    Enc,
+    enc_new, enc_free, enc_headers, enc_encode, enc_request_idr, enc_set_tolerance,
+    enc_set_idr_interval, enc_last_changed, enc_level_for,
+}
+
+const MB_I_PCM_IN_I: u32 = 25
+const MB_I_PCM_IN_P: u32 = 30
+const LOG2_FRAME_NUM: u32 = 8
+
+struct Enc {
+    w: usize,
+    h: usize,
+    mbw: usize,
+    mbh: usize,
+    fps: u32,
+    cur: yuv.Yuv,
+    prev: yuv.Yuv,
+    frame_num: u32,
+    idr_id: u32,
+    since_idr: u32,
+    idr_interval: u32,
+    want_idr: bool,
+    started: bool,
+    tol: u32,
+    changed: usize,
+}
+
+fn enc_level_for(mbw: usize, mbh: usize) -> u32 {
+    let mbs: usize = mbw * mbh
+    if mbs <= 1620 { return 30 as u32 }
+    if mbs <= 3600 { return 31 as u32 }
+    if mbs <= 8192 { return 40 as u32 }
+    return 51 as u32
+}
+
+fn enc_new(width: usize, height: usize, fps: u32) -> Enc {
+    let w: usize = (width + 1) & ~1
+    let h: usize = (height + 1) & ~1
+    return Enc {
+        w: w, h: h, mbw: yuv.pad16(w) / 16, mbh: yuv.pad16(h) / 16, fps: fps,
+        cur: yuv.yuv_new(w, h), prev: yuv.yuv_new(w, h),
+        frame_num: 0 as u32, idr_id: 0 as u32, since_idr: 0 as u32, idr_interval: 0 as u32,
+        want_idr: true, started: false, tol: 0 as u32, changed: 0,
+    }
+}
+
+fn enc_free(e: *mut Enc) {
+    yuv.yuv_free(&(*e).cur)
+    yuv.yuv_free(&(*e).prev)
+}
+
+fn enc_request_idr(e: *mut Enc) {
+    (*e).want_idr = true
+}
+
+fn enc_set_tolerance(e: *mut Enc, tol: u32) {
+    (*e).tol = tol
+}
+
+fn enc_set_idr_interval(e: *mut Enc, frames: u32) {
+    (*e).idr_interval = frames
+}
+
+fn enc_last_changed(e: *mut Enc) -> usize {
+    return (*e).changed
+}
+
+fn write_sps(e: *mut Enc, out: *mut rt.Buf) {
+    var b: bits.BitW = bits.bw_new()
+    bits.bw_bits(&b, 66 as u32, 8)
+    bits.bw_bits(&b, 64 as u32, 8)
+    bits.bw_bits(&b, enc_level_for((*e).mbw, (*e).mbh), 8)
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_ue(&b, LOG2_FRAME_NUM - 4 as u32)
+    bits.bw_ue(&b, 2 as u32)
+    bits.bw_ue(&b, 1 as u32)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_ue(&b, ((*e).mbw - 1) as u32)
+    bits.bw_ue(&b, ((*e).mbh - 1) as u32)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 1 as u32, 1)
+    let cr: usize = (yuv.pad16((*e).w) - (*e).w) / 2
+    let cb: usize = (yuv.pad16((*e).h) - (*e).h) / 2
+    if cr > 0 || cb > 0 {
+        bits.bw_bits(&b, 1 as u32, 1)
+        bits.bw_ue(&b, 0 as u32)
+        bits.bw_ue(&b, cr as u32)
+        bits.bw_ue(&b, 0 as u32)
+        bits.bw_ue(&b, cb as u32)
+    } else {
+        bits.bw_bits(&b, 0 as u32, 1)
+    }
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 5 as u32, 3)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 6 as u32, 8)
+    bits.bw_bits(&b, 6 as u32, 8)
+    bits.bw_bits(&b, 6 as u32, 8)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 1 as u32, 32)
+    bits.bw_bits(&b, (*e).fps * 2 as u32, 32)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_trailing(&b)
+    nal.nal_write(out, 3 as u32, nal.NAL_SPS, bits.bw_data(&b), bits.bw_len(&b))
+    bits.bw_free(&b)
+}
+
+fn write_pps(out: *mut rt.Buf) {
+    var b: bits.BitW = bits.bw_new()
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 2)
+    bits.bw_se(&b, 0)
+    bits.bw_se(&b, 0)
+    bits.bw_se(&b, 0)
+    bits.bw_bits(&b, 1 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_bits(&b, 0 as u32, 1)
+    bits.bw_trailing(&b)
+    nal.nal_write(out, 3 as u32, nal.NAL_PPS, bits.bw_data(&b), bits.bw_len(&b))
+    bits.bw_free(&b)
+}
+
+fn enc_headers(e: *mut Enc, out: *mut rt.Buf) {
+    write_sps(e, out)
+    write_pps(out)
+}
+
+fn write_aud(out: *mut rt.Buf) {
+    var one: rt.Buf = rt.buf_new()
+    rt.buf_push(&one, 240 as u8)
+    nal.nal_write(out, 0 as u32, 9 as u32, one.ptr, 1)
+    rt.buf_free(&one)
+}
+
+fn put_pcm(b: *mut bits.BitW, e: *mut Enc, mbx: usize, mby: usize) {
+    bits.bw_align_zero(b)
+    var r: usize = 0
+    while r < 16 {
+        bits.bw_bytes(b, (*e).cur.y.ptr + ((mby * 16 + r) * (*e).cur.w + mbx * 16) as u64, 16)
+        r = r + 1
+    }
+    r = 0
+    while r < 8 {
+        bits.bw_bytes(b, (*e).cur.u.ptr + ((mby * 8 + r) * (*e).cur.cw + mbx * 8) as u64, 8)
+        r = r + 1
+    }
+    r = 0
+    while r < 8 {
+        bits.bw_bytes(b, (*e).cur.v.ptr + ((mby * 8 + r) * (*e).cur.cw + mbx * 8) as u64, 8)
+        r = r + 1
+    }
+}
+
+fn write_slice(e: *mut Enc, idr: bool, mby: usize, out: *mut rt.Buf) {
+    var b: bits.BitW = bits.bw_new()
+    bits.bw_ue(&b, (mby * (*e).mbw) as u32)
+    if idr { bits.bw_ue(&b, 2 as u32) } else { bits.bw_ue(&b, 0 as u32) }
+    bits.bw_ue(&b, 0 as u32)
+    bits.bw_bits(&b, (*e).frame_num, LOG2_FRAME_NUM)
+    if idr { bits.bw_ue(&b, (*e).idr_id) }
+    if !idr {
+        bits.bw_bits(&b, 0 as u32, 1)
+        bits.bw_bits(&b, 0 as u32, 1)
+    }
+    if idr {
+        bits.bw_bits(&b, 0 as u32, 1)
+        bits.bw_bits(&b, 0 as u32, 1)
+    } else {
+        bits.bw_bits(&b, 0 as u32, 1)
+    }
+    bits.bw_se(&b, 0)
+    bits.bw_ue(&b, 1 as u32)
+    var skip: u32 = 0 as u32
+    var mbx: usize = 0
+    while mbx < (*e).mbw {
+        var coded: bool = idr
+        if !idr {
+            if !yuv.yuv_mb_same(&(*e).cur, &(*e).prev, mbx, mby, (*e).tol) { coded = true }
+        }
+        if coded {
+            if idr {
+                bits.bw_ue(&b, MB_I_PCM_IN_I)
+            } else {
+                bits.bw_ue(&b, skip)
+                skip = 0 as u32
+                bits.bw_ue(&b, MB_I_PCM_IN_P)
+            }
+            put_pcm(&b, e, mbx, mby)
+            yuv.yuv_copy_mb(&(*e).prev, &(*e).cur, mbx, mby)
+            (*e).changed = (*e).changed + 1
+        } else {
+            skip = skip + 1 as u32
+        }
+        mbx = mbx + 1
+    }
+    if skip > 0 as u32 { bits.bw_ue(&b, skip) }
+    bits.bw_trailing(&b)
+    var ref_idc: u32 = 2 as u32
+    var kind: u32 = nal.NAL_SLICE
+    if idr {
+        ref_idc = 3 as u32
+        kind = nal.NAL_IDR
+    }
+    nal.nal_write(out, ref_idc, kind, bits.bw_data(&b), bits.bw_len(&b))
+    bits.bw_free(&b)
+}
+
+fn enc_encode(e: *mut Enc, pix: u64, stride: usize, fmt: u32, out: *mut rt.Buf) -> bool {
+    yuv.yuv_from_rgb(&(*e).cur, pix, stride, (*e).w, (*e).h, fmt)
+    var idr: bool = (*e).want_idr || !(*e).started
+    if (*e).idr_interval > 0 as u32 && (*e).since_idr >= (*e).idr_interval { idr = true }
+    rt.buf_clear(out)
+    write_aud(out)
+    if idr {
+        enc_headers(e, out)
+        (*e).frame_num = 0 as u32
+        (*e).since_idr = 0 as u32
+        (*e).idr_id = ((*e).idr_id + 1 as u32) & 65535 as u32
+    }
+    (*e).changed = 0
+    var mby: usize = 0
+    while mby < (*e).mbh {
+        write_slice(e, idr, mby, out)
+        mby = mby + 1
+    }
+    (*e).want_idr = false
+    (*e).started = true
+    (*e).since_idr = (*e).since_idr + 1 as u32
+    (*e).frame_num = ((*e).frame_num + 1 as u32) & ((1 as u32 << LOG2_FRAME_NUM) - 1 as u32)
+    return idr
+}

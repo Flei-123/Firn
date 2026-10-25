@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    Yuv,
+    PF_BGRA, PF_RGBA,
+    yuv_new, yuv_free, yuv_from_rgb, yuv_to_rgb, yuv_copy_mb, yuv_mb_same, yuv_copy, yuv_mb_equal_exact,
+    pad16,
+}
+
+const PF_BGRA: u32 = 0
+const PF_RGBA: u32 = 1
+
+struct Yuv {
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    y: rt.Buf,
+    u: rt.Buf,
+    v: rt.Buf,
+}
+
+fn pad16(n: usize) -> usize {
+    return (n + 15) & ~15
+}
+
+fn plane(b: *mut rt.Buf, n: usize, fill: u8) {
+    rt.buf_reserve(b, n)
+    rt.buf_set_len(b, n)
+    rt.mem_set((*b).ptr, fill, n)
+}
+
+fn yuv_new(w: usize, h: usize) -> Yuv {
+    let pw: usize = pad16(w)
+    let ph: usize = pad16(h)
+    var f: Yuv = Yuv { w: pw, h: ph, cw: pw / 2, ch: ph / 2, y: rt.buf_new(), u: rt.buf_new(), v: rt.buf_new() }
+    plane(&f.y, pw * ph, 16 as u8)
+    plane(&f.u, (pw / 2) * (ph / 2), 128 as u8)
+    plane(&f.v, (pw / 2) * (ph / 2), 128 as u8)
+    return f
+}
+
+fn yuv_free(f: *mut Yuv) {
+    rt.buf_free(&(*f).y)
+    rt.buf_free(&(*f).u)
+    rt.buf_free(&(*f).v)
+}
+
+fn clamp8(v: i32) -> u8 {
+    if v < 0 { return 0 as u8 }
+    if v > 255 { return 255 as u8 }
+    return v as u8
+}
+
+fn px(pix: u64, stride: usize, fmt: u32, w: usize, h: usize, x: usize, y: usize, rgb: *mut [i32; 3]) {
+    var xx: usize = x
+    var yy: usize = y
+    if xx >= w { xx = w - 1 }
+    if yy >= h { yy = h - 1 }
+    let o: usize = yy * stride + xx * 4
+    if fmt == PF_BGRA {
+        (*rgb)[0] = rt.ld8(pix, o + 2) as i32
+        (*rgb)[1] = rt.ld8(pix, o + 1) as i32
+        (*rgb)[2] = rt.ld8(pix, o) as i32
+    } else {
+        (*rgb)[0] = rt.ld8(pix, o) as i32
+        (*rgb)[1] = rt.ld8(pix, o + 1) as i32
+        (*rgb)[2] = rt.ld8(pix, o + 2) as i32
+    }
+}
+
+fn luma_of(r: i32, g: i32, b: i32) -> u8 {
+    return clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16)
+}
+
+fn yuv_from_rgb(f: *mut Yuv, pix: u64, stride: usize, w: usize, h: usize, fmt: u32) {
+    var rgb: [i32; 3] = [0, 0, 0]
+    var y: usize = 0
+    while y < (*f).h {
+        var x: usize = 0
+        while x < (*f).w {
+            px(pix, stride, fmt, w, h, x, y, &rgb)
+            rt.st8((*f).y.ptr, y * (*f).w + x, luma_of(rgb[0], rgb[1], rgb[2]))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var cy: usize = 0
+    while cy < (*f).ch {
+        var cx: usize = 0
+        while cx < (*f).cw {
+            var sr: i32 = 0
+            var sg: i32 = 0
+            var sb: i32 = 0
+            var k: usize = 0
+            while k < 4 {
+                px(pix, stride, fmt, w, h, cx * 2 + (k & 1), cy * 2 + (k >> 1), &rgb)
+                sr = sr + rgb[0]
+                sg = sg + rgb[1]
+                sb = sb + rgb[2]
+                k = k + 1
+            }
+            sr = (sr + 2) >> 2
+            sg = (sg + 2) >> 2
+            sb = (sb + 2) >> 2
+            rt.st8((*f).u.ptr, cy * (*f).cw + cx, clamp8(((-38 * sr - 74 * sg + 112 * sb + 128) >> 8) + 128))
+            rt.st8((*f).v.ptr, cy * (*f).cw + cx, clamp8(((112 * sr - 94 * sg - 18 * sb + 128) >> 8) + 128))
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+}
+
+fn yuv_to_rgb(f: *mut Yuv, out: u64, stride: usize, w: usize, h: usize, fmt: u32) {
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            let l: i32 = rt.ld8((*f).y.ptr, y * (*f).w + x) as i32 - 16
+            let cb: i32 = rt.ld8((*f).u.ptr, (y >> 1) * (*f).cw + (x >> 1)) as i32 - 128
+            let cr: i32 = rt.ld8((*f).v.ptr, (y >> 1) * (*f).cw + (x >> 1)) as i32 - 128
+            let r: u8 = clamp8((298 * l + 409 * cr + 128) >> 8)
+            let g: u8 = clamp8((298 * l - 100 * cb - 208 * cr + 128) >> 8)
+            let b: u8 = clamp8((298 * l + 516 * cb + 128) >> 8)
+            let o: usize = y * stride + x * 4
+            if fmt == PF_BGRA {
+                rt.st8(out, o, b)
+                rt.st8(out, o + 1, g)
+                rt.st8(out, o + 2, r)
+            } else {
+                rt.st8(out, o, r)
+                rt.st8(out, o + 1, g)
+                rt.st8(out, o + 2, b)
+            }
+            rt.st8(out, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn yuv_copy(dst: *mut Yuv, src: *mut Yuv) {
+    rt.mem_copy((*dst).y.ptr, (*src).y.ptr, (*src).w * (*src).h)
+    rt.mem_copy((*dst).u.ptr, (*src).u.ptr, (*src).cw * (*src).ch)
+    rt.mem_copy((*dst).v.ptr, (*src).v.ptr, (*src).cw * (*src).ch)
+}
+
+fn copy_block(dst: u64, src: u64, stride: usize, x0: usize, y0: usize, size: usize) {
+    var r: usize = 0
+    while r < size {
+        let o: usize = (y0 + r) * stride + x0
+        rt.mem_copy(dst + o as u64, src + o as u64, size)
+        r = r + 1
+    }
+}
+
+fn yuv_copy_mb(dst: *mut Yuv, src: *mut Yuv, mbx: usize, mby: usize) {
+    copy_block((*dst).y.ptr, (*src).y.ptr, (*src).w, mbx * 16, mby * 16, 16)
+    copy_block((*dst).u.ptr, (*src).u.ptr, (*src).cw, mbx * 8, mby * 8, 8)
+    copy_block((*dst).v.ptr, (*src).v.ptr, (*src).cw, mbx * 8, mby * 8, 8)
+}
+
+fn block_same(a: u64, b: u64, stride: usize, x0: usize, y0: usize, size: usize, tol: u32) -> bool {
+    var r: usize = 0
+    while r < size {
+        let o: usize = (y0 + r) * stride + x0
+        if tol == 0 as u32 {
+            if !rt.mem_eq(a + o as u64, b + o as u64, size) { return false }
+        } else {
+            var c: usize = 0
+            while c < size {
+                let d: i32 = rt.ld8(a, o + c) as i32 - rt.ld8(b, o + c) as i32
+                if d > tol as i32 || -d > tol as i32 { return false }
+                c = c + 1
+            }
+        }
+        r = r + 1
+    }
+    return true
+}
+
+fn yuv_mb_same(a: *mut Yuv, b: *mut Yuv, mbx: usize, mby: usize, tol: u32) -> bool {
+    if !block_same((*a).y.ptr, (*b).y.ptr, (*a).w, mbx * 16, mby * 16, 16, tol) { return false }
+    if !block_same((*a).u.ptr, (*b).u.ptr, (*a).cw, mbx * 8, mby * 8, 8, tol) { return false }
+    return block_same((*a).v.ptr, (*b).v.ptr, (*a).cw, mbx * 8, mby * 8, 8, tol)
+}
+
+fn yuv_mb_equal_exact(a: *mut Yuv, b: *mut Yuv, mbx: usize, mby: usize) -> bool {
+    return yuv_mb_same(a, b, mbx, mby, 0 as u32)
+}

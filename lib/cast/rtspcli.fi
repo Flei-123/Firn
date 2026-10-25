@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.rtsp
+import cast.sdp
+
+export {
+    RtspCli,
+    rc_new, rc_free, rc_request, rc_response, rc_playing, rc_sprop, rc_server_rtp_port, rc_teardown,
+}
+
+const STEP_OPTIONS: u32 = 0
+const STEP_DESCRIBE: u32 = 1
+const STEP_SETUP: u32 = 2
+const STEP_PLAY: u32 = 3
+const STEP_PLAYING: u32 = 4
+const STEP_CLOSED: u32 = 5
+
+struct RtspCli {
+    url: rt.Buf,
+    control: rt.Buf,
+    session: rt.Buf,
+    sprop: rt.Buf,
+    step: u32,
+    cseq: u32,
+    client_rtp: u32,
+    server_rtp: u32,
+}
+
+fn rc_new(url: str, client_rtp_port: u32) -> RtspCli {
+    var c: RtspCli = RtspCli {
+        url: rt.buf_new(), control: rt.buf_new(), session: rt.buf_new(), sprop: rt.buf_new(),
+        step: STEP_OPTIONS, cseq: 0 as u32, client_rtp: client_rtp_port, server_rtp: 0 as u32,
+    }
+    rt.buf_push_bytes(&c.url, url.p as u64, url.n)
+    return c
+}
+
+fn rc_free(c: *mut RtspCli) {
+    rt.buf_free(&(*c).url)
+    rt.buf_free(&(*c).control)
+    rt.buf_free(&(*c).session)
+    rt.buf_free(&(*c).sprop)
+}
+
+fn rc_playing(c: *mut RtspCli) -> bool { return (*c).step == STEP_PLAYING }
+fn rc_server_rtp_port(c: *mut RtspCli) -> u32 { return (*c).server_rtp }
+
+fn rc_sprop(c: *mut RtspCli, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (*c).sprop.ptr, (*c).sprop.len)
+}
+
+fn session_header(c: *mut RtspCli, h: *mut rt.Buf) {
+    rtsp.rtsp_push_text(h, "Session: ")
+    rt.buf_push_bytes(h, (*c).session.ptr, (*c).session.len)
+    rtsp.rtsp_push_text(h, "\r\n")
+}
+
+fn rc_request(c: *mut RtspCli, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    (*c).cseq = (*c).cseq + 1 as u32
+    var h: rt.Buf = rt.buf_new()
+    var uri: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&uri, (*c).url.ptr, (*c).url.len)
+    var ok: bool = true
+    if (*c).step == STEP_OPTIONS {
+        rtsp.rtsp_build_request(out, "OPTIONS", rt.buf_str(&uri), (*c).cseq, "", 0, 0)
+    } else if (*c).step == STEP_DESCRIBE {
+        rtsp.rtsp_build_request(out, "DESCRIBE", rt.buf_str(&uri), (*c).cseq, "Accept: application/sdp\r\n", 0, 0)
+    } else if (*c).step == STEP_SETUP {
+        rt.buf_clear(&uri)
+        if (*c).control.len > 7 && rt.mem_eq((*c).control.ptr, "rtsp://".p as u64, 7) {
+            rt.buf_push_bytes(&uri, (*c).control.ptr, (*c).control.len)
+        } else {
+            rt.buf_push_bytes(&uri, (*c).url.ptr, (*c).url.len)
+            rt.buf_push(&uri, 47 as u8)
+            rt.buf_push_bytes(&uri, (*c).control.ptr, (*c).control.len)
+        }
+        rtsp.rtsp_push_text(&h, "Transport: RTP/AVP;unicast;client_port=")
+        rt.buf_push_dec_u64(&h, (*c).client_rtp as u64)
+        rt.buf_push(&h, 45 as u8)
+        rt.buf_push_dec_u64(&h, ((*c).client_rtp + 1 as u32) as u64)
+        rtsp.rtsp_push_text(&h, "\r\n")
+        rtsp.rtsp_build_request(out, "SETUP", rt.buf_str(&uri), (*c).cseq, rt.buf_str(&h), 0, 0)
+    } else if (*c).step == STEP_PLAY {
+        session_header(c, &h)
+        rtsp.rtsp_push_text(&h, "Range: npt=0.000-\r\n")
+        rtsp.rtsp_build_request(out, "PLAY", rt.buf_str(&uri), (*c).cseq, rt.buf_str(&h), 0, 0)
+    } else if (*c).step == STEP_PLAYING {
+        session_header(c, &h)
+        rtsp.rtsp_build_request(out, "TEARDOWN", rt.buf_str(&uri), (*c).cseq, rt.buf_str(&h), 0, 0)
+        (*c).step = STEP_CLOSED
+    } else {
+        ok = false
+    }
+    rt.buf_free(&h)
+    rt.buf_free(&uri)
+    return ok
+}
+
+fn rc_teardown(c: *mut RtspCli) -> bool {
+    return (*c).step == STEP_PLAYING
+}
+
+fn rc_response(c: *mut RtspCli, p: u64, n: usize) -> i32 {
+    var m: rtsp.RtspMsg = rtsp.RtspMsg { is_response: false, status: 0 as u32, m_off: 0, m_len: 0, u_off: 0, u_len: 0, h_off: 0, h_end: 0, b_off: 0, b_len: 0, used: 0 }
+    if rtsp.rtsp_parse(p, n, &m) <= 0 || !m.is_response { return -1 }
+    if m.status != 200 as u32 { return -(m.status as i32) }
+    if rtsp.rtsp_cseq(p, &m) != (*c).cseq as i64 { return -2 }
+    if (*c).step == STEP_OPTIONS {
+        (*c).step = STEP_DESCRIBE
+    } else if (*c).step == STEP_DESCRIBE {
+        let body: u64 = p + m.b_off as u64
+        if !sdp.sdp_sprop_to_annexb(body, m.b_len, &(*c).sprop) { return -3 }
+        var off: usize = 0
+        var len: usize = 0
+        rt.buf_clear(&(*c).control)
+        if sdp.sdp_control(body, m.b_len, &off, &len) {
+            rt.buf_push_bytes(&(*c).control, body + off as u64, len)
+        }
+        (*c).step = STEP_SETUP
+    } else if (*c).step == STEP_SETUP {
+        var off: usize = 0
+        var len: usize = 0
+        if !rtsp.rtsp_header(p, &m, "Session", &off, &len) { return -4 }
+        var digits: usize = 0
+        while digits < len && rt.ld8(p, off + digits) != 59 as u8 { digits = digits + 1 }
+        rt.buf_clear(&(*c).session)
+        rt.buf_push_bytes(&(*c).session, p + off as u64, digits)
+        if !rtsp.rtsp_header(p, &m, "Transport", &off, &len) { return -5 }
+        let sp: i64 = rtsp.rtsp_param_u32(p + off as u64, len, "server_port=")
+        if sp < 1 { return -5 }
+        (*c).server_rtp = sp as u32
+        (*c).step = STEP_PLAY
+    } else if (*c).step == STEP_PLAY {
+        (*c).step = STEP_PLAYING
+        return 1
+    }
+    return 0
+}

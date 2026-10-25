@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.rtsp
+
+export {
+    RtspSrv,
+    rs_new, rs_free, rs_set_sdp, rs_set_base, rs_set_server_ports, rs_handle, rs_state,
+    rs_client_rtp_port, rs_session,
+    EV_NONE, EV_SETUP, EV_PLAY, EV_TEARDOWN,
+}
+
+const EV_NONE: u32 = 0
+const EV_SETUP: u32 = 1
+const EV_PLAY: u32 = 2
+const EV_TEARDOWN: u32 = 3
+
+struct RtspSrv {
+    sdp: rt.Buf,
+    base: rt.Buf,
+    state: u32,
+    session: u32,
+    client_rtp: u32,
+    client_rtcp: u32,
+    server_rtp: u32,
+    server_rtcp: u32,
+}
+
+fn rs_new(session: u32) -> RtspSrv {
+    return RtspSrv {
+        sdp: rt.buf_new(), base: rt.buf_new(), state: 0 as u32, session: session,
+        client_rtp: 0 as u32, client_rtcp: 0 as u32, server_rtp: 0 as u32, server_rtcp: 0 as u32,
+    }
+}
+
+fn rs_free(s: *mut RtspSrv) {
+    rt.buf_free(&(*s).sdp)
+    rt.buf_free(&(*s).base)
+}
+
+fn rs_set_sdp(s: *mut RtspSrv, p: u64, n: usize) {
+    rt.buf_clear(&(*s).sdp)
+    rt.buf_push_bytes(&(*s).sdp, p, n)
+}
+
+fn rs_set_base(s: *mut RtspSrv, base: str) {
+    rt.buf_clear(&(*s).base)
+    rt.buf_push_bytes(&(*s).base, base.p as u64, base.n)
+}
+
+fn rs_set_server_ports(s: *mut RtspSrv, rtp_port: u32) {
+    (*s).server_rtp = rtp_port
+    (*s).server_rtcp = rtp_port + 1 as u32
+}
+
+fn rs_state(s: *mut RtspSrv) -> u32 { return (*s).state }
+fn rs_client_rtp_port(s: *mut RtspSrv) -> u32 { return (*s).client_rtp }
+fn rs_session(s: *mut RtspSrv) -> u32 { return (*s).session }
+
+fn session_ok(s: *mut RtspSrv, p: u64, m: *mut rtsp.RtspMsg) -> bool {
+    var off: usize = 0
+    var len: usize = 0
+    if !rtsp.rtsp_header(p, m, "Session", &off, &len) { return false }
+    var digits: usize = 0
+    while digits < len && rt.ld8(p, off + digits) >= 48 as u8 && rt.ld8(p, off + digits) <= 57 as u8 { digits = digits + 1 }
+    let v: i64 = rtsp.rtsp_number(p + off as u64, digits)
+    return v == (*s).session as i64
+}
+
+fn rs_handle(s: *mut RtspSrv, p: u64, n: usize, resp: *mut rt.Buf) -> u32 {
+    var m: rtsp.RtspMsg = rtsp.RtspMsg { is_response: false, status: 0 as u32, m_off: 0, m_len: 0, u_off: 0, u_len: 0, h_off: 0, h_end: 0, b_off: 0, b_len: 0, used: 0 }
+    rt.buf_clear(resp)
+    if rtsp.rtsp_parse(p, n, &m) <= 0 || m.is_response {
+        rtsp.rtsp_build_response(resp, 400 as u32, 0, "", 0, 0)
+        return EV_NONE
+    }
+    let cseq: i64 = rtsp.rtsp_cseq(p, &m)
+    if cseq < 0 {
+        rtsp.rtsp_build_response(resp, 400 as u32, 0, "", 0, 0)
+        return EV_NONE
+    }
+    if rtsp.rtsp_is_method(p, &m, "OPTIONS") {
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n", 0, 0)
+        return EV_NONE
+    }
+    if rtsp.rtsp_is_method(p, &m, "DESCRIBE") {
+        var h: rt.Buf = rt.buf_new()
+        rtsp.rtsp_push_text(&h, "Content-Type: application/sdp\r\nContent-Base: ")
+        rt.buf_push_bytes(&h, (*s).base.ptr, (*s).base.len)
+        rtsp.rtsp_push_text(&h, "\r\n")
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, rt.buf_str(&h), (*s).sdp.ptr, (*s).sdp.len)
+        rt.buf_free(&h)
+        return EV_NONE
+    }
+    if rtsp.rtsp_is_method(p, &m, "SETUP") {
+        var off: usize = 0
+        var len: usize = 0
+        if !rtsp.rtsp_header(p, &m, "Transport", &off, &len) {
+            rtsp.rtsp_build_response(resp, 400 as u32, cseq, "", 0, 0)
+            return EV_NONE
+        }
+        let tp: u64 = p + off as u64
+        let port: i64 = rtsp.rtsp_param_u32(tp, len, "client_port=")
+        if rtsp.rtsp_find(tp, len, 0, "TCP") >= 0 || port < 1 || port > 65534 {
+            rtsp.rtsp_build_response(resp, 461 as u32, cseq, "", 0, 0)
+            return EV_NONE
+        }
+        (*s).client_rtp = port as u32
+        (*s).client_rtcp = port as u32 + 1 as u32
+        (*s).state = 1 as u32
+        var h: rt.Buf = rt.buf_new()
+        rtsp.rtsp_push_text(&h, "Transport: RTP/AVP;unicast;client_port=")
+        rt.buf_push_dec_u64(&h, (*s).client_rtp as u64)
+        rt.buf_push(&h, 45 as u8)
+        rt.buf_push_dec_u64(&h, (*s).client_rtcp as u64)
+        rtsp.rtsp_push_text(&h, ";server_port=")
+        rt.buf_push_dec_u64(&h, (*s).server_rtp as u64)
+        rt.buf_push(&h, 45 as u8)
+        rt.buf_push_dec_u64(&h, (*s).server_rtcp as u64)
+        rtsp.rtsp_push_text(&h, "\r\nSession: ")
+        rt.buf_push_dec_u64(&h, (*s).session as u64)
+        rtsp.rtsp_push_text(&h, ";timeout=60\r\n")
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, rt.buf_str(&h), 0, 0)
+        rt.buf_free(&h)
+        return EV_SETUP
+    }
+    if rtsp.rtsp_is_method(p, &m, "PLAY") {
+        if !session_ok(s, p, &m) || (*s).state == 0 as u32 {
+            rtsp.rtsp_build_response(resp, 454 as u32, cseq, "", 0, 0)
+            return EV_NONE
+        }
+        (*s).state = 2 as u32
+        var h: rt.Buf = rt.buf_new()
+        rtsp.rtsp_push_text(&h, "Range: npt=0.000-\r\nSession: ")
+        rt.buf_push_dec_u64(&h, (*s).session as u64)
+        rtsp.rtsp_push_text(&h, "\r\n")
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, rt.buf_str(&h), 0, 0)
+        rt.buf_free(&h)
+        return EV_PLAY
+    }
+    if rtsp.rtsp_is_method(p, &m, "TEARDOWN") {
+        if !session_ok(s, p, &m) {
+            rtsp.rtsp_build_response(resp, 454 as u32, cseq, "", 0, 0)
+            return EV_NONE
+        }
+        (*s).state = 0 as u32
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, "", 0, 0)
+        return EV_TEARDOWN
+    }
+    if rtsp.rtsp_is_method(p, &m, "GET_PARAMETER") || rtsp.rtsp_is_method(p, &m, "SET_PARAMETER") {
+        rtsp.rtsp_build_response(resp, 200 as u32, cseq, "", 0, 0)
+        return EV_NONE
+    }
+    rtsp.rtsp_build_response(resp, 501 as u32, cseq, "", 0, 0)
+    return EV_NONE
+}

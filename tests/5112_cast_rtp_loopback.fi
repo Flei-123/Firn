@@ -1,0 +1,136 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.udp
+import std.net
+import cast.h264enc
+import cast.h264dec
+import cast.nal
+import cast.pktlist
+import cast.rtp
+import cast.rtcp
+import cast.yuv
+
+const W: usize = 160
+const H: usize = 96
+
+fn paint(pix: u64, frame: usize) {
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            let o: usize = (y * W + x) * 4
+            var v: usize = (x * 3 + y * 5 + frame * 11) % 251
+            if x > 20 + frame * 6 && x < 60 + frame * 6 && y > 30 && y < 60 { v = 255 - v }
+            rt.st8(pix, o, v as u8)
+            rt.st8(pix, o + 1, (v / 2 + 20) as u8)
+            rt.st8(pix, o + 2, ((v * 7) % 253) as u8)
+            rt.st8(pix, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn same_frame(a: *mut yuv.Yuv, b: *mut yuv.Yuv) -> bool {
+    return rt.mem_eq((*a).y.ptr, (*b).y.ptr, (*a).w * (*a).h) && rt.mem_eq((*a).u.ptr, (*b).u.ptr, (*a).cw * (*a).ch) && rt.mem_eq((*a).v.ptr, (*b).v.ptr, (*a).cw * (*a).ch)
+}
+
+fn main() -> i32 {
+    var pix: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&pix, W * H * 4)
+    rt.buf_set_len(&pix, W * H * 4)
+    var e: h264enc.Enc = h264enc.enc_new(W, H, 30 as u32)
+    var d: h264dec.Dec = h264dec.dec_new()
+    var pk: rtp.H264Pack = rtp.h264pack_new(rtp.PT_H264, 305419896 as u32, 65530 as u32, 1200)
+    var dp: rtp.H264Depack = rtp.h264depack_new()
+    var au: rt.Buf = rt.buf_new()
+    var got: rt.Buf = rt.buf_new()
+    var list: pktlist.PktList = pktlist.pl_new()
+
+    let rx: i64 = udp.udp_open()
+    let tx: i64 = udp.udp_open()
+    if rx < 0 || tx < 0 { return 1 }
+    if udp.udp_bind(rx, net.ADDR_LOCAL, 0 as u16) < 0 { return 2 }
+    let port: u16 = udp.udp_local_port(rx) as u16
+    udp.udp_set_timeout(rx, 500 as u64)
+    var dgram: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&dgram, 4096)
+    rt.buf_set_len(&dgram, 4096)
+
+    var f: usize = 0
+    var frames_ok: usize = 0
+    var max_pkts: usize = 0
+    while f < 6 {
+        paint(pix.ptr, f)
+        h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+        pktlist.pl_clear(&list)
+        rtp.h264pack_au(&pk, au.ptr, au.len, (f * 3000) as u32, &list)
+        if pktlist.pl_count(&list) > max_pkts { max_pkts = pktlist.pl_count(&list) }
+        var pos: usize = 0
+        var pp: u64 = 0
+        var pn: usize = 0
+        var sent: usize = 0
+        while pktlist.pl_next(&list, &pos, &pp, &pn) {
+            if pn > 1212 { return 3 }
+            if udp.udp_sendto(tx, pp, pn, net.ADDR_LOCAL, port) != pn as i64 { return 4 }
+            sent = sent + 1
+        }
+        var complete: bool = false
+        var recv: usize = 0
+        while recv < sent {
+            var from: u32 = 0 as u32
+            var fport: u16 = 0 as u16
+            let r: i64 = udp.udp_recvfrom(rx, dgram.ptr, 4096, &from, &fport)
+            if r <= 0 { return 5 }
+            if rtp.h264depack_push(&dp, dgram.ptr, r as usize) { complete = true }
+            recv = recv + 1
+        }
+        if !complete { return 6 }
+        if !rtp.h264depack_take(&dp, &got) { return 7 }
+        if rtp.h264depack_damaged(&dp) { return 8 }
+        if h264dec.dec_annexb(&d, got.ptr, got.len) != h264dec.DEC_OK { return 9 }
+        if !same_frame(h264dec.dec_frame(&d), &e.prev) { return 10 }
+        frames_ok = frames_ok + 1
+        f = f + 1
+    }
+    if frames_ok != 6 { return 11 }
+    if max_pkts < 18 { return 12 }
+
+    var pli: rt.Buf = rt.buf_new()
+    rtcp.rtcp_pli(&pli, 1 as u32, 305419896 as u32)
+    if !rtcp.rtcp_is_pli(pli.ptr, pli.len) { return 20 }
+    var sr: rt.Buf = rt.buf_new()
+    rtcp.rtcp_sender_report(&sr, 1 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32, 0 as u32)
+    if rtcp.rtcp_is_pli(sr.ptr, sr.len) { return 21 }
+
+    paint(pix.ptr, 8)
+    h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+    pktlist.pl_clear(&list)
+    rtp.h264pack_au(&pk, au.ptr, au.len, 30000 as u32, &list)
+    var pos2: usize = 0
+    var pp2: u64 = 0
+    var pn2: usize = 0
+    var idx: usize = 0
+    var dropped: bool = false
+    var complete2: bool = false
+    while pktlist.pl_next(&list, &pos2, &pp2, &pn2) {
+        if idx == 5 {
+            dropped = true
+        } else {
+            if rtp.h264depack_push(&dp, pp2, pn2) { complete2 = true }
+        }
+        idx = idx + 1
+    }
+    if !dropped || !complete2 { return 30 }
+    if !rtp.h264depack_take(&dp, &got) { return 31 }
+    if !rtp.h264depack_damaged(&dp) { return 32 }
+
+    udp.udp_close(rx)
+    udp.udp_close(tx)
+    h264enc.enc_free(&e)
+    h264dec.dec_free(&d)
+    rtp.h264depack_free(&dp)
+    pktlist.pl_free(&list)
+    return 0
+}
