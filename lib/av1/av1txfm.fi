@@ -1,0 +1,659 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/av1/av1txfm.fi -- AV1 inverse transforms: DCT 4..64, ADST 4/8/16, identity, 2D driver.
+import rt.rt
+
+export { txfm_work_size, idct1d, iadst1d, iidentity1d, inv_txfm_2d, tx_log2w, tx_log2h, row_kind, col_kind, flip_ud, flip_lr }
+
+static COS128: [i16; 65] = [
+    4096, 4095, 4091, 4085, 4076, 4065, 4052, 4036,
+    4017, 3996, 3973, 3948, 3920, 3889, 3857, 3822,
+    3784, 3745, 3703, 3659, 3612, 3564, 3513, 3461,
+    3406, 3349, 3290, 3229, 3166, 3102, 3035, 2967,
+    2896, 2824, 2751, 2675, 2598, 2520, 2440, 2359,
+    2276, 2191, 2106, 2019, 1931, 1842, 1751, 1660,
+    1567, 1474, 1380, 1285, 1189, 1092, 995, 897,
+    799, 700, 601, 501, 401, 301, 201, 101, 0,
+]
+static TXW_LOG: [i16; 19] = [2, 3, 4, 5, 6, 2, 3, 3, 4, 4, 5, 5, 6, 2, 4, 3, 5, 4, 6]
+static TXH_LOG: [i16; 19] = [2, 3, 4, 5, 6, 3, 2, 4, 3, 5, 4, 6, 5, 4, 2, 5, 3, 6, 4]
+static ROW_SHIFT: [i16; 19] = [0, 1, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]
+static ROW_KIND: [i16; 16] = [0, 0, 1, 1, 0, 1, 1, 1, 1, 2, 2, 0, 2, 1, 2, 1]
+static COL_KIND: [i16; 16] = [0, 1, 0, 1, 1, 0, 1, 1, 1, 2, 0, 2, 1, 2, 1, 2]
+static FLIP_UD: [i16; 16] = [0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0]
+static FLIP_LR: [i16; 16] = [0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1]
+
+fn tx_log2w(sz: i64) -> i64 {
+    return TXW_LOG[sz as usize] as i64
+}
+
+fn tx_log2h(sz: i64) -> i64 {
+    return TXH_LOG[sz as usize] as i64
+}
+
+fn row_kind(tt: i64) -> i64 {
+    return ROW_KIND[tt as usize] as i64
+}
+
+fn col_kind(tt: i64) -> i64 {
+    return COL_KIND[tt as usize] as i64
+}
+
+fn flip_ud(tt: i64) -> i64 {
+    return FLIP_UD[tt as usize] as i64
+}
+
+fn flip_lr(tt: i64) -> i64 {
+    return FLIP_LR[tt as usize] as i64
+}
+
+fn txfm_work_size() -> i64 {
+    return 128 * 4
+}
+
+#[no_gc]
+fn ld(p: u64, i: i64) -> i64 {
+    return (*((p + ((i * 4) as u64)) as *mut i32)) as i64
+}
+
+#[no_gc]
+fn st(p: u64, i: i64, v: i64) {
+    *((p + ((i * 4) as u64)) as *mut i32) = v as i32
+}
+
+fn r2(x: i64, n: i64) -> i64 {
+    if n == 0 {
+        return x
+    }
+    return (x + (1 << (n - 1))) >> n
+}
+
+fn brev(nb: i64, x: i64) -> i64 {
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < nb {
+        let bit: i64 = (x >> i) & 1
+        t = t + (bit << (nb - 1 - i))
+        i = i + 1
+    }
+    return t
+}
+
+fn cos128(angle: i64) -> i64 {
+    let a2: i64 = angle & 255
+    if a2 <= 64 {
+        return COS128[a2 as usize] as i64
+    }
+    if a2 <= 128 {
+        return 0 - (COS128[(128 - a2) as usize] as i64)
+    }
+    if a2 <= 192 {
+        return 0 - (COS128[(a2 - 128) as usize] as i64)
+    }
+    return COS128[(256 - a2) as usize] as i64
+}
+
+fn sin128(angle: i64) -> i64 {
+    return cos128(angle - 64)
+}
+
+fn bf(t: u64, a: i64, b: i64, angle: i64, flip: i64) {
+    let ta: i64 = ld(t, a)
+    let tb: i64 = ld(t, b)
+    let c: i64 = cos128(angle)
+    let s: i64 = sin128(angle)
+    let x: i64 = r2(ta * c - tb * s, 12)
+    let y: i64 = r2(ta * s + tb * c, 12)
+    if flip == 0 {
+        st(t, a, x)
+        st(t, b, y)
+    } else {
+        st(t, a, y)
+        st(t, b, x)
+    }
+}
+
+fn clipr(v: i64, r: i64) -> i64 {
+    let lo: i64 = 0 - (1 << (r - 1))
+    let hi: i64 = (1 << (r - 1)) - 1
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn hd(t: u64, a0: i64, b0: i64, flip: i64, r: i64) {
+    var a: i64 = a0
+    var b: i64 = b0
+    if flip != 0 {
+        a = b0
+        b = a0
+    }
+    let x: i64 = ld(t, a)
+    let y: i64 = ld(t, b)
+    st(t, a, clipr(x + y, r))
+    st(t, b, clipr(x - y, r))
+}
+
+fn idct1d(t: u64, n: i64, r: i64) {
+    let sc: u64 = t + 256
+    let len: i64 = 1 << n
+    var i: i64 = 0
+    while i < len {
+        st(sc, i, ld(t, i))
+        i = i + 1
+    }
+    i = 0
+    while i < len {
+        st(t, i, ld(sc, brev(n, i)))
+        i = i + 1
+    }
+    var j: i64 = 0
+    if n == 6 {
+        i = 0
+        while i < 16 {
+            bf(t, 32 + i, 63 - i, 63 - 4 * brev(4, i), 0)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 8 {
+            bf(t, 16 + i, 31 - i, 6 + (brev(3, 7 - i) << 3), 0)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 16 {
+            hd(t, 32 + i * 2, 33 + i * 2, i & 1, r)
+            i = i + 1
+        }
+    }
+    if n >= 4 {
+        i = 0
+        while i < 4 {
+            bf(t, 8 + i, 15 - i, 12 + (brev(2, 3 - i) << 4), 0)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 8 {
+            hd(t, 16 + 2 * i, 17 + 2 * i, i & 1, r)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 4 {
+            j = 0
+            while j < 2 {
+                bf(t, 62 - i * 4 - j, 33 + i * 4 + j, 60 - 16 * brev(2, i) + 64 * j, 1)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n >= 3 {
+        i = 0
+        while i < 2 {
+            bf(t, 4 + i, 7 - i, 56 - 32 * i, 0)
+            i = i + 1
+        }
+    }
+    if n >= 4 {
+        i = 0
+        while i < 4 {
+            hd(t, 8 + 2 * i, 9 + 2 * i, i & 1, r)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 2 {
+            j = 0
+            while j < 2 {
+                bf(t, 30 - 4 * i - j, 17 + 4 * i + j, 24 + (j << 6) + ((1 - i) << 5), 1)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 8 {
+            j = 0
+            while j < 2 {
+                hd(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1, r)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < 2 {
+        bf(t, 2 * i, 2 * i + 1, 32 + 16 * i, 1 - i)
+        i = i + 1
+    }
+    if n >= 3 {
+        i = 0
+        while i < 2 {
+            hd(t, 4 + 2 * i, 5 + 2 * i, i, r)
+            i = i + 1
+        }
+    }
+    if n >= 4 {
+        i = 0
+        while i < 2 {
+            bf(t, 14 - i, 9 + i, 48 + 64 * i, 1)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 4 {
+            j = 0
+            while j < 2 {
+                hd(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1, r)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 2 {
+            j = 0
+            while j < 4 {
+                bf(t, 61 - i * 8 - j, 34 + i * 8 + j, 56 - i * 32 + (j >> 1) * 64, 1)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < 2 {
+        hd(t, i, 3 - i, 0, r)
+        i = i + 1
+    }
+    if n >= 3 {
+        bf(t, 6, 5, 32, 1)
+    }
+    if n >= 4 {
+        i = 0
+        while i < 2 {
+            j = 0
+            while j < 2 {
+                hd(t, 8 + 4 * i + j, 11 + 4 * i - j, i, r)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 4 {
+            bf(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, 1)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 4 {
+            j = 0
+            while j < 4 {
+                hd(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1, r)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n >= 3 {
+        i = 0
+        while i < 4 {
+            hd(t, i, 7 - i, 0, r)
+            i = i + 1
+        }
+    }
+    if n >= 4 {
+        i = 0
+        while i < 2 {
+            bf(t, 13 - i, 10 + i, 32, 1)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 2 {
+            j = 0
+            while j < 4 {
+                hd(t, 16 + i * 8 + j, 23 + i * 8 - j, i, r)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 8 {
+            var ang: i64 = 112
+            if i < 4 {
+                ang = 48
+            }
+            bf(t, 59 - i, 36 + i, ang, 1)
+            i = i + 1
+        }
+    }
+    if n >= 4 {
+        i = 0
+        while i < 8 {
+            hd(t, i, 15 - i, 0, r)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 4 {
+            bf(t, 27 - i, 20 + i, 32, 1)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 8 {
+            hd(t, 32 + i, 47 - i, 0, r)
+            hd(t, 48 + i, 63 - i, 1, r)
+            i = i + 1
+        }
+    }
+    if n >= 5 {
+        i = 0
+        while i < 16 {
+            hd(t, i, 31 - i, 0, r)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 8 {
+            bf(t, 55 - i, 40 + i, 32, 1)
+            i = i + 1
+        }
+    }
+    if n == 6 {
+        i = 0
+        while i < 32 {
+            hd(t, i, 63 - i, 0, r)
+            i = i + 1
+        }
+    }
+}
+
+fn adst_in_perm(t: u64, n: i64) {
+    let sc: u64 = t + 256
+    let n0: i64 = 1 << n
+    var i: i64 = 0
+    while i < n0 {
+        st(sc, i, ld(t, i))
+        i = i + 1
+    }
+    i = 0
+    while i < n0 {
+        var idx: i64 = n0 - i - 1
+        if (i & 1) != 0 {
+            idx = i - 1
+        }
+        st(t, i, ld(sc, idx))
+        i = i + 1
+    }
+}
+
+fn adst_out_perm(t: u64, n: i64) {
+    let sc: u64 = t + 256
+    let n0: i64 = 1 << n
+    var i: i64 = 0
+    while i < n0 {
+        st(sc, i, ld(t, i))
+        i = i + 1
+    }
+    i = 0
+    while i < n0 {
+        let a: i64 = (i >> 3) & 1
+        let b: i64 = ((i >> 2) & 1) ^ ((i >> 3) & 1)
+        let c: i64 = ((i >> 1) & 1) ^ ((i >> 2) & 1)
+        let d: i64 = (i & 1) ^ ((i >> 1) & 1)
+        let idx: i64 = ((d << 3) | (c << 2) | (b << 1) | a) >> (4 - n)
+        var v: i64 = ld(sc, idx)
+        if (i & 1) != 0 {
+            v = 0 - v
+        }
+        st(t, i, v)
+        i = i + 1
+    }
+}
+
+fn iadst4(t: u64) {
+    let t0: i64 = ld(t, 0)
+    let t1: i64 = ld(t, 1)
+    let t2: i64 = ld(t, 2)
+    let t3: i64 = ld(t, 3)
+    var s0: i64 = 1321 * t0
+    var s1: i64 = 2482 * t0
+    var s2: i64 = 3344 * t1
+    var s3: i64 = 3803 * t2
+    let s4: i64 = 1321 * t2
+    let s5: i64 = 2482 * t3
+    let s6: i64 = 3803 * t3
+    let a7: i64 = t0 - t2
+    let b7: i64 = a7 + t3
+    s0 = s0 + s3
+    s1 = s1 - s4
+    s3 = s2
+    s2 = 3344 * b7
+    s0 = s0 + s5
+    s1 = s1 - s6
+    let x0: i64 = s0 + s3
+    let x1: i64 = s1 + s3
+    let x2: i64 = s2
+    var x3: i64 = s0 + s1
+    x3 = x3 - s3
+    st(t, 0, r2(x0, 12))
+    st(t, 1, r2(x1, 12))
+    st(t, 2, r2(x2, 12))
+    st(t, 3, r2(x3, 12))
+}
+
+fn iadst8(t: u64, r: i64) {
+    adst_in_perm(t, 3)
+    var i: i64 = 0
+    while i < 4 {
+        bf(t, 2 * i, 2 * i + 1, 60 - 16 * i, 1)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        hd(t, i, 4 + i, 0, r)
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        bf(t, 4 + 3 * i, 5 + i, 48 - 32 * i, 1)
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        var j: i64 = 0
+        while j < 2 {
+            hd(t, 4 * j + i, 2 + 4 * j + i, 0, r)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        bf(t, 2 + 4 * i, 3 + 4 * i, 32, 1)
+        i = i + 1
+    }
+    adst_out_perm(t, 3)
+}
+
+fn iadst16(t: u64, r: i64) {
+    adst_in_perm(t, 4)
+    var i: i64 = 0
+    while i < 8 {
+        bf(t, 2 * i, 2 * i + 1, 62 - 8 * i, 1)
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        hd(t, i, 8 + i, 0, r)
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        bf(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, 1)
+        bf(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, 1)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        var j: i64 = 0
+        while j < 2 {
+            hd(t, 8 * j + i, 4 + 8 * j + i, 0, r)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        var j: i64 = 0
+        while j < 2 {
+            bf(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, 1)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 2 {
+        var j: i64 = 0
+        while j < 4 {
+            hd(t, 4 * j + i, 2 + 4 * j + i, 0, r)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        bf(t, 2 + 4 * i, 3 + 4 * i, 32, 1)
+        i = i + 1
+    }
+    adst_out_perm(t, 4)
+}
+
+fn iadst1d(t: u64, n: i64, r: i64) {
+    if n == 2 {
+        iadst4(t)
+    } else if n == 3 {
+        iadst8(t, r)
+    } else {
+        iadst16(t, r)
+    }
+}
+
+fn iidentity1d(t: u64, n: i64) {
+    let len: i64 = 1 << n
+    var i: i64 = 0
+    while i < len {
+        let v: i64 = ld(t, i)
+        if n == 2 {
+            st(t, i, r2(v * 5793, 12))
+        } else if n == 3 {
+            st(t, i, v * 2)
+        } else if n == 4 {
+            st(t, i, r2(v * 11586, 12))
+        } else {
+            st(t, i, v * 4)
+        }
+        i = i + 1
+    }
+}
+
+fn tx1d(t: u64, kind: i64, n: i64, r: i64) {
+    if kind == 0 {
+        idct1d(t, n, r)
+    } else if kind == 1 {
+        iadst1d(t, n, r)
+    } else {
+        iidentity1d(t, n)
+    }
+}
+
+fn inv_txfm_2d(coef: u64, cstride: i64, res: u64, work: u64, tx_size: i64, tx_type: i64, bit_depth: i64) {
+    let log2w: i64 = tx_log2w(tx_size)
+    let log2h: i64 = tx_log2h(tx_size)
+    let w: i64 = 1 << log2w
+    let h: i64 = 1 << log2h
+    let rshift: i64 = ROW_SHIFT[tx_size as usize] as i64
+    let rclamp: i64 = bit_depth + 8
+    var cclamp: i64 = bit_depth + 6
+    if cclamp < 16 {
+        cclamp = 16
+    }
+    let rk: i64 = row_kind(tx_type)
+    let ck: i64 = col_kind(tx_type)
+    let rect: i64 = iabs_i(log2w - log2h)
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        if i >= 32 {
+            while j < w {
+                st(res, i * w + j, 0)
+                j = j + 1
+            }
+        } else {
+            while j < w {
+                var v: i64 = 0
+                if j < 32 {
+                    v = clipr(ld(coef, i * cstride + j), rclamp)
+                }
+                if rect == 1 {
+                    v = r2(v * 2896, 12)
+                }
+                st(work, j, v)
+                j = j + 1
+            }
+            tx1d(work, rk, log2w, rclamp)
+            j = 0
+            while j < w {
+                st(res, i * w + j, clipr(r2(ld(work, j), rshift), cclamp))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    var j2: i64 = 0
+    while j2 < w {
+        i = 0
+        while i < h {
+            st(work, i, ld(res, i * w + j2))
+            i = i + 1
+        }
+        tx1d(work, ck, log2h, cclamp)
+        i = 0
+        while i < h {
+            st(res, i * w + j2, r2(ld(work, i), 4))
+            i = i + 1
+        }
+        j2 = j2 + 1
+    }
+}
+
+fn iabs_i(a: i64) -> i64 {
+    if a < 0 {
+        return 0 - a
+    }
+    return a
+}
