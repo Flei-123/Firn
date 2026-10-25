@@ -13,7 +13,7 @@ worktrees (`/root/certus-*`, branch names in the last column). Tempo only where 
 | GIF | 87a / 89a, animation | yes | no | - | compared with Pillow, browser rules where they differ | Firn `lib/gif/gif.fi` |
 | AVIF | HEIF container, AV1 intra frame: 4:2:0 / mono, alpha, sb128, tiles, delta_q / delta_lf, qmatrix, palette, intrabc, irot / imir, deblock, CDEF, loop restoration | yes (still pictures, intra only) | no | - | bit-exact fixtures (`avif_420`, `sb128`, ...); `image/avif` Accept is default off (`--avif=1`) | Certus `lib/paint/avif*.fi`, `av1*.fi` (`w-r1720avif`) |
 | AVIF (Firn `lib/av1`) | HEIF container, AV1 intra frame: 8 bit, 4:4:4 / 4:2:0 / 4:0:0, lossless + lossy, deblock, CDEF, loop restoration; refused: 10 bit, 4:2:2, multiple tiles, sb128, palette, qmatrix, delta_q, segmentation, intrabc | yes (`av1.still`, planar YUV out) | no | - | 63 fixtures bit-exact vs ffmpeg/dav1d (`tools/av1/check_still.sh`), test 5460, bitflip fuzz | `lib/av1/*.fi` |
-| JPEG XL | header only (jxl_bits, jxl_container, jxl_header, jxl.jxl_info) | planned: Modular lossless, VarDCT | no | - | - | Firn `lib/jxl` (entropy modules on branch staff/firn-mvo7ma20, untested) |
+| JPEG XL | header, frame header + TOC (jxl_bits, jxl_container, jxl_header, jxl_frame, jxl.jxl_info, jxl.jxl_frame_info) | planned: Modular lossless, VarDCT | no | - | - | Firn `lib/jxl` (entropy modules jxl_huff/jxl_ans/jxl_code compile but are untested) |
 | HEIC / HEIF (HEVC) | none | no | no | - | - | - |
 | BMP, ICO, TGA, TIFF | none (ICO / ICNS are only written by `pack.icons`) | no | partly | - | - | - |
 
@@ -45,4 +45,4 @@ Picture limit in the Firn decoders: 16,777,216 pixels by default, checked before
 ## Reference decoders on this host
 
 - `ffmpeg` with `libjxl` 0.7 (encoder + decoder), libaom, dav1d, libwebp, libx264, libx265.
-- `djxl` / `cjxl` are not installed (`apt-cache policy libjxl-tools`: candidate 0.7.0-10+deb12u1, not installed). `pillow-jxl-plugin` is on PyPI.
+- Reference tools: `/root/jarvis/projects/u_DiS4in7esMF1/firncodec/tools/libjxl/bin/{cjxl,djxl}` (v0.13.0); libjxl 0.8.2 sources in `/root/jarvis/data/staff_wt/firn/_jxl_ref/src`. `pillow-jxl-plugin` is on PyPI.

@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_frame.fi -- jxl_frame: JPEG XL frame header and table of contents
+import std.rt
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_err
+import jxl.jxl_header
+
+export {
+    JxlFrame, jf_new, jf_free, jf_read, jf_read_toc, jf_section_offset, jf_section_size,
+    JF_FLAG_NOISE, JF_FLAG_PATCHES, JF_FLAG_SPLINES, JF_FLAG_USE_LF, JF_REGULAR, JF_MODULAR, JF_VARDCT,
+}
+
+const JF_FLAG_NOISE: u64 = 1
+const JF_FLAG_PATCHES: u64 = 2
+const JF_FLAG_SPLINES: u64 = 16
+const JF_FLAG_USE_LF: u64 = 32
+const JF_REGULAR: u32 = 0
+const JF_VARDCT: u32 = 0
+const JF_MODULAR: u32 = 1
+
+struct JxlFrame {
+    frame_type: u32,
+    encoding: u32,
+    flags: u64,
+    do_ycbcr: bool,
+    upsampling: u32,
+    group_shift: u32,
+    num_passes: u32,
+    x0: i32,
+    y0: i32,
+    width: u32,
+    height: u32,
+    is_last: bool,
+    group_dim: u32,
+    groups_x: u32,
+    groups_y: u32,
+    num_groups: u32,
+    lf_groups_x: u32,
+    lf_groups_y: u32,
+    num_lf_groups: u32,
+    blend_mode: u32,
+    duration: u32,
+    toc_count: usize,
+    toc: u64,
+    permuted: bool,
+    body_start: usize,
+}
+
+fn jf_new() -> JxlFrame {
+    return JxlFrame { frame_type: 0, encoding: 0, flags: 0, do_ycbcr: false, upsampling: 1, group_shift: 1,
+        num_passes: 1, x0: 0, y0: 0, width: 0, height: 0, is_last: true, group_dim: 256, groups_x: 0, groups_y: 0,
+        num_groups: 0, lf_groups_x: 0, lf_groups_y: 0, num_lf_groups: 0, blend_mode: 0, duration: 0, toc_count: 0,
+        toc: 0, permuted: false, body_start: 0 }
+}
+
+fn jf_free(f: *mut JxlFrame) {
+    rt.heap_free((*f).toc, (*f).toc_count * 4)
+    (*f).toc = 0
+    (*f).toc_count = 0
+}
+
+fn div_ceil(a: u32, b: u32) -> u32 {
+    return (a + b - 1) / b
+}
+
+fn read_dim(b: *mut jxl_bits.JxlBits) -> u32 {
+    return jxl_bits.jb_u32(b, jxl_bits.jd_bits(8), jxl_bits.jd_off(11, 256), jxl_bits.jd_off(14, 2304), jxl_bits.jd_off(30, 18688))
+}
+
+fn read_blending(b: *mut jxl_bits.JxlBits, num_extra: usize, mode_out: *mut u32) {
+    let mode: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_off(2, 3))
+    if num_extra > 0 && (mode == 2 || mode == 3) {
+        jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_off(3, 3))
+        jxl_bits.jb_bit(b)
+    } else if mode == 4 {
+        jxl_bits.jb_bit(b)
+    }
+    if mode != 0 {
+        jxl_bits.jb_read(b, 2)
+    }
+    *mode_out = mode
+}
+
+fn read_loop_filter(b: *mut jxl_bits.JxlBits, modular: bool) {
+    if jxl_bits.jb_bit(b) {
+        return
+    }
+    if jxl_bits.jb_bit(b) {
+        if jxl_bits.jb_bit(b) {
+            var i: u32 = 0
+            while i < 6 {
+                jxl_bits.jb_f16(b)
+                i = i + 1
+            }
+        }
+    }
+    let iters: u32 = jxl_bits.jb_read(b, 2)
+    if iters > 0 {
+        if !modular {
+            if jxl_bits.jb_bit(b) {
+                var i: u32 = 0
+                while i < 8 {
+                    jxl_bits.jb_f16(b)
+                    i = i + 1
+                }
+            }
+        }
+        if jxl_bits.jb_bit(b) {
+            var i: u32 = 0
+            while i < 3 {
+                jxl_bits.jb_f16(b)
+                i = i + 1
+            }
+            jxl_bits.jb_read(b, 32)
+        }
+        if jxl_bits.jb_bit(b) {
+            if !modular {
+                jxl_bits.jb_f16(b)
+            }
+            jxl_bits.jb_f16(b)
+            jxl_bits.jb_f16(b)
+            jxl_bits.jb_f16(b)
+        }
+        if modular {
+            jxl_bits.jb_f16(b)
+        }
+    }
+    skip_extensions(b)
+}
+
+fn skip_extensions(b: *mut jxl_bits.JxlBits) {
+    let mask: u64 = jxl_bits.jb_u64(b)
+    var sizes: [u64; 64] = [0; 64]
+    var i: u64 = 0
+    while i < 64 {
+        if ((mask >> i) & 1) != 0 {
+            sizes[i as usize] = jxl_bits.jb_u64(b)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 64 {
+        if sizes[i as usize] != 0 {
+            jxl_bits.jb_skip_bits(b, sizes[i as usize])
+        }
+        i = i + 1
+    }
+}
+
+fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFrame) -> i32 {
+    *f = jf_new()
+    let num_extra: usize = vec.vec_len[jxl_header.JxlExtra](&(*m).extra)
+    (*f).width = (*m).width
+    (*f).height = (*m).height
+    if jxl_bits.jb_bit(b) {
+        (*f).group_dim = 256
+        (*f).is_last = true
+    } else {
+        (*f).frame_type = jxl_bits.jb_read(b, 2)
+        (*f).encoding = jxl_bits.jb_read(b, 1)
+        (*f).flags = jxl_bits.jb_u64(b)
+        if !(*m).xyb_encoded {
+            (*f).do_ycbcr = jxl_bits.jb_bit(b)
+        }
+        if ((*f).flags & JF_FLAG_USE_LF) == 0 {
+            if (*f).do_ycbcr {
+                jxl_bits.jb_read(b, 6)
+            }
+            (*f).upsampling = jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
+            var e: usize = 0
+            while e < num_extra {
+                jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
+                e = e + 1
+            }
+        }
+        if (*f).encoding == JF_MODULAR {
+            (*f).group_shift = jxl_bits.jb_read(b, 2)
+        }
+        if (*f).frame_type != 2 {
+            (*f).num_passes = jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(3), jxl_bits.jd_off(3, 4))
+            if (*f).num_passes != 1 {
+                let nds: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_off(1, 3))
+                var i: u32 = 0
+                while i + 1 < (*f).num_passes {
+                    jxl_bits.jb_read(b, 2)
+                    i = i + 1
+                }
+                i = 0
+                while i < nds {
+                    jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
+                    jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_bits(3))
+                    i = i + 1
+                }
+            }
+        }
+        if (*f).frame_type == 1 {
+            jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(3), jxl_bits.jd_val(4))
+        }
+        if (*f).frame_type != 1 {
+            if jxl_bits.jb_bit(b) {
+                if (*f).frame_type != 2 {
+                    (*f).x0 = jxl_bits.jb_signed(read_dim(b))
+                    (*f).y0 = jxl_bits.jb_signed(read_dim(b))
+                }
+                (*f).width = read_dim(b)
+                (*f).height = read_dim(b)
+            }
+        }
+        if (*f).frame_type == 0 || (*f).frame_type == 3 {
+            read_blending(b, num_extra, &(*f).blend_mode)
+            var e: usize = 0
+            var dummy: u32 = 0
+            while e < num_extra {
+                read_blending(b, num_extra, &dummy)
+                e = e + 1
+            }
+            if (*m).have_animation {
+                (*f).duration = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_bits(8), jxl_bits.jd_bits(32))
+                if (*m).have_timecodes {
+                    jxl_bits.jb_read(b, 32)
+                }
+            }
+            if (*f).frame_type == 0 {
+                (*f).is_last = jxl_bits.jb_bit(b)
+            } else {
+                (*f).is_last = false
+            }
+        } else {
+            (*f).is_last = false
+        }
+        if !(*f).is_last && (*f).frame_type != 1 {
+            jxl_bits.jb_read(b, 2)
+        }
+        if (*f).frame_type == 2 {
+            jxl_bits.jb_bit(b)
+        }
+        let name_len: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_bits(4), jxl_bits.jd_off(5, 16), jxl_bits.jd_off(10, 48))
+        jxl_bits.jb_skip_bits(b, name_len as u64 * 8)
+        read_loop_filter(b, (*f).encoding == JF_MODULAR)
+        skip_extensions(b)
+    }
+    if jxl_bits.jb_over(b) {
+        return jxl_err.JX_TRUNCATED
+    }
+    if (*f).upsampling != 1 {
+        (*f).width = div_ceil((*f).width, (*f).upsampling)
+        (*f).height = div_ceil((*f).height, (*f).upsampling)
+    }
+    (*f).group_dim = (128 as u32) << (*f).group_shift
+    (*f).groups_x = div_ceil((*f).width, (*f).group_dim)
+    (*f).groups_y = div_ceil((*f).height, (*f).group_dim)
+    (*f).num_groups = (*f).groups_x * (*f).groups_y
+    (*f).lf_groups_x = div_ceil((*f).width, (*f).group_dim * 8)
+    (*f).lf_groups_y = div_ceil((*f).height, (*f).group_dim * 8)
+    (*f).num_lf_groups = (*f).lf_groups_x * (*f).lf_groups_y
+    return jxl_err.JX_OK
+}
+
+fn jf_read_toc(b: *mut jxl_bits.JxlBits, f: *mut JxlFrame) -> i32 {
+    var count: usize = 1
+    if (*f).num_groups != 1 || (*f).num_passes != 1 {
+        count = 2 + (*f).num_lf_groups as usize + ((*f).num_passes as usize) * ((*f).num_groups as usize)
+    }
+    if count > 1048576 {
+        return jxl_err.JX_TOO_LARGE
+    }
+    (*f).permuted = jxl_bits.jb_bit(b)
+    if (*f).permuted {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if !jxl_bits.jb_zero_pad(b) {
+        return jxl_err.JX_BAD
+    }
+    (*f).toc_count = count
+    (*f).toc = rt.heap_alloc(count * 4)
+    if (*f).toc == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var i: usize = 0
+    while i < count {
+        let v: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_bits(10), jxl_bits.jd_off(14, 1024), jxl_bits.jd_off(22, 17408), jxl_bits.jd_off(30, 4211712))
+        rt.st32((*f).toc, i, v)
+        i = i + 1
+    }
+    if !jxl_bits.jb_zero_pad(b) || jxl_bits.jb_over(b) {
+        return jxl_err.JX_BAD
+    }
+    (*f).body_start = jxl_bits.jb_byte_pos(b)
+    return jxl_err.JX_OK
+}
+
+fn jf_section_size(f: *mut JxlFrame, i: usize) -> usize {
+    return rt.ld32((*f).toc, i) as usize
+}
+
+fn jf_section_offset(f: *mut JxlFrame, i: usize) -> usize {
+    var off: usize = (*f).body_start
+    var k: usize = 0
+    while k < i {
+        off = off + rt.ld32((*f).toc, k) as usize
+        k = k + 1
+    }
+    return off
+}
