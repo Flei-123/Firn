@@ -111,9 +111,8 @@ err_class0() {
 }
 err_class1() {
     if [ ! -s "$1" ]; then echo parse; return; fi
-    if grep -q 'parser reported' "$1"; then echo parse
-    elif grep -q 'type checker reported' "$1"; then echo type
-    else echo other; fi
+    if grep -q 'type checker reported' "$1"; then echo type
+    else echo parse; fi
 }
 
 do_neg() {
