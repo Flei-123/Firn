@@ -831,6 +831,8 @@ echo "  settings phone layout (360x800 tabs)  OK"
 echo "  settings 1100x700 shot, light + dark + open list   OK"
 build kitset
 "$W/kitset"
+build kitspec
+"$W/kitspec"
 build screenax
 "$W/screenax"
 build screenaxbench
