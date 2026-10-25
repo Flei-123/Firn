@@ -50,11 +50,15 @@ Default is `--opt dev` (`--no-opt`): statement-precise lines, nothing removed. `
 
 ## Baseline
 
-62 `tests/*.fi` programs with `fn main` (every 16th file, picked by number order) built with `--opt dev`, run through `/root/jarvis/bin/heavy` with `firncov suite -j 6` (about 12 minutes wall, host load about 20). Selection `--include lib/`:
+`tests/*.fi` split into 8 shards by file number modulo 8, each built with `--opt dev` and run through `/root/jarvis/bin/heavy` with `firncov suite -j 12` (two shards at a time, 16-25 minutes each at host load 30-40), then combined with `firncov merge`. Selection `--include lib/`. First four shards (0, 1, 4, 5 = 498 of 998 files):
 
 | Measure | Hit / total | Percent |
 |---|---|---|
-| Lines | 40939 / 116178 | 35.2 |
-| Functions | 3453 / 9125 | 37.8 |
+| Lines | 135469 / 211697 | 64.0 |
+| Functions | 10533 / 16115 | 65.4 |
 
-The same run over everything (library plus the test files): 46437 / 121852 lines (38.1 %), 3760 / 9443 functions (39.8 %). The test programs themselves are about 100 % covered; the denominator is every imported library function the compiler emits, so a small sample leaves most of `lib/` at 0 %. Files with `#[test]` only and no `main` need `--test` with `run`.
+Suite summary of those shards: 493 profiled, 0 skipped, 6 failed (callgrind timeout on heavy `tests/*mc_*` programs, listed in the suite output). The other four shards were not finished in the same session, so the figure is a lower bound. The previous sample (62 programs) gave 35.2 % lines, 37.8 % functions.
+
+Least covered lib modules (all 0 %, of at least 30 lines): `async/wsc`, `audio/dev`, `audio/pulse`, `audio/ring`, `audio/sink`, `browser/quirks_data`, `db/datetime`, `desktop/notify`, `font/cbdt`, `fui/shape`, `fui/style`, `generated/grapheme_tables`, `generated/linebreak_tables`, `gif/gif`, `gpu/gl_fbo`.
+
+The denominator is every imported library function the compiler emits, so modules no test imports stay at 0 %.
