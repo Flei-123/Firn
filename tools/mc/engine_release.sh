@@ -49,5 +49,17 @@ with open(os.path.join(out, "manifest.json"), "w") as fh:
     json.dump(manifest, fh, indent=2)
     fh.write("\n")
 PY
+SIGN_KEY=${SIGN_KEY:-/root/.fleilauncher-engine-signing/engine_signing.pem}
+if [ -f "$SIGN_KEY" ]; then
+  openssl pkeyutl -sign -rawin -inkey "$SIGN_KEY" -in "$OUT/manifest.json" -out "$W/manifest.sig" || fail "manifest signing"
+  [ "$(stat -c %s "$W/manifest.sig")" = 64 ] || fail "signature is not 64 bytes"
+  od -An -tx1 -v "$W/manifest.sig" | tr -d ' \n' > "$OUT/manifest.json.sig"
+  openssl pkey -in "$SIGN_KEY" -pubout -out "$W/pub.pem"
+  openssl pkeyutl -verify -rawin -pubin -inkey "$W/pub.pem" -in "$OUT/manifest.json" -sigfile "$W/manifest.sig" >/dev/null || fail "signature self-check"
+elif [ "${ALLOW_UNSIGNED:-0}" = 1 ]; then
+  rm -f "$OUT/manifest.json.sig"
+else
+  fail "signing key $SIGN_KEY missing (set SIGN_KEY or ALLOW_UNSIGNED=1)"
+fi
 echo "  ok  $OUT: $(ls "$OUT" | tr '\n' ' ')"
 echo "RESULT mc-engine-release: ok"
