@@ -349,6 +349,83 @@ print("  server chest (ui): " + " ".join("%d=%s" % (n, got[n]) for n in sorted(g
 ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",1) and got[6]==("stone",21) and got[7]==("stone",21) and got[8]==("stone",21) and hot[0]==("stone",30) and hot[1] is None
 sys.exit(0 if ok else 1)
 PY
+# ---- anvil + enchanting table UI (MCPLAY_CONT_UI=1|2): the block is set next to the player, mcplay opens it with a right click packet and prints the cell centres.
+# anvil: pickaxe into the input slot, type "Bo e1" into the name field (E and the digit must not close the panel / swap), the server's result slot must fill (rename accepted).
+# enchanting table: pickaxe + 3 lapis in, click the first option; the server must enchant the pickaxe and take one lapis
+if [ "${RUN_INV_CONT:-0}" = 1 ]; then
+CJD="$W/cj"; CJAR=""
+MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_client.sh "$CJD" "$MCV" >/dev/null 2>&1 && CJAR="$CJD/client.jar"
+CJENV=(MC_VANILLA=1 "MC_VANILLA_JAR=$CJAR" "MC_VANILLA_ASSETS=${MC_VANILLA_ASSETS:-/root/.w5/menu-assets}" MC_VANILLA_INDEX=5)
+[ -n "$CJAR" ] || { echo "  FAIL  cont ui: no client jar for $MCV"; ERR=1; }
+ccell() { grep "contui cell $2 " "$W/$1.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
+cclick() { local xy; xy=$(ccell "$1" "$2"); [ -n "$xy" ] || { echo "  FAIL  cont ui: no cell $2"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.8; }
+env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player16 > "$W/an.out" 2>&1 &
+PP=$!
+sleep 5
+echo "kill @e[type=minecraft:item]" >&3
+echo "execute at Player16 run setblock ~1 ~ ~ minecraft:air" >&3
+echo "gamemode survival Player16" >&3; echo "give Player16 iron_pickaxe 1" >&3; echo "give Player16 stone 4" >&3
+echo "execute at Player16 run setblock ~1 ~ ~ minecraft:anvil" >&3
+for i in $(seq 1 40); do grep -q 'contui cell hot1 ' "$W/an.out" 2>/dev/null && break; sleep 1; done
+if grep -q 'contui cell hot1 ' "$W/an.out"; then
+    sleep 1
+    cclick an hot0; cclick an ws=0
+    xdotool type --delay 250 "Bo e1"; sleep 2.5
+    xdotool key Escape; sleep 1.5
+else
+    echo "  FAIL  anvil ui: anvil did not open"; ERR=1
+fi
+wait $PP
+ANS=$(grep 'mcplay: contui state' "$W/an.out" | head -1); ANE=$(grep 'mcplay: contui end' "$W/an.out" | head -1)
+echo "  $ANS"; echo "  $ANE"
+case "$ANS" in *"kind=5"*) ;; *) echo "  FAIL  anvil ui: no anvil state: $ANS"; ERR=1;; esac
+python3 - "$ANS" <<'PY' || { echo "  FAIL  anvil ui: local state $ANS"; ERR=1; }
+import re,sys
+t=sys.argv[1]
+def num(k):
+    m=re.search(k+r'=(-?\d+)', t); return int(m.group(1)) if m else None
+w0=re.search(r'w0=(-?\d+)x(\d+)', t); w2=re.search(r'w2=(-?\d+)x(\d+)', t)
+ok=bool(w0) and int(w0.group(1))>=0 and int(w0.group(2))==1 and bool(w2) and int(w2.group(1))>=0 and (num('cost') or 0)>0 and num('name_n')==5 and (num('sent_name') or 0)>=5
+sys.exit(0 if ok else 1)
+PY
+case "$ANE" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;; *) echo "  FAIL  anvil ui: panel did not close / mouse not captured again: $ANE"; ERR=1;; esac
+env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=2 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player17 > "$W/en.out" 2>&1 &
+PP=$!
+sleep 5
+echo "kill @e[type=minecraft:item]" >&3
+echo "execute at Player17 run setblock ~1 ~ ~ minecraft:air" >&3
+echo "gamemode survival Player17" >&3; echo "xp set Player17 30 levels" >&3; echo "give Player17 iron_pickaxe 1" >&3; echo "give Player17 lapis_lazuli 3" >&3
+echo "execute at Player17 run setblock ~1 ~ ~ minecraft:enchanting_table" >&3
+for i in $(seq 1 40); do grep -q 'contui cell hot1 ' "$W/en.out" 2>/dev/null && break; sleep 1; done
+if grep -q 'contui cell hot1 ' "$W/en.out"; then
+    sleep 1
+    cclick en hot0; cclick en ws=0; cclick en hot1; cclick en ws=1
+    sleep 2
+    cclick en opt0; sleep 2
+    xdotool key Escape; sleep 1.5
+    echo "data get entity Player17 Inventory" >&3
+    sleep 2
+else
+    echo "  FAIL  enchant ui: table did not open"; ERR=1
+fi
+wait $PP
+ENS=$(grep 'mcplay: contui state' "$W/en.out" | head -1); ENE=$(grep 'mcplay: contui end' "$W/en.out" | head -1)
+echo "  $ENS"; echo "  $(grep 'mcplay: enchant click' "$W/en.out" | head -2 | tr '\n' ' ')"
+case "$ENS" in *"kind=6"*"w1="*"x2 "*"sent_button=1"*) ;; *) echo "  FAIL  enchant ui: local state $ENS"; ERR=1;; esac
+case "$ENE" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;; *) echo "  FAIL  enchant ui: panel did not close / mouse not captured again: $ENE"; ERR=1;; esac
+EI=$(grep 'Player17 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$EI" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+ench='iron_pickaxe' in t and 'nchantments' in t
+lap=re.search(r'\{[^{}]*lapis_lazuli[^{}]*\}', t)
+cnt=re.search(r'(?:Count: |count: )(\d+)', lap.group(0)) if lap else None
+print("  server: pickaxe enchanted=%s lapis=%s" % (ench, cnt.group(1) if cnt else None))
+sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
+PY
+fi
 # ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &

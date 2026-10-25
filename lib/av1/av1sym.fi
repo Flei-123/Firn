@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/av1/av1sym.fi -- AV1 range (symbol) decoder with CDF adaptation.
+import rt.rt
+import av1.av1mem
+
+export { Sym, sym_init, sym_read, sym_bool, sym_literal, sym_set_update, sym_bits_left, cdf_ld, cdf_st, cdf_copy }
+
+struct Sym {
+    p: u64,
+    n: i64,
+    pos: i64,
+    val: i64,
+    rng: i64,
+    maxbits: i64,
+    upd: i64,
+}
+
+static BOOL_CDF: [u16; 3] = [16384, 32768, 0]
+
+#[no_gc]
+fn cdf_ld(cdf: u64, i: i64) -> i64 {
+    return (*((cdf + (i * 2) as u64) as *mut u16)) as i64
+}
+
+#[no_gc]
+fn cdf_st(cdf: u64, i: i64, v: i64) {
+    *((cdf + (i * 2) as u64) as *mut u16) = (v & 65535) as u16
+}
+
+fn cdf_copy(dst: u64, src: u64, cells: i64) {
+    var i: i64 = 0
+    while i < cells {
+        cdf_st(dst, i, cdf_ld(src, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn rb(s: *mut Sym, i: i64) -> i64 {
+    if i < 0 || i >= (*s).n {
+        return 0
+    }
+    return (*(((*s).p + i as u64) as *mut u8)) as i64
+}
+
+fn sym_getbits(s: *mut Sym, k: i64) -> i64 {
+    if k <= 0 {
+        return 0
+    }
+    let by: i64 = (*s).pos >> 3
+    let sh: i64 = (*s).pos & 7
+    let w: i64 = (rb(s, by) << 16) | (rb(s, by + 1) << 8) | rb(s, by + 2)
+    (*s).pos = (*s).pos + k
+    return (w >> (24 - sh - k)) & ((1 << k) - 1)
+}
+
+fn floor_log2(x: i64) -> i64 {
+    var r: i64 = 0
+    var v: i64 = x
+    while v > 1 {
+        v = v >> 1
+        r = r + 1
+    }
+    return r
+}
+
+fn sym_init(s: *mut Sym, p: u64, n: i64, update: i64) {
+    (*s).p = p
+    (*s).n = n
+    (*s).pos = 0
+    var nb: i64 = n * 8
+    if nb > 15 {
+        nb = 15
+    }
+    let buf: i64 = sym_getbits(s, nb)
+    let padded: i64 = buf << (15 - nb)
+    (*s).val = 32767 ^ padded
+    (*s).rng = 32768
+    (*s).maxbits = 8 * n - 15
+    (*s).upd = update
+}
+
+fn sym_set_update(s: *mut Sym, update: i64) {
+    (*s).upd = update
+}
+
+fn sym_bits_left(s: *mut Sym) -> i64 {
+    return (*s).maxbits
+}
+
+fn sym_core(s: *mut Sym, cdf: u64, nsym: i64) -> i64 {
+    var cur: i64 = (*s).rng
+    var prev: i64 = cur
+    var symbol: i64 = -1
+    let r8: i64 = (*s).rng >> 8
+    let v: i64 = (*s).val
+    while true {
+        symbol = symbol + 1
+        prev = cur
+        let f: i64 = 32768 - cdf_ld(cdf, symbol)
+        cur = ((r8 * (f >> 6)) >> 1) + 4 * (nsym - symbol - 1)
+        if !(v < cur) {
+            break
+        }
+        if symbol >= nsym - 1 {
+            break
+        }
+    }
+    (*s).rng = prev - cur
+    (*s).val = v - cur
+    let bits: i64 = 15 - floor_log2((*s).rng)
+    (*s).rng = (*s).rng << bits
+    var nb: i64 = (*s).maxbits
+    if nb < 0 {
+        nb = 0
+    }
+    if nb > bits {
+        nb = bits
+    }
+    let nd: i64 = sym_getbits(s, nb)
+    let pd: i64 = nd << (bits - nb)
+    (*s).val = pd ^ ((((*s).val + 1) << bits) - 1)
+    (*s).maxbits = (*s).maxbits - bits
+    return symbol
+}
+
+fn sym_read(s: *mut Sym, cdf: u64, nsym: i64) -> i64 {
+    let symbol: i64 = sym_core(s, cdf, nsym)
+    if (*s).upd != 0 {
+        let cnt: i64 = cdf_ld(cdf, nsym)
+        var rate: i64 = 3
+        if cnt > 15 {
+            rate = rate + 1
+        }
+        if cnt > 31 {
+            rate = rate + 1
+        }
+        var fl: i64 = floor_log2(nsym)
+        if fl > 2 {
+            fl = 2
+        }
+        rate = rate + fl
+        var tmp: i64 = 0
+        var i: i64 = 0
+        while i < nsym - 1 {
+            if i == symbol {
+                tmp = 32768
+            }
+            let c: i64 = cdf_ld(cdf, i)
+            if tmp < c {
+                cdf_st(cdf, i, c - ((c - tmp) >> rate))
+            } else {
+                cdf_st(cdf, i, c + ((tmp - c) >> rate))
+            }
+            i = i + 1
+        }
+        if cnt < 32 {
+            cdf_st(cdf, nsym, cnt + 1)
+        }
+    }
+    return symbol
+}
+
+fn sym_bool(s: *mut Sym) -> i64 {
+    return sym_core(s, (&BOOL_CDF[0]) as u64, 2)
+}
+
+fn sym_literal(s: *mut Sym, n: i64) -> i64 {
+    var x: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        x = 2 * x + sym_bool(s)
+        i = i + 1
+    }
+    return x
+}
