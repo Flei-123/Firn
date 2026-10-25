@@ -1,0 +1,202 @@
+import std.rt
+import std.vec
+import fontsrc.model
+import fontgen.fgbytes
+import fontgen.glyf
+
+export { build_gpos }
+
+const MAX_PAIRS: usize = 40000
+const SUBTABLE_BUDGET: usize = 48000
+const HEADER_SIZE: usize = 10
+const SCRIPT_LIST_SIZE: usize = 20
+const FEATURE_LIST_SIZE: usize = 14
+
+struct GposPair {
+    left: u32,
+    right: u32,
+    value: i64,
+}
+
+fn pair_before(a: *mut GposPair, b: *mut GposPair) -> bool {
+    if (*a).left != (*b).left {
+        return (*a).left < (*b).left
+    }
+    return (*a).right < (*b).right
+}
+
+fn collect_pairs(f: *mut model.Font, pairs: *mut vec.Vec[GposPair]) {
+    var i: usize = 0
+    let n: usize = model.font_kern_count(f)
+    while i < n && vec.vec_len[GposPair](pairs) < MAX_PAIRS {
+        let k: *mut model.Kern = model.font_kern_at(f, i)
+        let left: i64 = glyf.gid_of_cp(f, (*k).left)
+        let right: i64 = glyf.gid_of_cp(f, (*k).right)
+        if left >= 0 && right >= 0 && (*k).value != 0 {
+            vec.vec_push[GposPair](pairs, GposPair { left: left as u32, right: right as u32, value: (*k).value })
+        }
+        i = i + 1
+    }
+}
+
+fn sort_pairs(pairs: *mut vec.Vec[GposPair]) {
+    let n: usize = vec.vec_len[GposPair](pairs)
+    var i: usize = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && pair_before(vec.vec_elem_ptr[GposPair](pairs, j), vec.vec_elem_ptr[GposPair](pairs, j - 1)) {
+            vec.vec_swap[GposPair](pairs, j, j - 1)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+fn group_end(pairs: *mut vec.Vec[GposPair], from: usize) -> usize {
+    let n: usize = vec.vec_len[GposPair](pairs)
+    let left: u32 = (*vec.vec_elem_ptr[GposPair](pairs, from)).left
+    var j: usize = from
+    while j < n && (*vec.vec_elem_ptr[GposPair](pairs, j)).left == left {
+        j = j + 1
+    }
+    return j
+}
+
+fn subtable_end(pairs: *mut vec.Vec[GposPair], from: usize) -> usize {
+    let n: usize = vec.vec_len[GposPair](pairs)
+    var at: usize = from
+    var size: usize = 14
+    while at < n {
+        let next: usize = group_end(pairs, at)
+        let add: usize = 8 + (next - at) * 4
+        if at > from && size + add > SUBTABLE_BUDGET {
+            break
+        }
+        size = size + add
+        at = next
+    }
+    return at
+}
+
+fn build_pair_pos(pairs: *mut vec.Vec[GposPair], from: usize, to: usize, out: *mut rt.Buf) {
+    var groups: usize = 0
+    var at: usize = from
+    while at < to {
+        groups = groups + 1
+        at = group_end(pairs, at)
+    }
+    let coverage_at: usize = 10 + 2 * groups
+    fgbytes.put16(out, 1)
+    fgbytes.put16(out, coverage_at as u32)
+    fgbytes.put16(out, 4)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, groups as u32)
+    var offset: usize = coverage_at + 4 + 2 * groups
+    at = from
+    while at < to {
+        let next: usize = group_end(pairs, at)
+        fgbytes.put16(out, offset as u32)
+        offset = offset + 2 + (next - at) * 4
+        at = next
+    }
+    fgbytes.put16(out, 1)
+    fgbytes.put16(out, groups as u32)
+    at = from
+    while at < to {
+        fgbytes.put16(out, (*vec.vec_elem_ptr[GposPair](pairs, at)).left)
+        at = group_end(pairs, at)
+    }
+    at = from
+    while at < to {
+        let next: usize = group_end(pairs, at)
+        fgbytes.put16(out, (next - at) as u32)
+        var k: usize = at
+        while k < next {
+            let p: *mut GposPair = vec.vec_elem_ptr[GposPair](pairs, k)
+            fgbytes.put16(out, (*p).right)
+            fgbytes.put_i16(out, (*p).value)
+            k = k + 1
+        }
+        at = next
+    }
+}
+
+fn build_script_and_feature_lists(out: *mut rt.Buf) {
+    fgbytes.put16(out, 1)
+    fgbytes.put_tag(out, "DFLT")
+    fgbytes.put16(out, 8)
+    fgbytes.put16(out, 4)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, 65535)
+    fgbytes.put16(out, 1)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, 1)
+    fgbytes.put_tag(out, "kern")
+    fgbytes.put16(out, 8)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, 1)
+    fgbytes.put16(out, 0)
+}
+
+fn build_gpos(f: *mut model.Font, out: *mut rt.Buf) -> bool {
+    var pairs: vec.Vec[GposPair] = vec.vec_new[GposPair]()
+    collect_pairs(f, &pairs)
+    if vec.vec_len[GposPair](&pairs) == 0 {
+        vec.vec_free[GposPair](&pairs)
+        return false
+    }
+    sort_pairs(&pairs)
+    var bodies: vec.Vec[rt.Buf] = vec.vec_new[rt.Buf]()
+    var at: usize = 0
+    let n: usize = vec.vec_len[GposPair](&pairs)
+    while at < n {
+        let to: usize = subtable_end(&pairs, at)
+        var body: rt.Buf = rt.buf_new()
+        build_pair_pos(&pairs, at, to, &body)
+        vec.vec_push[rt.Buf](&bodies, body)
+        at = to
+    }
+    let count: usize = vec.vec_len[rt.Buf](&bodies)
+    let lookup_list_at: usize = HEADER_SIZE + SCRIPT_LIST_SIZE + FEATURE_LIST_SIZE
+    fgbytes.put32(out, 65536 as u32)
+    fgbytes.put16(out, HEADER_SIZE as u32)
+    fgbytes.put16(out, (HEADER_SIZE + SCRIPT_LIST_SIZE) as u32)
+    fgbytes.put16(out, lookup_list_at as u32)
+    build_script_and_feature_lists(out)
+    fgbytes.put16(out, 1)
+    fgbytes.put16(out, 4)
+    fgbytes.put16(out, 9)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, count as u32)
+    let lookup_header: usize = 6 + 2 * count
+    var offset: usize = lookup_header
+    var i: usize = 0
+    while i < count {
+        fgbytes.put16(out, offset as u32)
+        offset = offset + 8
+        i = i + 1
+    }
+    var extension_at: usize = lookup_header
+    var body_at: usize = lookup_header + 8 * count
+    i = 0
+    while i < count {
+        let body: *mut rt.Buf = vec.vec_elem_ptr[rt.Buf](&bodies, i)
+        fgbytes.put16(out, 1)
+        fgbytes.put16(out, 2)
+        fgbytes.put32(out, (body_at - extension_at) as u32)
+        extension_at = extension_at + 8
+        body_at = body_at + rt.buf_len(body)
+        i = i + 1
+    }
+    i = 0
+    while i < count {
+        let body: *mut rt.Buf = vec.vec_elem_ptr[rt.Buf](&bodies, i)
+        rt.buf_push_bytes(out, rt.buf_ptr(body), rt.buf_len(body))
+        rt.buf_free(body)
+        i = i + 1
+    }
+    vec.vec_free[rt.Buf](&bodies)
+    vec.vec_free[GposPair](&pairs)
+    return true
+}
