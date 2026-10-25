@@ -5,7 +5,8 @@
 #   2. lifeprobe.fi on an Xvfb window: resize, OUT_OF_DATE, SUBOPTIMAL, minimised, SURFACE_LOST, DEVICE_LOST, each vs an offscreen render
 #   3. tools/gpu/vk/run.sh (offscreen triangles vs mc_raster, PSNR >= 34 dB, ms/frame, swapchain) = the regression of vk.fi
 #   4. Windows builds (vkplat.windows.fi + vk_life) compile only; pure test also runs under Wine when available
-#   5. voxel scenes vs mc_raster (PSNR >= 34 dB) through vk_mc: NOT wired yet (see docs/VK-LIFE.md "Harness"), prints the state
+#   5. voxel / scene / model layers vs mc_raster (PSNR >= 34 dB) through vk_mc: vkmc_run.sh, vkscene_run.sh, vkmodel_run.sh
+#   6. Windows cross build of demos/mcplay (vk_mc + vkplat.windows) compiles (compile only, no Windows Vulkan device here)
 # SKIP (exit 0) without libvulkan / ICD. Usage: bash tools/mc/vk/run.sh [firnc]
 set -u
 cd "$(dirname "$0")/../../.."
@@ -43,8 +44,8 @@ fi
 bash tools/gpu/vk/run.sh "$FIRNC" 2>&1 | grep -E "ok:|FAIL|SKIP|us/frame|psnr=" | sed 's/^/   /'
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 # Windows: compile only
-for f in tools/mc/vk/lifeprobe.fi tests/3101_mc_vk_life_cache.fi; do
-    if "$FIRNC" --target=x86_64-windows -o "$D/w.exe" "$f" 2>"$D/err"; then echo "   ok:   Windows build of $(basename "$f") (compile only)"; else echo "   FAIL: Windows build of $f"; head -3 "$D/err"; fail=1; fi
+for f in tools/mc/vk/lifeprobe.fi tests/3101_mc_vk_life_cache.fi demos/mcplay/main.fi; do
+    if "$FIRNC" --target=x86_64-windows --opt-level=dev-fast -o "$D/w.exe" "$f" 2>"$D/err"; then echo "   ok:   Windows build of $(basename "$f") (compile only)"; else echo "   FAIL: Windows build of $f"; head -3 "$D/err"; fail=1; fi
 done
 WINE=$(command -v wine64 || command -v wine || true)
 if [ -n "$WINE" ] && "$FIRNC" --target=x86_64-windows -o "$D/p.exe" tests/3100_mc_vk_life_pure.fi 2>/dev/null; then
