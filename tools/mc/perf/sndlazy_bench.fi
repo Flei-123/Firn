@@ -12,6 +12,22 @@ import mc.mc_packsnd
 import mc.mc_lazysnd
 import mc.mc_vanilla
 import mc.mc_vanilla_snd
+import jobs.jobs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn parse_uint(s: str) -> u64 {
+    var v: u64 = 0 as u64
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 as u64 + (rt.ld8(s.p as u64, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
 
 fn ms_since(t0: u64) -> u64 {
     return (time.monotonic_ns() - t0) / 1000000 as u64
@@ -20,12 +36,11 @@ fn ms_since(t0: u64) -> u64 {
 #[allow_escape]
 fn main(start: u64) -> i32 {
     let args: [str; 6] = [env.get("SB_SYNTH"), env.get("SB_ASSETS"), env.get("SB_INDEX"), env.get("SB_MODE"), env.get("SB_EAGER_MS"), env.get("SB_CACHE")]
-    var eager_ms: u64 = 0 as u64
-    var i: usize = 0
-    while i < args[4].length() {
-        eager_ms = eager_ms * 10 as u64 + (rt.ld8(args[4].p as u64, i) - 48 as u8) as u64
-        i = i + 1
-    }
+    let eager_ms: u64 = parse_uint(args[4])
+    let workers: u64 = parse_uint(env.get("SB_THREADS"))
+    let sync_bytes: u64 = parse_uint(env.get("SB_SYNC_BYTES"))
+    var pool: jobs.Jobs = jobs.Jobs { blk: 0 }
+    if workers > 0 as u64 { pool = jobs.create(workers) }
     let lazy: bool = args[3].length() == 4
     var kept: i32 = 0
     let t_cache: u64 = time.monotonic_ns()
@@ -39,6 +54,7 @@ fn main(start: u64) -> i32 {
     var b: bank.Bank = bank.bank_new()
     var m: mc_audio.McAudio = mc_audio.mca_new(&e)
     if lazy { mc_audio.mca_set_lazy_sounds(&m, true, eager_ms, 0) }
+    if lazy && pool.blk != 0 { mc_audio.mca_set_lazy_pool(&m, ((&pool) as *mut jobs.Jobs) as u64, sync_bytes as usize) }
     if args[0].length() > 0 {
         let t_syn: u64 = time.monotonic_ns()
         let r: i32 = mc_audio.mca_bank_load_file(&m, &b, args[0])
@@ -54,6 +70,7 @@ fn main(start: u64) -> i32 {
     while k < 8 {
         var worst: u64 = 0 as u64
         var total: u64 = 0 as u64
+        var worst_poll: u64 = 0 as u64
         var r: i32 = 0
         while r < 16 {
             let t1: u64 = time.monotonic_ns()
@@ -61,11 +78,27 @@ fn main(start: u64) -> i32 {
             let us: u64 = (time.monotonic_ns() - t1) / 1000 as u64
             total = total + us
             if us > worst { worst = us }
+            var spins: i32 = 0
+            while mc_lazysnd.lazy_inflight(lz) > 0 && spins < 4000 {
+                let t2: u64 = time.monotonic_ns()
+                mc_lazysnd.lazy_poll(lz)
+                let pus: u64 = (time.monotonic_ns() - t2) / 1000 as u64
+                if pus > worst_poll { worst_poll = pus }
+                time.sleep_ms(1 as u64)
+                spins = spins + 1
+            }
             r = r + 1
         }
-        io.fmt_print(f"play {names[k]} 16x total_us={total} worst_us={worst}\n")
+        io.fmt_print(f"play {names[k]} 16x total_us={total} worst_us={worst} worst_poll_us={worst_poll}\n")
         k = k + 1
     }
-    io.fmt_print(f"after plays: samples={engine.engine_sample_count(&e)} pending={mc_lazysnd.lazy_pending(lz)} decoded={(*lz).decoded} failed={(*lz).failed} full={(*lz).full}\n")
+    if env.get("SB_EVICT").length() > 0 {
+        let t3: u64 = time.monotonic_ns()
+        let ev: usize = mc_lazysnd.lazy_evict(lz, 200)
+        io.fmt_print(f"evict 200 -> {ev} in us={(time.monotonic_ns() - t3) / 1000 as u64}\n")
+    }
+    io.fmt_print(f"after plays: samples={engine.engine_sample_count(&e)} pending={mc_lazysnd.lazy_pending(lz)} decoded={(*lz).decoded} failed={(*lz).failed} full={(*lz).full} async_jobs={(*lz).async_jobs} async_done={(*lz).async_done} evicted={(*lz).evicted}\n")
+    mc_audio.mca_set_lazy_pool(&m, 0 as u64, 0)
+    if pool.blk != 0 { jobs.destroy(&pool) }
     return 0
 }

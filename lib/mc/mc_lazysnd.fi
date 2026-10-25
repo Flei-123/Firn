@@ -5,12 +5,13 @@ import std.time
 import audio.engine
 import audio.bank
 import audio.load_ogg
+import mc.mc_lazydec
 import zip.zip
 import mc.mc_assets
 
 export {
     Lazy, lazy_new, lazy_free, lazy_enable, lazy_on, lazy_reset, lazy_begin_apply, lazy_eager_ok, lazy_placeholder, lazy_begin, lazy_add_slot,
-    lazy_commit, lazy_ensure, lazy_pending, lazy_find_ogg, lazy_file_hash, LAZY_NAME, LAZY_MAX_EVENTS,
+    lazy_commit, lazy_ensure, lazy_pending, lazy_poll, lazy_drain, lazy_set_pool, lazy_inflight, lazy_evict, lazy_find_ogg, lazy_file_hash, LAZY_NAME, LAZY_MAX_EVENTS,
 }
 
 const LAZY_NAME: str = "lazy:silence"
@@ -21,6 +22,13 @@ const F_SLOTS: usize = 1
 const F_DIST: usize = 2
 const F_DONE: usize = 3
 const F_NAME: usize = 4
+const F_INFLIGHT: usize = 5
+const MAX_INFLIGHT: usize = 8
+const POLL_BUDGET: usize = 2
+const EVICT_LOW: usize = 48
+const EVICT_BATCH: usize = 96
+const RETIRED_CAP: usize = 512
+const GRACE_NS: u64 = 1500000000
 const F_DIST_OFF: usize = 8
 const F_SLOT_DIST: usize = 24
 
@@ -42,14 +50,37 @@ struct Lazy {
     failed: i32,
     full: i32,
     steps: i32,
+    pool: u64,
+    sync_bytes: usize,
+    jobs_p: u64,
+    n_infl: usize,
+    stamps: u64,
+    victims: u64,
+    retired: u64,
+    n_ret: usize,
+    tick: u32,
+    evicted: i32,
+    async_jobs: i32,
+    async_done: i32,
 }
 
 fn lazy_new() -> Lazy {
     return Lazy { on: false, eager_ns: 2000000000 as u64, min_events: 256, t0: 0 as u64, placeholder: 0 - 1, recs: 0, by_ev: 0, n: 0, paths: rt.buf_new(), names: rt.buf_new(),
-        st: 0 as *mut mc_assets.PackStack, eng: 0 as *mut engine.Engine, bk: 0 as *mut bank.Bank, decoded: 0, failed: 0, full: 0, steps: 0 }
+        st: 0 as *mut mc_assets.PackStack, eng: 0 as *mut engine.Engine, bk: 0 as *mut bank.Bank, decoded: 0, failed: 0, full: 0, steps: 0,
+        pool: 0, sync_bytes: 0, jobs_p: 0, n_infl: 0, stamps: 0, victims: 0, retired: 0, n_ret: 0, tick: 1 as u32, evicted: 0, async_jobs: 0, async_done: 0 }
 }
 
 fn lazy_free(lz: *mut Lazy) {
+    lazy_drain(lz)
+    if (*lz).jobs_p != 0 { rt.heap_free((*lz).jobs_p, MAX_INFLIGHT * 8) }
+    if (*lz).stamps != 0 { rt.heap_free((*lz).stamps, engine.MAX_SAMPLES * 4) }
+    if (*lz).victims != 0 { rt.heap_free((*lz).victims, engine.MAX_SAMPLES * 4) }
+    if (*lz).retired != 0 { rt.heap_free((*lz).retired, RETIRED_CAP * 16) }
+    (*lz).jobs_p = 0
+    (*lz).stamps = 0
+    (*lz).victims = 0
+    (*lz).retired = 0
+    (*lz).pool = 0
     if (*lz).recs != 0 { rt.heap_free((*lz).recs, LAZY_MAX_EVENTS * WORDS * 4) }
     if (*lz).by_ev != 0 { rt.heap_free((*lz).by_ev, LAZY_MAX_EVENTS * 4) }
     (*lz).recs = 0
@@ -73,6 +104,18 @@ fn lazy_enable(lz: *mut Lazy, eager_ns: u64, min_events: usize) -> bool {
         (*lz).by_ev = rt.heap_alloc(LAZY_MAX_EVENTS * 4)
         if (*lz).recs == 0 || (*lz).by_ev == 0 { return false }
         zero32((*lz).by_ev, LAZY_MAX_EVENTS)
+        (*lz).jobs_p = rt.heap_alloc(MAX_INFLIGHT * 8)
+        (*lz).stamps = rt.heap_alloc(engine.MAX_SAMPLES * 4)
+        (*lz).victims = rt.heap_alloc(engine.MAX_SAMPLES * 4)
+        (*lz).retired = rt.heap_alloc(RETIRED_CAP * 16)
+        if (*lz).jobs_p == 0 || (*lz).stamps == 0 || (*lz).victims == 0 || (*lz).retired == 0 { return false }
+        var w: usize = 0
+        while w < MAX_INFLIGHT {
+            rt.st64((*lz).jobs_p, w, 0)
+            w = w + 1
+        }
+        zero32((*lz).stamps, engine.MAX_SAMPLES)
+        zero32((*lz).victims, engine.MAX_SAMPLES)
     }
     (*lz).eager_ns = eager_ns
     (*lz).min_events = min_events
@@ -93,6 +136,8 @@ fn lazy_pending(lz: *mut Lazy) -> usize {
 }
 
 fn lazy_reset(lz: *mut Lazy) {
+    lazy_drain(lz)
+    if (*lz).stamps != 0 { zero32((*lz).stamps, engine.MAX_SAMPLES) }
     if (*lz).by_ev != 0 { zero32((*lz).by_ev, LAZY_MAX_EVENTS) }
     (*lz).n = 0
     rt.buf_clear(&(*lz).paths)
@@ -216,60 +261,299 @@ fn lazy_find_ogg(s: *mut mc_assets.PackStack, path: u64, pn: usize, raw: *mut rt
     return false
 }
 
-fn decode_path(lz: *mut Lazy, off: usize) -> i32 {
+fn slot_sample_ok(id: i32) -> bool { return id >= 0 && (id as usize) < engine.MAX_SAMPLES }
+
+fn lazy_touch(lz: *mut Lazy, ev: i32, base: usize) {
+    let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
+    var s: usize = 0
+    while s < slots {
+        let id: i32 = engine.engine_event_slot_sample((*lz).eng, ev, s)
+        if slot_sample_ok(id) && rt.ld32((*lz).stamps, id as usize) != 0 as u32 { rt.st32((*lz).stamps, id as usize, (*lz).tick) }
+        s = s + 1
+    }
+}
+
+fn lazy_apply(lz: *mut Lazy, base: usize, ev: i32, done: usize, id: i32) {
+    let ph: i32 = (*lz).placeholder
+    let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
+    var s: usize = 0
+    while s < slots {
+        let mine: bool = rt.ld32((*lz).recs, base + F_SLOT_DIST + s) as usize == done
+        if mine || engine.engine_event_slot_sample((*lz).eng, ev, s) == ph {
+            engine.engine_event_set_sample((*lz).eng, ev, s, id)
+        }
+        s = s + 1
+    }
+    lazy_advance(lz, base, done)
+}
+
+fn lazy_advance(lz: *mut Lazy, base: usize, done: usize) {
+    if rt.ld32((*lz).recs, base + F_DONE) as usize == done { rt.st32((*lz).recs, base + F_DONE, (done + 1) as u32) }
+}
+
+fn lazy_register(lz: *mut Lazy, nm: str, h: u64, id: i32) {
+    bank.bank_provide_hashed((*lz).bk, nm, h, id)
+    if slot_sample_ok(id) { rt.st32((*lz).stamps, id as usize, (*lz).tick) }
+    (*lz).decoded = (*lz).decoded + 1
+    if engine.engine_sample_room((*lz).eng) < EVICT_LOW { lazy_evict(lz, EVICT_BATCH) }
+}
+
+fn lazy_sweep(lz: *mut Lazy) {
+    if (*lz).n_ret == 0 { return }
+    let now: u64 = time.monotonic_ns()
+    var keep: usize = 0
+    var i: usize = 0
+    while i < (*lz).n_ret {
+        let id: i32 = rt.ld64((*lz).retired, i * 2) as i32
+        let ts: u64 = rt.ld64((*lz).retired, i * 2 + 1)
+        var gone: bool = false
+        if now - ts >= GRACE_NS { gone = engine.engine_sample_release((*lz).eng, id) }
+        if !gone {
+            rt.st64((*lz).retired, keep * 2, id as u64)
+            rt.st64((*lz).retired, keep * 2 + 1, ts)
+            keep = keep + 1
+        }
+        i = i + 1
+    }
+    (*lz).n_ret = keep
+}
+
+fn pick_victims(lz: *mut Lazy, want: usize) -> usize {
+    let nsm: usize = engine.engine_sample_count((*lz).eng)
+    zero32((*lz).victims, engine.MAX_SAMPLES)
+    var count: usize = 0
+    var tries: usize = 0
+    while count < want && tries < want * 2 + 8 && (*lz).n_ret + count < RETIRED_CAP {
+        tries = tries + 1
+        var best: i32 = 0 - 1
+        var best_stamp: u32 = 4294967295 as u32
+        var i: usize = 0
+        while i < nsm {
+            let st: u32 = rt.ld32((*lz).stamps, i)
+            if st != 0 as u32 && rt.ld32((*lz).victims, i) == 0 as u32 && st <= best_stamp {
+                best = i as i32
+                best_stamp = st
+            }
+            i = i + 1
+        }
+        if best < 0 { break }
+        if engine.engine_sample_in_use((*lz).eng, best) {
+            rt.st32((*lz).victims, best as usize, 2 as u32)
+        } else {
+            rt.st32((*lz).victims, best as usize, 1 as u32)
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn repend_records(lz: *mut Lazy) {
+    var r: usize = 0
+    while r < (*lz).n {
+        let base: usize = r * WORDS
+        let ev: i32 = rt.ld32((*lz).recs, base + F_EV) as i32
+        if ev < 0 || rt.ld32((*lz).recs, base + F_INFLIGHT) != 0 as u32 {
+            r = r + 1
+            continue
+        }
+        let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
+        var first: usize = rt.ld32((*lz).recs, base + F_DIST) as usize
+        var s: usize = 0
+        while s < slots {
+            let id: i32 = engine.engine_event_slot_sample((*lz).eng, ev, s)
+            if slot_sample_ok(id) && rt.ld32((*lz).victims, id as usize) == 1 as u32 {
+                let d: usize = rt.ld32((*lz).recs, base + F_SLOT_DIST + s) as usize
+                if d < first { first = d }
+            }
+            s = s + 1
+        }
+        if first < rt.ld32((*lz).recs, base + F_DONE) as usize { rt.st32((*lz).recs, base + F_DONE, first as u32) }
+        r = r + 1
+    }
+}
+
+fn lazy_evict(lz: *mut Lazy, want: usize) -> usize {
+    if (*lz).eng as u64 == 0 || (*lz).retired == 0 || (*lz).stamps == 0 || (*lz).placeholder < 0 { return 0 }
+    let count: usize = pick_victims(lz, want)
+    if count == 0 { return 0 }
+    repend_records(lz)
+    let now: u64 = time.monotonic_ns()
+    let nsm: usize = engine.engine_sample_count((*lz).eng)
+    var i: usize = 0
+    while i < nsm {
+        if rt.ld32((*lz).victims, i) == 1 as u32 {
+            engine.engine_sample_retarget((*lz).eng, i as i32, (*lz).placeholder)
+            bank.bank_forget_sample((*lz).bk, i as i32, (*lz).placeholder)
+            rt.st32((*lz).stamps, i, 0 as u32)
+            rt.st64((*lz).retired, (*lz).n_ret * 2, i as u64)
+            rt.st64((*lz).retired, (*lz).n_ret * 2 + 1, now)
+            (*lz).n_ret = (*lz).n_ret + 1
+        }
+        i = i + 1
+    }
+    (*lz).evicted = (*lz).evicted + count as i32
+    return count
+}
+
+fn lazy_set_pool(lz: *mut Lazy, pool: u64, sync_bytes: usize) {
+    lazy_drain(lz)
+    (*lz).pool = pool
+    (*lz).sync_bytes = sync_bytes
+}
+
+fn lazy_inflight(lz: *mut Lazy) -> usize { return (*lz).n_infl }
+
+fn lazy_drain(lz: *mut Lazy) {
+    if (*lz).jobs_p == 0 { return }
+    var i: usize = 0
+    while i < MAX_INFLIGHT {
+        let job: u64 = rt.ld64((*lz).jobs_p, i)
+        if job != 0 {
+            var pcm: load_ogg.OggPcm = load_ogg.OggPcm { data: 0, frames: 0 as u64, channels: 0 as u32 }
+            mc_lazydec.dj_collect((*lz).pool, job, &pcm)
+            load_ogg.ogg_pcm_free(&pcm)
+            let r: usize = mc_lazydec.dj_get(job, mc_lazydec.DJ_REC) as usize
+            if r < (*lz).n && (*lz).recs != 0 { rt.st32((*lz).recs, r * WORDS + F_INFLIGHT, 0 as u32) }
+            mc_lazydec.dj_free(job)
+            rt.st64((*lz).jobs_p, i, 0)
+        }
+        i = i + 1
+    }
+    (*lz).n_infl = 0
+}
+
+fn complete_job(lz: *mut Lazy, slot: usize, job: u64) {
+    var pcm: load_ogg.OggPcm = load_ogg.OggPcm { data: 0, frames: 0 as u64, channels: 0 as u32 }
+    let ok: bool = mc_lazydec.dj_collect((*lz).pool, job, &pcm)
+    let r: usize = mc_lazydec.dj_get(job, mc_lazydec.DJ_REC) as usize
+    let done: usize = mc_lazydec.dj_get(job, mc_lazydec.DJ_DONE) as usize
+    let h: u64 = mc_lazydec.dj_get(job, mc_lazydec.DJ_HASH)
+    let off: usize = mc_lazydec.dj_get(job, mc_lazydec.DJ_NAME) as usize
+    rt.st64((*lz).jobs_p, slot, 0)
+    (*lz).n_infl = (*lz).n_infl - 1
+    let base: usize = r * WORDS
+    rt.st32((*lz).recs, base + F_INFLIGHT, 0 as u32)
+    let ev: i32 = rt.ld32((*lz).recs, base + F_EV) as i32
+    let nm: str = str { p: rt.buf_data(&(*lz).paths) + off as u64, n: line_end(&(*lz).paths, off) - off }
+    var id: i32 = 0 - 1
+    var retry: bool = false
+    if ok {
+        let cached: i32 = bank.bank_cached_id((*lz).bk, nm, h)
+        if cached >= 0 {
+            id = cached
+        } else if engine.engine_sample_room((*lz).eng) == 0 {
+            (*lz).full = (*lz).full + 1
+            lazy_evict(lz, EVICT_BATCH)
+            retry = true
+        } else {
+            id = engine.engine_add_sample((*lz).eng, pcm.data, pcm.frames, pcm.channels)
+            if id >= 0 { lazy_register(lz, nm, h, id) }
+        }
+    }
+    load_ogg.ogg_pcm_free(&pcm)
+    mc_lazydec.dj_free(job)
+    (*lz).async_done = (*lz).async_done + 1
+    if retry { return }
+    if id >= 0 && ev >= 0 {
+        lazy_apply(lz, base, ev, done, id)
+    } else {
+        (*lz).failed = (*lz).failed + 1
+        lazy_advance(lz, base, done)
+    }
+}
+
+fn lazy_poll(lz: *mut Lazy) {
+    if (*lz).eng as u64 == 0 { return }
+    lazy_sweep(lz)
+    if (*lz).n_infl == 0 { return }
+    var budget: usize = POLL_BUDGET
+    var i: usize = 0
+    while i < MAX_INFLIGHT && budget > 0 {
+        let job: u64 = rt.ld64((*lz).jobs_p, i)
+        if job != 0 && mc_lazydec.dj_ready(job) {
+            budget = budget - 1
+            complete_job(lz, i, job)
+        }
+        i = i + 1
+    }
+}
+
+fn submit_job(lz: *mut Lazy, r: usize, done: usize, off: usize, h: u64, og: *mut rt.Buf) -> bool {
+    var slot: usize = MAX_INFLIGHT
+    var i: usize = 0
+    while i < MAX_INFLIGHT {
+        if rt.ld64((*lz).jobs_p, i) == 0 {
+            slot = i
+            break
+        }
+        i = i + 1
+    }
+    if slot == MAX_INFLIGHT { return false }
+    let job: u64 = mc_lazydec.dj_new((*lz).pool, rt.buf_ptr(og), rt.buf_len(og), (*(*lz).eng).rate)
+    if job == 0 { return false }
+    mc_lazydec.dj_set(job, mc_lazydec.DJ_REC, r as u64)
+    mc_lazydec.dj_set(job, mc_lazydec.DJ_DONE, done as u64)
+    mc_lazydec.dj_set(job, mc_lazydec.DJ_HASH, h)
+    mc_lazydec.dj_set(job, mc_lazydec.DJ_NAME, off as u64)
+    rt.st64((*lz).jobs_p, slot, job)
+    (*lz).n_infl = (*lz).n_infl + 1
+    rt.st32((*lz).recs, r * WORDS + F_INFLIGHT, 1 as u32)
+    return true
+}
+
+fn step_file(lz: *mut Lazy, r: usize, ev: i32) {
+    let base: usize = r * WORDS
+    let done: usize = rt.ld32((*lz).recs, base + F_DONE) as usize
+    let off: usize = rt.ld32((*lz).recs, base + F_DIST_OFF + done) as usize
     let e: usize = line_end(&(*lz).paths, off)
     let p: u64 = rt.buf_ptr(&(*lz).paths) + off as u64
     let nm: str = str { p: rt.buf_data(&(*lz).paths) + off as u64, n: e - off }
     var og: rt.Buf = rt.buf_new()
-    var id: i32 = 0 - 1
     if !lazy_find_ogg((*lz).st, p, e - off, &og) {
         (*lz).failed = (*lz).failed + 1
-    } else {
-        let h: u64 = lazy_file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
-        let cached: i32 = bank.bank_cached_id((*lz).bk, nm, h)
-        if cached >= 0 {
-            id = cached
-        } else if engine.engine_sample_count((*lz).eng) >= engine.MAX_SAMPLES {
-            (*lz).full = (*lz).full + 1
-        } else {
-            id = load_ogg.ogg_load((*lz).eng, rt.buf_ptr(&og), rt.buf_len(&og))
-            if id >= 0 {
-                bank.bank_provide_hashed((*lz).bk, nm, h, id)
-                (*lz).decoded = (*lz).decoded + 1
-            } else {
-                (*lz).failed = (*lz).failed + 1
-            }
-        }
+        lazy_advance(lz, base, done)
+        rt.buf_free(&og)
+        return
     }
+    let h: u64 = lazy_file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
+    let cached: i32 = bank.bank_cached_id((*lz).bk, nm, h)
+    if cached >= 0 {
+        lazy_apply(lz, base, ev, done, cached)
+        rt.buf_free(&og)
+        return
+    }
+    (*lz).steps = (*lz).steps + 1
+    if (*lz).pool != 0 && rt.buf_len(&og) >= (*lz).sync_bytes {
+        if submit_job(lz, r, done, off, h, &og) { (*lz).async_jobs = (*lz).async_jobs + 1 }
+        rt.buf_free(&og)
+        return
+    }
+    if engine.engine_sample_room((*lz).eng) == 0 {
+        (*lz).full = (*lz).full + 1
+        lazy_evict(lz, EVICT_BATCH)
+        rt.buf_free(&og)
+        return
+    }
+    let id: i32 = load_ogg.ogg_load((*lz).eng, rt.buf_ptr(&og), rt.buf_len(&og))
     rt.buf_free(&og)
-    return id
+    if id < 0 {
+        (*lz).failed = (*lz).failed + 1
+        lazy_advance(lz, base, done)
+        return
+    }
+    lazy_register(lz, nm, h, id)
+    lazy_apply(lz, base, ev, done, id)
 }
 
 fn lazy_ensure(lz: *mut Lazy, ev: i32) {
     if !(*lz).on || ev < 0 || (ev as usize) >= LAZY_MAX_EVENTS || (*lz).by_ev == 0 { return }
     let k: u32 = rt.ld32((*lz).by_ev, ev as usize)
     if k == 0 as u32 { return }
-    let base: usize = ((k - 1 as u32) as usize) * WORDS
-    let done: usize = rt.ld32((*lz).recs, base + F_DONE) as usize
-    let nd: usize = rt.ld32((*lz).recs, base + F_DIST) as usize
-    if done >= nd {
-        rt.st32((*lz).by_ev, ev as usize, 0 as u32)
-        return
-    }
-    (*lz).steps = (*lz).steps + 1
-    let id: i32 = decode_path(lz, rt.ld32((*lz).recs, base + F_DIST_OFF + done) as usize)
-    if id >= 0 {
-        let ph: i32 = (*lz).placeholder
-        let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
-        var s: usize = 0
-        while s < slots {
-            let mine: bool = rt.ld32((*lz).recs, base + F_SLOT_DIST + s) as usize == done
-            if mine || engine.engine_event_slot_sample((*lz).eng, ev, s) == ph {
-                engine.engine_event_set_sample((*lz).eng, ev, s, id)
-            }
-            s = s + 1
-        }
-    }
-    rt.st32((*lz).recs, base + F_DONE, (done + 1) as u32)
-    if done + 1 >= nd { rt.st32((*lz).by_ev, ev as usize, 0 as u32) }
+    (*lz).tick = (*lz).tick + 1 as u32
+    let r: usize = (k - 1 as u32) as usize
+    let base: usize = r * WORDS
+    lazy_touch(lz, ev, base)
+    if rt.ld32((*lz).recs, base + F_INFLIGHT) != 0 as u32 { return }
+    if rt.ld32((*lz).recs, base + F_DONE) >= rt.ld32((*lz).recs, base + F_DIST) { return }
+    step_file(lz, r, ev)
 }
