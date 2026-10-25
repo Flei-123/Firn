@@ -354,7 +354,7 @@ MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VI
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &
 PP=$!
 sleep 6
-echo "gamemode creative Player15" >&3
+echo "gamemode survival Player15" >&3; sleep 1; echo "gamemode creative Player15" >&3
 echo "clear Player15" >&3
 sleep 3
 crcell() { grep "crui cell $1 " "$W/cr.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
