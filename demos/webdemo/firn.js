@@ -579,6 +579,15 @@ const firnTag = document.currentScript;
         e.preventDefault();
         ev(x.firn_web_wheel_ex ? x.firn_web_wheel_ex(e.deltaX, e.deltaY, e.deltaMode, mods(e)) : x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode));
     }, { passive: false });
+    const BROWSER_FKEYS = new Set(['F5', 'F11', 'F12']);
+    const BROWSER_CTRL = new Set(['r', 'l', 'w', 't', 'Tab', 'PageUp', 'PageDown', '0', '-', '=', '+']);
+    const BROWSER_CTRL_SHIFT = new Set(['i', 'j', 'c', 'k', 'r', 't', 'n', 'w']);
+    const browserOwned = (e) => {
+        if (BROWSER_FKEYS.has(e.key)) return true;
+        if (!(e.ctrlKey || e.metaKey)) return false;
+        const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+        return BROWSER_CTRL.has(k) || (e.shiftKey && BROWSER_CTRL_SHIFT.has(k));
+    };
     const key = (down) => (e) => {
         if (e.isComposing || e.key === 'Process' || e.key === 'Unidentified') return;
         // The mirrored field edits itself (Backspace, the arrows, Home/End,
@@ -589,7 +598,7 @@ const firnTag = document.currentScript;
         const k = utf8.encode(e.key).subarray(0, 255);
         const p = x.firn_web_scratch();
         bytes(p, k.length).set(k);
-        if (ev(x.firn_web_key(down, p, k.length, mods(e)))) e.preventDefault();
+        if (ev(x.firn_web_key(down, p, k.length, mods(e))) && !browserOwned(e)) e.preventDefault();
     };
     for (const t of [canvas, ta]) { t.addEventListener('keydown', key(1)); t.addEventListener('keyup', key(0)); }
 
