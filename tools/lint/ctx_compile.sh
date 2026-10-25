@@ -13,7 +13,7 @@ ctx_flags() {
     case "$1" in
         lib/@android/*|lib/android/*|lib/plat/android/*) echo "--target=aarch64-android --pic -c" ;;
         lib/@windows/*|*.windows.fi) echo "--target=x86_64-windows" ;;
-        lib/@web/*) echo "--target=wasm32-browser" ;;
+        lib/@web/*|lib/gpu/glweb*|lib/plat/web*) echo "--target=wasm32-browser" ;;
         *) echo "" ;;
     esac
 }
