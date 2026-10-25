@@ -121,6 +121,7 @@ import mc.mc_health_ui
 import mc.mc_hud_play
 import mc.mc_item_icon
 import mc.mc_inv_ui
+import mc.mc_inv_drag
 import mc.mc_hud_debug
 import mc.mc_shot
 import mc.mc_keybinds
@@ -471,6 +472,7 @@ struct Ctx {
     hudp: mc_hud_play.HudPlay,
     icons: mc_item_icon.IconCache,
     iui: mc_inv_ui.InvUi,
+    idrag: mc_inv_drag.InvDrag,
     shot_req: bool,
     shot_armed: bool,
     shot_n: i32,
@@ -1284,7 +1286,7 @@ fn track_held(c: *mut Ctx) {
 fn handle_hotbar(c: *mut Ctx) {
     if mc_pause.pause_active() { return }
     let hb: i32 = mc_keybinds.kb_hotbar_pressed(&(*c).kb, &(*c).rw)
-    if hb >= 0 { (*c).pl.slot = hb }
+    if hb >= 0 && !(*c).show_inv { (*c).pl.slot = hb }
     let wy: i64 = raw.wheel_y(&(*c).rw)
     if wy != 0 && (*c).grab {
         (*c).pl.slot = mc_world.floor_mod((*c).pl.slot - (wy as i32), 9)
@@ -1781,6 +1783,7 @@ fn draw_container(c: *mut Ctx, r: *mut mc_raster.Raster) {
 fn ui_set_open(c: *mut Ctx, on: bool) {
     if on == (*c).show_inv { return }
     (*c).show_inv = on
+    (*c).idrag = mc_inv_drag.idrag_new()
     if on {
         (*c).ui_regrab = (*c).grab
         if (*c).grab { grab_mouse(c, false) }
@@ -1850,17 +1853,14 @@ fn ui_slot_at(c: *mut Ctx) -> i32 {
     return 0 - 1
 }
 
-// Mouse in the open inventory panel: left / right click = Click Container (shift = quick move, asks the server only)
-fn ui_inv_click(c: *mut Ctx) {
-    var btn: i32 = 0 - 1
-    if raw.mouse_pressed(&(*c).rw, raw.MB_LEFT) { btn = 0 }
-    if raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT) { btn = 1 }
-    if btn < 0 { return }
-    let slot: i32 = ui_slot_at(c)
-    if slot == 0 - 1 { return }
+fn if_mb(btn: i32) -> u32 {
+    if btn == 1 { return raw.MB_RIGHT }
+    return raw.MB_LEFT
+}
+
+fn ui_click_now(c: *mut Ctx, btn: i32, slot: i32) {
     var mode: i32 = 0
     if raw.key_down(&(*c).rw, 42 as u32) && slot >= 0 { mode = 1 }
-    // a second left press on the same slot within 250 ms (hand not empty) collects equal stacks: Click Container mode 6
     let now: u64 = now_ms()
     if mode == 0 && btn == 0 && slot >= 0 && slot == (*c).last_click_slot && now - (*c).last_click_t < 250 as u64 && mc_inv.inv_cursor_item(&(*c).inv) >= 0 {
         mode = 6
@@ -1868,6 +1868,69 @@ fn ui_inv_click(c: *mut Ctx) {
     (*c).last_click_slot = slot
     (*c).last_click_t = now
     mc_inv.inv_click(&(*c).cl, &(*c).inv, slot, btn, mode)
+}
+
+fn ui_drag_events(c: *mut Ctx, slot: i32) {
+    let ev: i32 = mc_inv_drag.idrag_hover(&(*c).idrag, slot)
+    let typ: i32 = mc_inv_drag.idrag_type(&(*c).idrag)
+    if ev == mc_inv_drag.EV_BEGIN {
+        mc_inv.inv_drag_begin(&(*c).cl, &(*c).inv, typ)
+        mc_inv.inv_drag_add(&(*c).cl, &(*c).inv, mc_inv_drag.idrag_start_slot(&(*c).idrag), typ)
+        mc_inv.inv_drag_add(&(*c).cl, &(*c).inv, slot, typ)
+    } else if ev == mc_inv_drag.EV_ADD {
+        mc_inv.inv_drag_add(&(*c).cl, &(*c).inv, slot, typ)
+    }
+}
+
+fn ui_inv_keys(c: *mut Ctx, slot: i32) {
+    if slot < 0 { return }
+    if mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_DROP) && mc_inv.inv_cursor_item(&(*c).inv) < 0 {
+        let all: bool = raw.key_down(&(*c).rw, 29 as u32)
+        mc_inv.inv_drop_slot(&(*c).cl, &(*c).inv, slot, all)
+        return
+    }
+    let hb: i32 = mc_keybinds.kb_hotbar_pressed(&(*c).kb, &(*c).rw)
+    if hb >= 0 {
+        mc_inv.inv_click(&(*c).cl, &(*c).inv, slot, hb, 2)
+        return
+    }
+    if mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_SWAP) {
+        mc_inv.inv_click(&(*c).cl, &(*c).inv, slot, 40, 2)
+    }
+}
+
+// Mouse in the open inventory panel: click on release, drag over slots with a carried stack (left = split evenly, right = one each), Q / number keys on the hovered slot
+fn ui_inv_click(c: *mut Ctx) {
+    let slot: i32 = ui_slot_at(c)
+    let d: *mut mc_inv_drag.InvDrag = &(*c).idrag
+    if mc_inv_drag.idrag_held(d) {
+        let b: u32 = if_mb(mc_inv_drag.idrag_button(d))
+        if raw.mouse_down(&(*c).rw, b) {
+            ui_drag_events(c, slot)
+        } else {
+            let rel: i32 = mc_inv_drag.idrag_release(d)
+            if rel == mc_inv_drag.REL_END {
+                mc_inv.inv_drag_end(&(*c).cl, &(*c).inv, mc_inv_drag.idrag_type(d))
+            } else if rel == mc_inv_drag.REL_CLICK {
+                ui_click_now(c, mc_inv_drag.idrag_button(d), mc_inv_drag.idrag_start_slot(d))
+            }
+        }
+        return
+    }
+    var btn: i32 = 0 - 1
+    if raw.mouse_pressed(&(*c).rw, raw.MB_LEFT) { btn = 0 }
+    if raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT) { btn = 1 }
+    if btn < 0 {
+        ui_inv_keys(c, slot)
+        return
+    }
+    if slot == 0 - 1 { return }
+    let shift: bool = raw.key_down(&(*c).rw, 42 as u32)
+    if slot >= 0 && !shift && mc_inv.inv_cursor_item(&(*c).inv) >= 0 {
+        mc_inv_drag.idrag_press(d, btn, slot)
+        return
+    }
+    ui_click_now(c, btn, slot)
 }
 
 // MCPLAY_CLICK_TEST=1 (survival, after `give <name> stone 32`): picks the stack of 32 up, puts it into slot 10, takes half, puts that
@@ -3480,7 +3543,7 @@ fn main(start: u64) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_biome_updates: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
-        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), chat_ui: mc_chat_ui.chatui_new(), tabl: mc_tablist.tab_new(), tab_log: env_flag("MCPLAY_TAB_LOG", false), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), icons: mc_item_icon.icons_new(), iui: mc_inv_ui.iui_new(), shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, tab_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), chat_ui: mc_chat_ui.chatui_new(), tabl: mc_tablist.tab_new(), tab_log: env_flag("MCPLAY_TAB_LOG", false), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), icons: mc_item_icon.icons_new(), iui: mc_inv_ui.iui_new(), idrag: mc_inv_drag.idrag_new(), shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, tab_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, sprint_sent: false, input_sent: 0 as u32, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
