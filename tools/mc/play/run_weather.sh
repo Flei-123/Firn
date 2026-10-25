@@ -12,7 +12,7 @@ case "$MCV" in 1.20.1) PROTO=763;; 1.21.1) PROTO=767;; 1.21.4) PROTO=769;; 1.21.
 export MCPLAY_PROTOCOL=$PROTO
 JAVA=${JAVA:-/usr/bin/java}; [ -x /root/tools/jdk25/bin/java ] && case "$MCV" in 1.2[1-9]*|26*) JAVA=/root/tools/jdk25/bin/java ;; esac
 W=$(mktemp -d); SRV_PID=""; XV_PID=""
-cleanup() { exec 3>&- 2>/dev/null; if [ -n "${MCPLAY_KEEP_DIR:-}" ]; then mkdir -p "$MCPLAY_KEEP_DIR"; cp "$W"/*.out "$W"/server.log "$MCPLAY_KEEP_DIR"/ 2>/dev/null; fi; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; sleep 1; rm -rf "$W"; }
+cleanup() { exec 3>&- 2>/dev/null; if [ -n "${MCPLAY_KEEP_DIR:-}" ]; then mkdir -p "$MCPLAY_KEEP_DIR"; cp "$W"/*.out "$W"/*.xwd "$W"/server.log "$MCPLAY_KEEP_DIR"/ 2>/dev/null; fi; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; sleep 1; rm -rf "$W"; }
 trap cleanup EXIT
 fail() { echo "  FAIL  $1"; echo "RESULT mc-play-weather: FAIL"; exit 1; }
 for t in Xvfb xdotool; do command -v $t >/dev/null || fail "missing tool: $t"; done
@@ -58,9 +58,10 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
-FIRN_AUDIO="file:$W/weather.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_WEATHER_LOG=1 MCPLAY_BIOME_LOG=1 MCPLAY_RUN_S=${WEATHER_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+FIRN_AUDIO="file:$W/weather.wav" MCPLAY_CREATIVE=0 MCPLAY_AUDIO_LOG=1 MCPLAY_WEATHER_LOG=1 MCPLAY_BIOME_LOG=1 MCPLAY_RUN_S=${WEATHER_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 200 "$W/mcplay" 127.0.0.1 "$PORT" WeatherA > "$W/a.out" 2>&1 &
 PP=$!
+shot() { xwd -root -silent -out "$W/$1.xwd" 2>/dev/null; }
 wait_for() { # pattern, seconds
     local i
     for i in $(seq 1 "$2"); do grep -Eq "$1" "$W/a.out" 2>/dev/null && return 0; kill -0 "$PP" 2>/dev/null || return 1; sleep 1; done
@@ -93,8 +94,11 @@ echo "weather rain 1000" >&3
 wait_for 'weather raining=true rain=1000 ' 40 || { echo "  FAIL  rain level did not reach 1000"; ERR=1; }
 wait_for 'audiolog .* ev=weather\.rain ' 40 || { echo "  FAIL  no rain sound logged"; ERR=1; }
 echo "weather thunder 1000" >&3
+wait_for 'weather raining=true rain=1000 thunder=1000 ' 40 && shot rain || true
 wait_for 'weather raining=true rain=1000 thunder=1000 ' 40 || { echo "  FAIL  thunder level did not reach 1000"; ERR=1; }
-echo "execute at WeatherA run summon lightning_bolt ~4 ~ ~" >&3
+( for i in $(seq 1 600); do grep -q 'bolt drawn bolts=1' "$W/a.out" 2>/dev/null && { shot bolt; break; }; sleep 0.05; done ) &
+SH_PID=$!
+echo "execute at WeatherA run summon lightning_bolt ~ ~ ~7" >&3
 wait_for 'lightning new=' 30 || { echo "  FAIL  lightning bolt entity not seen"; ERR=1; }
 wait_for 'bolt drawn bolts=1 boxes=224' 30 || { echo "  FAIL  bolt geometry not drawn (expected 224 boxes)"; ERR=1; }
 wait_for 'audiolog .* ev=entity\.lightning_bolt\.thunder ' 20 || { echo "  FAIL  no thunder sound logged"; ERR=1; }
@@ -102,6 +106,28 @@ wait_for 'audiolog .* ev=entity\.lightning_bolt\.impact ' 20 || { echo "  FAIL  
 echo "weather clear 1000" >&3
 wait_for 'weather raining=false rain=0 ' 60 || { echo "  FAIL  weather did not clear to 0"; ERR=1; }
 wait $PP
+kill "$SH_PID" 2>/dev/null
+if [ -f "$W/bolt.xwd" ]; then
+    python3 -I - "$W/bolt.xwd" <<'PY' || ERR=1
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+h = struct.unpack(">25I", d[:100])
+hdr, w, ht, bpl, ncol = h[0], h[4], h[5], h[12], h[19]
+off = hdr + ncol * 12
+bright = 0
+for y in range(min(ht, 360)):
+    row = d[off + y * bpl: off + y * bpl + min(w, 640) * 4]
+    for x in range(0, len(row), 4):
+        if min(row[x], row[x + 1], row[x + 2]) >= 235:
+            bright += 1
+print("  bolt frame: %d emissive pixels" % bright)
+if bright < 300:
+    print("  FAIL  bolt is not bright (%d pixels >= 235, expected >= 300)" % bright)
+    sys.exit(1)
+PY
+else
+    echo "  FAIL  no bolt screenshot"; ERR=1
+fi
 grep -qiE "invalid|disconnect|kicked|illegal" "$W/server.log" && grep -iE "invalid|disconnect|kicked|illegal" "$W/server.log" | head -3
 grep 'weather raining=' "$W/a.out" | sed -n '1p;$p'
 grep -E 'mcplay: audio bytes' "$W/a.out" | sed 's/.*sounds=/  audio: sounds=/'
