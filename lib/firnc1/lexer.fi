@@ -166,27 +166,40 @@ const L_FSTR: u32 = 3
 // Firn has no mutable global state (point 13 of the list in
 // docs/SELF_HOSTING.md). So a word table cannot be a global constant --
 // it is built from ONE '|' separated literal.
+const TAB_FIRST_BYTES: usize = 256
+const TAB_MASK_LIMIT: usize = 64
+
 struct Table {
     txt: u64,
     off: Vec[u32],
     len: Vec[u32],
+    first: u64,
 }
 
 fn table_new() -> Table {
-    return Table { txt: 0, off: vec_new[u32](), len: vec_new[u32]() }
+    return Table { txt: 0, off: vec_new[u32](), len: vec_new[u32](), first: 0 }
 }
 
 fn table_free(t: *mut Table) {
     vec_free[u32](&(*t).off)
     vec_free[u32](&(*t).len)
+    rt.heap_free((*t).first, TAB_FIRST_BYTES * 8)
+    (*t).first = 0
 }
 
 fn tab_build(t: *mut Table, p: u64, n: usize) {
     (*t).txt = p
+    (*t).first = rt.heap_alloc(TAB_FIRST_BYTES * 8)
+    rt.mem_set((*t).first, 0 as u8, TAB_FIRST_BYTES * 8)
     var start: usize = 0
     var i: usize = 0
     while i <= n {
         if i == n || rt.ld8(p, i) == 124 as u8 {
+            let slot: usize = vec_len[u32](&(*t).off)
+            if slot < TAB_MASK_LIMIT && i > start {
+                let lead: usize = rt.ld8(p, start) as usize
+                rt.st64((*t).first, lead, rt.ld64((*t).first, lead) | (1 as u64 << slot as u64))
+            }
             vec_push[u32](&(*t).off, start as u32)
             vec_push[u32](&(*t).len, (i - start) as u32)
             start = i + 1
@@ -547,6 +560,19 @@ fn hex_value(c: u32) -> i32 {
 
 // ------------------------------------------------- whitespace and comments
 
+fn skip_line(l: *mut Lexer) {
+    var p: usize = (*l).p
+    var c: u32 = (*l).col
+    while p < (*l).n {
+        let b: u8 = rt.ld8((*l).q, p)
+        if b == 10 as u8 { break }
+        if (b & 192 as u8) != 128 as u8 { c = c + 1 }
+        p = p + 1
+    }
+    (*l).p = p
+    (*l).col = c
+}
+
 fn skip(l: *mut Lexer) {
     while true {
         let c: u32 = look(l, 0)
@@ -555,15 +581,9 @@ fn skip(l: *mut Lexer) {
         } else if c == 35 && (*l).p == 0 && look(l, 1) == 33 {
             // Shebang: `#!` at offset 0 is a line comment (same rule as
             // skip_trivia in compiler/src/lexer.rs); the line break stays.
-            while (*l).p < (*l).n {
-                if look(l, 0) == 10 { break }
-                vor1(l)
-            }
+            skip_line(l)
         } else if c == 47 && look(l, 1) == 47 {
-            while (*l).p < (*l).n {
-                if look(l, 0) == 10 { break }
-                vor1(l)
-            }
+            skip_line(l)
         } else if c == 47 && look(l, 1) == 42 {
             let kz: u32 = (*l).line
             let ks: u32 = (*l).col
@@ -602,23 +622,25 @@ fn lex_name(l: *mut Lexer) {
     let line: u32 = (*l).line
     let col: u32 = (*l).col
     let start: usize = (*l).p
-    while (*l).p < (*l).n {
-        if !is_name_next(look(l, 0)) { break }
-        vor1(l)
+    var end: usize = start
+    while end < (*l).n && is_name_next(rt.ld8((*l).q, end) as u32) {
+        end = end + 1
     }
-    let len: usize = (*l).p - start
+    (*l).p = end
+    (*l).col = (*l).col + (end - start) as u32
+    let len: usize = end - start
+    var pending: u64 = rt.ld64((*l).kw.first, rt.ld8((*l).q, start) as usize)
     var k: usize = 0
-    while k < tab_count(&(*l).kw) {
-        if tab_length(&(*l).kw, k) == len {
+    while pending != 0 as u64 {
+        if (pending & 1 as u64) != 0 as u64 && tab_length(&(*l).kw, k) == len {
             if rt.mem_eq(tab_ptr(&(*l).kw, k), (*l).q + start as u64, len) {
-                // ROUND 89: every keyword but the last one is `4 + k`; see
-                // `A_KWSTATIC` above for why the last one is not.
                 var kind: u32 = 4 + k as u32
                 if k >= KW_STATIC_AT { kind = A_KWSTATIC + (k - KW_STATIC_AT) as u32 }
                 tok(l, kind, line, col, len as u32, 0, 0)
                 return
             }
         }
+        pending = pending >> 1 as u64
         k = k + 1
     }
     let n: i64 = intern.intern_number(lex_names(l), (*l).q + start as u64, len)

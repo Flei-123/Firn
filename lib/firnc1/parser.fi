@@ -35,6 +35,7 @@ import gc
 import iface
 import report
 import tokname
+import nameidx
 
 export { Parser, par_new, par_new_module, par_free, par_run, par_error, par_tree,
     par_file_set, par_pend,
@@ -202,6 +203,7 @@ struct Parser {
     foreign: u64, // shared tree (0 = we use our own)
     multi: bool, // several files are compiled (`module__x`); an interpolation copy keeps it, `foreign` alone cannot tell
     module: Vec[u32], // intern numbers of the module aliases (for `module.x`)
+    module_at: Vec[u32],
     module_to: Vec[u32], // parallel to `module`: the module name behind the alias (`import a.b as c`: c -> b)
     scratch: rt.Buf, // builds up qualified names
     parens: usize, // open parentheses (for `next()`)
@@ -377,6 +379,7 @@ fn par_new(lx: u64) -> Parser {
         tree: ast.tree_new(),
         alias: NONE, own: vec_new[u32](), foreign: 0, multi: false,
         module: vec_new[u32](),
+        module_at: vec_new[u32](),
         module_to: vec_new[u32](),
         scratch: rt.buf_new(),
         parens: 0, no_slit: 0, err: 0, pend: report.pend_new(), dmsg: rt.buf_new(), not_core: false,
@@ -494,6 +497,7 @@ fn par_free(p: *mut Parser) {
     }
     vec_free[u32](&(*p).module)
     vec_free[u32](&(*p).module_to)
+    vec_free[u32](&(*p).module_at)
     vec_free[u32](&(*p).own)
     rt.buf_free(&(*p).scratch)
     report.pend_free(&(*p).pend)
@@ -809,14 +813,7 @@ fn join(p: *mut Parser, a: u32, sep: u64, tn: usize, b: u32) -> u32 {
 
 // Is `nr` an identifier that THIS file declares at the top level?
 fn is_own(p: *mut Parser, nr: u32) -> bool {
-    var i: usize = 0
-    while i < vec_len[u32](&(*p).own) {
-        if vec_at[u32](&(*p).own, i) == nr {
-            return true
-        }
-        i = i + 1
-    }
-    return false
+    return nameidx.nameidx_get(&(*p).own, nr) != nameidx.NAMEIDX_NONE
 }
 
 // Rename an identifier of this file to `alias__name`. In the root file
@@ -991,27 +988,17 @@ fn qualify(p: *mut Parser, module: u32, name: u32) -> u32 {
 }
 
 fn is_module(p: *mut Parser, nr: u32) -> bool {
-    var i: usize = 0
-    while i < vec_len[u32](&(*p).module) {
-        if vec_at[u32](&(*p).module, i) == nr {
-            return true
-        }
-        i = i + 1
-    }
-    return false
+    return nameidx.nameidx_get(&(*p).module_at, nr) != nameidx.NAMEIDX_NONE
 }
 
 // `import a.b as c`: the module name behind the alias `c` (`b`); any other
 // name stays as it is (twin of `modules.rs`, alias -> last path part).
 fn module_target(p: *mut Parser, nr: u32) -> u32 {
-    var i: usize = 0
-    while i < vec_len[u32](&(*p).module) {
-        if vec_at[u32](&(*p).module, i) == nr {
-            return vec_at[u32](&(*p).module_to, i)
-        }
-        i = i + 1
+    let i: u32 = nameidx.nameidx_get(&(*p).module_at, nr)
+    if i == nameidx.NAMEIDX_NONE {
+        return nr
     }
-    return nr
+    return vec_at[u32](&(*p).module_to, i as usize)
 }
 
 // The identifier has already been read; if it is a module alias followed by
@@ -6617,6 +6604,7 @@ fn import_decl(p: *mut Parser) {
     }
     let path: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch), rt.buf_len(&(*p).scratch)) as u32
     ast.imp_add(par_tree(p), path, chosen)
+    nameidx.nameidx_put(&(*p).module_at, chosen, vec_len[u32](&(*p).module) as u32)
     vec_push[u32](&(*p).module, chosen)
     vec_push[u32](&(*p).module_to, last)
     end_stmt(p)
@@ -7083,6 +7071,7 @@ fn module_upfront(p: *mut Parser) {
                 chosen = lexer.lex_nr(lx(p), j + 1)
             }
             if last != ast.NOTHING {
+                nameidx.nameidx_put(&(*p).module_at, chosen, vec_len[u32](&(*p).module) as u32)
                 vec_push[u32](&(*p).module, chosen)
                 vec_push[u32](&(*p).module_to, last)
             }
@@ -7417,7 +7406,7 @@ fn own_search(p: *mut Parser) {
         let a: u32 = lexer.lex_kind(lx(p), i)
         // HOOK alias: `type NAME = T` declares a name of this module
         if a == A_IDENT && alias_head_at(p, i) == 1 {
-            vec_push[u32](&(*p).own, lexer.lex_nr(lx(p), i + 1))
+            nameidx.nameidx_put(&(*p).own, lexer.lex_nr(lx(p), i + 1), 0)
         }
         // ROUND 89: `static mut NAME` puts one token between the keyword
         // and the name; `static NAME` does not. Everything else in this
@@ -7426,7 +7415,7 @@ fn own_search(p: *mut Parser) {
             var at: usize = i + 1
             if lexer.lex_kind(lx(p), at) == A_KWMUT { at = at + 1 }
             if at < (*p).n && lexer.lex_kind(lx(p), at) == A_IDENT {
-                vec_push[u32](&(*p).own, lexer.lex_nr(lx(p), at))
+                nameidx.nameidx_put(&(*p).own, lexer.lex_nr(lx(p), at), 0)
             }
             i = i + 1
             continue
@@ -7442,7 +7431,7 @@ fn own_search(p: *mut Parser) {
                     generic = lexer.lex_kind(lx(p), i + 2) == A_LBRACKET
                 }
                 if !generic {
-                    vec_push[u32](&(*p).own, lexer.lex_nr(lx(p), i + 1))
+                    nameidx.nameidx_put(&(*p).own, lexer.lex_nr(lx(p), i + 1), 0)
                 }
             }
         }
