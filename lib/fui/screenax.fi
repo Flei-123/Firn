@@ -5,12 +5,13 @@ import fui.widget
 export {
     Ax, install, active, get, begin, note, note_last, set_value_last, count, changed, mark_shown, F_FOCUS, F_CHECKED, F_SELECTED, F_DISABLED, F_MENUITEM, F_HEADING,
     name_of, kind_of, state_of, value_of, rect_of, focusable, focus_step, focus_rect, focus_clear, target, set_tree, wants_tree, at_point, NONE, CAP,
-    focus_index, set_focus_index,
+    focus_index, set_focus_index, bind_last, text_last, text_of, owner_of, aux_of, set_num_handler, set_text_handler, note_join, group, apply_num, apply_text, settable_num, settable_text,
 }
 
 const CAP: usize = 256
 const ARENA: usize = 16384
 const NAME_MAX: usize = 120
+const TEXT_MAX: usize = 400
 const NONE: usize = 18446744073709551615
 
 const F_FOCUS: u32 = 1
@@ -30,6 +31,13 @@ struct Ax {
     len: [u32; 256],
     key: [u64; 256],
     val: [i64; 256],
+    own: [u64; 256],
+    aux: [u64; 256],
+    gr: [u32; 256],
+    toff: [u32; 256],
+    tlen: [u32; 256],
+    setnum: fn(u64, u64, i64) -> bool,
+    settext: fn(u64, u64, str) -> bool,
     r: [f64; 1024],
     n: usize,
     alen: usize,
@@ -39,9 +47,13 @@ struct Ax {
     fkey: u64,
     appfocus: bool,
     tree: bool,
+    grp: u32,
 }
 
 static mut G: u64 = 0
+
+fn no_num(own: u64, aux: u64, v: i64) -> bool { return false }
+fn no_text(own: u64, aux: u64, t: str) -> bool { return false }
 
 fn get() -> *mut Ax { return G as *mut Ax }
 fn active() -> bool { return G != 0 }
@@ -51,6 +63,8 @@ fn install() -> *mut Ax {
     let a: *mut Ax = rt.heap_alloc(1 << 15) as *mut Ax
     if a as u64 == 0 { return a }
     (*a).arena = rt.heap_alloc(ARENA)
+    (*a).setnum = no_num
+    (*a).settext = no_text
     (*a).n = 0
     (*a).alen = 0
     (*a).hash = SEED
@@ -58,6 +72,7 @@ fn install() -> *mut Ax {
     (*a).fkey = 0
     (*a).appfocus = false
     (*a).tree = false
+    (*a).grp = 0 as u32
     G = a as u64
     return a
 }
@@ -75,6 +90,11 @@ fn begin() {
     (*a).alen = 0
     (*a).hash = SEED
     (*a).appfocus = false
+    (*a).grp = 0 as u32
+}
+
+fn group(g: u32) {
+    if G != 0 { (*get()).grp = g }
 }
 
 fn mix(h: u64, v: u64) -> u64 { return (h ^ v) *% PRIME }
@@ -114,6 +134,11 @@ fn note(kind: u32, st: u32, name: str, x: f64, y: f64, w: f64, h: f64, value: i6
     (*a).len[i] = n as u32
     (*a).key[i] = k
     (*a).val[i] = value
+    (*a).own[i] = 0
+    (*a).gr[i] = (*a).grp
+    (*a).aux[i] = 0
+    (*a).toff[i] = 0 as u32
+    (*a).tlen[i] = 0 as u32
     (*a).r[i * 4] = x
     (*a).r[i * 4 + 1] = y
     (*a).r[i * 4 + 2] = w
@@ -124,12 +149,38 @@ fn note(kind: u32, st: u32, name: str, x: f64, y: f64, w: f64, h: f64, value: i6
     var hh: u64 = mix((*a).hash, k)
     hh = mix(hh, st as u64)
     hh = mix(hh, value as u64)
+    hh = mix(hh, (*a).grp as u64)
     hh = mix(hh, (x as i64) as u64)
     hh = mix(hh, (y as i64) as u64)
     hh = mix(hh, (w as i64) as u64)
     hh = mix(hh, (h as i64) as u64)
     (*a).hash = hh
     return i
+}
+
+#[allow_escape]
+fn note_join(kind: u32, st: u32, a: str, b: str, x: f64, y: f64, w: f64, h: f64, value: i64) -> usize {
+    if G == 0 { return NONE }
+    var buf: [u8; 128] = [0 as u8; 128]
+    var n: usize = 0
+    var i: usize = 0
+    while i < a.n && n < 60 {
+        buf[n] = rt.ld8(a.p as u64, i)
+        n = n + 1
+        i = i + 1
+    }
+    if a.n > 0 && b.n > 0 && n < 126 {
+        buf[n] = 58 as u8
+        buf[n + 1] = 32 as u8
+        n = n + 2
+    }
+    i = 0
+    while i < b.n && n < NAME_MAX {
+        buf[n] = rt.ld8(b.p as u64, i)
+        n = n + 1
+        i = i + 1
+    }
+    return note(kind, st, str { p: (&buf[0]) as *mut u8, n: n }, x, y, w, h, value)
 }
 
 fn note_last() -> usize {
@@ -141,6 +192,68 @@ fn set_value_last(v: i64) {
     if G == 0 || (*get()).n == 0 { return }
     (*get()).val[(*get()).n - 1] = v
     (*get()).hash = mix((*get()).hash, v as u64)
+}
+
+fn bind_last(own: u64, aux: u64) {
+    if G == 0 || (*get()).n == 0 { return }
+    let i: usize = (*get()).n - 1
+    (*get()).own[i] = own
+    (*get()).aux[i] = aux
+}
+
+fn text_last(t: str) {
+    if G == 0 || (*get()).n == 0 { return }
+    let a: *mut Ax = get()
+    let i: usize = (*a).n - 1
+    var n: usize = t.n
+    if n > TEXT_MAX { n = TEXT_MAX }
+    if (*a).alen + n > ARENA { return }
+    if n > 0 { rt.mem_copy((*a).arena + (*a).alen as u64, t.p as u64, n) }
+    (*a).toff[i] = (*a).alen as u32
+    (*a).tlen[i] = n as u32
+    (*a).alen = (*a).alen + n
+    var hh: u64 = (*a).hash
+    var j: usize = 0
+    while j < n {
+        hh = mix(hh, rt.ld8(t.p as u64, j) as u64)
+        j = j + 1
+    }
+    (*a).hash = mix(hh, n as u64)
+}
+
+fn text_of(i: usize) -> str {
+    let a: *mut Ax = get()
+    return str { p: ((*a).arena + (*a).toff[i] as u64) as *mut u8, n: (*a).tlen[i] as usize }
+}
+
+fn owner_of(i: usize) -> u64 { return (*get()).own[i] }
+fn aux_of(i: usize) -> u64 { return (*get()).aux[i] }
+
+fn set_num_handler(f: fn(u64, u64, i64) -> bool) {
+    if G != 0 { (*get()).setnum = f }
+}
+
+fn set_text_handler(f: fn(u64, u64, str) -> bool) {
+    if G != 0 { (*get()).settext = f }
+}
+
+fn settable_num(i: usize) -> bool {
+    return G != 0 && i < (*get()).n && (*get()).own[i] != 0 && (*get()).kind[i] == widget.KIND_SLIDER
+}
+
+fn settable_text(i: usize) -> bool {
+    return G != 0 && i < (*get()).n && (*get()).own[i] != 0 && (*get()).kind[i] == widget.KIND_TEXTBOX
+}
+
+fn apply_num(i: usize, v: i64) -> bool {
+    if !settable_num(i) || ((*get()).st[i] & F_DISABLED) != 0 as u32 { return false }
+    return ((*get()).setnum)((*get()).own[i], (*get()).aux[i], v)
+}
+
+#[allow_escape]
+fn apply_text(i: usize, t: str) -> bool {
+    if !settable_text(i) || ((*get()).st[i] & F_DISABLED) != 0 as u32 { return false }
+    return ((*get()).settext)((*get()).own[i], (*get()).aux[i], t)
 }
 
 fn name_of(i: usize) -> str {
@@ -190,6 +303,8 @@ fn focus_clear() {
     if G != 0 { (*get()).fkey = 0 }
 }
 
+fn rank(i: usize) -> u64 { return ((*get()).gr[i] as u64) * 4096 + i as u64 }
+
 fn focus_step(back: bool) -> bool {
     if G == 0 { return false }
     let a: *mut Ax = get()
@@ -203,10 +318,10 @@ fn focus_step(back: bool) -> bool {
     while i < (*a).n {
         if focusable(i) {
             cnt = cnt + 1
-            if first == NONE { first = i }
-            if cur != NONE && i < cur { prev = i }
-            if cur != NONE && i > cur && next == NONE { next = i }
-            last = i
+            if first == NONE || rank(i) < rank(first) { first = i }
+            if last == NONE || rank(i) > rank(last) { last = i }
+            if cur != NONE && rank(i) < rank(cur) && (prev == NONE || rank(i) > rank(prev)) { prev = i }
+            if cur != NONE && rank(i) > rank(cur) && (next == NONE || rank(i) < rank(next)) { next = i }
         }
         i = i + 1
     }
