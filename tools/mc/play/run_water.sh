@@ -91,7 +91,7 @@ SCENES=${WATER_SCENES:-top under up}
 for s in $SCENES; do
     case $s in
         top) P="6.5 -55 -4.5"; R="0 38";;
-        under) P="6.5 -59.5 9.5"; R="180 0";;
+        under) P="6.5 -60.0 9.5"; R="180 0";;
         up) P="5.0 -62.2 5.0"; R="0 -70";;
         edge) P="12.5 -58 1.5"; R="0 45";;
         *) continue;;
