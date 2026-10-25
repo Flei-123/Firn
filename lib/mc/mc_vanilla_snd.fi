@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.fs
+import std.env
+import std.str
+import std.json
+import zip.zip
+import mc.mc_vanilla
+import mc.mc_assetindex
+
+export {
+    vsnd_keep, vsnd_locate, vsnd_cache_file, vsnd_build_cache, vsnd_ensure, VSND_SKIP_PREFIXES,
+}
+
+const VSND_SKIP_PREFIXES: i32 = 2
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn starts(p: u64, n: usize, pre: str) -> bool {
+    if n < pre.length() { return false }
+    return rt.mem_eq(p, pre.p as u64, pre.length())
+}
+
+fn skip_prefix(i: i32) -> str {
+    if i == 0 { return "minecraft/sounds/music/" }
+    return "minecraft/sounds/records/"
+}
+
+fn vsnd_keep(p: u64, n: usize) -> bool {
+    if n == 21 && rt.mem_eq(p, "minecraft/sounds.json".p as u64, 21) { return true }
+    if !starts(p, n, "minecraft/sounds/") { return false }
+    if n < 22 || !rt.mem_eq(p + (n - 4) as u64, ".ogg".p as u64, 4) { return false }
+    var i: i32 = 0
+    while i < VSND_SKIP_PREFIXES {
+        if starts(p, n, skip_prefix(i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn index_path(assets: str, id: str, out: *mut rt.Buf) {
+    push(out, assets)
+    push(out, "/indexes/")
+    push(out, id)
+    push(out, ".json")
+}
+
+fn read_version_index_id(jar: str, version: str, out: *mut rt.Buf) -> bool {
+    var vj: rt.Buf = rt.buf_new()
+    push(&vj, mc_vanilla.vanilla_dir_of(jar))
+    push(&vj, "/")
+    push(&vj, version)
+    push(&vj, ".json")
+    var raw: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(rt.buf_str(&vj), &raw) catch | e | (0)
+    var ok: bool = false
+    if got > 0 { ok = mc_assetindex.aidx_version_index_id(rt.buf_ptr(&raw), rt.buf_len(&raw), out) }
+    rt.buf_free(&raw)
+    rt.buf_free(&vj)
+    return ok
+}
+
+fn vsnd_locate(jar: str, version: str, assets: *mut rt.Buf, id: *mut rt.Buf) -> bool {
+    if env.has("MC_VANILLA_ASSETS") && env.get("MC_VANILLA_ASSETS").length() > 0 {
+        push(assets, env.get("MC_VANILLA_ASSETS"))
+    } else {
+        let versions_dir: str = mc_vanilla.vanilla_dir_of(mc_vanilla.vanilla_dir_of(jar))
+        let root: str = mc_vanilla.vanilla_dir_of(versions_dir)
+        if root.length() == 0 { return false }
+        push(assets, root)
+        push(assets, "/assets")
+    }
+    if env.has("MC_VANILLA_INDEX") && env.get("MC_VANILLA_INDEX").length() > 0 {
+        push(id, env.get("MC_VANILLA_INDEX"))
+    } else if !read_version_index_id(jar, version, id) {
+        return false
+    }
+    var ip: rt.Buf = rt.buf_new()
+    index_path(rt.buf_str(assets), rt.buf_str(id), &ip)
+    let ok: bool = fs.is_file(rt.buf_str(&ip))
+    rt.buf_free(&ip)
+    return ok
+}
+
+fn vsnd_cache_file(version: str, id: str, out: *mut rt.Buf) -> bool {
+    if !mc_vanilla.vanilla_cache_dir(out) { return false }
+    push(out, "/vanillasnd-")
+    push(out, version)
+    push(out, "-")
+    push(out, id)
+    push(out, ".zip")
+    return true
+}
+
+fn add_object(w: *mut zip.ZipWriter, assets: str, ix: *mut mc_assetindex.AssetIndex, e: u32, name: str.Span, kept_json: *mut bool) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    var rc: i32 = 0
+    if !mc_assetindex.aidx_object_path(assets, mc_assetindex.aidx_hash(ix, e), &path) {
+        rt.buf_free(&path)
+        return 0
+    }
+    var body: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(rt.buf_str(&path), &body) catch | e2 | (0)
+    if got > 0 {
+        var zname: rt.Buf = rt.buf_new()
+        push(&zname, "assets/")
+        rt.buf_push_bytes(&zname, name.p as u64, name.n)
+        let is_json: bool = name.n == 21
+        let added: bool = zip.zip_add(w, rt.buf_str(&zname), rt.buf_ptr(&body), rt.buf_len(&body), is_json) catch | e2 | (false)
+        if added {
+            rc = 1
+            if is_json { *kept_json = true }
+        } else {
+            rc = 0 - 1
+        }
+        rt.buf_free(&zname)
+    }
+    rt.buf_free(&body)
+    rt.buf_free(&path)
+    return rc
+}
+
+fn vsnd_build_cache(assets: str, id: str, dest: str, pack_format: i32, count: *mut i32) -> i32 {
+    *count = 0
+    var ip: rt.Buf = rt.buf_new()
+    index_path(assets, id, &ip)
+    var raw: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(rt.buf_str(&ip), &raw) catch | e | (0)
+    rt.buf_free(&ip)
+    var ix: mc_assetindex.AssetIndex = mc_assetindex.aidx_new()
+    if got == 0 || !mc_assetindex.aidx_parse(&ix, rt.buf_ptr(&raw), rt.buf_len(&raw)) {
+        mc_assetindex.aidx_free(&ix)
+        rt.buf_free(&raw)
+        return mc_vanilla.VANILLA_NO_ASSETS
+    }
+    rt.buf_free(&raw)
+    var out: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&out)
+    var rc: i32 = mc_vanilla.VANILLA_OK
+    if !mc_vanilla.vanilla_add_meta(&w, pack_format) { rc = mc_vanilla.VANILLA_WRITE_FAILED }
+    var kept: i32 = 0
+    var kept_json: bool = false
+    var e: u32 = mc_assetindex.aidx_first(&ix)
+    while e != json.JSON_NONE && rc == mc_vanilla.VANILLA_OK {
+        let name: str.Span = mc_assetindex.aidx_name(&ix, e)
+        if vsnd_keep(name.p as u64, name.n) {
+            let r: i32 = add_object(&w, assets, &ix, e, name, &kept_json)
+            if r > 0 { kept = kept + 1 }
+            if r < 0 { rc = mc_vanilla.VANILLA_WRITE_FAILED }
+        }
+        e = mc_assetindex.aidx_next(&ix, e)
+    }
+    if rc == mc_vanilla.VANILLA_OK && !kept_json { rc = mc_vanilla.VANILLA_NO_ASSETS }
+    if rc == mc_vanilla.VANILLA_OK {
+        let fin: usize = zip.zip_finish(&w) catch | e2 | (0)
+        if fin == 0 { rc = mc_vanilla.VANILLA_WRITE_FAILED }
+    }
+    zip.zip_writer_free(&w)
+    mc_assetindex.aidx_free(&ix)
+    if rc == mc_vanilla.VANILLA_OK && !mc_vanilla.vanilla_write_cache(dest, &out) { rc = mc_vanilla.VANILLA_WRITE_FAILED }
+    rt.buf_free(&out)
+    if rc == mc_vanilla.VANILLA_OK { *count = kept }
+    return rc
+}
+
+fn vsnd_ensure(protocol: i32, out: *mut rt.Buf) -> i32 {
+    var jar: rt.Buf = rt.buf_new()
+    let found: i32 = mc_vanilla.vanilla_resolve(protocol, &jar)
+    if found != mc_vanilla.VANILLA_OK {
+        rt.buf_free(&jar)
+        return found
+    }
+    let version: str = mc_vanilla.vanilla_version_name(protocol)
+    var assets: rt.Buf = rt.buf_new()
+    var id: rt.Buf = rt.buf_new()
+    var cache: rt.Buf = rt.buf_new()
+    var rc: i32 = mc_vanilla.VANILLA_OK
+    if !vsnd_locate(rt.buf_str(&jar), version, &assets, &id) {
+        rc = mc_vanilla.VANILLA_NO_ASSETS
+    } else if !vsnd_cache_file(version, rt.buf_str(&id), &cache) {
+        rc = mc_vanilla.VANILLA_NO_CACHE_DIR
+    } else if !fs.is_file(rt.buf_str(&cache)) {
+        var kept: i32 = 0
+        var pf: i32 = mc_vanilla.vanilla_jar_pack_format(protocol)
+        if pf == 0 { pf = 15 }
+        rc = vsnd_build_cache(rt.buf_str(&assets), rt.buf_str(&id), rt.buf_str(&cache), pf, &kept)
+    }
+    if rc == mc_vanilla.VANILLA_OK { rt.buf_push_bytes(out, rt.buf_ptr(&cache), rt.buf_len(&cache)) }
+    rt.buf_free(&cache)
+    rt.buf_free(&id)
+    rt.buf_free(&assets)
+    rt.buf_free(&jar)
+    return rc
+}
