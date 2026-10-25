@@ -59,7 +59,7 @@ if [ -z "$ONLY" ] || [ "$ONLY" = biomezoom ]; then
     echo "== mc/biomezoom =="
     bash tools/mc/play/run_biomezoom.sh || ERR=$((ERR+1))
 fi
-if [ "$ONLY" = slimeplay ]; then
+if [ -z "$ONLY" ] || [ "$ONLY" = slimeplay ]; then
     echo "== mc/slimeplay =="
     bash tools/mc/play/run_slime.sh || ERR=$((ERR+1))
 fi

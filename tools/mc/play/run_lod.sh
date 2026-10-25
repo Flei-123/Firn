@@ -64,7 +64,7 @@ run_one() { # name, env...
     local att pn pp rc ok py
     for att in 1 2 3; do
         pn="P${name}${att}"; ok=1; rm -f "$W/$name.png"
-        env FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_RUN_S=${LOD_RUN_S:-45} MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/$name.png" "$@" \
+        env FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_RUN_S=${LOD_RUN_S:-45} MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/$name.png" "$@" \
             "$W/mcplay" 127.0.0.1 "$PORT" "$pn" > "$W/$name.out" 2>&1 &
         pp=$!
         if wait_log "$pn joined the game" 90; then
