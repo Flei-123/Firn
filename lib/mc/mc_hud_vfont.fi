@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mc.mc_raster
+import mc.mc_hud
+import mc.mc_gui_font
+import mc.mc_gui_tex
+import mc.mc_text
+
+export {
+    vfont_load, vfont_ok, vfont_unload, vfont_adv, vfont_glyph, vtext_width, vtext_line, vtext_wrap, vtext_colour_alpha,
+    VF_BOLD, VF_ITALIC, VF_UNDERLINE, VF_STRIKE, VF_OBFUSCATED, VF_ROW_H,
+}
+
+const VF_BOLD: u32 = 1
+const VF_ITALIC: u32 = 2
+const VF_UNDERLINE: u32 = 4
+const VF_STRIKE: u32 = 8
+const VF_OBFUSCATED: u32 = 16
+const VF_ROW_H: i32 = 9
+const CELL: i32 = 8
+const FALLBACK_ADV: i32 = 6
+
+static mut ROWS: u64 = 0
+static mut ADV: u64 = 0
+
+fn vfont_ok() -> bool { return ROWS != 0 as u64 }
+
+fn vfont_unload() {
+    if ROWS != 0 as u64 {
+        rt.heap_free(ROWS, 256 * 8)
+        rt.heap_free(ADV, 256)
+    }
+    ROWS = 0 as u64
+    ADV = 0 as u64
+}
+
+fn vfont_load(f: *mut mc_gui_font.GuiFont) -> bool {
+    if !mc_gui_font.gfont_ok(f) { return false }
+    vfont_unload()
+    let rows: u64 = rt.heap_alloc(256 * 8)
+    let adv: u64 = rt.heap_alloc(256)
+    if rows == 0 as u64 || adv == 0 as u64 { return false }
+    var code: i32 = 0
+    while code < 256 {
+        let ox: i32 = (code % 16) * CELL
+        let oy: i32 = (code / 16) * CELL
+        var gy: i32 = 0
+        while gy < CELL {
+            var mask: u32 = 0 as u32
+            var gx: i32 = 0
+            while gx < CELL {
+                if (mc_gui_tex.gtex_get(&(*f).atlas, ox + gx, oy + gy) >> 24 as u32) != 0 as u32 {
+                    mask = mask | (1 as u32 << ((CELL - 1 - gx) as u32))
+                }
+                gx = gx + 1
+            }
+            rt.st8(rows, (code * 8 + gy) as usize, mask as u8)
+            gy = gy + 1
+        }
+        rt.st8(adv, code as usize, rt.ld32((*f).adv, code as usize) as u8)
+        code = code + 1
+    }
+    ROWS = rows
+    ADV = adv
+    return true
+}
+
+fn vfont_adv(code: u32, flags: u32) -> i32 {
+    var a: i32 = FALLBACK_ADV
+    if ROWS != 0 as u64 { a = rt.ld8(ADV, (code & 255 as u32) as usize) as i32 }
+    if (flags & VF_BOLD) != 0 as u32 && a > 0 { a = a + 1 }
+    return a
+}
+
+fn vtext_colour_alpha(c: u32, a: i32) -> u32 {
+    let base: i32 = (c >> 24 as u32) as i32
+    let out: i32 = (base * a) / 255
+    return (c & 0x00FFFFFF as u32) | ((out as u32) << 24 as u32)
+}
+
+fn obfuscated_code(code: u32, seed: u32) -> u32 {
+    if ROWS == 0 as u64 || code <= 32 as u32 || code > 126 as u32 { return code }
+    let want: i32 = rt.ld8(ADV, code as usize) as i32
+    var pick: u32 = (seed * 2654435761 as u32 + code * 40503 as u32) >> 8 as u32
+    var tries: i32 = 0
+    while tries < 95 {
+        let cand: u32 = 33 as u32 + pick % 94 as u32
+        if rt.ld8(ADV, cand as usize) as i32 == want { return cand }
+        pick = pick + 1 as u32
+        tries = tries + 1
+    }
+    return code
+}
+
+fn paint_rows(r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, c: u32, italic: bool, code: u32, dx: i32) {
+    var row: i32 = 0
+    while row < CELL {
+        let mask: u32 = rt.ld8(ROWS, (code as i32 * 8 + row) as usize) as u32
+        if mask != 0 as u32 {
+            var shift: i32 = 0
+            if italic && row < 4 { shift = 1 }
+            var col: i32 = 0
+            while col < CELL {
+                if ((mask >> ((CELL - 1 - col) as u32)) & 1 as u32) != 0 as u32 {
+                    var end: i32 = col + 1
+                    while end < CELL && ((mask >> ((CELL - 1 - end) as u32)) & 1 as u32) != 0 as u32 { end = end + 1 }
+                    mc_hud.hud_rect(r, x + (col + shift + dx) * s, y + row * s, (end - col) * s, s, c)
+                    col = end
+                } else {
+                    col = col + 1
+                }
+            }
+        }
+        row = row + 1
+    }
+}
+
+fn paint_fallback(r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, c: u32, code: u32, dx: i32) {
+    mc_hud.hud_glyph(r, x + dx * s, y, s, c, code)
+}
+
+fn vfont_glyph(r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, c: u32, flags: u32, code_in: u32, seed: u32) -> i32 {
+    var code: u32 = code_in
+    if (flags & VF_OBFUSCATED) != 0 as u32 { code = obfuscated_code(code_in, seed) }
+    let a: i32 = vfont_adv(code, flags)
+    if ROWS != 0 as u64 {
+        if code != 32 as u32 {
+            let italic: bool = (flags & VF_ITALIC) != 0 as u32
+            paint_rows(r, x, y, s, c, italic, code, 0)
+            if (flags & VF_BOLD) != 0 as u32 { paint_rows(r, x, y, s, c, italic, code, 1) }
+        }
+    } else if code != 32 as u32 {
+        paint_fallback(r, x, y, s, c, code, 0)
+        if (flags & VF_BOLD) != 0 as u32 { paint_fallback(r, x, y, s, c, code, 1) }
+    }
+    if (flags & VF_UNDERLINE) != 0 as u32 { mc_hud.hud_rect(r, x - s, y + 8 * s, (a + 1) * s, s, c) }
+    if (flags & VF_STRIKE) != 0 as u32 { mc_hud.hud_rect(r, x, y + 4 * s, a * s, s, c) }
+    return a
+}
+
+fn vtext_width(p: u64, fl: u64, from: usize, to: usize) -> i32 {
+    var w: i32 = 0
+    var i: usize = from
+    while i < to {
+        var f: u32 = 0 as u32
+        if fl != 0 as u64 { f = rt.ld8(fl, i) as u32 }
+        w = w + vfont_adv(rt.ld8(p, i) as u32, f)
+        i = i + 1
+    }
+    return w
+}
+
+fn pass_line(r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, alpha: i32, p: u64, cols: u64, fl: u64, from: usize, to: usize, shadow: bool, seed: u32) -> i32 {
+    var pen: i32 = 0
+    var i: usize = from
+    while i < to {
+        var c: u32 = rt.ld32(cols, i)
+        var f: u32 = 0 as u32
+        if fl != 0 as u64 { f = rt.ld8(fl, i) as u32 }
+        if shadow { c = mc_gui_font.shadow_of(c) }
+        c = vtext_colour_alpha(c, alpha)
+        var off: i32 = 0
+        if shadow { off = s }
+        pen = pen + vfont_glyph(r, x + pen * s + off, y + off, s, c, f, rt.ld8(p, i) as u32, seed + i as u32)
+        i = i + 1
+    }
+    return pen
+}
+
+fn vtext_line(r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, alpha: i32, p: u64, cols: u64, fl: u64, from: usize, to: usize, shadow: bool, seed: u32) -> i32 {
+    if alpha <= 0 { return 0 }
+    if shadow { pass_line(r, x, y, s, alpha, p, cols, fl, from, to, true, seed) }
+    return pass_line(r, x, y, s, alpha, p, cols, fl, from, to, false, seed)
+}
+
+fn vtext_wrap(p: u64, fl: u64, from: usize, len: usize, max_w: i32) -> usize {
+    var w: i32 = 0
+    var i: usize = from
+    var last_space: usize = from + len
+    while i < from + len {
+        var f: u32 = 0 as u32
+        if fl != 0 as u64 { f = rt.ld8(fl, i) as u32 }
+        let c: u8 = rt.ld8(p, i)
+        let a: i32 = vfont_adv(c as u32, f)
+        if w + a > max_w && i > from {
+            if last_space > from && last_space < i { return last_space + 1 - from }
+            return i - from
+        }
+        if c == 32 as u8 { last_space = i }
+        w = w + a
+        i = i + 1
+    }
+    return len
+}

@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_chat_complete.fi -- tab completion for the chat line: server suggestions for '/' text (C2S/S2C tab_complete, protocol 393+),
+// player names from the tab list for plain text.
+//
+//   complete_request(&ch, &sg, cl)               ask the server for the text before the cursor (false: not a command or version too old)
+//   complete_names(&ch, &sg, &tl)                fill the suggestion list with the player names that start with the word before the cursor
+//   complete_press(&ch, &sg, cl, &tl)            Tab: apply the selected suggestion, or ask / list names when there is none
+//   complete_on_packet(&sg, cl, id)              S2C tab_complete -> suggestion list; false = not that packet
+
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_play
+import mc.mc_chat
+import mc.mc_chat_suggest
+import mc.mc_tablist
+
+export { complete_request, complete_names, complete_press, complete_on_packet, complete_apply, word_start }
+
+fn is_command(ch: *mut mc_chat.Chat) -> bool {
+    return mc_chat.chat_input_len(ch) > 0 && rt.ld8(mc_chat.chat_input_ptr(ch), 0) == 47 as u8
+}
+
+fn word_start(ch: *mut mc_chat.Chat) -> usize {
+    let p: u64 = mc_chat.chat_input_ptr(ch)
+    var i: usize = mc_chat.chat_input_cursor(ch)
+    while i > 0 && rt.ld8(p, i - 1) != 32 as u8 { i = i - 1 }
+    return i
+}
+
+fn complete_request(ch: *mut mc_chat.Chat, sg: *mut mc_chat_suggest.Suggest, cl: *mut mc_client.Client) -> bool {
+    if !is_command(ch) || (*cl).ver.protocol < 393 { return false }
+    let n: usize = mc_chat.chat_input_cursor(ch)
+    let p: u64 = mc_chat.chat_input_ptr(ch)
+    let txid: i32 = mc_chat_suggest.sugg_request(sg, p, n)
+    return mc_play.send_tab_complete(cl, txid, p, n)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+fn prefix_matches(name_p: u64, name_n: usize, pre_p: u64, pre_n: usize) -> bool {
+    if name_n < pre_n { return false }
+    var i: usize = 0
+    while i < pre_n {
+        if lower(rt.ld8(name_p, i)) != lower(rt.ld8(pre_p, i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn complete_names(ch: *mut mc_chat.Chat, sg: *mut mc_chat_suggest.Suggest, tl: *mut mc_tablist.TabList) -> usize {
+    mc_chat_suggest.sugg_clear(sg)
+    let start: usize = word_start(ch)
+    let cur: usize = mc_chat.chat_input_cursor(ch)
+    let pre_p: u64 = mc_chat.chat_input_ptr(ch) + start as u64
+    let pre_n: usize = cur - start
+    var k: usize = 0
+    let total: usize = mc_tablist.tab_count(tl)
+    while k < total {
+        if prefix_matches(mc_tablist.tab_name_ptr(tl, k), mc_tablist.tab_name_len(tl, k), pre_p, pre_n) {
+            mc_chat_suggest.sugg_add(sg, mc_tablist.tab_name_ptr(tl, k), mc_tablist.tab_name_len(tl, k))
+        }
+        k = k + 1
+    }
+    mc_chat_suggest.sugg_set_range(sg, start as i32, pre_n as i32)
+    (*sg).local = true
+    mc_chat_suggest.sugg_sort(sg)
+    return mc_chat_suggest.sugg_count(sg)
+}
+
+fn complete_apply(ch: *mut mc_chat.Chat, sg: *mut mc_chat_suggest.Suggest) -> bool {
+    let sel: i32 = mc_chat_suggest.sugg_selected(sg)
+    if sel < 0 { return false }
+    let from: usize = (*sg).start as usize
+    var to: usize = from + ((*sg).span as usize)
+    if to < mc_chat.chat_input_cursor(ch) && (*sg).local { to = mc_chat.chat_input_cursor(ch) }
+    mc_chat.chat_input_replace(ch, from, to, mc_chat_suggest.sugg_item_ptr(sg, sel as usize), mc_chat_suggest.sugg_item_len(sg, sel as usize))
+    mc_chat_suggest.sugg_clear(sg)
+    return true
+}
+
+fn complete_press(ch: *mut mc_chat.Chat, sg: *mut mc_chat_suggest.Suggest, cl: *mut mc_client.Client, tl: *mut mc_tablist.TabList) -> bool {
+    if mc_chat_suggest.sugg_count(sg) > 0 { return complete_apply(ch, sg) }
+    if is_command(ch) { return complete_request(ch, sg, cl) }
+    let n: usize = complete_names(ch, sg, tl)
+    if n == 1 { return complete_apply(ch, sg) }
+    return n > 0
+}
+
+fn complete_on_packet(sg: *mut mc_chat_suggest.Suggest, cl: *mut mc_client.Client, id: i32) -> bool {
+    if !mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_TAB_COMPLETE) { return false }
+    var b: bytes.Bytes = *mc_client.client_body(cl)
+    if (*cl).ver.protocol >= 393 {
+        mc_chat_suggest.sugg_response(sg, &b, (*cl).ver.protocol)
+        mc_chat_suggest.sugg_sort(sg)
+    }
+    return true
+}

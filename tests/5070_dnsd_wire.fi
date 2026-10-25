@@ -1,0 +1,281 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/5070_dnsd_wire.fi -- lib/net/dnsd.fi + lib/net/dnszone.fi as a pure function:
+// one request in, one reply out, every field read back from the octets.
+import std.rt
+import net.dnszone
+import net.dnsd
+
+const ZONE_TEXT: str = "zone mc.example.com\nttl 60\nsoa @ ns1.example.com hostmaster.example.com 7 3600 600 86400 30\nns @ ns1.example.com\na @ 203.0.113.7\naaaa @ 2001:db8::7\nmx @ 10 mail.example.com\ntxt @ \"hello world\"\na ns1 203.0.113.8\ncname www @\ntxt i.* what-%1\na * 203.0.113.7\nsrv _minecraft._tcp.* 0 5 443 %1.mc.example.com\nsrv _x._tcp.** 1 2 3 deep-%1.mc.example.com\n"
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn build_query(out: *mut rt.Buf, id: u32, name: str, qtype: u32, payload: u32) {
+    rt.buf_clear(out)
+    put16(out, id)
+    put16(out, 256 as u32)
+    put16(out, 1 as u32)
+    put16(out, 0 as u32)
+    put16(out, 0 as u32)
+    put16(out, if payload > 0 as u32 { 1 as u32 } else { 0 as u32 })
+    var start: usize = 0
+    var i: usize = 0
+    while i <= name.n {
+        if i == name.n || rt.ld8(name.p as u64, i) == 46 as u8 {
+            rt.buf_push(out, (i - start) as u8)
+            rt.buf_push_bytes(out, (name.p as u64) + start as u64, i - start)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 0 as u8)
+    put16(out, qtype)
+    put16(out, 1 as u32)
+    if payload > 0 as u32 {
+        rt.buf_push(out, 0 as u8)
+        put16(out, 41 as u32)
+        put16(out, payload)
+        put16(out, 0 as u32)
+        put16(out, 0 as u32)
+        put16(out, 0 as u32)
+    }
+}
+
+fn be16(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+fn rcode(r: *mut rt.Buf) -> u32 { return be16((*r).ptr, 2) & 15 as u32 }
+fn is_aa(r: *mut rt.Buf) -> bool { return (be16((*r).ptr, 2) & 1024 as u32) != 0 as u32 }
+fn is_tc(r: *mut rt.Buf) -> bool { return (be16((*r).ptr, 2) & 512 as u32) != 0 as u32 }
+fn ancount(r: *mut rt.Buf) -> u32 { return be16((*r).ptr, 6) }
+fn nscount(r: *mut rt.Buf) -> u32 { return be16((*r).ptr, 8) }
+fn arcount(r: *mut rt.Buf) -> u32 { return be16((*r).ptr, 10) }
+
+fn skip_name(p: u64, pos: usize) -> usize {
+    var q: usize = pos
+    while rt.ld8(p, q) != 0 as u8 {
+        if rt.ld8(p, q) >= 192 as u8 {
+            return q + 2
+        }
+        q = q + 1 + rt.ld8(p, q) as usize
+    }
+    return q + 1
+}
+
+fn first_rr(r: *mut rt.Buf) -> usize {
+    return skip_name((*r).ptr, 12) + 4
+}
+
+fn rr_type(r: *mut rt.Buf, rr: usize) -> u32 { return be16((*r).ptr, skip_name((*r).ptr, rr)) }
+fn rr_data(r: *mut rt.Buf, rr: usize) -> usize { return skip_name((*r).ptr, rr) + 10 }
+fn rr_len(r: *mut rt.Buf, rr: usize) -> usize { return be16((*r).ptr, skip_name((*r).ptr, rr) + 8) as usize }
+fn rr_next(r: *mut rt.Buf, rr: usize) -> usize { return rr_data(r, rr) + rr_len(r, rr) }
+fn rr_ttl(r: *mut rt.Buf, rr: usize) -> u32 {
+    let o: usize = skip_name((*r).ptr, rr) + 4
+    return (be16((*r).ptr, o) << 16) | be16((*r).ptr, o + 2)
+}
+
+fn name_at_is(r: *mut rt.Buf, pos: usize, text: str) -> bool {
+    var q: usize = pos
+    var w: usize = 0
+    while rt.ld8((*r).ptr, q) != 0 as u8 {
+        let l: usize = rt.ld8((*r).ptr, q) as usize
+        if w > 0 {
+            if w >= text.n || rt.ld8(text.p as u64, w) != 46 as u8 {
+                return false
+            }
+            w = w + 1
+        }
+        var k: usize = 0
+        while k < l {
+            if w >= text.n || rt.ld8(text.p as u64, w) != rt.ld8((*r).ptr, q + 1 + k) {
+                return false
+            }
+            w = w + 1
+            k = k + 1
+        }
+        q = q + 1 + l
+    }
+    return w == text.n
+}
+
+fn ask(z: *mut dnszone.Zone, out: *mut rt.Buf, name: str, qtype: u32, payload: u32, udp: bool) -> bool {
+    var req: rt.Buf = rt.buf_new()
+    build_query(&req, 4660 as u32, name, qtype, payload)
+    let ok: bool = dnsd.dnsd_answer(z, req.ptr, req.len, out, udp)
+    rt.buf_free(&req)
+    return ok
+}
+
+fn zone_with_big(z: *mut dnszone.Zone, rules: usize) -> usize {
+    var t: rt.Buf = rt.buf_new()
+    var head: str = "zone mc.example.com\nsoa @ ns1.example.com h.example.com 1 2 3 4 5\n"
+    rt.buf_push_bytes(&t, head.p as u64, head.n)
+    var i: usize = 0
+    while i < rules {
+        var line: str = "txt big 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\n"
+        rt.buf_push_bytes(&t, line.p as u64, line.n)
+        i = i + 1
+    }
+    let bad: usize = dnszone.zone_parse(z, t.ptr, t.len)
+    rt.buf_free(&t)
+    return bad
+}
+
+fn expect_bad(text: str) -> usize {
+    var z: dnszone.Zone = dnszone.zone_new()
+    return dnszone.zone_parse(&z, text.p as u64, text.n)
+}
+
+fn main() -> i32 {
+    var z: dnszone.Zone = dnszone.zone_new()
+    let bad: usize = dnszone.zone_parse(&z, ZONE_TEXT.p as u64, ZONE_TEXT.n)
+    if bad != 0 { return 200 + bad as i32 }
+    var r: rt.Buf = rt.buf_new()
+
+    if !ask(&z, &r, "_minecraft._tcp.thunder.mc.example.com", 33 as u32, 0 as u32, true) { return 10 }
+    if rcode(&r) != 0 as u32 || !is_aa(&r) || ancount(&r) != 1 as u32 || nscount(&r) != 0 as u32 { return 11 }
+    var rr: usize = first_rr(&r)
+    if rr_type(&r, rr) != 33 as u32 || rr_ttl(&r, rr) != 60 as u32 { return 12 }
+    var d: usize = rr_data(&r, rr)
+    if be16(r.ptr, d) != 0 as u32 || be16(r.ptr, d + 2) != 5 as u32 || be16(r.ptr, d + 4) != 443 as u32 { return 13 }
+    if !name_at_is(&r, d + 6, "thunder.mc.example.com") { return 14 }
+    if be16(r.ptr, 0) != 4660 as u32 { return 15 }
+
+    if !ask(&z, &r, "_MineCraft._TCP.Thunder.MC.example.COM", 33 as u32, 0 as u32, true) { return 16 }
+    if ancount(&r) != 1 as u32 { return 17 }
+    d = rr_data(&r, first_rr(&r))
+    if !name_at_is(&r, d + 6, "thunder.mc.example.com") { return 18 }
+    if rt.ld8(r.ptr, 13) != 95 as u8 || rt.ld8(r.ptr, 14) != 77 as u8 { return 19 }
+
+    if !ask(&z, &r, "_minecraft._tcp.a-b_c.mc.example.com", 33 as u32, 0 as u32, true) { return 20 }
+    d = rr_data(&r, first_rr(&r))
+    if !name_at_is(&r, d + 6, "a-b_c.mc.example.com") { return 21 }
+
+    if !ask(&z, &r, "_minecraft._tcp.a.b.mc.example.com", 33 as u32, 0 as u32, true) { return 22 }
+    if rcode(&r) != 3 as u32 || ancount(&r) != 0 as u32 || nscount(&r) != 1 as u32 || !is_aa(&r) { return 23 }
+    rr = first_rr(&r)
+    if rr_type(&r, rr) != 6 as u32 || rr_ttl(&r, rr) != 30 as u32 { return 24 }
+
+    if !ask(&z, &r, "_x._tcp.a.b.mc.example.com", 33 as u32, 0 as u32, true) { return 25 }
+    if rcode(&r) != 0 as u32 || ancount(&r) != 1 as u32 { return 26 }
+    d = rr_data(&r, first_rr(&r))
+    if be16(r.ptr, d) != 1 as u32 || be16(r.ptr, d + 4) != 3 as u32 { return 27 }
+    if !name_at_is(&r, d + 6, "deep-a.b.mc.example.com") { return 28 }
+
+    if !ask(&z, &r, "thunder.mc.example.com", 1 as u32, 0 as u32, true) { return 30 }
+    if rcode(&r) != 0 as u32 || ancount(&r) != 1 as u32 { return 31 }
+    rr = first_rr(&r)
+    d = rr_data(&r, rr)
+    if rr_type(&r, rr) != 1 as u32 || rr_len(&r, rr) != 4 { return 32 }
+    if rt.ld8(r.ptr, d) != 203 as u8 || rt.ld8(r.ptr, d + 3) != 7 as u8 { return 33 }
+
+    if !ask(&z, &r, "ns1.mc.example.com", 1 as u32, 0 as u32, true) { return 34 }
+    d = rr_data(&r, first_rr(&r))
+    if rt.ld8(r.ptr, d + 3) != 8 as u8 { return 35 }
+
+    if !ask(&z, &r, "thunder.mc.example.com", 28 as u32, 0 as u32, true) { return 36 }
+    if rcode(&r) != 0 as u32 || ancount(&r) != 0 as u32 || nscount(&r) != 1 as u32 { return 37 }
+
+    if !ask(&z, &r, "mc.example.com", 28 as u32, 0 as u32, true) { return 38 }
+    rr = first_rr(&r)
+    d = rr_data(&r, rr)
+    if ancount(&r) != 1 as u32 || rr_len(&r, rr) != 16 || rt.ld8(r.ptr, d) != 32 as u8 || rt.ld8(r.ptr, d + 15) != 7 as u8 { return 39 }
+
+    if !ask(&z, &r, "mc.example.com", 2 as u32, 0 as u32, true) { return 40 }
+    if ancount(&r) != 1 as u32 { return 41 }
+    if !name_at_is(&r, rr_data(&r, first_rr(&r)), "ns1.example.com") { return 42 }
+
+    if !ask(&z, &r, "mc.example.com", 15 as u32, 0 as u32, true) { return 43 }
+    d = rr_data(&r, first_rr(&r))
+    if be16(r.ptr, d) != 10 as u32 || !name_at_is(&r, d + 2, "mail.example.com") { return 44 }
+
+    if !ask(&z, &r, "mc.example.com", 16 as u32, 0 as u32, true) { return 45 }
+    d = rr_data(&r, first_rr(&r))
+    if rt.ld8(r.ptr, d) != 11 as u8 || rt.ld8(r.ptr, d + 1) != 104 as u8 { return 46 }
+
+    if !ask(&z, &r, "i.foo.mc.example.com", 16 as u32, 0 as u32, true) { return 47 }
+    d = rr_data(&r, first_rr(&r))
+    if rt.ld8(r.ptr, d) != 8 as u8 || rt.ld8(r.ptr, d + 1) != 119 as u8 || rt.ld8(r.ptr, d + 7) != 111 as u8 { return 48 }
+
+    if !ask(&z, &r, "mc.example.com", 6 as u32, 0 as u32, true) { return 50 }
+    rr = first_rr(&r)
+    d = rr_data(&r, rr)
+    if ancount(&r) != 1 as u32 || !name_at_is(&r, d, "ns1.example.com") { return 51 }
+    let after_mname: usize = skip_name(r.ptr, d)
+    if !name_at_is(&r, after_mname, "hostmaster.example.com") { return 52 }
+    let nums: usize = skip_name(r.ptr, after_mname)
+    if be16(r.ptr, nums + 2) != 7 as u32 || be16(r.ptr, nums + 18) != 30 as u32 { return 53 }
+
+    if !ask(&z, &r, "mc.example.com", 255 as u32, 0 as u32, true) { return 54 }
+    if ancount(&r) != 6 as u32 { return 55 }
+
+    if !ask(&z, &r, "www.mc.example.com", 1 as u32, 0 as u32, true) { return 56 }
+    if ancount(&r) != 1 as u32 || rr_type(&r, first_rr(&r)) != 5 as u32 { return 57 }
+    if !name_at_is(&r, rr_data(&r, first_rr(&r)), "mc.example.com") { return 58 }
+
+    if !ask(&z, &r, "example.org", 1 as u32, 0 as u32, true) { return 60 }
+    if rcode(&r) != 5 as u32 || is_aa(&r) || ancount(&r) != 0 as u32 { return 61 }
+    if !ask(&z, &r, "notmc.example.com", 1 as u32, 0 as u32, true) { return 62 }
+    if rcode(&r) != 5 as u32 { return 63 }
+    if !ask(&z, &r, "mc.example.com", 252 as u32, 0 as u32, false) { return 64 }
+    if rcode(&r) != 5 as u32 { return 65 }
+
+    if !ask(&z, &r, "bad!.mc.example.com", 1 as u32, 0 as u32, true) { return 66 }
+    if rcode(&r) != 3 as u32 { return 67 }
+
+    if !ask(&z, &r, "thunder.mc.example.com", 1 as u32, 1232 as u32, true) { return 70 }
+    if arcount(&r) != 1 as u32 || rt.ld8(r.ptr, r.len - 11) != 0 as u8 || be16(r.ptr, r.len - 10) != 41 as u32 { return 71 }
+    if be16(r.ptr, r.len - 8) != 1232 as u32 { return 72 }
+
+    var req: rt.Buf = rt.buf_new()
+    build_query(&req, 1 as u32, "mc.example.com", 1 as u32, 0 as u32)
+    rt.st8(req.ptr, 2, 128 as u8)
+    if dnsd.dnsd_answer(&z, req.ptr, req.len, &r, true) { return 80 }
+    rt.st8(req.ptr, 2, 0 as u8)
+    if dnsd.dnsd_answer(&z, req.ptr, 11, &r, true) { return 81 }
+    rt.st8(req.ptr, 5, 0 as u8)
+    if !dnsd.dnsd_answer(&z, req.ptr, req.len, &r, true) || rcode(&r) != 1 as u32 { return 82 }
+    rt.st8(req.ptr, 5, 1 as u8)
+    rt.st8(req.ptr, 2, 40 as u8)
+    if !dnsd.dnsd_answer(&z, req.ptr, req.len, &r, true) || rcode(&r) != 4 as u32 { return 83 }
+    rt.st8(req.ptr, 2, 0 as u8)
+    rt.st8(req.ptr, 12, 192 as u8)
+    if !dnsd.dnsd_answer(&z, req.ptr, req.len, &r, true) || rcode(&r) != 1 as u32 { return 84 }
+    rt.buf_free(&req)
+
+    var zb: dnszone.Zone = dnszone.zone_new()
+    if zone_with_big(&zb, 8) != 0 { return 90 }
+    if !ask(&zb, &r, "big.mc.example.com", 16 as u32, 0 as u32, true) { return 91 }
+    if !is_tc(&r) || ancount(&r) != 0 as u32 || r.len > 512 { return 92 }
+    if !ask(&zb, &r, "big.mc.example.com", 16 as u32, 0 as u32, false) { return 93 }
+    if is_tc(&r) || ancount(&r) != 8 as u32 || r.len < 1000 { return 94 }
+    if !ask(&zb, &r, "big.mc.example.com", 16 as u32, 1232 as u32, true) { return 95 }
+    if !is_tc(&r) { return 96 }
+    if !ask(&zb, &r, "big.mc.example.com", 16 as u32, 4096 as u32, true) { return 97 }
+    if !is_tc(&r) { return 98 }
+    var zs: dnszone.Zone = dnszone.zone_new()
+    if zone_with_big(&zs, 3) != 0 { return 99 }
+    if !ask(&zs, &r, "big.mc.example.com", 16 as u32, 1232 as u32, true) { return 100 }
+    if is_tc(&r) || ancount(&r) != 3 as u32 { return 101 }
+    if !ask(&zs, &r, "big.mc.example.com", 16 as u32, 0 as u32, true) { return 102 }
+    if !is_tc(&r) { return 103 }
+
+    if expect_bad("zone a.test\nbogus x 1\n") != 2 { return 110 }
+    if expect_bad("a x 1.2.3.4\n") != 1 { return 111 }
+    if expect_bad("zone a.test\na * 1.2.3.999\n") != 2 { return 112 }
+    if expect_bad("zone a.test\na *.* 1.2.3.4\n") != 2 { return 113 }
+    if expect_bad("zone a.test\ncname x target-%1.a.test\n") != 2 { return 114 }
+    if expect_bad("zone a.test\nsrv x 0 0 70000 t.a.test\n") != 2 { return 115 }
+    if expect_bad("zone a.test\n# comment\n\na x 1.2.3.4\n") != 0 { return 116 }
+    if expect_bad("zone a.test\naaaa x 2001:db8::zz\n") != 2 { return 117 }
+    if expect_bad("a x 1.2.3.4\n") != 1 { return 118 }
+    if expect_bad("zone a.test\nsrv _s._tcp.* 0 0 1 %1.a.test\n") != 0 { return 119 }
+
+    rt.buf_free(&r)
+    return 0
+}

@@ -53,7 +53,7 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
-MCPLAY_AUDIO=0 MCPLAY_CHAT_LOG=1 MCPLAY_CHAT_TEST_TICKS=380 MCPLAY_CHAT_TEST='hi there|/time set day' MCPLAY_RUN_S=${CHAT_RUN_S:-45} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+MCPLAY_AUDIO=0 MCPLAY_CHAT_LOG=1 MCPLAY_TAB_LOG=1 MCPLAY_TAB_TEST='/tim' MCPLAY_TAB_TEST_TICKS=500 MCPLAY_CHAT_TEST_TICKS=380 MCPLAY_CHAT_TEST='hi there|/time set day' MCPLAY_RUN_S=${CHAT_RUN_S:-45} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 170 "$W/mcplay" 127.0.0.1 "$PORT" ChatA > "$W/a.out" 2>&1 &
 PP=$!
 for i in $(seq 1 90); do grep -q "ChatA joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
@@ -74,6 +74,11 @@ grep -q 'chat line=raw_line' "$W/a.out" || { echo "  FAIL  tellraw line missing"
 grep -q 'chattest sent=2' "$W/a.out" || { echo "  FAIL  chattest sent != 2"; ERR=1; }
 grep -q '<ChatA> hi there' "$W/server.log" || { echo "  FAIL  server did not log the chat message"; ERR=1; }
 grep -q 'chat line=Set the time to' "$W/a.out" || { echo "  FAIL  command feedback line missing"; ERR=1; }
+grep -q 'tabtest sent=true' "$W/a.out" || { echo "  FAIL  tab complete request not sent"; ERR=1; }
+TC=$(grep -o 'tabcomplete n=[0-9]*' "$W/a.out" | tail -1 | cut -d= -f2)
+[ "${TC:-0}" -ge 1 ] || { echo "  FAIL  tab complete answered no suggestion (n=${TC:-none})"; ERR=1; }
+TL=$(grep -o 'tablist n=[0-9]*' "$W/a.out" | sort -t= -k2 -n | tail -1 | cut -d= -f2)
+[ "${TL:-0}" -ge 2 ] || { echo "  FAIL  player list never reached 2 entries (n=${TL:-none})"; ERR=1; }
 grep -qiE "invalid|disconnect|kicked|chat message validation" "$W/server.log" && grep -iE "invalid|disconnect|kicked|validation" "$W/server.log" | head -3
 grep 'chat line=' "$W/a.out" | head -5
 echo stop >&3; sleep 1

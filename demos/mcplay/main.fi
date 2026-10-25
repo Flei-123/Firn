@@ -111,6 +111,11 @@ import mc.mc_play
 import mc.mc_chat
 import mc.mc_chat_ui
 import mc.mc_chat_net
+import mc.mc_chat_complete
+import mc.mc_chat_suggest
+import mc.mc_chat_assets
+import mc.mc_tablist
+import mc.mc_tablist_ui
 import mc.mc_health
 import mc.mc_health_ui
 import mc.mc_hud_play
@@ -457,6 +462,9 @@ struct Ctx {
     show_inv: bool,
     chat: mc_chat.Chat,
     chat_net: mc_chat_net.ChatNet,
+    chat_ui: mc_chat_ui.ChatUi,
+    tabl: mc_tablist.TabList,
+    tab_log: bool,
     health: mc_health.Health,
     hudp: mc_hud_play.HudPlay,
     shot_req: bool,
@@ -479,6 +487,7 @@ struct Ctx {
     cbt_phase: i32, // MCPLAY_COMBAT_TEST script (attack / interact / use item on the entity under the crosshair)
     cbt_t: u64,
     chat_test_done: bool,
+    tab_test_done: bool,
     cont_ui: bool, // the inventory panel was opened by a container window (chest ...): closes with it
     ui_regrab: bool, // the mouse was captured when the panel opened: capture it again on close
     give_done: bool,
@@ -961,6 +970,7 @@ fn on_packet(c: *mut Ctx, id: i32) {
         mc_snowfall.snowfall_reset(&(*c).snowfall)
         (*c).ent_resets = (*c).ent_resets + 1 as u64
     } else if on_chat(c, id) {
+    } else if on_tab(c, id) {
     } else if mc_entity.entity_on_packet(&(*c).ents, &(*cl).ver, id, mc_client.client_body(cl)) {
         let n: usize = mc_entity.store_count(&(*c).ents)
         if n > (*c).ent_peak { (*c).ent_peak = n }
@@ -1003,7 +1013,7 @@ fn pump(c: *mut Ctx) {
     var guard: i32 = 0
     while k != window.EV_NONE && guard < 20000 {
         guard = guard + 1
-        if k == window.EV_CHAR { mc_chat_ui.chat_ui_char(&(*c).chat, window.ev_a((*c).wp), !(*c).show_inv && !(*c).health.dead) }
+        if k == window.EV_CHAR { mc_chat_ui.chat_ui_char(&(*c).chat, &(*c).chat_ui, window.ev_a((*c).wp), chat_allowed(c)) }
         if k == window.EV_CONFIGURE {
             (*c).resized = true
         } else if k == window.EV_CLOSED {
@@ -1026,15 +1036,21 @@ fn pump(c: *mut Ctx) {
     chat_pump_end(c)
 }
 
+fn chat_allowed(c: *mut Ctx) -> bool {
+    return !(*c).show_inv && !(*c).health.dead && !mc_pause.pause_active()
+}
+
 fn chat_pump_end(c: *mut Ctx) {
     let ch: *mut mc_chat.Chat = &(*c).chat
-    let k: i32 = mc_chat_ui.chat_ui_keys(ch, &(*c).rw, !(*c).show_inv && !(*c).health.dead)
+    let k: i32 = mc_chat_ui.chat_ui_keys(ch, &(*c).chat_ui, &(*c).kb, &(*c).rw, chat_allowed(c))
     if (*ch).open && !(*ch).was_open {
         (*ch).was_open = true
         (*ch).regrab = (*c).grab
         if (*c).grab { grab_mouse(c, false) }
     }
     if (k & mc_chat_ui.CK_SUBMIT) != 0 { mc_chat_net.chat_send_input(ch, &(*c).cl) }
+    if (k & mc_chat_ui.CK_TAB) != 0 { mc_chat_complete.complete_press(ch, &(*c).chat_ui.sugg, &(*c).cl, &(*c).tabl) }
+    if (k & mc_chat_ui.CK_REQUEST) != 0 { mc_chat_complete.complete_request(ch, &(*c).chat_ui.sugg, &(*c).cl) }
     if !(*ch).open && (*ch).was_open {
         (*ch).was_open = false
         if (*ch).regrab { grab_mouse(c, true) }
@@ -1056,6 +1072,22 @@ fn on_chat(c: *mut Ctx, id: i32) -> bool {
     return true
 }
 
+fn on_tab(c: *mut Ctx, id: i32) -> bool {
+    let cl: *mut mc_client.Client = &(*c).cl
+    if mc_chat_complete.complete_on_packet(&(*c).chat_ui.sugg, cl, id) {
+        if (*c).tab_log { say(f"mcplay: tabcomplete n={mc_chat_suggest.sugg_count(&(*c).chat_ui.sugg)}\n") }
+        return true
+    }
+    if !mc_tablist.tab_on_packet(&(*c).tabl, &(*c).chat_net, cl, id) { return false }
+    if (*c).tab_log { say(f"mcplay: tablist n={mc_tablist.tab_count(&(*c).tabl)}\n") }
+    return true
+}
+
+fn draw_tab_list(c: *mut Ctx, r: *mut mc_raster.Raster, s: i32) {
+    if (*c).chat.open || mc_pause.pause_active() || !mc_keybinds.kb_down(&(*c).kb, &(*c).rw, mc_keybinds.KB_PLAYERLIST) { return }
+    mc_tablist_ui.tablist_ui_draw(&(*c).tabl, r, s, env_flag("MCPLAY_TAB_HEADS", false), now_ms())
+}
+
 fn chat_test(c: *mut Ctx) {
     if (*c).chat_test_done || (*c).n_ticks < (env_int("MCPLAY_CHAT_TEST_TICKS", 60) as u64) { return }
     (*c).chat_test_done = true
@@ -1063,6 +1095,16 @@ fn chat_test(c: *mut Ctx) {
     if s.n == 0 { return }
     let n: i32 = mc_chat_net.chat_send_script(&(*c).chat, &(*c).cl, s.p as u64, s.n)
     say(f"mcplay: chattest sent={n}\n")
+}
+
+fn tab_test(c: *mut Ctx) {
+    if (*c).tab_test_done || (*c).n_ticks < (env_int("MCPLAY_TAB_TEST_TICKS", 100) as u64) { return }
+    (*c).tab_test_done = true
+    let s: str = env.get("MCPLAY_TAB_TEST")
+    if s.n == 0 { return }
+    mc_chat.chat_input_set(&(*c).chat, s.p as u64, s.n)
+    let sent: bool = mc_chat_complete.complete_request(&(*c).chat, &(*c).chat_ui.sugg, &(*c).cl)
+    say(f"mcplay: tabtest sent={sent}\n")
 }
 
 fn load_keybinds() -> mc_keybinds.Keybinds {
@@ -1266,6 +1308,7 @@ fn handle_hotbar(c: *mut Ctx) {
     track_held(c)
     if (*c).have_pos { give_items(c) }
     if (*c).have_pos { chat_test(c) }
+    if (*c).have_pos { tab_test(c) }
     if (*c).have_pos {
         let tf: i32 = test_flags()
         if tf != 0 { run_tests(c, tf) }
@@ -1476,7 +1519,10 @@ fn draw_inventory_body(c: *mut Ctx, r: *mut mc_raster.Raster) {
     } else {
         mc_health_ui.health_ui_draw(&(*c).health, r, s)
     }
-    if !mc_hud_play.hp_hidden(&(*c).hudp) { mc_chat_ui.chat_ui_draw(&(*c).chat, r, s, now_ms()) }
+    if !mc_hud_play.hp_hidden(&(*c).hudp) {
+        draw_tab_list(c, r, s)
+        mc_chat_ui.chat_ui_draw(&(*c).chat, &(*c).chat_ui, r, s, now_ms())
+    }
     mc_combat_ui.combat_ui_draw(&(*c).cfx, r, s, now_ms())
     log_combat_hud(c)
     var bx: i32 = ((*r).w - 181 * s) / 2
@@ -3395,7 +3441,7 @@ fn main(start: u64) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_biome_updates: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
-        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), chat_ui: mc_chat_ui.chatui_new(), tabl: mc_tablist.tab_new(), tab_log: env_flag("MCPLAY_TAB_LOG", false), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, tab_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, sprint_sent: false, input_sent: 0 as u32, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
@@ -3403,6 +3449,7 @@ fn main(start: u64) -> i32 {
         return 5
     }
     if use_res { gfx_packs_load(&c.g, proto) }
+    mc_chat_assets.chatassets_load(proto)
     if c.models_on {
         c.ms = mc_model_mesh.ms_new(&c.reg, &c.g.res.stack, &c.g.res.ex)
         mc_model_mesh.ms_load_biomes(&c.ms)

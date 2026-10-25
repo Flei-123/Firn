@@ -16,6 +16,7 @@ FleiLauncher (Minecraft launcher in Firn/fUi), which has to talk to
 | `net.dnsconf` | `lib/net/dnsconf.fi`, `dnsconf.windows.fi` | where the servers and the hosts table come from: `/etc/resolv.conf` and `/etc/hosts`; on Windows `GetNetworkParams` (made into resolv.conf text, so one parser serves both) and `C:\Windows\System32\drivers\etc\hosts` |
 | `tls.trust` | `lib/tls/trust.fi`, `trust.windows.fi` | the system's root certificates: first PEM bundle that exists (Debian, Fedora, openSUSE, Alpine paths); on Windows the `ROOT` and `AuthRoot` stores through crypt32, plus `cacert.pem` in the current directory |
 | `net.http` | `lib/net/http.fi` | `https://`, host names, every address of an answer tried in turn |
+| `net.dnsd` | `lib/net/dnsd*.fi`, `dnszone.fi` | the other side: an authoritative server with wildcard rules (`docs/DNSD.md`) |
 
 `lib/net/dns_main.fi` is the resolver as a program (`dns_main [-s ip[:port]] [-6] name...`).
 

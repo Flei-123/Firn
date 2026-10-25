@@ -1,0 +1,778 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dnszone.fi -- the zone model of the authoritative DNS server (net.dnsd).
+//
+// A zone is a list of RULES, parsed from text:
+//
+//     zone minecraft.example.com
+//     ttl 60
+//     soa @ ns1.example.com hostmaster.example.com 1 3600 600 86400 60
+//     ns  @ ns1.example.com
+//     a   @ 203.0.113.7
+//     a   * 203.0.113.7
+//     srv _minecraft._tcp.* 0 5 443 %1.minecraft.example.com
+//
+// OWNER PATTERNS are relative to the zone. `@` is the apex, `*` stands for exactly one
+// label, `**` for one or more. At most one wildcard per pattern. `%1` in the data of a
+// rule is what the wildcard matched, so ONE rule answers every name.
+//
+// SELECTION. A name matches a rule when the pattern fits. Exact patterns beat `*`,
+// `*` beats `**`, more literal labels beat fewer, the first rule of the file beats a
+// later one. The best rule fixes the owner pattern; every rule with the SAME pattern is
+// a record of that name. A name no rule matches does not exist (NXDOMAIN).
+//
+// HONEST
+//   Z1 a wildcard only matches labels made of a-z 0-9 - _ (case folded). Anything else
+//      is "no such name", so odd octets are never echoed back into an answer.
+//   Z2 no empty non-terminals: `_tcp.foo` above `_minecraft._tcp.foo` is NXDOMAIN, not NODATA.
+//   Z3 comments are whole lines starting with `#`; there are no inline comments, so a TXT
+//      value may contain `#`.
+//   Z4 at most 64 rules, a pattern up to 96 octets, rule text up to 192 octets.
+import std.rt
+import net.ip6
+
+export {
+    Zone, Lookup, zone_new, zone_parse, zone_lookup, zone_relative, zone_render,
+    zone_same_owner, zone_pat_ptr, zone_text_ptr, zone_addr_ptr, lookup_new,
+    RT_A, RT_NS, RT_CNAME, RT_SOA, RT_MX, RT_TXT, RT_AAAA, RT_SRV,
+    ZONE_MAX_RULES, ZONE_CAP_MAX,
+}
+
+const RT_A: u32 = 1
+const RT_NS: u32 = 2
+const RT_CNAME: u32 = 5
+const RT_SOA: u32 = 6
+const RT_MX: u32 = 15
+const RT_TXT: u32 = 16
+const RT_AAAA: u32 = 28
+const RT_SRV: u32 = 33
+
+const ZONE_MAX_RULES: usize = 64
+const ZONE_CAP_MAX: usize = 128
+const PAT_MAX: usize = 96
+const TEXT_MAX: usize = 192
+const ORIGIN_MAX: usize = 200
+const NUMS_PER_RULE: usize = 5
+const BAD: usize = 18446744073709551615 as usize
+
+const KIND_EXACT: u32 = 0
+const KIND_ONE: u32 = 1
+const KIND_MANY: u32 = 2
+
+struct Zone {
+    origin: [u8; 256],
+    origin_len: usize,
+    ttl: u32,
+    n: usize,
+    r_type: [u32; 64],
+    r_pat: [u8; 6144],
+    r_plen: [usize; 64],
+    r_nlab: [usize; 64],
+    r_kind: [u32; 64],
+    r_wpos: [usize; 64],
+    r_text: [u8; 12288],
+    r_tlen: [usize; 64],
+    r_num: [u32; 320],
+    r_addr: [u8; 1024],
+}
+
+struct Lookup {
+    found: bool,
+    best: usize,
+    cap: [u8; 128],
+    cap_len: usize,
+}
+
+fn zone_new() -> Zone {
+    return Zone { origin: [0; 256], origin_len: 0, ttl: 60 as u32, n: 0,
+        r_type: [0; 64], r_pat: [0; 6144], r_plen: [0; 64], r_nlab: [0; 64],
+        r_kind: [0; 64], r_wpos: [0; 64], r_text: [0; 12288], r_tlen: [0; 64],
+        r_num: [0; 320], r_addr: [0; 1024] }
+}
+
+fn lookup_new() -> Lookup {
+    return Lookup { found: false, best: 0, cap: [0; 128], cap_len: 0 }
+}
+
+fn zone_pat_ptr(z: *mut Zone, i: usize) -> u64 {
+    return ((&(*z).r_pat[0]) as u64) + (i * PAT_MAX) as u64
+}
+
+fn zone_text_ptr(z: *mut Zone, i: usize) -> u64 {
+    return ((&(*z).r_text[0]) as u64) + (i * TEXT_MAX) as u64
+}
+
+fn zone_addr_ptr(z: *mut Zone, i: usize) -> u64 {
+    return ((&(*z).r_addr[0]) as u64) + (i * 16) as u64
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn is_blank(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 13 as u8
+}
+
+fn is_label_char(c: u8) -> bool {
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return true
+    }
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return true
+    }
+    return c == 45 as u8 || c == 95 as u8
+}
+
+fn label_count(p: u64, n: usize) -> usize {
+    if n == 0 {
+        return 0
+    }
+    var k: usize = 1
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 46 as u8 {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn label_span(p: u64, n: usize, want: usize, start: *mut usize, len: *mut usize) -> bool {
+    var k: usize = 0
+    var s: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 46 as u8 {
+            if k == want {
+                *start = s
+                *len = i - s
+                return true
+            }
+            k = k + 1
+            s = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn span_all_label_chars(p: u64, s: usize, n: usize) -> bool {
+    if n == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if !is_label_char(rt.ld8(p, s + i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn span_dotted_label_chars(p: u64, s: usize, n: usize) -> bool {
+    if n == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, s + i)
+        if !is_label_char(c) && c != 46 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn lit_eq(p: u64, n: usize, lit: str) -> bool {
+    if lit.n != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if lower(rt.ld8(p, i)) != rt.ld8(lit.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_u32(p: u64, n: usize, out: *mut u32) -> bool {
+    if n == 0 || n > 10 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u64 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    if v > 4294967295 as u64 {
+        return false
+    }
+    *out = v as u32
+    return true
+}
+
+fn parse_ipv4(p: u64, n: usize, out: u64) -> bool {
+    var part: u32 = 0
+    var digits: usize = 0
+    var idx: usize = 0
+    var i: usize = 0
+    while i <= n {
+        let c: u8 = if i < n { rt.ld8(p, i) } else { 46 as u8 }
+        if c == 46 as u8 {
+            if digits == 0 || idx >= 4 {
+                return false
+            }
+            rt.st8(out, idx, part as u8)
+            idx = idx + 1
+            part = 0 as u32
+            digits = 0
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            part = part * 10 as u32 + (c - 48 as u8) as u32
+            digits = digits + 1
+            if part > 255 as u32 || digits > 3 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return idx == 4
+}
+
+fn next_token(p: u64, pos: usize, end: usize, tend: *mut usize) -> usize {
+    var i: usize = pos
+    while i < end && is_blank(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    var k: usize = i
+    while k < end && !is_blank(rt.ld8(p, k)) {
+        k = k + 1
+    }
+    *tend = k
+    return i
+}
+
+fn copy_lower(dst: u64, src: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st8(dst, i, lower(rt.ld8(src, i)))
+        i = i + 1
+    }
+}
+
+fn strip_dot(p: u64, n: usize) -> usize {
+    if n > 1 && rt.ld8(p, n - 1) == 46 as u8 {
+        return n - 1
+    }
+    return n
+}
+
+fn valid_dotted(p: u64, n: usize) -> bool {
+    if n == 0 || n > 253 {
+        return false
+    }
+    let labels: usize = label_count(p, n)
+    var k: usize = 0
+    while k < labels {
+        var s: usize = 0
+        var l: usize = 0
+        if !label_span(p, n, k, &s, &l) {
+            return false
+        }
+        if l == 0 || l > 63 || !span_all_label_chars(p, s, l) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn valid_template(p: u64, n: usize, has_wild: bool) -> bool {
+    if n == 0 || n > TEXT_MAX {
+        return false
+    }
+    if n == 1 && rt.ld8(p, 0) == 64 as u8 {
+        return true
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 37 as u8 {
+            if !has_wild || i + 1 >= n || rt.ld8(p, i + 1) != 49 as u8 {
+                return false
+            }
+            i = i + 1
+        } else if !is_label_char(c) && c != 46 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn set_pattern(z: *mut Zone, i: usize, p: u64, n: usize) -> bool {
+    var m: usize = n
+    if n == 1 && rt.ld8(p, 0) == 64 as u8 {
+        m = 0
+    }
+    if m > PAT_MAX {
+        return false
+    }
+    let dst: u64 = zone_pat_ptr(z, i)
+    copy_lower(dst, p, m)
+    (*z).r_plen[i] = m
+    let labels: usize = label_count(dst, m)
+    (*z).r_nlab[i] = labels
+    (*z).r_kind[i] = KIND_EXACT
+    (*z).r_wpos[i] = 0
+    var wild_seen: bool = false
+    var k: usize = 0
+    while k < labels {
+        var s: usize = 0
+        var l: usize = 0
+        if !label_span(dst, m, k, &s, &l) {
+            return false
+        }
+        if l == 0 || l > 63 {
+            return false
+        }
+        if l == 1 && rt.ld8(dst, s) == 42 as u8 {
+            if wild_seen {
+                return false
+            }
+            wild_seen = true
+            (*z).r_kind[i] = KIND_ONE
+            (*z).r_wpos[i] = k
+        } else if l == 2 && rt.ld8(dst, s) == 42 as u8 && rt.ld8(dst, s + 1) == 42 as u8 {
+            if wild_seen {
+                return false
+            }
+            wild_seen = true
+            (*z).r_kind[i] = KIND_MANY
+            (*z).r_wpos[i] = k
+        } else if !span_all_label_chars(dst, s, l) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn set_text(z: *mut Zone, i: usize, p: u64, n: usize, fold: bool) -> bool {
+    if n > TEXT_MAX {
+        return false
+    }
+    let dst: u64 = zone_text_ptr(z, i)
+    if fold {
+        copy_lower(dst, p, n)
+    } else {
+        rt.mem_copy(dst, p, n)
+    }
+    (*z).r_tlen[i] = n
+    return true
+}
+
+fn set_name_text(z: *mut Zone, i: usize, p: u64, n: usize) -> bool {
+    let m: usize = strip_dot(p, n)
+    let has_wild: bool = (*z).r_kind[i] != KIND_EXACT
+    if !valid_template(p, m, has_wild) {
+        return false
+    }
+    return set_text(z, i, p, m, true)
+}
+
+fn parse_origin(z: *mut Zone, p: u64, n: usize) -> bool {
+    let m: usize = strip_dot(p, n)
+    if m > ORIGIN_MAX || !valid_dotted(p, m) {
+        return false
+    }
+    copy_lower(((&(*z).origin[0]) as u64), p, m)
+    (*z).origin_len = m
+    return true
+}
+
+fn num_at(z: *mut Zone, i: usize, k: usize) -> usize {
+    return i * NUMS_PER_RULE + k
+}
+
+fn read_num_token(p: u64, pos: usize, end: usize, tend: *mut usize, out: *mut u32) -> bool {
+    let s: usize = next_token(p, pos, end, tend)
+    if *tend == s {
+        return false
+    }
+    return parse_u32(p + s as u64, *tend - s, out)
+}
+
+fn parse_rule_data(z: *mut Zone, i: usize, rtype: u32, p: u64, pos: usize, end: usize) -> bool {
+    var te: usize = 0
+    var ts: usize = 0
+    if rtype == RT_A {
+        ts = next_token(p, pos, end, &te)
+        return te > ts && parse_ipv4(p + ts as u64, te - ts, zone_addr_ptr(z, i))
+    }
+    if rtype == RT_AAAA {
+        ts = next_token(p, pos, end, &te)
+        if te == ts {
+            return false
+        }
+        var a6: [u8; 16] = [0; 16]
+        if !ip6.ip6_parse(p + ts as u64, te - ts, &a6) {
+            return false
+        }
+        rt.mem_copy(zone_addr_ptr(z, i), (&a6[0]) as u64, 16)
+        return true
+    }
+    if rtype == RT_NS || rtype == RT_CNAME {
+        ts = next_token(p, pos, end, &te)
+        return te > ts && set_name_text(z, i, p + ts as u64, te - ts)
+    }
+    if rtype == RT_MX {
+        var pref: u32 = 0
+        if !read_num_token(p, pos, end, &te, &pref) {
+            return false
+        }
+        (*z).r_num[num_at(z, i, 0)] = pref
+        ts = next_token(p, te, end, &te)
+        return te > ts && set_name_text(z, i, p + ts as u64, te - ts)
+    }
+    if rtype == RT_SRV {
+        var cur: usize = pos
+        var k: usize = 0
+        while k < 3 {
+            var v: u32 = 0
+            if !read_num_token(p, cur, end, &te, &v) {
+                return false
+            }
+            if k == 2 && v > 65535 as u32 {
+                return false
+            }
+            if k < 2 && v > 65535 as u32 {
+                return false
+            }
+            (*z).r_num[num_at(z, i, k)] = v
+            cur = te
+            k = k + 1
+        }
+        ts = next_token(p, cur, end, &te)
+        return te > ts && set_name_text(z, i, p + ts as u64, te - ts)
+    }
+    if rtype == RT_TXT {
+        var s: usize = pos
+        while s < end && is_blank(rt.ld8(p, s)) {
+            s = s + 1
+        }
+        var e: usize = end
+        while e > s && is_blank(rt.ld8(p, e - 1)) {
+            e = e - 1
+        }
+        if e - s >= 2 && rt.ld8(p, s) == 34 as u8 && rt.ld8(p, e - 1) == 34 as u8 {
+            s = s + 1
+            e = e - 1
+        }
+        if e <= s || e - s > 255 {
+            return false
+        }
+        var q: usize = s
+        while q < e {
+            let c: u8 = rt.ld8(p, q)
+            if c == 37 as u8 {
+                if (*z).r_kind[i] == KIND_EXACT || q + 1 >= e || rt.ld8(p, q + 1) != 49 as u8 {
+                    return false
+                }
+                q = q + 1
+            } else if c < 32 as u8 || c > 126 as u8 {
+                return false
+            }
+            q = q + 1
+        }
+        return set_text(z, i, p + s as u64, e - s, false)
+    }
+    if rtype == RT_SOA {
+        var ms: usize = 0
+        var me: usize = 0
+        var rs: usize = 0
+        var re: usize = 0
+        ms = next_token(p, pos, end, &me)
+        rs = next_token(p, me, end, &re)
+        if me == ms || re == rs {
+            return false
+        }
+        let ml: usize = strip_dot(p + ms as u64, me - ms)
+        let rl: usize = strip_dot(p + rs as u64, re - rs)
+        if !valid_template(p + ms as u64, ml, false) || !valid_template(p + rs as u64, rl, false) {
+            return false
+        }
+        if ml + 1 + rl > TEXT_MAX {
+            return false
+        }
+        let dst: u64 = zone_text_ptr(z, i)
+        copy_lower(dst, p + ms as u64, ml)
+        rt.st8(dst, ml, 32 as u8)
+        copy_lower(dst + (ml + 1) as u64, p + rs as u64, rl)
+        (*z).r_tlen[i] = ml + 1 + rl
+        var cur: usize = re
+        var k: usize = 0
+        while k < 5 {
+            var v: u32 = 0
+            if !read_num_token(p, cur, end, &te, &v) {
+                return false
+            }
+            (*z).r_num[num_at(z, i, k)] = v
+            cur = te
+            k = k + 1
+        }
+        return true
+    }
+    return false
+}
+
+fn keyword_type(p: u64, n: usize) -> u32 {
+    if lit_eq(p, n, "a") { return RT_A }
+    if lit_eq(p, n, "aaaa") { return RT_AAAA }
+    if lit_eq(p, n, "ns") { return RT_NS }
+    if lit_eq(p, n, "cname") { return RT_CNAME }
+    if lit_eq(p, n, "soa") { return RT_SOA }
+    if lit_eq(p, n, "mx") { return RT_MX }
+    if lit_eq(p, n, "txt") { return RT_TXT }
+    if lit_eq(p, n, "srv") { return RT_SRV }
+    return 0 as u32
+}
+
+fn parse_line(z: *mut Zone, p: u64, s: usize, e: usize) -> bool {
+    var k1e: usize = 0
+    let k1: usize = next_token(p, s, e, &k1e)
+    if k1e == k1 {
+        return true
+    }
+    if rt.ld8(p, k1) == 35 as u8 {
+        return true
+    }
+    let kw: u64 = p + k1 as u64
+    let kn: usize = k1e - k1
+    if lit_eq(kw, kn, "zone") {
+        var oe: usize = 0
+        let os: usize = next_token(p, k1e, e, &oe)
+        return oe > os && parse_origin(z, p + os as u64, oe - os)
+    }
+    if lit_eq(kw, kn, "ttl") {
+        var v: u32 = 0
+        var te: usize = 0
+        if !read_num_token(p, k1e, e, &te, &v) || v == 0 as u32 || v > 86400 as u32 {
+            return false
+        }
+        (*z).ttl = v
+        return true
+    }
+    let rtype: u32 = keyword_type(kw, kn)
+    if rtype == 0 as u32 || (*z).origin_len == 0 || (*z).n >= ZONE_MAX_RULES {
+        return false
+    }
+    var ow_e: usize = 0
+    let ow: usize = next_token(p, k1e, e, &ow_e)
+    if ow_e == ow {
+        return false
+    }
+    let i: usize = (*z).n
+    (*z).r_type[i] = rtype
+    (*z).r_tlen[i] = 0
+    if !set_pattern(z, i, p + ow as u64, ow_e - ow) {
+        return false
+    }
+    if !parse_rule_data(z, i, rtype, p, ow_e, e) {
+        return false
+    }
+    (*z).n = i + 1
+    return true
+}
+
+fn zone_parse(z: *mut Zone, p: u64, n: usize) -> usize {
+    var line: usize = 1
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if !parse_line(z, p, i, e) {
+            return line
+        }
+        line = line + 1
+        i = e + 1
+    }
+    if (*z).origin_len == 0 {
+        return line
+    }
+    return 0
+}
+
+fn zone_same_owner(z: *mut Zone, a: usize, b: usize) -> bool {
+    let pl: usize = (*z).r_plen[a]
+    if pl != (*z).r_plen[b] {
+        return false
+    }
+    if pl == 0 {
+        return true
+    }
+    return rt.mem_eq(zone_pat_ptr(z, a), zone_pat_ptr(z, b), pl)
+}
+
+fn score_of(kind: u32, nlab: usize) -> u32 {
+    if kind == KIND_EXACT {
+        return 3000 as u32 + nlab as u32
+    }
+    if kind == KIND_ONE {
+        return 2000 as u32 + nlab as u32
+    }
+    return 1000 as u32 + nlab as u32
+}
+
+fn labels_equal(a: u64, an: usize, ai: usize, b: u64, bn: usize, bi: usize) -> bool {
+    var s1: usize = 0
+    var l1: usize = 0
+    var s2: usize = 0
+    var l2: usize = 0
+    if !label_span(a, an, ai, &s1, &l1) || !label_span(b, bn, bi, &s2, &l2) {
+        return false
+    }
+    return l1 == l2 && rt.mem_eq(a + s1 as u64, b + s2 as u64, l1)
+}
+
+fn match_rule(z: *mut Zone, i: usize, rel: u64, rlen: usize, cap: u64, capn: *mut usize) -> u32 {
+    let pat: u64 = zone_pat_ptr(z, i)
+    let pl: usize = (*z).r_plen[i]
+    let pn: usize = (*z).r_nlab[i]
+    let kind: u32 = (*z).r_kind[i]
+    let wpos: usize = (*z).r_wpos[i]
+    let qn: usize = label_count(rel, rlen)
+    *capn = 0
+    if kind == KIND_EXACT {
+        if rlen == pl && (pl == 0 || rt.mem_eq(pat, rel, pl)) {
+            return score_of(kind, pn)
+        }
+        return 0 as u32
+    }
+    if kind == KIND_ONE && qn != pn {
+        return 0 as u32
+    }
+    if kind == KIND_MANY && qn < pn {
+        return 0 as u32
+    }
+    var cover: usize = 1
+    if kind == KIND_MANY {
+        cover = qn - pn + 1
+    }
+    var k: usize = 0
+    while k < pn {
+        if k != wpos {
+            var qi: usize = k
+            if k > wpos {
+                qi = k + cover - 1
+            }
+            if !labels_equal(pat, pl, k, rel, rlen, qi) {
+                return 0 as u32
+            }
+        }
+        k = k + 1
+    }
+    var cs: usize = 0
+    var cl: usize = 0
+    var s1: usize = 0
+    var l1: usize = 0
+    if !label_span(rel, rlen, wpos, &cs, &l1) {
+        return 0 as u32
+    }
+    var last: usize = 0
+    var l2: usize = 0
+    if !label_span(rel, rlen, wpos + cover - 1, &last, &l2) {
+        return 0 as u32
+    }
+    cl = last + l2 - cs
+    if cl > ZONE_CAP_MAX || !span_dotted_label_chars(rel, cs, cl) {
+        return 0 as u32
+    }
+    if kind == KIND_ONE && !span_all_label_chars(rel, cs, cl) {
+        return 0 as u32
+    }
+    rt.mem_copy(cap, rel + cs as u64, cl)
+    *capn = cl
+    return score_of(kind, pn - 1)
+}
+
+fn zone_lookup(z: *mut Zone, rel: u64, rlen: usize, out: *mut Lookup) {
+    (*out).found = false
+    (*out).best = 0
+    (*out).cap_len = 0
+    var best_score: u32 = 0
+    var tmp: [u8; 128] = [0; 128]
+    var tn: usize = 0
+    var i: usize = 0
+    while i < (*z).n {
+        let sc: u32 = match_rule(z, i, rel, rlen, (&tmp[0]) as u64, &tn)
+        if sc > best_score {
+            best_score = sc
+            (*out).found = true
+            (*out).best = i
+            rt.mem_copy(((&(*out).cap[0]) as u64), (&tmp[0]) as u64, tn)
+            (*out).cap_len = tn
+        }
+        i = i + 1
+    }
+}
+
+fn ends_with_origin(z: *mut Zone, name: u64, n: usize) -> bool {
+    let on: usize = (*z).origin_len
+    if n < on + 2 {
+        return false
+    }
+    if rt.ld8(name, n - on - 1) != 46 as u8 {
+        return false
+    }
+    return rt.mem_eq(name + (n - on) as u64, ((&(*z).origin[0]) as u64), on)
+}
+
+fn zone_relative(z: *mut Zone, name: u64, n: usize, rel: *mut u64, rlen: *mut usize) -> bool {
+    let on: usize = (*z).origin_len
+    if n == on && rt.mem_eq(name, ((&(*z).origin[0]) as u64), on) {
+        *rel = name
+        *rlen = 0
+        return true
+    }
+    if ends_with_origin(z, name, n) {
+        *rel = name
+        *rlen = n - on - 1
+        return true
+    }
+    return false
+}
+
+fn zone_render(z: *mut Zone, tp: u64, tn: usize, cap: u64, capn: usize, out: *mut rt.Buf) {
+    if tn == 1 && rt.ld8(tp, 0) == 64 as u8 {
+        rt.buf_push_bytes(out, ((&(*z).origin[0]) as u64), (*z).origin_len)
+        return
+    }
+    var i: usize = 0
+    while i < tn {
+        let c: u8 = rt.ld8(tp, i)
+        if c == 37 as u8 && i + 1 < tn && rt.ld8(tp, i + 1) == 49 as u8 {
+            rt.buf_push_bytes(out, cap, capn)
+            i = i + 1
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}

@@ -10,13 +10,13 @@
 //   chat_set_action(&ch, p, n, now_ms)          action bar text, shown for ACTION_MS
 //   chat_input_char / _backspace / _delete / _left / _right / _home / _end / _clear / _set
 //
-// Non ASCII input is stored as UTF-8 and sent as it is; lines received are reduced to ASCII (every multi-octet sequence becomes one '?').
 
 import std.rt
 import mc.mc_text
+import mc.mc_fontmap
 
 export {
-    Chat, chat_new, chat_free, chat_add_doc, chat_add_plain, chat_line_count, chat_line_len, chat_line_ptr, chat_line_color, chat_line_time,
+    Chat, chat_new, chat_free, chat_add_doc, chat_add_plain, chat_line_count, chat_line_len, chat_line_ptr, chat_line_color, chat_line_flags, chat_line_colors_ptr, chat_line_flags_ptr, chat_line_time, chat_input_replace,
     chat_set_action, chat_action_len, chat_action_ptr, chat_action_color, chat_action_live,
     chat_input_char, chat_input_backspace, chat_input_delete, chat_input_left, chat_input_right, chat_input_home, chat_input_end,
     chat_input_clear, chat_input_set, chat_input_len, chat_input_ptr, chat_input_cursor,
@@ -32,6 +32,7 @@ const WHITE: u32 = 0xFFFFFFFF
 struct Chat {
     text: rt.Buf,
     color: rt.Buf,
+    style: rt.Buf,
     lens: rt.Buf,
     time: rt.Buf,
     head: usize,
@@ -59,11 +60,12 @@ fn zero_fill(b: *mut rt.Buf, n: usize) {
 }
 
 fn chat_new() -> Chat {
-    var ch: Chat = Chat { text: rt.buf_new(), color: rt.buf_new(), lens: rt.buf_new(), time: rt.buf_new(), head: 0, count: 0,
+    var ch: Chat = Chat { text: rt.buf_new(), color: rt.buf_new(), style: rt.buf_new(), lens: rt.buf_new(), time: rt.buf_new(), head: 0, count: 0,
         input: rt.buf_new(), cur: 0, action: rt.buf_new(), action_color: WHITE, action_t: 0 as u64, open: false, was_open: false, scroll: 0, guard: 0,
         regrab: false, received: 0 as u64, sent: 0 as u64 }
     zero_fill(&ch.text, MAX_LINES * LINE_MAX)
     zero_fill(&ch.color, MAX_LINES * LINE_MAX * 4)
+    zero_fill(&ch.style, MAX_LINES * LINE_MAX)
     zero_fill(&ch.lens, MAX_LINES * 4)
     zero_fill(&ch.time, MAX_LINES * 4)
     return ch
@@ -72,6 +74,7 @@ fn chat_new() -> Chat {
 fn chat_free(ch: *mut Chat) {
     rt.buf_free(&(*ch).text)
     rt.buf_free(&(*ch).color)
+    rt.buf_free(&(*ch).style)
     rt.buf_free(&(*ch).lens)
     rt.buf_free(&(*ch).time)
     rt.buf_free(&(*ch).input)
@@ -86,15 +89,17 @@ fn argb_of(rgb: i32) -> u32 {
     return 0xFF000000 | (b << 16) | (g << 8) | r
 }
 
-fn push_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, n: usize, now: u64) {
+fn push_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, fp: *mut rt.Buf, n: usize, now: u64) {
     if n == 0 { return }
     let idx: usize = (*ch).head
     let tb: u64 = rt.buf_ptr(&(*ch).text) + (idx * LINE_MAX) as u64
     let cb: u64 = rt.buf_ptr(&(*ch).color) + (idx * LINE_MAX * 4) as u64
+    let fb: u64 = rt.buf_ptr(&(*ch).style) + (idx * LINE_MAX) as u64
     var i: usize = 0
     while i < n {
         rt.st8(tb, i, rt.ld8(rt.buf_ptr(tp), i))
         rt.st32(cb, i, rt.ld32(rt.buf_ptr(cp), i))
+        rt.st8(fb, i, rt.ld8(rt.buf_ptr(fp), i))
         i = i + 1
     }
     rt.st32(rt.buf_ptr(&(*ch).lens), idx, n as u32)
@@ -104,14 +109,16 @@ fn push_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, n: usize, now: u64
     (*ch).received = (*ch).received + 1 as u64
 }
 
-fn flush_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, now: u64) {
-    push_line(ch, tp, cp, rt.buf_len(tp), now)
+fn flush_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, fp: *mut rt.Buf, now: u64) {
+    push_line(ch, tp, cp, fp, rt.buf_len(tp), now)
     rt.buf_clear(tp)
     rt.buf_clear(cp)
+    rt.buf_clear(fp)
 }
 
-fn push_glyph(tp: *mut rt.Buf, cp: *mut rt.Buf, c: u8, argb: u32) {
+fn push_glyph(tp: *mut rt.Buf, cp: *mut rt.Buf, fp: *mut rt.Buf, c: u8, argb: u32, flags: u32) {
     rt.buf_push(tp, c)
+    rt.buf_push(fp, flags as u8)
     let n: usize = rt.buf_len(cp)
     zero_fill(cp, 4)
     rt.st32(rt.buf_ptr(cp), n / 4, argb)
@@ -120,6 +127,7 @@ fn push_glyph(tp: *mut rt.Buf, cp: *mut rt.Buf, c: u8, argb: u32) {
 fn chat_add_octets(ch: *mut Chat, p: u64, n: usize, spans: *mut mc_text.TextDoc, use_spans: bool, now: u64, argb: u32) {
     var tp: rt.Buf = rt.buf_new()
     var cp: rt.Buf = rt.buf_new()
+    var fp: rt.Buf = rt.buf_new()
     var span: usize = 0
     var spans_n: usize = 0
     if use_spans { spans_n = mc_text.text_span_count(spans) }
@@ -127,24 +135,29 @@ fn chat_add_octets(ch: *mut Chat, p: u64, n: usize, spans: *mut mc_text.TextDoc,
     while i < n {
         let c: u8 = rt.ld8(p, i)
         var col: u32 = argb
+        var fl: u32 = 0 as u32
         if spans_n > 0 {
             while span < spans_n && mc_text.text_span_off(spans, span) + mc_text.text_span_len(spans, span) <= i { span = span + 1 }
-            if span < spans_n && mc_text.text_span_off(spans, span) <= i { col = argb_of(mc_text.text_span_color(spans, span)) }
+            if span < spans_n && mc_text.text_span_off(spans, span) <= i { let sc: i32 = mc_text.text_span_color(spans, span)
+                if sc >= 0 { col = argb_of(sc) }
+                fl = mc_text.text_span_flags(spans, span)
+            }
         }
+        var used: usize = 1
         if c == 10 as u8 {
-            flush_line(ch, &tp, &cp, now)
-        } else if c >= 128 as u8 && c < 192 as u8 {
+            flush_line(ch, &tp, &cp, &fp, now)
         } else {
-            var g: u8 = c
-            if c >= 192 as u8 || c < 32 as u8 { g = 63 as u8 }
-            push_glyph(&tp, &cp, g, col)
-            if rt.buf_len(&tp) >= LINE_MAX { flush_line(ch, &tp, &cp, now) }
+            var cpt: u32 = 0 as u32
+            used = mc_fontmap.fontmap_decode(p, n, i, &cpt)
+            push_glyph(&tp, &cp, &fp, mc_fontmap.fontmap_glyph(cpt) as u8, col, fl)
+            if rt.buf_len(&tp) >= LINE_MAX { flush_line(ch, &tp, &cp, &fp, now) }
         }
-        i = i + 1
+        i = i + used
     }
-    flush_line(ch, &tp, &cp, now)
+    flush_line(ch, &tp, &cp, &fp, now)
     rt.buf_free(&tp)
     rt.buf_free(&cp)
+    rt.buf_free(&fp)
     (*ch).scroll = 0
 }
 
@@ -153,9 +166,10 @@ fn chat_add_doc(ch: *mut Chat, doc: *mut mc_text.TextDoc, now: u64) {
 }
 
 fn chat_add_plain(ch: *mut Chat, p: u64, n: usize, argb: u32, now: u64) {
-    var none: mc_text.TextDoc = mc_text.text_new()
-    chat_add_octets(ch, p, n, &none, false, now, argb)
-    mc_text.text_free(&none)
+    var doc: mc_text.TextDoc = mc_text.text_new()
+    mc_text.text_from_legacy(&doc, p, n)
+    chat_add_octets(ch, mc_text.text_ptr(&doc), mc_text.text_len(&doc), &doc, true, now, argb)
+    mc_text.text_free(&doc)
 }
 
 fn chat_line_count(ch: *mut Chat) -> usize { return (*ch).count }
@@ -177,6 +191,18 @@ fn chat_line_color(ch: *mut Chat, k: usize, j: usize) -> u32 {
     return rt.ld32(rt.buf_ptr(&(*ch).color) + (line_index(ch, k) * LINE_MAX * 4) as u64, j)
 }
 
+fn chat_line_flags(ch: *mut Chat, k: usize, j: usize) -> u32 {
+    return rt.ld8(rt.buf_ptr(&(*ch).style) + (line_index(ch, k) * LINE_MAX) as u64, j) as u32
+}
+
+fn chat_line_colors_ptr(ch: *mut Chat, k: usize) -> u64 {
+    return rt.buf_ptr(&(*ch).color) + (line_index(ch, k) * LINE_MAX * 4) as u64
+}
+
+fn chat_line_flags_ptr(ch: *mut Chat, k: usize) -> u64 {
+    return rt.buf_ptr(&(*ch).style) + (line_index(ch, k) * LINE_MAX) as u64
+}
+
 fn chat_line_time(ch: *mut Chat, k: usize) -> u32 {
     return rt.ld32(rt.buf_ptr(&(*ch).time), line_index(ch, k))
 }
@@ -184,10 +210,11 @@ fn chat_line_time(ch: *mut Chat, k: usize) -> u32 {
 fn chat_set_action(ch: *mut Chat, p: u64, n: usize, argb: u32, now: u64) {
     rt.buf_clear(&(*ch).action)
     var i: usize = 0
-    while i < n && i < LINE_MAX {
-        let c: u8 = rt.ld8(p, i)
-        if c >= 32 as u8 && c < 128 as u8 { rt.buf_push(&(*ch).action, c) } else if c >= 192 as u8 { rt.buf_push(&(*ch).action, 63) }
-        i = i + 1
+    while i < n && rt.buf_len(&(*ch).action) < LINE_MAX {
+        var cpt: u32 = 0 as u32
+        let used: usize = mc_fontmap.fontmap_decode(p, n, i, &cpt)
+        if cpt >= 32 as u32 { rt.buf_push(&(*ch).action, mc_fontmap.fontmap_glyph(cpt) as u8) }
+        i = i + used
     }
     (*ch).action_color = argb
     (*ch).action_t = now
@@ -314,4 +341,18 @@ fn chat_input_set(ch: *mut Chat, p: u64, n: usize) {
         i = i + 1
     }
     (*ch).cur = rt.buf_len(&(*ch).input)
+}
+
+fn chat_input_replace(ch: *mut Chat, from: usize, to: usize, p: u64, n: usize) {
+    let len: usize = rt.buf_len(&(*ch).input)
+    var a: usize = from
+    var b: usize = to
+    if b > len { b = len }
+    if a > b { a = b }
+    if len - (b - a) + n > INPUT_MAX { return }
+    var ins: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&ins, p, n)
+    input_remove(ch, a, b)
+    input_insert(ch, a, &ins)
+    rt.buf_free(&ins)
 }
