@@ -12,6 +12,12 @@ import layout_check as lc
 WIDGETS = "assets/minecraft/textures/gui/widgets.png"
 ICONS = "assets/minecraft/textures/gui/icons.png"
 INVENTORY = "assets/minecraft/textures/gui/container/inventory.png"
+CONTAINER_TEX = {
+    "generic": "generic_54",
+    "furnace": "furnace",
+    "craft": "crafting_table",
+}
+CONTAINER_H = {"furnace": 166, "craft": 166}
 
 
 def load(jar, name):
@@ -88,6 +94,51 @@ def check_inventory(img, jar, errors):
         errors.append("inv")
 
 
+def match_px(img, tex, s, ox, oy, u, v, w, h):
+    good = 0
+    total = 0
+    for dy in range(h * s):
+        for dx in range(w * s):
+            tr, tg, tb, ta = tex.getpixel((u + dx // s, v + dy // s))
+            if ta < 255:
+                continue
+            px = (ox + dx, oy + dy)
+            if px[0] >= img.size[0] or px[1] >= img.size[1]:
+                continue
+            total += 1
+            if img.getpixel(px)[:3] == (tr, tg, tb):
+                good += 1
+    return good, total
+
+
+def check_container(img, jar, kind, rows, errors):
+    w, h = img.size
+    s = lc.scale_for(w, h)
+    if not os.path.isfile(jar):
+        print("  skip  container panel needs the vanilla jar")
+        return
+    tex = load(jar, f"assets/minecraft/textures/gui/container/{CONTAINER_TEX[kind]}.png")
+    pw = 176
+    if kind == "generic":
+        top = rows * 18 + 17
+        ph = 114 + rows * 18
+    else:
+        ph = CONTAINER_H[kind]
+        top = ph - 96
+    ox = (w - pw * s) // 2
+    oy = (h - ph * s) // 2
+    if kind == "generic":
+        g1, t1 = match_px(img, tex, s, ox, oy, 0, 0, pw, top)
+        expect(f"{kind}{rows} top part", g1, t1, errors, 0.85)
+        g2, t2 = match_px(img, tex, s, ox, oy + top * s, 0, 126, pw, 96)
+        expect(f"{kind}{rows} bottom part", g2, t2, errors, 0.85)
+    else:
+        g1, t1 = match_px(img, tex, s, ox, oy, 0, 0, pw, top)
+        expect(f"{kind} upper part", g1, t1, errors, 0.8)
+        g2, t2 = match_px(img, tex, s, ox, oy + top * s, 0, top, pw, 96)
+        expect(f"{kind} player part", g2, t2, errors, 0.85)
+
+
 def has_hotbar(img, jar):
     widgets = load(jar, WIDGETS)
     w, h = img.size
@@ -133,6 +184,8 @@ def main():
         check_bars(img, jar, errors)
     elif mode == "inv":
         check_inventory(img, jar, errors)
+    elif mode == "cont":
+        check_container(img, jar, sys.argv[4], int(sys.argv[5]) if len(sys.argv) > 5 else 3, errors)
     elif mode == "hidden":
         ok = not has_hotbar(img, jar)
         print(f"  {'ok  ' if ok else 'FAIL'}  hud hidden with F1")
