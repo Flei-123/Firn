@@ -1,0 +1,410 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_chat_net
+import mc.mc_pkt_field
+
+export {
+    HudState, hs_new, hs_on_packet, hs_reset, hs_title_alpha, hs_title_ptr, hs_title_len, hs_subtitle_ptr, hs_subtitle_len,
+    hs_bar_ptr, hs_bar_text_len, hs_score_count, hs_score_name_ptr, hs_score_name_len, hs_score_value, hs_sidebar_title_ptr, hs_sidebar_title_len,
+    hs_sidebar_row_order,
+    BARS_MAX, SCORES_MAX, TEXT_MAX, NAME_MAX, OBJ_MAX,
+}
+
+const BARS_MAX: usize = 8
+const SCORES_MAX: usize = 64
+const TEXT_MAX: usize = 64
+const NAME_MAX: usize = 40
+const OBJ_MAX: usize = 16
+const TICK_MS: u64 = 50 as u64
+const SIDEBAR_POSITION: i32 = 1
+
+struct HudState {
+    xp_x1000: i32,
+    level: i32,
+    title: [u8; 64],
+    title_len: usize,
+    subtitle: [u8; 64],
+    subtitle_len: usize,
+    title_ms: u64,
+    fade_in: i32,
+    stay: i32,
+    fade_out: i32,
+    bar_key: [u64; 8],
+    bar_used: [bool; 8],
+    bar_pct: [i32; 8],
+    bar_color: [i32; 8],
+    bar_div: [i32; 8],
+    bar_len: [usize; 8],
+    bar_text: [u8; 512],
+    sb_obj: [u8; 16],
+    sb_obj_len: usize,
+    sb_title: [u8; 64],
+    sb_title_len: usize,
+    sc_used: [bool; 64],
+    sc_val: [i32; 64],
+    sc_name_len: [usize; 64],
+    sc_name: [u8; 2560],
+    sc_obj: [u8; 1024],
+    sc_obj_len: [usize; 64],
+}
+
+fn hs_new() -> HudState {
+    return HudState {
+        xp_x1000: 0, level: 0, title: [0; 64], title_len: 0, subtitle: [0; 64], subtitle_len: 0, title_ms: 0 as u64,
+        fade_in: 10, stay: 70, fade_out: 20,
+        bar_key: [0 as u64; 8], bar_used: [false; 8], bar_pct: [0; 8], bar_color: [0; 8], bar_div: [0; 8], bar_len: [0 as usize; 8], bar_text: [0; 512],
+        sb_obj: [0; 16], sb_obj_len: 0, sb_title: [0; 64], sb_title_len: 0,
+        sc_used: [false; 64], sc_val: [0; 64], sc_name_len: [0 as usize; 64], sc_name: [0; 2560], sc_obj: [0; 1024], sc_obj_len: [0 as usize; 64],
+    }
+}
+
+fn hs_reset(hs: *mut HudState) {
+    *hs = hs_new()
+}
+
+fn key_of(cl: *mut mc_client.Client, id: i32, name: str) -> u64 {
+    var p: u64 = 0
+    var n: usize = 0
+    if !mc_chat_net.field_of(cl, id, name, &p, &n) { return 0 as u64 }
+    var h: u64 = 1469598103934665603 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u64)) * (1099511628211 as u64)
+        i = i + 1
+    }
+    return h | (1 as u64)
+}
+
+fn copy_text(dst: u64, cap: usize, p: u64, n: usize) -> usize {
+    var m: usize = n
+    if m > cap { m = cap }
+    var i: usize = 0
+    while i < m {
+        rt.st8(dst, i, rt.ld8(p, i))
+        i = i + 1
+    }
+    return m
+}
+
+fn plain_into(net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32, name: str, dst: u64, cap: usize) -> usize {
+    var b: rt.Buf = rt.buf_new()
+    var n: usize = 0
+    if mc_chat_net.component_plain(net, cl, id, name, &b) { n = copy_text(dst, cap, rt.buf_ptr(&b), rt.buf_len(&b)) }
+    rt.buf_free(&b)
+    return n
+}
+
+fn string_into(cl: *mut mc_client.Client, id: i32, name: str, dst: u64, cap: usize) -> usize {
+    var p: u64 = 0
+    var n: usize = 0
+    if !mc_chat_net.field_of(cl, id, name, &p, &n) { return 0 }
+    return copy_text(dst, cap, p, n)
+}
+
+fn find_bar(hs: *mut HudState, key: u64) -> i32 {
+    var i: usize = 0
+    while i < BARS_MAX {
+        if (*hs).bar_used[i] && (*hs).bar_key[i] == key { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn free_bar(hs: *mut HudState) -> i32 {
+    var i: usize = 0
+    while i < BARS_MAX {
+        if !(*hs).bar_used[i] { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn on_boss_bar(hs: *mut HudState, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32) {
+    var action: i32 = 0
+    if !mc_pkt_field.pkt_varint(cl, id, "action", &action) { return }
+    let key: u64 = key_of(cl, id, "entityUUID")
+    if key == 0 as u64 { return }
+    var at: i32 = find_bar(hs, key)
+    if action == 0 && at < 0 { at = free_bar(hs) }
+    if at < 0 { return }
+    let i: usize = at as usize
+    if action == 1 {
+        (*hs).bar_used[i] = false
+        return
+    }
+    if action == 0 {
+        (*hs).bar_used[i] = true
+        (*hs).bar_key[i] = key
+        (*hs).bar_pct[i] = 1000
+        (*hs).bar_color[i] = 0
+        (*hs).bar_div[i] = 0
+        (*hs).bar_len[i] = 0
+    }
+    if action == 0 || action == 3 {
+        (*hs).bar_len[i] = plain_into(net, cl, id, "title", (&(*hs).bar_text[i * TEXT_MAX]) as u64, TEXT_MAX)
+    }
+    if action == 0 || action == 2 {
+        var h: f32 = 0.0 as f32
+        if mc_pkt_field.pkt_f32(cl, id, "health", &h) {
+            var v: i32 = (h * (1000.0 as f32)) as i32
+            if v < 0 { v = 0 }
+            if v > 1000 { v = 1000 }
+            (*hs).bar_pct[i] = v
+        }
+    }
+    if action == 0 || action == 4 {
+        var v: i32 = 0
+        if mc_pkt_field.pkt_varint(cl, id, "color", &v) { (*hs).bar_color[i] = v }
+        if mc_pkt_field.pkt_varint(cl, id, "dividers", &v) { (*hs).bar_div[i] = v }
+    }
+}
+
+fn sidebar_matches(hs: *mut HudState, p: u64, n: usize) -> bool {
+    if (*hs).sb_obj_len == 0 || n != (*hs).sb_obj_len { return false }
+    var i: usize = 0
+    while i < n {
+        if (*hs).sb_obj[i] != rt.ld8(p, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn clear_scores_of(hs: *mut HudState, p: u64, n: usize) {
+    var i: usize = 0
+    while i < SCORES_MAX {
+        if (*hs).sc_used[i] && (*hs).sc_obj_len[i] == n {
+            var same: bool = true
+            var k: usize = 0
+            while k < n {
+                if (*hs).sc_obj[i * OBJ_MAX + k] != rt.ld8(p, k) { same = false }
+                k = k + 1
+            }
+            if same { (*hs).sc_used[i] = false }
+        }
+        i = i + 1
+    }
+}
+
+fn find_score(hs: *mut HudState, np: u64, nn: usize, op: u64, on: usize) -> i32 {
+    var i: usize = 0
+    while i < SCORES_MAX {
+        if (*hs).sc_used[i] && (*hs).sc_name_len[i] == nn && (*hs).sc_obj_len[i] == on {
+            var same: bool = true
+            var k: usize = 0
+            while k < nn {
+                if (*hs).sc_name[i * NAME_MAX + k] != rt.ld8(np, k) { same = false }
+                k = k + 1
+            }
+            k = 0
+            while k < on {
+                if (*hs).sc_obj[i * OBJ_MAX + k] != rt.ld8(op, k) { same = false }
+                k = k + 1
+            }
+            if same { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn on_score(hs: *mut HudState, cl: *mut mc_client.Client, id: i32) {
+    var np: u64 = 0
+    var nn: usize = 0
+    var op: u64 = 0
+    var on: usize = 0
+    if !mc_chat_net.field_of(cl, id, "itemName", &np, &nn) { return }
+    if !mc_chat_net.field_of(cl, id, "scoreName", &op, &on) { return }
+    if nn > NAME_MAX { nn = NAME_MAX }
+    if on > OBJ_MAX { on = OBJ_MAX }
+    var action: i32 = 0
+    mc_pkt_field.pkt_varint(cl, id, "action", &action)
+    var at: i32 = find_score(hs, np, nn, op, on)
+    if action == 1 {
+        if at >= 0 { (*hs).sc_used[at as usize] = false }
+        return
+    }
+    if at < 0 {
+        var i: usize = 0
+        while i < SCORES_MAX && at < 0 {
+            if !(*hs).sc_used[i] { at = i as i32 }
+            i = i + 1
+        }
+    }
+    if at < 0 { return }
+    let s: usize = at as usize
+    (*hs).sc_used[s] = true
+    (*hs).sc_name_len[s] = copy_text((&(*hs).sc_name[s * NAME_MAX]) as u64, NAME_MAX, np, nn)
+    (*hs).sc_obj_len[s] = copy_text((&(*hs).sc_obj[s * OBJ_MAX]) as u64, OBJ_MAX, op, on)
+    var v: i32 = 0
+    mc_pkt_field.pkt_varint(cl, id, "value", &v)
+    (*hs).sc_val[s] = v
+}
+
+fn on_objective(hs: *mut HudState, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32) {
+    var np: u64 = 0
+    var nn: usize = 0
+    if !mc_chat_net.field_of(cl, id, "name", &np, &nn) { return }
+    var action: i32 = 0
+    if !mc_pkt_field.pkt_i8(cl, id, "action", &action) { return }
+    if action == 1 {
+        clear_scores_of(hs, np, nn)
+        if sidebar_matches(hs, np, nn) {
+            (*hs).sb_obj_len = 0
+            (*hs).sb_title_len = 0
+        }
+        return
+    }
+    if sidebar_matches(hs, np, nn) {
+        (*hs).sb_title_len = plain_into(net, cl, id, "displayText", (&(*hs).sb_title[0]) as u64, TEXT_MAX)
+    }
+}
+
+fn on_display(hs: *mut HudState, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32) {
+    var pos: i32 = 0
+    if !mc_pkt_field.pkt_i8(cl, id, "position", &pos) { return }
+    if pos != SIDEBAR_POSITION { return }
+    (*hs).sb_obj_len = string_into(cl, id, "name", (&(*hs).sb_obj[0]) as u64, OBJ_MAX)
+    (*hs).sb_title_len = (*hs).sb_obj_len
+    var i: usize = 0
+    while i < (*hs).sb_obj_len {
+        (*hs).sb_title[i] = (*hs).sb_obj[i]
+        i = i + 1
+    }
+}
+
+fn hs_on_packet(hs: *mut HudState, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32, now: u64) -> bool {
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_EXPERIENCE) {
+        var bar: f32 = 0.0 as f32
+        var lv: i32 = 0
+        if mc_pkt_field.pkt_f32(cl, id, "experienceBar", &bar) {
+            var v: i32 = (bar * (1000.0 as f32)) as i32
+            if v < 0 { v = 0 }
+            if v > 1000 { v = 1000 }
+            (*hs).xp_x1000 = v
+        }
+        if mc_pkt_field.pkt_varint(cl, id, "level", &lv) { (*hs).level = lv }
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_TITLE_TEXT) {
+        (*hs).title_len = plain_into(net, cl, id, "text", (&(*hs).title[0]) as u64, TEXT_MAX)
+        (*hs).title_ms = now
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_TITLE_SUBTITLE) {
+        (*hs).subtitle_len = plain_into(net, cl, id, "text", (&(*hs).subtitle[0]) as u64, TEXT_MAX)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_TITLE_TIME) {
+        var a: i32 = 0
+        var b: i32 = 0
+        var c: i32 = 0
+        if mc_pkt_field.pkt_i32(cl, id, "fadeIn", &a) { (*hs).fade_in = a }
+        if mc_pkt_field.pkt_i32(cl, id, "stay", &b) { (*hs).stay = b }
+        if mc_pkt_field.pkt_i32(cl, id, "fadeOut", &c) { (*hs).fade_out = c }
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_CLEAR_TITLES) {
+        var reset: bool = false
+        var p: u64 = 0
+        var n: usize = 0
+        if mc_chat_net.field_of(cl, id, "reset", &p, &n) && n == 1 { reset = rt.ld8(p, 0) != 0 as u8 }
+        (*hs).title_len = 0
+        (*hs).subtitle_len = 0
+        if reset {
+            (*hs).fade_in = 10
+            (*hs).stay = 70
+            (*hs).fade_out = 20
+        }
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_BOSS_BAR) {
+        on_boss_bar(hs, net, cl, id)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SCOREBOARD_DISPLAY) {
+        on_display(hs, net, cl, id)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SCOREBOARD_OBJECTIVE) {
+        on_objective(hs, net, cl, id)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SCOREBOARD_SCORE) {
+        on_score(hs, cl, id)
+        return true
+    }
+    return false
+}
+
+fn hs_title_alpha(hs: *mut HudState, now: u64) -> i32 {
+    if (*hs).title_len == 0 && (*hs).subtitle_len == 0 { return 0 }
+    if now < (*hs).title_ms { return 0 }
+    let t: i32 = (((now - (*hs).title_ms) / TICK_MS) as i32)
+    let total: i32 = (*hs).fade_in + (*hs).stay + (*hs).fade_out
+    if t >= total { return 0 }
+    if t < (*hs).fade_in { return (255 * t) / (*hs).fade_in }
+    if t < (*hs).fade_in + (*hs).stay { return 255 }
+    return (255 * (total - t)) / (*hs).fade_out
+}
+
+fn hs_title_ptr(hs: *mut HudState) -> u64 { return (&(*hs).title[0]) as u64 }
+fn hs_title_len(hs: *mut HudState) -> usize { return (*hs).title_len }
+fn hs_subtitle_ptr(hs: *mut HudState) -> u64 { return (&(*hs).subtitle[0]) as u64 }
+fn hs_subtitle_len(hs: *mut HudState) -> usize { return (*hs).subtitle_len }
+
+fn hs_bar_ptr(hs: *mut HudState, i: usize) -> u64 { return (&(*hs).bar_text[i * TEXT_MAX]) as u64 }
+fn hs_bar_text_len(hs: *mut HudState, i: usize) -> usize { return (*hs).bar_len[i] }
+
+fn hs_score_count(hs: *mut HudState) -> i32 {
+    var n: i32 = 0
+    var i: usize = 0
+    while i < SCORES_MAX {
+        if (*hs).sc_used[i] && sidebar_matches(hs, (&(*hs).sc_obj[i * OBJ_MAX]) as u64, (*hs).sc_obj_len[i]) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn hs_score_name_ptr(hs: *mut HudState, i: usize) -> u64 { return (&(*hs).sc_name[i * NAME_MAX]) as u64 }
+fn hs_score_name_len(hs: *mut HudState, i: usize) -> usize { return (*hs).sc_name_len[i] }
+fn hs_score_value(hs: *mut HudState, i: usize) -> i32 { return (*hs).sc_val[i] }
+fn hs_sidebar_title_ptr(hs: *mut HudState) -> u64 { return (&(*hs).sb_title[0]) as u64 }
+fn hs_sidebar_title_len(hs: *mut HudState) -> usize { return (*hs).sb_title_len }
+
+fn name_less(hs: *mut HudState, a: usize, b: usize) -> bool {
+    let an: usize = (*hs).sc_name_len[a]
+    let bn: usize = (*hs).sc_name_len[b]
+    var k: usize = 0
+    while k < an && k < bn {
+        let x: u8 = (*hs).sc_name[a * NAME_MAX + k]
+        let y: u8 = (*hs).sc_name[b * NAME_MAX + k]
+        if x != y { return x < y }
+        k = k + 1
+    }
+    return an < bn
+}
+
+fn row_before(hs: *mut HudState, a: usize, b: usize) -> bool {
+    if (*hs).sc_val[a] != (*hs).sc_val[b] { return (*hs).sc_val[a] > (*hs).sc_val[b] }
+    return name_less(hs, a, b)
+}
+
+fn hs_sidebar_row_order(hs: *mut HudState, out: u64, max: i32) -> i32 {
+    var n: i32 = 0
+    var i: usize = 0
+    while i < SCORES_MAX {
+        if (*hs).sc_used[i] && sidebar_matches(hs, (&(*hs).sc_obj[i * OBJ_MAX]) as u64, (*hs).sc_obj_len[i]) && n < max {
+            var at: i32 = n
+            while at > 0 && row_before(hs, i, rt.ld32(out, (at - 1) as usize) as usize) {
+                rt.st32(out, at as usize, rt.ld32(out, (at - 1) as usize))
+                at = at - 1
+            }
+            rt.st32(out, at as usize, i as u32)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
