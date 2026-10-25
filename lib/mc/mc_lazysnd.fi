@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.hash
+import std.time
+import audio.engine
+import audio.bank
+import audio.load_ogg
+import zip.zip
+import mc.mc_assets
+
+export {
+    Lazy, lazy_new, lazy_free, lazy_enable, lazy_on, lazy_reset, lazy_begin_apply, lazy_eager_ok, lazy_placeholder, lazy_begin, lazy_add_slot,
+    lazy_commit, lazy_ensure, lazy_pending, lazy_find_ogg, lazy_file_hash, LAZY_NAME, LAZY_MAX_EVENTS,
+}
+
+const LAZY_NAME: str = "lazy:silence"
+const LAZY_MAX_EVENTS: usize = 2048
+const WORDS: usize = 40
+const F_EV: usize = 0
+const F_SLOTS: usize = 1
+const F_DIST: usize = 2
+const F_DONE: usize = 3
+const F_NAME: usize = 4
+const F_DIST_OFF: usize = 8
+const F_SLOT_DIST: usize = 24
+
+struct Lazy {
+    on: bool,
+    eager_ns: u64,
+    min_events: usize,
+    t0: u64,
+    placeholder: i32,
+    recs: u64,
+    by_ev: u64,
+    n: usize,
+    paths: rt.Buf,
+    names: rt.Buf,
+    st: *mut mc_assets.PackStack,
+    eng: *mut engine.Engine,
+    bk: *mut bank.Bank,
+    decoded: i32,
+    failed: i32,
+    full: i32,
+    steps: i32,
+}
+
+fn lazy_new() -> Lazy {
+    return Lazy { on: false, eager_ns: 2000000000 as u64, min_events: 256, t0: 0 as u64, placeholder: 0 - 1, recs: 0, by_ev: 0, n: 0, paths: rt.buf_new(), names: rt.buf_new(),
+        st: 0 as *mut mc_assets.PackStack, eng: 0 as *mut engine.Engine, bk: 0 as *mut bank.Bank, decoded: 0, failed: 0, full: 0, steps: 0 }
+}
+
+fn lazy_free(lz: *mut Lazy) {
+    if (*lz).recs != 0 { rt.heap_free((*lz).recs, LAZY_MAX_EVENTS * WORDS * 4) }
+    if (*lz).by_ev != 0 { rt.heap_free((*lz).by_ev, LAZY_MAX_EVENTS * 4) }
+    (*lz).recs = 0
+    (*lz).by_ev = 0
+    (*lz).on = false
+    rt.buf_free(&(*lz).paths)
+    rt.buf_free(&(*lz).names)
+}
+
+fn zero32(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st32(p, i, 0 as u32)
+        i = i + 1
+    }
+}
+
+fn lazy_enable(lz: *mut Lazy, eager_ns: u64, min_events: usize) -> bool {
+    if (*lz).recs == 0 {
+        (*lz).recs = rt.heap_alloc(LAZY_MAX_EVENTS * WORDS * 4)
+        (*lz).by_ev = rt.heap_alloc(LAZY_MAX_EVENTS * 4)
+        if (*lz).recs == 0 || (*lz).by_ev == 0 { return false }
+        zero32((*lz).by_ev, LAZY_MAX_EVENTS)
+    }
+    (*lz).eager_ns = eager_ns
+    (*lz).min_events = min_events
+    (*lz).on = true
+    return true
+}
+
+fn lazy_on(lz: *mut Lazy) -> bool { return (*lz).on }
+
+fn lazy_pending(lz: *mut Lazy) -> usize {
+    var k: usize = 0
+    var r: usize = 0
+    while r < (*lz).n {
+        if rt.ld32((*lz).recs, r * WORDS + F_DONE) < rt.ld32((*lz).recs, r * WORDS + F_DIST) { k = k + 1 }
+        r = r + 1
+    }
+    return k
+}
+
+fn lazy_reset(lz: *mut Lazy) {
+    if (*lz).by_ev != 0 { zero32((*lz).by_ev, LAZY_MAX_EVENTS) }
+    (*lz).n = 0
+    rt.buf_clear(&(*lz).paths)
+    rt.buf_clear(&(*lz).names)
+}
+
+fn lazy_begin_apply(lz: *mut Lazy, s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mut bank.Bank) {
+    lazy_reset(lz)
+    (*lz).st = s
+    (*lz).eng = e
+    (*lz).bk = b
+    (*lz).t0 = time.monotonic_ns()
+}
+
+fn lazy_eager_ok(lz: *mut Lazy) -> bool {
+    if !(*lz).on { return true }
+    return time.monotonic_ns() - (*lz).t0 < (*lz).eager_ns
+}
+
+fn lazy_placeholder(lz: *mut Lazy) -> i32 {
+    let e: *mut engine.Engine = (*lz).eng
+    if (*lz).placeholder >= 0 && ((*lz).placeholder as usize) < engine.engine_sample_count(e) && engine.engine_sample_frames(e, (*lz).placeholder) == 1 as u64 {
+        return (*lz).placeholder
+    }
+    let p: u64 = rt.heap_alloc(4)
+    if p == 0 { return 0 - 1 }
+    rt.st32(p, 0, 0 as u32)
+    (*lz).placeholder = engine.engine_add_sample(e, p, 1 as u64, 1 as u32)
+    rt.heap_free(p, 4)
+    if (*lz).placeholder >= 0 { bank.bank_provide_hashed((*lz).bk, LAZY_NAME, 1 as u64, (*lz).placeholder) }
+    return (*lz).placeholder
+}
+
+fn lazy_begin(lz: *mut Lazy, name_p: u64, name_n: usize) -> i32 {
+    if (*lz).n >= LAZY_MAX_EVENTS { return 0 - 1 }
+    let r: usize = (*lz).n
+    zero32((*lz).recs + (r * WORDS * 4) as u64, WORDS)
+    rt.st32((*lz).recs, r * WORDS + F_EV, 4294967295 as u32)
+    rt.st32((*lz).recs, r * WORDS + F_NAME, rt.buf_len(&(*lz).names) as u32)
+    rt.buf_push_bytes(&(*lz).names, name_p, name_n)
+    rt.buf_push(&(*lz).names, 0 as u8)
+    (*lz).n = r + 1
+    return r as i32
+}
+
+fn line_end(b: *mut rt.Buf, off: usize) -> usize {
+    let all: u64 = rt.buf_ptr(b)
+    let tot: usize = rt.buf_len(b)
+    var e: usize = off
+    while e < tot && rt.ld8(all, e) != 10 as u8 { e = e + 1 }
+    return e
+}
+
+fn lazy_add_slot(lz: *mut Lazy, r: i32, p: u64, n: usize) -> bool {
+    let base: usize = (r as usize) * WORDS
+    let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
+    if slots >= 16 { return false }
+    let nd: usize = rt.ld32((*lz).recs, base + F_DIST) as usize
+    var d: usize = 0
+    while d < nd {
+        let off: usize = rt.ld32((*lz).recs, base + F_DIST_OFF + d) as usize
+        let e: usize = line_end(&(*lz).paths, off)
+        if e - off == n && rt.mem_eq(rt.buf_ptr(&(*lz).paths) + off as u64, p, n) {
+            rt.st32((*lz).recs, base + F_SLOT_DIST + slots, d as u32)
+            rt.st32((*lz).recs, base + F_SLOTS, (slots + 1) as u32)
+            return true
+        }
+        d = d + 1
+    }
+    rt.st32((*lz).recs, base + F_DIST_OFF + nd, rt.buf_len(&(*lz).paths) as u32)
+    rt.buf_push_bytes(&(*lz).paths, p, n)
+    rt.buf_push(&(*lz).paths, 10 as u8)
+    rt.st32((*lz).recs, base + F_SLOT_DIST + slots, nd as u32)
+    rt.st32((*lz).recs, base + F_DIST, (nd + 1) as u32)
+    rt.st32((*lz).recs, base + F_SLOTS, (slots + 1) as u32)
+    return true
+}
+
+fn lazy_commit(lz: *mut Lazy) -> i32 {
+    var live: i32 = 0
+    var r: usize = 0
+    while r < (*lz).n {
+        let noff: usize = rt.ld32((*lz).recs, r * WORDS + F_NAME) as usize
+        let nn: usize = line_end0(&(*lz).names, noff)
+        let ev: i32 = engine.engine_find_event((*lz).eng, str { p: rt.buf_data(&(*lz).names) + noff as u64, n: nn - noff })
+        if ev >= 0 && (ev as usize) < LAZY_MAX_EVENTS {
+            rt.st32((*lz).recs, r * WORDS + F_EV, ev as u32)
+            rt.st32((*lz).by_ev, ev as usize, (r + 1) as u32)
+            live = live + 1
+        }
+        r = r + 1
+    }
+    return live
+}
+
+fn line_end0(b: *mut rt.Buf, off: usize) -> usize {
+    let all: u64 = rt.buf_ptr(b)
+    let tot: usize = rt.buf_len(b)
+    var e: usize = off
+    while e < tot && rt.ld8(all, e) != 0 as u8 { e = e + 1 }
+    return e
+}
+
+fn lazy_file_hash(p: u64, n: usize) -> u64 {
+    let h: u64 = hash.fnv1a64(p, n)
+    if h == 0 as u64 { return 1 as u64 }
+    return h
+}
+
+fn lazy_find_ogg(s: *mut mc_assets.PackStack, path: u64, pn: usize, raw: *mut rt.Buf) -> bool {
+    var pi: usize = 0
+    while pi < (*s).n {
+        let idx: i64 = mc_assets.pack_find_bytes(&(*s).packs[pi], path, pn)
+        if idx >= 0 {
+            let got: usize = zip.zip_extract(&(*s).packs[pi].z, idx as usize, raw) catch | e | (0)
+            if got > 0 { return true }
+            rt.buf_clear(raw)
+        }
+        pi = pi + 1
+    }
+    return false
+}
+
+fn decode_path(lz: *mut Lazy, off: usize) -> i32 {
+    let e: usize = line_end(&(*lz).paths, off)
+    let p: u64 = rt.buf_ptr(&(*lz).paths) + off as u64
+    let nm: str = str { p: rt.buf_data(&(*lz).paths) + off as u64, n: e - off }
+    var og: rt.Buf = rt.buf_new()
+    var id: i32 = 0 - 1
+    if !lazy_find_ogg((*lz).st, p, e - off, &og) {
+        (*lz).failed = (*lz).failed + 1
+    } else {
+        let h: u64 = lazy_file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
+        let cached: i32 = bank.bank_cached_id((*lz).bk, nm, h)
+        if cached >= 0 {
+            id = cached
+        } else if engine.engine_sample_count((*lz).eng) >= engine.MAX_SAMPLES {
+            (*lz).full = (*lz).full + 1
+        } else {
+            id = load_ogg.ogg_load((*lz).eng, rt.buf_ptr(&og), rt.buf_len(&og))
+            if id >= 0 {
+                bank.bank_provide_hashed((*lz).bk, nm, h, id)
+                (*lz).decoded = (*lz).decoded + 1
+            } else {
+                (*lz).failed = (*lz).failed + 1
+            }
+        }
+    }
+    rt.buf_free(&og)
+    return id
+}
+
+fn lazy_ensure(lz: *mut Lazy, ev: i32) {
+    if !(*lz).on || ev < 0 || (ev as usize) >= LAZY_MAX_EVENTS || (*lz).by_ev == 0 { return }
+    let k: u32 = rt.ld32((*lz).by_ev, ev as usize)
+    if k == 0 as u32 { return }
+    let base: usize = ((k - 1 as u32) as usize) * WORDS
+    let done: usize = rt.ld32((*lz).recs, base + F_DONE) as usize
+    let nd: usize = rt.ld32((*lz).recs, base + F_DIST) as usize
+    if done >= nd {
+        rt.st32((*lz).by_ev, ev as usize, 0 as u32)
+        return
+    }
+    (*lz).steps = (*lz).steps + 1
+    let id: i32 = decode_path(lz, rt.ld32((*lz).recs, base + F_DIST_OFF + done) as usize)
+    if id >= 0 {
+        let ph: i32 = (*lz).placeholder
+        let slots: usize = rt.ld32((*lz).recs, base + F_SLOTS) as usize
+        var s: usize = 0
+        while s < slots {
+            let mine: bool = rt.ld32((*lz).recs, base + F_SLOT_DIST + s) as usize == done
+            if mine || engine.engine_event_slot_sample((*lz).eng, ev, s) == ph {
+                engine.engine_event_set_sample((*lz).eng, ev, s, id)
+            }
+            s = s + 1
+        }
+    }
+    rt.st32((*lz).recs, base + F_DONE, (done + 1) as u32)
+    if done + 1 >= nd { rt.st32((*lz).by_ev, ev as usize, 0 as u32) }
+}
