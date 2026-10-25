@@ -73,6 +73,10 @@ while IFS= read -r f; do
     fi
     "$DUMP" "$f" > "$TMPD"/parv_b.txt 2>/dev/null
     rc=$?
+    if [ "$rc" -eq 1 ] && head -n 3 "$f" | grep -q '^// diff: neg'; then
+        skipped=$((skipped+1))
+        continue
+    fi
     if [ "$rc" -eq 3 ]; then
         noncore=$((noncore+1))
         continue
