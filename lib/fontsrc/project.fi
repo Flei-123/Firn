@@ -1,0 +1,205 @@
+import std.rt
+import std.dir
+import fontsrc.model
+import fontsrc.cursor
+import fontsrc.glyph_text
+import fontsrc.meta_text
+
+export { load_dir, save_dir, load_font_text }
+
+const SYS_MKDIR: i64 = 83
+const DIR_MODE: i64 = 493
+
+fn join_path(out: *mut rt.Buf, root: str, name: str) {
+    rt.buf_clear(out)
+    cursor.push_text(out, root)
+    if root.n > 0 && rt.ld8(root.p as u64, root.n - 1) != 47 as u8 {
+        rt.buf_push(out, 47 as u8)
+    }
+    cursor.push_text(out, name)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn glyph_file_name(out: *mut rt.Buf, cp: u32) {
+    rt.buf_clear(out)
+    cursor.push_cp(out, cp)
+    cursor.push_text(out, ".fglyph")
+}
+
+fn make_dir(path_c: *mut rt.Buf) {
+    syscall(SYS_MKDIR, rt.buf_ptr(path_c) as i64, DIR_MODE, 0, 0, 0, 0)
+}
+
+fn fail_at(err: *mut rt.Buf, file: str, line: i64) -> bool {
+    rt.buf_clear(err)
+    cursor.push_text(err, file)
+    cursor.push_text(err, ":")
+    cursor.push_int(err, line)
+    return false
+}
+
+fn read_text(root: str, name: str, data: *mut rt.Buf) -> bool {
+    var path_c: rt.Buf = rt.buf_new()
+    join_path(&path_c, root, name)
+    rt.buf_clear(data)
+    let ok: bool = rt.read_file(rt.buf_ptr(&path_c), data)
+    rt.buf_free(&path_c)
+    return ok
+}
+
+fn write_text(root: str, name: str, data: *mut rt.Buf) -> bool {
+    var path_c: rt.Buf = rt.buf_new()
+    join_path(&path_c, root, name)
+    let ok: bool = rt.write_file(rt.buf_ptr(&path_c), rt.buf_ptr(data), rt.buf_len(data))
+    rt.buf_free(&path_c)
+    return ok
+}
+
+fn has_suffix(s: str, suffix: str) -> bool {
+    if s.n < suffix.n {
+        return false
+    }
+    return rt.mem_eq(s.p as u64 + (s.n - suffix.n) as u64, suffix.p as u64, suffix.n)
+}
+
+fn load_glyph_file(root: str, name: str, f: *mut model.Font, err: *mut rt.Buf) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    var rel: rt.Buf = rt.buf_new()
+    cursor.push_text(&rel, "glyphs/")
+    cursor.push_text(&rel, name)
+    var ok: bool = true
+    if !read_text(root, model.text_str(&rel), &data) {
+        ok = fail_at(err, model.text_str(&rel), 0)
+    } else {
+        var g: model.Glyph = model.glyph_new(0 as u32)
+        let bad: i64 = glyph_text.glyph_parse(rt.buf_ptr(&data), rt.buf_len(&data), &g)
+        var expected: rt.Buf = rt.buf_new()
+        glyph_file_name(&expected, g.cp)
+        if bad != 0 {
+            ok = fail_at(err, model.text_str(&rel), bad)
+            model.glyph_free(&g)
+        } else if !cursor.str_eq(model.text_str(&expected), name) {
+            ok = fail_at(err, model.text_str(&rel), 1)
+            model.glyph_free(&g)
+        } else {
+            model.font_add_glyph(f, g)
+        }
+        rt.buf_free(&expected)
+    }
+    rt.buf_free(&rel)
+    rt.buf_free(&data)
+    return ok
+}
+
+fn load_dir(root: str, f: *mut model.Font, err: *mut rt.Buf) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    if !read_text(root, "font.ffont", &data) {
+        rt.buf_free(&data)
+        return fail_at(err, "font.ffont", 0)
+    }
+    let bad_meta: i64 = meta_text.meta_parse(rt.buf_ptr(&data), rt.buf_len(&data), f)
+    if bad_meta != 0 {
+        rt.buf_free(&data)
+        return fail_at(err, "font.ffont", bad_meta)
+    }
+    if read_text(root, "kerning.ffk", &data) {
+        let bad_kern: i64 = meta_text.kerning_parse(rt.buf_ptr(&data), rt.buf_len(&data), f)
+        if bad_kern != 0 {
+            rt.buf_free(&data)
+            return fail_at(err, "kerning.ffk", bad_kern)
+        }
+    }
+    rt.buf_free(&data)
+    var sub: rt.Buf = rt.buf_new()
+    cursor.push_text(&sub, root)
+    cursor.push_text(&sub, "/glyphs")
+    var d: dir.Dir = dir.open(model.text_str(&sub))
+    rt.buf_free(&sub)
+    var ok: bool = true
+    if dir.is_open(&d) {
+        while ok && dir.next(&d) {
+            if has_suffix(d.name, ".fglyph") {
+                ok = load_glyph_file(root, d.name, f, err)
+            }
+        }
+        dir.close(&d)
+    }
+    return ok
+}
+
+fn remove_stale(root: str, f: *mut model.Font) {
+    var sub: rt.Buf = rt.buf_new()
+    cursor.push_text(&sub, root)
+    cursor.push_text(&sub, "/glyphs")
+    var d: dir.Dir = dir.open(model.text_str(&sub))
+    var stale: rt.Buf = rt.buf_new()
+    if dir.is_open(&d) {
+        while dir.next(&d) {
+            if has_suffix(d.name, ".fglyph") {
+                var probe: cursor.Cur = cursor.cur_new(d.name.p as u64, d.name.n - 7)
+                var cp: u32 = 0
+                if !cursor.cur_cp(&probe, &cp) || model.font_find_index(f, cp) < 0 {
+                    cursor.push_text(&stale, d.name)
+                    rt.buf_push(&stale, 10 as u8)
+                }
+            }
+        }
+        dir.close(&d)
+    }
+    var c: cursor.Cur = cursor.cur_new(rt.buf_ptr(&stale), rt.buf_len(&stale))
+    var path_c: rt.Buf = rt.buf_new()
+    while cursor.cur_next_line(&c) {
+        let name: str = cursor.cur_word(&c)
+        rt.buf_clear(&path_c)
+        cursor.push_text(&path_c, model.text_str(&sub))
+        rt.buf_push(&path_c, 47 as u8)
+        cursor.push_text(&path_c, name)
+        rt.buf_push(&path_c, 0 as u8)
+        rt.unlink_file(rt.buf_ptr(&path_c))
+    }
+    rt.buf_free(&path_c)
+    rt.buf_free(&stale)
+    rt.buf_free(&sub)
+}
+
+fn save_dir(root: str, f: *mut model.Font) -> bool {
+    var path_c: rt.Buf = rt.buf_new()
+    join_path(&path_c, root, "")
+    make_dir(&path_c)
+    join_path(&path_c, root, "glyphs")
+    make_dir(&path_c)
+    rt.buf_free(&path_c)
+    var out: rt.Buf = rt.buf_new()
+    meta_text.meta_write(f, &out)
+    var ok: bool = write_text(root, "font.ffont", &out)
+    rt.buf_clear(&out)
+    meta_text.kerning_write(f, &out)
+    ok = ok && write_text(root, "kerning.ffk", &out)
+    var rel: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    let n: usize = model.font_glyph_count(f)
+    while ok && i < n {
+        let g: *mut model.Glyph = model.font_glyph_at(f, i)
+        rt.buf_clear(&out)
+        glyph_text.glyph_write(g, &out)
+        rt.buf_clear(&rel)
+        cursor.push_text(&rel, "glyphs/")
+        var name: rt.Buf = rt.buf_new()
+        glyph_file_name(&name, (*g).cp)
+        cursor.push_text(&rel, model.text_str(&name))
+        rt.buf_free(&name)
+        ok = write_text(root, model.text_str(&rel), &out)
+        i = i + 1
+    }
+    rt.buf_free(&rel)
+    rt.buf_free(&out)
+    remove_stale(root, f)
+    return ok
+}
+
+fn load_font_text(root: str, f: *mut model.Font) -> bool {
+    var err: rt.Buf = rt.buf_new()
+    let ok: bool = load_dir(root, f, &err)
+    rt.buf_free(&err)
+    return ok
+}
