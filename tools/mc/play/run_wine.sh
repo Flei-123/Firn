@@ -150,7 +150,7 @@ run_start() {
     local nm cfgf pid i
     cfgf="$W/wp/drive_c/users/$(id -un)/AppData/Local/mcplay/mcplay.cfg"
     nm=WinStartA
-    env -u MCPLAY_CONFIG MCPLAY_GL=0 FIRN_AUDIO=null MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    env -u MCPLAY_CONFIG MCPLAY_SINGLE=0 MCPLAY_GL=0 FIRN_AUDIO=null MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
         timeout -s KILL 170 wine "$exe" > "$W/$nm.out" 2>&1 &
     pid=$!
     for i in $(seq 1 40); do xdotool search --onlyvisible --name mcplay >/dev/null 2>&1 && break; sleep 1; done
@@ -159,7 +159,7 @@ run_start() {
     sleep 1
     xdotool type --delay 80 "127.0.0.1"; sleep 0.3
     xdotool key Tab; sleep 0.3
-    xdotool key BackSpace BackSpace BackSpace BackSpace BackSpace BackSpace; sleep 0.3
+    xdotool key ctrl+a; sleep 0.3
     xdotool type --delay 80 "$PORT"; sleep 0.3
     xdotool key Tab; sleep 0.3
     xdotool type --delay 80 "$nm"; sleep 0.5
@@ -171,7 +171,7 @@ run_start() {
     if [ -n "$cf" ] && grep -q "^host=127.0.0.1" "$cf" && grep -q "^port=$PORT" "$cf" && grep -q "^name=$nm" "$cf"; then echo "  ok    start: no arguments -> form -> join, config saved (${cf#$W/wp/})"
     else echo "  FAIL  start: config not saved in the user profile"; ERR=1; return; fi
     nm=WinStartA
-    env -u MCPLAY_CONFIG MCPLAY_GL=0 FIRN_AUDIO=null MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    env -u MCPLAY_CONFIG MCPLAY_SINGLE=0 MCPLAY_GL=0 FIRN_AUDIO=null MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
         timeout -s KILL 170 wine "$exe" > "$W/WinStartB.out" 2>&1 &
     pid=$!
     for i in $(seq 1 40); do xdotool search --onlyvisible --name mcplay >/dev/null 2>&1 && break; sleep 1; done
@@ -184,10 +184,26 @@ run_start() {
     wait $pid 2>/dev/null
     [ "$(grep -c "$nm joined the game" "$W/server.log")" -gt "$before" ] && echo "  ok    start: second launch prefilled from the saved config, Return joins" || { echo "  FAIL  start: saved config did not prefill the form"; ERR=1; }
 }
+run_single() {
+    local exe=$1 pid i out
+    command -v xdotool >/dev/null || { echo "  skip  single instance test (no xdotool)"; return; }
+    env -u MCPLAY_CONFIG MCPLAY_GL=0 FIRN_AUDIO=null timeout -s KILL 120 wine "$exe" > "$W/WinSingleA.out" 2>&1 &
+    pid=$!
+    for i in $(seq 1 40); do xdotool search --onlyvisible --name mcplay >/dev/null 2>&1 && break; sleep 1; done
+    sleep 3
+    env -u MCPLAY_CONFIG MCPLAY_GL=0 FIRN_AUDIO=null timeout -s KILL 60 wine "$exe" > "$W/WinSingleB.out" 2>&1; local rc=$?
+    if [ $rc -eq 0 ] && grep -q "already running" "$W/WinSingleB.out"; then echo "  ok    single: second launch exits 0 (already running)"; else echo "  FAIL  single: second launch rc=$rc"; ERR=1; fi
+    kill -0 $pid 2>/dev/null || { echo "  FAIL  single: first instance gone"; ERR=1; }
+    xdotool search --onlyvisible --name mcplay 2>/dev/null | head -1 | while read -r w; do xdotool windowfocus "$w" 2>/dev/null; done
+    sleep 1
+    xdotool key Escape
+    wait $pid 2>/dev/null
+}
 run_play WinCpu MCPLAY_GL=0
 run_input
 run_dist
 run_start "$W/pkg/mcplay.exe"
+run_single "$W/pkg/mcplay.exe"
 # 5) the seam maps a recv timeout to EAGAIN like Linux (needs a firnc built after the win_seam.rs fix, r133)
 bash tools/windows/timeout.sh 2>&1 | sed "s/^/  seam: /" | grep -v "^  seam: RESULT" ; [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  FAIL  seam recv timeout"; ERR=1; }
 [ "${MCPLAY_GL:-0}" = 1 ] && run_play WinGl MCPLAY_GL=1

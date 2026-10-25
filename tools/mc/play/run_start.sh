@@ -94,8 +94,7 @@ wait $PE; [ $? -eq 0 ] || { echo "  FAIL  E: exit code"; ERR=1; }
 grep -q "^host=localhost" "$W/e.cfg" && grep -q "^name=StartE" "$W/e.cfg" && grep -q "^port=$PORT" "$W/e.cfg" || { echo "  FAIL  E: hostname not written to config"; ERR=1; }
 
 rm -f "$W/f.cfg"
-SPORT=$((20000 + RANDOM % 20000))
-MCPLAY_SINGLE=1 MCPLAY_SINGLE_PORT=$SPORT MCPLAY_CONFIG="$W/f.cfg" "$W/mcplay" > "$W/F.out" 2>&1 & PF=$!
+MCPLAY_SINGLE=1 MCPLAY_CONFIG="$W/f.cfg" "$W/mcplay" > "$W/F.out" 2>&1 & PF=$!
 focus || { echo "  FAIL  F: no start window"; ERR=1; }
 xdotool type --delay 80 "127.0.0.1"; sleep 0.3
 xdotool key Tab; sleep 0.3
@@ -106,7 +105,7 @@ xdotool type --delay 80 "StartF"; sleep 0.5
 WF=$(xdotool search --name mcplay 2>/dev/null | head -1)
 xdotool mousemove --window "$WF" 402 368 click 1; sleep 1
 grep -q "^host=127.0.0.1" "$W/f.cfg" && grep -q "^name=StartF" "$W/f.cfg" && grep -q "^port=$PORT" "$W/f.cfg" || { echo "  FAIL  F: Save did not write the config"; ERR=1; }
-MCPLAY_SINGLE=1 MCPLAY_SINGLE_PORT=$SPORT MCPLAY_CONFIG="$W/f.cfg" timeout 20 "$W/mcplay" > "$W/F2.out" 2>&1; RF2=$?
+MCPLAY_SINGLE=1 MCPLAY_CONFIG="$W/f.cfg" timeout 20 "$W/mcplay" > "$W/F2.out" 2>&1; RF2=$?
 [ $RF2 -eq 0 ] && grep -q "already running" "$W/F2.out" || { echo "  FAIL  F: second instance rc=$RF2 must exit 0 with 'already running'"; ERR=1; }
 kill -0 $PF 2>/dev/null || { echo "  FAIL  F: first instance gone"; ERR=1; }
 xdotool key Escape

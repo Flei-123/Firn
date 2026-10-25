@@ -127,6 +127,7 @@ extern fn CreateFileW(p: u64, acc: i64, share: i64, sa: i64, disp: i64, fl: i64,
 extern fn DeleteFileW(p: u64) -> i32;
 extern fn GetFileAttributesW(p: u64) -> i32;
 extern fn SetFilePointerEx(h: i64, dist: i64, np: u64, how: i64) -> i32;
+extern fn LockFileEx(h: i64, flags: i64, res: i64, lo: i64, hi: i64, ov: u64) -> i32;
 extern fn FlushFileBuffers(h: i64) -> i32;
 extern fn VirtualAlloc(a: u64, n: u64, t: i64, prot: i64) -> u64;
 extern fn VirtualFree(a: u64, n: u64, t: i64) -> i32;
@@ -1582,6 +1583,28 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
     }
     if nr == 7 {
         return __win_poll(a1 as u64, a2, a3)
+    }
+    if nr == 73 {
+        // flock(fd, op): LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8. The lock
+        // covers the first byte of the file and goes away with the handle.
+        if __win_kind_of(a1) != 1 {
+            return 0 - 9
+        }
+        if (a2 & 8) != 0 {
+            return 0
+        }
+        var fl: i64 = 0
+        if (a2 & 2) != 0 {
+            fl = 2
+        }
+        if (a2 & 4) != 0 {
+            fl = fl + 1
+        }
+        var ovl: [i64; 4] = [0; 4]
+        if LockFileEx(__win_handle(a1), fl, 0, 1, 0, (&ovl[0]) as u64) == 0 {
+            return 0 - 11
+        }
+        return 0
     }
     if nr == 72 {
         // fcntl: F_GETFD 1 / F_SETFD 2 (close-on-exec has no meaning
