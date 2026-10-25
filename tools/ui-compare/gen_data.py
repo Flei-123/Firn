@@ -8,6 +8,7 @@ import datetime as dt
 OUT = os.path.join(os.environ.get("UIVGL_DIR", os.path.dirname(os.path.abspath(__file__))), "data")
 os.makedirs(OUT, exist_ok=True)
 R = random.Random(20261021)
+ROWS = int(os.environ.get("GEN_ROWS", "100000"))
 BASE = dt.datetime(2026, 10, 21, 12, 0, 0)
 
 
@@ -70,7 +71,7 @@ WORDS = ["report", "image", "backup", "build", "data", "notes", "draft", "final"
 DIRS = ["Documents", "Pictures", "Music", "Videos", "Projects", "Downloads", "Backups", "Config"]
 dir_counts = {d: 0 for d in DIRS}
 rows = []
-for i in range(100000):
+for i in range(ROWS):
     typ = TYPES[R.randrange(len(TYPES))]
     name = "%s_%s_%05d.%s" % (WORDS[R.randrange(20)], WORDS[R.randrange(20)], i, typ)
     size = int(10 ** R.uniform(2, 8.5))
