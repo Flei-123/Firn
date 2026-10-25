@@ -151,6 +151,7 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = menuplay ]; then
     echo "== mc/menuplay =="
     MC_VANILLA=1 bash tools/mc/menu/run_menu.sh || ERR=$((ERR+1))
+    MC_VANILLA=1 bash tools/mc/menu/run_pause.sh || ERR=$((ERR+1))
 fi
 # start screen: mcplay without arguments (config file, auto start, typed form, Escape)
 if [ -z "$ONLY" ] || [ "$ONLY" = startplay ]; then
