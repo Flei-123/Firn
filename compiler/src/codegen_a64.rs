@@ -1606,11 +1606,6 @@ fn emit_inst(
                 load_zx(e, fr, A, *src, bits);
                 e.line(&format!("cmp {}, #0", rw(A, to)));
                 e.line(&format!("cset {}, ne", w(A)));
-            } else if std::env::var_os("FIRN_A64_NO_CASTDST").is_none() {
-                let rd = dreg(fr, d, A);
-                load_ext(e, fr, rd, *src, *from, 64);
-                commit(e, fr, d, rd);
-                return Ok(());
             } else {
                 load_ext(e, fr, A, *src, *from, 64);
             }
