@@ -115,4 +115,5 @@ def main():
     print("  ok    %dx%d scale %d: 5 buttons + language icon match" % (w, h, s))
 
 
-main()
+if __name__ == "__main__":
+    main()
