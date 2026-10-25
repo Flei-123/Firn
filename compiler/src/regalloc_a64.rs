@@ -298,6 +298,7 @@ fn plain_op(op: &Op) -> bool {
             | Op::Select { .. }
             | Op::GlobalAddr { .. }
             | Op::Copy { .. }
+            | Op::MemCopy { .. }
     )
 }
 

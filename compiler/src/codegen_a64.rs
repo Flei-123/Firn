@@ -1096,6 +1096,20 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     Ok(())
 }
 
+fn fusable_cmp_index(b: &Block) -> Option<usize> {
+    if std::env::var_os("FIRN_A64_NO_CMPCOPY").is_some() {
+        return b.insts.len().checked_sub(1);
+    }
+    let mut k = b.insts.len();
+    while k > 0 {
+        k -= 1;
+        if !matches!(b.insts[k].op, Op::Copy { .. }) {
+            return Some(k);
+        }
+    }
+    None
+}
+
 /// For every block: does it end in `cmp` + `brcond` on exactly that compare, with the compare result read
 /// nowhere else? Then the flags feed the branch directly (`cmp` + `b.cc`) and the boolean is never built.
 fn fusable_compares(f: &Func) -> Vec<bool> {
@@ -1125,7 +1139,7 @@ fn fusable_compares(f: &Func) -> Vec<bool> {
     }
     let mut out = vec![false; f.blocks.len().max(1) + 1];
     for b in &f.blocks {
-        if let (Some(last), Term::BrCond { cond, .. }) = (b.insts.last(), &b.term) {
+        if let (Some(last), Term::BrCond { cond, .. }) = (fusable_cmp_index(b).map(|k| &b.insts[k]), &b.term) {
             if let (Op::Cmp { ty, .. }, Some(d)) = (&last.op, last.dst) {
                 // a vector compare does not exist here, but stay on the safe side
                 if d == *cond
@@ -1201,6 +1215,37 @@ fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
     e.line("ret");
 }
 
+fn emit_mem_copy(e: &mut Emitter, esz: u8) {
+    let done = uniq(e, "mc_done");
+    let wide = uniq(e, "mc_wide");
+    let tail = uniq(e, "mc_tail");
+    let one = uniq(e, "mc_one");
+    let (ld, st, r1, r2) = match esz {
+        1 => ("ldrb", "strb", w(T1), w(T2)),
+        4 => ("ldr", "str", w(T1), w(T2)),
+        _ => ("ldr", "str", T1.to_string(), T2.to_string()),
+    };
+    e.line(&format!("subs {}, {}, #4", C, C));
+    e.line(&format!("b.lo {}", tail));
+    e.raw(&format!("{}:", wide));
+    for k in 0..4 {
+        let r = if k % 2 == 0 { &r1 } else { &r2 };
+        e.line(&format!("{} {}, [{}], #{}", ld, r, B, esz));
+        e.line(&format!("{} {}, [{}], #{}", st, r, A, esz));
+    }
+    e.line(&format!("subs {}, {}, #4", C, C));
+    e.line(&format!("b.hs {}", wide));
+    e.raw(&format!("{}:", tail));
+    e.line(&format!("adds {}, {}, #4", C, C));
+    e.line(&format!("b.eq {}", done));
+    e.raw(&format!("{}:", one));
+    e.line(&format!("{} {}, [{}], #{}", ld, r1, B, esz));
+    e.line(&format!("{} {}, [{}], #{}", st, r1, A, esz));
+    e.line(&format!("subs {}, {}, #1", C, C));
+    e.line(&format!("b.ne {}", one));
+    e.raw(&format!("{}:", done));
+}
+
 fn emit_block(
     e: &mut Emitter,
     f: &Func,
@@ -1212,8 +1257,9 @@ fn emit_block(
 ) -> Result<(), String> {
     let bi = b.id as usize;
     let mut fused_cc: Option<&'static str> = None;
+    let fused_at = if fused { fusable_cmp_index(b) } else { None };
     for (ii, i) in b.insts.iter().enumerate() {
-        if fused && ii + 1 == b.insts.len() {
+        if fused && Some(ii) == fused_at {
             // the compare feeds the branch of this block: flags only, no boolean
             if let Op::Cmp { op, ty: oty, a, b: rb } = &i.op {
                 fused_cc = Some(emit_cmp_flags(e, fr, *op, *oty, *a, *rb));
@@ -1841,8 +1887,12 @@ fn emit_inst(
             }
             store_dst(e, fr, d, A);
         }
-        // `memcpy_idiom.rs` only runs for x86-64; this can never be reached.
-        Op::MemCopy { .. } => return Err("internal error: memcopy on a non-x86 target".to_string()),
+        Op::MemCopy { dst, src, n, esz } => {
+            load_full(e, fr, A, *dst);
+            load_full(e, fr, B, *src);
+            load_full(e, fr, C, *n);
+            emit_mem_copy(e, *esz);
+        }
         Op::CopyMem { dst, src, size } => {
             if *size == 0 {
                 return Ok(());

@@ -972,7 +972,12 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             fx.note(5, h > 0);
             phi_check(f, "licm");
         }
-        let memcpy_on = cfg.runs("memcpy") && crate::target::active() == crate::target::Target::X86_64;
+        let memcpy_on = cfg.runs("memcpy")
+            && match crate::target::active() {
+                crate::target::Target::X86_64 => true,
+                crate::target::Target::Aarch64 => std::env::var_os("FIRN_A64_NO_MEMCPY").is_none(),
+                _ => false,
+            };
         if (cfg.runs("memset") || memcpy_on) && fx.due(11) {
             let t = std::time::Instant::now();
             let mut m = if cfg.runs("memset") { crate::memset::recognise(f) } else { 0 };
