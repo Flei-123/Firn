@@ -113,12 +113,11 @@ fn out_bit(j: u32) -> u64 {
 struct Taint {
     mask: u64, // bit i -- derived from parameter i
     lname: u32, // the FIRST local source, NOTHING = none
-    ldecl: u64, // where it is declared
-    ltake: u64, // where its address is taken
+    take: u32, // index into `takes`: where its address is taken
 }
 
 fn t_none() -> Taint {
-    return Taint { mask: 0, lname: NOTHING, ldecl: 0, ltake: 0 }
+    return Taint { mask: 0, lname: NOTHING, take: 0 }
 }
 
 fn t_is_empty(t: Taint) -> bool {
@@ -140,13 +139,14 @@ fn t_unite(a: Taint, o: Taint) -> Taint {
     r.mask = r.mask | o.mask
     if r.lname == NOTHING {
         r.lname = o.lname
-        r.ldecl = o.ldecl
-        r.ltake = o.ltake
+        r.take = o.take
     }
     return r
 }
 
-const MK: usize = 6
+const MK: usize = 3
+const SH32: u64 = 32
+const LO32: u64 = 4294967295
 
 const HOLD_FREE_KINDS: u64 = 7287
 
@@ -181,7 +181,8 @@ struct Esc {
 
     // --- the marks: place path -> taint, insertion ordered
     pcomp: Vec[u32], // the components of every path, one after another
-    marks: Vec[u64], // MK words per mark: off, len, mask, lname, ldecl, ltake
+    marks: Vec[u64], // MK words per mark: off | len << 32, mask, lname | take << 32
+    takes: Vec[u64], // the places where addresses are taken in this function
     snaps: Vec[u64], // arena of saved `marks` copies
     srec: Vec[u64], // snapshot records: start, words, owner -- a stack
     lazy_at: usize, // records from here up are still equal to `marks`
@@ -196,6 +197,8 @@ struct Esc {
 
     dp: u64, // the dependency record of the fixed point (0 = none)
     report: bool,
+    took_local: bool, // an address of a local was taken during the current run
+    can_report: Vec[u32], // per function: 0 = its last run took no address of a local
     depth: u32,
 }
 
@@ -408,30 +411,50 @@ fn taint_under(e: *mut Esc, off: u32, len: u32) -> Taint {
     return taint_under_at(e, (*e).pcomp.ptr + (off as u64) * 4, len)
 }
 
+fn taint_of_local(e: *mut Esc, nr: u32) -> Taint {
+    var out: Taint = t_none()
+    let pc: u64 = (*e).pcomp.ptr
+    var q: u64 = (*e).marks.ptr
+    let end: u64 = q + ((*e).marks.len as u64) * 8
+    while q < end {
+        if rd32(pc + (rd_word(q) & LO32) * 4) == nr {
+            out.mask = out.mask | rd_word(q + 8)
+            if out.lname == NOTHING {
+                let w2: u64 = rd_word(q + 16)
+                out.lname = (w2 & LO32) as u32
+                out.take = (w2 >> SH32) as u32
+            }
+        }
+        q = q + 24
+    }
+    return out
+}
+
 fn taint_under_at(e: *mut Esc, mine: u64, len: u32) -> Taint {
     var out: Taint = t_none()
     let pc: u64 = (*e).pcomp.ptr
     var q: u64 = (*e).marks.ptr
     let end: u64 = q + ((*e).marks.len as u64) * 8
     while q < end {
-        var m: u32 = rd_word(q + 8) as u32
+        let w0: u64 = rd_word(q)
+        var m: u32 = (w0 >> SH32) as u32
         if len < m {
             m = len
         }
-        let theirs: u64 = pc + (rd_word(q) as u32 as u64) * 4
+        let theirs: u64 = pc + (w0 & LO32) * 4
         var k: u32 = 0
         while k < m && rd32(theirs + (k as u64) * 4) == rd32(mine + (k as u64) * 4) {
             k = k + 1
         }
         if k == m {
-            out.mask = out.mask | rd_word(q + 16)
+            out.mask = out.mask | rd_word(q + 8)
             if out.lname == NOTHING {
-                out.lname = rd_word(q + 24) as u32
-                out.ldecl = rd_word(q + 32)
-                out.ltake = rd_word(q + 40)
+                let w2: u64 = rd_word(q + 16)
+                out.lname = (w2 & LO32) as u32
+                out.take = (w2 >> SH32) as u32
             }
         }
-        q = q + 48
+        q = q + 24
     }
     return out
 }
@@ -447,9 +470,10 @@ fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
     var removed: bool = false
     while r < n {
         let q: u64 = base + (r as u64) * 8
-        var under: bool = (rd_word(q + 8) as u32) >= len
+        let w0: u64 = rd_word(q)
+        var under: bool = ((w0 >> SH32) as u32) >= len
         if under {
-            let theirs: u64 = (*e).pcomp.ptr + (rd_word(q) as u32 as u64) * 4
+            let theirs: u64 = (*e).pcomp.ptr + (w0 & LO32) * 4
             var k: u32 = 0
             while k < len && rd32(theirs + (k as u64) * 4) == rd32(mine + (k as u64) * 4) {
                 k = k + 1
@@ -464,12 +488,9 @@ fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
         } else {
             if removed {
                 let z: u64 = base + (w as u64) * 8
-                wr_word(z, rd_word(q))
+                wr_word(z, w0)
                 wr_word(z + 8, rd_word(q + 8))
                 wr_word(z + 16, rd_word(q + 16))
-                wr_word(z + 24, rd_word(q + 24))
-                wr_word(z + 32, rd_word(q + 32))
-                wr_word(z + 40, rd_word(q + 40))
             }
             w = w + MK
         }
@@ -512,37 +533,32 @@ fn m_count(e: *mut Esc) -> usize {
 
 #[inline]
 fn m_off(e: *mut Esc, i: usize) -> u32 {
-    return vec_at[u64](&(*e).marks, i * MK) as u32
+    return (vec_at[u64](&(*e).marks, i * MK) & LO32) as u32
 }
 
 #[inline]
 fn m_len(e: *mut Esc, i: usize) -> u32 {
-    return vec_at[u64](&(*e).marks, i * MK + 1) as u32
+    return (vec_at[u64](&(*e).marks, i * MK) >> SH32) as u32
 }
 
 fn m_taint(e: *mut Esc, i: usize) -> Taint {
     let q: u64 = (*e).marks.ptr + ((i * MK) as u64) * 8
-    return Taint { mask: rd_word(q + 16), lname: rd_word(q + 24) as u32,
-        ldecl: rd_word(q + 32), ltake: rd_word(q + 40) }
+    let w2: u64 = rd_word(q + 16)
+    return Taint { mask: rd_word(q + 8), lname: (w2 & LO32) as u32, take: (w2 >> SH32) as u32 }
 }
 
 fn m_set_taint(e: *mut Esc, i: usize, t: Taint) {
     cow(e)
     let q: u64 = (*e).marks.ptr + ((i * MK) as u64) * 8
-    wr_word(q + 16, t.mask)
-    wr_word(q + 24, t.lname as u64)
-    wr_word(q + 32, t.ldecl)
-    wr_word(q + 40, t.ltake)
+    wr_word(q + 8, t.mask)
+    wr_word(q + 16, (t.lname as u64) | ((t.take as u64) << SH32))
 }
 
 fn m_push(e: *mut Esc, off: u32, len: u32, t: Taint) {
     cow(e)
-    vec_push[u64](&(*e).marks, off as u64)
-    vec_push[u64](&(*e).marks, len as u64)
+    vec_push[u64](&(*e).marks, (off as u64) | ((len as u64) << SH32))
     vec_push[u64](&(*e).marks, t.mask)
-    vec_push[u64](&(*e).marks, t.lname as u64)
-    vec_push[u64](&(*e).marks, t.ldecl)
-    vec_push[u64](&(*e).marks, t.ltake)
+    vec_push[u64](&(*e).marks, (t.lname as u64) | ((t.take as u64) << SH32))
 }
 
 // The taint of a place given as an expression, or the empty one.
@@ -649,11 +665,11 @@ fn value(e: *mut Esc, x: u32) -> Taint {
         a = *(((*b).e_kind.ptr +% (x as u64) *% 4) as *mut u32)
     }
     if a == ast.E_ID {
-        var cell: u32 = ast.e_a(b, x)
+        let cell: u32 = ast.e_a(b, x)
         if !is_local(e, cell) {
             return t_none()
         }
-        return taint_under_at(e, (&cell) as u64, 1)
+        return taint_of_local(e, cell)
     }
     if a == ast.E_UN {
         let op: u32 = ast.e_a(b, x)
@@ -728,6 +744,15 @@ fn value(e: *mut Esc, x: u32) -> Taint {
 
 // The taint of the ADDRESS of the place `x` (`&x`). `at` is where the `&`
 // stands, for the message.
+fn take_at(e: *mut Esc, at: u64) -> u32 {
+    let n: usize = vec_len[u64](&(*e).takes)
+    if n > 0 && vec_at[u64](&(*e).takes, n - 1) == at {
+        return (n - 1) as u32
+    }
+    vec_push[u64](&(*e).takes, at)
+    return n as u32
+}
+
 fn address_of(e: *mut Esc, x: u32, at: u64) -> Taint {
     let b: *mut ast.Tree = tree(e)
     let a: u32 = ast.e_kind(b, x)
@@ -737,10 +762,10 @@ fn address_of(e: *mut Esc, x: u32, at: u64) -> Taint {
             // A constant lies in .rodata and outlives everything.
             return t_none()
         }
+        (*e).took_local = true
         var t: Taint = t_none()
         t.lname = nr
-        t.ldecl = decl_of(e, nr)
-        t.ltake = at
+        t.take = take_at(e, at)
         return t
     }
     // `&(*p).f` and `&p[i]` are `p` plus an offset -- the frame of the local
@@ -878,14 +903,15 @@ fn flow(e: *mut Esc, t: Taint, sink: u64, route: u32, rname: u32, rarg: u32, at:
     if !(*e).report {
         return
     }
+    let taken: u64 = vec_at[u64](&(*e).takes, t.take as usize)
     var place: u64 = at
     if place == 0 {
-        place = t.ltake
+        place = taken
     }
     vec_push[u64](&(*e).f_pos, place)
     vec_push[u32](&(*e).f_lname, t.lname)
-    vec_push[u64](&(*e).f_ldecl, t.ldecl)
-    vec_push[u64](&(*e).f_ltake, t.ltake)
+    vec_push[u64](&(*e).f_ldecl, decl_of(e, t.lname))
+    vec_push[u64](&(*e).f_ltake, taken)
     vec_push[u32](&(*e).f_who, (*e).who)
     vec_push[u64](&(*e).f_fend, (*e).fend)
     vec_push[u32](&(*e).f_route, route)
@@ -1102,74 +1128,74 @@ fn walk_stmt(e: *mut Esc, s: u32) {
 
 // ------------------------------------------------------------ expressions
 
-fn walk_expr(e: *mut Esc, x0: u32) {
+#[inline]
+fn walk_expr(e: *mut Esc, x: u32) {
     let b: *mut ast.Tree = tree(e)
+    if (x as usize) < (*b).e_kind.len {
+        let a: u32 = *(((*b).e_kind.ptr +% (x as u64) *% 4) as *mut u32)
+        if a > ast.E_ID && a != ast.E_FLOAT32 {
+            walk_node(e, x)
+        }
+    }
+}
+
+fn walk_node(e: *mut Esc, x0: u32) {
+    let b: *mut ast.Tree = tree(e)
+    let kn: usize = (*b).e_kind.len
     var x: u32 = x0
     while true {
-        if (x as usize) >= (*b).e_kind.len {
+        if (x as usize) >= kn {
             return
         }
-        let a: u32 = *(((*b).e_kind.ptr +% (x as u64) *% 4) as *mut u32)
+        let xo: u64 = (x as u64) *% 4
+        let a: u32 = *(((*b).e_kind.ptr +% xo) as *mut u32)
         if a <= ast.E_ID || a == ast.E_FLOAT32 {
             return
         }
+        let xa: u32 = *(((*b).e_a.ptr +% xo) as *mut u32)
+        let xb: u32 = *(((*b).e_b.ptr +% xo) as *mut u32)
+        let xc: u32 = *(((*b).e_c.ptr +% xo) as *mut u32)
         if a == ast.E_CALL {
-            let argc: u32 = ast.e_c(b, x)
-            let aoff: u32 = ast.e_b(b, x)
-            let kn: usize = (*b).e_kind.len
             var k: u32 = 0
-            while k < argc {
-                let c: u32 = *(((*b).children.ptr +% ((aoff + k) as u64) *% 4) as *mut u32)
-                if (c as usize) < kn {
-                    let ck: u32 = *(((*b).e_kind.ptr +% (c as u64) *% 4) as *mut u32)
-                    if ck > ast.E_ID && ck != ast.E_FLOAT32 {
-                        walk_expr(e, c)
-                    }
-                }
+            while k < xc {
+                walk_expr(e, *(((*b).children.ptr +% ((xb + k) as u64) *% 4) as *mut u32))
                 k = k + 1
             }
             walk_call(e, x)
-            walk_match_cases(e, ast.e_a(b, x))
+            walk_match_cases(e, xa)
             return
         }
         if a == ast.E_LAMBDA {
-            // Round 58: a closure body is its own function and is checked
-            // nowhere -- gap E4 of docs/ROUND79.md.
             return
         }
-        // ROUND IFEXPR
         if a == ast.E_IFEX {
-            walk_expr(e, ast.e_a(b, x))
-            walk_expr(e, ast.e_b(b, x))
-            x = ast.e_c(b, x)
+            walk_expr(e, xa)
+            walk_expr(e, xb)
+            x = xc
         } else if a == ast.E_UN {
-            x = ast.e_b(b, x)
+            x = xb
         } else if a == ast.E_BIN {
-            walk_expr(e, ast.e_b(b, x))
-            x = ast.e_c(b, x)
+            walk_expr(e, xb)
+            x = xc
         } else if a == ast.E_FIELD || a == ast.E_AS || a == ast.E_TEXT {
-            x = ast.e_a(b, x)
+            x = xa
         } else if a == ast.E_IDX {
-            walk_expr(e, ast.e_a(b, x))
-            x = ast.e_b(b, x)
+            walk_expr(e, xa)
+            x = xb
         } else if a == ast.E_AWDH {
-            walk_expr(e, ast.e_a(b, x))
-            x = ast.e_b(b, x)
+            walk_expr(e, xa)
+            x = xb
         } else if a == ast.E_SYSCALL || a == ast.E_ALIT {
-            let n: u32 = ast.e_c(b, x)
-            let off: u32 = ast.e_b(b, x)
             var j: u32 = 0
-            while j < n {
-                walk_expr(e, ast.child_at(b, off + j))
+            while j < xc {
+                walk_expr(e, *(((*b).children.ptr +% ((xb + j) as u64) *% 4) as *mut u32))
                 j = j + 1
             }
             return
         } else if a == ast.E_SLIT {
-            let n2: u32 = ast.e_c(b, x)
-            let off2: u32 = ast.e_b(b, x)
             var m: u32 = 0
-            while m < n2 {
-                walk_expr(e, ast.child_at(b, off2 + m * 2 + 1))
+            while m < xc {
+                walk_expr(e, *(((*b).children.ptr +% ((xb + m * 2 + 1) as u64) *% 4) as *mut u32))
                 m = m + 1
             }
             return
@@ -1211,6 +1237,10 @@ fn walk_call(e: *mut Esc, x: u32) {
     var i: u32 = 0
     while i < np && i < argc {
         let fl: u64 = vec_at[u64](&(*e).sum, (off + i) as usize)
+        if fl < 2 {
+            i = i + 1
+            continue
+        }
         let t: Taint = value(e, ast.child_at(b, aoff + i))
         if !t_is_empty(t) {
             if fl & (SINK_FOREIGN | SINK_THREAD) != 0 {
@@ -1337,11 +1367,12 @@ fn snap_merge(e: *mut Esc, s: *mut Snap) {
     var i: usize = 0
     while i < count {
         let q: u64 = sb2 + ((i * MK) as u64) * 8
-        let off: u32 = rd_word(q) as u32
-        let len: u32 = rd_word(q + 8) as u32
-        let o: Taint = Taint { mask: rd_word(q + 16),
-            lname: rd_word(q + 24) as u32,
-            ldecl: rd_word(q + 32), ltake: rd_word(q + 40) }
+        let w0: u64 = rd_word(q)
+        let off: u32 = (w0 & LO32) as u32
+        let len: u32 = (w0 >> SH32) as u32
+        let w2: u64 = rd_word(q + 16)
+        let o: Taint = Taint { mask: rd_word(q + 8), lname: (w2 & LO32) as u32,
+            take: (w2 >> SH32) as u32 }
         var hit: bool = false
         var j: usize = i
         if j < m_count(e) && same_path(e, j, off, len) {
@@ -1520,14 +1551,14 @@ fn esc_empty() -> Esc {
         sum_off: vec_new[u32](), sum: vec_new[u64](),
         who: NOTHING, fend: 0, np: 0, poff: 0, found: vec_new[u64](),
         lname: vec_new[u32](), ldecl: vec_new[u64](), lidx: vec_new[u32](),
-        pcomp: vec_new[u32](), marks: vec_new[u64](), snaps: vec_new[u64](), srec: vec_new[u64](), lazy_at: 0,
+        pcomp: vec_new[u32](), marks: vec_new[u64](), takes: vec_new[u64](), snaps: vec_new[u64](), srec: vec_new[u64](), lazy_at: 0,
         pbuf: vec_new[u32](),
         ninfo: vec_new[u32](),
         f_pos: vec_new[u64](), f_lname: vec_new[u32](),
         f_ldecl: vec_new[u64](), f_ltake: vec_new[u64](),
         f_who: vec_new[u32](), f_fend: vec_new[u64](),
         f_route: vec_new[u32](), f_rname: vec_new[u32](), f_rarg: vec_new[u32](),
-        dp: 0, report: false, depth: 0,
+        dp: 0, report: false, took_local: false, can_report: vec_new[u32](), depth: 0,
     }
 }
 
@@ -1540,10 +1571,12 @@ fn esc_free(e: *mut Esc) {
     vec_free[u32](&(*e).lidx)
     vec_free[u32](&(*e).pcomp)
     vec_free[u64](&(*e).marks)
+    vec_free[u64](&(*e).takes)
     vec_free[u64](&(*e).snaps)
     vec_free[u64](&(*e).srec)
     vec_free[u32](&(*e).pbuf)
     vec_free[u32](&(*e).ninfo)
+    vec_free[u32](&(*e).can_report)
     vec_free[u64](&(*e).f_pos)
     vec_free[u32](&(*e).f_lname)
     vec_free[u64](&(*e).f_ldecl)
@@ -1580,6 +1613,7 @@ fn run_fn(e: *mut Esc, fi: usize, report: bool) {
     (*e).np = ast.fn_plen(b, fi)
     (*e).poff = ast.fn_poff(b, fi)
     (*e).report = report
+    (*e).took_local = false
     (*e).depth = 0
     if (*e).dp != 0 && !report {
         escdeps.deps_begin((*e).dp as *mut escdeps.Deps, fi)
@@ -1592,6 +1626,7 @@ fn run_fn(e: *mut Esc, fi: usize, report: bool) {
     vec_clear[u32](&(*e).lname)
     vec_clear[u64](&(*e).ldecl)
     marks_clear(e)
+    vec_clear[u64](&(*e).takes)
     vec_clear[u32](&(*e).pcomp)
     vec_clear[u64](&(*e).found)
     var i: u32 = 0
@@ -1615,6 +1650,13 @@ fn run_fn(e: *mut Esc, fi: usize, report: bool) {
         i = i + 1
     }
     walk_block(e, ast.fn_body(b, fi))
+    if !report {
+        var can: u32 = 0
+        if (*e).took_local {
+            can = 1
+        }
+        vec_set[u32](&(*e).can_report, fi, can)
+    }
     if (*e).dp != 0 && !report {
         escdeps.deps_end((*e).dp as *mut escdeps.Deps, fi)
     }
@@ -1634,6 +1676,7 @@ fn escape_check(sm: u64, mu: u64, it: u64) -> usize {
     var i: usize = 0
     while i < ast.fn_count(b) {
         vec_push[u32](&e.sum_off, total as u32)
+        vec_push[u32](&e.can_report, 1)
         total = total + ast.fn_plen(b, i) as usize
         i = i + 1
     }
@@ -1651,6 +1694,7 @@ fn escape_check(sm: u64, mu: u64, it: u64) -> usize {
     var fresh_fn: Vec[u32] = vec_new[u32]()
     var fresh_bits: Vec[u64] = vec_new[u64]()
     var round: u32 = 0
+    var converged: bool = false
     while round < MAX_ROUNDS {
         vec_clear[u32](&fresh_fn)
         vec_clear[u64](&fresh_bits)
@@ -1679,6 +1723,7 @@ fn escape_check(sm: u64, mu: u64, it: u64) -> usize {
             i = i + 1
         }
         if vec_len[u32](&fresh_fn) == 0 {
+            converged = true
             break
         }
         var w: usize = 0
@@ -1705,7 +1750,7 @@ fn escape_check(sm: u64, mu: u64, it: u64) -> usize {
     // --- phase 2: the report
     i = 0
     while i < ast.fn_count(b) {
-        if !skipped(&e, i) {
+        if !skipped(&e, i) && (!converged || vec_at[u32](&e.can_report, i) != 0) {
             run_fn(&e, i, true)
         }
         i = i + 1
