@@ -68,8 +68,8 @@ export {
     viewport_needs_h, viewport_needs_v,
     viewport_scroll_by, viewport_wheel, viewport_key,
     viewport_fling, viewport_tick, viewport_moving,
-    viewport_set_overscroll, viewport_pull, viewport_over_x, viewport_over_y,
-    VP_OVER_K, VP_OVER_C,
+    viewport_set_overscroll, viewport_set_wheel_overscroll, viewport_rubber, viewport_rubber_raw, viewport_pull, viewport_over_x, viewport_over_y,
+    VP_OVER_K, VP_OVER_C, VP_RUBBER_C,
     viewport_share_h, viewport_share_v,
     viewport_value_h, viewport_value_v,
     viewport_bar_rect_v, viewport_bar_rect_h,
@@ -129,7 +129,8 @@ const VP_SMOOTH_TAU: f64 = 60.0
 // C = 0.6 of critical damping: one small, soft overshoot, then rest.
 const VP_OVER_K: f64 = 0.0004
 const VP_OVER_C: f64 = 0.024
-const VP_OVER_MAX_FRAC: f64 = 0.3
+const VP_RUBBER_C: f64 = 0.55
+const VP_RUBBER_EDGE: f64 = 0.999
 const VP_OVER_FLICK: f64 = 0.25
 
 // WHICH BAR IS MEANT. The same kind of number as the eight
@@ -199,6 +200,7 @@ struct Viewport {
     // spring velocity in px/ms. Layout of the logic (ox/oy, hit tests via
     // the clamped offset) never sees it.
     os_en: u32,
+    os_touch: u32,
     osx: f64,
     osy: f64,
     ovx: f64,
@@ -218,7 +220,7 @@ fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
         fl_ox: 0.0, fl_oy: 0.0, fl_vx: 0.0, fl_vy: 0.0, fl_t0: 0, fl_k: VP_FLING_K, fl_mode: 0 as u32, fl_dx: 0.0, fl_dy: 0.0, fl_tx: 0.0, fl_ty: 0.0, fr_on: 0 as u32,
         sm_x: 0.0, sm_y: 0.0, sm_t: 0, sm_on: 0 as u32,
         drag: VP_BAR_NONE, tombstone: 0.0, tombstone_off: 0.0,
-        os_en: 0 as u32, osx: 0.0, osy: 0.0, ovx: 0.0, ovy: 0.0, os_t: 0 - 1,
+        os_en: 0 as u32, os_touch: 1 as u32, osx: 0.0, osy: 0.0, ovx: 0.0, ovy: 0.0, os_t: 0 - 1,
         os_pull_t: 0 - 1000000 }
 }
 
@@ -569,7 +571,7 @@ fn viewport_shift(v: *mut Viewport, dy: f64) {
 // a64: a finger drags the content by (dx, dy). Inside the content it follows 1:1; what the finger drags past an end (or while the band is
 // already pulled) goes into the rubber band (viewport_pull) when overscroll is on, else it is dropped.
 fn viewport_drag(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
-    if (*v).os_en == 0 as u32 {
+    if (*v).os_touch == 0 as u32 {
         viewport_scroll_by(v, dx, dy)
         return
     }
@@ -599,7 +601,7 @@ fn viewport_drag(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
         }
     }
     if rx != 0.0 || ry != 0.0 {
-        viewport_pull(v, rx, ry, now_ms)
+        pull_band(v, rx, ry, now_ms)
     }
 }
 
@@ -651,7 +653,7 @@ fn inject_over(v: *mut Viewport, horiz: bool, sp: f64, at_max: bool, now_ms: i64
 }
 
 fn over_active(v: *mut Viewport) -> bool {
-    return (*v).os_en != 0 as u32 && ((*v).osx != 0.0 || (*v).osy != 0.0 || (*v).ovx != 0.0 || (*v).ovy != 0.0)
+    return ((*v).osx != 0.0 || (*v).osy != 0.0 || (*v).ovx != 0.0 || (*v).ovy != 0.0)
 }
 
 // One spring axis, 2 ms sub-steps (semi-implicit Euler: stable and dt
@@ -727,7 +729,7 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
             var n: f64 = fling_axis(v, false, dt, &sp, &dn)
             let mx: f64 = viewport_max_x(v)
             if n <= 0.0 || n >= mx {
-                if (*v).os_en != 0 as u32 && mx > 0.0 {
+                if ((*v).os_en != 0 as u32 || (*v).os_touch != 0 as u32) && mx > 0.0 {
                     inject_over(v, true, sp, n >= mx, now_ms)
                 }
                 if n < 0.0 { n = 0.0 }
@@ -744,7 +746,7 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
             var n2: f64 = fling_axis(v, true, dt, &sp2, &dn2)
             let my: f64 = viewport_max_y(v)
             if n2 <= 0.0 || n2 >= my {
-                if (*v).os_en != 0 as u32 && my > 0.0 {
+                if ((*v).os_en != 0 as u32 || (*v).os_touch != 0 as u32) && my > 0.0 {
                     inject_over(v, false, sp2, n2 >= my, now_ms)
                 }
                 if n2 < 0.0 { n2 = 0.0 }
@@ -878,17 +880,33 @@ fn viewport_bar_rect_h(v: *mut Viewport, x: *mut f64, y: *mut f64,
 fn viewport_content_x(v: *mut Viewport) -> f64 { return (*v).x - (*v).ox - (*v).osx }
 fn viewport_content_y(v: *mut Viewport) -> f64 { return (*v).y - (*v).oy - (*v).osy }
 
-// Overscroll on/off (default off: a list stops dead at its ends).
+// Overscroll on/off for touch drags and the wheel together (default: touch on, wheel off).
 fn viewport_set_overscroll(v: *mut Viewport, on: bool) {
+    (*v).os_en = 0 as u32
+    (*v).os_touch = 0 as u32
+    if on {
+        (*v).os_en = 1 as u32
+        (*v).os_touch = 1 as u32
+    } else {
+        over_reset(v)
+    }
+}
+
+// Overscroll for the wheel / touchpad only; touch drags keep their own setting.
+fn viewport_set_wheel_overscroll(v: *mut Viewport, on: bool) {
     (*v).os_en = 0 as u32
     if on {
         (*v).os_en = 1 as u32
-    } else {
-        (*v).osx = 0.0
-        (*v).osy = 0.0
-        (*v).ovx = 0.0
-        (*v).ovy = 0.0
+    } else if (*v).os_touch == 0 as u32 {
+        over_reset(v)
     }
+}
+
+fn over_reset(v: *mut Viewport) {
+    (*v).osx = 0.0
+    (*v).osy = 0.0
+    (*v).ovx = 0.0
+    (*v).ovy = 0.0
 }
 
 // How far the content stands beyond its end right now (px; + = past the max
@@ -896,44 +914,62 @@ fn viewport_set_overscroll(v: *mut Viewport, on: bool) {
 fn viewport_over_x(v: *mut Viewport) -> f64 { return (*v).osx }
 fn viewport_over_y(v: *mut Viewport) -> f64 { return (*v).osy }
 
-// The pointer / touchpad pulls by (dx, dy) while the content already stands
-// at an end: the content follows with growing resistance (rubber band) and
-// springs back by itself once the pulling stops (viewport_tick).
-fn pull_axis(os: f64, d: f64, at_start: bool, at_end: bool, lim: f64) -> f64 {
-    var r: f64 = os
-    if (d < 0.0 && at_start) || (d > 0.0 && at_end) || (os != 0.0 && ((os < 0.0 && d < 0.0) || (os > 0.0 && d > 0.0))) {
-        var a: f64 = os
-        if a < 0.0 { a = 0.0 - a }
-        var k: f64 = 1.0 - a / lim
-        if k < 0.0 { k = 0.0 }
-        r = os + d * k * 0.5
-    } else if os != 0.0 {
-        r = os + d
-        if (os > 0.0 && r < 0.0) || (os < 0.0 && r > 0.0) { r = 0.0 }
-    }
-    if r > lim { r = lim }
-    if r < 0.0 - lim { r = 0.0 - lim }
-    return r
+// iOS rubber band (UIScrollView): the content stands (1 - 1 / (c * x / d + 1)) * d past the edge for a raw pull of x on an axis of size d.
+fn viewport_rubber(x: f64, d: f64) -> f64 {
+    if x <= 0.0 || d <= 0.0 { return 0.0 }
+    return (1.0 - 1.0 / (VP_RUBBER_C * x / d + 1.0)) * d
 }
 
-fn viewport_pull(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
-    if (*v).os_en == 0 as u32 {
-        return
+// The raw pull distance that produced the band offset `os` (inverse of viewport_rubber).
+fn viewport_rubber_raw(os: f64, d: f64) -> f64 {
+    if os <= 0.0 || d <= 0.0 { return 0.0 }
+    var o: f64 = os
+    if o > d * VP_RUBBER_EDGE { o = d * VP_RUBBER_EDGE }
+    return d * o / (VP_RUBBER_C * (d - o))
+}
+
+fn pull_axis(os: f64, d: f64, at_start: bool, at_end: bool, dim: f64) -> f64 {
+    var sgn: f64 = 0.0
+    var raw: f64 = 0.0
+    if os != 0.0 {
+        var a: f64 = os
+        sgn = 1.0
+        if os < 0.0 { a = 0.0 - os; sgn = 0.0 - 1.0 }
+        raw = viewport_rubber_raw(a, dim) + sgn * d
+    } else if d < 0.0 && at_start {
+        sgn = 0.0 - 1.0
+        raw = 0.0 - d
+    } else if d > 0.0 && at_end {
+        sgn = 1.0
+        raw = d
+    } else {
+        return os
     }
+    if raw <= 0.0 { return 0.0 }
+    return sgn * viewport_rubber(raw, dim)
+}
+
+fn pull_band(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
     let mx: f64 = viewport_max_x(v)
     let my: f64 = viewport_max_y(v)
-    let limx: f64 = (*v).w * VP_OVER_MAX_FRAC
-    let limy: f64 = (*v).h * VP_OVER_MAX_FRAC
     if dx != 0.0 && mx > 0.0 {
-        (*v).osx = pull_axis((*v).osx, dx, (*v).ox <= 0.0, (*v).ox >= mx, limx)
+        (*v).osx = pull_axis((*v).osx, dx, (*v).ox <= 0.0, (*v).ox >= mx, (*v).w)
         (*v).ovx = 0.0
     }
     if dy != 0.0 && my > 0.0 {
-        (*v).osy = pull_axis((*v).osy, dy, (*v).oy <= 0.0, (*v).oy >= my, limy)
+        (*v).osy = pull_axis((*v).osy, dy, (*v).oy <= 0.0, (*v).oy >= my, (*v).h)
         (*v).ovy = 0.0
     }
     (*v).os_pull_t = now_ms
     (*v).os_t = 0 - 1
+}
+
+// The pointer / touchpad pulls by (dx, dy) while the content already stands at an end (wheel path, needs the wheel overscroll switch).
+fn viewport_pull(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
+    if (*v).os_en == 0 as u32 {
+        return
+    }
+    pull_band(v, dx, dy, now_ms)
 }
 
 // Does a window point lie in the viewport, and where does it lie IN THE CONTENT?
