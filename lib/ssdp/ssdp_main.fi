@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ssdp/ssdp_main.fi -- ssdp.ssdp_main: command line driver (search, serve, desc) used by tools/ssdp/run.sh
+import std.rt
+import net.dns
+import net.url
+import ssdp.ssdp_sock
+import ssdp.ssdp_desc
+
+fn arg_is(start: u64, i: usize, lit: str) -> bool {
+    let p: u64 = rt.arg_ptr(start, i)
+    return rt.c_length(p) == lit.n && rt.mem_eq(p, lit.p as u64, lit.n)
+}
+
+fn parse_u32(p: u64, n: usize, out: *mut u32) -> bool {
+    if n == 0 || n > 9 {
+        return false
+    }
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u32 + (c - 48 as u8) as u32
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+struct Opts {
+    port: u32,
+    iface: u32,
+    ms: u32,
+}
+
+fn opts_parse(start: u64, from: usize, o: *mut Opts) -> bool {
+    let argc: usize = rt.arg_count(start)
+    var i: usize = from
+    while i + 1 < argc {
+        let pp: u64 = rt.arg_ptr(start, i + 1)
+        if arg_is(start, i, "--port") {
+            if !parse_u32(pp, rt.c_length(pp), &(*o).port) {
+                return false
+            }
+        } else if arg_is(start, i, "--ms") {
+            if !parse_u32(pp, rt.c_length(pp), &(*o).ms) {
+                return false
+            }
+        } else if arg_is(start, i, "--iface") {
+            if !dns.dns_parse_ipv4(pp, rt.c_length(pp), &(*o).iface) {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 2
+    }
+    return true
+}
+
+fn push_line(b: *mut rt.Buf, tag: str, v: str) {
+    rt.buf_push_bytes(b, tag.p as u64, tag.n)
+    rt.buf_push(b, 9 as u8)
+    if v.n > 0 {
+        rt.buf_push_bytes(b, v.p as u64, v.n)
+    }
+    rt.buf_push(b, 10 as u8)
+}
+
+fn cmd_search(start: u64, argc: usize) -> i32 {
+    if argc < 3 {
+        return 64
+    }
+    var o: Opts = Opts { port: 1900 as u32, iface: 0 as u32, ms: 2500 as u32 }
+    if !opts_parse(start, 3, &o) {
+        return 64
+    }
+    let fd: i64 = ssdp_sock.client_open(o.iface)
+    if fd < 0 {
+        return 69
+    }
+    let sp: u64 = rt.arg_ptr(start, 2)
+    let st: str = str { p: sp as *mut u8, n: rt.c_length(sp) }
+    var h: ssdp_sock.Hits = ssdp_sock.hits_new()
+    let n: usize = ssdp_sock.search_run(fd, o.port as u16, st, 1 as u32, o.ms as u64, &h)
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        push_line(&b, "ST", ssdp_sock.hit_st(&h, i))
+        push_line(&b, "USN", ssdp_sock.hit_usn(&h, i))
+        push_line(&b, "LOCATION", ssdp_sock.hit_location(&h, i))
+        i = i + 1
+    }
+    rt.write_everything(1, b.ptr, b.len)
+    rt.buf_free(&b)
+    ssdp_sock.sock_close(fd)
+    return 0
+}
+
+fn cmd_serve(start: u64, argc: usize) -> i32 {
+    if argc < 5 {
+        return 64
+    }
+    var o: Opts = Opts { port: 1900 as u32, iface: 0 as u32, ms: 4000 as u32 }
+    if !opts_parse(start, 5, &o) {
+        return 64
+    }
+    let a: u64 = rt.arg_ptr(start, 2)
+    let b2: u64 = rt.arg_ptr(start, 3)
+    let c: u64 = rt.arg_ptr(start, 4)
+    var sv: ssdp_sock.Service = ssdp_sock.service_new()
+    ssdp_sock.service_set(&sv, str { p: a as *mut u8, n: rt.c_length(a) }, str { p: b2 as *mut u8, n: rt.c_length(b2) },
+        str { p: c as *mut u8, n: rt.c_length(c) }, "firn/1 UPnP/1.1 ssdp/1", 1800 as u32)
+    let fd: i64 = ssdp_sock.sock_open(o.port as u16, o.iface)
+    if fd < 0 {
+        return 69
+    }
+    let ready: str = "READY\n"
+    rt.write_everything(1, ready.p as u64, ready.n)
+    ssdp_sock.responder_run(fd, o.port as u16, &sv, o.ms as u64)
+    ssdp_sock.sock_close(fd)
+    return 0
+}
+
+fn push_url(b: *mut rt.Buf, tag: str, base: u64, bn: usize, d: *mut ssdp_desc.Desc, rel: str) {
+    var u: url.Url = url.url_new()
+    rt.buf_push_bytes(b, tag.p as u64, tag.n)
+    rt.buf_push(b, 9 as u8)
+    if ssdp_desc.desc_resolve(base, bn, d, rel.p as u64, rel.n, &u) {
+        url.url_write(&u, b)
+    }
+    rt.buf_push(b, 10 as u8)
+}
+
+fn cmd_desc(start: u64, argc: usize) -> i32 {
+    if argc < 4 {
+        return 64
+    }
+    let lp: u64 = rt.arg_ptr(start, 2)
+    var xmlb: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 3), &xmlb) {
+        return 66
+    }
+    var d: ssdp_desc.Desc = ssdp_desc.desc_new()
+    if !ssdp_desc.desc_parse(xmlb.ptr, xmlb.len, &d) {
+        return 65
+    }
+    var b: rt.Buf = rt.buf_new()
+    push_line(&b, "FRIENDLY", ssdp_desc.desc_friendly(&d))
+    push_line(&b, "MANUFACTURER", ssdp_desc.desc_manufacturer(&d))
+    push_line(&b, "MODEL", ssdp_desc.desc_model(&d))
+    push_line(&b, "UDN", ssdp_desc.desc_udn(&d))
+    push_line(&b, "TYPE", ssdp_desc.desc_device_type(&d))
+    var i: usize = 0
+    while i < d.count {
+        push_line(&b, "SERVICE", ssdp_desc.desc_service_type(&d, i))
+        push_url(&b, "CONTROL", lp, rt.c_length(lp), &d, ssdp_desc.desc_service_control(&d, i))
+        push_url(&b, "SCPD", lp, rt.c_length(lp), &d, ssdp_desc.desc_service_scpd(&d, i))
+        push_url(&b, "EVENTS", lp, rt.c_length(lp), &d, ssdp_desc.desc_service_events(&d, i))
+        i = i + 1
+    }
+    rt.write_everything(1, b.ptr, b.len)
+    return 0
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc < 2 {
+        return 64
+    }
+    if arg_is(start, 1, "search") {
+        return cmd_search(start, argc)
+    }
+    if arg_is(start, 1, "serve") {
+        return cmd_serve(start, argc)
+    }
+    if arg_is(start, 1, "desc") {
+        return cmd_desc(start, argc)
+    }
+    return 64
+}

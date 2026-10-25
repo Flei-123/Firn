@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ssdp/ssdp_sock.fi -- ssdp.ssdp_sock: SSDP over UDP multicast (M-SEARCH client, NOTIFY, responder loop)
+import std.rt
+import std.time
+import net.udp
+import net.mcast
+import ssdp.ssdp_msg
+
+export {
+    Hits, Service, client_open, HIT_MAX, FIELD_MAX, sock_open, sock_close, now_ms, hits_new, hit_usn, hit_st,
+    hit_location, hit_addr, search_run, service_new, service_set, announce, responder_run,
+}
+
+const HIT_MAX: usize = 16
+const FIELD_MAX: usize = 192
+const RECV_CAP: usize = 4096
+
+struct Hits {
+    count: usize,
+    st: [u8; 3072],
+    nst: [usize; 16],
+    usn: [u8; 3072],
+    nusn: [usize; 16],
+    loc: [u8; 3072],
+    nloc: [usize; 16],
+    addr: [u32; 16],
+}
+
+struct Service {
+    nt: [u8; 192],
+    nnt: usize,
+    usn: [u8; 192],
+    nusn: usize,
+    loc: [u8; 192],
+    nloc: usize,
+    max_age: u32,
+    server: [u8; 192],
+    nserver: usize,
+}
+
+fn now_ms() -> u64 {
+    return time.monotonic_ns() / 1000000 as u64
+}
+
+fn sock_open(port: u16, iface: u32) -> i64 {
+    let fd: i64 = mcast.mcast_open(port, iface)
+    if fd < 0 {
+        return fd
+    }
+    let j: i64 = mcast.mcast_join(fd, mcast.MCAST_SSDP_V4, iface)
+    if j < 0 {
+        udp.udp_close(fd)
+        return j
+    }
+    return fd
+}
+
+fn client_open(iface: u32) -> i64 {
+    let fd: i64 = udp.udp_open()
+    if fd < 0 {
+        return fd
+    }
+    let b: i64 = udp.udp_bind(fd, 0 as u32, 0 as u16)
+    if b < 0 {
+        udp.udp_close(fd)
+        return b
+    }
+    mcast.mcast_set_loop(fd, true)
+    mcast.mcast_set_ttl(fd, 4)
+    if iface != 0 as u32 {
+        mcast.mcast_set_iface(fd, iface)
+    }
+    return fd
+}
+
+fn sock_close(fd: i64) {
+    udp.udp_close(fd)
+}
+
+fn hits_new() -> Hits {
+    return Hits { count: 0, st: [0; 3072], nst: [0; 16], usn: [0; 3072], nusn: [0; 16], loc: [0; 3072],
+        nloc: [0; 16], addr: [0; 16] }
+}
+
+fn str_of(p: u64, n: usize) -> str {
+    if n == 0 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: n }
+}
+
+fn hit_st(h: *mut Hits, i: usize) -> str { return str_of((&(*h).st[0]) as u64 + (i * FIELD_MAX) as u64, (*h).nst[i]) }
+fn hit_usn(h: *mut Hits, i: usize) -> str { return str_of((&(*h).usn[0]) as u64 + (i * FIELD_MAX) as u64, (*h).nusn[i]) }
+fn hit_location(h: *mut Hits, i: usize) -> str { return str_of((&(*h).loc[0]) as u64 + (i * FIELD_MAX) as u64, (*h).nloc[i]) }
+fn hit_addr(h: *mut Hits, i: usize) -> u32 { return (*h).addr[i] }
+
+fn copy_to(dst: u64, src: u64, n: usize) -> usize {
+    var k: usize = n
+    if k > FIELD_MAX {
+        k = FIELD_MAX
+    }
+    var i: usize = 0
+    while i < k {
+        rt.st8(dst, i, rt.ld8(src, i))
+        i = i + 1
+    }
+    return k
+}
+
+fn header_copy(m: *mut ssdp_msg.Msg, name: str, dst: u64) -> usize {
+    var o: usize = 0
+    var l: usize = 0
+    if !ssdp_msg.msg_header(m, name, &o, &l) {
+        return 0
+    }
+    return copy_to(dst, (*m).src + o as u64, l)
+}
+
+fn wait_slice(deadline: u64, now: u64) -> u64 {
+    if deadline <= now {
+        return 1 as u64
+    }
+    let left: u64 = deadline - now
+    if left > 100 as u64 {
+        return 100 as u64
+    }
+    return left
+}
+
+fn hit_known(h: *mut Hits, usn: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < (*h).count {
+        if (*h).nusn[i] == n && rt.mem_eq((&(*h).usn[0]) as u64 + (i * FIELD_MAX) as u64, usn, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn hit_add(h: *mut Hits, m: *mut ssdp_msg.Msg, from: u32) {
+    if (*h).count >= HIT_MAX {
+        return
+    }
+    let i: usize = (*h).count
+    var scratch: [u8; 192] = [0; 192]
+    let nu: usize = header_copy(m, "USN", (&scratch[0]) as u64)
+    if nu == 0 || hit_known(h, (&scratch[0]) as u64, nu) {
+        return
+    }
+    (*h).nusn[i] = copy_to((&(*h).usn[0]) as u64 + (i * FIELD_MAX) as u64, (&scratch[0]) as u64, nu)
+    let stname: str = "ST"
+    var nm: str = stname
+    var o: usize = 0
+    var l: usize = 0
+    if !ssdp_msg.msg_header(m, "ST", &o, &l) {
+        nm = "NT"
+    }
+    (*h).nst[i] = header_copy(m, nm, (&(*h).st[0]) as u64 + (i * FIELD_MAX) as u64)
+    (*h).nloc[i] = header_copy(m, "LOCATION", (&(*h).loc[0]) as u64 + (i * FIELD_MAX) as u64)
+    (*h).addr[i] = from
+    (*h).count = i + 1
+}
+
+fn search_run(fd: i64, port: u16, st: str, mx: u32, window_ms: u64, h: *mut Hits) -> usize {
+    let buf: u64 = rt.heap_alloc(RECV_CAP)
+    var q: rt.Buf = rt.buf_new()
+    ssdp_msg.build_msearch(&q, st.p as u64, st.n, mx, "firn/1 UPnP/1.1 ssdp/1")
+    let start: u64 = now_ms()
+    let deadline: u64 = start + window_ms
+    var sends: u32 = 0
+    var next_send: u64 = start
+    var go: bool = true
+    while go {
+        let now: u64 = now_ms()
+        if now >= deadline {
+            go = false
+        } else {
+            if sends < 2 as u32 && now >= next_send {
+                udp.udp_sendto(fd, q.ptr, q.len, mcast.MCAST_SSDP_V4, port)
+                sends = sends + 1 as u32
+                next_send = now + 300 as u64
+            }
+            udp.udp_set_timeout(fd, wait_slice(deadline, now))
+            var fa: u32 = 0
+            var fp: u16 = 0 as u16
+            let k: i64 = udp.udp_recvfrom(fd, buf, RECV_CAP, &fa, &fp)
+            if k > 0 {
+                var m: ssdp_msg.Msg = ssdp_msg.msg_new()
+                if ssdp_msg.msg_parse(buf, k as usize, &m) && m.kind == ssdp_msg.KIND_RESPONSE {
+                    var so: usize = 0
+                    var sl: usize = 0
+                    if ssdp_msg.msg_header(&m, "ST", &so, &sl) && ssdp_msg.st_matches(st.p as u64, st.n, buf + so as u64, sl) {
+                        hit_add(h, &m, fa)
+                    }
+                }
+            }
+        }
+    }
+    rt.buf_free(&q)
+    rt.heap_free(buf, RECV_CAP)
+    return (*h).count
+}
+
+fn service_new() -> Service {
+    return Service { nt: [0; 192], nnt: 0, usn: [0; 192], nusn: 0, loc: [0; 192], nloc: 0,
+        max_age: 1800 as u32, server: [0; 192], nserver: 0 }
+}
+
+fn service_set(s: *mut Service, nt: str, usn: str, location: str, server: str, max_age: u32) {
+    (*s).nnt = copy_to((&(*s).nt[0]) as u64, nt.p as u64, nt.n)
+    (*s).nusn = copy_to((&(*s).usn[0]) as u64, usn.p as u64, usn.n)
+    (*s).nloc = copy_to((&(*s).loc[0]) as u64, location.p as u64, location.n)
+    (*s).nserver = copy_to((&(*s).server[0]) as u64, server.p as u64, server.n)
+    (*s).max_age = max_age
+}
+
+fn announce(fd: i64, port: u16, s: *mut Service, alive: bool) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    ssdp_msg.build_notify(&b, (&(*s).nt[0]) as u64, (*s).nnt, alive, (&(*s).usn[0]) as u64, (*s).nusn,
+        (&(*s).loc[0]) as u64, (*s).nloc, (*s).max_age, str_of((&(*s).server[0]) as u64, (*s).nserver))
+    let r: i64 = udp.udp_sendto(fd, b.ptr, b.len, mcast.MCAST_SSDP_V4, port)
+    rt.buf_free(&b)
+    return r
+}
+
+fn reply(fd: i64, s: *mut Service, st: u64, stn: usize, to: u32, port: u16) {
+    var b: rt.Buf = rt.buf_new()
+    ssdp_msg.build_response(&b, st, stn, (&(*s).usn[0]) as u64, (*s).nusn, (&(*s).loc[0]) as u64, (*s).nloc,
+        (*s).max_age, str_of((&(*s).server[0]) as u64, (*s).nserver))
+    udp.udp_sendto(fd, b.ptr, b.len, to, port)
+    rt.buf_free(&b)
+}
+
+fn responder_run(fd: i64, port: u16, s: *mut Service, window_ms: u64) -> u32 {
+    let buf: u64 = rt.heap_alloc(RECV_CAP)
+    announce(fd, port, s, true)
+    let start: u64 = now_ms()
+    let deadline: u64 = start + window_ms
+    var answered: u32 = 0
+    var go: bool = true
+    while go {
+        let now: u64 = now_ms()
+        if now >= deadline {
+            go = false
+        } else {
+            udp.udp_set_timeout(fd, wait_slice(deadline, now))
+            var fa: u32 = 0
+            var fp: u16 = 0 as u16
+            let k: i64 = udp.udp_recvfrom(fd, buf, RECV_CAP, &fa, &fp)
+            if k > 0 {
+                var m: ssdp_msg.Msg = ssdp_msg.msg_new()
+                if ssdp_msg.msg_parse(buf, k as usize, &m) && m.kind == ssdp_msg.KIND_SEARCH
+                    && ssdp_msg.msg_header_eq(&m, "MAN", "\"ssdp:discover\"") {
+                    var so: usize = 0
+                    var sl: usize = 0
+                    if ssdp_msg.msg_header(&m, "ST", &so, &sl)
+                        && ssdp_msg.st_matches(buf + so as u64, sl, (&(*s).nt[0]) as u64, (*s).nnt) {
+                        reply(fd, s, (&(*s).nt[0]) as u64, (*s).nnt, fa, fp)
+                        answered = answered + 1 as u32
+                    }
+                }
+            }
+        }
+    }
+    announce(fd, port, s, false)
+    rt.heap_free(buf, RECV_CAP)
+    return answered
+}
