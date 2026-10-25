@@ -5,6 +5,7 @@ import std.core
 import std.bytes
 import mc.mc_nbt
 import mc.mc_text_nbt
+import mc.mc_item_regs
 
 export { Pool, im_new, im_free, im_begin, im_commit, im_find, im_from_nbt, im_comp_line, im_sig_of_bytes }
 
@@ -15,10 +16,17 @@ struct Pool {
     arena: rt.Buf,
     scratch: rt.Buf,
     pend_id: i32,
+    at_type: i64,
+    at_amt: i64,
+    at_op: i64,
+    at_slot: i64,
+    at_base: i64,
+    fx_id: i64,
+    fx_amp: i64,
 }
 
 fn im_new() -> Pool {
-    return Pool { arena: rt.buf_new(), scratch: rt.buf_new(), pend_id: 0 - 1 }
+    return Pool { arena: rt.buf_new(), scratch: rt.buf_new(), pend_id: 0 - 1, at_type: 0 - 1, at_amt: 0, at_op: 0, at_slot: 0, at_base: 0, fx_id: 0 - 1, fx_amp: 0 }
 }
 
 fn im_free(m: *mut Pool) {
@@ -29,6 +37,9 @@ fn im_free(m: *mut Pool) {
 fn im_begin(m: *mut Pool) {
     rt.buf_clear(&(*m).scratch)
     (*m).pend_id = 0 - 1
+    (*m).at_type = 0 - 1
+    (*m).at_base = 0
+    (*m).fx_id = 0 - 1
 }
 
 fn put_u32(b: *mut rt.Buf, v: u32) {
@@ -180,6 +191,32 @@ fn put_attributes(m: *mut Pool, d: *mut mc_nbt.Doc, list: u32) {
     }
 }
 
+fn put_nbt_effects(m: *mut Pool, d: *mut mc_nbt.Doc, list: u32) {
+    if list == 0 as u32 || mc_nbt.nbt_kind(d, list) != nbt.TAG_LIST { return }
+    var e: u32 = mc_nbt.nbt_first(d, list)
+    var guard: i32 = 0
+    while e != 0 as u32 && guard < 16 {
+        let idn: u32 = child(d, e, "Id")
+        let amp: u32 = child(d, e, "Amplifier")
+        let dur: u32 = child(d, e, "Duration")
+        if idn != 0 as u32 {
+            var a: i64 = 0
+            var du: i64 = 600
+            if amp != 0 as u32 { a = mc_nbt.nbt_i64(d, amp) }
+            if dur != 0 as u32 { du = mc_nbt.nbt_i64(d, dur) }
+            rt.buf_push(&(*m).scratch, 102)
+            rt.buf_push_dec_i64(&(*m).scratch, mc_nbt.nbt_i64(d, idn) - 1)
+            rt.buf_push(&(*m).scratch, 9)
+            rt.buf_push_dec_i64(&(*m).scratch, a)
+            rt.buf_push(&(*m).scratch, 9)
+            rt.buf_push_dec_i64(&(*m).scratch, du)
+            rt.buf_push(&(*m).scratch, 10)
+        }
+        e = mc_nbt.nbt_next(d, e)
+        guard = guard + 1
+    }
+}
+
 fn im_from_nbt(m: *mut Pool, d: *mut mc_nbt.Doc) {
     let root: u32 = mc_nbt.doc_root(d)
     let disp: u32 = child(d, root, "display")
@@ -205,6 +242,8 @@ fn im_from_nbt(m: *mut Pool, d: *mut mc_nbt.Doc) {
     let ub: u32 = child(d, root, "Unbreakable")
     if ub != 0 as u32 && mc_nbt.nbt_i64(d, ub) != 0 { put_num_line(m, 117 as u8, 1) }
     put_attributes(m, d, child(d, root, "AttributeModifiers"))
+    put_str_child(m, d, root, "Potion", 113 as u8)
+    put_nbt_effects(m, d, child(d, root, "CustomPotionEffects"))
 }
 
 fn comp_id(protocol: i32, k: i32) -> i32 {
@@ -280,9 +319,143 @@ fn put_hex_text(m: *mut Pool, tag: u8, vp: u64, vn: usize) {
     rt.buf_free(&js)
 }
 
+fn hex_u64(p: u64, n: usize, ok: *mut bool) -> u64 {
+    *ok = n > 2 && rt.ld8(p, 0) == 48 as u8 && rt.ld8(p, 1) == 120 as u8
+    var r: u64 = 0
+    var i: usize = 2
+    while i < n && *ok {
+        let d: i32 = hex_nib(rt.ld8(p, i))
+        if d < 0 { *ok = false } else { r = (r << 4 as u64) | (d as u64) }
+        i = i + 1
+    }
+    return r
+}
+
+fn index_after(p: u64, n: usize, from: usize, end: *mut usize) -> i32 {
+    if from >= n || rt.ld8(p, from) != 91 as u8 { return 0 - 1 }
+    var q: usize = from + 1
+    while q < n && rt.ld8(p, q) != 93 as u8 { q = q + 1 }
+    if q + 1 >= n || rt.ld8(p, q + 1) != 46 as u8 { return 0 - 1 }
+    var ok: bool = false
+    let x: i64 = parse_dec(p + ((from + 1) as u64), q - from - 1, &ok)
+    if !ok { return 0 - 1 }
+    *end = q + 2
+    return x as i32
+}
+
+fn emit_attribute(m: *mut Pool, protocol: i32) {
+    var np: u64 = 0
+    var nn: usize = 0
+    var sp: u64 = 0
+    var sn: usize = 0
+    if !mc_item_regs.attr_name(protocol, (*m).at_type, &np, &nn) || !mc_item_regs.slot_name((*m).at_slot, &sp, &sn) { return }
+    var amount: i64 = (*m).at_amt
+    if (*m).at_base == 1 { amount = amount + 100 }
+    if (*m).at_base == 2 { amount = amount + 400 }
+    rt.buf_push(&(*m).scratch, 97)
+    rt.buf_push_bytes(&(*m).scratch, "minecraft:".p as u64, 10)
+    rt.buf_push_bytes(&(*m).scratch, np, nn)
+    rt.buf_push(&(*m).scratch, 9)
+    rt.buf_push_dec_i64(&(*m).scratch, amount)
+    rt.buf_push(&(*m).scratch, 9)
+    rt.buf_push_dec_i64(&(*m).scratch, (*m).at_op)
+    rt.buf_push(&(*m).scratch, 9)
+    rt.buf_push_bytes(&(*m).scratch, sp, sn)
+    rt.buf_push(&(*m).scratch, 9)
+    rt.buf_push_dec_i64(&(*m).scratch, (*m).at_base)
+    rt.buf_push(&(*m).scratch, 10)
+    (*m).at_type = 0 - 1
+    (*m).at_base = 0
+}
+
+fn attr_comp_line(m: *mut Pool, protocol: i32, rp: u64, rn: usize, vp: u64, vn: usize) {
+    var at: usize = 0
+    if protocol <= 769 {
+        if rn == 16 && starts(rp, rn, "data.showTooltip") {
+            if vn == 5 && starts(vp, vn, "false") { put_num_line(m, 120 as u8, 1) }
+            return
+        }
+        if !starts(rp, rn, "data.attributes") { return }
+        at = 15
+    } else {
+        if !starts(rp, rn, "data[") { return }
+        at = 4
+    }
+    var fe: usize = 0
+    if index_after(rp, rn, at, &fe) < 0 { return }
+    let fp: u64 = rp + (fe as u64)
+    let fl: usize = rn - fe
+    var ok: bool = false
+    if fl == 6 && starts(fp, fl, "typeId") {
+        (*m).at_type = parse_dec(vp, vn, &ok)
+        if !ok { (*m).at_type = 0 - 1 }
+        (*m).at_base = 0
+    } else if fl == 4 && starts(fp, fl, "name") {
+        if starts(vp, vn, "\"minecraft:base_attack_damage\"") { (*m).at_base = 1 }
+        if starts(vp, vn, "\"minecraft:base_attack_speed\"") { (*m).at_base = 2 }
+    } else if fl == 5 && starts(fp, fl, "value") {
+        let bits: u64 = hex_u64(vp, vn, &ok)
+        if ok { (*m).at_amt = amount_x100(bits) } else { (*m).at_amt = 0 }
+    } else if fl == 9 && starts(fp, fl, "operation") {
+        (*m).at_op = parse_dec(vp, vn, &ok)
+    } else if fl == 4 && starts(fp, fl, "slot") {
+        (*m).at_slot = parse_dec(vp, vn, &ok)
+        if protocol <= 769 && (*m).at_type >= 0 { emit_attribute(m, protocol) }
+    } else if fl == 12 && starts(fp, fl, "display.type") {
+        let d: i64 = parse_dec(vp, vn, &ok)
+        if (*m).at_type >= 0 && d != 1 { emit_attribute(m, protocol) }
+        (*m).at_type = 0 - 1
+    }
+}
+
+fn potion_comp_line(m: *mut Pool, rp: u64, rn: usize, vp: u64, vn: usize) {
+    var ok: bool = false
+    if rn == 13 && starts(rp, rn, "data.potionId") {
+        let v: i64 = parse_dec(vp, vn, &ok)
+        if ok { put_num_line(m, 112 as u8, v) }
+        return
+    }
+    if !starts(rp, rn, "data.customEffects") { return }
+    var fe: usize = 0
+    if index_after(rp, rn, 18, &fe) < 0 { return }
+    let fp: u64 = rp + (fe as u64)
+    let fl: usize = rn - fe
+    if fl == 2 && starts(fp, fl, "id") {
+        (*m).fx_id = parse_dec(vp, vn, &ok)
+        if !ok { (*m).fx_id = 0 - 1 }
+    } else if fl == 17 && starts(fp, fl, "details.amplifier") {
+        (*m).fx_amp = parse_dec(vp, vn, &ok)
+    } else if fl == 16 && starts(fp, fl, "details.duration") {
+        let du: i64 = parse_dec(vp, vn, &ok)
+        if ok && (*m).fx_id >= 0 {
+            rt.buf_push(&(*m).scratch, 102)
+            rt.buf_push_dec_i64(&(*m).scratch, (*m).fx_id)
+            rt.buf_push(&(*m).scratch, 9)
+            rt.buf_push_dec_i64(&(*m).scratch, (*m).fx_amp)
+            rt.buf_push(&(*m).scratch, 9)
+            rt.buf_push_dec_i64(&(*m).scratch, du)
+            rt.buf_push(&(*m).scratch, 10)
+        }
+        (*m).fx_id = 0 - 1
+    }
+}
+
 fn im_comp_line(m: *mut Pool, protocol: i32, ct: i32, rp: u64, rn: usize, vp: u64, vn: usize) {
     if ct < 0 { return }
     var ok: bool = false
+    if ct == mc_item_regs.comp_max_damage() && rn == 4 && starts(rp, rn, "data") {
+        let v: i64 = parse_dec(vp, vn, &ok)
+        if ok { put_num_line(m, 109 as u8, v) }
+        return
+    }
+    if ct == mc_item_regs.comp_attr_modifiers(protocol) {
+        attr_comp_line(m, protocol, rp, rn, vp, vn)
+        return
+    }
+    if ct == mc_item_regs.comp_potion_contents(protocol) {
+        potion_comp_line(m, rp, rn, vp, vn)
+        return
+    }
     if rn == 4 && starts(rp, rn, "type") {
         if ct == comp_id(protocol, 1) { put_num_line(m, 117 as u8, 1) }
         return
