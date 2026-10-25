@@ -97,7 +97,7 @@ done
 echo "setblock 0 -60 3 oak_slab[type=bottom]" >&3 # r248: half-height model under the crosshair (selection box)
 for i in $(seq 1 30); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 5 ] && break; sleep 1; done
 [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 5 ] || fail "server setblock of the stairs"
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN

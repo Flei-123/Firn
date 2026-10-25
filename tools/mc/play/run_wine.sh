@@ -54,7 +54,7 @@ SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
 echo "time set day" >&3
-DN=$((200 + RANDOM % 90))
+DN=$(bash tools/mc/pick_display.sh 200 90)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN WINEPREFIX="$W/wp" WINEDEBUG=-all WINEARCH=win64

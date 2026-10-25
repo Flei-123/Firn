@@ -88,7 +88,7 @@ for z in 5 64; do
 done
 for i in $(seq 1 40); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 8 ] && break; sleep 1; done
 [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 8 ] || fail "server setblock of the stairs (need 8, FAR chunk loaded?)"
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN

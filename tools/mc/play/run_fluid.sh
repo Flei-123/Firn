@@ -42,7 +42,7 @@ for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break;
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
 for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "drowningDamage false" "fallDamage false" "fireDamage false"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
-DN=$((120 + RANDOM % 70))
+DN=$(bash tools/mc/pick_display.sh 120 70)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN

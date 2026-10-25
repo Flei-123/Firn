@@ -42,7 +42,7 @@ mkfifo "$W/in"; exec 3<>"$W/in"
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
@@ -50,7 +50,7 @@ export FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MC
 wait_log() { local i; for i in $(seq 1 "$2"); do grep -qE "$1" "$W/server.log" && return 0; sleep 1; done; return 1; }
 ERR=0
 cfg() { printf 'host=127.0.0.1\nport=%s\nname=%s\nprotocol=763\nview=3\n' "$PORT" "$1"; }
-focus() { local i w; for i in $(seq 1 20); do w=$(xdotool search --name mcplay 2>/dev/null | head -1); [ -n "$w" ] && { xdotool windowfocus "$w" 2>/dev/null; sleep 0.5; return 0; }; sleep 0.5; done; return 1; }
+focus() { local i w; for i in $(seq 1 60); do w=$(xdotool search --onlyvisible --name mcplay 2>/dev/null | head -1); [ -n "$w" ] && xdotool windowfocus "$w" 2>/dev/null && [ "$(xdotool getwindowfocus 2>/dev/null)" = "$w" ] && { sleep 1; return 0; }; sleep 0.5; done; return 1; }
 
 cfg StartA > "$W/a.cfg"
 MCPLAY_CONFIG="$W/a.cfg" MCPLAY_START_AUTO=1 MCPLAY_RUN_S=20 "$W/mcplay" > "$W/A.out" 2>&1 & PA=$!

@@ -2,23 +2,31 @@
 # tools/mc/play/run_hud.sh -- vanilla HUD in mcplay under Xvfb against the official 1.20.1 server (survival): bars vs widgets/icons.png, F3 debug, F1 hide, F2 PNG screenshot. Prints `RESULT mc-hud: ok`.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
+MCV=${1:-1.20.1}
+case "$MCV" in 1.20.1) PROTO=763;; 1.21.1) PROTO=767;; 1.21.4) PROTO=769;; 1.21.5) PROTO=770;; 1.21.8) PROTO=772;; 1.21.11) PROTO=774;; *) PROTO=${MCPLAY_PROTOCOL:-0};; esac
+PLAIN=0; [ "$MCV" = 1.20.1 ] || PLAIN=1
+JAVA=${JAVA:-/usr/bin/java}; [ -x /root/tools/jdk25/bin/java ] && case "$MCV" in 1.2[1-9]*|26*) JAVA=/root/tools/jdk25/bin/java ;; esac
 FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNLIB="$(pwd)/lib"
-export MC_VANILLA_JAR=${MC_VANILLA_JAR:-/root/.w5/jars/client-1.20.1.jar}
-export MC_VANILLA_ASSETS=${MC_VANILLA_ASSETS:-/root/.w5/menu-assets}
-export MC_VANILLA_INDEX=${MC_VANILLA_INDEX:-5}
-export MC_VANILLA=${MC_VANILLA_FORCE:-1}
+if [ $PLAIN -eq 0 ]; then
+  export MC_VANILLA_JAR=${MC_VANILLA_JAR:-/root/.w5/jars/client-1.20.1.jar}
+  export MC_VANILLA_ASSETS=${MC_VANILLA_ASSETS:-/root/.w5/menu-assets}
+  export MC_VANILLA_INDEX=${MC_VANILLA_INDEX:-5}
+  export MC_VANILLA=${MC_VANILLA_FORCE:-1}
+else
+  export MC_VANILLA_JAR=/nonexistent
+fi
 W=$(mktemp -d); SRV_PID=""; XV_PID=""
 cleanup() { [ -n "${HUD_KEEP_DIR:-}" ] && { mkdir -p "$HUD_KEEP_DIR"; cp "$W"/*.out "$W"/*.png "$W"/server.log "$W"/*.cfg "$HUD_KEEP_DIR"/ 2>/dev/null; }; exec 3>&- 2>/dev/null; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null && sleep 1 && kill -9 "$SRV_PID" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 fail() { echo "  FAIL  $1"; echo "RESULT mc-hud: FAIL"; exit 1; }
 for t in Xvfb java xdotool xwd python3; do command -v $t >/dev/null || fail "missing tool: $t"; done
-[ -f "$MC_VANILLA_JAR" ] || fail "missing $MC_VANILLA_JAR"
+[ $PLAIN -eq 1 ] || [ -f "$MC_VANILLA_JAR" ] || fail "missing $MC_VANILLA_JAR"
 ERR=0
 $FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
 mkdir -p "$W/srv"
-MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_server.sh "$W/srv" 1.20.1 || fail "server download"
+MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 cat > "$W/srv/server.properties" <<PROPS
@@ -38,11 +46,11 @@ enable-rcon=false
 enable-query=false
 PROPS
 mkfifo "$W/in"; exec 3<>"$W/in"
-( cd "$W/srv" && exec "${JAVA:-/usr/bin/java}" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
+( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
@@ -55,11 +63,11 @@ shot() { xwd -id "$1" -silent -out "$W/$2.xwd" && python3 -I tools/mc/menu/xwd_t
 check() { xdotool mousemove --window "$1" 5 5; sleep 0.8; if shot "$1" "$2"; then python3 -I "$CHECK" "$W/$2.ppm" "$MC_VANILLA_JAR" "$2" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')"; }; else echo "  FAIL  screenshot $2"; ERR=1; fi; }
 key() { xdotool key --window "$1" "$2"; sleep 0.8; }
 
-printf 'name=HudP\nprotocol=763\nview=3\n' > "$W/p.cfg"
+printf 'name=HudP\nprotocol=%s\nview=3\n' "$PROTO" > "$W/p.cfg"
 MCPLAY_CONFIG="$W/p.cfg" MCPLAY_RUN_S=90 "$W/mcplay" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
 wait_log "HudP joined the game" 120 || { echo "  FAIL  no join"; ERR=1; }
 WP=$(win) || { echo "  FAIL  no window"; ERR=1; WP=""; }
-hudcheck() { xdotool mousemove --window "$1" 5 5; sleep 0.8; shot "$1" "$2" && python3 -I "$CHECK" "$3" "$W/$2.ppm" "$MC_VANILLA_JAR" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')" 2>/dev/null; }; }
+hudcheck() { xdotool mousemove --window "$1" 5 5; sleep 0.8; shot "$1" "$2" && python3 -I "$CHECK" "$3" "$W/$2.ppm" "$MC_VANILLA_JAR" "$W/bars.ppm" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')" 2>/dev/null; }; }
 if [ -n "$WP" ]; then
   xdotool windowfocus "$WP" 2>/dev/null; sleep 12
   hudcheck "$WP" bars bars

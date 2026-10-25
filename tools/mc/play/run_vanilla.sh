@@ -55,7 +55,7 @@ for spec in "-2 east" "0 south" "2 west" "4 north"; do
 done
 for i in $(seq 1 30); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] && break; sleep 1; done
 [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] || fail "server setblock of the stairs"
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
