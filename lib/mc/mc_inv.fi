@@ -51,12 +51,13 @@ import mc.mc_hash
 import mc.mc_attr
 import mc.mc_craft
 import mc.mc_menu
+import mc.mc_item_meta
 
 export {
     Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_on_window_items_v, inv_on_set_slot_v, inv_hotbar_item, inv_hotbar_count, inv_held_item,
     inv_item, inv_count, inv_set, inv_send_creative, inv_clear, INV_SLOTS, INV_HOTBAR0, INV_MAIN0,
     inv_eff, inv_held_eff, inv_set_efficiency_id, inv_cursor_item, inv_cursor_count, inv_use_registry, inv_on_set_cursor_v,
-    inv_click, inv_click_build, inv_drop_slot, inv_local_drop, inv_set_eff, inv_click_kind, inv_sig, inv_max_stack, inv_cursor_sig,
+    inv_click, inv_click_build, inv_drop_slot, inv_local_drop, inv_set_eff, inv_click_kind, inv_sig, inv_max_stack, inv_cursor_sig, inv_slot_meta, inv_cursor_meta,
     inv_set_enchant_keys, inv_patch_of, inv_hash_off, inv_set_creative, inv_drag_begin, inv_drag_add, inv_drag_end,
     INV_CAP, inv_window_mk, inv_prop, inv_on_property, inv_on_open_horse, inv_window_cols, inv_window_title, inv_on_open_window_v, inv_on_close_window_v, inv_close_window, inv_local_close, inv_window, inv_window_slots,
     inv_win_item, inv_win_count, inv_win_to_int, inv_int_to_win, inv_window_size,
@@ -129,13 +130,14 @@ struct Inv {
     craft_g: u64, // u32 [9], scratch grid (item id + 1) of the craft matcher
     sel: i32, // selected hotbar slot 0..8 (Inventory.add tries it first)
     sv: u64, // u32 [(INV_CAP + 1) * 5], undo buffer of a craft click (slot_save / slot_restore)
+    im: mc_item_meta.Pool,
 }
 
 fn inv_new() -> Inv {
     var v: Inv = Inv { ids: rt.heap_alloc(INV_CAP * 4), counts: rt.heap_alloc(INV_CAP * 4), effs: rt.heap_alloc(INV_CAP * 4),
         sigs: rt.heap_alloc(INV_CAP * 4), maxs: rt.heap_alloc(INV_CAP * 4), cur_sig: 0, cur_max: 0,
         cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_srv: 0 as u32, hash_off: false, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, qc_hi: 0 as u64, win: 0, win_n: 0, creative: false,
-        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0, win_res: 0 - 1, win_mk: 0 - 1, props: rt.heap_alloc(PROPS_CAP * 4), xscr: rt.heap_alloc(XS_LEN * 4), rcp: 0, craft_g: rt.heap_alloc(9 * 4), sel: 0, sv: rt.heap_alloc((INV_CAP + 1) * 5 * 4) }
+        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0, win_res: 0 - 1, win_mk: 0 - 1, props: rt.heap_alloc(PROPS_CAP * 4), xscr: rt.heap_alloc(XS_LEN * 4), rcp: 0, craft_g: rt.heap_alloc(9 * 4), sel: 0, sv: rt.heap_alloc((INV_CAP + 1) * 5 * 4), im: mc_item_meta.im_new() }
     inv_clear(&v)
     props_clear(&v)
     var z: usize = 0
@@ -159,6 +161,7 @@ fn inv_free(v: *mut Inv) {
     (*v).xscr = 0
     rt.heap_free((*v).craft_g, 9 * 4)
     rt.heap_free((*v).sv, (INV_CAP + 1) * 5 * 4)
+    mc_item_meta.im_free(&(*v).im)
     (*v).craft_g = 0
     rt.heap_free((*v).ptab, PT_CAP * PT_STRIDE * 4)
     (*v).pscr = 0
@@ -196,6 +199,14 @@ fn inv_max_stack(v: *mut Inv, slot: i32) -> i32 {
     return rt.ld32((*v).maxs, slot as usize) as i32
 }
 fn inv_cursor_sig(v: *mut Inv) -> i32 { return (*v).cur_sig }
+
+fn inv_slot_meta(v: *mut Inv, slot: i32, out_p: *mut u64, out_n: *mut usize) -> bool {
+    return mc_item_meta.im_find(&(*v).im, inv_sig(v, slot), out_p, out_n)
+}
+
+fn inv_cursor_meta(v: *mut Inv, out_p: *mut u64, out_n: *mut usize) -> bool {
+    return mc_item_meta.im_find(&(*v).im, (*v).cur_sig, out_p, out_n)
+}
 
 fn set_extra(v: *mut Inv, slot: i32, sig: i32, mx: i32) {
     if slot == SLOT_CUR { (*v).cur_sig = sig; (*v).cur_max = mx; return }
@@ -615,10 +626,11 @@ fn nbt_efficiency(d: *mut mc_nbt.Doc) -> i32 {
 }
 
 // Reads one slot value (present bool, varint item, i8 count, optional NBT). item = -1 for an empty slot. false = malformed.
-fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32, eff: *mut i32) -> bool {
+fn read_slot(v: *mut Inv, b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32, eff: *mut i32, sig: *mut i32) -> bool {
     *item = 0 - 1
     *count = 0
     *eff = 0
+    *sig = 0
     let present: bool = bytes.get_bool(b) catch false
     if !present { return true }
     let it: i32 = bytes.get_varint(b) catch (0 - 1)
@@ -629,9 +641,16 @@ fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32
     if tag != 0 as u8 {
         // a compound follows (named root up to 1.20.1; nameless since 1.20.2): step back and parse it
         bytes.bytes_set_pos(b, bytes.bytes_pos(b) - 1)
+        let at0: usize = bytes.bytes_pos(b)
         var d: mc_nbt.Doc = mc_nbt.doc_new()
         let ok: bool = mc_nbt.doc_parse(&d, b, protocol >= 764, false) catch false
-        if ok { *eff = nbt_efficiency(&d) }
+        if ok {
+            *eff = nbt_efficiency(&d)
+            mc_item_meta.im_begin(&(*v).im)
+            mc_item_meta.im_from_nbt(&(*v).im, &d)
+            *sig = mc_item_meta.im_sig_of_bytes(bytes.bytes_ptr(b) + (at0 as u64), bytes.bytes_pos(b) - at0)
+            mc_item_meta.im_commit(&(*v).im, *sig)
+        }
         mc_nbt.doc_free(&d)
         if !ok { return false }
     }
@@ -643,6 +662,11 @@ fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32
 fn put_slot_e(v: *mut Inv, slot: i32, item: i32, count: i32, eff: i32) {
     put_slot(v, slot, item, count)
     if item >= 0 && count > 0 { inv_set_eff(v, slot, eff) }
+}
+
+fn put_slot_s(v: *mut Inv, slot: i32, item: i32, count: i32, eff: i32, sig: i32) {
+    put_slot_e(v, slot, item, count, eff)
+    if item >= 0 && count > 0 && sig != 0 { set_extra(v, slot, sig, 0) }
 }
 
 fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
@@ -667,10 +691,11 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
         var item: i32 = 0 - 1
         var cnt: i32 = 0
         var eff: i32 = 0
-        if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
+        var sg: i32 = 0
+        if !read_slot(v, b, protocol, &item, &cnt, &eff, &sg) { (*v).bad = (*v).bad + 1 as u32; return false }
         var ti: i32 = i
         if mapw { ti = inv_win_to_int(v, i) }
-        put_slot_e(v, ti, item, cnt, eff)
+        put_slot_s(v, ti, item, cnt, eff, sg)
         i = i + 1
     }
     if protocol >= 756 {
@@ -678,8 +703,9 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
         var item: i32 = 0 - 1
         var cnt: i32 = 0
         var eff: i32 = 0
-        if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
-        put_slot_e(v, SLOT_CUR, item, cnt, eff)
+        var sg: i32 = 0
+        if !read_slot(v, b, protocol, &item, &cnt, &eff, &sg) { (*v).bad = (*v).bad + 1 as u32; return false }
+        put_slot_s(v, SLOT_CUR, item, cnt, eff, sg)
     }
     return true
 }
@@ -704,8 +730,9 @@ fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
     var item: i32 = 0 - 1
     var cnt: i32 = 0
     var eff: i32 = 0
-    if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
-    put_slot_e(v, slot, item, cnt, eff)
+    var sg: i32 = 0
+    if !read_slot(v, b, protocol, &item, &cnt, &eff, &sg) { (*v).bad = (*v).bad + 1 as u32; return false }
+    put_slot_s(v, slot, item, cnt, eff, sg)
     return true
 }
 
@@ -1235,6 +1262,7 @@ fn flush_extra(v: *mut Inv, protocol: i32, slot: i32, h: u64, n: i32, mx: i32) {
     var sig: i32 = 0
     if n > 0 { sig = ((h & 2147483647) | 1) as i32 }
     set_extra(v, slot, sig, mx)
+    mc_item_meta.im_commit(&(*v).im, sig)
     patch_register(v, protocol, sig)
 }
 
@@ -1346,6 +1374,7 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                     acc_n = 0
                     acc_mx = 0
                     ps_reset(v)
+                    mc_item_meta.im_begin(&(*v).im)
                     let c: i32 = parse_dec(vp, vn, &okn)
                     comp_type = 0 - 1
                     ench_cur = 0 - 1
@@ -1436,6 +1465,7 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                                 }
                             }
                         }
+                        mc_item_meta.im_comp_line(&(*v).im, (*ver).protocol, comp_type, rp, rn, vp, vn)
                     }
                 }
             }

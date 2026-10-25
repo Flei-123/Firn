@@ -58,6 +58,7 @@ const MAX_PRIO_INLINES: usize = 200_000;
 /// Growth guard of the size-ordered phase, in percent of the module size
 /// before it started.
 const MAX_GROWTH_PCT: usize = 40;
+const HEAT_GROWTH_PCT: usize = 50;
 /// Largest callee embedded into a (self-)recursive caller in the middle
 /// version kept for the frame budget (see `REC_SMALL`).
 const REC_CALLER_TIER: usize = 10;
@@ -183,7 +184,7 @@ pub(crate) fn allowed_at_all(callee: &Func) -> bool {
         && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
 }
 
-fn inlinable(callee: &Func) -> bool {
+pub(crate) fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
     // arguments, say the sink mutators of the tokenizer) may have more
     // blocks: their control flow is a DAG, and because `dst` is empty, not
@@ -1065,12 +1066,13 @@ impl CallGraph {
 fn inline_by_size(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) -> usize {
     let budget = env_usize("FIRNC_INLINE_BUDGET", MAX_PRIO_INLINES);
     let growth_pct = env_usize("FIRNC_INLINE_GROWTH", MAX_GROWTH_PCT);
+    let heat_pct = env_usize("FIRNC_INLINE_HEAT", HEAT_GROWTH_PCT);
     let stats = std::env::var_os("FIRNC_INLINE_STATS").is_some();
     // The frame budget is decided in codegen_x86 and only the x86-64 frames
     // share slots by lifetime; the other back ends keep round INLGZ.
     let rec_default = if matches!(crate::target::active(), crate::target::Target::X86_64) { 2 } else { 0 };
     let rec_mode = env_usize("FIRNC_INLINE_REC", rec_default);
-    inline_by_size_with(m, dbg || stats, changed, budget, growth_pct, rec_mode)
+    inline_by_size_with(m, dbg || stats, changed, budget, growth_pct, heat_pct, rec_mode)
 }
 
 /// `inline_by_size` with the two bounds and the recursion mode as parameters
@@ -1084,6 +1086,7 @@ fn inline_by_size_with(
     changed: &mut Vec<usize>,
     budget: usize,
     growth_pct: usize,
+    heat_pct: usize,
     rec_mode: usize,
 ) -> usize {
     let idx: HashMap<String, usize> =
@@ -1098,6 +1101,7 @@ fn inline_by_size_with(
     let mut per_tier: Vec<usize> = Vec::new();
     let mut kept: HashMap<String, Func> = HashMap::default();
     let mut small: HashMap<String, Func> = HashMap::default();
+    let mut stopped_by_growth = false;
     // One tier per callee size, from just above the trivial leaves up: when
     // the growth guard stops the phase, it stops at a size boundary.
     let tiers: Vec<usize> = (MAX_TRIVIAL_INSTS + 1..=MAX_CALLEE_INSTS).collect();
@@ -1125,6 +1129,7 @@ fn inline_by_size_with(
             loop {
                 if n >= budget || grown >= max_growth {
                     per_tier.push(n - at_start);
+                    stopped_by_growth = n < budget;
                     break 'tiers;
                 }
                 let caller = &m.funcs[ci];
@@ -1227,10 +1232,29 @@ fn inline_by_size_with(
             }
         }
     }
+    let mut heat_sites = 0usize;
+    let mut heat_copied = 0usize;
+    let mut heat_threshold = 0.0f64;
+    if stopped_by_growth && heat_pct > 0 {
+        let mut ctx = crate::inline_heat::HeatContext {
+            idx: &idx,
+            cg: &mut cg,
+            self_rec: &mut self_rec,
+            kept: &mut kept,
+            rec_mode,
+            max_sites: budget - n,
+            max_copied: base * heat_pct / 100,
+        };
+        let r = crate::inline_heat::run(m, &mut ctx, changed);
+        heat_sites = r.sites;
+        heat_copied = r.copied;
+        heat_threshold = r.threshold;
+        n += r.sites;
+    }
     if dbg {
         eprintln!(
-            "inline-by-size: {} sites, tiers {:?} -> {:?}, module {} insts, +{} copied (guard {}), {} recursive callers kept for the frame budget",
-            n, tiers, per_tier, base, grown, max_growth, kept.len()
+            "inline-by-size: {} sites, tiers {:?} -> {:?}, module {} insts, +{} copied (guard {}), heat {} sites +{} copied (threshold {:.3}), {} recursive callers kept for the frame budget",
+            n, tiers, per_tier, base, grown, max_growth, heat_sites, heat_copied, heat_threshold, kept.len()
         );
     }
     rec_originals_put(kept);
@@ -1724,7 +1748,7 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("user", &["big", "small"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1, 100, 0);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1, 100, 0, 0);
         assert_eq!(n, 1);
         assert_eq!(calls_to(&m, "user", "small"), 0);
         assert_eq!(calls_to(&m, "user", "big"), 1);
@@ -1743,9 +1767,33 @@ mod tests {
         m.funcs.push(chain_fn("filler", 1190));
         assert_eq!(m.inst_count(), 1203);
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1, 0);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1, 0, 0);
         assert_eq!(n, 2);
         assert_eq!(calls_to(&m, "user", "small"), 2);
+    }
+
+    #[test]
+    fn heat_phase_spends_the_extra_budget_after_the_growth_guard() {
+        let mut m = Module::new();
+        m.funcs.push(chain_fn("small", 8));
+        m.funcs.push(caller_of("user", &["small", "small", "small", "small"]));
+        m.funcs.push(chain_fn("filler", 1190));
+        let mut changed = Vec::new();
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1, 100, 0);
+        assert_eq!(n, 4);
+        assert_eq!(calls_to(&m, "user", "small"), 0);
+    }
+
+    #[test]
+    fn heat_phase_respects_its_own_budget() {
+        let mut m = Module::new();
+        m.funcs.push(chain_fn("small", 8));
+        m.funcs.push(caller_of("user", &["small"; 8]));
+        m.funcs.push(chain_fn("filler", 1190));
+        let mut changed = Vec::new();
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1, 1, 0);
+        assert_eq!(n, 4);
+        assert_eq!(calls_to(&m, "user", "small"), 4);
     }
 
     #[test]
@@ -1756,7 +1804,7 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("rec", &["small", "rec"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0, 0);
         assert_eq!(n, 0);
         assert_eq!(calls_to(&m, "rec", "small"), 1);
     }
@@ -1777,7 +1825,7 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("rec_k", &["small", "rec_k"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 2);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0, 2);
         assert_eq!(n, 1);
         assert_eq!(calls_to(&m, "rec_k", "small"), 0);
         let kept = rec_originals_take();
@@ -1797,7 +1845,7 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("rec_1", &["small", "rec_1"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 1);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0, 1);
         // `chain_fn` is a single block without an alloca: taken, and nothing
         // is kept in mode 1
         assert_eq!(n, 1);
@@ -1821,7 +1869,7 @@ mod tests {
         m.funcs.push(caller_of("a", &["b"]));
         m.funcs.push(caller_of("b", &["a"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0, 0);
         assert_eq!(n, 0);
     }
 }
