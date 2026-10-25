@@ -4,8 +4,8 @@ The apps in `examples/fui_apps/` (`lib/fui/screen.fi`) are ONE source for X11, A
 
 | Need | Linux/Windows | Android | Browser |
 |---|---|---|---|
-| Inter (4 weights) | `lib/fui/fonts` via `plat.uifont` | APK `assets/` via `lib/@android/plat/uifont.fi` | `data-fonts` slots 0-3 (`lib/@web/plat/uifont.fi`) |
-| Monospace | DejaVu Sans Mono / Consolas | `/system/fonts/DroidSansMono.ttf` | `data-fonts` slot 4 |
+| Inter (4 weights) | Linux: `lib/fui/fonts` via `plat.uifont`; Windows: embedded in the exe (`lib/@windows/plat/fontbundle.fi`), a `fonts/` folder next to the exe or `$FUI_FONT_DIR` still wins | APK `assets/` via `lib/@android/plat/uifont.fi` | `data-fonts` slots 0-3 (`lib/@web/plat/uifont.fi`) |
+| Monospace | DejaVu Sans Mono (`lib/fui/fonts`, embedded on Windows) | `/system/fonts/DroidSansMono.ttf` | `data-fonts` slot 4 |
 | Data and pictures | `plat.assetio` over `fui.datadir` (`$FUI_DATA_DIR`, `<exe>/data`, `examples/fui_apps/data`) | AssetManager | `data-assets` (`firn_web_asset`, delivered before `main`) |
 | Headless shot | `--shot` | works | refused (`lib/@web/fui/safeout.fi`) |
 
