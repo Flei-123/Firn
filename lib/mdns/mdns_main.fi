@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.dns
+import mdns.mdns_wire
+import mdns.mdns_cache
+import mdns.mdns_browse
+import mdns.mdns_resp
+import mdns.mdns_sock
+
+fn arg_is(start: u64, i: usize, lit: str) -> bool {
+    let p: u64 = rt.arg_ptr(start, i)
+    let n: usize = rt.c_length(p)
+    return n == lit.n && rt.mem_eq(p, lit.p as u64, n)
+}
+
+fn parse_u32(p: u64, n: usize, out: *mut u32) -> bool {
+    if n == 0 || n > 9 {
+        return false
+    }
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u32 + (c - 48 as u8) as u32
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+struct Opts {
+    port: u32,
+    iface: u32,
+    ms: u32,
+    probe: bool,
+    txt: rt.Buf,
+}
+
+fn opts_parse(start: u64, from: usize, o: *mut Opts) -> bool {
+    let argc: usize = rt.arg_count(start)
+    var i: usize = from
+    while i < argc {
+        let has_next: bool = i + 1 < argc
+        if arg_is(start, i, "--no-probe") {
+            (*o).probe = false
+        } else if arg_is(start, i, "--port") && has_next {
+            let pp: u64 = rt.arg_ptr(start, i + 1)
+            if !parse_u32(pp, rt.c_length(pp), &(*o).port) {
+                return false
+            }
+            i = i + 1
+        } else if arg_is(start, i, "--ms") && has_next {
+            let pp: u64 = rt.arg_ptr(start, i + 1)
+            if !parse_u32(pp, rt.c_length(pp), &(*o).ms) {
+                return false
+            }
+            i = i + 1
+        } else if arg_is(start, i, "--iface") && has_next {
+            let pp: u64 = rt.arg_ptr(start, i + 1)
+            if !dns.dns_parse_ipv4(pp, rt.c_length(pp), &(*o).iface) {
+                return false
+            }
+            i = i + 1
+        } else if arg_is(start, i, "--txt") && has_next {
+            let pp: u64 = rt.arg_ptr(start, i + 1)
+            let pn: usize = rt.c_length(pp)
+            var eq: usize = pn
+            var k: usize = 0
+            while k < pn {
+                if rt.ld8(pp, k) == 61 as u8 && eq == pn {
+                    eq = k
+                }
+                k = k + 1
+            }
+            if eq == pn {
+                if !mdns_wire.txt_push_pair(&(*o).txt, pp, pn, 0 as u64, 0, false) {
+                    return false
+                }
+            } else if !mdns_wire.txt_push_pair(&(*o).txt, pp, eq, pp + (eq + 1) as u64, pn - eq - 1, true) {
+                return false
+            }
+            i = i + 1
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn opts_new() -> Opts {
+    return Opts { port: mdns_sock.MDNS_PORT, iface: 0 as u32, ms: 3000 as u32, probe: true, txt: rt.buf_new() }
+}
+
+fn push_v4(b: *mut rt.Buf, a: u32) {
+    rt.buf_push_dec_u64(b, ((a >> 24) & 255 as u32) as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_dec_u64(b, ((a >> 16) & 255 as u32) as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_dec_u64(b, ((a >> 8) & 255 as u32) as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_dec_u64(b, (a & 255 as u32) as u64)
+}
+
+fn push_v6(b: *mut rt.Buf, p: u64) {
+    var g: usize = 0
+    while g < 8 {
+        if g > 0 {
+            rt.buf_push(b, 58 as u8)
+        }
+        rt.buf_push_hex_u64(b, ((rt.ld8(p, g * 2) as u64) << 8) | (rt.ld8(p, g * 2 + 1) as u64), 1)
+        g = g + 1
+    }
+}
+
+fn print_found(inst: u64, ilen: usize, f: *mut mdns_browse.Found, got: u32) {
+    var b: rt.Buf = rt.buf_new()
+    var lit: str = "FOUND\t"
+    rt.buf_push_bytes(&b, lit.p as u64, lit.n)
+    rt.buf_push_bytes(&b, mdns_wire.wname_label_ptr(inst), mdns_wire.wname_label_len(inst))
+    rt.buf_push(&b, 9 as u8)
+    if (got & mdns_browse.FOUND_SRV) != 0 as u32 {
+        mdns_wire.wname_to_text((&(*f).host[0]) as u64, (*f).hlen, &b)
+    } else {
+        rt.buf_push(&b, 45 as u8)
+    }
+    rt.buf_push(&b, 9 as u8)
+    rt.buf_push_dec_u64(&b, (*f).port as u64)
+    rt.buf_push(&b, 9 as u8)
+    if (got & mdns_browse.FOUND_A) != 0 as u32 {
+        push_v4(&b, (*f).a4)
+    } else {
+        rt.buf_push(&b, 45 as u8)
+    }
+    rt.buf_push(&b, 9 as u8)
+    if (got & mdns_browse.FOUND_AAAA) != 0 as u32 {
+        push_v6(&b, (&(*f).a6[0]) as u64)
+    } else {
+        rt.buf_push(&b, 45 as u8)
+    }
+    var pos: usize = 0
+    var s: usize = 0
+    var l: usize = 0
+    while mdns_wire.txt_next((&(*f).txt[0]) as u64, (*f).tlen, &pos, &s, &l) {
+        if l > 0 {
+            rt.buf_push(&b, 9 as u8)
+            rt.buf_push_bytes(&b, (&(*f).txt[0]) as u64 + s as u64, l)
+        }
+    }
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, b.ptr, b.len)
+    rt.buf_free(&b)
+}
+
+fn cmd_browse(start: u64, argc: usize) -> i32 {
+    if argc < 3 {
+        return 64
+    }
+    var o: Opts = opts_new()
+    if !opts_parse(start, 3, &o) {
+        return 64
+    }
+    var tw: [u8; 256] = [0; 256]
+    let tp: u64 = rt.arg_ptr(start, 2)
+    let tl: usize = mdns_wire.wname_from_text(tp, rt.c_length(tp), (&tw[0]) as u64, 256)
+    if tl == 0 {
+        return 64
+    }
+    let fd: i64 = mdns_sock.sock_open(o.port as u16, o.iface)
+    if fd < 0 {
+        return 69
+    }
+    var c: mdns_cache.Cache = mdns_cache.cache_new(96)
+    mdns_sock.browse_run(fd, o.port as u16, (&tw[0]) as u64, tl, &c, o.ms as u64)
+    var i: usize = mdns_cache.cache_find(&c, (&tw[0]) as u64, tl, mdns_wire.T_PTR, 0, mdns_sock.now_ms())
+    var n: i32 = 0
+    while i != mdns_cache.NONE {
+        var inst: [u8; 256] = [0; 256]
+        let il: usize = mdns_cache.cache_dlen(&c, i)
+        rt.mem_copy((&inst[0]) as u64, mdns_cache.cache_data(&c, i), il)
+        var f: mdns_browse.Found = mdns_browse.found_new()
+        let got: u32 = mdns_sock.resolve_run(fd, o.port as u16, &c, (&inst[0]) as u64, il, 1500 as u64, &f)
+        print_found((&inst[0]) as u64, il, &f, got)
+        n = n + 1
+        i = mdns_cache.cache_find(&c, (&tw[0]) as u64, tl, mdns_wire.T_PTR, i + 1, mdns_sock.now_ms())
+    }
+    mdns_cache.cache_free(&c)
+    mdns_sock.sock_close(fd)
+    return 0
+}
+
+fn cmd_serve(start: u64, argc: usize) -> i32 {
+    if argc < 7 {
+        return 64
+    }
+    var o: Opts = opts_new()
+    o.ms = 0 as u32
+    if !opts_parse(start, 7, &o) {
+        return 64
+    }
+    var a4: u32 = 0
+    var port: u32 = 0
+    let ap: u64 = rt.arg_ptr(start, 5)
+    let pp: u64 = rt.arg_ptr(start, 6)
+    if !dns.dns_parse_ipv4(ap, rt.c_length(ap), &a4) || !parse_u32(pp, rt.c_length(pp), &port) || port > 65535 as u32 {
+        return 64
+    }
+    var reg: mdns_resp.Reg = mdns_resp.reg_new()
+    let lp: u64 = rt.arg_ptr(start, 2)
+    let tp: u64 = rt.arg_ptr(start, 3)
+    let hp: u64 = rt.arg_ptr(start, 4)
+    let idx: usize = mdns_resp.reg_add(&reg, lp, rt.c_length(lp), tp, rt.c_length(tp), hp, rt.c_length(hp),
+        port, o.txt.ptr, o.txt.len, a4, true)
+    if idx == mdns_resp.BAD {
+        return 64
+    }
+    let fd: i64 = mdns_sock.sock_open(o.port as u16, o.iface)
+    if fd < 0 {
+        return 69
+    }
+    var sv: mdns_sock.Serve = mdns_sock.serve_open(fd, o.port as u16, 0 as u64)
+    var rc: i32 = mdns_sock.serve_start(&sv, &reg, o.probe)
+    if rc == mdns_sock.SERVE_OK {
+        var ready: str = "READY\n"
+        rt.write_everything(1, ready.p as u64, ready.n)
+        rc = mdns_sock.serve_loop(&sv, &reg, o.ms as u64)
+        mdns_sock.serve_end(&sv, &reg)
+    }
+    mdns_sock.sock_close(fd)
+    return rc
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc < 2 {
+        return 64
+    }
+    if arg_is(start, 1, "browse") {
+        return cmd_browse(start, argc)
+    }
+    if arg_is(start, 1, "serve") {
+        return cmd_serve(start, argc)
+    }
+    return 64
+}

@@ -1,0 +1,644 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.str
+import net.http
+import print.ippmsg
+import print.ippcaps
+
+export {
+    IppError, Transport, Client, JobSpec, JobInfo,
+    client_new, client_free, client_set_transport, client_set_user, client_status, client_http_status,
+    default_transport, spec_default, spec_set_ranges, normalize_uri, uri_to_url,
+    get_printer_attributes, get_printers, validate_job, print_job, create_job, send_document,
+    get_job, list_jobs, cancel_job, identify_printer, job_info_new,
+    TR_NO_SERVER, TR_BAD_URL, TR_HTTP, TR_TLS,
+    JOB_PENDING, JOB_HELD, JOB_PROCESSING, JOB_STOPPED, JOB_CANCELED, JOB_ABORTED, JOB_COMPLETED,
+    QUALITY_DRAFT, QUALITY_NORMAL, QUALITY_HIGH,
+    ORIENT_PORTRAIT, ORIENT_LANDSCAPE, ORIENT_REVERSE_LANDSCAPE, ORIENT_REVERSE_PORTRAIT,
+}
+
+error IppError {
+    NoServer,
+    Http,
+    Tls,
+    Ipp,
+    BadPrinter,
+    Protocol,
+}
+
+const TR_NO_SERVER: u32 = 1
+const TR_BAD_URL: u32 = 2
+const TR_HTTP: u32 = 3
+const TR_TLS: u32 = 4
+
+const JOB_PENDING: u32 = 3
+const JOB_HELD: u32 = 4
+const JOB_PROCESSING: u32 = 5
+const JOB_STOPPED: u32 = 6
+const JOB_CANCELED: u32 = 7
+const JOB_ABORTED: u32 = 8
+const JOB_COMPLETED: u32 = 9
+
+const QUALITY_DRAFT: u32 = 3
+const QUALITY_NORMAL: u32 = 4
+const QUALITY_HIGH: u32 = 5
+
+const ORIENT_PORTRAIT: u32 = 3
+const ORIENT_LANDSCAPE: u32 = 4
+const ORIENT_REVERSE_LANDSCAPE: u32 = 5
+const ORIENT_REVERSE_PORTRAIT: u32 = 6
+
+struct Transport {
+    post: fn(u64, str, u64, usize, *mut rt.Buf) -> u32,
+    ud: u64,
+}
+
+struct Client {
+    tr: Transport,
+    request_id: u32,
+    status: u32,
+    http_status: u32,
+    user: str,
+    version: u32,
+}
+
+struct JobSpec {
+    copies: u32,
+    sides: str,
+    color_mode: str,
+    media: str,
+    quality: u32,
+    orientation: u32,
+    scaling: str,
+    res_x: u32,
+    res_y: u32,
+    job_name: str,
+    ranges: Vec[u32],
+}
+
+struct JobInfo {
+    id: u32,
+    state: u32,
+    reasons: str,
+    name: str,
+    user: str,
+    impressions: u32,
+    sheets: u32,
+}
+
+fn default_post(ud: u64, url: str, body: u64, n: usize, out: *mut rt.Buf) -> u32 {
+    var c: http.Client = http.client_new()
+    if !http.client_init(&c) {
+        return TR_HTTP
+    }
+    http.client_set_cache(&c, false)
+    http.client_set_gzip(&c, false)
+    http.client_set_timeout(&c, 30000)
+    var r: http.Response = http.resp_new()
+    http.resp_init(&r)
+    let ct: str = "application/ipp"
+    var kind: u32 = 0
+    let ok: bool = http.http_post(&c, url.p as u64, url.n, body, n, ct.p as u64, ct.n, &r) catch | e | (map_http(e, &kind))
+    var status: u32 = kind
+    if ok {
+        status = http.resp_status(&r)
+        rt.buf_push_bytes(out, http.resp_body_ptr(&r), http.resp_body_len(&r))
+    }
+    http.resp_free(&r)
+    http.client_free(&c)
+    return status
+}
+
+fn map_http(e: HttpError, kind: *mut u32) -> bool {
+    if e == HttpError::Connect || e == HttpError::Resolve {
+        *kind = TR_NO_SERVER
+    } else if e == HttpError::Url || e == HttpError::Scheme {
+        *kind = TR_BAD_URL
+    } else if e == HttpError::Tls {
+        *kind = TR_TLS
+    } else {
+        *kind = TR_HTTP
+    }
+    return false
+}
+
+fn default_transport() -> Transport {
+    return Transport { post: default_post, ud: 0 }
+}
+
+fn client_new() -> Client {
+    return Client { tr: default_transport(), request_id: 0, status: 0, http_status: 0, user: "firn", version: 512 }
+}
+
+fn client_free(c: *mut Client) {
+}
+
+fn client_set_transport(c: *mut Client, t: Transport) { (*c).tr = t }
+fn client_set_user(c: *mut Client, user: str) { (*c).user = user }
+fn client_status(c: *mut Client) -> u32 { return (*c).status }
+fn client_http_status(c: *mut Client) -> u32 { return (*c).http_status }
+
+fn spec_default() -> JobSpec {
+    return JobSpec { copies: 1, sides: "", color_mode: "", media: "", quality: 0, orientation: 0, scaling: "",
+        res_x: 0, res_y: 0, job_name: "", ranges: vec_new[u32]() }
+}
+
+fn spec_set_ranges(s: *mut JobSpec, text: str) -> bool {
+    vec_clear[u32](&(*s).ranges)
+    var i: usize = 0
+    var cur: u32 = 0
+    var have: bool = false
+    var lo: u32 = 0
+    var has_lo: bool = false
+    while i <= text.n {
+        var ch: u8 = 44 as u8
+        if i < text.n {
+            ch = rt.ld8(text.p as u64, i)
+        }
+        if ch >= 48 as u8 && ch <= 57 as u8 {
+            cur = cur * 10 + (ch - 48 as u8) as u32
+            have = true
+        } else if ch == 45 as u8 {
+            if !have || has_lo {
+                return false
+            }
+            lo = cur
+            has_lo = true
+            cur = 0
+            have = false
+        } else if ch == 44 as u8 {
+            if !have {
+                return false
+            }
+            if !has_lo {
+                lo = cur
+            }
+            if lo == 0 || cur < lo {
+                return false
+            }
+            vec_push[u32](&(*s).ranges, lo)
+            vec_push[u32](&(*s).ranges, cur)
+            cur = 0
+            have = false
+            has_lo = false
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn host_end(rest: str) -> usize {
+    var k: usize = 0
+    while k < rest.n {
+        if rt.ld8(rest.p as u64, k) == 47 as u8 {
+            return k
+        }
+        k = k + 1
+    }
+    return rest.n
+}
+
+fn normalize_uri(printer: str) -> str {
+    if printer.n == 0 {
+        return ""
+    }
+    if printer.starts_with("ipp://") || printer.starts_with("ipps://") {
+        return printer
+    }
+    if printer.starts_with("http://") {
+        return "ipp://" + printer.ab(7)
+    }
+    if printer.starts_with("https://") {
+        return "ipps://" + printer.ab(8)
+    }
+    if printer.contains("://") || printer.contains("/") {
+        return ""
+    }
+    return "ipp://localhost:631/printers/" + printer
+}
+
+fn uri_to_url(uri: str) -> str {
+    var scheme: str = ""
+    var rest: str = ""
+    var default_port: bool = true
+    if uri.starts_with("ipp://") {
+        scheme = "http://"
+        rest = uri.ab(6)
+    } else if uri.starts_with("ipps://") {
+        scheme = "https://"
+        rest = uri.ab(7)
+    } else if uri.starts_with("http://") {
+        scheme = "http://"
+        rest = uri.ab(7)
+        default_port = false
+    } else if uri.starts_with("https://") {
+        scheme = "https://"
+        rest = uri.ab(8)
+        default_port = false
+    } else {
+        return ""
+    }
+    let he: usize = host_end(rest)
+    var host: str = rest.part(0, he)
+    let path: str = rest.ab(he)
+    if host.n == 0 {
+        return ""
+    }
+    var has_port: bool = false
+    var k: usize = 0
+    while k < host.n {
+        if rt.ld8(host.p as u64, k) == 58 as u8 {
+            has_port = true
+        }
+        if rt.ld8(host.p as u64, k) == 93 as u8 {
+            has_port = false
+            if k + 1 < host.n && rt.ld8(host.p as u64, k + 1) == 58 as u8 {
+                has_port = true
+            }
+            k = host.n
+        }
+        k = k + 1
+    }
+    if host.starts_with("localhost") {
+        host = "127.0.0.1" + host.ab(9)
+    }
+    if !has_port && default_port {
+        host = host + ":631"
+    }
+    if path.n == 0 {
+        return scheme + host + "/"
+    }
+    return scheme + host + path
+}
+
+fn request_head(c: *mut Client, b: *mut rt.Buf, op: u32, uri: str) {
+    (*c).request_id = (*c).request_id + 1
+    ippmsg.begin(b, (*c).version, op, (*c).request_id)
+    ippmsg.group(b, ippmsg.T_OPERATION)
+    ippmsg.put_str(b, ippmsg.V_CHARSET, "attributes-charset", "utf-8")
+    ippmsg.put_str(b, ippmsg.V_LANGUAGE, "attributes-natural-language", "en")
+    ippmsg.put_str(b, ippmsg.V_URI, "printer-uri", uri)
+}
+
+fn job_head(c: *mut Client, b: *mut rt.Buf, op: u32, uri: str, job: u32) {
+    (*c).request_id = (*c).request_id + 1
+    ippmsg.begin(b, (*c).version, op, (*c).request_id)
+    ippmsg.group(b, ippmsg.T_OPERATION)
+    ippmsg.put_str(b, ippmsg.V_CHARSET, "attributes-charset", "utf-8")
+    ippmsg.put_str(b, ippmsg.V_LANGUAGE, "attributes-natural-language", "en")
+    ippmsg.put_str(b, ippmsg.V_URI, "printer-uri", uri)
+    ippmsg.put_int(b, ippmsg.V_INTEGER, "job-id", job)
+}
+
+fn user_attr(c: *mut Client, b: *mut rt.Buf) {
+    ippmsg.put_str(b, ippmsg.V_NAME, "requesting-user-name", (*c).user)
+}
+
+fn job_template(b: *mut rt.Buf, s: *mut JobSpec) {
+    ippmsg.group(b, ippmsg.T_JOB)
+    if (*s).copies > 1 {
+        ippmsg.put_int(b, ippmsg.V_INTEGER, "copies", (*s).copies)
+    }
+    if (*s).sides.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_KEYWORD, "sides", (*s).sides)
+    }
+    if (*s).color_mode.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_KEYWORD, "print-color-mode", (*s).color_mode)
+    }
+    if (*s).media.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_KEYWORD, "media", (*s).media)
+    }
+    if (*s).quality > 0 {
+        ippmsg.put_int(b, ippmsg.V_ENUM, "print-quality", (*s).quality)
+    }
+    if (*s).orientation > 0 {
+        ippmsg.put_int(b, ippmsg.V_ENUM, "orientation-requested", (*s).orientation)
+    }
+    if (*s).scaling.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_KEYWORD, "print-scaling", (*s).scaling)
+    }
+    if (*s).res_x > 0 && (*s).res_y > 0 {
+        ippmsg.put_resolution(b, "printer-resolution", (*s).res_x, (*s).res_y, 3 as u32)
+    }
+    let n: usize = vec_len[u32](&(*s).ranges)
+    var i: usize = 0
+    while i + 1 < n {
+        if i == 0 {
+            ippmsg.put_range(b, "page-ranges", vec_at[u32](&(*s).ranges, i), vec_at[u32](&(*s).ranges, i + 1))
+        } else {
+            ippmsg.put_range(b, "", vec_at[u32](&(*s).ranges, i), vec_at[u32](&(*s).ranges, i + 1))
+        }
+        i = i + 2
+    }
+}
+
+const E_OK: u32 = 0
+const E_NO_SERVER: u32 = 1
+const E_HTTP: u32 = 2
+const E_TLS: u32 = 3
+const E_IPP: u32 = 4
+const E_BAD: u32 = 5
+const E_PROTO: u32 = 6
+
+fn err_of(rc: u32) -> IppError {
+    if rc == E_NO_SERVER { return IppError::NoServer }
+    if rc == E_HTTP { return IppError::Http }
+    if rc == E_TLS { return IppError::Tls }
+    if rc == E_IPP { return IppError::Ipp }
+    if rc == E_BAD { return IppError::BadPrinter }
+    return IppError::Protocol
+}
+
+fn call(c: *mut Client, uri: str, req: *mut rt.Buf, doc: u64, ndoc: usize, out: *mut ippmsg.Msg) -> u32 {
+    let url: str = uri_to_url(uri)
+    if url.n == 0 {
+        return E_BAD
+    }
+    if doc != 0 && ndoc > 0 {
+        rt.buf_push_bytes(req, doc, ndoc)
+    }
+    var ans: rt.Buf = rt.buf_new()
+    let post: fn(u64, str, u64, usize, *mut rt.Buf) -> u32 = (*c).tr.post
+    let st: u32 = post((*c).tr.ud, url, rt.buf_ptr(req), rt.buf_len(req), &ans)
+    (*c).http_status = st
+    var rc: u32 = E_OK
+    if st == TR_NO_SERVER { rc = E_NO_SERVER }
+    else if st == TR_BAD_URL { rc = E_BAD }
+    else if st == TR_TLS { rc = E_TLS }
+    else if st != 200 { rc = E_HTTP }
+    else if !ippmsg.msg_parse(out, rt.buf_ptr(&ans), rt.buf_len(&ans)) { rc = E_PROTO }
+    else {
+        (*c).status = ippmsg.msg_code(out)
+        if (*c).status >= 256 { rc = E_IPP }
+    }
+    rt.buf_free(&ans)
+    return rc
+}
+
+fn run(c: *mut Client, uri: str, req: *mut rt.Buf, doc: u64, ndoc: usize, out: *mut ippmsg.Msg) -> u32 {
+    ippmsg.end(req)
+    return call(c, uri, req, doc, ndoc, out)
+}
+
+fn get_printer_attributes(c: *mut Client, printer: str, caps: *mut ippcaps.Caps) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_GET_PRINTER_ATTRIBUTES, uri)
+    user_attr(c, &b)
+    ippmsg.put_str(&b, ippmsg.V_KEYWORD, "requested-attributes", "all")
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    if rc != E_OK {
+        ippmsg.msg_free(&m)
+        return err_of(rc)
+    }
+    let ok: bool = ippcaps.caps_parse(caps, &m, 0 as u32)
+    ippmsg.msg_free(&m)
+    if !ok {
+        return IppError::Protocol
+    }
+    return true
+}
+
+fn doc_attrs(c: *mut Client, b: *mut rt.Buf, format: str, name: str) {
+    user_attr(c, b)
+    if name.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_NAME, "job-name", name)
+    }
+    if format.n > 0 {
+        ippmsg.put_str(b, ippmsg.V_MIME, "document-format", format)
+    }
+}
+
+fn job_id_of(m: *mut ippmsg.Msg) -> u32 {
+    let at: usize = ippmsg.msg_find(m, ippmsg.T_JOB, 0 as u32, "job-id")
+    if at == ippmsg.NONE_INDEX {
+        return 0 as u32
+    }
+    return ippmsg.msg_int(m, at)
+}
+
+fn validate_job(c: *mut Client, printer: str, format: str, s: *mut JobSpec) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_VALIDATE_JOB, uri)
+    doc_attrs(c, &b, format, (*s).job_name)
+    job_template(&b, s)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return true
+}
+
+fn print_job(c: *mut Client, printer: str, p: u64, n: usize, format: str, s: *mut JobSpec) -> IppError!u32 {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_PRINT_JOB, uri)
+    doc_attrs(c, &b, format, (*s).job_name)
+    job_template(&b, s)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, p, n, &m)
+    rt.buf_free(&b)
+    let id: u32 = job_id_of(&m)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    if id == 0 {
+        return IppError::Protocol
+    }
+    return id
+}
+
+fn create_job(c: *mut Client, printer: str, s: *mut JobSpec) -> IppError!u32 {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_CREATE_JOB, uri)
+    doc_attrs(c, &b, "", (*s).job_name)
+    job_template(&b, s)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    let id: u32 = job_id_of(&m)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    if id == 0 {
+        return IppError::Protocol
+    }
+    return id
+}
+
+fn send_document(c: *mut Client, printer: str, job: u32, p: u64, n: usize, format: str, last: bool) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    job_head(c, &b, ippmsg.OP_SEND_DOCUMENT, uri, job)
+    user_attr(c, &b)
+    if format.n > 0 {
+        ippmsg.put_str(&b, ippmsg.V_MIME, "document-format", format)
+    }
+    ippmsg.put_bool(&b, "last-document", last)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, p, n, &m)
+    rt.buf_free(&b)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return true
+}
+
+fn job_info_new() -> JobInfo {
+    return JobInfo { id: 0, state: 0, reasons: "", name: "", user: "", impressions: 0, sheets: 0 }
+}
+
+fn take_job(m: *mut ippmsg.Msg, lo: usize, hi: usize, j: *mut JobInfo) {
+    var at: usize = ippmsg.msg_find_in(m, lo, hi, "job-id")
+    if at != ippmsg.NONE_INDEX { (*j).id = ippmsg.msg_int(m, at) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-state")
+    if at != ippmsg.NONE_INDEX { (*j).state = ippmsg.msg_int(m, at) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-state-reasons")
+    if at != ippmsg.NONE_INDEX { (*j).reasons = __str_copy(ippmsg.msg_str(m, at)) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-name")
+    if at != ippmsg.NONE_INDEX { (*j).name = __str_copy(ippmsg.msg_str(m, at)) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-originating-user-name")
+    if at != ippmsg.NONE_INDEX { (*j).user = __str_copy(ippmsg.msg_str(m, at)) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-impressions-completed")
+    if at != ippmsg.NONE_INDEX { (*j).impressions = ippmsg.msg_int(m, at) }
+    at = ippmsg.msg_find_in(m, lo, hi, "job-media-sheets-completed")
+    if at != ippmsg.NONE_INDEX { (*j).sheets = ippmsg.msg_int(m, at) }
+}
+
+fn get_job(c: *mut Client, printer: str, job: u32, j: *mut JobInfo) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    job_head(c, &b, ippmsg.OP_GET_JOB_ATTRIBUTES, uri, job)
+    user_attr(c, &b)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    var lo: usize = 0
+    var hi: usize = 0
+    var found: bool = false
+    if rc == E_OK {
+        found = ippmsg.msg_group_find(&m, ippmsg.T_JOB, 0 as u32, &lo, &hi)
+        if found {
+            take_job(&m, lo, hi, j)
+        }
+    }
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    if !found {
+        return IppError::Protocol
+    }
+    return true
+}
+
+fn list_jobs(c: *mut Client, printer: str, completed: bool, out: *mut Vec[JobInfo]) -> IppError!usize {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_GET_JOBS, uri)
+    user_attr(c, &b)
+    if completed {
+        ippmsg.put_str(&b, ippmsg.V_KEYWORD, "which-jobs", "completed")
+    } else {
+        ippmsg.put_str(&b, ippmsg.V_KEYWORD, "which-jobs", "not-completed")
+    }
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    var count: usize = 0
+    if rc == E_OK {
+        var k: u32 = 0
+        var lo: usize = 0
+        var hi: usize = 0
+        while ippmsg.msg_group_find(&m, ippmsg.T_JOB, k, &lo, &hi) {
+            var j: JobInfo = job_info_new()
+            take_job(&m, lo, hi, &j)
+            vec_push[JobInfo](out, j)
+            count = count + 1
+            k = k + 1
+        }
+    }
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return count
+}
+
+fn cancel_job(c: *mut Client, printer: str, job: u32) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    job_head(c, &b, ippmsg.OP_CANCEL_JOB, uri, job)
+    user_attr(c, &b)
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return true
+}
+
+fn identify_printer(c: *mut Client, printer: str, message: str) -> IppError!bool {
+    let uri: str = normalize_uri(printer)
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_IDENTIFY_PRINTER, uri)
+    user_attr(c, &b)
+    ippmsg.put_str(&b, ippmsg.V_KEYWORD, "identify-actions", "sound")
+    if message.n > 0 {
+        ippmsg.put_str(&b, ippmsg.V_TEXT, "message", message)
+    }
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return true
+}
+
+fn get_printers(c: *mut Client, server: str, out: *mut Vec[ippcaps.Caps]) -> IppError!usize {
+    var uri: str = server
+    if uri.n == 0 {
+        uri = "ipp://localhost:631/"
+    }
+    var b: rt.Buf = rt.buf_new()
+    request_head(c, &b, ippmsg.OP_CUPS_GET_PRINTERS, uri)
+    user_attr(c, &b)
+    ippmsg.put_str(&b, ippmsg.V_KEYWORD, "requested-attributes", "all")
+    var m: ippmsg.Msg = ippmsg.msg_new()
+    let rc: u32 = run(c, uri, &b, 0 as u64, 0, &m)
+    rt.buf_free(&b)
+    var count: usize = 0
+    if rc == E_OK {
+        var k: u32 = 0
+        var cp: ippcaps.Caps = ippcaps.caps_new()
+        while ippcaps.caps_parse(&cp, &m, k) {
+            vec_push[ippcaps.Caps](out, cp)
+            cp = ippcaps.caps_new()
+            count = count + 1
+            k = k + 1
+        }
+        ippcaps.caps_free(&cp)
+    }
+    ippmsg.msg_free(&m)
+    if rc != E_OK {
+        return err_of(rc)
+    }
+    return count
+}

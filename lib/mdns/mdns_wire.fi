@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    T_A, T_NS, T_CNAME, T_PTR, T_TXT, T_AAAA, T_SRV, T_ANY, CLASS_IN, FLAG_QR, FLAG_AA, NOPOS,
+    Hdr, Rr, Qn, Pk,
+    wname_from_text, wname_read, wname_eq, wname_suffix_at, wname_to_text,
+    wname_make_instance, wname_label_ptr, wname_label_len, wname_has_labels,
+    hdr_new, hdr_read, rr_new, rr_read, qn_new, q_read,
+    pk_new, pk_free, pk_q, pk_rr, pk_finish, pk_len, pk_ptr, pk_fits,
+    txt_push_pair, txt_ensure, txt_next, be16, be32,
+}
+
+const T_A: u32 = 1
+const T_NS: u32 = 2
+const T_CNAME: u32 = 5
+const T_PTR: u32 = 12
+const T_TXT: u32 = 16
+const T_AAAA: u32 = 28
+const T_SRV: u32 = 33
+const T_ANY: u32 = 255
+const CLASS_IN: u32 = 1
+const FLAG_QR: u32 = 32768
+const FLAG_AA: u32 = 1024
+const NOPOS: usize = 65535
+const NAME_CAP: usize = 256
+const DATA_CAP: usize = 1024
+const PK_LIMIT: usize = 1400
+
+fn low(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn be16(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+fn be32(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 24) | ((rt.ld8(p, off + 1) as u32) << 16)
+    | ((rt.ld8(p, off + 2) as u32) << 8) | (rt.ld8(p, off + 3) as u32)
+}
+
+fn push16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn push32(b: *mut rt.Buf, v: u32) {
+    push16(b, (v >> 16) & 65535 as u32)
+    push16(b, v & 65535 as u32)
+}
+
+fn put16(p: u64, off: usize, v: u32) {
+    rt.st8(p, off, ((v >> 8) & 255 as u32) as u8)
+    rt.st8(p, off + 1, (v & 255 as u32) as u8)
+}
+
+fn wname_from_text(p: u64, n: usize, out: u64, cap: usize) -> usize {
+    var m: usize = n
+    if m > 0 && rt.ld8(p, m - 1) == 46 as u8 && !(m > 1 && rt.ld8(p, m - 2) == 92 as u8) {
+        m = m - 1
+    }
+    if cap < 2 {
+        return 0
+    }
+    if m == 0 {
+        rt.st8(out, 0, 0 as u8)
+        return 1
+    }
+    var lstart: usize = 0
+    var llen: usize = 0
+    var pos: usize = 1
+    var i: usize = 0
+    while i <= m {
+        var c: u8 = 46 as u8
+        var lit: bool = false
+        if i < m {
+            c = rt.ld8(p, i)
+            if c == 92 as u8 && i + 1 < m {
+                i = i + 1
+                c = rt.ld8(p, i)
+                lit = true
+            }
+        }
+        if c == 46 as u8 && !lit {
+            if llen == 0 || llen > 63 || pos >= cap || pos > 254 {
+                return 0
+            }
+            rt.st8(out, lstart, llen as u8)
+            lstart = pos
+            pos = pos + 1
+            llen = 0
+        } else {
+            if pos + 1 >= cap || pos > 253 {
+                return 0
+            }
+            rt.st8(out, pos, c)
+            pos = pos + 1
+            llen = llen + 1
+        }
+        i = i + 1
+    }
+    rt.st8(out, lstart, 0 as u8)
+    return lstart + 1
+}
+
+fn wname_read(msg: u64, n: usize, off: usize, out: u64, next: *mut usize) -> usize {
+    var pos: usize = off
+    var o: usize = 0
+    var jumped: bool = false
+    var hops: usize = 0
+    var nxt: usize = 0
+    while true {
+        if pos >= n {
+            return 0
+        }
+        let b: usize = rt.ld8(msg, pos) as usize
+        if b == 0 {
+            if !jumped {
+                nxt = pos + 1
+            }
+            break
+        }
+        if (b & 192) == 192 {
+            if pos + 1 >= n {
+                return 0
+            }
+            let ptr: usize = ((b & 63) << 8) | (rt.ld8(msg, pos + 1) as usize)
+            if !jumped {
+                nxt = pos + 2
+                jumped = true
+            }
+            hops = hops + 1
+            if hops > 16 || ptr >= n {
+                return 0
+            }
+            pos = ptr
+        } else if (b & 192) != 0 {
+            return 0
+        } else {
+            if pos + 1 + b > n || o + b + 2 > 255 {
+                return 0
+            }
+            rt.st8(out, o, b as u8)
+            rt.mem_copy(out + (o + 1) as u64, msg + (pos + 1) as u64, b)
+            o = o + 1 + b
+            pos = pos + 1 + b
+        }
+    }
+    rt.st8(out, o, 0 as u8)
+    *next = nxt
+    return o + 1
+}
+
+fn wname_eq(a: u64, an: usize, b: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if low(rt.ld8(a, i)) != low(rt.ld8(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn wname_suffix_at(w: u64, wn: usize, s: u64, sn: usize) -> usize {
+    var pos: usize = 0
+    while pos < wn {
+        if wn - pos == sn && wname_eq(w + pos as u64, sn, s, sn) {
+            return pos
+        }
+        pos = pos + 1 + (rt.ld8(w, pos) as usize)
+    }
+    return NOPOS
+}
+
+fn wname_has_labels(w: u64) -> bool {
+    return rt.ld8(w, 0) != 0 as u8
+}
+
+fn wname_label_len(w: u64) -> usize {
+    return rt.ld8(w, 0) as usize
+}
+
+fn wname_label_ptr(w: u64) -> u64 {
+    return w + 1 as u64
+}
+
+fn wname_to_text(w: u64, wn: usize, b: *mut rt.Buf) {
+    var pos: usize = 0
+    var first: bool = true
+    while pos < wn {
+        let l: usize = rt.ld8(w, pos) as usize
+        if l == 0 {
+            break
+        }
+        if !first {
+            rt.buf_push(b, 46 as u8)
+        }
+        first = false
+        var k: usize = 0
+        while k < l {
+            let c: u8 = rt.ld8(w, pos + 1 + k)
+            if c == 46 as u8 || c == 92 as u8 {
+                rt.buf_push(b, 92 as u8)
+            }
+            rt.buf_push(b, c)
+            k = k + 1
+        }
+        pos = pos + 1 + l
+    }
+    if first {
+        rt.buf_push(b, 46 as u8)
+    }
+}
+
+fn wname_make_instance(label: u64, ln: usize, typ: u64, tn: usize, out: u64, cap: usize) -> usize {
+    if ln == 0 || ln > 63 || 1 + ln + tn > 255 || 1 + ln + tn > cap {
+        return 0
+    }
+    rt.st8(out, 0, ln as u8)
+    rt.mem_copy(out + 1 as u64, label, ln)
+    rt.mem_copy(out + (1 + ln) as u64, typ, tn)
+    return 1 + ln + tn
+}
+
+struct Hdr {
+    id: u32,
+    flags: u32,
+    qd: u32,
+    an: u32,
+    ns: u32,
+    ar: u32,
+}
+
+fn hdr_new() -> Hdr {
+    return Hdr { id: 0 as u32, flags: 0 as u32, qd: 0 as u32, an: 0 as u32, ns: 0 as u32, ar: 0 as u32 }
+}
+
+fn hdr_read(msg: u64, n: usize, h: *mut Hdr) -> bool {
+    if n < 12 {
+        return false
+    }
+    (*h).id = be16(msg, 0)
+    (*h).flags = be16(msg, 2)
+    (*h).qd = be16(msg, 4)
+    (*h).an = be16(msg, 6)
+    (*h).ns = be16(msg, 8)
+    (*h).ar = be16(msg, 10)
+    return true
+}
+
+struct Rr {
+    name: [u8; 256],
+    nlen: usize,
+    typ: u32,
+    class: u32,
+    flush: bool,
+    ttl: u32,
+    data: [u8; 1024],
+    dlen: usize,
+    ok: bool,
+}
+
+fn rr_new() -> Rr {
+    return Rr { name: [0; 256], nlen: 0, typ: 0 as u32, class: 0 as u32, flush: false,
+        ttl: 0 as u32, data: [0; 1024], dlen: 0, ok: false }
+}
+
+fn rr_read(msg: u64, n: usize, off: usize, rr: *mut Rr) -> usize {
+    var nx: usize = 0
+    let ln: usize = wname_read(msg, n, off, (&(*rr).name[0]) as u64, &nx)
+    if ln == 0 || nx + 10 > n {
+        return 0
+    }
+    (*rr).nlen = ln
+    (*rr).typ = be16(msg, nx)
+    let cls: u32 = be16(msg, nx + 2)
+    (*rr).class = cls & 32767 as u32
+    (*rr).flush = (cls & 32768 as u32) != 0 as u32
+    (*rr).ttl = be32(msg, nx + 4)
+    let rdlen: usize = be16(msg, nx + 8) as usize
+    let rdoff: usize = nx + 10
+    if rdoff + rdlen > n {
+        return 0
+    }
+    (*rr).ok = false
+    (*rr).dlen = 0
+    let t: u32 = (*rr).typ
+    let dp: u64 = (&(*rr).data[0]) as u64
+    if t == T_PTR || t == T_CNAME || t == T_NS {
+        var d: usize = 0
+        let k: usize = wname_read(msg, rdoff + rdlen, rdoff, dp, &d)
+        if k != 0 {
+            (*rr).dlen = k
+            (*rr).ok = true
+        }
+    } else if t == T_SRV {
+        if rdlen >= 7 {
+            rt.mem_copy(dp, msg + rdoff as u64, 6)
+            var d: usize = 0
+            let k: usize = wname_read(msg, rdoff + rdlen, rdoff + 6, dp + 6 as u64, &d)
+            if k != 0 {
+                (*rr).dlen = 6 + k
+                (*rr).ok = true
+            }
+        }
+    } else if rdlen <= DATA_CAP {
+        rt.mem_copy(dp, msg + rdoff as u64, rdlen)
+        (*rr).dlen = rdlen
+        (*rr).ok = true
+    }
+    return rdoff + rdlen
+}
+
+struct Qn {
+    name: [u8; 256],
+    nlen: usize,
+    typ: u32,
+    class: u32,
+    unicast: bool,
+}
+
+fn qn_new() -> Qn {
+    return Qn { name: [0; 256], nlen: 0, typ: 0 as u32, class: 0 as u32, unicast: false }
+}
+
+fn q_read(msg: u64, n: usize, off: usize, q: *mut Qn) -> usize {
+    var nx: usize = 0
+    let ln: usize = wname_read(msg, n, off, (&(*q).name[0]) as u64, &nx)
+    if ln == 0 || nx + 4 > n {
+        return 0
+    }
+    (*q).nlen = ln
+    (*q).typ = be16(msg, nx)
+    let cls: u32 = be16(msg, nx + 2)
+    (*q).class = cls & 32767 as u32
+    (*q).unicast = (cls & 32768 as u32) != 0 as u32
+    return nx + 4
+}
+
+struct Pk {
+    b: rt.Buf,
+    qd: u32,
+    an: u32,
+    ns: u32,
+    ar: u32,
+    full: bool,
+}
+
+fn pk_new(id: u32, flags: u32) -> Pk {
+    var p: Pk = Pk { b: rt.buf_new(), qd: 0 as u32, an: 0 as u32, ns: 0 as u32, ar: 0 as u32, full: false }
+    push16(&p.b, id)
+    push16(&p.b, flags)
+    push32(&p.b, 0 as u32)
+    push32(&p.b, 0 as u32)
+    return p
+}
+
+fn pk_free(p: *mut Pk) {
+    rt.buf_free(&(*p).b)
+}
+
+fn pk_len(p: *mut Pk) -> usize {
+    return (*p).b.len
+}
+
+fn pk_ptr(p: *mut Pk) -> u64 {
+    return (*p).b.ptr
+}
+
+fn pk_fits(p: *mut Pk, extra: usize) -> bool {
+    return (*p).b.len + extra <= PK_LIMIT
+}
+
+fn pk_q(p: *mut Pk, name: u64, nlen: usize, typ: u32, unicast: bool) -> bool {
+    if !pk_fits(p, nlen + 4) {
+        (*p).full = true
+        return false
+    }
+    rt.buf_push_bytes(&(*p).b, name, nlen)
+    push16(&(*p).b, typ)
+    var cls: u32 = CLASS_IN
+    if unicast {
+        cls = cls | 32768 as u32
+    }
+    push16(&(*p).b, cls)
+    (*p).qd = (*p).qd + 1 as u32
+    return true
+}
+
+fn pk_rr(p: *mut Pk, section: u32, name: u64, nlen: usize, typ: u32, flush: bool,
+    ttl: u32, data: u64, dlen: usize) -> bool {
+    if !pk_fits(p, nlen + 10 + dlen) {
+        (*p).full = true
+        return false
+    }
+    rt.buf_push_bytes(&(*p).b, name, nlen)
+    push16(&(*p).b, typ)
+    var cls: u32 = CLASS_IN
+    if flush {
+        cls = cls | 32768 as u32
+    }
+    push16(&(*p).b, cls)
+    push32(&(*p).b, ttl)
+    push16(&(*p).b, dlen as u32)
+    rt.buf_push_bytes(&(*p).b, data, dlen)
+    if section == 1 as u32 {
+        (*p).an = (*p).an + 1 as u32
+    } else if section == 2 as u32 {
+        (*p).ns = (*p).ns + 1 as u32
+    } else {
+        (*p).ar = (*p).ar + 1 as u32
+    }
+    return true
+}
+
+fn pk_finish(p: *mut Pk) {
+    let b: u64 = (*p).b.ptr
+    put16(b, 4, (*p).qd)
+    put16(b, 6, (*p).an)
+    put16(b, 8, (*p).ns)
+    put16(b, 10, (*p).ar)
+}
+
+fn txt_push_pair(b: *mut rt.Buf, key: u64, kn: usize, val: u64, vn: usize, has_val: bool) -> bool {
+    var total: usize = kn
+    if has_val {
+        total = kn + 1 + vn
+    }
+    if kn == 0 || total > 255 {
+        return false
+    }
+    rt.buf_push(b, total as u8)
+    rt.buf_push_bytes(b, key, kn)
+    if has_val {
+        rt.buf_push(b, 61 as u8)
+        rt.buf_push_bytes(b, val, vn)
+    }
+    return true
+}
+
+fn txt_ensure(b: *mut rt.Buf) {
+    if (*b).len == 0 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+fn txt_next(t: u64, tn: usize, pos: *mut usize, start: *mut usize, len: *mut usize) -> bool {
+    var p: usize = *pos
+    if p >= tn {
+        return false
+    }
+    let l: usize = rt.ld8(t, p) as usize
+    if p + 1 + l > tn {
+        return false
+    }
+    *start = p + 1
+    *len = l
+    *pos = p + 1 + l
+    return true
+}

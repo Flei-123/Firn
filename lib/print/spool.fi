@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.str
+import print.ippmsg
+import print.ippclient
+
+export {
+    Spool, SpoolJob, spool_new, spool_free, spool_submit, spool_cancel, spool_step, spool_state,
+    spool_find, spool_job, spool_count, spool_active, spool_remove_finished, spool_save, spool_load,
+    S_QUEUED, S_PRINTING, S_DONE, S_FAILED, S_CANCELED,
+}
+
+const S_QUEUED: u32 = 0
+const S_PRINTING: u32 = 1
+const S_DONE: u32 = 2
+const S_FAILED: u32 = 3
+const S_CANCELED: u32 = 4
+
+struct SpoolJob {
+    id: u32,
+    printer: str,
+    name: str,
+    format: str,
+    data: rt.Buf,
+    spec: ippclient.JobSpec,
+    state: u32,
+    remote: u32,
+    tries: u32,
+    next_ms: u64,
+    ipp_status: u32,
+}
+
+struct Spool {
+    jobs: Vec[SpoolJob],
+    next_id: u32,
+    max_tries: u32,
+    retry_ms: u64,
+    poll_ms: u64,
+}
+
+fn spool_new() -> Spool {
+    return Spool { jobs: vec_new[SpoolJob](), next_id: 1, max_tries: 5, retry_ms: 2000, poll_ms: 1000 }
+}
+
+fn spool_free(s: *mut Spool) {
+    var i: usize = 0
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    while i < n {
+        let j: *mut SpoolJob = vec_elem_ptr[SpoolJob](&(*s).jobs, i)
+        rt.buf_free(&(*j).data)
+        vec_free[u32](&(*j).spec.ranges)
+        i = i + 1
+    }
+    vec_free[SpoolJob](&(*s).jobs)
+}
+
+fn spool_count(s: *mut Spool) -> usize { return vec_len[SpoolJob](&(*s).jobs) }
+fn spool_job(s: *mut Spool, i: usize) -> *mut SpoolJob { return vec_elem_ptr[SpoolJob](&(*s).jobs, i) }
+
+fn spool_find(s: *mut Spool, id: u32) -> usize {
+    var i: usize = 0
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    while i < n {
+        if (*spool_job(s, i)).id == id {
+            return i
+        }
+        i = i + 1
+    }
+    return ippmsg.NONE_INDEX
+}
+
+fn spool_state(s: *mut Spool, id: u32) -> u32 {
+    let i: usize = spool_find(s, id)
+    if i == ippmsg.NONE_INDEX {
+        return S_FAILED
+    }
+    return (*spool_job(s, i)).state
+}
+
+fn spool_submit(s: *mut Spool, printer: str, name: str, format: str, p: u64, n: usize, spec: ippclient.JobSpec) -> u32 {
+    var d: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&d, p, n)
+    let id: u32 = (*s).next_id
+    (*s).next_id = id + 1
+    vec_push[SpoolJob](&(*s).jobs, SpoolJob { id: id, printer: __str_copy(printer), name: __str_copy(name), format: __str_copy(format),
+        data: d, spec: spec, state: S_QUEUED, remote: 0, tries: 0, next_ms: 0, ipp_status: 0 })
+    return id
+}
+
+fn spool_active(s: *mut Spool) -> usize {
+    var c: usize = 0
+    var i: usize = 0
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    while i < n {
+        let st: u32 = (*spool_job(s, i)).state
+        if st == S_QUEUED || st == S_PRINTING {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn is_transient(e: IppError, status: u32) -> bool {
+    if e == IppError::NoServer || e == IppError::Http || e == IppError::Tls {
+        return true
+    }
+    if e == IppError::Ipp {
+        return status >= 1280
+    }
+    return false
+}
+
+fn retry_or_fail(s: *mut Spool, j: *mut SpoolJob, e: IppError, status: u32, now: u64) {
+    (*j).tries = (*j).tries + 1
+    (*j).ipp_status = status
+    if is_transient(e, status) && (*j).tries < (*s).max_tries {
+        (*j).next_ms = now + (*s).retry_ms * (*j).tries as u64
+    } else {
+        (*j).state = S_FAILED
+    }
+}
+
+fn spool_step(s: *mut Spool, c: *mut ippclient.Client, now: u64) -> usize {
+    var acted: usize = 0
+    var i: usize = 0
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    while i < n {
+        let j: *mut SpoolJob = spool_job(s, i)
+        if (*j).next_ms <= now {
+            if (*j).state == S_QUEUED {
+                acted = acted + 1
+                var kind: IppError = IppError::Protocol
+                let id: u32 = ippclient.print_job(c, (*j).printer, rt.buf_ptr(&(*j).data), rt.buf_len(&(*j).data), (*j).format, &(*j).spec) catch | e | (note_err(e, &kind))
+                if id != 0 {
+                    (*j).remote = id
+                    (*j).state = S_PRINTING
+                    (*j).next_ms = now + (*s).poll_ms
+                    rt.buf_clear(&(*j).data)
+                } else {
+                    retry_or_fail(s, j, kind, ippclient.client_status(c), now)
+                }
+            } else if (*j).state == S_PRINTING {
+                acted = acted + 1
+                var info: ippclient.JobInfo = ippclient.job_info_new()
+                var kind: IppError = IppError::Protocol
+                let ok: bool = ippclient.get_job(c, (*j).printer, (*j).remote, &info) catch | e | (note_err_b(e, &kind))
+                if ok {
+                    if info.state == ippclient.JOB_COMPLETED {
+                        (*j).state = S_DONE
+                    } else if info.state == ippclient.JOB_CANCELED {
+                        (*j).state = S_CANCELED
+                    } else if info.state == ippclient.JOB_ABORTED {
+                        (*j).state = S_FAILED
+                    } else {
+                        (*j).next_ms = now + (*s).poll_ms
+                    }
+                } else {
+                    retry_or_fail(s, j, kind, ippclient.client_status(c), now)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return acted
+}
+
+fn note_err(e: IppError, out: *mut IppError) -> u32 {
+    *out = e
+    return 0 as u32
+}
+
+fn note_err_b(e: IppError, out: *mut IppError) -> bool {
+    *out = e
+    return false
+}
+
+fn spool_cancel(s: *mut Spool, c: *mut ippclient.Client, id: u32) -> bool {
+    let i: usize = spool_find(s, id)
+    if i == ippmsg.NONE_INDEX {
+        return false
+    }
+    let j: *mut SpoolJob = spool_job(s, i)
+    if (*j).state == S_QUEUED {
+        (*j).state = S_CANCELED
+        rt.buf_clear(&(*j).data)
+        return true
+    }
+    if (*j).state == S_PRINTING {
+        let ok: bool = ippclient.cancel_job(c, (*j).printer, (*j).remote) catch | e | (false)
+        if ok {
+            (*j).state = S_CANCELED
+        }
+        return ok
+    }
+    return false
+}
+
+fn spool_remove_finished(s: *mut Spool) -> usize {
+    var removed: usize = 0
+    var i: usize = 0
+    while i < vec_len[SpoolJob](&(*s).jobs) {
+        let j: *mut SpoolJob = spool_job(s, i)
+        if (*j).state == S_DONE || (*j).state == S_FAILED || (*j).state == S_CANCELED {
+            rt.buf_free(&(*j).data)
+            vec_free[u32](&(*j).spec.ranges)
+            vec_remove_fast_job(s, i)
+            removed = removed + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return removed
+}
+
+fn vec_remove_fast_job(s: *mut Spool, i: usize) {
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    var k: usize = i
+    while k + 1 < n {
+        *spool_job(s, k) = *spool_job(s, k + 1)
+        k = k + 1
+    }
+    vec_shorten[SpoolJob](&(*s).jobs, n - 1)
+}
+
+fn put_text(b: *mut rt.Buf, s: str) {
+    ippmsg.put32(b, s.n as u32)
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn spool_save(s: *mut Spool, out: *mut rt.Buf) {
+    let magic: str = "FPSP1"
+    rt.buf_push_bytes(out, magic.p as u64, magic.n)
+    ippmsg.put32(out, (*s).next_id)
+    var live: u32 = 0
+    var i: usize = 0
+    let n: usize = vec_len[SpoolJob](&(*s).jobs)
+    while i < n {
+        if (*spool_job(s, i)).state == S_QUEUED {
+            live = live + 1
+        }
+        i = i + 1
+    }
+    ippmsg.put32(out, live)
+    i = 0
+    while i < n {
+        let j: *mut SpoolJob = spool_job(s, i)
+        if (*j).state == S_QUEUED {
+            ippmsg.put32(out, (*j).id)
+            put_text(out, (*j).printer)
+            put_text(out, (*j).name)
+            put_text(out, (*j).format)
+            put_text(out, (*j).spec.sides)
+            put_text(out, (*j).spec.color_mode)
+            put_text(out, (*j).spec.media)
+            put_text(out, (*j).spec.scaling)
+            put_text(out, (*j).spec.job_name)
+            ippmsg.put32(out, (*j).spec.copies)
+            ippmsg.put32(out, (*j).spec.quality)
+            ippmsg.put32(out, (*j).spec.orientation)
+            ippmsg.put32(out, (*j).spec.res_x)
+            ippmsg.put32(out, (*j).spec.res_y)
+            ippmsg.put32(out, (*j).tries)
+            ippmsg.put32(out, rt.buf_len(&(*j).data) as u32)
+            rt.buf_push_bytes(out, rt.buf_ptr(&(*j).data), rt.buf_len(&(*j).data))
+        }
+        i = i + 1
+    }
+}
+
+struct Cur {
+    p: u64,
+    n: usize,
+    i: usize,
+    bad: bool,
+}
+
+fn cur_u32(c: *mut Cur) -> u32 {
+    if (*c).i + 4 > (*c).n {
+        (*c).bad = true
+        return 0 as u32
+    }
+    let v: u32 = (rt.ld8((*c).p, (*c).i) as u32 << 24) | (rt.ld8((*c).p, (*c).i + 1) as u32 << 16) | (rt.ld8((*c).p, (*c).i + 2) as u32 << 8) | rt.ld8((*c).p, (*c).i + 3) as u32
+    (*c).i = (*c).i + 4
+    return v
+}
+
+fn cur_text(c: *mut Cur) -> str {
+    let l: usize = cur_u32(c) as usize
+    if (*c).bad || (*c).i + l > (*c).n {
+        (*c).bad = true
+        return ""
+    }
+    let t: str = __str_copy(str { p: rt.ptr_of((*c).p + (*c).i as u64), n: l })
+    (*c).i = (*c).i + l
+    return t
+}
+
+fn spool_load(s: *mut Spool, p: u64, n: usize) -> bool {
+    if n < 13 || !rt.mem_eq(p, "FPSP1".p as u64, 5) {
+        return false
+    }
+    var c: Cur = Cur { p: p, n: n, i: 5, bad: false }
+    let next: u32 = cur_u32(&c)
+    let count: u32 = cur_u32(&c)
+    var k: u32 = 0
+    while k < count && !c.bad {
+        var spec: ippclient.JobSpec = ippclient.spec_default()
+        let id: u32 = cur_u32(&c)
+        let printer: str = cur_text(&c)
+        let name: str = cur_text(&c)
+        let format: str = cur_text(&c)
+        spec.sides = cur_text(&c)
+        spec.color_mode = cur_text(&c)
+        spec.media = cur_text(&c)
+        spec.scaling = cur_text(&c)
+        spec.job_name = cur_text(&c)
+        spec.copies = cur_u32(&c)
+        spec.quality = cur_u32(&c)
+        spec.orientation = cur_u32(&c)
+        spec.res_x = cur_u32(&c)
+        spec.res_y = cur_u32(&c)
+        let tries: u32 = cur_u32(&c)
+        let dl: usize = cur_u32(&c) as usize
+        if c.bad || c.i + dl > n {
+            return false
+        }
+        var d: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&d, p + c.i as u64, dl)
+        c.i = c.i + dl
+        vec_push[SpoolJob](&(*s).jobs, SpoolJob { id: id, printer: printer, name: name, format: format, data: d, spec: spec,
+            state: S_QUEUED, remote: 0, tries: tries, next_ms: 0, ipp_status: 0 })
+        k = k + 1
+    }
+    if c.bad {
+        return false
+    }
+    if next > (*s).next_id {
+        (*s).next_id = next
+    }
+    return true
+}

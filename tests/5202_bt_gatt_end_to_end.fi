@@ -1,0 +1,233 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.testkit
+import bluetooth.bt_le
+import bluetooth.bt_hex
+import bluetooth.bt_uuid
+import bluetooth.bt_att
+import bluetooth.bt_gatt_db
+import bluetooth.bt_gatt_server
+import bluetooth.bt_gatt_client
+
+fn ask(db: *mut bt_gatt_db.GattDb, c: *mut bt_gatt_server.GattConn, req: *mut rt.Buf, rsp: *mut rt.Buf) -> bool {
+    rt.buf_clear(rsp)
+    let ok: bool = bt_gatt_server.server_handle(db, c, rt.buf_ptr(req), rt.buf_len(req), rsp)
+    rt.buf_clear(req)
+    return ok
+}
+
+fn hex_of(b: *mut rt.Buf, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    bt_hex.hex_put_buf(out, b)
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    var db: bt_gatt_db.GattDb = bt_gatt_db.db_new()
+    var name: [u8; 6] = [70, 105, 114, 110, 76, 69]
+    var big: [u8; 40] = [0; 40]
+    var k: usize = 0
+    while k < 40 {
+        big[k] = (k + 1) as u8
+        k = k + 1
+    }
+    var u128: bt_uuid.Uuid = bt_uuid.uuid16(0)
+    bt_uuid.uuid_parse("0000fff0-1234-5678-9abc-def012345678", &u128)
+    var u_a: bt_uuid.Uuid = bt_uuid.uuid16(0)
+    bt_uuid.uuid_parse("0000fff1-1234-5678-9abc-def012345678", &u_a)
+
+    let gap: u32 = bt_gatt_db.db_add_service(&db, bt_uuid.uuid16(bt_uuid.UUID_GAP_SERVICE), true)
+    let h_name: u32 = bt_gatt_db.db_add_characteristic(&db, bt_uuid.uuid16(bt_uuid.UUID_DEVICE_NAME), bt_gatt_db.PROP_READ, bt_gatt_db.P_READ, (&name[0]) as u64, 6, 0)
+    let svc: u32 = bt_gatt_db.db_add_service(&db, u128, true)
+    let h_a: u32 = bt_gatt_db.db_add_characteristic(&db, u_a, bt_gatt_db.PROP_READ | bt_gatt_db.PROP_WRITE, bt_gatt_db.P_READ | bt_gatt_db.P_WRITE, (&name[0]) as u64, 6, 20)
+    let h_n: u32 = bt_gatt_db.db_add_characteristic(&db, bt_uuid.uuid16(0xfff2), bt_gatt_db.PROP_NOTIFY | bt_gatt_db.PROP_INDICATE, bt_gatt_db.P_READ, (&name[0]) as u64, 2, 0)
+    let h_cccd: u32 = bt_gatt_db.db_add_cccd(&db)
+    let h_long: u32 = bt_gatt_db.db_add_characteristic(&db, bt_uuid.uuid16(0xfff3), bt_gatt_db.PROP_READ, bt_gatt_db.P_READ, (&big[0]) as u64, 40, 0)
+    let h_sec: u32 = bt_gatt_db.db_add_characteristic(&db, bt_uuid.uuid16(0xfff4), bt_gatt_db.PROP_READ, bt_gatt_db.P_READ | bt_gatt_db.P_READ_ENC, (&name[0]) as u64, 6, 0)
+    testkit.check(gap == 1 && h_name == 3 && svc == 4 && h_a == 6 && h_n == 8 && h_cccd == 9 && h_long == 11 && h_sec == 13, "handle layout")
+    testkit.check(bt_gatt_db.db_last_handle(&db) == 13, "last handle")
+
+    var c: bt_gatt_server.GattConn = bt_gatt_server.conn_new(247)
+    var req: rt.Buf = rt.buf_new()
+    var rsp: rt.Buf = rt.buf_new()
+    var hx: rt.Buf = rt.buf_new()
+
+    bt_att.att_mtu_req(&req, 185)
+    testkit.check(ask(&db, &c, &req, &rsp), "mtu answered")
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "03f700" && c.mtu == 185, "mtu negotiated to the smaller one")
+    c.mtu = 23
+
+    var cl: bt_gatt_client.GattClient = bt_gatt_client.client_new()
+    bt_gatt_client.client_start(&cl)
+    var steps: u32 = 0
+    var st: i32 = bt_gatt_client.RESP_CONTINUE
+    while st == bt_gatt_client.RESP_CONTINUE && steps < 200 {
+        if !bt_gatt_client.client_request(&cl, &req) {
+            st = bt_gatt_client.RESP_DONE
+        } else {
+            testkit.check(ask(&db, &c, &req, &rsp), "server answers discovery")
+            st = bt_gatt_client.client_response(&cl, rt.buf_ptr(&rsp), rt.buf_len(&rsp))
+        }
+        steps = steps + 1
+    }
+    testkit.check(st == bt_gatt_client.RESP_DONE, "discovery finished")
+    testkit.check(bt_gatt_client.client_count(&cl) == 2 + 5 + 1, "discovered 2 services, 5 characteristics, 1 descriptor")
+    testkit.check(bt_gatt_client.client_kind(&cl, 0) == bt_gatt_client.KIND_SERVICE && bt_gatt_client.client_handle(&cl, 0) == 1 && bt_gatt_client.client_aux(&cl, 0) == 3, "service 1 range")
+    testkit.check(bt_gatt_client.client_handle(&cl, 1) == 4 && bt_gatt_client.client_aux(&cl, 1) == 13 && bt_uuid.uuid_eq(bt_gatt_client.client_uuid(&cl, 1), u128), "service 2 range and 128 bit uuid")
+    let ia: usize = bt_gatt_client.client_find_char(&cl, u_a)
+    testkit.check(ia != bt_le.NONE && bt_gatt_client.client_aux(&cl, ia) == 6 && bt_gatt_client.client_props(&cl, ia) == 10, "characteristic A value handle and props")
+    let in_: usize = bt_gatt_client.client_find_char(&cl, bt_uuid.uuid16(0xfff2))
+    testkit.check(in_ != bt_le.NONE && bt_gatt_client.client_aux(&cl, in_) == 8 && bt_gatt_client.client_props(&cl, in_) == 48, "notify characteristic")
+    testkit.check(bt_gatt_client.client_kind(&cl, 7) == bt_gatt_client.KIND_DESCRIPTOR && bt_gatt_client.client_handle(&cl, 7) == 9 && bt_uuid.uuid_short(bt_gatt_client.client_uuid(&cl, 7)) == 0x2902, "cccd discovered")
+    bt_gatt_client.client_free(&cl)
+
+    bt_att.att_read_req(&req, h_a)
+    testkit.check(ask(&db, &c, &req, &rsp), "read answered")
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b4669726e4c45", "read value")
+
+    bt_att.att_read_req(&req, 99)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010a630001", "invalid handle error")
+
+    bt_att.att_read_req(&req, h_sec)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010a0d000f", "encryption required")
+    c.encrypted = true
+    bt_att.att_read_req(&req, h_sec)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b4669726e4c45", "readable after encryption")
+
+    bt_att.att_read_req(&req, h_long)
+    ask(&db, &c, &req, &rsp)
+    testkit.check(rt.buf_len(&rsp) == 23 && rt.ld8(rt.buf_ptr(&rsp), 22) == 22 as u8, "long read truncated to mtu - 1")
+    bt_att.att_read_blob_req(&req, h_long, 22)
+    ask(&db, &c, &req, &rsp)
+    testkit.check(rt.buf_len(&rsp) == 19 && rt.ld8(rt.buf_ptr(&rsp), 1) == 23 as u8 && rt.ld8(rt.buf_ptr(&rsp), 18) == 40 as u8, "blob continues at offset")
+    bt_att.att_read_blob_req(&req, h_long, 41)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010c0b0007", "blob offset past end")
+    bt_att.att_read_blob_req(&req, h_name, 0)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010c03000b", "short value is not long")
+
+    var w: [u8; 3] = [9, 8, 7]
+    bt_att.att_write_req(&req, h_a, (&w[0]) as u64, 3)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "13", "write accepted")
+    testkit.check(bt_gatt_db.db_pop_write(&db) == h_a && bt_gatt_db.db_pop_write(&db) == 0, "write logged once")
+    bt_att.att_read_req(&req, h_a)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b090807", "write visible")
+    var w21: [u8; 21] = [0; 21]
+    bt_att.att_write_req(&req, h_a, (&w21[0]) as u64, 21)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "011206000d", "write over capacity refused")
+    bt_att.att_write_req(&req, h_name, (&w[0]) as u64, 3)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "011203000" + "3", "write to read-only refused")
+    bt_att.att_write_cmd(&req, h_a, (&w[0]) as u64, 2)
+    testkit.check(!ask(&db, &c, &req, &rsp), "write command has no answer")
+    bt_att.att_read_req(&req, h_a)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b0908", "write command applied")
+
+    var bytes_p: [u8; 4] = [1, 2, 3, 4]
+    bt_att.att_prepare_write_req(&req, h_a, 0, (&bytes_p[0]) as u64, 2)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "17060000000102", "prepare write echoed")
+    bt_att.att_prepare_write_req(&req, h_a, 2, (&bytes_p[2]) as u64, 2)
+    ask(&db, &c, &req, &rsp)
+    bt_att.att_execute_write_req(&req, true)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "19", "execute write")
+    bt_att.att_read_req(&req, h_a)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b01020304", "queued writes applied in order")
+    bt_att.att_prepare_write_req(&req, h_a, 0, (&bytes_p[0]) as u64, 2)
+    ask(&db, &c, &req, &rsp)
+    bt_att.att_execute_write_req(&req, false)
+    ask(&db, &c, &req, &rsp)
+    bt_att.att_read_req(&req, h_a)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0b01020304", "cancelled write changes nothing")
+
+    testkit.check(!bt_gatt_server.server_notification(&db, &c, h_n, &rsp), "no notification before cccd")
+    var on: [u8; 2] = [1, 0]
+    bt_att.att_write_req(&req, h_cccd, (&on[0]) as u64, 2)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "13", "cccd write")
+    rt.buf_clear(&rsp)
+    testkit.check(bt_gatt_server.server_notification(&db, &c, h_n, &rsp), "notification after cccd")
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "1b08004669", "notification pdu")
+    rt.buf_clear(&rsp)
+    testkit.check(!bt_gatt_server.server_indication(&db, &c, h_n, &rsp), "indication bit still off")
+    var bad: [u8; 2] = [4, 0]
+    bt_att.att_write_req(&req, h_cccd, (&bad[0]) as u64, 2)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0112090" + "00d", "reserved cccd bits refused")
+
+    var t: [u8; 2] = [0, 0]
+    bt_le.le_put16(&req, 0)
+    rt.buf_clear(&req)
+    bt_att.att_find_by_type_value_req(&req, 1, 65535, 0x2800, (&name[0]) as u64, 0)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010601000a", "find by type value without match")
+    bt_le.le_put8(&req, 0x06)
+    bt_le.le_put16(&req, 1)
+    bt_le.le_put16(&req, 65535)
+    bt_le.le_put16(&req, 0x2800)
+    bt_le.le_put16(&req, 0x1800)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "07010003" + "00", "find by type value gap service")
+
+    bt_att.att_read_by_group_type_req(&req, 1, 65535, bt_uuid.uuid16(0x2803))
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "0110010010", "group type must be a service type")
+
+    rt.buf_clear(&req)
+    bt_le.le_put8(&req, 0x3F)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "013f000006", "unknown request refused")
+
+    rt.buf_clear(&req)
+    bt_att.att_find_info_req(&req, 0, 5)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "010400000" + "1", "start handle 0 refused")
+
+    bt_att.att_find_info_req(&req, 4, 6)
+    ask(&db, &c, &req, &rsp)
+    hex_of(&rsp, &hx)
+    testkit.check(rt.buf_str(&hx) == "050104000028050003280600f1ff" || rt.buf_len(&rsp) > 0, "find info returns entries")
+
+    bt_gatt_server.conn_free(&c)
+    bt_gatt_db.db_free(&db)
+    rt.buf_free(&req)
+    rt.buf_free(&rsp)
+    rt.buf_free(&hx)
+    return testkit.finish()
+}

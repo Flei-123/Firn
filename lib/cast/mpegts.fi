@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.pktlist
+
+export {
+    TsMux, TsDemux, Mp2tPack,
+    tsmux_new, tsmux_psi, tsmux_video, tsmux_reset,
+    tsdemux_new, tsdemux_free, tsdemux_push, tsdemux_take, tsdemux_flush, tsdemux_video_pid, tsdemux_errors,
+    mp2tpack_new, mp2tpack_push,
+    mpeg_crc32, TS_PMT_PID, TS_VIDEO_PID, TS_PACKET, TS_PER_RTP,
+}
+
+const TS_PACKET: usize = 188
+const TS_PER_RTP: usize = 7
+const TS_PMT_PID: u32 = 256
+const TS_VIDEO_PID: u32 = 4113
+const STREAM_H264: u32 = 27
+
+struct TsMux {
+    cc_pat: u32,
+    cc_pmt: u32,
+    cc_video: u32,
+    pmt_pid: u32,
+    video_pid: u32,
+}
+
+struct Mp2tPack {
+    ssrc: u32,
+    seq: u32,
+    pending: rt.Buf,
+}
+
+struct TsDemux {
+    carry: rt.Buf,
+    pes: rt.Buf,
+    have_pes: bool,
+    pmt_pid: u32,
+    video_pid: u32,
+    out: rt.Buf,
+    out_pts: u64,
+    out_ready: bool,
+    errors: u32,
+    last_cc: u32,
+    have_cc: bool,
+}
+
+fn mpeg_crc32(p: u64, n: usize) -> u32 {
+    var crc: u32 = 4294967295 as u32
+    var i: usize = 0
+    while i < n {
+        crc = crc ^ ((rt.ld8(p, i) as u32) << 24)
+        var k: u32 = 0 as u32
+        while k < 8 as u32 {
+            if (crc & 2147483648 as u32) != 0 as u32 {
+                crc = (crc << 1) ^ 79764919 as u32
+            } else {
+                crc = crc << 1
+            }
+            k = k + 1 as u32
+        }
+        i = i + 1
+    }
+    return crc
+}
+
+fn tsmux_new() -> TsMux {
+    return TsMux { cc_pat: 0 as u32, cc_pmt: 0 as u32, cc_video: 0 as u32, pmt_pid: TS_PMT_PID, video_pid: TS_VIDEO_PID }
+}
+
+fn tsmux_reset(m: *mut TsMux) {
+    (*m).cc_pat = 0 as u32
+    (*m).cc_pmt = 0 as u32
+    (*m).cc_video = 0 as u32
+}
+
+fn put_ts(out: *mut rt.Buf, pid: u32, pusi: bool, cc: u32, pcr: bool, pcr_base: u64, ra: bool, p: u64, n: usize) {
+    let start: usize = (*out).len
+    rt.buf_push(out, 71 as u8)
+    var b1: u32 = (pid >> 8) & 31 as u32
+    if pusi { b1 = b1 | 64 as u32 }
+    rt.buf_push(out, b1 as u8)
+    rt.buf_push(out, (pid & 255 as u32) as u8)
+    let total_af: usize = 184 - n
+    var b3: u32 = cc & 15 as u32
+    if total_af > 0 { b3 = b3 | 48 as u32 } else { b3 = b3 | 16 as u32 }
+    rt.buf_push(out, b3 as u8)
+    if total_af > 0 {
+        rt.buf_push(out, (total_af - 1) as u8)
+        if total_af > 1 {
+            var flags: u32 = 0 as u32
+            if ra { flags = flags | 64 as u32 }
+            if pcr { flags = flags | 16 as u32 }
+            rt.buf_push(out, flags as u8)
+            var used: usize = 2
+            if pcr {
+                rt.buf_push(out, ((pcr_base >> 25) & 255) as u8)
+                rt.buf_push(out, ((pcr_base >> 17) & 255) as u8)
+                rt.buf_push(out, ((pcr_base >> 9) & 255) as u8)
+                rt.buf_push(out, ((pcr_base >> 1) & 255) as u8)
+                rt.buf_push(out, ((((pcr_base & 1) << 7) | 126) & 255) as u8)
+                rt.buf_push(out, 0 as u8)
+                used = 8
+            }
+            while used < total_af {
+                rt.buf_push(out, 255 as u8)
+                used = used + 1
+            }
+        }
+    }
+    if n > 0 { rt.buf_push_bytes(out, p, n) }
+    if (*out).len - start != TS_PACKET { (*out).len = start }
+}
+
+fn psi_packet(out: *mut rt.Buf, pid: u32, cc: u32, section: *mut rt.Buf) {
+    var pay: rt.Buf = rt.buf_new()
+    rt.buf_push(&pay, 0 as u8)
+    rt.buf_push_bytes(&pay, (*section).ptr, (*section).len)
+    while pay.len < 184 { rt.buf_push(&pay, 255 as u8) }
+    put_ts(out, pid, true, cc, false, 0 as u64, false, pay.ptr, 184)
+    rt.buf_free(&pay)
+}
+
+fn section_finish(s: *mut rt.Buf) {
+    let crc: u32 = mpeg_crc32((*s).ptr, (*s).len)
+    rt.buf_push(s, ((crc >> 24) & 255 as u32) as u8)
+    rt.buf_push(s, ((crc >> 16) & 255 as u32) as u8)
+    rt.buf_push(s, ((crc >> 8) & 255 as u32) as u8)
+    rt.buf_push(s, (crc & 255 as u32) as u8)
+}
+
+fn tsmux_psi(m: *mut TsMux, out: *mut rt.Buf) {
+    var pat: rt.Buf = rt.buf_new()
+    rt.buf_push(&pat, 0 as u8)
+    rt.buf_push(&pat, 176 as u8)
+    rt.buf_push(&pat, 13 as u8)
+    rt.buf_push(&pat, 0 as u8)
+    rt.buf_push(&pat, 1 as u8)
+    rt.buf_push(&pat, 193 as u8)
+    rt.buf_push(&pat, 0 as u8)
+    rt.buf_push(&pat, 0 as u8)
+    rt.buf_push(&pat, 0 as u8)
+    rt.buf_push(&pat, 1 as u8)
+    rt.buf_push(&pat, (224 as u32 | (((*m).pmt_pid >> 8) & 31 as u32)) as u8)
+    rt.buf_push(&pat, ((*m).pmt_pid & 255 as u32) as u8)
+    section_finish(&pat)
+    psi_packet(out, 0 as u32, (*m).cc_pat, &pat)
+    (*m).cc_pat = ((*m).cc_pat + 1 as u32) & 15 as u32
+    rt.buf_free(&pat)
+
+    var pmt: rt.Buf = rt.buf_new()
+    rt.buf_push(&pmt, 2 as u8)
+    rt.buf_push(&pmt, 176 as u8)
+    rt.buf_push(&pmt, 18 as u8)
+    rt.buf_push(&pmt, 0 as u8)
+    rt.buf_push(&pmt, 1 as u8)
+    rt.buf_push(&pmt, 193 as u8)
+    rt.buf_push(&pmt, 0 as u8)
+    rt.buf_push(&pmt, 0 as u8)
+    rt.buf_push(&pmt, (224 as u32 | (((*m).video_pid >> 8) & 31 as u32)) as u8)
+    rt.buf_push(&pmt, ((*m).video_pid & 255 as u32) as u8)
+    rt.buf_push(&pmt, 240 as u8)
+    rt.buf_push(&pmt, 0 as u8)
+    rt.buf_push(&pmt, STREAM_H264 as u8)
+    rt.buf_push(&pmt, (224 as u32 | (((*m).video_pid >> 8) & 31 as u32)) as u8)
+    rt.buf_push(&pmt, ((*m).video_pid & 255 as u32) as u8)
+    rt.buf_push(&pmt, 240 as u8)
+    rt.buf_push(&pmt, 0 as u8)
+    section_finish(&pmt)
+    psi_packet(out, (*m).pmt_pid, (*m).cc_pmt, &pmt)
+    (*m).cc_pmt = ((*m).cc_pmt + 1 as u32) & 15 as u32
+    rt.buf_free(&pmt)
+}
+
+fn put_pts(b: *mut rt.Buf, pts: u64) {
+    rt.buf_push(b, (33 | (((pts >> 30) & 7) << 1)) as u8)
+    rt.buf_push(b, ((pts >> 22) & 255) as u8)
+    rt.buf_push(b, ((((pts >> 15) & 127) << 1) | 1) as u8)
+    rt.buf_push(b, ((pts >> 7) & 255) as u8)
+    rt.buf_push(b, (((pts & 127) << 1) | 1) as u8)
+}
+
+fn tsmux_video(m: *mut TsMux, annexb: u64, n: usize, pts: u64, keyframe: bool, out: *mut rt.Buf) {
+    var pes: rt.Buf = rt.buf_new()
+    rt.buf_push(&pes, 0 as u8)
+    rt.buf_push(&pes, 0 as u8)
+    rt.buf_push(&pes, 1 as u8)
+    rt.buf_push(&pes, 224 as u8)
+    rt.buf_push(&pes, 0 as u8)
+    rt.buf_push(&pes, 0 as u8)
+    rt.buf_push(&pes, 128 as u8)
+    rt.buf_push(&pes, 128 as u8)
+    rt.buf_push(&pes, 5 as u8)
+    put_pts(&pes, pts)
+    rt.buf_push_bytes(&pes, annexb, n)
+    var pos: usize = 0
+    var first: bool = true
+    var pcr: u64 = 0
+    if pts >= 6300 as u64 { pcr = pts - 6300 as u64 }
+    while pos < pes.len {
+        var cap: usize = 184
+        if first { cap = 176 }
+        var take: usize = pes.len - pos
+        if take > cap { take = cap }
+        put_ts(out, (*m).video_pid, first, (*m).cc_video, first, pcr, first && keyframe, pes.ptr + pos as u64, take)
+        (*m).cc_video = ((*m).cc_video + 1 as u32) & 15 as u32
+        pos = pos + take
+        first = false
+    }
+    rt.buf_free(&pes)
+}
+
+fn mp2tpack_new(ssrc: u32, first_seq: u32) -> Mp2tPack {
+    return Mp2tPack { ssrc: ssrc, seq: first_seq & 65535 as u32, pending: rt.buf_new() }
+}
+
+fn mp2tpack_push(p: *mut Mp2tPack, ts: u64, n: usize, rtp_ts: u32, pkts: *mut pktlist.PktList, flush: bool) {
+    rt.buf_push_bytes(&(*p).pending, ts, n)
+    let chunk: usize = TS_PACKET * TS_PER_RTP
+    var pos: usize = 0
+    while (*p).pending.len - pos >= chunk || (flush && pos < (*p).pending.len) {
+        var take: usize = (*p).pending.len - pos
+        if take > chunk { take = chunk }
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push(&b, 128 as u8)
+        rt.buf_push(&b, 33 as u8)
+        rt.buf_push(&b, (((*p).seq >> 8) & 255 as u32) as u8)
+        rt.buf_push(&b, ((*p).seq & 255 as u32) as u8)
+        rt.buf_push(&b, ((rtp_ts >> 24) & 255 as u32) as u8)
+        rt.buf_push(&b, ((rtp_ts >> 16) & 255 as u32) as u8)
+        rt.buf_push(&b, ((rtp_ts >> 8) & 255 as u32) as u8)
+        rt.buf_push(&b, (rtp_ts & 255 as u32) as u8)
+        rt.buf_push(&b, (((*p).ssrc >> 24) & 255 as u32) as u8)
+        rt.buf_push(&b, (((*p).ssrc >> 16) & 255 as u32) as u8)
+        rt.buf_push(&b, (((*p).ssrc >> 8) & 255 as u32) as u8)
+        rt.buf_push(&b, ((*p).ssrc & 255 as u32) as u8)
+        rt.buf_push_bytes(&b, (*p).pending.ptr + pos as u64, take)
+        pktlist.pl_add(pkts, b.ptr, b.len)
+        rt.buf_free(&b)
+        (*p).seq = ((*p).seq + 1 as u32) & 65535 as u32
+        pos = pos + take
+    }
+    if pos > 0 {
+        var rest: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&rest, (*p).pending.ptr + pos as u64, (*p).pending.len - pos)
+        rt.buf_clear(&(*p).pending)
+        rt.buf_push_bytes(&(*p).pending, rest.ptr, rest.len)
+        rt.buf_free(&rest)
+    }
+}
+
+fn tsdemux_new() -> TsDemux {
+    return TsDemux {
+        carry: rt.buf_new(), pes: rt.buf_new(), have_pes: false, pmt_pid: 65535 as u32, video_pid: 65535 as u32,
+        out: rt.buf_new(), out_pts: 0 as u64, out_ready: false, errors: 0 as u32, last_cc: 0 as u32, have_cc: false,
+    }
+}
+
+fn tsdemux_free(d: *mut TsDemux) {
+    rt.buf_free(&(*d).carry)
+    rt.buf_free(&(*d).pes)
+    rt.buf_free(&(*d).out)
+}
+
+fn tsdemux_video_pid(d: *mut TsDemux) -> u32 { return (*d).video_pid }
+fn tsdemux_errors(d: *mut TsDemux) -> u32 { return (*d).errors }
+
+fn pts_at(p: u64, i: usize) -> u64 {
+    return (((rt.ld8(p, i) as u64 >> 1) & 7) << 30) | ((rt.ld8(p, i + 1) as u64) << 22) | (((rt.ld8(p, i + 2) as u64) >> 1) << 15) | ((rt.ld8(p, i + 3) as u64) << 7) | ((rt.ld8(p, i + 4) as u64) >> 1)
+}
+
+fn finish_pes(d: *mut TsDemux) {
+    if !(*d).have_pes { return }
+    (*d).have_pes = false
+    let n: usize = (*d).pes.len
+    let p: u64 = (*d).pes.ptr
+    if n < 9 || rt.ld8(p, 0) != 0 as u8 || rt.ld8(p, 1) != 0 as u8 || rt.ld8(p, 2) != 1 as u8 {
+        (*d).errors = (*d).errors + 1 as u32
+        rt.buf_clear(&(*d).pes)
+        return
+    }
+    let hl: usize = rt.ld8(p, 8) as usize
+    if 9 + hl > n {
+        (*d).errors = (*d).errors + 1 as u32
+        rt.buf_clear(&(*d).pes)
+        return
+    }
+    var pts: u64 = 0
+    if (rt.ld8(p, 7) as u32 & 128 as u32) != 0 as u32 && hl >= 5 { pts = pts_at(p, 9) }
+    rt.buf_clear(&(*d).out)
+    rt.buf_push_bytes(&(*d).out, p + (9 + hl) as u64, n - 9 - hl)
+    (*d).out_pts = pts
+    (*d).out_ready = true
+    rt.buf_clear(&(*d).pes)
+}
+
+fn handle_packet(d: *mut TsDemux, p: u64) {
+    let b1: u32 = rt.ld8(p, 1) as u32
+    let pid: u32 = ((b1 & 31 as u32) << 8) | (rt.ld8(p, 2) as u32)
+    let pusi: bool = (b1 & 64 as u32) != 0 as u32
+    let b3: u32 = rt.ld8(p, 3) as u32
+    var off: usize = 4
+    if (b3 & 32 as u32) != 0 as u32 { off = 5 + rt.ld8(p, 4) as usize }
+    if off > 188 { return }
+    if (b3 & 16 as u32) == 0 as u32 { return }
+    if pid == 0 as u32 && pusi {
+        let sp: usize = off + 1 + rt.ld8(p, off) as usize
+        if sp + 12 <= 188 && rt.ld8(p, sp) == 0 as u8 {
+            (*d).pmt_pid = (((rt.ld8(p, sp + 10) as u32) & 31 as u32) << 8) | (rt.ld8(p, sp + 11) as u32)
+        }
+        return
+    }
+    if pid == (*d).pmt_pid && pusi {
+        let sp: usize = off + 1 + rt.ld8(p, off) as usize
+        if sp + 12 > 188 || rt.ld8(p, sp) != 2 as u8 { return }
+        let slen: usize = ((((rt.ld8(p, sp + 1) as usize) & 15) << 8) | (rt.ld8(p, sp + 2) as usize))
+        let pil: usize = (((rt.ld8(p, sp + 10) as usize) & 15) << 8) | (rt.ld8(p, sp + 11) as usize)
+        var q: usize = sp + 12 + pil
+        let end: usize = sp + 3 + slen - 4
+        while q + 5 <= end && q + 5 <= 188 {
+            let st: u32 = rt.ld8(p, q) as u32
+            let epid: u32 = (((rt.ld8(p, q + 1) as u32) & 31 as u32) << 8) | (rt.ld8(p, q + 2) as u32)
+            let eil: usize = (((rt.ld8(p, q + 3) as usize) & 15) << 8) | (rt.ld8(p, q + 4) as usize)
+            if st == STREAM_H264 { (*d).video_pid = epid }
+            q = q + 5 + eil
+        }
+        return
+    }
+    if pid != (*d).video_pid { return }
+    let cc: u32 = b3 & 15 as u32
+    if (*d).have_cc && cc != (((*d).last_cc + 1 as u32) & 15 as u32) { (*d).errors = (*d).errors + 1 as u32 }
+    (*d).last_cc = cc
+    (*d).have_cc = true
+    if pusi {
+        finish_pes(d)
+        rt.buf_clear(&(*d).pes)
+        (*d).have_pes = true
+    }
+    if (*d).have_pes { rt.buf_push_bytes(&(*d).pes, p + off as u64, 188 - off) }
+}
+
+fn tsdemux_push(d: *mut TsDemux, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*d).carry, p, n)
+    var pos: usize = 0
+    while pos + 188 <= (*d).carry.len {
+        if rt.ld8((*d).carry.ptr, pos) != 71 as u8 {
+            pos = pos + 1
+            (*d).errors = (*d).errors + 1 as u32
+        } else {
+            handle_packet(d, (*d).carry.ptr + pos as u64)
+            pos = pos + 188
+        }
+    }
+    if pos > 0 {
+        var rest: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&rest, (*d).carry.ptr + pos as u64, (*d).carry.len - pos)
+        rt.buf_clear(&(*d).carry)
+        rt.buf_push_bytes(&(*d).carry, rest.ptr, rest.len)
+        rt.buf_free(&rest)
+    }
+}
+
+fn tsdemux_flush(d: *mut TsDemux) {
+    finish_pes(d)
+}
+
+fn tsdemux_take(d: *mut TsDemux, out: *mut rt.Buf, pts: *mut u64) -> bool {
+    if !(*d).out_ready { return false }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (*d).out.ptr, (*d).out.len)
+    (*pts) = (*d).out_pts
+    (*d).out_ready = false
+    return true
+}

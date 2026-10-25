@@ -1,0 +1,486 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import bluetooth.bt_le
+import bluetooth.bt_uuid
+import bluetooth.bt_att
+import bluetooth.bt_gatt_db
+
+export {
+    GattConn, conn_new, conn_free, server_handle, server_notification,
+    server_indication,
+}
+
+const PREPARE_MAX: usize = 32
+
+struct GattConn {
+    mtu: u32,
+    server_mtu: u32,
+    encrypted: bool,
+    authenticated: bool,
+    queue: rt.Buf,
+    queued: usize,
+}
+
+fn conn_new(server_mtu: u32) -> GattConn {
+    return GattConn { mtu: bt_att.ATT_DEFAULT_MTU, server_mtu: server_mtu,
+        encrypted: false, authenticated: false, queue: rt.buf_new(), queued: 0 }
+}
+
+fn conn_free(c: *mut GattConn) {
+    rt.buf_free(&(*c).queue)
+}
+
+fn min_u32(a: u32, b: u32) -> u32 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn read_error(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, i: usize) -> u32 {
+    let perms: u32 = bt_gatt_db.db_perms(db, i)
+    if perms & bt_gatt_db.P_READ == 0 {
+        return bt_att.E_READ_NOT_PERMITTED
+    }
+    if perms & bt_gatt_db.P_READ_AUTHEN != 0 && !(*c).authenticated {
+        return bt_att.E_INSUFFICIENT_AUTHENTICATION
+    }
+    if perms & bt_gatt_db.P_READ_ENC != 0 && !(*c).encrypted {
+        return bt_att.E_INSUFFICIENT_ENCRYPTION
+    }
+    return 0
+}
+
+fn write_error(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, i: usize) -> u32 {
+    let perms: u32 = bt_gatt_db.db_perms(db, i)
+    if perms & bt_gatt_db.P_WRITE == 0 {
+        return bt_att.E_WRITE_NOT_PERMITTED
+    }
+    if perms & bt_gatt_db.P_WRITE_AUTHEN != 0 && !(*c).authenticated {
+        return bt_att.E_INSUFFICIENT_AUTHENTICATION
+    }
+    if perms & bt_gatt_db.P_WRITE_ENC != 0 && !(*c).encrypted {
+        return bt_att.E_INSUFFICIENT_ENCRYPTION
+    }
+    return 0
+}
+
+fn is_cccd(db: *mut bt_gatt_db.GattDb, i: usize) -> bool {
+    return bt_uuid.uuid_eq(bt_gatt_db.db_uuid(db, i), bt_uuid.uuid16(bt_uuid.UUID_CCCD))
+}
+
+fn handle_mtu(c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    if n != 3 {
+        bt_att.att_error(out, bt_att.ATT_MTU_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let client: u32 = bt_le.le_get16(p, 1)
+    if client < bt_att.ATT_DEFAULT_MTU {
+        bt_att.att_error(out, bt_att.ATT_MTU_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    (*c).mtu = min_u32(client, (*c).server_mtu)
+    bt_att.att_mtu_rsp(out, (*c).server_mtu)
+}
+
+fn handle_find_info(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    if n != 5 {
+        bt_att.att_error(out, bt_att.ATT_FIND_INFO_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let start: u32 = bt_le.le_get16(p, 1)
+    let end: u32 = bt_le.le_get16(p, 3)
+    if start == 0 || start > end {
+        bt_att.att_error(out, bt_att.ATT_FIND_INFO_REQ, start, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    let limit: usize = (*c).mtu as usize
+    var fmt: u32 = 0
+    var i: usize = start as usize - 1
+    var wrote: bool = false
+    while i < bt_gatt_db.db_count(db) && (i + 1) as u32 <= end {
+        let u: bt_uuid.Uuid = bt_gatt_db.db_uuid(db, i)
+        let short: bool = bt_uuid.uuid_is_short(u)
+        let want: u32 = if short { 1 } else { 2 }
+        let size: usize = if short { 4 } else { 18 }
+        if !wrote {
+            bt_le.le_put8(out, bt_att.ATT_FIND_INFO_RSP)
+            bt_le.le_put8(out, want)
+            fmt = want
+            wrote = true
+        } else if want != fmt {
+            return
+        }
+        if rt.buf_len(out) + size > limit {
+            return
+        }
+        bt_le.le_put16(out, (i + 1) as u32)
+        bt_uuid.uuid_put(out, u)
+        i = i + 1
+    }
+    if !wrote {
+        bt_att.att_error(out, bt_att.ATT_FIND_INFO_REQ, start, bt_att.E_ATTRIBUTE_NOT_FOUND)
+    }
+}
+
+fn handle_find_by_type(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    if n < 7 {
+        bt_att.att_error(out, bt_att.ATT_FIND_BY_TYPE_VALUE_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let start: u32 = bt_le.le_get16(p, 1)
+    let end: u32 = bt_le.le_get16(p, 3)
+    let t: bt_uuid.Uuid = bt_uuid.uuid16(bt_le.le_get16(p, 5))
+    let vlen: usize = n - 7
+    if start == 0 || start > end {
+        bt_att.att_error(out, bt_att.ATT_FIND_BY_TYPE_VALUE_REQ, start, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    var i: usize = start as usize - 1
+    var found: bool = false
+    while i < bt_gatt_db.db_count(db) && (i + 1) as u32 <= end {
+        if bt_uuid.uuid_eq(bt_gatt_db.db_uuid(db, i), t) && bt_gatt_db.db_value_len(db, i) == vlen
+            && bt_le.le_bytes_eq(bt_gatt_db.db_value_ptr(db, i), p + 7 as u64, vlen) {
+            if !found {
+                bt_le.le_put8(out, bt_att.ATT_FIND_BY_TYPE_VALUE_RSP)
+                found = true
+            }
+            if rt.buf_len(out) + 4 > (*c).mtu as usize {
+                return
+            }
+            bt_le.le_put16(out, (i + 1) as u32)
+            if bt_gatt_db.db_is_service_decl(db, i) {
+                bt_le.le_put16(out, bt_gatt_db.db_group_end(db, i))
+            } else {
+                bt_le.le_put16(out, (i + 1) as u32)
+            }
+        }
+        i = i + 1
+    }
+    if !found {
+        bt_att.att_error(out, bt_att.ATT_FIND_BY_TYPE_VALUE_REQ, start, bt_att.E_ATTRIBUTE_NOT_FOUND)
+    }
+}
+
+fn parse_type(p: u64, n: usize, at: usize, out: *mut bt_uuid.Uuid) -> bool {
+    return bt_uuid.uuid_get(p, at, n - at, out) && (n - at == 2 || n - at == 16)
+}
+
+fn handle_read_by_type(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    var t: bt_uuid.Uuid = bt_uuid.uuid16(0)
+    if n != 7 && n != 21 {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_TYPE_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let start: u32 = bt_le.le_get16(p, 1)
+    let end: u32 = bt_le.le_get16(p, 3)
+    parse_type(p, n, 5, &t)
+    if start == 0 || start > end {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_TYPE_REQ, start, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    var i: usize = start as usize - 1
+    var entry: usize = 0
+    var first: bool = true
+    while i < bt_gatt_db.db_count(db) && (i + 1) as u32 <= end {
+        if bt_uuid.uuid_eq(bt_gatt_db.db_uuid(db, i), t) {
+            let err: u32 = read_error(db, c, i)
+            if err != 0 {
+                if first {
+                    bt_att.att_error(out, bt_att.ATT_READ_BY_TYPE_REQ, (i + 1) as u32, err)
+                }
+                return
+            }
+            var vl: usize = bt_gatt_db.db_value_len(db, i)
+            let maxv: usize = (*c).mtu as usize - 4
+            if vl > maxv {
+                vl = maxv
+            }
+            if first {
+                bt_le.le_put8(out, bt_att.ATT_READ_BY_TYPE_RSP)
+                bt_le.le_put8(out, (2 + vl) as u32)
+                entry = 2 + vl
+                first = false
+            } else if 2 + vl != entry {
+                return
+            }
+            if rt.buf_len(out) + entry > (*c).mtu as usize {
+                return
+            }
+            bt_le.le_put16(out, (i + 1) as u32)
+            bt_le.le_put_raw(out, bt_gatt_db.db_value_ptr(db, i), vl)
+        }
+        i = i + 1
+    }
+    if first {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_TYPE_REQ, start, bt_att.E_ATTRIBUTE_NOT_FOUND)
+    }
+}
+
+fn handle_read_by_group(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    var t: bt_uuid.Uuid = bt_uuid.uuid16(0)
+    if n != 7 && n != 21 {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_GROUP_TYPE_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let start: u32 = bt_le.le_get16(p, 1)
+    let end: u32 = bt_le.le_get16(p, 3)
+    parse_type(p, n, 5, &t)
+    if start == 0 || start > end {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_GROUP_TYPE_REQ, start, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    if !bt_uuid.uuid_eq(t, bt_uuid.uuid16(bt_uuid.UUID_PRIMARY_SERVICE)) && !bt_uuid.uuid_eq(t, bt_uuid.uuid16(bt_uuid.UUID_SECONDARY_SERVICE)) {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_GROUP_TYPE_REQ, start, bt_att.E_UNSUPPORTED_GROUP_TYPE)
+        return
+    }
+    var i: usize = start as usize - 1
+    var entry: usize = 0
+    var first: bool = true
+    while i < bt_gatt_db.db_count(db) && (i + 1) as u32 <= end {
+        if bt_uuid.uuid_eq(bt_gatt_db.db_uuid(db, i), t) {
+            let vl: usize = bt_gatt_db.db_value_len(db, i)
+            if first {
+                bt_le.le_put8(out, bt_att.ATT_READ_BY_GROUP_TYPE_RSP)
+                bt_le.le_put8(out, (4 + vl) as u32)
+                entry = 4 + vl
+                first = false
+            } else if 4 + vl != entry {
+                return
+            }
+            if rt.buf_len(out) + entry > (*c).mtu as usize {
+                return
+            }
+            bt_le.le_put16(out, (i + 1) as u32)
+            bt_le.le_put16(out, bt_gatt_db.db_group_end(db, i))
+            bt_le.le_put_raw(out, bt_gatt_db.db_value_ptr(db, i), vl)
+        }
+        i = i + 1
+    }
+    if first {
+        bt_att.att_error(out, bt_att.ATT_READ_BY_GROUP_TYPE_REQ, start, bt_att.E_ATTRIBUTE_NOT_FOUND)
+    }
+}
+
+fn handle_read(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, blob: bool, out: *mut rt.Buf) {
+    let op: u32 = rt.ld8(p, 0) as u32
+    if (!blob && n != 3) || (blob && n != 5) {
+        bt_att.att_error(out, op, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let handle: u32 = bt_le.le_get16(p, 1)
+    let i: usize = bt_gatt_db.db_find(db, handle)
+    if i == bt_le.NONE || i >= bt_gatt_db.db_count(db) {
+        bt_att.att_error(out, op, handle, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    let err: u32 = read_error(db, c, i)
+    if err != 0 {
+        bt_att.att_error(out, op, handle, err)
+        return
+    }
+    var off: usize = 0
+    let vl: usize = bt_gatt_db.db_value_len(db, i)
+    if blob {
+        off = bt_le.le_get16(p, 3) as usize
+        if off > vl {
+            bt_att.att_error(out, op, handle, bt_att.E_INVALID_OFFSET)
+            return
+        }
+        if vl <= (*c).mtu as usize - 1 {
+            bt_att.att_error(out, op, handle, bt_att.E_ATTRIBUTE_NOT_LONG)
+            return
+        }
+    }
+    var take: usize = vl - off
+    if take > (*c).mtu as usize - 1 {
+        take = (*c).mtu as usize - 1
+    }
+    bt_le.le_put8(out, if blob { bt_att.ATT_READ_BLOB_RSP } else { bt_att.ATT_READ_RSP })
+    bt_le.le_put_raw(out, bt_gatt_db.db_value_ptr(db, i) + off as u64, take)
+}
+
+fn apply_write(db: *mut bt_gatt_db.GattDb, i: usize, offset: usize, p: u64, n: usize) -> u32 {
+    if is_cccd(db, i) && (offset != 0 || n != 2 || (rt.ld8(p, 0) & 252 as u8) != 0 as u8 || rt.ld8(p, 1) != 0 as u8) {
+        return bt_att.E_INVALID_ATTRIBUTE_VALUE_LENGTH
+    }
+    if !bt_gatt_db.db_write_value(db, i, offset, p, n) {
+        return bt_att.E_INVALID_ATTRIBUTE_VALUE_LENGTH
+    }
+    bt_gatt_db.db_log_write(db, (i + 1) as u32)
+    return 0
+}
+
+fn handle_write(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, command: bool, out: *mut rt.Buf) {
+    let op: u32 = rt.ld8(p, 0) as u32
+    if n < 3 {
+        if !command {
+            bt_att.att_error(out, op, 0, bt_att.E_INVALID_PDU)
+        }
+        return
+    }
+    let handle: u32 = bt_le.le_get16(p, 1)
+    let i: usize = bt_gatt_db.db_find(db, handle)
+    if i == bt_le.NONE || i >= bt_gatt_db.db_count(db) {
+        if !command {
+            bt_att.att_error(out, op, handle, bt_att.E_INVALID_HANDLE)
+        }
+        return
+    }
+    var err: u32 = write_error(db, c, i)
+    if err == 0 {
+        err = apply_write(db, i, 0, p + 3 as u64, n - 3)
+        if err == 0 {
+            bt_gatt_db.db_truncate(db, i, n - 3)
+        }
+    }
+    if command {
+        return
+    }
+    if err != 0 {
+        bt_att.att_error(out, op, handle, err)
+        return
+    }
+    bt_le.le_put8(out, bt_att.ATT_WRITE_RSP)
+}
+
+fn handle_prepare(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    if n < 5 {
+        bt_att.att_error(out, bt_att.ATT_PREPARE_WRITE_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    let handle: u32 = bt_le.le_get16(p, 1)
+    let i: usize = bt_gatt_db.db_find(db, handle)
+    if i == bt_le.NONE || i >= bt_gatt_db.db_count(db) {
+        bt_att.att_error(out, bt_att.ATT_PREPARE_WRITE_REQ, handle, bt_att.E_INVALID_HANDLE)
+        return
+    }
+    let err: u32 = write_error(db, c, i)
+    if err != 0 {
+        bt_att.att_error(out, bt_att.ATT_PREPARE_WRITE_REQ, handle, err)
+        return
+    }
+    if (*c).queued >= PREPARE_MAX {
+        bt_att.att_error(out, bt_att.ATT_PREPARE_WRITE_REQ, handle, bt_att.E_PREPARE_QUEUE_FULL)
+        return
+    }
+    bt_le.le_put16(&(*c).queue, handle)
+    bt_le.le_put16(&(*c).queue, bt_le.le_get16(p, 3))
+    bt_le.le_put16(&(*c).queue, (n - 5) as u32)
+    bt_le.le_put_raw(&(*c).queue, p + 5 as u64, n - 5)
+    (*c).queued = (*c).queued + 1
+    bt_le.le_put_raw(out, p, n)
+    rt.st8(rt.buf_ptr(out), 0, bt_att.ATT_PREPARE_WRITE_RSP as u8)
+}
+
+fn handle_execute(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) {
+    if n != 2 || rt.ld8(p, 1) > 1 as u8 {
+        bt_att.att_error(out, bt_att.ATT_EXECUTE_WRITE_REQ, 0, bt_att.E_INVALID_PDU)
+        return
+    }
+    var failed: u32 = 0
+    var failed_handle: u32 = 0
+    if rt.ld8(p, 1) == 1 as u8 {
+        let q: u64 = rt.buf_ptr(&(*c).queue)
+        var at: usize = 0
+        while at < rt.buf_len(&(*c).queue) && failed == 0 {
+            let h: u32 = bt_le.le_get16(q, at)
+            let off: usize = bt_le.le_get16(q, at + 2) as usize
+            let ln: usize = bt_le.le_get16(q, at + 4) as usize
+            let i: usize = bt_gatt_db.db_find(db, h)
+            if off + ln > bt_gatt_db.db_value_cap(db, i) {
+                failed = bt_att.E_INVALID_OFFSET
+                failed_handle = h
+            }
+            at = at + 6 + ln
+        }
+        if failed == 0 {
+            at = 0
+            while at < rt.buf_len(&(*c).queue) {
+                let h: u32 = bt_le.le_get16(q, at)
+                let off: usize = bt_le.le_get16(q, at + 2) as usize
+                let ln: usize = bt_le.le_get16(q, at + 4) as usize
+                apply_write(db, bt_gatt_db.db_find(db, h), off, q + (at + 6) as u64, ln)
+                at = at + 6 + ln
+            }
+        }
+    }
+    rt.buf_clear(&(*c).queue)
+    (*c).queued = 0
+    if failed != 0 {
+        bt_att.att_error(out, bt_att.ATT_EXECUTE_WRITE_REQ, failed_handle, failed)
+        return
+    }
+    bt_le.le_put8(out, bt_att.ATT_EXECUTE_WRITE_RSP)
+}
+
+fn server_handle(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if n < 1 {
+        return false
+    }
+    let op: u32 = rt.ld8(p, 0) as u32
+    if op == bt_att.ATT_MTU_REQ {
+        handle_mtu(c, p, n, out)
+    } else if op == bt_att.ATT_FIND_INFO_REQ {
+        handle_find_info(db, c, p, n, out)
+    } else if op == bt_att.ATT_FIND_BY_TYPE_VALUE_REQ {
+        handle_find_by_type(db, c, p, n, out)
+    } else if op == bt_att.ATT_READ_BY_TYPE_REQ {
+        handle_read_by_type(db, c, p, n, out)
+    } else if op == bt_att.ATT_READ_BY_GROUP_TYPE_REQ {
+        handle_read_by_group(db, c, p, n, out)
+    } else if op == bt_att.ATT_READ_REQ {
+        handle_read(db, c, p, n, false, out)
+    } else if op == bt_att.ATT_READ_BLOB_REQ {
+        handle_read(db, c, p, n, true, out)
+    } else if op == bt_att.ATT_WRITE_REQ {
+        handle_write(db, c, p, n, false, out)
+    } else if op == bt_att.ATT_WRITE_CMD {
+        handle_write(db, c, p, n, true, out)
+    } else if op == bt_att.ATT_PREPARE_WRITE_REQ {
+        handle_prepare(db, c, p, n, out)
+    } else if op == bt_att.ATT_EXECUTE_WRITE_REQ {
+        handle_execute(db, c, p, n, out)
+    } else if op == bt_att.ATT_HANDLE_VALUE_CFM {
+        return false
+    } else if op & 64 != 0 {
+        return false
+    } else {
+        bt_att.att_error(out, op, 0, bt_att.E_REQUEST_NOT_SUPPORTED)
+    }
+    return rt.buf_len(out) > 0
+}
+
+fn cccd_bits(db: *mut bt_gatt_db.GattDb, value_handle: u32) -> u32 {
+    let h: u32 = bt_gatt_db.db_cccd_of(db, value_handle)
+    if h == 0 {
+        return 0
+    }
+    return rt.ld8(bt_gatt_db.db_value_ptr(db, h as usize - 1), 0) as u32
+}
+
+fn server_notification(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, value_handle: u32, out: *mut rt.Buf) -> bool {
+    if cccd_bits(db, value_handle) & 1 == 0 {
+        return false
+    }
+    let i: usize = value_handle as usize - 1
+    var vl: usize = bt_gatt_db.db_value_len(db, i)
+    if vl > (*c).mtu as usize - 3 {
+        vl = (*c).mtu as usize - 3
+    }
+    bt_att.att_notification(out, value_handle, bt_gatt_db.db_value_ptr(db, i), vl)
+    return true
+}
+
+fn server_indication(db: *mut bt_gatt_db.GattDb, c: *mut GattConn, value_handle: u32, out: *mut rt.Buf) -> bool {
+    if cccd_bits(db, value_handle) & 2 == 0 {
+        return false
+    }
+    let i: usize = value_handle as usize - 1
+    var vl: usize = bt_gatt_db.db_value_len(db, i)
+    if vl > (*c).mtu as usize - 3 {
+        vl = (*c).mtu as usize - 3
+    }
+    bt_att.att_indication(out, value_handle, bt_gatt_db.db_value_ptr(db, i), vl)
+    return true
+}

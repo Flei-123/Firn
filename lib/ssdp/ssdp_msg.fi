@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    Msg, KIND_NONE, KIND_SEARCH, KIND_NOTIFY, KIND_RESPONSE, SSDP_PORT, MAX_HEADERS,
+    msg_new, msg_parse, msg_header, msg_header_eq, msg_header_u32,
+    build_msearch, build_notify, build_response, st_matches, ci_eq,
+}
+
+const KIND_NONE: u32 = 0
+const KIND_SEARCH: u32 = 1
+const KIND_NOTIFY: u32 = 2
+const KIND_RESPONSE: u32 = 3
+const SSDP_PORT: u32 = 1900
+const MAX_HEADERS: usize = 32
+
+struct Msg {
+    src: u64,
+    n: usize,
+    kind: u32,
+    status: u32,
+    count: usize,
+    name_off: [usize; 32],
+    name_len: [usize; 32],
+    val_off: [usize; 32],
+    val_len: [usize; 32],
+}
+
+fn msg_new() -> Msg {
+    return Msg { src: 0 as u64, n: 0, kind: KIND_NONE, status: 0 as u32, count: 0, name_off: [0; 32],
+        name_len: [0; 32], val_off: [0; 32], val_len: [0; 32] }
+}
+
+fn low(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn ci_eq(a: u64, an: usize, b: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if low(rt.ld8(a, i)) != low(rt.ld8(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn line_end(p: u64, n: usize, from: usize) -> usize {
+    var i: usize = from
+    while i < n && rt.ld8(p, i) != 10 as u8 {
+        i = i + 1
+    }
+    return i
+}
+
+fn starts_ci(p: u64, n: usize, lit: str) -> bool {
+    return n >= lit.n && ci_eq(p, lit.n, lit.p as u64, lit.n)
+}
+
+fn msg_parse(p: u64, n: usize, m: *mut Msg) -> bool {
+    (*m).src = p
+    (*m).n = n
+    (*m).count = 0
+    (*m).kind = KIND_NONE
+    (*m).status = 0 as u32
+    var e: usize = line_end(p, n, 0)
+    if e >= n {
+        return false
+    }
+    var le: usize = e
+    if le > 0 && rt.ld8(p, le - 1) == 13 as u8 {
+        le = le - 1
+    }
+    if starts_ci(p, le, "M-SEARCH * HTTP/1.") {
+        (*m).kind = KIND_SEARCH
+    } else if starts_ci(p, le, "NOTIFY * HTTP/1.") {
+        (*m).kind = KIND_NOTIFY
+    } else if starts_ci(p, le, "HTTP/1.") && le >= 12 {
+        (*m).kind = KIND_RESPONSE
+        var st: u32 = 0
+        var k: usize = 9
+        while k < 12 {
+            let c: u8 = rt.ld8(p, k)
+            if c < 48 as u8 || c > 57 as u8 {
+                return false
+            }
+            st = st * 10 as u32 + (c - 48 as u8) as u32
+            k = k + 1
+        }
+        (*m).status = st
+    } else {
+        return false
+    }
+    var pos: usize = e + 1
+    while pos < n && (*m).count < MAX_HEADERS {
+        e = line_end(p, n, pos)
+        le = e
+        if le > pos && rt.ld8(p, le - 1) == 13 as u8 {
+            le = le - 1
+        }
+        if le == pos {
+            break
+        }
+        var colon: usize = pos
+        while colon < le && rt.ld8(p, colon) != 58 as u8 {
+            colon = colon + 1
+        }
+        if colon < le && colon > pos {
+            var ns: usize = pos
+            var ne: usize = colon
+            while ne > ns && (rt.ld8(p, ne - 1) == 32 as u8 || rt.ld8(p, ne - 1) == 9 as u8) {
+                ne = ne - 1
+            }
+            var vs: usize = colon + 1
+            var ve: usize = le
+            while vs < ve && (rt.ld8(p, vs) == 32 as u8 || rt.ld8(p, vs) == 9 as u8) {
+                vs = vs + 1
+            }
+            while ve > vs && (rt.ld8(p, ve - 1) == 32 as u8 || rt.ld8(p, ve - 1) == 9 as u8) {
+                ve = ve - 1
+            }
+            let c: usize = (*m).count
+            (*m).name_off[c] = ns
+            (*m).name_len[c] = ne - ns
+            (*m).val_off[c] = vs
+            (*m).val_len[c] = ve - vs
+            (*m).count = c + 1
+        }
+        pos = e + 1
+    }
+    return true
+}
+
+fn msg_header(m: *mut Msg, name: str, off: *mut usize, len: *mut usize) -> bool {
+    var i: usize = 0
+    while i < (*m).count {
+        if ci_eq((*m).src + (*m).name_off[i] as u64, (*m).name_len[i], name.p as u64, name.n) {
+            *off = (*m).val_off[i]
+            *len = (*m).val_len[i]
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn msg_header_eq(m: *mut Msg, name: str, value: str) -> bool {
+    var o: usize = 0
+    var l: usize = 0
+    if !msg_header(m, name, &o, &l) {
+        return false
+    }
+    return ci_eq((*m).src + o as u64, l, value.p as u64, value.n)
+}
+
+fn msg_header_u32(m: *mut Msg, name: str, out: *mut u32) -> bool {
+    var o: usize = 0
+    var l: usize = 0
+    if !msg_header(m, name, &o, &l) || l == 0 || l > 9 {
+        return false
+    }
+    var v: u32 = 0
+    var i: usize = 0
+    while i < l {
+        let c: u8 = rt.ld8((*m).src, o + i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u32 + (c - 48 as u8) as u32
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn put_header(b: *mut rt.Buf, name: str, v: u64, vn: usize) {
+    put(b, name)
+    put(b, ": ")
+    rt.buf_push_bytes(b, v, vn)
+    put(b, "\r\n")
+}
+
+fn put_header_dec(b: *mut rt.Buf, name: str, v: u64) {
+    put(b, name)
+    put(b, ": ")
+    rt.buf_push_dec_u64(b, v)
+    put(b, "\r\n")
+}
+
+fn build_msearch(b: *mut rt.Buf, st: u64, stn: usize, mx: u32, agent: str) {
+    put(b, "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n")
+    put_header_dec(b, "MX", mx as u64)
+    put_header(b, "ST", st, stn)
+    put_header(b, "USER-AGENT", agent.p as u64, agent.n)
+    put(b, "\r\n")
+}
+
+fn build_notify(b: *mut rt.Buf, nt: u64, ntn: usize, alive: bool, usn: u64, usnn: usize,
+    location: u64, locn: usize, max_age: u32, server: str) {
+    put(b, "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n")
+    put_header(b, "NT", nt, ntn)
+    if alive {
+        put(b, "NTS: ssdp:alive\r\n")
+        put(b, "CACHE-CONTROL: max-age=")
+        rt.buf_push_dec_u64(b, max_age as u64)
+        put(b, "\r\n")
+        put_header(b, "LOCATION", location, locn)
+        put_header(b, "SERVER", server.p as u64, server.n)
+    } else {
+        put(b, "NTS: ssdp:byebye\r\n")
+    }
+    put_header(b, "USN", usn, usnn)
+    put(b, "\r\n")
+}
+
+fn build_response(b: *mut rt.Buf, st: u64, stn: usize, usn: u64, usnn: usize,
+    location: u64, locn: usize, max_age: u32, server: str) {
+    put(b, "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=")
+    rt.buf_push_dec_u64(b, max_age as u64)
+    put(b, "\r\nEXT:\r\n")
+    put_header(b, "LOCATION", location, locn)
+    put_header(b, "SERVER", server.p as u64, server.n)
+    put_header(b, "ST", st, stn)
+    put_header(b, "USN", usn, usnn)
+    put(b, "\r\n")
+}
+
+fn st_matches(search: u64, sn: usize, target: u64, tn: usize) -> bool {
+    let all: str = "ssdp:all"
+    if ci_eq(search, sn, all.p as u64, all.n) {
+        return true
+    }
+    return ci_eq(search, sn, target, tn)
+}

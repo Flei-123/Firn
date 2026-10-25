@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.nal
+import cast.pktlist
+
+export {
+    RtpPacket, H264Pack, H264Depack,
+    rtp_put_header, rtp_parse, rtp_seq_after,
+    h264pack_new, h264pack_au, h264pack_seq,
+    h264depack_new, h264depack_free, h264depack_push, h264depack_take, h264depack_damaged,
+    PT_H264, PT_MP2T, RTP_CLOCK,
+}
+
+const PT_H264: u32 = 96
+const PT_MP2T: u32 = 33
+const RTP_CLOCK: u32 = 90000
+const FU_A: u32 = 28
+
+struct RtpPacket {
+    pt: u32,
+    marker: bool,
+    seq: u32,
+    ts: u32,
+    ssrc: u32,
+    off: usize,
+    len: usize,
+}
+
+struct H264Pack {
+    pt: u32,
+    ssrc: u32,
+    seq: u32,
+    max_payload: usize,
+}
+
+struct H264Depack {
+    au: rt.Buf,
+    fu: rt.Buf,
+    fu_active: bool,
+    have_seq: bool,
+    last_seq: u32,
+    cur_ts: u32,
+    have_ts: bool,
+    damaged: bool,
+    ready: bool,
+    out_damaged: bool,
+    held: rt.Buf,
+    held_ready: bool,
+}
+
+fn rtp_put_header(out: *mut rt.Buf, pt: u32, marker: bool, seq: u32, ts: u32, ssrc: u32) {
+    rt.buf_push(out, 128 as u8)
+    var b1: u32 = pt & 127 as u32
+    if marker { b1 = b1 | 128 as u32 }
+    rt.buf_push(out, b1 as u8)
+    rt.buf_push(out, ((seq >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, (seq & 255 as u32) as u8)
+    rt.buf_push(out, ((ts >> 24) & 255 as u32) as u8)
+    rt.buf_push(out, ((ts >> 16) & 255 as u32) as u8)
+    rt.buf_push(out, ((ts >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, (ts & 255 as u32) as u8)
+    rt.buf_push(out, ((ssrc >> 24) & 255 as u32) as u8)
+    rt.buf_push(out, ((ssrc >> 16) & 255 as u32) as u8)
+    rt.buf_push(out, ((ssrc >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, (ssrc & 255 as u32) as u8)
+}
+
+fn be32_at(p: u64, i: usize) -> u32 {
+    return ((rt.ld8(p, i) as u32) << 24) | ((rt.ld8(p, i + 1) as u32) << 16) | ((rt.ld8(p, i + 2) as u32) << 8) | (rt.ld8(p, i + 3) as u32)
+}
+
+fn rtp_parse(p: u64, n: usize, out: *mut RtpPacket) -> bool {
+    if n < 12 { return false }
+    let b0: u32 = rt.ld8(p, 0) as u32
+    if (b0 >> 6) != 2 as u32 { return false }
+    let cc: usize = (b0 & 15 as u32) as usize
+    var off: usize = 12 + cc * 4
+    if off > n { return false }
+    if (b0 & 16 as u32) != 0 as u32 {
+        if off + 4 > n { return false }
+        let words: usize = ((rt.ld8(p, off + 2) as usize) << 8) | (rt.ld8(p, off + 3) as usize)
+        off = off + 4 + words * 4
+        if off > n { return false }
+    }
+    var end: usize = n
+    if (b0 & 32 as u32) != 0 as u32 {
+        let pad: usize = rt.ld8(p, n - 1) as usize
+        if pad == 0 || pad > n - off { return false }
+        end = n - pad
+    }
+    let b1: u32 = rt.ld8(p, 1) as u32
+    (*out).pt = b1 & 127 as u32
+    (*out).marker = (b1 & 128 as u32) != 0 as u32
+    (*out).seq = ((rt.ld8(p, 2) as u32) << 8) | (rt.ld8(p, 3) as u32)
+    (*out).ts = be32_at(p, 4)
+    (*out).ssrc = be32_at(p, 8)
+    (*out).off = off
+    (*out).len = end - off
+    return true
+}
+
+fn rtp_seq_after(prev: u32, next: u32) -> bool {
+    return ((prev + 1 as u32) & 65535 as u32) == next
+}
+
+fn h264pack_new(pt: u32, ssrc: u32, first_seq: u32, max_payload: usize) -> H264Pack {
+    return H264Pack { pt: pt, ssrc: ssrc, seq: first_seq & 65535 as u32, max_payload: max_payload }
+}
+
+fn h264pack_seq(p: *mut H264Pack) -> u32 {
+    return (*p).seq
+}
+
+fn emit(p: *mut H264Pack, pkts: *mut pktlist.PktList, ts: u32, marker: bool, head: u64, head_n: usize, body: u64, body_n: usize) {
+    var b: rt.Buf = rt.buf_new()
+    rtp_put_header(&b, (*p).pt, marker, (*p).seq, ts, (*p).ssrc)
+    if head_n > 0 { rt.buf_push_bytes(&b, head, head_n) }
+    rt.buf_push_bytes(&b, body, body_n)
+    pktlist.pl_add(pkts, b.ptr, b.len)
+    rt.buf_free(&b)
+    (*p).seq = ((*p).seq + 1 as u32) & 65535 as u32
+}
+
+fn pack_nal(p: *mut H264Pack, pkts: *mut pktlist.PktList, ts: u32, last: bool, nal_p: u64, nal_n: usize) {
+    if nal_n <= (*p).max_payload {
+        emit(p, pkts, ts, last, 0, 0, nal_p, nal_n)
+        return
+    }
+    let first: u32 = rt.ld8(nal_p, 0) as u32
+    let ind: u32 = (first & 224 as u32) | FU_A
+    let kind: u32 = first & 31 as u32
+    let chunk: usize = (*p).max_payload - 2
+    var pos: usize = 1
+    var head: [u8; 2] = [0, 0]
+    while pos < nal_n {
+        var take: usize = nal_n - pos
+        if take > chunk { take = chunk }
+        let is_first: bool = pos == 1
+        let is_last: bool = pos + take == nal_n
+        head[0] = ind as u8
+        var fh: u32 = kind
+        if is_first { fh = fh | 128 as u32 }
+        if is_last { fh = fh | 64 as u32 }
+        head[1] = fh as u8
+        emit(p, pkts, ts, last && is_last, rt.addr_of(&head[0]), 2, nal_p + pos as u64, take)
+        pos = pos + take
+    }
+}
+
+fn h264pack_au(p: *mut H264Pack, annexb: u64, n: usize, ts: u32, pkts: *mut pktlist.PktList) {
+    var it: nal.NalIter = nal.nal_iter_new(annexb, n)
+    var offs: [usize; 4096] = [0; 4096]
+    var lens: [usize; 4096] = [0; 4096]
+    var count: usize = 0
+    var off: usize = 0
+    var len: usize = 0
+    while count < 4096 && nal.nal_iter_next(&it, &off, &len) {
+        if len > 0 && nal.nal_type(rt.ld8(annexb, off)) != 9 as u32 {
+            offs[count] = off
+            lens[count] = len
+            count = count + 1
+        }
+    }
+    var i: usize = 0
+    while i < count {
+        pack_nal(p, pkts, ts, i + 1 == count, annexb + offs[i] as u64, lens[i])
+        i = i + 1
+    }
+}
+
+fn h264depack_new() -> H264Depack {
+    return H264Depack {
+        au: rt.buf_new(), fu: rt.buf_new(), fu_active: false, have_seq: false, last_seq: 0 as u32,
+        cur_ts: 0 as u32, have_ts: false, damaged: false, ready: false, out_damaged: false,
+        held: rt.buf_new(), held_ready: false,
+    }
+}
+
+fn h264depack_free(d: *mut H264Depack) {
+    rt.buf_free(&(*d).au)
+    rt.buf_free(&(*d).fu)
+    rt.buf_free(&(*d).held)
+}
+
+fn push_nal(d: *mut H264Depack, p: u64, n: usize) {
+    rt.buf_push(&(*d).au, 0 as u8)
+    rt.buf_push(&(*d).au, 0 as u8)
+    rt.buf_push(&(*d).au, 0 as u8)
+    rt.buf_push(&(*d).au, 1 as u8)
+    rt.buf_push_bytes(&(*d).au, p, n)
+}
+
+fn h264depack_take(d: *mut H264Depack, out: *mut rt.Buf) -> bool {
+    if (*d).held_ready {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, (*d).held.ptr, (*d).held.len)
+        rt.buf_clear(&(*d).held)
+        (*d).held_ready = false
+        (*d).out_damaged = true
+        return true
+    }
+    if !(*d).ready { return false }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (*d).au.ptr, (*d).au.len)
+    rt.buf_clear(&(*d).au)
+    (*d).ready = false
+    (*d).out_damaged = (*d).damaged
+    (*d).damaged = false
+    return true
+}
+
+fn h264depack_damaged(d: *mut H264Depack) -> bool {
+    return (*d).out_damaged
+}
+
+fn h264depack_push(d: *mut H264Depack, pkt: u64, n: usize) -> bool {
+    var h: RtpPacket = RtpPacket { pt: 0 as u32, marker: false, seq: 0 as u32, ts: 0 as u32, ssrc: 0 as u32, off: 0, len: 0 }
+    if !rtp_parse(pkt, n, &h) { return false }
+    if h.len == 0 { return false }
+    if (*d).have_ts && h.ts != (*d).cur_ts && (*d).au.len > 0 && !(*d).ready && !(*d).held_ready {
+        rt.buf_clear(&(*d).held)
+        rt.buf_push_bytes(&(*d).held, (*d).au.ptr, (*d).au.len)
+        rt.buf_clear(&(*d).au)
+        (*d).held_ready = true
+        (*d).damaged = false
+        (*d).fu_active = false
+    }
+    if (*d).have_seq && !rtp_seq_after((*d).last_seq, h.seq) {
+        (*d).damaged = true
+        (*d).fu_active = false
+        rt.buf_clear(&(*d).fu)
+    }
+    (*d).have_seq = true
+    (*d).last_seq = h.seq
+    (*d).cur_ts = h.ts
+    (*d).have_ts = true
+    let first: u32 = rt.ld8(pkt, h.off) as u32
+    let kind: u32 = first & 31 as u32
+    if kind >= 1 as u32 && kind <= 23 as u32 {
+        push_nal(d, pkt + h.off as u64, h.len)
+    } else if kind == FU_A && h.len >= 2 {
+        let fh: u32 = rt.ld8(pkt, h.off + 1) as u32
+        if (fh & 128 as u32) != 0 as u32 {
+            rt.buf_clear(&(*d).fu)
+            rt.buf_push(&(*d).fu, ((first & 224 as u32) | (fh & 31 as u32)) as u8)
+            (*d).fu_active = true
+        }
+        if (*d).fu_active {
+            rt.buf_push_bytes(&(*d).fu, pkt + (h.off + 2) as u64, h.len - 2)
+            if (fh & 64 as u32) != 0 as u32 {
+                push_nal(d, (*d).fu.ptr, (*d).fu.len)
+                (*d).fu_active = false
+                rt.buf_clear(&(*d).fu)
+            }
+        } else {
+            (*d).damaged = true
+        }
+    } else {
+        (*d).damaged = true
+    }
+    if h.marker {
+        (*d).ready = true
+    }
+    return (*d).ready || (*d).held_ready
+}

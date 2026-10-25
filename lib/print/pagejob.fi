@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.str
+import print.ippcaps
+import print.bitmap
+import print.pwgraster
+import print.urfraster
+
+export {
+    Delivery, PageSource, choose_delivery, build_raster_document, page_pixels,
+    D_NONE, D_PDF, D_PWG, D_URF,
+}
+
+const D_NONE: u32 = 0
+const D_PDF: u32 = 1
+const D_PWG: u32 = 2
+const D_URF: u32 = 3
+
+struct Delivery {
+    kind: u32,
+    format: str,
+    dpi: u32,
+    pix: u32,
+}
+
+struct PageSource {
+    pages: u32,
+    render: fn(u64, u32, u32, u32, u32, *mut rt.Buf) -> bool,
+    ud: u64,
+}
+
+fn page_pixels(points: u32, dpi: u32) -> u32 {
+    return (points * dpi + 36) / 72
+}
+
+fn pick_pix(color_ok: bool, mono_ok: bool, want_color: bool) -> u32 {
+    if want_color && color_ok {
+        return bitmap.FMT_RGB8
+    }
+    if mono_ok {
+        return bitmap.FMT_GRAY8
+    }
+    return bitmap.FMT_BLACK1
+}
+
+fn choose_delivery(c: *mut ippcaps.Caps, want_color: bool, dpi_cap: u32) -> Delivery {
+    if ippcaps.caps_supports_pdf(c) {
+        return Delivery { kind: D_PDF, format: "application/pdf", dpi: 0, pix: 0 }
+    }
+    if ippcaps.caps_supports_pwg(c) {
+        var dpi: u32 = ippcaps.caps_best_dpi(c, dpi_cap)
+        if dpi == 0 {
+            dpi = 300
+        }
+        let color_ok: bool = ippcaps.caps_list_has(ippcaps.caps_pwg_color_types(c), "srgb_8")
+        let mono_ok: bool = ippcaps.caps_list_has(ippcaps.caps_pwg_color_types(c), "sgray_8")
+        return Delivery { kind: D_PWG, format: "image/pwg-raster", dpi: dpi, pix: pick_pix(color_ok, mono_ok, want_color) }
+    }
+    if ippcaps.caps_supports_urf(c) {
+        var dpi: u32 = ippcaps.caps_best_dpi(c, dpi_cap)
+        if dpi == 0 {
+            dpi = 300
+        }
+        let color_ok: bool = ippcaps.caps_urf_has(c, "SRGB24")
+        let mono_ok: bool = ippcaps.caps_urf_has(c, "W8")
+        return Delivery { kind: D_URF, format: "image/urf", dpi: dpi, pix: pick_pix(color_ok, mono_ok, want_color) }
+    }
+    return Delivery { kind: D_NONE, format: "", dpi: 0, pix: 0 }
+}
+
+fn build_raster_document(src: *mut PageSource, d: *mut Delivery, width_pt: u32, height_pt: u32, media: str, out: *mut rt.Buf) -> bool {
+    if (*d).kind != D_PWG && (*d).kind != D_URF {
+        return false
+    }
+    let w: u32 = page_pixels(width_pt, (*d).dpi)
+    let h: u32 = page_pixels(height_pt, (*d).dpi)
+    if w == 0 || h == 0 || (*src).pages == 0 {
+        return false
+    }
+    if (*d).kind == D_PWG {
+        pwgraster.pwg_begin(out)
+    } else {
+        urfraster.urf_begin(out, (*src).pages)
+    }
+    var pg: pwgraster.PwgPage = pwgraster.pwg_page_default()
+    pg.dpi_x = (*d).dpi
+    pg.dpi_y = (*d).dpi
+    pg.width_pt = width_pt
+    pg.height_pt = height_pt
+    pg.media_name = media
+    pg.total_pages = (*src).pages
+    var rgba: rt.Buf = rt.buf_new()
+    var i: u32 = 0
+    while i < (*src).pages {
+        rt.buf_clear(&rgba)
+        let render: fn(u64, u32, u32, u32, u32, *mut rt.Buf) -> bool = (*src).render
+        if !render((*src).ud, i, w, h, (*d).dpi, &rgba) || rt.buf_len(&rgba) != w as usize * h as usize * 4 {
+            rt.buf_free(&rgba)
+            return false
+        }
+        var dither: u32 = bitmap.DITHER_NONE
+        if (*d).pix == bitmap.FMT_BLACK1 {
+            dither = bitmap.DITHER_FLOYD
+        }
+        var bm: bitmap.Bitmap = bitmap.bitmap_from_rgba(rt.buf_ptr(&rgba), w, h, (*d).pix, dither)
+        if (*d).kind == D_PWG {
+            pwgraster.pwg_add_page(out, &bm, &pg)
+        } else {
+            urfraster.urf_add_page(out, &bm, (*d).dpi, 1 as u32, 4 as u32)
+        }
+        bitmap.bitmap_free(&bm)
+        i = i + 1
+    }
+    rt.buf_free(&rgba)
+    return true
+}

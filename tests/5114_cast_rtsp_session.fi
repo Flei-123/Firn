@@ -1,0 +1,80 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.h264enc
+import cast.h264dec
+import cast.rtsp
+import cast.rtspsrv
+import cast.rtspcli
+import cast.sdp
+
+fn main() -> i32 {
+    var m: rtsp.RtspMsg = rtsp.RtspMsg { is_response: false, status: 0 as u32, m_off: 0, m_len: 0, u_off: 0, u_len: 0, h_off: 0, h_end: 0, b_off: 0, b_len: 0, used: 0 }
+    let part: str = "OPTIONS * RTSP/1.0\r\nCSeq: 7\r\nRequire: org.wfa.wfd1.0\r\n"
+    if rtsp.rtsp_parse(part.p as u64, part.n, &m) != rtsp.RTSP_NEED_MORE { return 1 }
+    let full: str = "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\ncseq: 12\r\nContent-Type: text/parameters\r\nContent-Length: 11\r\n\r\nwfd_x: abc\n"
+    let used: i64 = rtsp.rtsp_parse(full.p as u64, full.n, &m)
+    if used != full.n as i64 { return 2 }
+    if !rtsp.rtsp_is_method(full.p as u64, &m, "set_parameter") { return 3 }
+    if rtsp.rtsp_cseq(full.p as u64, &m) != 12 { return 4 }
+    if m.b_len != 11 { return 5 }
+    let short: str = "SET_PARAMETER x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 50\r\n\r\nabc"
+    if rtsp.rtsp_parse(short.p as u64, short.n, &m) != rtsp.RTSP_NEED_MORE { return 6 }
+    let junk: str = "HELLO\r\n\r\n"
+    if rtsp.rtsp_parse(junk.p as u64, junk.n, &m) != rtsp.RTSP_INVALID { return 7 }
+    let resp: str = "RTSP/1.0 454 Session Not Found\r\nCSeq: 3\r\n\r\n"
+    if rtsp.rtsp_parse(resp.p as u64, resp.n, &m) != resp.n as i64 || !m.is_response || m.status != 454 as u32 { return 8 }
+
+    var e: h264enc.Enc = h264enc.enc_new(1280, 720, 30 as u32)
+    var hdr: rt.Buf = rt.buf_new()
+    h264enc.enc_headers(&e, &hdr)
+    var sdp_text: rt.Buf = rt.buf_new()
+    if !sdp.sdp_h264(&sdp_text, "127.0.0.1", 96 as u32, hdr.ptr, hdr.len, 30 as u32, "streamid=0") { return 10 }
+    if rtsp.rtsp_find(sdp_text.ptr, sdp_text.len, 0, "profile-level-id=42401F") < 0 { return 11 }
+
+    var srv: rtspsrv.RtspSrv = rtspsrv.rs_new(12345678 as u32)
+    rtspsrv.rs_set_sdp(&srv, sdp_text.ptr, sdp_text.len)
+    rtspsrv.rs_set_base(&srv, "rtsp://127.0.0.1:8554/screen/")
+    rtspsrv.rs_set_server_ports(&srv, 6000 as u32)
+    var cli: rtspcli.RtspCli = rtspcli.rc_new("rtsp://127.0.0.1:8554/screen", 5000 as u32)
+    var req: rt.Buf = rt.buf_new()
+    var rsp: rt.Buf = rt.buf_new()
+    var events: u32 = 0 as u32
+    var rounds: u32 = 0 as u32
+    while !rtspcli.rc_playing(&cli) && rounds < 10 as u32 {
+        if !rtspcli.rc_request(&cli, &req) { return 20 }
+        let ev: u32 = rtspsrv.rs_handle(&srv, req.ptr, req.len, &rsp)
+        events = events * 8 as u32 + ev
+        if rtspcli.rc_response(&cli, rsp.ptr, rsp.len) < 0 { return 21 }
+        rounds = rounds + 1 as u32
+    }
+    if !rtspcli.rc_playing(&cli) { return 22 }
+    if rtspsrv.rs_state(&srv) != 2 as u32 { return 23 }
+    if rtspsrv.rs_client_rtp_port(&srv) != 5000 as u32 { return 24 }
+    if rtspcli.rc_server_rtp_port(&cli) != 6000 as u32 { return 25 }
+    if events != 1 * 8 + 2 { return 26 }
+
+    var sprop: rt.Buf = rt.buf_new()
+    rtspcli.rc_sprop(&cli, &sprop)
+    if sprop.len != hdr.len - 0 && sprop.len == 0 { return 27 }
+    var d: h264dec.Dec = h264dec.dec_new()
+    if h264dec.dec_annexb(&d, sprop.ptr, sprop.len) != h264dec.DEC_OK { return 28 }
+    if !h264dec.dec_ready(&d) || h264dec.dec_width(&d) != 1280 || h264dec.dec_height(&d) != 720 { return 29 }
+
+    let bad_play: str = "PLAY rtsp://x RTSP/1.0\r\nCSeq: 9\r\nSession: 1\r\n\r\n"
+    rtspsrv.rs_handle(&srv, bad_play.p as u64, bad_play.n, &rsp)
+    if rtsp.rtsp_find(rsp.ptr, rsp.len, 0, "454") < 0 { return 30 }
+    let tcp: str = "SETUP rtsp://x/streamid=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+    rtspsrv.rs_handle(&srv, tcp.p as u64, tcp.n, &rsp)
+    if rtsp.rtsp_find(rsp.ptr, rsp.len, 0, "461") < 0 { return 31 }
+
+    if !rtspcli.rc_request(&cli, &req) { return 40 }
+    if rtspsrv.rs_handle(&srv, req.ptr, req.len, &rsp) != rtspsrv.EV_TEARDOWN { return 41 }
+    if rtspsrv.rs_state(&srv) != 0 as u32 { return 42 }
+
+    rtspsrv.rs_free(&srv)
+    rtspcli.rc_free(&cli)
+    h264enc.enc_free(&e)
+    h264dec.dec_free(&d)
+    return 0
+}

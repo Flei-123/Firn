@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.time
+import net.udp
+import net.mcast
+import mdns.mdns_wire
+import mdns.mdns_cache
+import mdns.mdns_browse
+import mdns.mdns_resp
+
+export {
+    MDNS_PORT, sock_open, sock_close, now_ms, send_group, send_to,
+    browse_run, resolve_run, Serve, serve_open, serve_start, serve_loop, serve_end,
+    SERVE_OK, SERVE_CONFLICT, SERVE_ERROR,
+}
+
+const MDNS_PORT: u32 = 5353
+const RECV_CAP: usize = 9000
+const SERVE_OK: i32 = 0
+const SERVE_CONFLICT: i32 = 3
+const SERVE_ERROR: i32 = 1
+const OWN_RING: usize = 16
+
+fn now_ms() -> u64 {
+    return time.monotonic_ns() / 1000000 as u64
+}
+
+fn sock_open(port: u16, iface: u32) -> i64 {
+    let fd: i64 = mcast.mcast_open(port, iface)
+    if fd < 0 {
+        return fd
+    }
+    let j: i64 = mcast.mcast_join(fd, mcast.MCAST_MDNS_V4, iface)
+    if j < 0 {
+        udp.udp_close(fd)
+        return j
+    }
+    return fd
+}
+
+fn sock_close(fd: i64) {
+    udp.udp_close(fd)
+}
+
+fn send_group(fd: i64, pk: *mut mdns_wire.Pk, port: u16) -> i64 {
+    return udp.udp_sendto(fd, mdns_wire.pk_ptr(pk), mdns_wire.pk_len(pk), mcast.MCAST_MDNS_V4, port)
+}
+
+fn send_to(fd: i64, pk: *mut mdns_wire.Pk, addr: u32, port: u16) -> i64 {
+    return udp.udp_sendto(fd, mdns_wire.pk_ptr(pk), mdns_wire.pk_len(pk), addr, port)
+}
+
+fn fnv(p: u64, n: usize) -> u32 {
+    var h: u32 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u32)) *% 16777619 as u32
+        i = i + 1
+    }
+    return h
+}
+
+fn wait_slice(deadline: u64, now: u64) -> u64 {
+    if deadline <= now {
+        return 1 as u64
+    }
+    let left: u64 = deadline - now
+    if left > 100 as u64 {
+        return 100 as u64
+    }
+    return left
+}
+
+fn browse_run(fd: i64, port: u16, type_w: u64, tlen: usize, c: *mut mdns_cache.Cache, window_ms: u64) -> u32 {
+    let buf: u64 = rt.heap_alloc(RECV_CAP)
+    let start: u64 = now_ms()
+    let deadline: u64 = start + window_ms
+    var next_send: u64 = start
+    var interval: u64 = 1000
+    var total: u32 = 0
+    var go: bool = true
+    while go {
+        let now: u64 = now_ms()
+        if now >= deadline {
+            go = false
+        } else {
+            if now >= next_send {
+                var pk: mdns_wire.Pk = mdns_wire.pk_new(0 as u32, 0 as u32)
+                mdns_browse.browse_query(&pk, type_w, tlen, mdns_wire.T_PTR, false, c, now)
+                mdns_wire.pk_finish(&pk)
+                send_group(fd, &pk, port)
+                mdns_wire.pk_free(&pk)
+                next_send = now + interval
+                interval = interval * 2 as u64
+            }
+            udp.udp_set_timeout(fd, wait_slice(deadline, now))
+            var fa: u32 = 0
+            var fp: u16 = 0 as u16
+            let k: i64 = udp.udp_recvfrom(fd, buf, RECV_CAP, &fa, &fp)
+            if k > 0 {
+                total = total + mdns_browse.browse_ingest(c, buf, k as usize, now_ms())
+            }
+        }
+    }
+    rt.heap_free(buf, RECV_CAP)
+    return total
+}
+
+fn resolve_run(fd: i64, port: u16, c: *mut mdns_cache.Cache, inst: u64, ilen: usize,
+    window_ms: u64, f: *mut mdns_browse.Found) -> u32 {
+    let buf: u64 = rt.heap_alloc(RECV_CAP)
+    let start: u64 = now_ms()
+    let deadline: u64 = start + window_ms
+    var next_send: u64 = start
+    var got: u32 = 0
+    var go: bool = true
+    while go {
+        let now: u64 = now_ms()
+        got = mdns_browse.browse_resolve(c, inst, ilen, now, f)
+        let need: u32 = mdns_browse.FOUND_SRV | mdns_browse.FOUND_TXT | mdns_browse.FOUND_A
+        if (got & need) == need || now >= deadline {
+            go = false
+        } else {
+            if now >= next_send {
+                var pk: mdns_wire.Pk = mdns_wire.pk_new(0 as u32, 0 as u32)
+                if (got & mdns_browse.FOUND_SRV) == 0 as u32 {
+                    mdns_browse.browse_query(&pk, inst, ilen, mdns_wire.T_SRV, false, c, now)
+                    mdns_browse.browse_query(&pk, inst, ilen, mdns_wire.T_TXT, false, c, now)
+                } else {
+                    if (got & mdns_browse.FOUND_TXT) == 0 as u32 {
+                        mdns_browse.browse_query(&pk, inst, ilen, mdns_wire.T_TXT, false, c, now)
+                    }
+                    let hp: u64 = (&(*f).host[0]) as u64
+                    mdns_browse.browse_query(&pk, hp, (*f).hlen, mdns_wire.T_A, false, c, now)
+                    mdns_browse.browse_query(&pk, hp, (*f).hlen, mdns_wire.T_AAAA, false, c, now)
+                }
+                mdns_wire.pk_finish(&pk)
+                send_group(fd, &pk, port)
+                mdns_wire.pk_free(&pk)
+                next_send = now + 400 as u64
+            }
+            udp.udp_set_timeout(fd, wait_slice(deadline, now))
+            var fa: u32 = 0
+            var fp: u16 = 0 as u16
+            let k: i64 = udp.udp_recvfrom(fd, buf, RECV_CAP, &fa, &fp)
+            if k > 0 {
+                mdns_browse.browse_ingest(c, buf, k as usize, now_ms())
+            }
+        }
+    }
+    rt.heap_free(buf, RECV_CAP)
+    return got
+}
+
+struct Own {
+    ring: [u32; 16],
+    pos: usize,
+}
+
+fn own_note(o: *mut Own, p: u64, n: usize) {
+    (*o).ring[(*o).pos % OWN_RING] = fnv(p, n)
+    (*o).pos = (*o).pos + 1
+}
+
+fn own_has(o: *mut Own, p: u64, n: usize) -> bool {
+    let h: u32 = fnv(p, n)
+    var i: usize = 0
+    while i < OWN_RING {
+        if (*o).ring[i] == h {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn send_noted(fd: i64, o: *mut Own, pk: *mut mdns_wire.Pk, port: u16) {
+    own_note(o, mdns_wire.pk_ptr(pk), mdns_wire.pk_len(pk))
+    send_group(fd, pk, port)
+}
+
+fn listen_until(fd: i64, port: u16, reg: *mut mdns_resp.Reg, o: *mut Own, buf: u64, until: u64,
+    stop: u64, answer: bool) -> bool {
+    var conflict: bool = false
+    var go: bool = true
+    while go {
+        let now: u64 = now_ms()
+        if now >= until || (stop != 0 as u64 && rt.ld64(stop, 0) != 0 as u64) {
+            go = false
+        } else {
+            udp.udp_set_timeout(fd, wait_slice(until, now))
+            var fa: u32 = 0
+            var fp: u16 = 0 as u16
+            let k: i64 = udp.udp_recvfrom(fd, buf, RECV_CAP, &fa, &fp)
+            if k > 0 && !own_has(o, buf, k as usize) {
+                if mdns_resp.resp_conflict(reg, buf, k as usize) != mdns_resp.BAD {
+                    conflict = true
+                    go = false
+                } else if answer {
+                    var pk: mdns_wire.Pk = mdns_wire.pk_new(0 as u32, mdns_resp.RESP_FLAGS)
+                    let mode: u32 = mdns_resp.resp_answer(reg, buf, k as usize, fp as u32, port as u32, &pk)
+                    if mode == mdns_resp.MODE_MULTICAST {
+                        send_noted(fd, o, &pk, port)
+                    } else if mode == mdns_resp.MODE_UNICAST {
+                        send_to(fd, &pk, fa, fp)
+                    }
+                    mdns_wire.pk_free(&pk)
+                }
+            }
+        }
+    }
+    return conflict
+}
+
+struct Serve {
+    fd: i64,
+    port: u16,
+    own: Own,
+    buf: u64,
+    stop: u64,
+}
+
+fn serve_open(fd: i64, port: u16, stop: u64) -> Serve {
+    return Serve { fd: fd, port: port, own: Own { ring: [0; 16], pos: 0 }, buf: rt.heap_alloc(RECV_CAP), stop: stop }
+}
+
+fn send_each(sv: *mut Serve, reg: *mut mdns_resp.Reg, kind: u32) {
+    var i: usize = 0
+    while i < mdns_resp.MAX_SVC {
+        if mdns_resp.reg_used(reg, i) {
+            var pk: mdns_wire.Pk = mdns_wire.pk_new(0 as u32, 0 as u32)
+            if kind == 0 as u32 {
+                mdns_resp.resp_probe(reg, i, &pk)
+            } else {
+                pk = mdns_wire.pk_new(0 as u32, mdns_resp.RESP_FLAGS)
+                mdns_resp.resp_announce(reg, i, &pk, kind == 2 as u32)
+            }
+            send_noted((*sv).fd, &(*sv).own, &pk, (*sv).port)
+            mdns_wire.pk_free(&pk)
+        }
+        i = i + 1
+    }
+}
+
+fn serve_start(sv: *mut Serve, reg: *mut mdns_resp.Reg, probe: bool) -> i32 {
+    var round: u32 = 0
+    if probe {
+        while round < 3 as u32 {
+            send_each(sv, reg, 0 as u32)
+            if listen_until((*sv).fd, (*sv).port, reg, &(*sv).own, (*sv).buf, now_ms() + 250 as u64, (*sv).stop, false) {
+                return SERVE_CONFLICT
+            }
+            round = round + 1 as u32
+        }
+    }
+    round = 0
+    while round < 2 as u32 {
+        send_each(sv, reg, 1 as u32)
+        if listen_until((*sv).fd, (*sv).port, reg, &(*sv).own, (*sv).buf, now_ms() + 1000 as u64, (*sv).stop, true) {
+            return SERVE_CONFLICT
+        }
+        round = round + 1 as u32
+    }
+    return SERVE_OK
+}
+
+fn serve_loop(sv: *mut Serve, reg: *mut mdns_resp.Reg, run_ms: u64) -> i32 {
+    var until: u64 = 18446744073709551615
+    if run_ms != 0 as u64 {
+        until = now_ms() + run_ms
+    }
+    if listen_until((*sv).fd, (*sv).port, reg, &(*sv).own, (*sv).buf, until, (*sv).stop, true) {
+        return SERVE_CONFLICT
+    }
+    return SERVE_OK
+}
+
+fn serve_end(sv: *mut Serve, reg: *mut mdns_resp.Reg) {
+    send_each(sv, reg, 2 as u32)
+    rt.heap_free((*sv).buf, RECV_CAP)
+}
