@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.net
+import jobs.jobs
+import mc.mc_net
+import mc.mc_connect
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_serverlist
+import mc.mc_menu_addr
+import mc.mc_hostname
+
+export {
+    PingBoard, board_new, board_free, board_mark_dirty, board_tick, board_get, board_pending,
+    PS_PENDING, PS_OK, PS_FAILED, PW_STATE, PW_ONLINE, PW_MAX, PW_LATENCY, PW_MOTD, PW_MOTD_N,
+}
+
+const MAX_SLOTS: usize = 16
+const WORKERS: u64 = 2 as u64
+const STATUS_WAITS: i32 = 15
+const MOTD_MAX: usize = 160
+const PROTOCOL: i32 = 763
+const PS_PENDING: u64 = 0 as u64
+const PS_OK: u64 = 1 as u64
+const PS_FAILED: u64 = 2 as u64
+const PW_TASK: usize = 0
+const PW_ENTRY: usize = 1
+const PW_ENTRY_N: usize = 2
+const PW_STATE: usize = 3
+const PW_ONLINE: usize = 4
+const PW_MAX: usize = 5
+const PW_LATENCY: usize = 6
+const PW_MOTD: usize = 7
+const PW_MOTD_N: usize = 8
+const PW_WORDS: usize = 9
+
+struct PingBoard {
+    pool: jobs.Jobs,
+    slots: [u64; 16],
+    count: i32,
+    dirty: bool,
+}
+
+fn board_new() -> PingBoard {
+    return PingBoard { pool: jobs.create(WORKERS), slots: [0; 16], count: 0, dirty: true }
+}
+
+fn board_mark_dirty(b: *mut PingBoard) {
+    (*b).dirty = true
+}
+
+fn slot_free(s: u64) {
+    if rt.ld64(s, PW_ENTRY) != 0 { rt.heap_free(rt.ld64(s, PW_ENTRY), rt.ld64(s, PW_ENTRY_N) as usize) }
+    if rt.ld64(s, PW_MOTD) != 0 { rt.heap_free(rt.ld64(s, PW_MOTD), MOTD_MAX) }
+    rt.heap_free(s, PW_WORDS * 8)
+}
+
+fn ping_run(s: u64) -> u64 {
+    let entry: u64 = rt.ld64(s, PW_ENTRY)
+    let total: usize = rt.ld64(s, PW_ENTRY_N) as usize - 1
+    var hn: usize = 0
+    var port: i32 = 0
+    if !mc_menu_addr.addr_parse(entry, total, &hn, &port) {
+        rt.st64(s, PW_STATE, PS_FAILED)
+        return 0
+    }
+    var which: usize = 0
+    let conn: net.Conn = mc_connect.connect_host(entry, hn, port as u16, &which)
+    if !net.conn_is_open(&conn) {
+        rt.st64(s, PW_STATE, PS_FAILED)
+        return 0
+    }
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(PROTOCOL, &ver) {
+        rt.st64(s, PW_STATE, PS_FAILED)
+        return 0
+    }
+    var st: mc_net.Status = mc_net.status_new()
+    let inner_n: usize = mc_hostname.bracket_inner_len(entry, hn)
+    let hostz: u64 = rt.heap_alloc(inner_n + 1)
+    if hostz == 0 {
+        rt.st64(s, PW_STATE, PS_FAILED)
+        return 0
+    }
+    rt.mem_copy(hostz, mc_hostname.bracket_inner_ptr(entry, hn), inner_n)
+    rt.st8(hostz, inner_n, 0 as u8)
+    let rc: i32 = mc_net.net_status_on(conn, port as u16, hostz, &ver, STATUS_WAITS, &st)
+    rt.heap_free(hostz, inner_n + 1)
+    if rc != mc_net.NS_OK {
+        mc_net.status_free(&st)
+        rt.st64(s, PW_STATE, PS_FAILED)
+        return 0
+    }
+    rt.st64(s, PW_ONLINE, st.online as u64)
+    rt.st64(s, PW_MAX, st.max as u64)
+    rt.st64(s, PW_LATENCY, st.latency_ms)
+    var n: usize = rt.buf_len(&st.motd)
+    if n > MOTD_MAX { n = MOTD_MAX }
+    let m: u64 = rt.heap_alloc(MOTD_MAX)
+    if m != 0 {
+        rt.mem_copy(m, rt.buf_ptr(&st.motd), n)
+        rt.st64(s, PW_MOTD, m)
+        rt.st64(s, PW_MOTD_N, n as u64)
+    }
+    mc_net.status_free(&st)
+    rt.st64(s, PW_STATE, PS_OK)
+    return 1
+}
+
+fn slot_new(sl: *mut mc_serverlist.ServerList, i: i32) -> u64 {
+    let s: u64 = rt.heap_alloc(PW_WORDS * 8)
+    if s == 0 { return 0 }
+    var w: usize = 0
+    while w < PW_WORDS {
+        rt.st64(s, w, 0)
+        w = w + 1
+    }
+    let n: usize = mc_serverlist.sl_len(sl, i)
+    let copy: u64 = rt.heap_alloc(n + 1)
+    if copy == 0 {
+        rt.heap_free(s, PW_WORDS * 8)
+        return 0
+    }
+    rt.mem_copy(copy, mc_serverlist.sl_ptr(sl, i), n)
+    rt.st8(copy, n, 0 as u8)
+    rt.st64(s, PW_ENTRY, copy)
+    rt.st64(s, PW_ENTRY_N, (n + 1) as u64)
+    return s
+}
+
+fn board_pending(b: *mut PingBoard) -> i32 {
+    var k: i32 = 0
+    var i: i32 = 0
+    while i < (*b).count {
+        if rt.ld64((*b).slots[i as usize], PW_TASK) != 0 { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+fn board_reset(b: *mut PingBoard, sl: *mut mc_serverlist.ServerList) {
+    var i: i32 = 0
+    while i < (*b).count {
+        slot_free((*b).slots[i as usize])
+        (*b).slots[i as usize] = 0 as u64
+        i = i + 1
+    }
+    (*b).count = 0
+    if (*b).pool.blk == 0 { return }
+    var n: i32 = mc_serverlist.sl_count(sl)
+    if n > MAX_SLOTS as i32 { n = MAX_SLOTS as i32 }
+    i = 0
+    while i < n {
+        let s: u64 = slot_new(sl, i)
+        if s != 0 {
+            let t: u64 = jobs.spawn(&(*b).pool, ping_run, s)
+            if t != 0 {
+                rt.st64(s, PW_TASK, t)
+                (*b).slots[(*b).count as usize] = s
+                (*b).count = (*b).count + 1
+            } else {
+                slot_free(s)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn board_tick(b: *mut PingBoard, sl: *mut mc_serverlist.ServerList) {
+    var i: i32 = 0
+    while i < (*b).count {
+        let s: u64 = (*b).slots[i as usize]
+        let t: u64 = rt.ld64(s, PW_TASK)
+        if t != 0 && jobs.task_done(t) {
+            jobs.join(&(*b).pool, t)
+            rt.st64(s, PW_TASK, 0)
+        }
+        i = i + 1
+    }
+    if (*b).dirty && board_pending(b) == 0 {
+        (*b).dirty = false
+        board_reset(b, sl)
+    }
+}
+
+fn board_get(b: *mut PingBoard, sl: *mut mc_serverlist.ServerList, i: i32) -> u64 {
+    if i < 0 || i >= (*b).count || i >= mc_serverlist.sl_count(sl) { return 0 }
+    let s: u64 = (*b).slots[i as usize]
+    let n: usize = mc_serverlist.sl_len(sl, i)
+    if rt.ld64(s, PW_ENTRY_N) as usize != n + 1 { return 0 }
+    if !rt.mem_eq(rt.ld64(s, PW_ENTRY), mc_serverlist.sl_ptr(sl, i), n) { return 0 }
+    return s
+}
+
+fn board_free(b: *mut PingBoard) {
+    if board_pending(b) > 0 { return }
+    var i: i32 = 0
+    while i < (*b).count {
+        slot_free((*b).slots[i as usize])
+        i = i + 1
+    }
+    (*b).count = 0
+    if (*b).pool.blk != 0 { jobs.destroy(&(*b).pool) }
+}

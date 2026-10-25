@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.env
+import window.window
+import input.raw
+import mc.mc_present
+import mc.mc_raster
+import mc.mc_hud
+import mc.mc_serverlist
+import mc.mc_startscreen
+import mc.mc_gui_pack
+import mc.mc_gui_ui
+import mc.mc_panorama
+import mc.mc_menu_title
+import mc.mc_menu_multi
+import mc.mc_menu_info
+import mc.mc_menu_addr
+import mc.mc_menu_ping
+
+export { menu_run, menu_wanted, MENU_OK, MENU_CANCELLED, MENU_NO_DISPLAY, MENU_UNAVAILABLE }
+
+const MENU_OK: i32 = 0
+const MENU_CANCELLED: i32 = 1
+const MENU_NO_DISPLAY: i32 = 2
+const MENU_UNAVAILABLE: i32 = 3
+const SCR_TITLE: i32 = 0
+const SCR_MULTI: i32 = 1
+const SCR_ADD: i32 = 2
+const SCR_EDIT: i32 = 3
+const SCR_DIRECT: i32 = 4
+const SCR_SINGLE: i32 = 5
+const SCR_REALMS: i32 = 6
+const SCR_OPTIONS: i32 = 7
+const SC_ESC: u32 = 1
+const SC_BACKSPACE: u32 = 14
+const SC_TAB: u32 = 15
+const SC_ENTER: u32 = 28
+const SC_KP_ENTER: u32 = 96
+const FRAME_MS: i64 = 16
+const TICK_MS: u64 = 50 as u64
+
+struct Menu {
+    screen: i32,
+    title: mc_menu_title.TitleState,
+    multi: mc_menu_multi.MultiState,
+    field: rt.Buf,
+    pings: mc_menu_ping.PingBoard,
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn env_int(name: str, def: i32) -> i32 {
+    if !env.has(name) { return def }
+    let v: str = env.get(name)
+    if v.length() == 0 { return def }
+    var n: i32 = 0
+    var i: usize = 0
+    while i < v.length() {
+        let c: u8 = v.chars(i)
+        if c < 48 as u8 || c > 57 as u8 { return def }
+        n = n * 10 + (c as i32 - 48)
+        i = i + 1
+    }
+    return n
+}
+
+fn menu_wanted() -> bool {
+    if env.has("MCPLAY_MENU") && env.get("MCPLAY_MENU").length() > 0 && env.get("MCPLAY_MENU").chars(0) == 48 as u8 { return false }
+    return true
+}
+
+fn goto_screen(m: *mut Menu, scr: i32) {
+    (*m).screen = scr
+}
+
+fn open_field(m: *mut Menu, u: *mut mc_gui_ui.Ui, text_p: u64, text_n: usize) {
+    rt.buf_clear(&(*m).field)
+    rt.buf_push_bytes(&(*m).field, text_p, text_n)
+    (*u).focus = 0
+}
+
+fn join_selected(f: *mut mc_startscreen.StartForm, host_p: u64, host_n: usize, port: i32) {
+    mc_startscreen.form_set(f, mc_startscreen.FIELD_HOST, host_p, host_n)
+    var pb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&pb, port as i64)
+    mc_startscreen.form_set(f, mc_startscreen.FIELD_PORT, rt.buf_ptr(&pb), rt.buf_len(&pb))
+    rt.buf_free(&pb)
+    if mc_startscreen.form_text_len(f, mc_startscreen.FIELD_NAME) == 0 {
+        let dn: str = "Player"
+        mc_startscreen.form_set(f, mc_startscreen.FIELD_NAME, dn.p as u64, dn.n)
+    }
+    (*f).submitted = true
+}
+
+fn apply_address(m: *mut Menu, f: *mut mc_startscreen.StartForm, replace: i32, join: bool) {
+    var hn: usize = 0
+    var pt: i32 = 0
+    let p: u64 = rt.buf_ptr(&(*m).field)
+    if !mc_menu_addr.addr_parse(p, rt.buf_len(&(*m).field), &hn, &pt) { return }
+    if replace >= 0 { mc_serverlist.sl_remove(&(*f).servers, replace) }
+    if join {
+        join_selected(f, p, hn, pt)
+    } else {
+        mc_serverlist.sl_add(&(*f).servers, p, hn, pt)
+    }
+}
+
+fn selected_text(m: *mut Menu, f: *mut mc_startscreen.StartForm) {
+    rt.buf_clear(&(*m).field)
+    let i: i32 = (*m).multi.sel
+    if i < 0 { return }
+    rt.buf_push_bytes(&(*m).field, mc_serverlist.sl_ptr(&(*f).servers, i), mc_serverlist.sl_len(&(*f).servers, i))
+}
+
+fn frame_screen(m: *mut Menu, u: *mut mc_gui_ui.Ui, f: *mut mc_startscreen.StartForm, pan: *mut mc_panorama.Panorama, spin: f64) -> bool {
+    var quit: bool = false
+    if (*m).screen == SCR_TITLE {
+        let a: i32 = mc_menu_title.title_frame(u, &(*m).title, pan, spin)
+        if a == mc_menu_title.ACT_SINGLE { goto_screen(m, SCR_SINGLE) }
+        if a == mc_menu_title.ACT_REALMS { goto_screen(m, SCR_REALMS) }
+        if a == mc_menu_title.ACT_MULTI { goto_screen(m, SCR_MULTI) }
+        if a == mc_menu_title.ACT_OPTIONS { goto_screen(m, SCR_OPTIONS) }
+        if a == mc_menu_title.ACT_QUIT { quit = true }
+    } else if (*m).screen == SCR_MULTI {
+        let a: i32 = mc_menu_multi.multi_frame(u, &(*m).multi, &(*f).servers, &(*m).pings)
+        if a == mc_menu_multi.MA_BACK || (*u).key_esc { goto_screen(m, SCR_TITLE) }
+        if a == mc_menu_multi.MA_JOIN && (*m).multi.sel >= 0 {
+            selected_text(m, f)
+            apply_address(m, f, 0 - 1, true)
+        }
+        if a == mc_menu_multi.MA_DIRECT {
+            open_field(m, u, 0 as u64, 0)
+            goto_screen(m, SCR_DIRECT)
+        }
+        if a == mc_menu_multi.MA_ADD {
+            open_field(m, u, 0 as u64, 0)
+            goto_screen(m, SCR_ADD)
+        }
+        if a == mc_menu_multi.MA_EDIT && (*m).multi.sel >= 0 {
+            selected_text(m, f)
+            (*u).focus = 0
+            goto_screen(m, SCR_EDIT)
+        }
+        if a == mc_menu_multi.MA_DELETE && (*m).multi.sel >= 0 {
+            mc_serverlist.sl_remove(&(*f).servers, (*m).multi.sel)
+            (*m).multi.sel = 0 - 1
+            mc_menu_ping.board_mark_dirty(&(*m).pings)
+        }
+        if a == mc_menu_multi.MA_REFRESH { mc_menu_ping.board_mark_dirty(&(*m).pings) }
+    } else if (*m).screen == SCR_ADD {
+        let a: i32 = mc_menu_multi.address_frame(u, mc_gui_ui.ui_lang(u, "manageServer.add.title", "Add Server"), mc_gui_ui.ui_lang(u, "addServer.enterIp", "Server Address"), mc_gui_ui.ui_lang(u, "addServer.add", "Done"), &(*m).field, 100, 116, (*u).uh / 4 + 108)
+        if a == mc_menu_multi.AD_OK {
+            apply_address(m, f, 0 - 1, false)
+            mc_menu_ping.board_mark_dirty(&(*m).pings)
+            goto_screen(m, SCR_MULTI)
+        }
+        if a == mc_menu_multi.AD_CANCEL { goto_screen(m, SCR_MULTI) }
+    } else if (*m).screen == SCR_EDIT {
+        let a: i32 = mc_menu_multi.address_frame(u, mc_gui_ui.ui_lang(u, "manageServer.edit.title", "Edit Server Info"), mc_gui_ui.ui_lang(u, "addServer.enterIp", "Server Address"), mc_gui_ui.ui_lang(u, "addServer.add", "Done"), &(*m).field, 100, 116, (*u).uh / 4 + 108)
+        if a == mc_menu_multi.AD_OK {
+            apply_address(m, f, (*m).multi.sel, false)
+            mc_menu_ping.board_mark_dirty(&(*m).pings)
+            goto_screen(m, SCR_MULTI)
+        }
+        if a == mc_menu_multi.AD_CANCEL { goto_screen(m, SCR_MULTI) }
+    } else if (*m).screen == SCR_DIRECT {
+        let a: i32 = mc_menu_multi.address_frame(u, mc_gui_ui.ui_lang(u, "selectServer.direct", "Direct Connection"), mc_gui_ui.ui_lang(u, "addServer.enterIp", "Server Address"), mc_gui_ui.ui_lang(u, "selectServer.select", "Join Server"), &(*m).field, 100, 116, (*u).uh / 4 + 108)
+        if a == mc_menu_multi.AD_OK { apply_address(m, f, 0 - 1, true) }
+        if a == mc_menu_multi.AD_CANCEL { goto_screen(m, SCR_MULTI) }
+    } else if (*m).screen == SCR_SINGLE {
+        if mc_menu_info.info_frame(u, mc_gui_ui.ui_lang(u, "menu.singleplayer", "Singleplayer"), "Singleplayer is not available yet.", "Use Multiplayer to join a server.") || (*u).key_esc { goto_screen(m, SCR_TITLE) }
+    } else if (*m).screen == SCR_REALMS {
+        if mc_menu_info.info_frame(u, mc_gui_ui.ui_lang(u, "menu.online", "Minecraft Realms"), "Realms is not available in mcplay.", "Use Multiplayer to join a server.") || (*u).key_esc { goto_screen(m, SCR_TITLE) }
+    } else if (*m).screen == SCR_OPTIONS {
+        if mc_menu_info.options_frame(u) || (*u).key_esc { goto_screen(m, SCR_TITLE) }
+    }
+    return quit
+}
+
+fn menu_run(f: *mut mc_startscreen.StartForm, protocol: i32) -> i32 {
+    var pk: mc_gui_pack.GuiPack = mc_gui_pack.gpack_new()
+    if !mc_gui_pack.gpack_open(&pk, protocol) {
+        mc_gui_pack.gpack_free(&pk)
+        return MENU_UNAVAILABLE
+    }
+    var win: window.Window = window.window_new()
+    if !window.open_window(&win, 0) {
+        mc_gui_pack.gpack_free(&pk)
+        return MENU_NO_DISPLAY
+    }
+    window.full_input(&win, true)
+    let ww: i32 = env_int("MCPLAY_W", 854)
+    let wh: i32 = env_int("MCPLAY_H", 480)
+    if !window.make(&win, ww as usize, wh as usize) {
+        mc_gui_pack.gpack_free(&pk)
+        return MENU_NO_DISPLAY
+    }
+    window.raw_input(&win, true)
+    let ttl: str = "mcplay"
+    window.title(&win, ttl.p as u64, ttl.n)
+    window.show_window(&win)
+    var rw: raw.Raw = raw.raw_new()
+    var r: mc_raster.Raster = mc_raster.raster_new(ww, wh)
+    let bgrx: u64 = rt.heap_alloc((ww as usize) * (wh as usize) * 4)
+    var pan: mc_panorama.Panorama = mc_panorama.pan_new()
+    mc_panorama.pan_load(&pan, &pk)
+    var m: Menu = Menu { screen: SCR_TITLE, title: mc_menu_title.title_new(), multi: mc_menu_multi.multi_new(), field: rt.buf_new(), pings: mc_menu_ping.board_new() }
+    let t0: u64 = now_ms()
+    mc_menu_title.title_pick_splash(&m.title, &pk, t0)
+    var u: mc_gui_ui.Ui = mc_gui_ui.ui_new()
+    var closed: bool = false
+    var quit: bool = false
+    while !(*f).submitted && !closed && !quit {
+        raw.raw_begin(&rw)
+        var k: u32 = window.next_event(&win)
+        var guard: i32 = 0
+        while k != window.EV_NONE && guard < 20000 {
+            guard = guard + 1
+            if k == window.EV_CHAR {
+                let ch: u32 = window.ev_a(&win)
+                if ch < 128 as u32 { rt.buf_push(&u.typed, ch as u8) }
+            } else if k == window.EV_CLOSED {
+                closed = true
+            } else if k != window.EV_CONFIGURE {
+                raw.raw_feed(&rw, k, window.ev_a(&win), window.ev_x(&win), window.ev_y(&win), window.ev_state(&win))
+            }
+            k = window.next_event(&win)
+        }
+        raw.raw_end(&rw)
+        u.key_esc = raw.key_pressed(&rw, SC_ESC)
+        u.key_back = raw.key_pressed(&rw, SC_BACKSPACE)
+        u.key_tab = raw.key_pressed(&rw, SC_TAB)
+        u.key_enter = raw.key_pressed(&rw, SC_ENTER) || raw.key_pressed(&rw, SC_KP_ENTER)
+        let ms: u64 = now_ms()
+        let scale: i32 = mc_hud.hud_scale(ww, wh)
+        mc_gui_ui.ui_begin(&u, &r, &pk, scale, raw.mouse_x(&rw) as i32, raw.mouse_y(&rw) as i32, raw.mouse_pressed(&rw, 0 as u32), ms)
+        let spin: f64 = ((ms - t0) / TICK_MS) as f64
+        quit = frame_screen(&m, &u, f, &pan, spin)
+        mc_gui_ui.ui_end_frame(&u)
+        mc_present.rgba_to_bgrx(r.color, bgrx, (ww as usize) * (wh as usize))
+        window.image(&win, bgrx, ww as usize, wh as usize, 0, 0)
+        window.present(&win)
+        window.wait_event(&win, FRAME_MS)
+    }
+    rt.heap_free(bgrx, (ww as usize) * (wh as usize) * 4)
+    mc_gui_ui.ui_free(&u)
+    rt.buf_free(&m.field)
+    mc_menu_ping.board_free(&m.pings)
+    mc_menu_title.title_free(&m.title)
+    mc_panorama.pan_free(&pan)
+    mc_raster.raster_free(&r)
+    window.close_window(&win)
+    mc_gui_pack.gpack_free(&pk)
+    if (*f).submitted { return MENU_OK }
+    return MENU_CANCELLED
+}
