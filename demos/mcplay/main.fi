@@ -8,7 +8,7 @@
 // mouse (click captures again), Alt+F4 / window close quits.
 //
 // Environment (all optional):
-//   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
+//   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); default on Windows (falls back to Vulkan, then CPU); CPU elsewhere
 //   MCPLAY_GFX=vk      Vulkan back end (mc.vk_mc: sky, world, entities, tint, HUD in one render pass, frame read back and shown through the X11 window); default = CPU raster.
 //                      lavapipe (CPU Vulkan) when there is no GPU. MCPLAY_VK_CACHE=<file> pipeline cache file; MCPLAY_VK_LOST_AT=<frame> simulates a device loss (tests)
 //   MCPLAY_EDGE_EXP=0  CPU raster: exact top-left fill rule (no edge expansion, default 1 = on). Reference for GL / Vulkan picture comparisons (r261)
@@ -55,6 +55,7 @@ import std.env
 import std.fs
 import std.core
 import std.math
+import std.osinfo
 import window.window
 import window.backend
 import input.raw
@@ -65,6 +66,7 @@ import mc.mc_biome_update
 import mc.mc_client
 import mc.mc_session
 import mc.mc_startscreen_run
+import mc.mc_single
 import mc.mc_connect
 import mc.mc_hostname
 import mc.mc_auth
@@ -2714,6 +2716,51 @@ fn draw_frame_gl(c: *mut Ctx) {
     dl = mc_prof.prof_lap(mc_prof.PH_POST, dl)
 }
 
+fn gl_open_all(c: *mut Ctx, w0: i32, h0: i32) -> bool {
+    var o: glwindow.Opts = glwindow.opts_default()
+    o.vsync = env_int("MCPLAY_VSYNC", 1)
+    o.full_input = true
+    var ok: bool = glwindow.open(&(*c).gw, w0, h0, "mcplay", o)
+    if !ok && o.vsync != 0 {
+        o.vsync = 0
+        ok = glwindow.open(&(*c).gw, w0, h0, "mcplay", o)
+    }
+    if !ok {
+        io.eprint_line("mcplay: GL window failed (no EGL/GLX?)")
+        return false
+    }
+    (*c).wp = &(*c).gw.win
+    window.raw_input((*c).wp, true)
+    (*c).gb = gl_mc.glbe_open_with(glwindow.take_ctx(&(*c).gw), w0, h0)
+    if !(*c).gb.ok {
+        io.eprint_line("mcplay: GL back end failed")
+        glwindow.close(&(*c).gw)
+        return false
+    }
+    if env.has("MCPLAY_GL_MODE") {
+        let gmode: i32 = gl_mc.glbe_set_mode(&(*c).gb, env_int("MCPLAY_GL_MODE", 2))
+        say(f"mcplay: gl mode {gmode}\n")
+    }
+    gl_mc.glbe_set_facecull(&(*c).gb, env_flag("MCPLAY_FACECULL", true))
+    (*c).gsc = gl_scene.scene_open(&(*c).gb)
+    if !(*c).gsc.ok || !glshow.show_init(&(*c).sh, gl_mc.glbe_gl(&(*c).gb)) {
+        io.eprint_line("mcplay: GL scene layer failed")
+        glwindow.close(&(*c).gw)
+        return false
+    }
+    (*c).be = gl_mc.glbe_backend(&(*c).gb)
+    (*c).gl = true
+    if (*c).g.use_res {
+        mc_packs.res_reload_upload(&(*c).g.res, &(*c).be)
+    } else {
+        (*c).be.upload_atlas((*c).be.obj, ((&(*c).g.atlas) as u64))
+    }
+    io.print("mcplay: gl renderer=")
+    io.print_c(gl_mc.glbe_renderer(&(*c).gb))
+    say(f" api={glwindow.api_name(&(*c).gw)} vsync={glwindow.swap_interval_get(&(*c).gw)}\n")
+    return true
+}
+
 // MCPLAY_GFX=vk
 fn want_vk_gfx() -> bool {
     if !env.has("MCPLAY_GFX") { return false }
@@ -3081,6 +3128,10 @@ fn main(start: u64) -> i32 {
     }
     rt.buf_free(&s_path)
     let argc: usize = rt.arg_count(start)
+    if argc == 1 && !have_sess && mc_single.single_wanted() && !mc_single.single_acquire() {
+        io.eprint_line("mcplay: already running")
+        return 0
+    }
     if argc == 1 && (!have_sess || s_form > 0) {
         let keep_proto: i32 = s_proto
         let keep_view: i32 = s_view
@@ -3127,7 +3178,8 @@ fn main(start: u64) -> i32 {
     let vanilla_ok: bool = mc_packs.res_vanilla_wanted(proto)
     let use_res: bool = vanilla_ok || mc_packs.res_env_wanted()
     let run_s: i32 = env_int("MCPLAY_RUN_S", 0)
-    let want_gl: bool = env_flag("MCPLAY_GL", false)
+    let gl_auto: bool = osinfo.is_windows() && !env.has("MCPLAY_GL") && !env.has("MCPLAY_GFX")
+    let want_gl: bool = env_flag("MCPLAY_GL", gl_auto)
     var gb0: gl_mc.GlBackend = gl_mc.glbe_open_with(glctx.ctx_blank(), 1, 1)
     var ver: mc_version.Version = mc_version.version_empty()
     if !mc_versions.version_by_protocol(proto, &ver) || ver.chunk_format == mc_version.CF_LEGACY_8 {
@@ -3274,7 +3326,7 @@ fn main(start: u64) -> i32 {
         lr = mc_client.client_login_offline(&c.cl, name, LOGIN_WAITS)
     }
     if lr != 0 {
-        say(f"mcplay: login failed ({lr})\n")
+        say(f"mcplay: login failed ({lr}) net_err={net.conn_error(&c.cl.w.conn)}\n")
         return 5
     }
     mc_codec.wire_timeout(&c.cl.w, 2) // the frame loop must not block on the socket
@@ -3292,47 +3344,15 @@ fn main(start: u64) -> i32 {
     mc_inv.inv_use_registry(&c.inv, &c.reg) // stack limits + armour slots for the click prediction
     mc_inv.inv_use_recipes(&c.inv, &c.rcp) // craft result slot of the 2x2 / 3x3 grid
     // window: full_input BEFORE make so that button releases, motion and raw keys arrive
+    var gl_ready: bool = false
     if want_gl {
-        var o: glwindow.Opts = glwindow.opts_default()
-        o.vsync = env_int("MCPLAY_VSYNC", 1)
-        o.full_input = true
-        var ok: bool = glwindow.open(&c.gw, w0, h0, "mcplay", o)
-        if !ok && o.vsync != 0 {
-            o.vsync = 0
-            ok = glwindow.open(&c.gw, w0, h0, "mcplay", o)
-        }
-        if !ok {
-            io.eprint_line("mcplay: GL window failed (no EGL/GLX?) -- run without MCPLAY_GL")
+        gl_ready = gl_open_all(&c, w0, h0)
+        if !gl_ready && !gl_auto {
+            io.eprint_line("mcplay: run without MCPLAY_GL")
             return 6
         }
-        c.wp = &c.gw.win
-        window.raw_input(c.wp, true)
-        c.gb = gl_mc.glbe_open_with(glwindow.take_ctx(&c.gw), w0, h0)
-        if !c.gb.ok {
-            io.eprint_line("mcplay: GL back end failed")
-            return 6
-        }
-        if env.has("MCPLAY_GL_MODE") {
-            let gmode: i32 = gl_mc.glbe_set_mode(&c.gb, env_int("MCPLAY_GL_MODE", 2))
-            say(f"mcplay: gl mode {gmode}\n")
-        }
-        gl_mc.glbe_set_facecull(&c.gb, env_flag("MCPLAY_FACECULL", true)) // MCPLAY_FACECULL=0: no face-direction buckets (docs/MC-PERF.md 7)
-        c.gsc = gl_scene.scene_open(&c.gb)
-        if !c.gsc.ok || !glshow.show_init(&c.sh, gl_mc.glbe_gl(&c.gb)) {
-            io.eprint_line("mcplay: GL scene layer failed")
-            return 6
-        }
-        c.be = gl_mc.glbe_backend(&c.gb)
-        c.gl = true
-        if c.g.use_res {
-            mc_packs.res_reload_upload(&c.g.res, &c.be)
-        } else {
-            c.be.upload_atlas(c.be.obj, ((&c.g.atlas) as u64))
-        }
-        io.print("mcplay: gl renderer=")
-        io.print_c(gl_mc.glbe_renderer(&c.gb))
-        say(f" api={glwindow.api_name(&c.gw)} vsync={glwindow.swap_interval_get(&c.gw)}\n")
-    } else {
+    }
+    if !gl_ready {
         c.wp = &c.win
         if !window.open_window(c.wp, 0) {
             io.eprint_line("mcplay: cannot open the display")
@@ -3347,7 +3367,7 @@ fn main(start: u64) -> i32 {
         let ttl: str = "mcplay"
         window.title(c.wp, ttl.p as u64, ttl.n)
         window.show_window(c.wp)
-        if want_vk_gfx() {
+        if want_vk_gfx() || gl_auto {
             if vk_open_be(&c, w0, h0) {
                 c.vk = true
                 io.print("mcplay: gfx=vk device=")
