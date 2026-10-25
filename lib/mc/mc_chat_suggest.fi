@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.bytes
+
+export {
+    Suggest, sugg_new, sugg_free, sugg_clear, sugg_request, sugg_response, sugg_add, sugg_set_range, sugg_count, sugg_item_ptr, sugg_item_len,
+    sugg_move, sugg_selected, sugg_sort, SG_MAX, SG_LEN, SG_VISIBLE,
+}
+
+const SG_MAX: usize = 128
+const SG_LEN: usize = 64
+const SG_VISIBLE: i32 = 10
+const NBT_PROTOCOL: i32 = 765
+
+struct Suggest {
+    items: rt.Buf,
+    lens: rt.Buf,
+    count: usize,
+    sel: i32,
+    first: i32,
+    start: i32,
+    span: i32,
+    txid: i32,
+    pending: bool,
+    asked: rt.Buf,
+    local: bool,
+}
+
+fn fill_zero(b: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, 0)
+        i = i + 1
+    }
+}
+
+fn sugg_new() -> Suggest {
+    var s: Suggest = Suggest { items: rt.buf_new(), lens: rt.buf_new(), count: 0, sel: 0, first: 0, start: 0, span: 0, txid: 0, pending: false, asked: rt.buf_new(), local: false }
+    fill_zero(&s.items, SG_MAX * SG_LEN)
+    fill_zero(&s.lens, SG_MAX * 4)
+    return s
+}
+
+fn sugg_free(s: *mut Suggest) {
+    rt.buf_free(&(*s).items)
+    rt.buf_free(&(*s).lens)
+    rt.buf_free(&(*s).asked)
+}
+
+fn sugg_clear(s: *mut Suggest) {
+    (*s).count = 0
+    (*s).sel = 0
+    (*s).first = 0
+    (*s).start = 0
+    (*s).span = 0
+    (*s).local = false
+}
+
+fn sugg_count(s: *mut Suggest) -> usize { return (*s).count }
+fn sugg_item_ptr(s: *mut Suggest, k: usize) -> u64 { return rt.buf_ptr(&(*s).items) + (k * SG_LEN) as u64 }
+fn sugg_item_len(s: *mut Suggest, k: usize) -> usize { return rt.ld32(rt.buf_ptr(&(*s).lens), k) as usize }
+
+fn sugg_request(s: *mut Suggest, text_p: u64, text_n: usize) -> i32 {
+    (*s).txid = (*s).txid + 1
+    if (*s).txid > 1000000 { (*s).txid = 1 }
+    (*s).pending = true
+    rt.buf_clear(&(*s).asked)
+    rt.buf_push_bytes(&(*s).asked, text_p, text_n)
+    return (*s).txid
+}
+
+fn sugg_set_range(s: *mut Suggest, start: i32, span: i32) {
+    (*s).start = start
+    (*s).span = span
+}
+
+fn sugg_add(s: *mut Suggest, p: u64, n: usize) -> bool {
+    if (*s).count >= SG_MAX || n == 0 || n >= SG_LEN { return false }
+    let dst: u64 = sugg_item_ptr(s, (*s).count)
+    var i: usize = 0
+    while i < n {
+        rt.st8(dst, i, rt.ld8(p, i))
+        i = i + 1
+    }
+    rt.st32(rt.buf_ptr(&(*s).lens), (*s).count, n as u32)
+    (*s).count = (*s).count + 1
+    return true
+}
+
+fn skip_tooltip(body: *mut bytes.Bytes, protocol: i32) -> bool {
+    let has: bool = bytes.get_bool(body) catch false
+    if !has { return true }
+    if protocol >= NBT_PROTOCOL { return false }
+    var n: usize = 0
+    bytes.get_string(body, &n) catch 0
+    return bytes.bytes_ok(body)
+}
+
+fn sugg_response(s: *mut Suggest, body: *mut bytes.Bytes, protocol: i32) -> bool {
+    let txid: i32 = bytes.get_varint(body) catch 0 - 1
+    if txid != (*s).txid || !(*s).pending { return false }
+    (*s).pending = false
+    sugg_clear(s)
+    let start: i32 = bytes.get_varint(body) catch 0
+    let span: i32 = bytes.get_varint(body) catch 0
+    let count: i32 = bytes.get_varint(body) catch 0
+    sugg_set_range(s, start, span)
+    var i: i32 = 0
+    while i < count && i < 4096 {
+        var n: usize = 0
+        let p: u64 = bytes.get_string(body, &n) catch 0
+        if p == 0 as u64 || !bytes.bytes_ok(body) { return true }
+        sugg_add(s, p, n)
+        if protocol >= 393 && !skip_tooltip(body, protocol) { return true }
+        i = i + 1
+    }
+    return true
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+fn item_less(s: *mut Suggest, a: usize, b: usize) -> bool {
+    let pa: u64 = sugg_item_ptr(s, a)
+    let pb: u64 = sugg_item_ptr(s, b)
+    let la: usize = sugg_item_len(s, a)
+    let lb: usize = sugg_item_len(s, b)
+    var i: usize = 0
+    while i < la && i < lb {
+        let ca: u8 = lower(rt.ld8(pa, i))
+        let cb: u8 = lower(rt.ld8(pb, i))
+        if ca != cb { return ca < cb }
+        i = i + 1
+    }
+    return la < lb
+}
+
+fn swap_items(s: *mut Suggest, a: usize, b: usize) {
+    var i: usize = 0
+    while i < SG_LEN {
+        let x: u8 = rt.ld8(sugg_item_ptr(s, a), i)
+        rt.st8(sugg_item_ptr(s, a), i, rt.ld8(sugg_item_ptr(s, b), i))
+        rt.st8(sugg_item_ptr(s, b), i, x)
+        i = i + 1
+    }
+    let la: u32 = rt.ld32(rt.buf_ptr(&(*s).lens), a)
+    rt.st32(rt.buf_ptr(&(*s).lens), a, rt.ld32(rt.buf_ptr(&(*s).lens), b))
+    rt.st32(rt.buf_ptr(&(*s).lens), b, la)
+}
+
+fn sugg_sort(s: *mut Suggest) {
+    var i: usize = 1
+    while i < (*s).count {
+        var j: usize = i
+        while j > 0 && item_less(s, j, j - 1) {
+            swap_items(s, j, j - 1)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+fn sugg_move(s: *mut Suggest, dir: i32) {
+    let n: i32 = (*s).count as i32
+    if n == 0 { return }
+    var k: i32 = (*s).sel + dir
+    if k < 0 { k = n - 1 }
+    if k >= n { k = 0 }
+    (*s).sel = k
+    if k < (*s).first { (*s).first = k }
+    if k >= (*s).first + SG_VISIBLE { (*s).first = k - SG_VISIBLE + 1 }
+}
+
+fn sugg_selected(s: *mut Suggest) -> i32 {
+    if (*s).count == 0 { return 0 - 1 }
+    return (*s).sel
+}
