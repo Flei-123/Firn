@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.nbt
+import std.core
+import std.bytes
+import mc.mc_nbt
+import mc.mc_text_nbt
+
+export { Pool, im_new, im_free, im_begin, im_commit, im_find, im_from_nbt, im_comp_line, im_sig_of_bytes }
+
+const ARENA_CAP: usize = 1048576
+const MAX_LORE: i32 = 32
+
+struct Pool {
+    arena: rt.Buf,
+    scratch: rt.Buf,
+    pend_id: i32,
+}
+
+fn im_new() -> Pool {
+    return Pool { arena: rt.buf_new(), scratch: rt.buf_new(), pend_id: 0 - 1 }
+}
+
+fn im_free(m: *mut Pool) {
+    rt.buf_free(&(*m).arena)
+    rt.buf_free(&(*m).scratch)
+}
+
+fn im_begin(m: *mut Pool) {
+    rt.buf_clear(&(*m).scratch)
+    (*m).pend_id = 0 - 1
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8 as u32) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16 as u32) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24 as u32) & 255 as u32) as u8)
+}
+
+fn get_u32(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8 as u32) | ((rt.ld8(p, off + 2) as u32) << 16 as u32) | ((rt.ld8(p, off + 3) as u32) << 24 as u32)
+}
+
+fn put_line(m: *mut Pool, tag: u8, p: u64, n: usize) {
+    rt.buf_push(&(*m).scratch, tag)
+    var i: usize = 0
+    while i < n {
+        var c: u8 = rt.ld8(p, i)
+        if c == 10 as u8 { c = 32 as u8 }
+        rt.buf_push(&(*m).scratch, c)
+        i = i + 1
+    }
+    rt.buf_push(&(*m).scratch, 10)
+}
+
+fn put_num_line(m: *mut Pool, tag: u8, v: i64) {
+    rt.buf_push(&(*m).scratch, tag)
+    rt.buf_push_dec_i64(&(*m).scratch, v)
+    rt.buf_push(&(*m).scratch, 10)
+}
+
+fn put_pair_line(m: *mut Pool, tag: u8, p: u64, n: usize, level: i64) {
+    rt.buf_push(&(*m).scratch, tag)
+    rt.buf_push_bytes(&(*m).scratch, p, n)
+    rt.buf_push(&(*m).scratch, 9)
+    rt.buf_push_dec_i64(&(*m).scratch, level)
+    rt.buf_push(&(*m).scratch, 10)
+}
+
+fn im_find(m: *mut Pool, sig: i32, out_p: *mut u64, out_n: *mut usize) -> bool {
+    if sig == 0 { return false }
+    let base: u64 = rt.buf_ptr(&(*m).arena)
+    let total: usize = rt.buf_len(&(*m).arena)
+    var off: usize = 0
+    while off + 8 <= total {
+        let l: usize = get_u32(base, off + 4) as usize
+        if get_u32(base, off) == (sig as u32) {
+            *out_p = base + ((off + 8) as u64)
+            *out_n = l
+            return true
+        }
+        off = off + 8 + l
+    }
+    return false
+}
+
+fn im_commit(m: *mut Pool, sig: i32) {
+    if sig == 0 || rt.buf_len(&(*m).scratch) == 0 { return }
+    var p: u64 = 0
+    var n: usize = 0
+    if im_find(m, sig, &p, &n) { return }
+    if rt.buf_len(&(*m).arena) > ARENA_CAP { rt.buf_clear(&(*m).arena) }
+    put_u32(&(*m).arena, sig as u32)
+    put_u32(&(*m).arena, rt.buf_len(&(*m).scratch) as u32)
+    rt.buf_push_bytes(&(*m).arena, rt.buf_ptr(&(*m).scratch), rt.buf_len(&(*m).scratch))
+}
+
+fn im_sig_of_bytes(p: u64, n: usize) -> i32 {
+    var h: u64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = ((h ^ (rt.ld8(p, i) as u64)) * 16777619) & 4294967295
+        i = i + 1
+    }
+    return ((h & 2147483647) | 1) as i32
+}
+
+fn child(d: *mut mc_nbt.Doc, n: u32, name: str) -> u32 {
+    if n == 0 as u32 || mc_nbt.nbt_kind(d, n) != nbt.TAG_COMPOUND { return 0 as u32 }
+    return mc_nbt.nbt_get(d, n, name.p as u64, name.n)
+}
+
+fn put_str_child(m: *mut Pool, d: *mut mc_nbt.Doc, n: u32, key: str, tag: u8) {
+    let c: u32 = child(d, n, key)
+    if c == 0 as u32 || mc_nbt.nbt_kind(d, c) != nbt.TAG_STRING { return }
+    var l: usize = 0
+    let p: u64 = mc_nbt.nbt_str(d, c, &l)
+    put_line(m, tag, p, l)
+}
+
+fn put_enchants(m: *mut Pool, d: *mut mc_nbt.Doc, list: u32, tag: u8) {
+    if list == 0 as u32 || mc_nbt.nbt_kind(d, list) != nbt.TAG_LIST { return }
+    var e: u32 = mc_nbt.nbt_first(d, list)
+    var guard: i32 = 0
+    while e != 0 as u32 && guard < 64 {
+        let idn: u32 = child(d, e, "id")
+        let lv: u32 = child(d, e, "lvl")
+        if idn != 0 as u32 && mc_nbt.nbt_kind(d, idn) == nbt.TAG_STRING {
+            var l: usize = 0
+            let p: u64 = mc_nbt.nbt_str(d, idn, &l)
+            var level: i64 = 1
+            if lv != 0 as u32 { level = mc_nbt.nbt_i64(d, lv) }
+            put_pair_line(m, tag, p, l, level)
+        }
+        e = mc_nbt.nbt_next(d, e)
+        guard = guard + 1
+    }
+}
+
+fn amount_x100(bits: u64) -> i64 {
+    let f: f64 = core.bits_f64(bits)
+    var scaled: f64 = f * 100.0
+    if scaled >= 0.0 { scaled = scaled + 0.5 } else { scaled = scaled - 0.5 }
+    return scaled as i64
+}
+
+fn put_attributes(m: *mut Pool, d: *mut mc_nbt.Doc, list: u32) {
+    if list == 0 as u32 || mc_nbt.nbt_kind(d, list) != nbt.TAG_LIST { return }
+    var e: u32 = mc_nbt.nbt_first(d, list)
+    var guard: i32 = 0
+    while e != 0 as u32 && guard < 16 {
+        let an: u32 = child(d, e, "AttributeName")
+        let am: u32 = child(d, e, "Amount")
+        let op: u32 = child(d, e, "Operation")
+        let sl: u32 = child(d, e, "Slot")
+        if an != 0 as u32 && am != 0 as u32 && mc_nbt.nbt_kind(d, an) == nbt.TAG_STRING {
+            var nl: usize = 0
+            let np: u64 = mc_nbt.nbt_str(d, an, &nl)
+            rt.buf_push(&(*m).scratch, 97)
+            rt.buf_push_bytes(&(*m).scratch, np, nl)
+            rt.buf_push(&(*m).scratch, 9)
+            rt.buf_push_dec_i64(&(*m).scratch, amount_x100(mc_nbt.nbt_f64(d, am)))
+            rt.buf_push(&(*m).scratch, 9)
+            var opv: i64 = 0
+            if op != 0 as u32 { opv = mc_nbt.nbt_i64(d, op) }
+            rt.buf_push_dec_i64(&(*m).scratch, opv)
+            rt.buf_push(&(*m).scratch, 9)
+            if sl != 0 as u32 && mc_nbt.nbt_kind(d, sl) == nbt.TAG_STRING {
+                var sn: usize = 0
+                let sp: u64 = mc_nbt.nbt_str(d, sl, &sn)
+                rt.buf_push_bytes(&(*m).scratch, sp, sn)
+            } else {
+                rt.buf_push_bytes(&(*m).scratch, "mainhand".p as u64, 8)
+            }
+            rt.buf_push(&(*m).scratch, 10)
+        }
+        e = mc_nbt.nbt_next(d, e)
+        guard = guard + 1
+    }
+}
+
+fn im_from_nbt(m: *mut Pool, d: *mut mc_nbt.Doc) {
+    let root: u32 = mc_nbt.doc_root(d)
+    let disp: u32 = child(d, root, "display")
+    put_str_child(m, d, disp, "Name", 110 as u8)
+    let lore: u32 = child(d, disp, "Lore")
+    if lore != 0 as u32 && mc_nbt.nbt_kind(d, lore) == nbt.TAG_LIST {
+        var e: u32 = mc_nbt.nbt_first(d, lore)
+        var k: i32 = 0
+        while e != 0 as u32 && k < MAX_LORE {
+            if mc_nbt.nbt_kind(d, e) == nbt.TAG_STRING {
+                var l: usize = 0
+                let p: u64 = mc_nbt.nbt_str(d, e, &l)
+                put_line(m, 108 as u8, p, l)
+            }
+            e = mc_nbt.nbt_next(d, e)
+            k = k + 1
+        }
+    }
+    put_enchants(m, d, child(d, root, "Enchantments"), 101 as u8)
+    put_enchants(m, d, child(d, root, "StoredEnchantments"), 115 as u8)
+    let dm: u32 = child(d, root, "Damage")
+    if dm != 0 as u32 { put_num_line(m, 100 as u8, mc_nbt.nbt_i64(d, dm)) }
+    let ub: u32 = child(d, root, "Unbreakable")
+    if ub != 0 as u32 && mc_nbt.nbt_i64(d, ub) != 0 { put_num_line(m, 117 as u8, 1) }
+    put_attributes(m, d, child(d, root, "AttributeModifiers"))
+}
+
+fn comp_id(protocol: i32, k: i32) -> i32 {
+    if protocol >= 775 {
+        if k == 0 { return 3 } else if k == 1 { return 4 } else if k == 2 { return 6 } else if k == 3 { return 9 } else if k == 4 { return 11 }
+        else if k == 5 { return 12 } else if k == 6 { return 13 } else { return 42 }
+    }
+    if protocol >= 774 {
+        if k == 0 { return 3 } else if k == 1 { return 4 } else if k == 2 { return 6 } else if k == 3 { return 9 } else if k == 4 { return 11 }
+        else if k == 5 { return 12 } else if k == 6 { return 13 } else { return 41 }
+    }
+    if protocol >= 768 {
+        var stored: i32 = 34
+        if protocol <= 769 { stored = 33 }
+        if k == 0 { return 3 } else if k == 1 { return 4 } else if k == 2 { return 5 } else if k == 3 { return 6 } else if k == 4 { return 8 }
+        else if k == 5 { return 9 } else if k == 6 { return 10 } else { return stored }
+    }
+    if k == 0 { return 3 } else if k == 1 { return 4 } else if k == 2 { return 5 } else if k == 3 { return 6 } else if k == 4 { return 7 }
+    else if k == 5 { return 8 } else if k == 6 { return 9 } else { return 23 }
+}
+
+fn starts(p: u64, n: usize, lit: str) -> bool {
+    if n < lit.n { return false }
+    return rt.mem_eq(p, lit.p as u64, lit.n)
+}
+
+fn hex_nib(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c as i32) - 48 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c as i32) - 87 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c as i32) - 55 }
+    return 0 - 1
+}
+
+fn hex_text_to_json(vp: u64, vn: usize, out: *mut rt.Buf) -> bool {
+    if vn < 6 || !starts(vp, vn, "hex:") || ((vn - 4) % 2) != 0 { return false }
+    let nb: usize = (vn - 4) / 2
+    let raw: u64 = rt.heap_alloc(nb + 1)
+    var i: usize = 0
+    var good: bool = true
+    while i < nb {
+        let a: i32 = hex_nib(rt.ld8(vp, 4 + i * 2))
+        let b: i32 = hex_nib(rt.ld8(vp, 5 + i * 2))
+        if a < 0 || b < 0 { good = false }
+        rt.st8(raw, i, (a * 16 + b) as u8)
+        i = i + 1
+    }
+    var ok: bool = false
+    if good { ok = mc_text_nbt.nbt_field_to_json(raw, nb, out) }
+    rt.heap_free(raw, nb + 1)
+    return ok
+}
+
+fn parse_dec(p: u64, n: usize, ok: *mut bool) -> i64 {
+    var i: usize = 0
+    var neg: bool = false
+    var r: i64 = 0
+    *ok = n > 0
+    if n > 0 && rt.ld8(p, 0) == 45 as u8 { neg = true; i = 1; *ok = n > 1 }
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 { *ok = false; return 0 }
+        r = r * 10 + ((c as i64) - 48)
+        if r > 2000000000 { *ok = false; return 0 }
+        i = i + 1
+    }
+    if neg { r = 0 - r }
+    return r
+}
+
+fn put_hex_text(m: *mut Pool, tag: u8, vp: u64, vn: usize) {
+    var js: rt.Buf = rt.buf_new()
+    if hex_text_to_json(vp, vn, &js) { put_line(m, tag, rt.buf_ptr(&js), rt.buf_len(&js)) }
+    rt.buf_free(&js)
+}
+
+fn im_comp_line(m: *mut Pool, protocol: i32, ct: i32, rp: u64, rn: usize, vp: u64, vn: usize) {
+    if ct < 0 { return }
+    var ok: bool = false
+    if rn == 4 && starts(rp, rn, "type") {
+        if ct == comp_id(protocol, 1) { put_num_line(m, 117 as u8, 1) }
+        return
+    }
+    if rn == 4 && starts(rp, rn, "data") {
+        if ct == comp_id(protocol, 0) {
+            let v: i64 = parse_dec(vp, vn, &ok)
+            if ok { put_num_line(m, 100 as u8, v) }
+        } else if ct == comp_id(protocol, 5) {
+            let v: i64 = parse_dec(vp, vn, &ok)
+            if ok { put_num_line(m, 114 as u8, v) }
+        } else if ct == comp_id(protocol, 2) {
+            put_hex_text(m, 110 as u8, vp, vn)
+        } else if ct == comp_id(protocol, 3) {
+            put_hex_text(m, 105 as u8, vp, vn)
+        }
+        return
+    }
+    if ct == comp_id(protocol, 4) && rn > 5 && starts(rp, rn, "data[") {
+        put_hex_text(m, 108 as u8, vp, vn)
+        return
+    }
+    var tag: u8 = 0 as u8
+    if ct == comp_id(protocol, 6) { tag = 69 as u8 }
+    if ct == comp_id(protocol, 7) { tag = 83 as u8 }
+    if tag != 0 as u8 && rn > 19 && starts(rp, rn, "data.enchantments[") {
+        var t: usize = 18
+        while t < rn && rt.ld8(rp, t) != 93 as u8 { t = t + 1 }
+        if t + 1 < rn && rt.ld8(rp, t + 1) == 46 as u8 {
+            let sp: u64 = rp + ((t + 2) as u64)
+            let sn: usize = rn - t - 2
+            if sn == 2 && starts(sp, sn, "id") {
+                let v: i64 = parse_dec(vp, vn, &ok)
+                if ok { (*m).pend_id = v as i32 } else { (*m).pend_id = 0 - 1 }
+            } else if sn == 5 && starts(sp, sn, "level") {
+                let v: i64 = parse_dec(vp, vn, &ok)
+                if ok && (*m).pend_id >= 0 {
+                    rt.buf_push(&(*m).scratch, tag)
+                    rt.buf_push_dec_i64(&(*m).scratch, (*m).pend_id as i64)
+                    rt.buf_push(&(*m).scratch, 9)
+                    rt.buf_push_dec_i64(&(*m).scratch, v)
+                    rt.buf_push(&(*m).scratch, 10)
+                }
+                (*m).pend_id = 0 - 1
+            }
+        }
+    }
+}
