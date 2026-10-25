@@ -8,12 +8,14 @@ import av1.av1lf
 import av1.av1cdef
 import av1.av1lr
 
-export { Frame, frame_new, frame_free, still_decode, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR }
+export { Frame, frame_new, frame_free, still_decode, still_decode_limited, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR, STILL_TOO_LARGE, STILL_MAX_PIXELS }
 
 const STILL_OK: i32 = 0
 const STILL_NOT_AVIF: i32 = 1
 const STILL_UNSUPPORTED: i32 = 2
 const STILL_TILE_ERROR: i32 = 10
+const STILL_TOO_LARGE: i32 = 3
+const STILL_MAX_PIXELS: i64 = 67108864
 
 struct Frame {
     width: i64,
@@ -45,6 +47,21 @@ fn cell(info: u64, i: usize) -> i64 {
     return avif.avif_cell(info, i)
 }
 
+fn fits(info: u64, max_pixels: i64) -> bool {
+    let fb: usize = avif.FH_BASE
+    let w: i64 = cell(info, avif.AI_WIDTH)
+    let h: i64 = cell(info, avif.AI_HEIGHT)
+    let mw: i64 = cell(info, fb + avif.FH_MI_COLS) * 4
+    let mh: i64 = cell(info, fb + avif.FH_MI_ROWS) * 4
+    if w <= 0 || h <= 0 || mw <= 0 || mh <= 0 {
+        return false
+    }
+    if w > 65536 || h > 65536 || mw > 65536 + 64 || mh > 65536 + 64 {
+        return false
+    }
+    return w * h <= max_pixels && mw * mh <= max_pixels + max_pixels / 4 + 8192
+}
+
 fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bytes: *mut usize) -> u64 {
     let n: usize = (w * h) as usize
     let dst: u64 = av1mem.heap_alloc(n) as u64
@@ -61,11 +78,18 @@ fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bytes: *mut usize) -> u64 {
 }
 
 fn still_decode(src: u64, n: usize, f: *mut Frame) -> i32 {
+    return still_decode_limited(src, n, STILL_MAX_PIXELS, f)
+}
+
+fn still_decode_limited(src: u64, n: usize, max_pixels: i64, f: *mut Frame) -> i32 {
     let info: u64 = avif.avif_parse(src, n)
     if info == 0 {
         return STILL_NOT_AVIF
     }
-    let rc: i32 = decode_info(src, info, f)
+    var rc: i32 = STILL_TOO_LARGE
+    if fits(info, max_pixels) {
+        rc = decode_info(src, info, f)
+    }
     avif.avif_info_free(info)
     return rc
 }
@@ -123,6 +147,7 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     if av1tile.tile_err(t) != 0 {
         rc = STILL_TILE_ERROR + (av1tile.tile_err(t) as i32)
         av1tile.tile_free(t)
+        av1lr.lr_free(lrctx)
         return rc
     }
     if !lossless {
@@ -141,6 +166,7 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
         (*f).v = crop_plane(av1tile.tile_plane(t, 2), st, w, h, &(*f).v_bytes)
     }
     av1tile.tile_free(t)
+    av1lr.lr_free(lrctx)
     return STILL_OK
 }
 
@@ -191,5 +217,10 @@ fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64) {
     }
     if lrctx != 0 {
         av1lr.lr_frame(lrctx, av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), s0, s1, s2, st)
+        if cdef_on {
+            av1lr.lr_snapshot_free(s0, st, mr * 4)
+            av1lr.lr_snapshot_free(s1, st, mr * 4)
+            av1lr.lr_snapshot_free(s2, st, mr * 4)
+        }
     }
 }

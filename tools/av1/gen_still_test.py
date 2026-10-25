@@ -66,7 +66,7 @@ fn survives_cuts(name: str, step: usize) -> bool {
     var c: usize = 0
     while c < n {
         var f: still.Frame = still.frame_new()
-        let rc: i32 = still.still_decode(rt.buf_ptr(&data), c, &f)
+        let rc: i32 = still.still_decode_limited(rt.buf_ptr(&data), c, 4000000, &f)
         if rc == still.STILL_OK {
             still.frame_free(&f)
         }
@@ -95,7 +95,7 @@ fn survives_flips(name: str, copies: u32) -> bool {
             j = j + 1
         }
         var f: still.Frame = still.frame_new()
-        let rc: i32 = still.still_decode(rt.buf_ptr(&work), n, &f)
+        let rc: i32 = still.still_decode_limited(rt.buf_ptr(&work), n, 4000000, &f)
         if rc == still.STILL_OK {
             still.frame_free(&f)
         }
