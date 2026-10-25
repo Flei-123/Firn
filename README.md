@@ -67,7 +67,7 @@ $FIRNC -o /tmp/window examples/window/main.fi && /tmp/window
 $FIRNC --target=x86_64-windows --win-subsystem=windows -o window.exe examples/window/main.fi
 ```
 
-`bash test.sh` runs the full acceptance suite (it takes a while).
+`bash test.sh` runs the full acceptance suite (it takes a while); `bash tools/teststages/run.sh` runs it in stages (see RUN.md 4d).
 
 ## The language
 

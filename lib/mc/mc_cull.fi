@@ -95,6 +95,8 @@ struct Cull {
     rcnt: u64,
     cmask: u64,
     cmcap: usize,
+    d2tab: u64,
+    d2cap: usize,
 }
 
 fn cull_new(min_y: i32, nsec: i32) -> Cull {
@@ -104,7 +106,7 @@ fn cull_new(min_y: i32, nsec: i32) -> Cull {
         st: CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
             known: 0 as u32, ncells: 0 as u32, reused: 0 as u32 },
         graph_mode: false, gsig: GraphSig { valid: false, gen: 0 as u64, dist: 0, setback: false, cx: 0, sy: 0, cz: 0 },
-        gset: 0, gn: 0, gcap: 0, otmp: 0, otcap: 0, rcnt: 0, cmask: 0, cmcap: 0 }
+        gset: 0, gn: 0, gcap: 0, otmp: 0, otcap: 0, rcnt: 0, cmask: 0, cmcap: 0, d2tab: 0, d2cap: 0 }
 }
 
 fn cull_free(c: *mut Cull) {
@@ -114,7 +116,10 @@ fn cull_free(c: *mut Cull) {
     if (*c).out != 0 { rt.heap_free((*c).out, (*c).ocap * 16) }
     if (*c).gset != 0 { rt.heap_free((*c).gset, (*c).gcap * 8) }
     if (*c).otmp != 0 { rt.heap_free((*c).otmp, (*c).otcap * 16) }
-    if (*c).rcnt != 0 { rt.heap_free((*c).rcnt, RADIX_BUCKETS * 4) }
+    if (*c).rcnt != 0 { rt.heap_free((*c).rcnt, RADIX_BUCKETS * 8) }
+    if (*c).d2tab != 0 { rt.heap_free((*c).d2tab, (*c).d2cap * 8) }
+    (*c).d2tab = 0
+    (*c).d2cap = 0
     if (*c).cmask != 0 { rt.heap_free((*c).cmask, (*c).cmcap) }
     (*c).cmask = 0
     (*c).cmcap = 0
@@ -600,6 +605,11 @@ fn radix_pass(c: *mut Cull, src: u64, dst: u64, shift: u64) {
         rt.st32(cnt, b, rt.ld32(cnt, b) + 1 as u32)
         i = i + 1
     }
+    radix_scatter(c, src, dst, shift, cnt)
+}
+
+fn radix_scatter(c: *mut Cull, src: u64, dst: u64, shift: u64, cnt: u64) {
+    let n: usize = (*c).nout
     var acc: u32 = 0 as u32
     var b: usize = 0
     while b < RADIX_BUCKETS {
@@ -608,7 +618,7 @@ fn radix_pass(c: *mut Cull, src: u64, dst: u64, shift: u64) {
         acc = acc + v
         b = b + 1
     }
-    i = 0
+    var i: usize = 0
     while i < n {
         let d: u64 = rt.ld64(src, i * 2 + 1)
         let bk: usize = ((d >> shift) & 2047 as u64) as usize
@@ -616,6 +626,42 @@ fn radix_pass(c: *mut Cull, src: u64, dst: u64, shift: u64) {
         rt.st32(cnt, bk, (pos + 1) as u32)
         rt.st64(dst, pos * 2, rt.ld64(src, i * 2))
         rt.st64(dst, pos * 2 + 1, d)
+        i = i + 1
+    }
+}
+
+fn ensure_sort_scratch(c: *mut Cull) {
+    if (*c).rcnt == 0 { (*c).rcnt = rt.heap_alloc(RADIX_BUCKETS * 8) }
+    if (*c).otcap < (*c).ocap {
+        if (*c).otmp != 0 { rt.heap_free((*c).otmp, (*c).otcap * 16) }
+        (*c).otmp = rt.heap_alloc((*c).ocap * 16)
+        (*c).otcap = (*c).ocap
+    }
+}
+
+fn ensure_out(c: *mut Cull, n: usize) {
+    if (*c).ocap >= n { return }
+    var nc: usize = (*c).ocap
+    if nc == 0 { nc = 4096 }
+    while nc < n { nc = nc * 2 }
+    let nv: u64 = rt.heap_alloc(nc * 16)
+    if (*c).out != 0 {
+        rt.mem_copy(nv, (*c).out, (*c).nout * 16)
+        rt.heap_free((*c).out, (*c).ocap * 16)
+    }
+    (*c).out = nv
+    (*c).ocap = nc
+}
+
+fn ldd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn fill_axis_d2(p: u64, base: f64, cam: f64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let o: f64 = (base + (i as f64) * 16.0) - cam
+        *((p + (i as u64) * (8 as u64)) as *mut f64) = o * o
         i = i + 1
     }
 }
@@ -630,12 +676,7 @@ fn out_sort_stable(c: *mut Cull) {
         }
         i = i + 1
     }
-    if (*c).rcnt == 0 { (*c).rcnt = rt.heap_alloc(RADIX_BUCKETS * 4) }
-    if (*c).otcap < (*c).ocap {
-        if (*c).otmp != 0 { rt.heap_free((*c).otmp, (*c).otcap * 16) }
-        (*c).otmp = rt.heap_alloc((*c).ocap * 16)
-        (*c).otcap = (*c).ocap
-    }
+    ensure_sort_scratch(c)
     radix_pass(c, (*c).out, (*c).otmp, 0 as u64)
     radix_pass(c, (*c).otmp, (*c).out, RADIX_BITS)
 }
@@ -953,29 +994,74 @@ fn cull_run_graph(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: 
     (*c).sig.valid = false
     (*c).nout = 0
     tl = mc_prof.prof_lap(mc_prof.PH_CBFS, tl)
-    var k: usize = 0
-    var tests: u32 = 0 as u32
     let cw: i32 = dist * 2 + 1
     column_mask_build(c, cam, ccx - dist, ccz - dist, cw)
-    while k < (*c).gn {
-        let key: u64 = rt.ld64((*c).gset, k)
+    ensure_out(c, (*c).gn)
+    ensure_sort_scratch(c)
+    let ntab: usize = (cw * 2) as usize + (*c).nsec as usize
+    if (*c).d2cap < ntab {
+        if (*c).d2tab != 0 { rt.heap_free((*c).d2tab, (*c).d2cap * 8) }
+        (*c).d2tab = rt.heap_alloc(ntab * 8)
+        (*c).d2cap = ntab
+    }
+    let tx: u64 = (*c).d2tab
+    let tz: u64 = tx + (cw as u64) * (8 as u64)
+    let ty: u64 = tz + (cw as u64) * (8 as u64)
+    fill_axis_d2(tx, ((ccx - dist) * 16 + 8) as f64, (*cam).x, cw as usize)
+    fill_axis_d2(tz, ((ccz - dist) * 16 + 8) as f64, (*cam).z, cw as usize)
+    fill_axis_d2(ty, ((*c).min_y + 8) as f64, (*cam).y, (*c).nsec as usize)
+    let cnt0: u64 = (*c).rcnt
+    let cnt1: u64 = cnt0 + (RADIX_BUCKETS * 4) as u64
+    rt.mem_set(cnt0, 0 as u8, RADIX_BUCKETS * 8)
+    let out: u64 = (*c).out
+    let gset: u64 = (*c).gset
+    let cmask: u64 = (*c).cmask
+    let ox0: i32 = ccx - dist
+    let oz0: i32 = ccz - dist
+    let gn: usize = (*c).gn
+    var no: usize = 0
+    var mx: u64 = 0 as u64
+    var k: usize = 0
+    while k < gn {
+        let key: u64 = rt.ld64(gset, k)
         k = k + 1
         let cx: i32 = cull_out_cx(key)
         let sy: i32 = cull_out_sy(key)
         let cz: i32 = cull_out_cz(key)
-        tests = tests + 1 as u32
-        let mi: i32 = (cz - (ccz - dist)) * cw + (cx - (ccx - dist))
+        let ix: i32 = cx - ox0
+        let iz: i32 = cz - oz0
+        var inside: bool = false
+        if ix >= 0 && ix < cw && iz >= 0 && iz < cw && sy >= 0 && sy < (*c).nsec { inside = true }
         var cm: u8 = 1 as u8
-        if mi >= 0 && mi < cw * cw { cm = rt.ld8((*c).cmask, mi as usize) }
+        if inside { cm = rt.ld8(cmask, (iz * cw + ix) as usize) }
         if cm == 0 as u8 { continue }
         if cm == 2 as u8 || mc_camera.camera_section_visible(cam, cx, sy, cz, (*c).min_y) != 0 {
-            out_push(c, key, center_d2(cam, (*c).min_y, cx, sy, cz))
+            var d: u64 = 0 as u64
+            if inside {
+                d = (ldd(tx, ix as usize) + ldd(ty, sy as usize) + ldd(tz, iz as usize)) as u64
+            } else {
+                d = center_d2(cam, (*c).min_y, cx, sy, cz)
+            }
+            rt.st64(out, no * 2, key)
+            rt.st64(out, no * 2 + 1, d)
+            no = no + 1
+            if d > mx { mx = d }
+            let b0: usize = (d & 2047 as u64) as usize
+            let b1: usize = ((d >> RADIX_BITS) & 2047 as u64) as usize
+            rt.st32(cnt0, b0, rt.ld32(cnt0, b0) + 1 as u32)
+            rt.st32(cnt1, b1, rt.ld32(cnt1, b1) + 1 as u32)
         }
     }
-    (*c).st.frustum_tests = tests
-    (*c).st.frustum_out = tests - (*c).nout as u32
+    (*c).nout = no
+    (*c).st.frustum_tests = gn as u32
+    (*c).st.frustum_out = (gn - no) as u32
     tl = mc_prof.prof_lap(mc_prof.PH_CINIT, tl)
-    out_sort_stable(c)
+    if mx > RADIX_MAX_D2 {
+        out_sort(c)
+    } else {
+        radix_scatter(c, (*c).out, (*c).otmp, 0 as u64, cnt0)
+        radix_scatter(c, (*c).otmp, (*c).out, RADIX_BITS, cnt1)
+    }
     tl = mc_prof.prof_lap(mc_prof.PH_CSORT, tl)
     (*c).st.visited = (*c).nout as u32
     return (*c).nout

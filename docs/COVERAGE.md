@@ -50,14 +50,14 @@ Default is `--opt dev` (`--no-opt`): statement-precise lines, nothing removed. `
 
 ## Baseline
 
-`tests/*.fi` split into 8 shards by file number modulo 8, each built with `--opt dev` and run through `/root/jarvis/bin/heavy` with `firncov suite -j 12` (two shards at a time, 16-25 minutes each at host load 30-40), then combined with `firncov merge`. Selection `--include lib/`. First four shards (0, 1, 4, 5 = 498 of 998 files):
+`tests/*.fi` split into 8 shards by file number modulo 8, each built with `--opt dev` and run through `/root/jarvis/bin/heavy` with `firncov suite -j 12` (two shards at a time, 16-25 minutes each at host load 30-40), then combined with `firncov merge`. Selection `--include lib/`. All 8 shards (998 files):
 
 | Measure | Hit / total | Percent |
 |---|---|---|
-| Lines | 135469 / 211697 | 64.0 |
-| Functions | 10533 / 16115 | 65.4 |
+| Lines | 182542 / 268339 | 68.0 |
+| Functions | 15338 / 23057 | 66.5 |
 
-Suite summary of those shards: 493 profiled, 0 skipped, 6 failed (callgrind timeout on heavy `tests/*mc_*` programs, listed in the suite output). The other four shards were not finished in the same session, so the figure is a lower bound. The previous sample (62 programs) gave 35.2 % lines, 37.8 % functions.
+Suite summary over all shards: 967 profiled, 0 skipped, 11 failed (callgrind timeout on heavy `tests/*mc_*` programs, listed in the suite output). Failed programs add no hits, so the figure is a lower bound. The previous sample (62 programs) gave 35.2 % lines, 37.8 % functions.
 
 Least covered lib modules (all 0 %, of at least 30 lines): `async/wsc`, `audio/dev`, `audio/pulse`, `audio/ring`, `audio/sink`, `browser/quirks_data`, `db/datetime`, `desktop/notify`, `font/cbdt`, `fui/shape`, `fui/style`, `generated/grapheme_tables`, `generated/linebreak_tables`, `gif/gif`, `gpu/gl_fbo`.
 

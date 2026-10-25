@@ -231,7 +231,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
 FIRNC="$ROOT/compiler/target/release/firnc"
-WORK="$ROOT/.test-work"
+WORK="${TEST_WORK:-$ROOT/.test-work}"
+
+if [ "${1:-}" = "--stage" ]; then
+    TEST_STAGE="${2:?usage: test.sh [--stage N]}"
+fi
+if [ -n "${TEST_STAGE:-}" ] && [ -z "${TEST_STAGE_ACTIVE:-}" ]; then
+    STAGE_SCRIPT=$(mktemp "$ROOT/.test-stage.XXXXXX")
+    trap 'rm -f "$STAGE_SCRIPT"' EXIT
+    trap 'exit 143' TERM INT
+    bash tools/teststages/select.sh "$TEST_STAGE" > "$STAGE_SCRIPT"
+    STAGE_RC=0
+    TEST_STAGE_ACTIVE=1 TEST_WORK="$ROOT/.test-work-stage$TEST_STAGE" bash "$STAGE_SCRIPT" || STAGE_RC=$?
+    exit "$STAGE_RC"
+fi
 
 # Module search path (round 39): `import std.*` resolves over $FIRNLIB to
 # <repo>/lib -- no matter which directory a test project calls from.
@@ -1324,6 +1337,8 @@ if [ "$COVRC" -eq 0 ]; then
 else
     bad "tools/coverage/run.sh failed (see .test-work/coverage.log)"
     grep FAIL "$WORK/coverage.log" | head -10 | sed 's/^/   /' || true
+fi
+
 echo "== 53e. the compile cache of firnc1: hit, miss, byte-identical to uncached, damaged entries, concurrent (tools/cache/run_c1.sh, r989) =="
 bash tools/cache/run_c1.sh > "$WORK/cache_c1_proof.log" 2>&1 && CC1RC=0 || CC1RC=$?
 if [ "$CC1RC" -eq 0 ]; then
@@ -2299,6 +2314,8 @@ if [ "$F148RC" -eq 0 ]; then
 else
     bad "tools/diff_c0c1.sh failed (see .test-work/diff148.log)"
     grep -E '^DEVIATION' "$WORK/diff148.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 149. memory-safety UB probes recorded per build level (tools/safety/run.sh against tools/safety/expected.txt, docs/SAFETY.md; tools/safety/pe.sh: Windows .rodata read-only) =="
 FIRNC="$FIRNC" bash tools/safety/run.sh > "$WORK/safety149.log" 2>&1 && F149RC=0 || F149RC=$?
 FIRNC="$FIRNC" bash tools/safety/pe.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
