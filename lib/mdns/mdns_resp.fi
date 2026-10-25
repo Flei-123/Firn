@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mdns.mdns_wire
+
+export {
+    Reg, MAX_SVC, BAD, TTL_HOST, TTL_OTHER,
+    reg_new, reg_add, reg_remove, reg_set_a6, reg_count, reg_used,
+    resp_answer, resp_announce, resp_probe, resp_conflict,
+    MODE_NONE, MODE_MULTICAST, MODE_UNICAST, RESP_FLAGS,
+}
+
+const MAX_SVC: usize = 8
+const WIRE_CAP: usize = 256
+const TXT_CAP: usize = 1024
+const BAD: usize = 65535
+const TTL_HOST: u32 = 120
+const TTL_OTHER: u32 = 4500
+const TTL_LEGACY: u32 = 10
+const RESP_FLAGS: u32 = 33792
+const MODE_NONE: u32 = 0
+const MODE_MULTICAST: u32 = 1
+const MODE_UNICAST: u32 = 2
+const D_PTR: u32 = 1
+const D_SRV: u32 = 2
+const D_TXT: u32 = 4
+const D_A: u32 = 8
+const D_AAAA: u32 = 16
+const D_ENUM: u32 = 32
+
+struct Reg {
+    used: [bool; 8],
+    inst: [u8; 2048],
+    ilen: [usize; 8],
+    typ: [u8; 2048],
+    tlen: [usize; 8],
+    host: [u8; 2048],
+    hlen: [usize; 8],
+    port: [u32; 8],
+    txt: [u8; 8192],
+    xlen: [usize; 8],
+    a4: [u32; 8],
+    has4: [bool; 8],
+    a6: [u8; 128],
+    has6: [bool; 8],
+}
+
+fn reg_new() -> Reg {
+    return Reg { used: [false; 8], inst: [0; 2048], ilen: [0; 8], typ: [0; 2048], tlen: [0; 8],
+        host: [0; 2048], hlen: [0; 8], port: [0; 8], txt: [0; 8192], xlen: [0; 8], a4: [0; 8],
+        has4: [false; 8], a6: [0; 128], has6: [false; 8] }
+}
+
+fn reg_count(r: *mut Reg) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < MAX_SVC {
+        if (*r).used[i] {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn reg_used(r: *mut Reg, i: usize) -> bool {
+    return i < MAX_SVC && (*r).used[i]
+}
+
+fn inst_p(r: *mut Reg, i: usize) -> u64 {
+    return (&(*r).inst[0]) as u64 + (i * WIRE_CAP) as u64
+}
+
+fn typ_p(r: *mut Reg, i: usize) -> u64 {
+    return (&(*r).typ[0]) as u64 + (i * WIRE_CAP) as u64
+}
+
+fn host_p(r: *mut Reg, i: usize) -> u64 {
+    return (&(*r).host[0]) as u64 + (i * WIRE_CAP) as u64
+}
+
+fn txt_p(r: *mut Reg, i: usize) -> u64 {
+    return (&(*r).txt[0]) as u64 + (i * TXT_CAP) as u64
+}
+
+fn a6_p(r: *mut Reg, i: usize) -> u64 {
+    return (&(*r).a6[0]) as u64 + (i * 16) as u64
+}
+
+fn reg_add(r: *mut Reg, label: u64, ln: usize, typ: u64, tn: usize, host: u64, hn: usize,
+    port: u32, txt: u64, xn: usize, a4: u32, has4: bool) -> usize {
+    var slot: usize = BAD
+    var i: usize = 0
+    while i < MAX_SVC {
+        if !(*r).used[i] && slot == BAD {
+            slot = i
+        }
+        i = i + 1
+    }
+    if slot == BAD || xn > TXT_CAP {
+        return BAD
+    }
+    var tw: [u8; 256] = [0; 256]
+    let tl: usize = mdns_wire.wname_from_text(typ, tn, (&tw[0]) as u64, WIRE_CAP)
+    let hl: usize = mdns_wire.wname_from_text(host, hn, host_p(r, slot), WIRE_CAP)
+    if tl == 0 || hl == 0 {
+        return BAD
+    }
+    let il: usize = mdns_wire.wname_make_instance(label, ln, (&tw[0]) as u64, tl, inst_p(r, slot), WIRE_CAP)
+    if il == 0 {
+        return BAD
+    }
+    rt.mem_copy(typ_p(r, slot), (&tw[0]) as u64, tl)
+    (*r).ilen[slot] = il
+    (*r).tlen[slot] = tl
+    (*r).hlen[slot] = hl
+    (*r).port[slot] = port
+    if xn == 0 {
+        rt.st8(txt_p(r, slot), 0, 0 as u8)
+        (*r).xlen[slot] = 1
+    } else {
+        rt.mem_copy(txt_p(r, slot), txt, xn)
+        (*r).xlen[slot] = xn
+    }
+    (*r).a4[slot] = a4
+    (*r).has4[slot] = has4
+    (*r).has6[slot] = false
+    (*r).used[slot] = true
+    return slot
+}
+
+fn reg_set_a6(r: *mut Reg, i: usize, addr: u64) {
+    rt.mem_copy(a6_p(r, i), addr, 16)
+    (*r).has6[i] = true
+}
+
+fn reg_remove(r: *mut Reg, i: usize) {
+    if i < MAX_SVC {
+        (*r).used[i] = false
+    }
+}
+
+struct Ctx {
+    msg: u64,
+    n: usize,
+    ka_off: usize,
+    ka_count: u32,
+    cap: u32,
+    done: [u32; 8],
+}
+
+fn ctx_new() -> Ctx {
+    return Ctx { msg: 0 as u64, n: 0, ka_off: 0, ka_count: 0 as u32, cap: 0 as u32, done: [0; 8] }
+}
+
+fn known(cx: *mut Ctx, name: u64, nlen: usize, typ: u32, data: u64, dlen: usize, ttl: u32) -> bool {
+    var off: usize = (*cx).ka_off
+    var k: u32 = 0
+    var rr: mdns_wire.Rr = mdns_wire.rr_new()
+    while k < (*cx).ka_count {
+        let nx: usize = mdns_wire.rr_read((*cx).msg, (*cx).n, off, &rr)
+        if nx == 0 {
+            return false
+        }
+        if rr.ok && rr.typ == typ && rr.ttl >= ttl / 2 as u32
+            && mdns_wire.wname_eq((&rr.name[0]) as u64, rr.nlen, name, nlen)
+            && rr.dlen == dlen && rt.mem_eq((&rr.data[0]) as u64, data, dlen) {
+            return true
+        }
+        off = nx
+        k = k + 1 as u32
+    }
+    return false
+}
+
+fn emit(cx: *mut Ctx, pk: *mut mdns_wire.Pk, sec: u32, i: usize, bit: u32, name: u64, nlen: usize,
+    typ: u32, flush: bool, ttl0: u32, data: u64, dlen: usize, goodbye: bool) {
+    if ((*cx).done[i] & bit) != 0 as u32 {
+        return
+    }
+    var ttl: u32 = ttl0
+    if goodbye {
+        ttl = 0 as u32
+    } else if (*cx).cap != 0 as u32 && ttl > (*cx).cap {
+        ttl = (*cx).cap
+    }
+    if !goodbye && known(cx, name, nlen, typ, data, dlen, ttl0) {
+        (*cx).done[i] = (*cx).done[i] | bit
+        return
+    }
+    if mdns_wire.pk_rr(pk, sec, name, nlen, typ, flush, ttl, data, dlen) {
+        (*cx).done[i] = (*cx).done[i] | bit
+    }
+}
+
+fn do_ptr(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    emit(cx, pk, sec, i, D_PTR, typ_p(r, i), (*r).tlen[i], mdns_wire.T_PTR, false, TTL_OTHER,
+        inst_p(r, i), (*r).ilen[i], gb)
+}
+
+fn do_srv(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    var d: [u8; 262] = [0; 262]
+    d[4] = (((*r).port[i] >> 8) & 255 as u32) as u8
+    d[5] = ((*r).port[i] & 255 as u32) as u8
+    rt.mem_copy((&d[0]) as u64 + 6 as u64, host_p(r, i), (*r).hlen[i])
+    emit(cx, pk, sec, i, D_SRV, inst_p(r, i), (*r).ilen[i], mdns_wire.T_SRV, true, TTL_HOST,
+        (&d[0]) as u64, 6 + (*r).hlen[i], gb)
+}
+
+fn do_txt(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    emit(cx, pk, sec, i, D_TXT, inst_p(r, i), (*r).ilen[i], mdns_wire.T_TXT, true, TTL_OTHER,
+        txt_p(r, i), (*r).xlen[i], gb)
+}
+
+fn do_a(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    if !(*r).has4[i] {
+        return
+    }
+    var d: [u8; 4] = [0; 4]
+    d[0] = (((*r).a4[i] >> 24) & 255 as u32) as u8
+    d[1] = (((*r).a4[i] >> 16) & 255 as u32) as u8
+    d[2] = (((*r).a4[i] >> 8) & 255 as u32) as u8
+    d[3] = ((*r).a4[i] & 255 as u32) as u8
+    emit(cx, pk, sec, i, D_A, host_p(r, i), (*r).hlen[i], mdns_wire.T_A, true, TTL_HOST,
+        (&d[0]) as u64, 4, gb)
+}
+
+fn do_aaaa(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    if !(*r).has6[i] {
+        return
+    }
+    emit(cx, pk, sec, i, D_AAAA, host_p(r, i), (*r).hlen[i], mdns_wire.T_AAAA, true, TTL_HOST,
+        a6_p(r, i), 16, gb)
+}
+
+fn enum_name(out: u64) -> usize {
+    let t: str = "_services._dns-sd._udp.local"
+    return mdns_wire.wname_from_text(t.p as u64, t.n, out, WIRE_CAP)
+}
+
+fn first_of_type(r: *mut Reg, i: usize) -> bool {
+    var j: usize = 0
+    while j < i {
+        if (*r).used[j] && mdns_wire.wname_eq(typ_p(r, j), (*r).tlen[j], typ_p(r, i), (*r).tlen[i]) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn do_enum(cx: *mut Ctx, pk: *mut mdns_wire.Pk, r: *mut Reg, sec: u32, i: usize, gb: bool) {
+    if !first_of_type(r, i) {
+        return
+    }
+    var en: [u8; 256] = [0; 256]
+    let el: usize = enum_name((&en[0]) as u64)
+    emit(cx, pk, sec, i, D_ENUM, (&en[0]) as u64, el, mdns_wire.T_PTR, false, TTL_OTHER,
+        typ_p(r, i), (*r).tlen[i], gb)
+}
+
+fn is_type(q: u32, want: u32) -> bool {
+    return q == want || q == mdns_wire.T_ANY
+}
+
+fn resp_announce(r: *mut Reg, i: usize, pk: *mut mdns_wire.Pk, goodbye: bool) {
+    var cx: Ctx = ctx_new()
+    do_enum(&cx, pk, r, 1 as u32, i, goodbye)
+    do_ptr(&cx, pk, r, 1 as u32, i, goodbye)
+    do_srv(&cx, pk, r, 1 as u32, i, goodbye)
+    do_txt(&cx, pk, r, 1 as u32, i, goodbye)
+    do_a(&cx, pk, r, 1 as u32, i, goodbye)
+    do_aaaa(&cx, pk, r, 1 as u32, i, goodbye)
+    mdns_wire.pk_finish(pk)
+}
+
+fn resp_probe(r: *mut Reg, i: usize, pk: *mut mdns_wire.Pk) {
+    var cx: Ctx = ctx_new()
+    mdns_wire.pk_q(pk, inst_p(r, i), (*r).ilen[i], mdns_wire.T_ANY, false)
+    mdns_wire.pk_q(pk, host_p(r, i), (*r).hlen[i], mdns_wire.T_ANY, false)
+    do_srv(&cx, pk, r, 2 as u32, i, false)
+    do_a(&cx, pk, r, 2 as u32, i, false)
+    mdns_wire.pk_finish(pk)
+}
+
+fn resp_answer(r: *mut Reg, msg: u64, n: usize, from_port: u32, std_port: u32,
+    pk: *mut mdns_wire.Pk) -> u32 {
+    var h: mdns_wire.Hdr = mdns_wire.hdr_new()
+    if !mdns_wire.hdr_read(msg, n, &h) {
+        return MODE_NONE
+    }
+    if (h.flags & 63503 as u32) != 0 as u32 || h.qd == 0 as u32 {
+        return MODE_NONE
+    }
+    let legacy: bool = from_port != std_port
+    var cx: Ctx = ctx_new()
+    cx.msg = msg
+    cx.n = n
+    if legacy {
+        cx.cap = TTL_LEGACY
+    }
+    var q: mdns_wire.Qn = mdns_wire.qn_new()
+    var off: usize = 12
+    var k: u32 = 0
+    while k < h.qd {
+        let nx: usize = mdns_wire.q_read(msg, n, off, &q)
+        if nx == 0 {
+            return MODE_NONE
+        }
+        off = nx
+        k = k + 1 as u32
+    }
+    cx.ka_off = off
+    cx.ka_count = h.an
+    if legacy {
+        mdns_wire.pk_free(pk)
+        *pk = mdns_wire.pk_new(h.id, RESP_FLAGS)
+    }
+    off = 12
+    k = 0
+    var any_answer: bool = false
+    var all_qu: bool = true
+    var want_add: [u32; 8] = [0; 8]
+    var en: [u8; 256] = [0; 256]
+    let el: usize = enum_name((&en[0]) as u64)
+    while k < h.qd {
+        let nx: usize = mdns_wire.q_read(msg, n, off, &q)
+        off = nx
+        k = k + 1 as u32
+        if legacy {
+            mdns_wire.pk_q(pk, (&q.name[0]) as u64, q.nlen, q.typ, false)
+        }
+        if q.class == mdns_wire.CLASS_IN || q.class == 255 as u32 {
+            let before: u32 = (*pk).an
+            var i: usize = 0
+            while i < MAX_SVC {
+                if (*r).used[i] {
+                    let qn: u64 = (&q.name[0]) as u64
+                    if mdns_wire.wname_eq(qn, q.nlen, (&en[0]) as u64, el) && is_type(q.typ, mdns_wire.T_PTR) {
+                        do_enum(&cx, pk, r, 1 as u32, i, false)
+                    }
+                    if mdns_wire.wname_eq(qn, q.nlen, typ_p(r, i), (*r).tlen[i]) && is_type(q.typ, mdns_wire.T_PTR) {
+                        do_ptr(&cx, pk, r, 1 as u32, i, false)
+                        want_add[i] = want_add[i] | D_SRV | D_TXT | D_A | D_AAAA
+                    }
+                    if mdns_wire.wname_eq(qn, q.nlen, inst_p(r, i), (*r).ilen[i]) {
+                        if is_type(q.typ, mdns_wire.T_SRV) {
+                            do_srv(&cx, pk, r, 1 as u32, i, false)
+                            want_add[i] = want_add[i] | D_A | D_AAAA
+                        }
+                        if is_type(q.typ, mdns_wire.T_TXT) {
+                            do_txt(&cx, pk, r, 1 as u32, i, false)
+                        }
+                    }
+                    if mdns_wire.wname_eq(qn, q.nlen, host_p(r, i), (*r).hlen[i]) {
+                        if is_type(q.typ, mdns_wire.T_A) {
+                            do_a(&cx, pk, r, 1 as u32, i, false)
+                        }
+                        if is_type(q.typ, mdns_wire.T_AAAA) {
+                            do_aaaa(&cx, pk, r, 1 as u32, i, false)
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            if (*pk).an != before {
+                any_answer = true
+                if !q.unicast {
+                    all_qu = false
+                }
+            }
+        }
+    }
+    var i: usize = 0
+    while i < MAX_SVC {
+        if (*r).used[i] && cx.done[i] != 0 as u32 {
+            if (want_add[i] & D_SRV) != 0 as u32 {
+                do_srv(&cx, pk, r, 3 as u32, i, false)
+            }
+            if (want_add[i] & D_TXT) != 0 as u32 {
+                do_txt(&cx, pk, r, 3 as u32, i, false)
+            }
+            if (want_add[i] & D_A) != 0 as u32 {
+                do_a(&cx, pk, r, 3 as u32, i, false)
+            }
+            if (want_add[i] & D_AAAA) != 0 as u32 {
+                do_aaaa(&cx, pk, r, 3 as u32, i, false)
+            }
+        }
+        i = i + 1
+    }
+    mdns_wire.pk_finish(pk)
+    if !any_answer {
+        return MODE_NONE
+    }
+    if legacy || all_qu {
+        return MODE_UNICAST
+    }
+    return MODE_MULTICAST
+}
+
+fn resp_conflict(r: *mut Reg, msg: u64, n: usize) -> usize {
+    var h: mdns_wire.Hdr = mdns_wire.hdr_new()
+    if !mdns_wire.hdr_read(msg, n, &h) || (h.flags & mdns_wire.FLAG_QR) == 0 as u32 {
+        return BAD
+    }
+    var off: usize = 12
+    var q: mdns_wire.Qn = mdns_wire.qn_new()
+    var k: u32 = 0
+    while k < h.qd {
+        let nx: usize = mdns_wire.q_read(msg, n, off, &q)
+        if nx == 0 {
+            return BAD
+        }
+        off = nx
+        k = k + 1 as u32
+    }
+    var rr: mdns_wire.Rr = mdns_wire.rr_new()
+    let total: u32 = h.an + h.ns + h.ar
+    k = 0
+    while k < total {
+        let nx: usize = mdns_wire.rr_read(msg, n, off, &rr)
+        if nx == 0 {
+            return BAD
+        }
+        off = nx
+        k = k + 1 as u32
+        if rr.ok {
+            var i: usize = 0
+            while i < MAX_SVC {
+                if (*r).used[i] {
+                    let rn: u64 = (&rr.name[0]) as u64
+                    if rr.typ == mdns_wire.T_SRV && mdns_wire.wname_eq(rn, rr.nlen, inst_p(r, i), (*r).ilen[i]) {
+                        var mine: [u8; 262] = [0; 262]
+                        mine[4] = (((*r).port[i] >> 8) & 255 as u32) as u8
+                        mine[5] = ((*r).port[i] & 255 as u32) as u8
+                        rt.mem_copy((&mine[0]) as u64 + 6 as u64, host_p(r, i), (*r).hlen[i])
+                        if rr.dlen != 6 + (*r).hlen[i] || !rt.mem_eq((&rr.data[0]) as u64, (&mine[0]) as u64, rr.dlen) {
+                            return i
+                        }
+                    }
+                    if rr.typ == mdns_wire.T_A && (*r).has4[i] && rr.dlen == 4
+                        && mdns_wire.wname_eq(rn, rr.nlen, host_p(r, i), (*r).hlen[i]) {
+                        let theirs: u32 = mdns_wire.be32((&rr.data[0]) as u64, 0)
+                        if theirs != (*r).a4[i] {
+                            return i
+                        }
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return BAD
+}
