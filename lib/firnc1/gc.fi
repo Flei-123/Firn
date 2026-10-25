@@ -35,8 +35,9 @@ import lexer
 import ast
 import types
 import gcnames
+import regerr
 
-export { Gc, gc_new, gc_free, gc_error, gc_count, gc_has_classes,
+export { Gc, gc_regerr, gc_new, gc_free, gc_error, gc_count, gc_has_classes,
     gc_class_add, gc_base_set, gc_field_add,
     gc_runtime_set, gc_runtime,
     gc_index_of, gc_is_class, gc_name, gc_sidx, gc_widx,
@@ -147,9 +148,11 @@ const NONE: u32 = 4294967295
 
 struct Gc {
     k_name: Vec[u32], // class name (number in the interner)
+    k_pos: Vec[u64], k_bpos: Vec[u64],
     k_base: Vec[u32], // name of the base, 0 = none
     k_foff: Vec[u32], k_flen: Vec[u32], // own fields: range in f_*
     f_name: Vec[u32], f_te: Vec[u32], // field name, type node in the tree
+    f_pos: Vec[u64],
     k_sidx: Vec[u32], // struct "gc C", type context (NONE up to gc_register)
     k_widx: Vec[u32], // struct "GcWeak[C]"
     k_size: Vec[u64], // after the layout: size in bytes
@@ -160,6 +163,7 @@ struct Gc {
     k_woff: Vec[u32], k_wlen: Vec[u32], // weak ones: range in w_offs
     s_offs: Vec[u64], w_offs: Vec[u64],
     scratch: rt.Buf,
+    re: regerr.RegErr,
     err: usize,
     // Round 49: 1 = the runtime (lib/gc/gc.fi) is part of this program,
     // even if there is NO `gc class`. Then the state block still has to
@@ -176,9 +180,9 @@ struct Gc {
 
 fn gc_new() -> Gc {
     return Gc {
-        k_name: vec_new[u32](), k_base: vec_new[u32](),
+        k_name: vec_new[u32](), k_base: vec_new[u32](), k_pos: vec_new[u64](), k_bpos: vec_new[u64](),
         k_foff: vec_new[u32](), k_flen: vec_new[u32](),
-        f_name: vec_new[u32](), f_te: vec_new[u32](),
+        f_name: vec_new[u32](), f_te: vec_new[u32](), f_pos: vec_new[u64](),
         k_sidx: vec_new[u32](), k_widx: vec_new[u32](),
         k_size: vec_new[u64](), k_btid: vec_new[u64](),
         k_union: vec_new[u32](), k_done: vec_new[u32](),
@@ -186,6 +190,7 @@ fn gc_new() -> Gc {
         k_woff: vec_new[u32](), k_wlen: vec_new[u32](),
         s_offs: vec_new[u64](), w_offs: vec_new[u64](),
         scratch: rt.buf_new(),
+        re: regerr.regerr_new(),
         err: 0,
         runtime: 0,
         root_lo: 0,
@@ -200,6 +205,10 @@ fn gc_free(g: *mut Gc) {
     vec_free[u32](&(*g).k_flen)
     vec_free[u32](&(*g).f_name)
     vec_free[u32](&(*g).f_te)
+    vec_free[u64](&(*g).f_pos)
+    vec_free[u64](&(*g).k_pos)
+    vec_free[u64](&(*g).k_bpos)
+    regerr.regerr_free(&(*g).re)
     vec_free[u32](&(*g).k_sidx)
     vec_free[u32](&(*g).k_widx)
     vec_free[u64](&(*g).k_size)
@@ -216,6 +225,13 @@ fn gc_free(g: *mut Gc) {
 }
 
 fn gc_error(g: *mut Gc) -> usize { return (*g).err }
+
+fn gc_regerr(g: *mut Gc) -> *mut regerr.RegErr { return &(*g).re }
+
+fn fail(g: *mut Gc, code: u32, pos: u64, a0: u64, a1: u64) {
+    regerr.regerr_add(&(*g).re, code, pos, a0, a1, 0, 0, 0, 0)
+    (*g).err = (*g).err + 1
+}
 fn gc_count(g: *mut Gc) -> usize { return vec_len[u32](&(*g).k_name) }
 fn gc_has_classes(g: *mut Gc) -> bool { return gc_count(g) > 0 }
 
@@ -309,12 +325,14 @@ fn gc_weak_off(g: *mut Gc, ki: u32, j: u32) -> u64 {
 
 // A new class from the parser. NONE if the name already exists --
 // the caller (the parser) reports the error itself.
-fn gc_class_add(g: *mut Gc, name: u32) -> u32 {
+fn gc_class_add(g: *mut Gc, name: u32, pos: u64) -> u32 {
     if gc_index_of(g, name) != NONE {
         return NONE
     }
     let i: u32 = gc_count(g) as u32
     vec_push[u32](&(*g).k_name, name)
+    vec_push[u64](&(*g).k_pos, pos)
+    vec_push[u64](&(*g).k_bpos, 0)
     vec_push[u32](&(*g).k_base, 0)
     vec_push[u32](&(*g).k_foff, vec_len[u32](&(*g).f_name) as u32)
     vec_push[u32](&(*g).k_flen, 0)
@@ -348,6 +366,8 @@ fn gc_capture_class(g: *mut Gc, t: *mut types.Types, it: *mut intern.Interner,
     name: u32, caps: *mut Vec[u32]) -> u32 {
     let ki: u32 = gc_count(g) as u32
     vec_push[u32](&(*g).k_name, name)
+    vec_push[u64](&(*g).k_pos, 0)
+    vec_push[u64](&(*g).k_bpos, 0)
     vec_push[u32](&(*g).k_base, 0)
     vec_push[u32](&(*g).k_foff, vec_len[u32](&(*g).f_name) as u32)
     vec_push[u32](&(*g).k_flen, 0)
@@ -405,12 +425,13 @@ fn gc_capture_class(g: *mut Gc, t: *mut types.Types, it: *mut intern.Interner,
     return ki
 }
 
-fn gc_base_set(g: *mut Gc, ki: u32, base: u32) {
+fn gc_base_set(g: *mut Gc, ki: u32, base: u32, bpos: u64) {
+    vec_set[u64](&(*g).k_bpos, ki as usize, bpos)
     vec_set[u32](&(*g).k_base, ki as usize, base)
 }
 
 // An own field. false = duplicate (the parser reports the error).
-fn gc_field_add(g: *mut Gc, ki: u32, fname: u32, te: u32) -> bool {
+fn gc_field_add(g: *mut Gc, ki: u32, fname: u32, te: u32, fpos: u64) -> bool {
     let off: u32 = vec_at[u32](&(*g).k_foff, ki as usize)
     let len: u32 = vec_at[u32](&(*g).k_flen, ki as usize)
     var k: u32 = 0
@@ -422,6 +443,7 @@ fn gc_field_add(g: *mut Gc, ki: u32, fname: u32, te: u32) -> bool {
     }
     vec_push[u32](&(*g).f_name, fname)
     vec_push[u32](&(*g).f_te, te)
+    vec_push[u64](&(*g).f_pos, fpos)
     vec_set[u32](&(*g).k_flen, ki as usize, len + 1)
     return true
 }
@@ -679,8 +701,7 @@ fn gc_register(g2: u64, t: *mut types.Types, it: *mut intern.Interner) {
     while i < n {
         let name: u32 = vec_at[u32](&(*g).k_name, i)
         if types.struct_index(t, name) >= 0 {
-            // type '...' is already declared
-            (*g).err = (*g).err + 1
+            fail(g, 201, vec_at[u64](&(*g).k_pos, i), name as u64, 0)
         }
         rt.buf_clear(&(*g).scratch)
         var p1: [u8; 3] = "gc "
@@ -729,12 +750,10 @@ fn gc_register(g2: u64, t: *mut types.Types, it: *mut intern.Interner) {
         if b != 0 {
             let bi: u32 = gc_index_of(g, b)
             if bi == NONE {
-                // unknown base class
-                (*g).err = (*g).err + 1
+                fail(g, 202, vec_at[u64](&(*g).k_bpos, i), b as u64, 0)
                 vec_set[u32](&(*g).k_base, i, 0)
             } else if circle(g, bi, i as u32) {
-                // cyclic inheritance chain
-                (*g).err = (*g).err + 1
+                fail(g, 203, vec_at[u64](&(*g).k_bpos, i), vec_at[u32](&(*g).k_name, i) as u64, 0)
                 vec_set[u32](&(*g).k_base, i, 0)
             }
         }
@@ -854,15 +873,13 @@ fn put_out(g: *mut Gc, t: *mut types.Types, b: *mut ast.Tree, it: *mut intern.In
             j = j + 1
         }
         if duplicate {
-            // the base already declares that field
-            (*g).err = (*g).err + 1
+            fail(g, 204, vec_at[u64](&(*g).f_pos, (foff + k) as usize), fname as u64, vec_at[u32](&(*g).k_name, i as usize) as u64)
             k = k + 1
             continue
         }
         let ty: u32 = types.resolve(t, b, it, fte)
         if !field_ty_allowed(g, t, ty) {
-            // field type is not allowed in a gc class
-            (*g).err = (*g).err + 1
+            fail(g, 205, vec_at[u64](&(*g).f_pos, (foff + k) as usize), ty as u64, 0)
             k = k + 1
             continue
         }
@@ -925,7 +942,8 @@ fn put_out(g: *mut Gc, t: *mut types.Types, b: *mut ast.Tree, it: *mut intern.In
 // Returning NONE means it is not a GC name and normal resolution continues.
 // Errors are COUNTED here (the type checker folds them into its own count
 // through `gc_error` -- like `err.fi`).
-fn gc_ty_hook(g2: u64, t: *mut types.Types, it: *mut intern.Interner, nr: u32) -> u32 {
+fn gc_ty_hook(g2: u64, t: *mut types.Types, b: *mut ast.Tree, it: *mut intern.Interner, nr: u32, tnode: u32) -> u32 {
+    let tpos: u64 = ast.ty_pos(b, tnode)
     let g: *mut Gc = g2 as *mut Gc
     var pfx1: [u8; 7] = "__gc#p:"
     if name_prefix(it, nr, (&pfx1[0]) as u64, 7) {
@@ -937,8 +955,7 @@ fn gc_ty_hook(g2: u64, t: *mut types.Types, it: *mut intern.Interner, nr: u32) -
             ki = gc_index_of(g, kn as u32)
         }
         if ki == NONE {
-            // unknown gc class
-            (*g).err = (*g).err + 1
+            fail(g, 206, tpos, (intern.intern_number(it, p + 7, n - 7)) as u64, 0)
             return types.new_ty(t, types.K_ERROR, 0, 0)
         }
         let st: u32 = types.new_ty(t, types.K_STRUCT, gc_sidx(g, ki), 0)
@@ -954,15 +971,14 @@ fn gc_ty_hook(g2: u64, t: *mut types.Types, it: *mut intern.Interner, nr: u32) -
             ki = gc_index_of(g, kn as u32)
         }
         if ki == NONE {
-            (*g).err = (*g).err + 1
+            fail(g, 206, tpos, (intern.intern_number(it, p + 7, n - 7)) as u64, 0)
             return types.new_ty(t, types.K_ERROR, 0, 0)
         }
         return types.new_ty(t, types.K_STRUCT, gc_widx(g, ki), 0)
     }
     // `let x: Node` -- a gc class value lives ONLY on the GC heap.
     if gc_is_class(g, nr) {
-        // '...' is a gc class and cannot be a value
-        (*g).err = (*g).err + 1
+        fail(g, 207, tpos, nr as u64, 0)
         return types.new_ty(t, types.K_ERROR, 0, 0)
     }
     return NONE

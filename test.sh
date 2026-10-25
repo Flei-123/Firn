@@ -366,7 +366,12 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
 echo "== 3. positive tests (in every build level) =="
 PROGS=$(ls tests/*.fi tests/opt/*.fi examples/*.fi)
 NPROG=0
+SHARD_INDEX=${TEST_SHARD_INDEX:-0}
+SHARD_COUNT=${TEST_SHARD_COUNT:-1}
+PROG_ID=0
 for f in $PROGS; do
+    PROG_ID=$((PROG_ID + 1))
+    [ $(((PROG_ID - 1) % SHARD_COUNT)) -eq "$SHARD_INDEX" ] || continue
     NPROG=$((NPROG + 1))
     printf '  %-40s' "$f"
     run_case "$f" opt

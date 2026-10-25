@@ -42,6 +42,8 @@ import escape
 import moves
 import report
 import msgfmt
+import regerr
+import regmsg
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_pend, sema_ty, sema_widen32,
     sema_is_seq, sema_hidden_idx, sema_vec_slice, sema_vec_sugar, sema_seq_elem,
@@ -673,6 +675,19 @@ fn complain(s: *mut Sema) {
     say(s, (*s).cur_pos, 1, (&m[0]) as u64, 22, 0, 0, 0, 0)
 }
 
+fn drain_reg(s: *mut Sema, r: *mut regerr.RegErr, from: usize) -> usize {
+    var i: usize = from
+    while i < regerr.regerr_count(r) {
+        if regmsg.regmsg_say(r, i, &(*s).pend, &(*s).dmsg, table(s), names(s)) {
+            (*s).err = (*s).err + 1
+        } else {
+            complain(s)
+        }
+        i = i + 1
+    }
+    return i
+}
+
 fn count_error(s: *mut Sema) {
     (*s).err = (*s).err + 1
 }
@@ -1190,6 +1205,20 @@ fn ast_ty(s: *mut Sema, te: u32) -> u32 {
     return r
 }
 
+fn declared_type_name(s: *mut Sema, name: u32) -> bool {
+    var str_word: [u8; 3] = "str"
+    if intern.intern_find(names(s), (&str_word[0]) as u64, 3) == name as i64 {
+        return true
+    }
+    if has_mu(s) && pattern.pat_enum_find(mu(s), name) != 4294967295 {
+        return true
+    }
+    if has_fe(s) && err.error_set_find(fe(s), name) != 4294967295 {
+        return true
+    }
+    return false
+}
+
 // r912 (sema.rs::collect_structs / collect_fns / check_main): a struct or a function declared
 // twice, and a `main` that is not `fn main()` / `fn main(u64)` returning `i32`.
 fn check_declarations(s: *mut Sema) {
@@ -1201,7 +1230,7 @@ fn check_declarations(s: *mut Sema) {
         while vec_len[u8](&seen) <= n {
             vec_push[u8](&seen, 0 as u8)
         }
-        if vec_at[u8](&seen, n) != 0 as u8 {
+        if vec_at[u8](&seen, n) != 0 as u8 || declared_type_name(s, n as u32) {
             var mm1002: [u8; 31] = "struct '%n' is already declared"
             say(s, ast.structure_pos(b, i), 1, (&mm1002[0]) as u64, 31, (n) as u64, 0, 0, 0)
         }
@@ -6510,8 +6539,10 @@ fn sema_run(s: *mut Sema) {
     // 0. Enums: register the NAMES first, so that structs and signatures can
     //    use them (before the struct layout -- exactly like `declare_enums`
     //    before `collect_structs` in stage 0).
+    var mu_so_far: usize = 0
     if has_mu(s) {
         pattern.pat_register(mu(s), table(s))
+        mu_so_far = drain_reg(s, pattern.pat_regerr(mu(s)), mu_so_far)
     }
     // 0b. Error sets: register the NAMES -- after the enums, before the
     //    structs of the tree, exactly like `declare_error_sets` in stage 0. The
@@ -6562,11 +6593,8 @@ fn sema_run(s: *mut Sema) {
     //    present, all signatures matching (`hook_check_impls` in stage 0). Runs
     //    AFTER the signatures and BEFORE the bodies.
     if has_if(s) {
-        let ij: usize = iface.if_check((*s).ifr, table(s), b, names(s))
-        while if_so_far < ij {
-            complain(s)
-            if_so_far = if_so_far + 1
-        }
+        iface.if_check((*s).ifr, table(s), b, names(s))
+        if_so_far = drain_reg(s, iface.if_regerr(ifp(s)), if_so_far)
     }
     // 1b. Collect `#[must_consume]` (sema.rs::check_attrs, round 36):
     //    marked functions by their NAME, marked types by their struct
@@ -6592,33 +6620,21 @@ fn sema_run(s: *mut Sema) {
     if has_fe(s) {
         // Count the errors from the registry too (duplicate sets,
         // unknown sets, unions used as a field type).
-        let fj: usize = err.error_error(fe(s))
-        while fe_so_far < fj {
-            complain(s)
-            fe_so_far = fe_so_far + 1
-        }
+        fe_so_far = drain_reg(s, err.error_regerr(fe(s)), fe_so_far)
     }
     // 1b. Enums: record the LAYOUTS -- after the struct layout of the
     //    handwritten structs and before any use (`layout_enums` in
     //    stage 0). Errors from that count too.
     if has_mu(s) {
-        let mf: u32 = pattern.pat_layout(mu(s), table(s), b, names(s))
-        var mk: u32 = 0
-        while mk < mf {
-            complain(s)
-            mk = mk + 1
-        }
+        pattern.pat_layout(mu(s), table(s), b, names(s))
+        mu_so_far = drain_reg(s, pattern.pat_regerr(mu(s)), mu_so_far)
     }
     // 1c. gc classes: work out the field layout -- only here are the structs
     //    of the program known (`layout_classes` in stage 0). Errors from that
     //    (unknown base, cycles, forbidden field types) count too.
     if has_gc(s) {
         gc.gc_layout((*s).gc, table(s), b, names(s))
-        let gj: usize = gc.gc_error(gcp(s))
-        while gc_so_far < gj {
-            complain(s)
-            gc_so_far = gc_so_far + 1
-        }
+        gc_so_far = drain_reg(s, gc.gc_regerr(gcp(s)), gc_so_far)
     }
 
     // 2. Create the primitive types once instead of at every access.
@@ -6831,20 +6847,12 @@ fn sema_run(s: *mut Sema) {
     if has_fe(s) {
         // Unions that are resolved only inside a BODY (say
         // `let r: E!i32 = ...`) can still have counted errors there.
-        let fj: usize = err.error_error(fe(s))
-        while fe_so_far < fj {
-            complain(s)
-            fe_so_far = fe_so_far + 1
-        }
+        fe_so_far = drain_reg(s, err.error_regerr(fe(s)), fe_so_far)
     }
     if has_gc(s) {
         // gc type errors that only showed up inside a BODY (unknown
         // class in `Gc[...]`, a class name used as a value type).
-        let gj: usize = gc.gc_error(gcp(s))
-        while gc_so_far < gj {
-            complain(s)
-            gc_so_far = gc_so_far + 1
-        }
+        gc_so_far = drain_reg(s, gc.gc_regerr(gcp(s)), gc_so_far)
         // 6. Check `#[no_gc]` transitively (nogc.rs). Runs AFTER the
         //    type check, because rule 3 (writing to a Gc[T] field) needs
         //    the type table.
@@ -6855,7 +6863,7 @@ fn sema_run(s: *mut Sema) {
         let nf: usize = nogc.nogc_check(s as u64, mu2, (*s).gc, (*s).it)
         var nk: usize = 0
         while nk < nf {
-            complain(s)
+            count_error(s)
             nk = nk + 1
         }
     }
