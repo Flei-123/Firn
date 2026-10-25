@@ -90,7 +90,7 @@ for name, tp in (("a", 3), ("b", 4), ("c", 5)):
     after = ph[vmin:]
     print("%s_vmin=%d" % (name, ph[vmin][5]))
     print("%s_vup=%d" % (name, max(r[5] for r in after)))
-    print("%s_rise=%d" % (name, max(r[3] for r in after) - ph[vmin][3]))
+    print("%s_rise=%d" % (name, max([r[3] for r in after[1:]] or [min(r[3] for r in ph)]) - min(r[3] for r in ph)))
     print("%s_end_y=%d" % (name, ph[-1][3]))
 PY
 )
