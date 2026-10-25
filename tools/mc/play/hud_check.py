@@ -94,6 +94,29 @@ def main():
         print(f"  {'ok  ' if ok else 'FAIL'}  hud debug text pixels={bright}")
         if not ok:
             errors.append("debug")
+    elif mode == "boss":
+        bars = load(jar, "assets/minecraft/textures/gui/bars.png")
+        s = lc.scale_for(*img.size)
+        gw = (img.size[0] + s - 1) // s
+        g, t = match(img, bars, s, gw // 2 - 91, 12, 0, 25, 182, 5, 255)
+        expect("bossbar", g, t, errors, 0.9)
+    elif mode == "title":
+        s = lc.scale_for(*img.size)
+        w, h = img.size
+        white = sum(1 for x in range(w // 2 - 40 * s, w // 2 + 40 * s) for y in range(h // 2 - 22 * s, h // 2 - 2 * s) if min(img.getpixel((x, y))) > 240)
+        ok = white > 200
+        print(f"  {'ok  ' if ok else 'FAIL'}  hud title white pixels={white}")
+        if not ok:
+            errors.append("title")
+    elif mode == "side":
+        before = read(sys.argv[4])
+        w, h = img.size
+        s = lc.scale_for(w, h)
+        diff = sum(1 for x in range(w - 30 * s, w - 3 * s) for y in range(h // 2 - 20 * s, h // 2 + 20 * s) if img.getpixel((x, y)) != before.getpixel((x, y)))
+        ok = diff > 300
+        print(f"  {'ok  ' if ok else 'FAIL'}  hud sidebar changed pixels={diff}")
+        if not ok:
+            errors.append("side")
     elif mode == "png":
         w, h = img.size
         ok = (w, h) == (int(sys.argv[4]), int(sys.argv[5]))

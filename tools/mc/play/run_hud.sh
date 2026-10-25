@@ -72,6 +72,12 @@ if [ -n "$WP" ]; then
   hudcheck "$WP" hidden hidden
   key "$WP" F1
   xdotool windowfocus "$WP" 2>/dev/null
+  printf '%s\n' 'bossbar add hudtest {"text":"Boss"}' 'bossbar set minecraft:hudtest players @a' 'bossbar set minecraft:hudtest color red' 'bossbar set minecraft:hudtest value 100' 'scoreboard objectives add hudobj dummy {"text":"Sidebar"}' 'scoreboard objectives setdisplay sidebar hudobj' 'scoreboard players set Alpha hudobj 7' 'title @a title {"text":"HELLO"}' >&3
+  sleep 1
+  hudcheck "$WP" title title
+  hudcheck "$WP" boss boss
+  xdotool mousemove --window "$WP" 5 5; sleep 0.5
+  shot "$WP" side && { python3 -I "$CHECK" side "$W/side.ppm" "$MC_VANILLA_JAR" "$W/bars.ppm" || ERR=1; }
 fi
 sleep 1
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
