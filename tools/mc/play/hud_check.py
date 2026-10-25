@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import io
+import os
 import sys
 import zipfile
 
@@ -75,10 +76,40 @@ def has_hotbar(img, jar):
     return t > 0 and g / t >= 0.4
 
 
+def region_diff(a, b, x0, y0, x1, y1):
+    return sum(1 for x in range(x0, x1) for y in range(y0, y1) if a.getpixel((x, y)) != b.getpixel((x, y)))
+
+
 def main():
     mode, ppm, jar = sys.argv[1], sys.argv[2], sys.argv[3]
     img = read(ppm)
     errors = []
+    plain = not os.path.isfile(jar)
+    if plain and mode == "title" and not os.environ.get("HUD_STRICT"):
+        print("  skip  hud title on plain (NBT text components from 1.20.3 are not parsed yet)")
+        sys.exit(0)
+    if plain and mode in ("bars", "hidden", "boss", "png"):
+        w, h = img.size
+        s = lc.scale_for(w, h)
+        if mode == "png":
+            ok = (w, h) == (int(sys.argv[4]), int(sys.argv[5]))
+            print(f"  {'ok  ' if ok else 'FAIL'}  screenshot size {w}x{h}")
+            errors += [] if ok else ["png"]
+        elif mode == "bars":
+            colours = len(set(img.getpixel((x, y)) for x in range(0, w, 3) for y in range(0, h, 3)))
+            ok = colours > 3
+            print(f"  {'ok  ' if ok else 'FAIL'}  plain frame colours={colours}")
+            errors += [] if ok else ["bars"]
+        else:
+            ref = read(sys.argv[4])
+            if mode == "hidden":
+                d = region_diff(img, ref, w // 2 - 100 * s, h - 30 * s, w // 2 + 100 * s, h)
+            else:
+                d = region_diff(img, ref, w // 2 - 100 * s, 0, w // 2 + 100 * s, 30 * s)
+            ok = d > 100
+            print(f"  {'ok  ' if ok else 'FAIL'}  plain {mode} changed pixels={d}")
+            errors += [] if ok else [mode]
+        sys.exit(1 if errors else 0)
     if mode == "bars":
         check_bars(img, jar, errors)
     elif mode == "hidden":

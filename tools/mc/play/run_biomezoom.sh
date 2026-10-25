@@ -105,7 +105,7 @@ done
 L=$(tail -n +"$((NSB + 1))" "$W/server.log")
 [ "$(echo "$L" | grep -c 'Successfully filled')" -ge 2 ] || { echo "$L" | tail -8; fail "server fill of the platform (need 2 'Successfully filled')"; }
 [ "$(echo "$L" | grep -c 'biome entry/entries set between')" -ge 4 ] || { echo "$L" | tail -8; fail "server fillbiome (need 4 'biome entry/entries set between')"; }
-DN=$((90 + RANDOM % 100))
+DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN

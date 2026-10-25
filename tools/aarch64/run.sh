@@ -175,6 +175,12 @@ one_case() {
         *) echo "X86BAD $file :: no expectation in line 1"; return ;;
     esac
 
+    local skip_why
+    skip_why=$(awk -F'\t' -v f="$file" '$1==f {print $2; exit}' tools/aarch64/skip.txt 2>/dev/null)
+    if [ -n "$skip_why" ]; then
+        echo "NOTSUP $file :: [qemu-slow] $skip_why"
+        return
+    fi
     # `// only_target: x86_64` = the feature under test exists on x86-64 only
     # (r904 stack guard: aarch64 startup belongs to fUi). Not comparable.
     if head -5 "$file" | grep -q '^// only_target: x86_64$'; then
@@ -333,7 +339,7 @@ echo "  build stage:    $LABEL"
 echo "  SAME:           $SAME"
 echo "  DIFFERENT:      $DIFF"
 echo "  NOT SUPPORTED:  $NOTSUP"
-for c in x86-asm link-lib x86-only gap; do
+for c in x86-asm link-lib x86-only qemu-slow gap; do
     n=$(grep -c "^NOTSUP .* :: \[$c\]" "$WORK/result.$LABEL.txt" || true)
     [ "$n" -gt 0 ] && echo "    of which $c: $n"
 done

@@ -48,7 +48,7 @@ grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did
 sleep "${RUN_INV_WARMUP:-0}" # a cold 1.21.11 / 26.1 server answers the first login late
 for gr in "doDaylightCycle false" "doMobSpawning false"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
-DN=$((120 + RANDOM % 70))
+DN=$(bash tools/mc/pick_display.sh 120 70)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
