@@ -3,8 +3,19 @@ FNR == NR {
         n = split($0, parts, /[: ]+/)
         for (i = 2; i <= n; i++) {
             if (parts[i] == "") continue
-            if (parts[i] in stage_of) dup = dup " " parts[i]
-            stage_of[parts[i]] = parts[1] + 0
+            base = parts[i]
+            spec = ""
+            if (index(base, "@") > 0) {
+                spec = substr(base, index(base, "@") + 1)
+                base = substr(base, 1, index(base, "@") - 1)
+                sharded[base] = 1
+            }
+            key = parts[1] + 0
+            if ((base in stage_of) && !(base in sharded)) dup = dup " " base
+            if ((key SUBSEP base) in has) dup = dup " " base
+            has[key, base] = 1
+            if (spec != "") shard[key, base] = spec
+            if (!(base in stage_of)) stage_of[base] = key
         }
         if (parts[1] + 0 > last_stage) last_stage = parts[1] + 0
     }
@@ -14,9 +25,19 @@ FNR == NR {
     id = $0
     sub(/^echo "== /, "", id)
     sub(/\..*/, "", id)
-    st = (id in stage_of) ? stage_of[id] : last_stage
     seen[id] = 1
-    if (id != "1" && index(ids[st] " ", " " id " ") == 0) ids[st] = ids[st] " " id
+    if (id in stage_of) {
+        for (s = 1; s <= last_stage; s++) {
+            if (!((s SUBSEP id) in has)) continue
+            item = id
+            if ((s SUBSEP id) in shard) item = id "@" shard[s, id]
+            if (id != "1" && index(ids[s] " ", " " item " ") == 0) ids[s] = ids[s] " " item
+        }
+        sel = ((stage SUBSEP id) in has)
+    } else {
+        if (id != "1" && index(ids[last_stage] " ", " " id " ") == 0) ids[last_stage] = ids[last_stage] " " id
+        sel = (stage == last_stage)
+    }
     section = id
     if (id == "1") {
         mode = "common"
@@ -25,9 +46,15 @@ FNR == NR {
             print "__stage_tick() { echo \"   [elapsed since previous mark: $((SECONDS - __stage_t0))s]\"; __stage_t0=$SECONDS; }"
         }
     }
-    else if (list == 1 || st == stage) mode = "sel"
+    else if (list == 1 || sel) mode = "sel"
     else mode = "skip"
-    if (mode == "sel" && emit) print "__stage_tick"
+    if (mode == "sel" && emit) {
+        print "__stage_tick"
+        if ((stage SUBSEP id) in shard) {
+            split(shard[stage, id], sp, "/")
+            print "TEST_SHARD_INDEX=" (sp[1] - 1) "; TEST_SHARD_COUNT=" sp[2]
+        }
+    }
     next_is_section = 1
 }
 section == "2" && $0 == "rm -rf \"$WORK\"" { mode = "common" }
