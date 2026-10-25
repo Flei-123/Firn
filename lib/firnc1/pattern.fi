@@ -42,8 +42,9 @@ import vec
 import intern
 import ast
 import types
+import regerr
 
-export { Pat, pat_new, pat_free, pat_error,
+export { Pat, pat_new, pat_free, pat_error, pat_regerr,
     MU_WILD, MU_BIND, MU_INT, MU_BOOL, MU_RANGE, MU_VARIANT,
     pat_enum_add, pat_vt_start, pat_vt_add, pat_variant_add,
     pat_match_add, pat_arm_add,
@@ -74,7 +75,7 @@ const MU_VARIANT: u32 = 5 // `Enum::Variant(sub..)` -- mu_a = the enum
 
 struct Pat {
     // enums
-    e_name: Vec[u32],
+    e_name: Vec[u32], e_pos: Vec[u64],
     e_sidx: Vec[u32], // struct index, types.Types (NONE up to pat_register)
     e_voff: Vec[u32], e_vlen: Vec[u32],
     e_size: Vec[u64], e_align: Vec[u64],
@@ -100,11 +101,12 @@ struct Pat {
 
     scratch: rt.Buf,
     err: usize,
+    re: regerr.RegErr,
 }
 
 fn pat_new() -> Pat {
     return Pat {
-        e_name: vec_new[u32](), e_sidx: vec_new[u32](),
+        e_name: vec_new[u32](), e_pos: vec_new[u64](), e_sidx: vec_new[u32](),
         e_voff: vec_new[u32](), e_vlen: vec_new[u32](),
         e_size: vec_new[u64](), e_align: vec_new[u64](),
         v_name: vec_new[u32](), v_tag: vec_new[u32](),
@@ -119,11 +121,13 @@ fn pat_new() -> Pat {
         mu_children: vec_new[u32](),
         scratch: rt.buf_new(),
         err: 0,
+        re: regerr.regerr_new(),
     }
 }
 
 fn pat_free(m: *mut Pat) {
     vec_free[u32](&(*m).e_name)
+    vec_free[u64](&(*m).e_pos)
     vec_free[u32](&(*m).e_sidx)
     vec_free[u32](&(*m).e_voff)
     vec_free[u32](&(*m).e_vlen)
@@ -152,9 +156,17 @@ fn pat_free(m: *mut Pat) {
     vec_free[u32](&(*m).mu_slen)
     vec_free[u32](&(*m).mu_children)
     rt.buf_free(&(*m).scratch)
+    regerr.regerr_free(&(*m).re)
 }
 
 fn pat_error(m: *mut Pat) -> usize { return (*m).err }
+
+fn pat_regerr(m: *mut Pat) -> *mut regerr.RegErr { return &(*m).re }
+
+fn fail(m: *mut Pat, code: u32, pos: u64, a0: u64, a1: u64) {
+    regerr.regerr_add(&(*m).re, code, pos, a0, a1, 0, 0, 0, 0)
+    (*m).err = (*m).err + 1
+}
 
 // -------------------------------------------------------------- creating
 
@@ -172,12 +184,13 @@ fn pat_enum_find(m: *mut Pat, name: u32) -> u32 {
 // A new enum. The name stays UNCHANGED -- enum names are visible
 // program wide, not per module (SPEC 14.1). Declaring it twice is an
 // error; it is recorded anyway (the first entry wins the lookup).
-fn pat_enum_add(m: *mut Pat, name: u32) -> u32 {
+fn pat_enum_add(m: *mut Pat, name: u32, pos: u64) -> u32 {
     if pat_enum_find(m, name) != NONE {
         (*m).err = (*m).err + 1
     }
     let i: u32 = vec_len[u32](&(*m).e_name) as u32
     vec_push[u32](&(*m).e_name, name)
+    vec_push[u64](&(*m).e_pos, pos)
     vec_push[u32](&(*m).e_sidx, NONE)
     vec_push[u32](&(*m).e_voff, vec_len[u32](&(*m).v_name) as u32)
     vec_push[u32](&(*m).e_vlen, 0)
@@ -380,7 +393,9 @@ fn pat_register(m: *mut Pat, t: *mut types.Types) {
     while i < pat_enum_count(m) {
         let name: u32 = pat_e_name(m, i as u32)
         if types.struct_index(t, name) >= 0 {
-            (*m).err = (*m).err + 1
+            fail(m, 401, vec_at[u64](&(*m).e_pos, i), name as u64, 0)
+            i = i + 1
+            continue
         }
         let idx: u32 = types.types_struct_reserve(t, name)
         vec_set[u32](&(*m).e_sidx, i, idx)
@@ -516,8 +531,11 @@ fn pat_layout(m: *mut Pat, t: *mut types.Types, b: *mut ast.Tree,
         while k < ast.structure_flen(b, si) {
             let fi: u32 = ast.structure_foff(b, si) + k
             let ty: u32 = types.resolve(t, b, it, ast.field_ty(b, fi))
-            if contains_enum(m, t, ty) {
-                (*m).err = (*m).err + 1
+            let wn: u32 = value_name(b, ast.field_ty(b, fi))
+            if wn != NONE && pat_enum_find(m, wn) != NONE {
+                fail(m, 402, ast.field_pos(b, fi), ast.field_name(b, fi) as u64, wn as u64)
+            } else if contains_enum(m, t, ty) {
+                fail(m, 499, 0, 0, 0)
             }
             k = k + 1
         }
@@ -574,8 +592,8 @@ fn pat_layout(m: *mut Pat, t: *mut types.Types, b: *mut ast.Tree,
     vec_free[u32](&state)
     i = 0
     while i < vec_len[u32](&bad) {
-        // the enum contains itself (directly or indirectly).
-        (*m).err = (*m).err + 1
+        let bi: u32 = vec_at[u32](&bad, i)
+        fail(m, 403, vec_at[u64](&(*m).e_pos, bi as usize), pat_e_name(m, bi) as u64, 0)
         i = i + 1
     }
 
@@ -609,10 +627,10 @@ fn pat_layout(m: *mut Pat, t: *mut types.Types, b: *mut ast.Tree,
                 vec_len[u32](&(*m).rf_ty) as u32)
             var f: u32 = 0
             while f < tlen {
-                let ty: u32 = types.resolve(t, b, it,
-                    vec_at[u32](&(*m).vt_ty, (toff + f) as usize))
+                let te: u32 = vec_at[u32](&(*m).vt_ty, (toff + f) as usize)
+                let ty: u32 = types.resolve(t, b, it, te)
                 if types.ty_kind(t, ty) == types.K_VOID {
-                    (*m).err = (*m).err + 1
+                    fail(m, 404, ast.ty_pos(b, te), 0, 0)
                 }
                 var a: u64 = types.alignment_of(t, ty)
                 if a < 1 { a = 1 }

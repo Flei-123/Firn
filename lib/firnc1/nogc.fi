@@ -33,6 +33,7 @@ import types
 import pattern
 import gc
 import sema
+import report
 
 export { nogc_check }
 
@@ -51,6 +52,12 @@ struct Checker {
     m_flag: Vec[u32], // 1 = has `#[no_gc]`
     err: usize,
     depth: u32, // nesting depth of the `match` body blocks
+    who: u32,
+    fpos: Vec[u64],
+    foff: Vec[u32],
+    flen: Vec[u32],
+    ftxt: rt.Buf,
+    msg: rt.Buf,
 }
 
 fn names(p: *mut Checker) -> *mut intern.Interner { return (*p).it as *mut intern.Interner }
@@ -104,7 +111,9 @@ fn nogc_check(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
     var p: Checker = Checker {
         sm: sm, mu: mu, gcr: gcr2, it: it,
         m_name: vec_new[u32](), m_flag: vec_new[u32](),
-        err: 0, depth: 0,
+        err: 0, depth: 0, who: NONE,
+        fpos: vec_new[u64](), foff: vec_new[u32](), flen: vec_new[u32](),
+        ftxt: rt.buf_new(), msg: rt.buf_new(),
     }
     let b: *mut ast.Tree = sema.sema_tree(p.sm as *mut sema.Sema)
     // Collect the markings. For names declared twice (which the type
@@ -143,15 +152,182 @@ fn nogc_check(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
         i = 0
         while i < ast.fn_count(b) {
             if ast.fn_nogc(b, i) == 1 {
+                p.who = ast.fn_name(b, i)
                 check_block(&p, b, ast.fn_body(b, i))
             }
             i = i + 1
         }
     }
+    flush(&p, sema.sema_pend(p.sm as *mut sema.Sema))
     let out: usize = p.err
     vec_free[u32](&p.m_name)
     vec_free[u32](&p.m_flag)
+    vec_free[u64](&p.fpos)
+    vec_free[u32](&p.foff)
+    vec_free[u32](&p.flen)
+    rt.buf_free(&p.ftxt)
+    rt.buf_free(&p.msg)
     return out
+}
+
+fn finding_same(p: *mut Checker, x: usize, y: usize) -> bool {
+    if vec_at[u64](&(*p).fpos, x) != vec_at[u64](&(*p).fpos, y) {
+        return false
+    }
+    let n: usize = vec_at[u32](&(*p).flen, x) as usize
+    if n != vec_at[u32](&(*p).flen, y) as usize {
+        return false
+    }
+    let bx: u64 = rt.buf_ptr(&(*p).ftxt) + vec_at[u32](&(*p).foff, x) as u64
+    let by: u64 = rt.buf_ptr(&(*p).ftxt) + vec_at[u32](&(*p).foff, y) as u64
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(bx, i) != rt.ld8(by, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn flush(p: *mut Checker, pend: *mut report.Pend) {
+    let n: usize = vec_len[u64](&(*p).fpos)
+    var order: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < n {
+        var j: usize = vec_len[u32](&order)
+        vec_push[u32](&order, i as u32)
+        while j > 0 && vec_at[u64](&(*p).fpos, vec_at[u32](&order, j - 1) as usize) > vec_at[u64](&(*p).fpos, i) {
+            vec_set[u32](&order, j, vec_at[u32](&order, j - 1))
+            j = j - 1
+        }
+        vec_set[u32](&order, j, i as u32)
+        i = i + 1
+    }
+    var prev: usize = n
+    i = 0
+    while i < n {
+        let k: usize = vec_at[u32](&order, i) as usize
+        if prev == n || !finding_same(p, prev, k) {
+            rt.buf_clear(&(*p).msg)
+            rt.buf_push_bytes(&(*p).msg, rt.buf_ptr(&(*p).ftxt) + vec_at[u32](&(*p).foff, k) as u64, vec_at[u32](&(*p).flen, k) as usize)
+            report.pend_add(pend, vec_at[u64](&(*p).fpos, k), 1, &(*p).msg)
+        } else {
+            (*p).err = (*p).err - 1
+        }
+        prev = k
+        i = i + 1
+    }
+    vec_free[u32](&order)
+}
+
+fn find_double_underscore(it: *mut intern.Interner, name: u32, from: usize) -> i64 {
+    let ptr: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    var i: usize = from
+    while i + 1 < n {
+        if rt.ld8(ptr, i) == 95 as u8 && rt.ld8(ptr, i + 1) == 95 as u8 {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn push_readable(buf: *mut rt.Buf, it: *mut intern.Interner, name: u32) {
+    let ptr: u64 = intern.intern_ptr(it, name)
+    let n: usize = intern.intern_length(it, name)
+    var split: i64 = -1
+    if !(n > 0 && rt.ld8(ptr, 0) == 95 as u8) && !is_interner_name(it, name) {
+        let first: i64 = find_double_underscore(it, name, 0)
+        if first > 0 && (first as usize) + 2 < n && find_double_underscore(it, name, (first as usize) + 2) < 0 {
+            split = first
+        }
+    }
+    if split < 0 {
+        rt.buf_push_bytes(buf, ptr, n)
+        return
+    }
+    rt.buf_push_bytes(buf, ptr, split as usize)
+    rt.buf_push(buf, 46 as u8)
+    rt.buf_push_bytes(buf, ptr + (split as u64) + 2, n - (split as usize) - 2)
+}
+
+fn begin_finding(p: *mut Checker, pos: u64) {
+    rt.buf_clear(&(*p).msg)
+    vec_push[u64](&(*p).fpos, pos)
+    vec_push[u32](&(*p).foff, rt.buf_len(&(*p).ftxt) as u32)
+    var q: [u8; 1] = "'"
+    rt.buf_push_bytes(&(*p).msg, (&q[0]) as u64, 1)
+    push_readable(&(*p).msg, names(p), (*p).who)
+}
+
+fn end_finding(p: *mut Checker) {
+    vec_push[u32](&(*p).flen, rt.buf_len(&(*p).msg) as u32)
+    rt.buf_push_bytes(&(*p).ftxt, rt.buf_ptr(&(*p).msg), rt.buf_len(&(*p).msg))
+    (*p).err = (*p).err + 1
+}
+
+fn put_lit(p: *mut Checker, text: u64, n: usize) {
+    rt.buf_push_bytes(&(*p).msg, text, n)
+}
+
+fn put_name(p: *mut Checker, name: u32) {
+    rt.buf_push_bytes(&(*p).msg, intern.intern_ptr(names(p), name), intern.intern_length(names(p), name))
+}
+
+fn report_alloc(p: *mut Checker, pos: u64, name: u32) {
+    begin_finding(p, pos)
+    var t1: [u8; 49] = "' is #[no_gc], but allocates on the GC heap via '"
+    put_lit(p, (&t1[0]) as u64, 49)
+    push_readable(&(*p).msg, names(p), name)
+    var t2: [u8; 1] = "'"
+    put_lit(p, (&t2[0]) as u64, 1)
+    end_finding(p)
+}
+
+fn report_method(p: *mut Checker, pos: u64, name: u32) {
+    begin_finding(p, pos)
+    var t1: [u8; 37] = "' is #[no_gc], but calls the method '"
+    put_lit(p, (&t1[0]) as u64, 37)
+    rt.buf_push_bytes(&(*p).msg, intern.intern_ptr(names(p), name) + 7, intern.intern_length(names(p), name) - 7)
+    var t2: [u8; 1] = "'"
+    put_lit(p, (&t2[0]) as u64, 1)
+    end_finding(p)
+}
+
+fn report_call(p: *mut Checker, pos: u64, name: u32) {
+    begin_finding(p, pos)
+    var t1: [u8; 26] = "' is #[no_gc], but calls '"
+    put_lit(p, (&t1[0]) as u64, 26)
+    push_readable(&(*p).msg, names(p), name)
+    var t2: [u8; 18] = "' without #[no_gc]"
+    put_lit(p, (&t2[0]) as u64, 18)
+    end_finding(p)
+}
+
+fn report_write_field(p: *mut Checker, pos: u64, field: u32) {
+    begin_finding(p, pos)
+    var t1: [u8; 45] = "' is #[no_gc], but writes into the GC field '"
+    put_lit(p, (&t1[0]) as u64, 45)
+    put_name(p, field)
+    var t2: [u8; 1] = "'"
+    put_lit(p, (&t2[0]) as u64, 1)
+    end_finding(p)
+}
+
+fn report_write_elem(p: *mut Checker, pos: u64) {
+    begin_finding(p, pos)
+    var t1: [u8; 53] = "' is #[no_gc], but writes into a GC element in memory"
+    put_lit(p, (&t1[0]) as u64, 53)
+    end_finding(p)
+}
+
+fn report_write_deref(p: *mut Checker, pos: u64) {
+    begin_finding(p, pos)
+    var t1: [u8; 58] = "' is #[no_gc], but writes into a GC field behind a pointer"
+    put_lit(p, (&t1[0]) as u64, 58)
+    end_finding(p)
 }
 
 fn check_block(p: *mut Checker, b: *mut ast.Tree, bi: u32) {
@@ -232,7 +408,7 @@ fn check_write_target(p: *mut Checker, b: *mut ast.Tree, target: u32) {
     }
     let a: u32 = ast.e_kind(b, target)
     if a == ast.E_FIELD {
-        (*p).err = (*p).err + 1
+        report_write_field(p, name_pos(b, target), ast.e_b(b, target))
         return
     }
     if a == ast.E_IDX {
@@ -240,20 +416,28 @@ fn check_write_target(p: *mut Checker, b: *mut ast.Tree, target: u32) {
         if ast.e_kind(b, ast.e_a(b, target)) == ast.E_ID {
             return
         }
-        (*p).err = (*p).err + 1
+        report_write_elem(p, ast.expr_pos(b, target))
         return
     }
     if a == ast.E_UN && ast.e_a(b, target) == 3 {
-        (*p).err = (*p).err + 1
+        report_write_deref(p, ast.expr_pos(b, target))
         return
     }
+}
+
+fn name_pos(b: *mut ast.Tree, e: u32) -> u64 {
+    let a: u64 = ast.expr_aux(b, e)
+    if a != 0 {
+        return a
+    }
+    return ast.expr_pos(b, e)
 }
 
 fn check_expr(p: *mut Checker, b: *mut ast.Tree, e: u32) {
     let a: u32 = ast.e_kind(b, e)
     if a == ast.E_CALL {
         let name: u32 = ast.e_a(b, e)
-        check_call(p, name)
+        check_call(p, name, name_pos(b, e))
         var k: u32 = 0
         while k < ast.e_c(b, e) {
             check_expr(p, b, ast.child_at(b, ast.e_b(b, e) + k))
@@ -320,10 +504,10 @@ fn check_expr(p: *mut Checker, b: *mut ast.Tree, e: u32) {
     // E_INT / E_FLOAT / E_BOOL / E_ID: leaves.
 }
 
-fn check_call(p: *mut Checker, name: u32) {
+fn check_call(p: *mut Checker, name: u32, pos: u64) {
     // Rule 1: GC allocation -- can trigger a collection.
     if gc.gc_is_alloc_call(gcr(p), names(p), name) {
-        (*p).err = (*p).err + 1
+        report_alloc(p, pos, name)
         return
     }
     // ROUND 45 (nogc.rs): a method call cannot be resolved here --
@@ -331,7 +515,7 @@ fn check_call(p: *mut Checker, name: u32) {
     // Reject it explicitly instead of stepping over it silently: a hole
     // in a promise would be worse than a missing convenience.
     if is_method_call(names(p), name) {
-        (*p).err = (*p).err + 1
+        report_method(p, pos, name)
         return
     }
     if is_interner_name(names(p), name) {
@@ -339,7 +523,7 @@ fn check_call(p: *mut Checker, name: u32) {
     }
     // Rule 2: call without #[no_gc] -- breaks the chain.
     if marking(p, name) == 2 {
-        (*p).err = (*p).err + 1
+        report_call(p, pos, name)
         return
     }
 }
