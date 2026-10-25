@@ -75,5 +75,15 @@ MCPLAY_SESSION_FILE="$W/none.session" "$W/mcplay" > "$W/D1.out" 2>&1; [ $? -eq 2
 printf 'port=%s\nname=NoHost\n' "$PORT" > "$W/d.session"
 MCPLAY_SESSION_FILE="$W/d.session" "$W/mcplay" > "$W/D2.out" 2>&1; [ $? -eq 2 ] || { echo "  FAIL  D2: no host must exit 2"; ERR=1; }
 grep -q "NoHost joined" "$W/server.log" && { echo "  FAIL  D2: connected without a host"; ERR=1; }
+focus() { local i w; for i in $(seq 1 20); do w=$(xdotool search --name mcplay 2>/dev/null | head -1); [ -n "$w" ] && { xdotool windowfocus "$w" 2>/dev/null; sleep 0.5; return 0; }; sleep 0.5; done; return 1; }
+printf 'host=127.0.0.1\nport=%s\nname=ConfigName\nprotocol=763\nview=3\n' "$PORT" > "$W/e.cfg"
+printf 'form=1\nname=FormE\nprotocol=763\nview=3\n' > "$W/e.session"
+MCPLAY_CONFIG="$W/e.cfg" MCPLAY_SESSION_FILE="$W/e.session" MCPLAY_RUN_S=25 "$W/mcplay" > "$W/E.out" 2>&1 & PE=$!
+focus || { echo "  FAIL  E: no start window"; ERR=1; }
+xdotool key Return
+wait_log "FormE joined the game" 120 || { echo "  FAIL  E: form with session name did not join as FormE"; ERR=1; }
+wait $PE; [ $? -eq 0 ] || { echo "  FAIL  E: exit code"; ERR=1; }
+[ ! -e "$W/e.session" ] || { echo "  FAIL  E: session file not deleted"; ERR=1; }
+grep -q "ConfigName joined" "$W/server.log" && { echo "  FAIL  E: config name used instead of the session name"; ERR=1; }
 [ $ERR -eq 0 ] && echo "RESULT mc-play-session: ok" || echo "RESULT mc-play-session: FAIL"
 exit $ERR
