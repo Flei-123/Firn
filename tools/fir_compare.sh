@@ -76,7 +76,7 @@ IMPORTS_ONLY=${FIR_IMPORTS_ONLY:-0}
 FIRNC1=""
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     FIRNC1="$TMPD"/firnc1
-    FIRNLIB=lib "$FIRNC" bin/firnc1.fi -o "$FIRNC1" || exit 1
+    FIRNLIB=lib "$FIRNC" --opt-level="${FIRNC1_OPT:-release-fast}" bin/firnc1.fi -o "$FIRNC1" || exit 1
 fi
 imp_same=0
 imp_diff=0

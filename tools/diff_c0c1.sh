@@ -49,7 +49,7 @@ if [ -z "${DIFF_SHARD:-}" ]; then
         done < <(find bin lib -name '*.fi' -not -type l)
     fi
     if [ "$rebuild" -eq 1 ]; then
-        "$FIRNC" bin/firnc1.fi -o "$WORK/firnc1.new" || { echo "cannot build firnc1"; exit 2; }
+        "$FIRNC" --opt-level="${FIRNC1_OPT:-release-fast}" bin/firnc1.fi -o "$WORK/firnc1.new" || { echo "cannot build firnc1"; exit 2; }
         mv -f "$WORK/firnc1.new" "$FC1" || exit 2
     fi
     n=${DIFF_JOBS:-4}

@@ -70,7 +70,7 @@ fi
 if [ "$rebuild" -eq 1 ]; then
     # Build next to the target and rename: the rename is atomic, so a parallel
     # run never sees (or executes) a half-written compiler.
-    "$FIRNC" bin/firnc1.fi -o "$WORK/firnc1.new" || exit 1
+    "$FIRNC" --opt-level="${FIRNC1_OPT:-release-fast}" bin/firnc1.fi -o "$WORK/firnc1.new" || exit 1
     mv -f "$WORK/firnc1.new" "$FC1" || exit 1
 fi
 

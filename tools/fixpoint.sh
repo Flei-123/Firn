@@ -3,7 +3,7 @@
 #
 # Three stages, the same source:
 #
-#   stage 1   firnc0 (Rust)  compiles  bin/firnc1.fi  ->  .firnc1
+#   stage 1   firnc0 (Rust)  compiles  bin/firnc1.fi  ->  .firnc1   (release-fast; FIRNC1_OPT=dev overrides)
 #   stage 2   .firnc1        compiles  bin/firnc1.fi  ->  .firnc2
 #   stage 3   .firnc2        compiles  bin/firnc1.fi  ->  .firnc3
 #
@@ -77,7 +77,7 @@ rm -f "$GCNTMP"
 if [ ! -x ./.firnc1 ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer ./.firnc1 -print -quit)" ]; then
     # Build in the private temp dir, then rename atomically (r198): a parallel
     # run never executes a half-written .firnc1.
-    "$FIRNC" "$SOURCE" -o "$TMPD/firnc1.new" || { echo "stage 1 failed"; exit 1; }
+    "$FIRNC" --opt-level="${FIRNC1_OPT:-release-fast}" "$SOURCE" -o "$TMPD/firnc1.new" || { echo "stage 1 failed"; exit 1; }
     mv -f "$TMPD/firnc1.new" ./.firnc1 || { echo "stage 1 failed"; exit 1; }
 fi
 

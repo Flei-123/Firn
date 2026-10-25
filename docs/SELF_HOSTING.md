@@ -2586,3 +2586,11 @@ only holds when the machine is idle is not a proof. The honest fix is to
 give the counter-check a floor — repeat until the raw counter loses at
 least once, with an upper bound, and fail only if it never does. That is a
 change to a test of rounds 47/49 and belongs into a round of its own.
+
+## Building a fast firnc1
+
+`firnc1` has no optimizer, so a `firnc1` built by `firnc1` (stage 2 and later) runs unoptimized. The `firnc1` to use day to day is the one built by `firnc0` at `--opt-level=release-fast`:
+
+    firnc --opt-level=release-fast bin/firnc1.fi -o firnc1
+
+Measured on the OrientOS kernel (`kernel/kmain.fi`, `--no-cache`, same object and same `.s` from both builds): 8.7 G instructions instead of 14.8 G, 3.3 s instead of 4.5 s wall. All gate scripts that need a stage-1 `firnc1` (`tools/fixpoint.sh`, `diff_c0c1.sh`, `self_compare.sh`, `fir_compare.sh`, `prune_compare.sh`) build it with `release-fast`; `FIRNC1_OPT=dev` brings back the plain build. Stage 2 and stage 3 of the fixpoint stay identical either way, because both are built by `firnc1` itself.

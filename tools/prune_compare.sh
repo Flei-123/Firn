@@ -35,7 +35,7 @@ FC1=${FIRNC1:-./.firnc1}
 MAX=${PRUNE_CMP_MAX:-1000000}
 
 if [ ! -x "$FC1" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$FC1" -print -quit)" ]; then
-    "$FIRNC" bin/firnc1.fi -o "$TMPD/firnc1.new" || { echo "stage 1 failed"; exit 1; }
+    "$FIRNC" --opt-level="${FIRNC1_OPT:-release-fast}" bin/firnc1.fi -o "$TMPD/firnc1.new" || { echo "stage 1 failed"; exit 1; }
     mv -f "$TMPD/firnc1.new" "$FC1" || exit 1
 fi
 
