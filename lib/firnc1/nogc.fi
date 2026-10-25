@@ -54,6 +54,7 @@ struct Checker {
     depth: u32, // nesting depth of the `match` body blocks
     who: u32,
     fpos: Vec[u64],
+    fspan: Vec[u32],
     foff: Vec[u32],
     flen: Vec[u32],
     ftxt: rt.Buf,
@@ -112,7 +113,7 @@ fn nogc_check(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
         sm: sm, mu: mu, gcr: gcr2, it: it,
         m_name: vec_new[u32](), m_flag: vec_new[u32](),
         err: 0, depth: 0, who: NONE,
-        fpos: vec_new[u64](), foff: vec_new[u32](), flen: vec_new[u32](),
+        fpos: vec_new[u64](), fspan: vec_new[u32](), foff: vec_new[u32](), flen: vec_new[u32](),
         ftxt: rt.buf_new(), msg: rt.buf_new(),
     }
     let b: *mut ast.Tree = sema.sema_tree(p.sm as *mut sema.Sema)
@@ -163,6 +164,7 @@ fn nogc_check(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
     vec_free[u32](&p.m_name)
     vec_free[u32](&p.m_flag)
     vec_free[u64](&p.fpos)
+    vec_free[u32](&p.fspan)
     vec_free[u32](&p.foff)
     vec_free[u32](&p.flen)
     rt.buf_free(&p.ftxt)
@@ -211,7 +213,7 @@ fn flush(p: *mut Checker, pend: *mut report.Pend) {
         if prev == n || !finding_same(p, prev, k) {
             rt.buf_clear(&(*p).msg)
             rt.buf_push_bytes(&(*p).msg, rt.buf_ptr(&(*p).ftxt) + vec_at[u32](&(*p).foff, k) as u64, vec_at[u32](&(*p).flen, k) as usize)
-            report.pend_add(pend, vec_at[u64](&(*p).fpos, k), 1, &(*p).msg)
+            report.pend_add(pend, vec_at[u64](&(*p).fpos, k), vec_at[u32](&(*p).fspan, k), &(*p).msg)
         } else {
             (*p).err = (*p).err - 1
         }
@@ -253,9 +255,18 @@ fn push_readable(buf: *mut rt.Buf, it: *mut intern.Interner, name: u32) {
     rt.buf_push_bytes(buf, ptr + (split as u64) + 2, n - (split as usize) - 2)
 }
 
-fn begin_finding(p: *mut Checker, pos: u64) {
+fn readable_len(it: *mut intern.Interner, name: u32) -> u32 {
+    var tmp: rt.Buf = rt.buf_new()
+    push_readable(&tmp, it, name)
+    let n: u32 = rt.buf_len(&tmp) as u32
+    rt.buf_free(&tmp)
+    return n
+}
+
+fn begin_finding(p: *mut Checker, pos: u64, span: u32) {
     rt.buf_clear(&(*p).msg)
     vec_push[u64](&(*p).fpos, pos)
+    vec_push[u32](&(*p).fspan, span)
     vec_push[u32](&(*p).foff, rt.buf_len(&(*p).ftxt) as u32)
     var q: [u8; 1] = "'"
     rt.buf_push_bytes(&(*p).msg, (&q[0]) as u64, 1)
@@ -277,7 +288,7 @@ fn put_name(p: *mut Checker, name: u32) {
 }
 
 fn report_alloc(p: *mut Checker, pos: u64, name: u32) {
-    begin_finding(p, pos)
+    begin_finding(p, pos, readable_len(names(p), name))
     var t1: [u8; 49] = "' is #[no_gc], but allocates on the GC heap via '"
     put_lit(p, (&t1[0]) as u64, 49)
     push_readable(&(*p).msg, names(p), name)
@@ -286,8 +297,17 @@ fn report_alloc(p: *mut Checker, pos: u64, name: u32) {
     end_finding(p)
 }
 
+fn report_closure_alloc(p: *mut Checker, pos: u64, span: u32) {
+    begin_finding(p, pos, span)
+    var t1: [u8; 49] = "' is #[no_gc], but allocates on the GC heap via '"
+    put_lit(p, (&t1[0]) as u64, 49)
+    var t2: [u8; 11] = "gc fn(…)'"
+    put_lit(p, (&t2[0]) as u64, 11)
+    end_finding(p)
+}
+
 fn report_method(p: *mut Checker, pos: u64, name: u32) {
-    begin_finding(p, pos)
+    begin_finding(p, pos, intern.intern_length(names(p), name) as u32 - 7)
     var t1: [u8; 37] = "' is #[no_gc], but calls the method '"
     put_lit(p, (&t1[0]) as u64, 37)
     rt.buf_push_bytes(&(*p).msg, intern.intern_ptr(names(p), name) + 7, intern.intern_length(names(p), name) - 7)
@@ -297,7 +317,7 @@ fn report_method(p: *mut Checker, pos: u64, name: u32) {
 }
 
 fn report_call(p: *mut Checker, pos: u64, name: u32) {
-    begin_finding(p, pos)
+    begin_finding(p, pos, readable_len(names(p), name))
     var t1: [u8; 26] = "' is #[no_gc], but calls '"
     put_lit(p, (&t1[0]) as u64, 26)
     push_readable(&(*p).msg, names(p), name)
@@ -307,7 +327,7 @@ fn report_call(p: *mut Checker, pos: u64, name: u32) {
 }
 
 fn report_write_field(p: *mut Checker, pos: u64, field: u32) {
-    begin_finding(p, pos)
+    begin_finding(p, pos, intern.intern_length(names(p), field) as u32)
     var t1: [u8; 45] = "' is #[no_gc], but writes into the GC field '"
     put_lit(p, (&t1[0]) as u64, 45)
     put_name(p, field)
@@ -316,15 +336,15 @@ fn report_write_field(p: *mut Checker, pos: u64, field: u32) {
     end_finding(p)
 }
 
-fn report_write_elem(p: *mut Checker, pos: u64) {
-    begin_finding(p, pos)
+fn report_write_elem(p: *mut Checker, pos: u64, span: u32) {
+    begin_finding(p, pos, span)
     var t1: [u8; 53] = "' is #[no_gc], but writes into a GC element in memory"
     put_lit(p, (&t1[0]) as u64, 53)
     end_finding(p)
 }
 
-fn report_write_deref(p: *mut Checker, pos: u64) {
-    begin_finding(p, pos)
+fn report_write_deref(p: *mut Checker, pos: u64, span: u32) {
+    begin_finding(p, pos, span)
     var t1: [u8; 58] = "' is #[no_gc], but writes into a GC field behind a pointer"
     put_lit(p, (&t1[0]) as u64, 58)
     end_finding(p)
@@ -416,11 +436,11 @@ fn check_write_target(p: *mut Checker, b: *mut ast.Tree, target: u32) {
         if ast.e_kind(b, ast.e_a(b, target)) == ast.E_ID {
             return
         }
-        report_write_elem(p, ast.expr_pos(b, target))
+        report_write_elem(p, ast.expr_pos(b, target), ast.expr_len(b, target))
         return
     }
     if a == ast.E_UN && ast.e_a(b, target) == 3 {
-        report_write_deref(p, ast.expr_pos(b, target))
+        report_write_deref(p, ast.expr_pos(b, target), ast.expr_len(b, target))
         return
     }
 }
@@ -499,6 +519,12 @@ fn check_expr(p: *mut Checker, b: *mut ast.Tree, e: u32) {
     if a == ast.E_AWDH {
         check_expr(p, b, ast.e_a(b, e))
         check_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_LAMBDA {
+        if (ast.e_number(b, e) & 1) == 1 {
+            report_closure_alloc(p, ast.expr_pos(b, e), ast.expr_len(b, e))
+        }
         return
     }
     // E_INT / E_FLOAT / E_BOOL / E_ID: leaves.
