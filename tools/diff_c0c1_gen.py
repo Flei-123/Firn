@@ -899,6 +899,7 @@ NEG = [
     ('fs_spec_dot', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:>8.}"))\n    return 0\n}\n'),
     ('fs_spec_type', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:q}"))\n    return 0\n}\n'),
     ('fs_brace', 'import std.io\nfn main() -> i32 {\n    io.fmt_print(f"}")\n    return 0\n}\n'),
+    ('arr_empty_infer', 'fn main() -> i32 {\n    let a = []\n    return 0\n}\n'),
 ]
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)
