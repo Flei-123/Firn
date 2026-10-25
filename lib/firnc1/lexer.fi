@@ -246,6 +246,7 @@ struct Lexer {
     // ROUND 64: scratch pad for the SUGGESTION (`= help: ...`).
     hint: rt.Buf,
     float_slow: usize,
+    tcap: usize,
 }
 
 fn lex_new(q: u64, n: usize, kw_txt: u64, kw_len: usize, name: u64, name_n: usize) -> Lexer {
@@ -265,6 +266,7 @@ fn lex_new(q: u64, n: usize, kw_txt: u64, kw_len: usize, name: u64, name_n: usiz
         msg: rt.buf_new(),
         hint: rt.buf_new(),
         float_slow: 0,
+        tcap: 0,
     }
     tab_build(&l.kw, kw_txt, kw_len)
     l.file = diag.diag_file(&l.dg, name, name_n, q, n)
@@ -554,33 +556,45 @@ fn sign(l: *mut Lexer) {
     }
 }
 
-fn tok(l: *mut Lexer, kind: u32, line: u32, col: u32, length: u32, number: u64, nr: u32) {
-    let n: usize = (*l).kind.len
-    if n < (*l).kind.cap && n < (*l).zl.cap && n < (*l).spl.cap && n < (*l).ln.cap
-    && n < (*l).number.cap && n < (*l).nr.cap
-    && n == (*l).zl.len && n == (*l).spl.len && n == (*l).ln.len
-    && n == (*l).number.len && n == (*l).nr.len {
-        let o4: u64 = n as u64 *% 4
-        *(((*l).kind.ptr +% o4) as *mut u32) = kind
-        *(((*l).zl.ptr +% o4) as *mut u32) = line
-        *(((*l).spl.ptr +% o4) as *mut u32) = col
-        *(((*l).ln.ptr +% o4) as *mut u32) = length
-        *(((*l).number.ptr +% n as u64 *% 8) as *mut u64) = number
-        *(((*l).nr.ptr +% o4) as *mut u32) = nr
-        (*l).kind.len = n + 1
-        (*l).zl.len = n + 1
-        (*l).spl.len = n + 1
-        (*l).ln.len = n + 1
-        (*l).number.len = n + 1
-        (*l).nr.len = n + 1
-        return
-    }
+fn tok_reserve(l: *mut Lexer, cap: usize) -> bool {
+    return vec_reserve[u32](&(*l).kind, cap) && vec_reserve[u32](&(*l).zl, cap)
+        && vec_reserve[u32](&(*l).spl, cap) && vec_reserve[u32](&(*l).ln, cap)
+        && vec_reserve[u64](&(*l).number, cap) && vec_reserve[u32](&(*l).nr, cap)
+}
+
+fn tok_slow(l: *mut Lexer, kind: u32, line: u32, col: u32, length: u32, number: u64, nr: u32) {
     vec_push[u32](&(*l).kind, kind)
     vec_push[u32](&(*l).zl, line)
     vec_push[u32](&(*l).spl, col)
     vec_push[u32](&(*l).ln, length)
     vec_push[u64](&(*l).number, number)
     vec_push[u32](&(*l).nr, nr)
+}
+
+fn tok(l: *mut Lexer, kind: u32, line: u32, col: u32, length: u32, number: u64, nr: u32) {
+    let n: usize = (*l).kind.len
+    if n >= (*l).tcap {
+        var cap: usize = (*l).tcap * 2
+        if cap < 256 { cap = 256 }
+        if !tok_reserve(l, cap) {
+            tok_slow(l, kind, line, col, length, number, nr)
+            return
+        }
+        (*l).tcap = cap
+    }
+    let o4: u64 = n as u64 *% 4
+    *(((*l).kind.ptr +% o4) as *mut u32) = kind
+    *(((*l).zl.ptr +% o4) as *mut u32) = line
+    *(((*l).spl.ptr +% o4) as *mut u32) = col
+    *(((*l).ln.ptr +% o4) as *mut u32) = length
+    *(((*l).number.ptr +% n as u64 *% 8) as *mut u64) = number
+    *(((*l).nr.ptr +% o4) as *mut u32) = nr
+    (*l).kind.len = n + 1
+    (*l).zl.len = n + 1
+    (*l).spl.len = n + 1
+    (*l).ln.len = n + 1
+    (*l).number.len = n + 1
+    (*l).nr.len = n + 1
 }
 
 fn is_digit(c: u32) -> bool { return c >= 48 && c <= 57 }
@@ -604,11 +618,24 @@ fn hex_value(c: u32) -> i32 {
 
 // ------------------------------------------------- whitespace and comments
 
+const LOW_ONES: u64 = 72340172838076673
+const NEWLINES: u64 = 723401728380766730
+
 fn skip_line(l: *mut Lexer) {
     var p: usize = (*l).p
     var c: u32 = (*l).col
-    while p < (*l).n {
-        let b: u8 = rt.ld8((*l).q, p)
+    let n: usize = (*l).n
+    let q: u64 = (*l).q
+    while p + 8 <= n {
+        let w: u64 = *((q +% p as u64) as *mut u64)
+        let x: u64 = w ^ NEWLINES
+        let found: u64 = (x -% LOW_ONES) & (x ^ 18446744073709551615) & (LOW_ONES << 7 as u64)
+        if found != 0 as u64 || (w & (LOW_ONES << 7 as u64)) != 0 as u64 { break }
+        p = p + 8
+        c = c + 8
+    }
+    while p < n {
+        let b: u8 = *((q +% p as u64) as *mut u8)
         if b == 10 as u8 { break }
         if (b & 192 as u8) != 128 as u8 { c = c + 1 }
         p = p + 1
@@ -634,7 +661,14 @@ fn skip(l: *mut Lexer) {
     while true {
         skip_blanks(l)
         let c: u32 = look(l, 0)
-        if is_empty(c) {
+        if c > 47 {
+            return
+        }
+        if c == 10 {
+            (*l).p = (*l).p + 1
+            (*l).line = (*l).line + 1
+            (*l).col = 1
+        } else if is_empty(c) {
             vor1(l)
         } else if c == 35 && (*l).p == 0 && look(l, 1) == 33 {
             // Shebang: `#!` at offset 0 is a line comment (same rule as
@@ -1573,6 +1607,7 @@ fn lex_char(l: *mut Lexer) -> bool {
     // read as `<<` plus `=`, and the compound assignment would fall apart
     // into two tokens.
     let n2: u32 = look(l, 2)
+    if (n >= 37 && n <= 62) || n == 124 {
     if c == 60 && n == 60 && n2 == 61 { kind = A_SHLEQ; width = 3 }
     else if c == 62 && n == 62 && n2 == 61 { kind = A_SHREQ; width = 3 }
     else if c == 45 && n == 62 { kind = A_ARROW; width = 2 }
@@ -1608,7 +1643,9 @@ fn lex_char(l: *mut Lexer) -> bool {
     else if c == 33 && n == 61 { kind = A_NOTEQ; width = 2 }
     else if c == 60 && n == 61 { kind = A_LE; width = 2 }
     else if c == 62 && n == 61 { kind = A_GE; width = 2 }
-    else if c == 40 { kind = A_LPAREN }
+    }
+    if kind == 999 {
+    if c == 40 { kind = A_LPAREN }
     else if c == 41 { kind = A_RPAREN }
     else if c == 123 { kind = A_LBRACE }
     else if c == 125 { kind = A_RBRACE }
@@ -1634,6 +1671,7 @@ fn lex_char(l: *mut Lexer) -> bool {
     else if c == 60 { kind = A_LT }
     else if c == 62 { kind = A_GT }
     else { return false }
+    }
     var i: u32 = 0
     while i < width {
         vor1(l)
@@ -2099,13 +2137,17 @@ fn lex_text(l: *mut Lexer) -> bool {
 // ---------------------------------------------------------------- the run
 
 fn lex_run(l: *mut Lexer) {
+    let want: usize = (*l).n / 6 + 64
+    if (*l).tcap < want && tok_reserve(l, want) {
+        (*l).tcap = want
+    }
     while true {
         skip(l)
         let c: u32 = look(l, 0)
         if c == 256 {
             break
         }
-        if lex_text(l) {
+        if (c == 34 || c == 98 || c == 117 || c == 102) && lex_text(l) {
             continue
         }
         if is_digit(c) {
