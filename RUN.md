@@ -437,6 +437,13 @@ compiler/target/release/firnc --opt-level=dev -o /tmp/anim tools/fui/anim_main.f
 
 ## 4d. The state of `bash test.sh` (re-measured 2026-09-21)
 
+`bash test.sh` without arguments runs every section. `bash test.sh --stage N` (or `TEST_STAGE=N`) runs only
+the sections of stage N from `tools/teststages/stages.txt` (each stage is meant to stay under 60 minutes; a
+section that is not listed lands in the last stage). `bash tools/teststages/run.sh` runs all stages one
+after another, `--heavy` sends each through `/root/jarvis/bin/heavy`, `--parallel` queues them all at once,
+`--list` shows the split, and stage logs go to `.test-stage-logs/`. Every stage prints the time of each
+section, so the split can be rebalanced from real numbers.
+
 `test.sh` runs 59 sections and takes roughly an hour and a half. It has
 to be started with **`bash`**, not `sh`: line 216 uses `set -o pipefail`.
 Measured on the state of this branch, from a compiler rebuilt from
