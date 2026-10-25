@@ -109,7 +109,8 @@ struct Cg {
     // would stay in the symbol table of the kernel image). `poff[k]` = octets
     // before message k, filled when the split starts.
     pref: Vec[u64],
-    poff: Vec[u64]
+    poff: Vec[u64],
+    symmemo: Vec[u32]
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -122,12 +123,16 @@ fn cg_new(f: u64, it: u64) -> Cg {
         pmsg: vec_new[u32](), pmap: vec_new[u32](), kpos: 0, koff: 0, kreg: 0, site: 0, sm: 0, idx_used: false,
         fstart: vec_new[u64](), tail_off: 0, tr_a: 0, tr_b: 0,
         pref: vec_new[u64](), poff: vec_new[u64](),
+        symmemo: vec_new[u32](),
     }
 }
 
 // ROUND 75 (SPEC 14.5): register the AST tree, so `sym` can resolve
 // `extern fn` / `#[export_c]` link names.
-fn cg_tree_set(c: *mut Cg, t: u64) { (*c).tr = t }
+fn cg_tree_set(c: *mut Cg, t: u64) {
+    (*c).tr = t
+    vec_clear[u32](&(*c).symmemo)
+}
 
 // ROUND 89 (statics.rs): register the type checker -- the initial values of
 // the global variables are finished octets there.
@@ -181,6 +186,7 @@ fn cg_free(c: *mut Cg) {
     vec_free[u64](&(*c).fstart)
     vec_free[u64](&(*c).pref)
     vec_free[u64](&(*c).poff)
+    vec_free[u32](&(*c).symmemo)
 }
 
 fn cg_unsuitable(c: *mut Cg) -> bool { return (*c).unsuitable }
@@ -286,45 +292,79 @@ fn sym_raw(c: *mut Cg, nr: u32) {
 //     here and has to come out under its bare Firn name so C can call it.
 // Every other name keeps going through the `_F1.` prefix exactly as
 // before -- this is additive, nothing about the existing scheme changed.
-fn sym(c: *mut Cg, nr: u32) {
+const SYM_PLAIN: u32 = 1
+const SYM_HASH: u32 = 2
+const SYM_LINK_BASE: u32 = 3
+const SYM_PREFIX: u32 = 774981215
+
+#[no_inline]
+fn sym_resolve(c: *mut Cg, nr: u32) -> u32 {
+    var st: u32 = SYM_PLAIN
     if extern_link_of(c, nr) {
-        sym_raw(c, (*c).ext_out)
-        return
+        st = (*c).ext_out + SYM_LINK_BASE
+    } else if export_c_of(c, nr) {
+        st = (*c).ext_out + SYM_LINK_BASE
+    } else {
+        let q: u64 = intern.intern_ptr(it(c), nr)
+        let n: usize = intern.intern_length(it(c), nr)
+        var k: usize = 0
+        while k < n {
+            if *((q +% k as u64) as *mut u8) == 35 as u8 {
+                st = SYM_HASH
+            }
+            k = k + 1
+        }
     }
-    if export_c_of(c, nr) {
-        sym_raw(c, (*c).ext_out)
-        return
+    let m: *mut Vec[u32] = &(*c).symmemo
+    while vec_len[u32](m) <= nr as usize {
+        vec_push[u32](m, 0 as u32)
     }
-    var p: [u8; 4] = "_F1."
-    t(c, (&p[0]) as u64, 4)
-    // ROUND 58: the generated functions of the closures carry a `#` in their
-    // name, so that no source text can ever write them (fnval.rs). The
-    // assembler does not accept the character -- it becomes a dot, which the
-    // naming scheme uses anyway.
+    vec_set[u32](m, nr as usize, st)
+    return st
+}
+
+#[no_inline]
+fn sym_hash(c: *mut Cg, nr: u32) {
     let q: u64 = intern.intern_ptr(it(c), nr)
     let n: usize = intern.intern_length(it(c), nr)
     let b: *mut rt.Buf = &(*c).out
     var k: usize = 0
-    if (*b).len + n <= (*b).cap {
-        let d: u64 = (*b).ptr +% (*b).len as u64
-        while k < n {
-            var ch: u8 = *((q +% k as u64) as *mut u8)
-            if ch == 35 as u8 {
-                ch = 46 as u8
-            }
-            *((d +% k as u64) as *mut u8) = ch
-            k = k + 1
-        }
-        (*b).len = (*b).len + n
-        return
-    }
     while k < n {
-        var ch: u8 = *((q + k as u64) as *mut u8)
+        var ch: u8 = *((q +% k as u64) as *mut u8)
         if ch == 35 as u8 {
             ch = 46 as u8
         }
         rt.buf_push(b, ch)
         k = k + 1
+    }
+}
+
+fn sym(c: *mut Cg, nr: u32) {
+    var st: u32 = 0
+    let m: *mut Vec[u32] = &(*c).symmemo
+    if (nr as usize) < (*m).len {
+        st = *(((*m).ptr +% (nr as u64) * 4) as *mut u32)
+    }
+    if st == 0 {
+        st = sym_resolve(c, nr)
+    }
+    if st >= SYM_LINK_BASE {
+        sym_raw(c, st - SYM_LINK_BASE)
+        return
+    }
+    let b: *mut rt.Buf = &(*c).out
+    let len: usize = (*b).len
+    if len + 4 <= (*b).cap {
+        *(((*b).ptr +% len as u64) as *mut u32) = SYM_PREFIX
+        (*b).len = len + 4
+    } else {
+        var p: [u8; 4] = "_F1."
+        t(c, (&p[0]) as u64, 4)
+    }
+    if st == SYM_PLAIN {
+        sym_raw(c, nr)
+    } else {
+        sym_hash(c, nr)
     }
 }
 
@@ -1328,6 +1368,65 @@ fn emit_global(c: *mut Cg, nr: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
+fn bytes_all_zero(p: u64, n: usize) -> bool {
+    var k: usize = 0
+    while k + 8 <= n {
+        if *((p +% k as u64) as *mut u64) != 0 {
+            return false
+        }
+        k = k + 8
+    }
+    while k < n {
+        if *((p +% k as u64) as *mut u8) != 0 as u8 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn static_bytes_lines(c: *mut Cg, p: u64, n: usize) {
+    let b: *mut rt.Buf = &(*c).out
+    rt.buf_reserve(b, (*b).len + n * 5 + (n / 16 + 1) * 12 + 16)
+    if (*b).cap < (*b).len + n * 5 + (n / 16 + 1) * 12 + 16 {
+        return
+    }
+    var bw: [u8; 10] = "    .byte "
+    var q: usize = 0
+    while q < n {
+        t(c, (&bw[0]) as u64, 10)
+        var d: u64 = (*b).ptr +% (*b).len as u64
+        let line_start: u64 = d
+        var col: usize = 0
+        while col < 16 && q < n {
+            if col > 0 {
+                *(d as *mut u16) = 8236 as u16
+                d = d +% 2
+            }
+            let raw: u8 = *((p +% q as u64) as *mut u8)
+            let v: u32 = raw as u32
+            if v >= 100 {
+                *(d as *mut u8) = (48 + v / 100) as u8
+                *((d +% 1) as *mut u8) = (48 + (v / 10) % 10) as u8
+                *((d +% 2) as *mut u8) = (48 + v % 10) as u8
+                d = d +% 3
+            } else if v >= 10 {
+                *(d as *mut u8) = (48 + v / 10) as u8
+                *((d +% 1) as *mut u8) = (48 + v % 10) as u8
+                d = d +% 2
+            } else {
+                *(d as *mut u8) = (48 + v) as u8
+                d = d +% 1
+            }
+            col = col + 1
+            q = q + 1
+        }
+        *(d as *mut u8) = 10 as u8
+        d = d +% 1
+        (*b).len = (*b).len + (d - line_start) as usize
+    }
+}
+
 // The DATA SECTION of the global variables (round 89, SPEC 14.1.statics).
 //
 //   `mut` and all zero  -> `.bss`     (`.zero n`, no space in the file)
@@ -1343,15 +1442,11 @@ fn statics_data(c: *mut Cg) {
     while i < sema.sema_static_count(s) {
         let p: u64 = sema.sema_static_bytes(s, i)
         let n: usize = sema.sema_static_size(s, i)
-        var zero: bool = true
-        var k: usize = 0
-        while k < n {
-            if rt.ld8(p, k) != 0 as u8 {
-                zero = false
-            }
-            k = k + 1
-        }
         let writable: bool = sema.sema_static_mut(s, i)
+        var zero: bool = false
+        if writable {
+            zero = bytes_all_zero(p, n)
+        }
         if !writable {
             var sr: [u8; 17] = ".section .rodata\n"
             t(c, (&sr[0]) as u64, 17)
@@ -1387,22 +1482,7 @@ fn statics_data(c: *mut Cg) {
             var zw2: [u8; 12] = "    .zero 1\n"
             t(c, (&zw2[0]) as u64, 12)
         } else {
-            var q: usize = 0
-            while q < n {
-                var bw: [u8; 10] = "    .byte "
-                t(c, (&bw[0]) as u64, 10)
-                var col: usize = 0
-                while col < 16 && q < n {
-                    if col > 0 {
-                        var cm: [u8; 2] = ", "
-                        t(c, (&cm[0]) as u64, 2)
-                    }
-                    number(c, rt.ld8(p, q) as u64)
-                    col = col + 1
-                    q = q + 1
-                }
-                nl(c)
-            }
+            static_bytes_lines(c, p, n)
         }
         i = i + 1
     }
@@ -2105,23 +2185,38 @@ fn panic_label(c: *mut Cg, k: u32) {
 // template of an `asm` block (fir.rs::asm_escape) -- four characters and
 // no table, so that both compilers write the same octets.
 fn ascii_masked(c: *mut Cg, p: u64, n: usize) {
+    let b: *mut rt.Buf = &(*c).out
+    rt.buf_reserve(b, (*b).len + n * 2)
+    if (*b).cap < (*b).len + n * 2 {
+        return
+    }
+    var d: u64 = (*b).ptr +% (*b).len as u64
+    let start: u64 = d
     var i: usize = 0
     while i < n {
-        let z: u8 = rt.ld8(p, i)
-        if z == 92 as u8 || z == 34 as u8 {
-            rt.buf_push(&(*c).out, 92 as u8)
-            rt.buf_push(&(*c).out, z)
+        let z: u8 = *((p +% i as u64) as *mut u8)
+        if z >= 35 as u8 && z != 92 as u8 {
+            *(d as *mut u8) = z
+            d = d +% 1
+        } else if z == 92 as u8 || z == 34 as u8 {
+            *(d as *mut u8) = 92 as u8
+            *((d +% 1) as *mut u8) = z
+            d = d +% 2
         } else if z == 10 as u8 {
-            rt.buf_push(&(*c).out, 92 as u8)
-            rt.buf_push(&(*c).out, 110 as u8)
+            *(d as *mut u8) = 92 as u8
+            *((d +% 1) as *mut u8) = 110 as u8
+            d = d +% 2
         } else if z == 9 as u8 {
-            rt.buf_push(&(*c).out, 92 as u8)
-            rt.buf_push(&(*c).out, 116 as u8)
+            *(d as *mut u8) = 92 as u8
+            *((d +% 1) as *mut u8) = 116 as u8
+            d = d +% 2
         } else {
-            rt.buf_push(&(*c).out, z)
+            *(d as *mut u8) = z
+            d = d +% 1
         }
         i = i + 1
     }
+    (*b).len = (*b).len + (d - start) as usize
 }
 
 // `.rodata`: every distinct message as raw octets, no NUL terminator --
@@ -3110,6 +3205,7 @@ fn cg_run(c: *mut Cg) {
     // BEFORE the first instruction is written, because a checked site
     // refers to its message by the label the table gives it.
     panic_collect(c)
+    rt.buf_reserve(&(*c).out, vec_len[u32](&(*f).b_ilist) * 26 + 65536)
     var header: [u8; 29] = ".intel_syntax noprefix\n.text\n"
     t(c, (&header[0]) as u64, 29)
     if !(*c).free {
@@ -3422,6 +3518,29 @@ fn cg_split_fill(c: *mut Cg, k: u32, nf: u32, out: *mut rt.Buf) {
 // Everything behind the last function. Section tracking: `codegen` only
 // writes `.text` and `.section <name>` lines. Labels at column 0 in a data
 // section are the ones the function parts refer to.
+const NL_WORD: u64 = 723401728380766730
+const LOW_ONES: u64 = 72340172838076673
+const HIGH_BITS: u64 = 9259542123273814144
+const ALL_ONES: u64 = 18446744073709551615
+
+fn find_newline(base: u64, from: u64, len: u64) -> u64 {
+    var e: u64 = from
+    while e +% 8 <= len {
+        let w: u64 = *((base +% e) as *mut u64) ^ NL_WORD
+        if ((w -% LOW_ONES) & (w ^ ALL_ONES) & HIGH_BITS) != 0 {
+            break
+        }
+        e = e +% 8
+    }
+    while e < len {
+        if *((base +% e) as *mut u8) == 10 as u8 {
+            return e
+        }
+        e = e +% 1
+    }
+    return len
+}
+
 fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
     let base: u64 = rt.buf_ptr(&(*c).out)
     let len: u64 = rt.buf_len(&(*c).out) as u64
@@ -3430,17 +3549,15 @@ fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
     var sec: [u8; 9] = ".section "
     var sectext: [u8; 14] = ".section .text"
     var txt: [u8; 5] = ".text"
-    // `.Lpanicmsg<k>` (k > 0) stays local: the references say `.Lpanicmsg0+off`.
     var pmsg: [u8; 10] = ".Lpanicmsg"
     var in_text: bool = true
     var pos: u64 = (*c).tail_off
+    var run: u64 = pos
     while pos < len {
-        var e: u64 = pos
-        while e < len {
-            if rt.ld8(base, e as usize) == 10 as u8 {
-                break
-            }
-            e = e + 1
+        let e: u64 = find_newline(base, pos, len)
+        if *((base +% pos) as *mut u8) != 46 as u8 {
+            pos = e + 1
+            continue
         }
         let n: usize = (e - pos) as usize
         let p: usize = pos as usize
@@ -3448,10 +3565,11 @@ fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
             in_text = eq_lit(base, p, e as usize, (&sectext[0]) as u64, 14)
         } else if n == 5 && eq_lit(base, p, e as usize, (&txt[0]) as u64, 5) {
             in_text = true
-        } else if !in_text && n > 3 && rt.ld8(base, p) == 46 as u8
-        && rt.ld8(base, p + 1) == 76 as u8 && rt.ld8(base, p + n - 1) == 58 as u8
+        } else if !in_text && n > 3 && rt.ld8(base, p + 1) == 76 as u8 && rt.ld8(base, p + n - 1) == 58 as u8
         && !(eq_lit(base, p, e as usize, (&pmsg[0]) as u64, 10)
             && !(n == 12 && rt.ld8(base, p + 10) == 48 as u8)) {
+            rt.buf_push_bytes(out, base + run, (pos - run) as usize)
+            run = pos
             rt.buf_push_bytes(out, (&gl[0]) as u64, 7)
             rt.buf_push_bytes(out, base + pos, n - 1)
             rt.buf_push(out, 10 as u8)
@@ -3459,11 +3577,9 @@ fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
             rt.buf_push_bytes(out, base + pos, n - 1)
             rt.buf_push(out, 10 as u8)
         }
-        if e < len {
-            rt.buf_push_bytes(out, base + pos, n + 1)
-        } else {
-            rt.buf_push_bytes(out, base + pos, n)
-        }
         pos = e + 1
+    }
+    if len > run {
+        rt.buf_push_bytes(out, base + run, (len - run) as usize)
     }
 }
