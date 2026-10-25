@@ -180,7 +180,7 @@ Real GPU, Firefox, Safari, mobile UNTESTED.
 
 ### Scene layer: lib/gpu/gl_scene.fi (round gpu-l, 2026-10-12) -- gate 132 (`tools/gpu/mc/run.sh`)
 `gpu.gl_scene` wires the shaders `gl_{sky,tint,ent,hud}_*.glsl`: `scene_open(&gb)`, `scene_frame` (timer ring), `scene_sky(&sc,&cam,&sky)` (after b.begin),
-`scene_ent_add/scene_ent_occluder` + `scene_ent_flush(&sc,&cam)` (ONE instanced draw; frustum + Hi-Z culling via gpu.cull, occluders = yaw-0 boxes),
+`scene_ent_add/scene_ent_emissive/scene_ent_occluder` + `scene_ent_flush(&sc,&cam)` (ONE instanced draw; frustum + Hi-Z culling via gpu.cull, occluders = yaw-0 boxes),
 `scene_tint` (depth < 1 pixels, blend DST_COLOR/ZERO), `scene_hud(&sc,&rec)` (mc_hud.hud_record rectangles, runs per blend mode, alpha not written),
 `scene_present_window` (resolve + FBO texture -> window, no read back; caller swaps). Timer passes PASS_* (stamp queries, never waits).
 gl_mc addition: `glbe_flush` (issue collected MODE_MULTI draws before an extra pass; `glbe_rebind` alone forgets them).
