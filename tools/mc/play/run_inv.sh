@@ -429,6 +429,8 @@ cnt=re.search(r'(?:Count: |count: )(\d+)', lap.group(0)) if lap else None
 print("  server: pickaxe enchanted=%s lapis=%s" % (ench, cnt.group(1) if cnt else None))
 sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
 PY
+. tools/mc/play/inv_panel_stage.sh
+[ -n "$CJAR" ] && run_panel_stage
 fi
 if [ "${RUN_INV_ONLY:-}" != cont ]; then
 # ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/mc/play/run_hud.sh -- vanilla HUD in mcplay under Xvfb against the official 1.20.1 server (survival): bars vs widgets/icons.png, F3 debug, F1 hide, F2 PNG screenshot. Prints `RESULT mc-hud: ok`.
+# tools/mc/play/run_hud.sh -- vanilla HUD in mcplay under Xvfb against the official 1.20.1 server (survival): bars vs widgets/icons.png, F3 debug, F1 hide, F2 PNG screenshot, container panels (chest/furnace/crafting table, HUD_CONT=1, default with HUD_WINE=1) pixel-checked. Prints `RESULT mc-hud: ok`.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 MCV=${1:-1.20.1}
@@ -113,6 +113,11 @@ if [ -n "$WP" ]; then
 fi
 sleep 1
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
+if [ "${HUD_CONT:-$WINE_RUN}" = 1 ] && [ $PLAIN -eq 0 ]; then
+  . tools/mc/play/hud_cont_stage.sh
+  [ "$WINE_RUN" = 1 ] && wineserver -k 2>/dev/null
+  run_cont_stage
+fi
 SH=$(ls "$W"/screenshots/*.png 2>/dev/null | head -1)
 if [ -n "$SH" ]; then
   python3 -I - "$SH" "$W/shot.ppm" <<'PY'
