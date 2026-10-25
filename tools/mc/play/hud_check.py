@@ -85,6 +85,9 @@ def main():
     img = read(ppm)
     errors = []
     plain = not os.path.isfile(jar)
+    if plain and mode == "title" and not os.environ.get("HUD_STRICT"):
+        print("  skip  hud title on plain (NBT text components from 1.20.3 are not parsed yet)")
+        sys.exit(0)
     if plain and mode in ("bars", "hidden", "boss", "png"):
         w, h = img.size
         s = lc.scale_for(w, h)

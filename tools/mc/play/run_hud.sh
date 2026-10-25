@@ -64,7 +64,7 @@ check() { xdotool mousemove --window "$1" 5 5; sleep 0.8; if shot "$1" "$2"; the
 key() { xdotool key --window "$1" "$2"; sleep 0.8; }
 
 printf 'name=HudP\nprotocol=%s\nview=3\n' "$PROTO" > "$W/p.cfg"
-MCPLAY_CONFIG="$W/p.cfg" MCPLAY_RUN_S=90 "$W/mcplay" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
+MCPLAY_CONFIG="$W/p.cfg" MCPLAY_PROTOCOL=$PROTO MCPLAY_RUN_S=90 "$W/mcplay" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
 wait_log "HudP joined the game" 120 || { echo "  FAIL  no join"; ERR=1; }
 WP=$(win) || { echo "  FAIL  no window"; ERR=1; WP=""; }
 hudcheck() { xdotool mousemove --window "$1" 5 5; sleep 0.8; shot "$1" "$2" && python3 -I "$CHECK" "$3" "$W/$2.ppm" "$MC_VANILLA_JAR" "$W/bars.ppm" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')" 2>/dev/null; }; }
