@@ -7197,6 +7197,14 @@ fn type_intrinsic_word(p: *mut Parser, nr: u32) -> bool {
     intern.intern_equal(itn, nr, (&gu[0]) as u64, 10)
 }
 
+fn kind_bit(k: u32, base: u32) -> u64 {
+    if k < base || k >= base + 64 {
+        return 0
+    }
+    let one: u64 = 1
+    return one << (k - base) as u64
+}
+
 // Prescan for extensions that this parser does NOT understand.
 //
 // Better here than in the middle of the descent: this way it is settled before
@@ -7227,10 +7235,111 @@ fn extensions_search(p: *mut Parser) {
     let ct2_nr: i64 = intern.intern_find(it, (&ct2[0]) as u64, 7)
     let ct3_nr: i64 = intern.intern_find(it, (&ct3[0]) as u64, 11)
 
+    let rare_lo: u64 = kind_bit(A_KWENUM, 0) | kind_bit(A_KWMATCH, 0) | kind_bit(A_KWERROR, 0)
+        | kind_bit(A_KWTRY, 0) | kind_bit(A_KWCATCH, 0) | kind_bit(A_KWERRDEFER, 0)
+        | kind_bit(A_KWCOMPTIME, 0) | kind_bit(A_HASH, 0) | kind_bit(A_QUESTION, 0)
+        | kind_bit(A_COLON, 0)
+    let rare_hi: u64 = kind_bit(A_KWENUM, 64) | kind_bit(A_KWMATCH, 64) | kind_bit(A_KWERROR, 64)
+        | kind_bit(A_KWTRY, 64) | kind_bit(A_KWCATCH, 64) | kind_bit(A_KWERRDEFER, 64)
+        | kind_bit(A_KWCOMPTIME, 64) | kind_bit(A_HASH, 64) | kind_bit(A_QUESTION, 64)
+        | kind_bit(A_COLON, 64)
     let kinds: u64 = (*lx(p)).kind.ptr
     var i: usize = 0
     while i < (*p).n {
         let a: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
+        if a == A_IDENT {
+            let nr: i64 = nr_at(p, i) as i64
+            // ROUND 82: the vector and crypto instructions
+            // (compiler/src/simd.rs). This parser knows neither the type
+            // `v128` nor the 42 `__v128_*` / `__aes*` / `__sha256*` /
+            // `__pclmulqdq` / `__crc32_*` / `__cpu_features` intrinsics, and
+            // `codegen.fi` could not emit them either -- it has no register
+            // allocation and no xmm class. Recognised by their SPELLING here,
+            // so that a file like `tests/1613_crypto.fi` counts cleanly as
+            // "not core" in `tools/self_compare.sh` instead of appearing as a
+            // FAULTY -- which is exactly what it did before this line
+            // existed. Porting it belongs to the round that gives
+            // `lib/firnc1` a code generator with registers.
+            if simd_word(p, nr_at(p, i)) {
+                (*p).not_core = true
+                return
+            }
+            if gc_nr >= 0 && nr == gc_nr {
+                // ROUND 34: `gc`/`gc class`/`gc C{}` belong to the core language
+                // as soon as the gc registry is registered (the same
+                // handover as in rounds 31-33, 35).
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct1_nr >= 0 && nr == ct1_nr {
+                // ROUND 36: `select(b, a, b)` is ported (ct.rs) -- the same
+                // handover as for `barrier`: core as soon as the gc
+                // registry is registered; the dump tools stay
+                // at "not core", because their stage 0 side prints
+                // `Op::Select`.
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct2_nr >= 0 && nr == ct2_nr {
+                // ROUND 34: `barrier(x)` is the opaque barrier from
+                // ct.rs -- for the behaviour (and this stage has no
+                // optimizer) it is the identity. It belongs to the
+                // core language as soon as the gc registry is registered:
+                // that registry needs it (tests/modules/dom.fi), and only the
+                // real compiler registers it -- the dump tools
+                // stay at "not core", because their stage 0 side prints
+                // the opaque part (`Op::Barrier`).
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if ct3_nr >= 0 && nr == ct3_nr {
+                // ROUND 36: `secure_zero(p, n)` is ported (ct.rs) --
+                // the same handover as for `select`.
+                if !has_gc(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if i + 1 < (*p).n && kd(p, i + 1) == A_NOT {
+                // `E!T` -- an error union is IDENT followed by `!`.
+                if !has_fe(p) {
+                    (*p).not_core = true
+                    return
+                }
+            }
+            if i + 1 < (*p).n && !has_gen(p) && kd(p, i + 1) == A_LBRACKET
+            && type_intrinsic_word(p, nr_at(p, i)) {
+                (*p).not_core = true
+                return
+            }
+            if i > 0 && i + 1 < (*p).n && !has_gen(p) {
+                let before: u32 = kd(p, i - 1)
+                if before == A_KWFN || before == A_KWSTRUCT {
+                    if kd(p, i + 1) == A_LBRACKET {
+                        (*p).not_core = true
+                        return
+                    }
+                }
+            }
+            i = i + 1
+            continue
+        }
+        var is_rare: bool = false
+        if a < 64 {
+            is_rare = ((rare_lo >> a as u64) & 1) != 0
+        } else if a < 128 {
+            is_rare = ((rare_hi >> (a - 64) as u64) & 1) != 0
+        }
+        if !is_rare {
+            i = i + 1
+            continue
+        }
         if a == A_KWENUM || a == A_KWMATCH {
             // Belongs to the core language AS SOON AS the pattern registry is
             // registered -- the same handover as for the generic templates
@@ -7370,94 +7479,9 @@ fn extensions_search(p: *mut Parser) {
                 }
             }
         }
-        if a == A_IDENT {
-            let nr: i64 = nr_at(p, i) as i64
-            // ROUND 82: the vector and crypto instructions
-            // (compiler/src/simd.rs). This parser knows neither the type
-            // `v128` nor the 42 `__v128_*` / `__aes*` / `__sha256*` /
-            // `__pclmulqdq` / `__crc32_*` / `__cpu_features` intrinsics, and
-            // `codegen.fi` could not emit them either -- it has no register
-            // allocation and no xmm class. Recognised by their SPELLING here,
-            // so that a file like `tests/1613_crypto.fi` counts cleanly as
-            // "not core" in `tools/self_compare.sh` instead of appearing as a
-            // FAULTY -- which is exactly what it did before this line
-            // existed. Porting it belongs to the round that gives
-            // `lib/firnc1` a code generator with registers.
-            if simd_word(p, nr_at(p, i)) {
-                (*p).not_core = true
-                return
-            }
-            if gc_nr >= 0 && nr == gc_nr {
-                // ROUND 34: `gc`/`gc class`/`gc C{}` belong to the core language
-                // as soon as the gc registry is registered (the same
-                // handover as in rounds 31-33, 35).
-                if !has_gc(p) {
-                    (*p).not_core = true
-                    return
-                }
-            }
-            if ct1_nr >= 0 && nr == ct1_nr {
-                // ROUND 36: `select(b, a, b)` is ported (ct.rs) -- the same
-                // handover as for `barrier`: core as soon as the gc
-                // registry is registered; the dump tools stay
-                // at "not core", because their stage 0 side prints
-                // `Op::Select`.
-                if !has_gc(p) {
-                    (*p).not_core = true
-                    return
-                }
-            }
-            if ct2_nr >= 0 && nr == ct2_nr {
-                // ROUND 34: `barrier(x)` is the opaque barrier from
-                // ct.rs -- for the behaviour (and this stage has no
-                // optimizer) it is the identity. It belongs to the
-                // core language as soon as the gc registry is registered:
-                // that registry needs it (tests/modules/dom.fi), and only the
-                // real compiler registers it -- the dump tools
-                // stay at "not core", because their stage 0 side prints
-                // the opaque part (`Op::Barrier`).
-                if !has_gc(p) {
-                    (*p).not_core = true
-                    return
-                }
-            }
-            if ct3_nr >= 0 && nr == ct3_nr {
-                // ROUND 36: `secure_zero(p, n)` is ported (ct.rs) --
-                // the same handover as for `select`.
-                if !has_gc(p) {
-                    (*p).not_core = true
-                    return
-                }
-            }
-            if i + 1 < (*p).n && kd(p, i + 1) == A_NOT {
-                // `E!T` -- an error union is IDENT followed by `!`.
-                if !has_fe(p) {
-                    (*p).not_core = true
-                    return
-                }
-            }
-            if i + 1 < (*p).n && !has_gen(p) && kd(p, i + 1) == A_LBRACKET
-            && type_intrinsic_word(p, nr_at(p, i)) {
-                (*p).not_core = true
-                return
-            }
-            if i > 0 && i + 1 < (*p).n && !has_gen(p) {
-                let before: u32 = kd(p, i - 1)
-                if before == A_KWFN || before == A_KWSTRUCT {
-                    if kd(p, i + 1) == A_LBRACKET {
-                        (*p).not_core = true
-                        return
-                    }
-                }
-            }
-        }
         i = i + 1
     }
 }
-
-// Collects the names that this file declares at the top level. Only those
-// are renamed -- a use from another module is written qualified there
-// anyway.
 fn own_search(p: *mut Parser) {
     if (*p).alias == NONE {
         return
@@ -7475,6 +7499,10 @@ fn own_search(p: *mut Parser) {
     var i: usize = 0
     while i + 1 < (*p).n {
         let a: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
+        if a != A_IDENT && a != A_KWFN && a != A_KWSTRUCT && a != A_KWCONST && a != A_KWSTATIC {
+            i = i + 1
+            continue
+        }
         var word: i64 = 0 - 1
         if a == A_IDENT {
             let wn: u32 = *((nrs +% i as u64 *% 4) as *mut u32)
