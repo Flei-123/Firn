@@ -110,3 +110,10 @@ Screen-door (ordered dither) fade between two representations of a column, in th
   | cull search | 1149 us | 263 us |
   | converge (inline meshing, whole window) | 3527 ms | 731 ms |
   Real GPU numbers still missing (Boss).
+
+## LOD tint (w15, 25.10.)
+- Cells carry the biome id of their top block (`lod_heights_bio` reads the section biome cell, `lod_bin_bio` keeps the id of the winning block). `lod_mesh_tint` swaps the tile of grass / leaf cells for a pre-tinted twin tile; the vertex stays 8 bytes, CPU / GL / VK read the same atlas, so they cannot diverge.
+- Twins (lib/mc/mc_lod_tint.fi): `tex_build_tables_ext` marks the top tile of `grass_block` and the tile of oak / jungle / acacia / dark_oak / mangrove leaves (8-colour palette from the biome table by k-means), birch / spruce leaves (1 fixed colour). Twin tiles are appended after the extended tiles (`TexExt.ntwin`); `twins_fill` multiplies the pack texel with the palette colour (`c * (t + 1) >> 8`, like the model quad tint) after every pack reload.
+- The twin table lives behind the 32768 * 6 tile entries of `MeshTables.tiles` (base twin tile, class); `map_build` turns the ModelSet biome colour table into biome id -> palette index (`Stream.lodt`, built lazily when models are on).
+- Only with models on (full-detail ring tinted too). Biome blend / Voronoi zoom are not applied in LOD; swamp noise ignored.
+- Tests 5250 (twin tables, atlas fill, palette map), 5251 (LOD mesh picks the twin per biome).
