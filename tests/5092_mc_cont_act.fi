@@ -1,0 +1,124 @@
+// expect_exit: 0
+import std.net
+import std.rt
+import std.bytes
+import mc.mc_codec
+import mc.mc_client
+import mc.mc_cont_act
+import mc.mc_sem
+import mc.mc_version
+import mc.v763.mc_proto_v763
+import mc.v769.mc_proto_v769
+
+static mut g_fail: i32 = 0
+
+fn expect(got: i32, want: i32, msg: str) {
+    if got != want {
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&o, "FAIL ".p as u64, 5)
+        rt.buf_push_bytes(&o, msg.p as u64, msg.n)
+        rt.buf_push_bytes(&o, " got ".p as u64, 5)
+        rt.buf_push_dec_i64(&o, got as i64)
+        rt.buf_push(&o, 10)
+        rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+        rt.buf_free(&o)
+        g_fail = g_fail + 1
+    }
+}
+
+fn read_button(sw: *mut mc_codec.Wire, ver: *mut mc_version.Version, wide: bool, win: *mut i32, button: *mut i32) -> bool {
+    var body: bytes.Bytes = bytes.bytes_new()
+    let id: i32 = mc_codec.wire_read_packet(sw, &body) catch 0 - 100
+    if id != mc_version.version_pid(ver, mc_sem.SEM_PLAY_C2S_ENCHANT_ITEM) { return false }
+    if wide {
+        *win = bytes.get_varint(&body) catch 0 - 1
+        *button = bytes.get_varint(&body) catch 0 - 1
+    } else {
+        *win = (bytes.get_i8(&body) catch 0) as i32
+        *button = (bytes.get_i8(&body) catch 0) as i32
+    }
+    return bytes.bytes_remaining(&body) == 0 as usize
+}
+
+fn read_name(sw: *mut mc_codec.Wire, ver: *mut mc_version.Version, want: str) -> i32 {
+    var body: bytes.Bytes = bytes.bytes_new()
+    let id: i32 = mc_codec.wire_read_packet(sw, &body) catch 0 - 100
+    if id != mc_version.version_pid(ver, mc_sem.SEM_PLAY_C2S_NAME_ITEM) { return 1 }
+    var n: usize = 0
+    let p: u64 = bytes.get_string(&body, &n) catch 0 as u64
+    if n != want.n { return 2 }
+    var i: usize = 0
+    while i < n {
+        if *((p + (i as u64)) as *u8) != *((want.p as u64 + (i as u64)) as *u8) { return 3 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn round(ver: mc_version.Version, wide: bool) {
+    var v: mc_version.Version = ver
+    var lst: net.Listener = net.listen_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), 0 as u16) catch net.listener_from_fd(0 - 1)
+    let port: u16 = net.listener_port(&lst)
+    var cc: net.Conn = net.connect_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), port) catch net.conn_from_fd(0 - 1)
+    var sc: net.Conn = net.accept(&lst) catch net.conn_from_fd(0 - 1)
+    var cl: mc_client.Client = mc_client.client_new(cc, v)
+    var sw: mc_codec.Wire = mc_codec.wire_open(sc)
+    mc_codec.wire_timeout(&sw, 300)
+    var a: mc_cont_act.ContAct = mc_cont_act.act_new()
+    var win: i32 = 0
+    var button: i32 = 0
+
+    expect(if_b(mc_cont_act.act_enchant_ok(30, 3, 2, false)), 1, "enchant ok with 3 lapis")
+    expect(if_b(mc_cont_act.act_enchant_ok(30, 2, 2, false)), 0, "enchant needs lapis > idx")
+    expect(if_b(mc_cont_act.act_enchant_ok(0, 3, 0, false)), 0, "no cost = no click")
+    expect(if_b(mc_cont_act.act_enchant_ok(10, 0, 0, true)), 1, "creative needs no lapis")
+    expect(if_b(mc_cont_act.act_enchant_ok(10, 3, 3, false)), 0, "idx 3 invalid")
+
+    expect(if_b(mc_cont_act.act_enchant_click(&a, &cl, 5, 1, 20, 2, false)), 1, "click idx 1 sent")
+    expect(if_b(read_button(&sw, &v, wide, &win, &button)), 1, "button packet shape")
+    expect(win, 5, "button window")
+    expect(button, 1, "button idx")
+    expect(if_b(mc_cont_act.act_enchant_click(&a, &cl, 5, 2, 20, 2, false)), 0, "click idx 2 refused (lapis 2)")
+    expect(if_b(mc_cont_act.act_enchant_click(&a, &cl, 0, 0, 20, 3, false)), 0, "click without window refused")
+
+    mc_cont_act.act_name_sync(&a, &cl, 7, 100)
+    expect(mc_cont_act.act_name_char(&a, &cl, 72 as u32) as i32, 1, "char H")
+    expect(read_name(&sw, &v, "H"), 0, "rename H")
+    expect(mc_cont_act.act_name_char(&a, &cl, 105 as u32) as i32, 1, "char i")
+    expect(read_name(&sw, &v, "Hi"), 0, "rename Hi")
+    expect(mc_cont_act.act_name_char(&a, &cl, 1 as u32) as i32, 0, "control char ignored")
+    expect(mc_cont_act.act_name_backspace(&a, &cl) as i32, 1, "backspace")
+    expect(read_name(&sw, &v, "H"), 0, "rename after backspace")
+    expect(mc_cont_act.act_name_len(&a) as i32, 1, "field len 1")
+    mc_cont_act.act_name_sync(&a, &cl, 7, 100)
+    expect(mc_cont_act.act_name_len(&a) as i32, 1, "same item keeps text")
+    mc_cont_act.act_name_sync(&a, &cl, 7, 200)
+    expect(mc_cont_act.act_name_len(&a) as i32, 0, "new item clears text")
+    expect(read_name(&sw, &v, ""), 0, "rename empty on item change")
+    expect(mc_cont_act.act_name_backspace(&a, &cl) as i32, 0, "backspace on empty")
+    var i: i32 = 0
+    while i < 60 {
+        mc_cont_act.act_name_char(&a, &cl, 97 as u32)
+        i = i + 1
+    }
+    expect(mc_cont_act.act_name_len(&a) as i32, 50, "name limit 50")
+    expect(mc_cont_act.act_name_wipe(&a, &cl) as i32, 1, "wipe")
+    expect(mc_cont_act.act_name_len(&a) as i32, 0, "wiped")
+    expect(a.sent_button as i32, 1, "sent_button counter")
+
+    mc_cont_act.act_free(&a)
+    mc_codec.wire_close(&sw)
+    mc_client.client_free(&cl)
+    net.close_listener(&lst)
+}
+
+fn if_b(b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+fn main() -> i32 {
+    round(mc_proto_v763.version_make(), false)
+    round(mc_proto_v769.version_make(), true)
+    return g_fail
+}
