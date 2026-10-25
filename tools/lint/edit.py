@@ -159,6 +159,16 @@ def remove_item(lines, idx):
     return True
 
 
+def remove_variable(lines, idx):
+    if not re.match(r"\s*(let|var)\s+\w+\s*(:[^=]*)?=", lines[idx]):
+        return False
+    end = item_end(lines, idx)
+    if end < 0:
+        return False
+    del lines[idx:end + 1]
+    return True
+
+
 def main():
     rule = sys.argv[1]
     path = sys.argv[2]
@@ -178,6 +188,8 @@ def main():
             lines[idx], ok = fix_bool_comparison(lines[idx])
         elif rule == "unused-import":
             ok = remove_import(lines, idx)
+        elif rule == "unused-variable":
+            ok = remove_variable(lines, idx)
         elif rule == "unused-private-item":
             ok = remove_item(lines, idx)
         else:
