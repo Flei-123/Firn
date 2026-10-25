@@ -19,6 +19,7 @@ pub struct Options {
     pub out: Option<PathBuf>,
     pub jobs: usize,
     pub timeout_secs: u64,
+    pub retries: usize,
     pub progress: bool,
     pub quiet: bool,
 }
@@ -26,7 +27,7 @@ pub struct Options {
 pub fn usage() -> &'static str {
     "usage: testrunner [--root DIR] [--compiler PATH] [--format text|json|jsonl|junit]\n\
      \x20                 [--out FILE] [--filter TEXT] [--levels opt,noopt,devfast,safe]\n\
-     \x20                 [--jobs N] [--timeout SECONDS] [--progress] [--quiet]\n"
+     \x20                 [--jobs N] [--timeout SECONDS] [--retries N] [--progress] [--quiet]\n"
 }
 
 fn take_value(args: &[String], i: &mut usize, inline: Option<String>, key: &str) -> Result<String, String> {
@@ -73,6 +74,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         out: None,
         jobs: 4,
         timeout_secs: 120,
+        retries: 0,
         progress: false,
         quiet: false,
     };
@@ -103,6 +105,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--timeout" => {
                 let v = take_value(args, &mut i, inline, &key)?;
                 o.timeout_secs = v.parse::<u64>().ok().filter(|n| *n > 0).ok_or(format!("--timeout '{}' is no positive number", v))?;
+            }
+            "--retries" => {
+                let v = take_value(args, &mut i, inline, &key)?;
+                o.retries = v.parse::<usize>().map_err(|_| format!("--retries '{}' is no number", v))?;
             }
             _ => return Err(format!("unknown option '{}'", a)),
         }

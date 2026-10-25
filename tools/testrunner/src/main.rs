@@ -18,13 +18,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-fn execute(o: &Options, work: &Path, job: &Job) -> Vec<Case> {
+fn execute_once(o: &Options, work: &Path, job: &Job) -> Vec<Case> {
     match job {
         Job::Run { rel, levels } => levels.iter().map(|l| check_run::run_program(o, work, rel, l)).collect(),
         Job::Negative { rel } => vec![check_neg::run_negative(o, work, rel)],
         Job::Unit { rel } => check_unit::run_unit(o, work, rel),
         Job::Skip { rel, level, reason } => vec![Case::new(rel, level, "run").skipped(reason)],
     }
+}
+
+fn execute(o: &Options, work: &Path, job: &Job) -> Vec<Case> {
+    let mut cases = execute_once(o, work, job);
+    for attempt in 1..=o.retries {
+        if !cases.iter().any(|c| c.status == Status::Fail) {
+            break;
+        }
+        let again = execute_once(o, work, job);
+        if o.progress {
+            eprintln!("RETRY {} of {}", attempt, o.retries);
+        }
+        cases = again;
+    }
+    cases
 }
 
 fn run_all(o: &Options, work: &Path, jobs: &[Job]) -> Vec<Case> {
