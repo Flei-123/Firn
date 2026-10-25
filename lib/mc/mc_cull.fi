@@ -97,6 +97,8 @@ struct Cull {
     cmcap: usize,
     d2tab: u64,
     d2cap: usize,
+    gcstart: u64,
+    gccap: usize,
 }
 
 fn cull_new(min_y: i32, nsec: i32) -> Cull {
@@ -106,7 +108,7 @@ fn cull_new(min_y: i32, nsec: i32) -> Cull {
         st: CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
             known: 0 as u32, ncells: 0 as u32, reused: 0 as u32 },
         graph_mode: false, gsig: GraphSig { valid: false, gen: 0 as u64, dist: 0, setback: false, cx: 0, sy: 0, cz: 0 },
-        gset: 0, gn: 0, gcap: 0, otmp: 0, otcap: 0, rcnt: 0, cmask: 0, cmcap: 0, d2tab: 0, d2cap: 0 }
+        gset: 0, gn: 0, gcap: 0, otmp: 0, otcap: 0, rcnt: 0, cmask: 0, cmcap: 0, d2tab: 0, d2cap: 0, gcstart: 0, gccap: 0 }
 }
 
 fn cull_free(c: *mut Cull) {
@@ -120,6 +122,9 @@ fn cull_free(c: *mut Cull) {
     if (*c).d2tab != 0 { rt.heap_free((*c).d2tab, (*c).d2cap * 8) }
     (*c).d2tab = 0
     (*c).d2cap = 0
+    if (*c).gcstart != 0 { rt.heap_free((*c).gcstart, (*c).gccap * 4) }
+    (*c).gcstart = 0
+    (*c).gccap = 0
     if (*c).cmask != 0 { rt.heap_free((*c).cmask, (*c).cmcap) }
     (*c).cmask = 0
     (*c).cmcap = 0
@@ -958,6 +963,53 @@ fn graph_same(c: *mut Cull, dist: i32, setback: bool, ccx: i32, csy: i32, ccz: i
     && (*g).cx == ccx && (*g).sy == csy && (*g).cz == ccz
 }
 
+fn group_by_column(c: *mut Cull, n: usize, dist: i32, ccx: i32, ccz: i32) {
+    let cw: i32 = dist * 2 + 1
+    let ncol: usize = (cw * cw) as usize
+    if (*c).gccap < ncol + 2 {
+        if (*c).gcstart != 0 { rt.heap_free((*c).gcstart, (*c).gccap * 4) }
+        (*c).gccap = ncol + 2
+        (*c).gcstart = rt.heap_alloc((*c).gccap * 4)
+    }
+    let cs: u64 = (*c).gcstart
+    rt.mem_set(cs, 0 as u8, (ncol + 2) * 4)
+    let tn: usize = n * 4 + (ncol + 1) * 4 + n * 8
+    let tmp: u64 = rt.heap_alloc(tn + 8)
+    let cells: u64 = tmp
+    let cur: u64 = tmp + (n * 4) as u64
+    let sorted: u64 = cur + ((ncol + 1) * 4) as u64
+    let ox0: i32 = ccx - dist
+    let oz0: i32 = ccz - dist
+    var k: usize = 0
+    while k < n {
+        let key: u64 = rt.ld64((*c).gset, k)
+        let ix: i32 = cull_out_cx(key) - ox0
+        let iz: i32 = cull_out_cz(key) - oz0
+        let sy: i32 = cull_out_sy(key)
+        var cell: usize = ncol
+        if ix >= 0 && ix < cw && iz >= 0 && iz < cw && sy >= 0 && sy < (*c).nsec { cell = (iz * cw + ix) as usize }
+        rt.st32(cells, k, cell as u32)
+        rt.st32(cs, cell + 1, rt.ld32(cs, cell + 1) + 1 as u32)
+        k = k + 1
+    }
+    var a: usize = 0
+    while a <= ncol {
+        rt.st32(cs, a + 1, rt.ld32(cs, a + 1) + rt.ld32(cs, a))
+        rt.st32(cur, a, rt.ld32(cs, a))
+        a = a + 1
+    }
+    k = 0
+    while k < n {
+        let cell: usize = rt.ld32(cells, k) as usize
+        let pos: usize = rt.ld32(cur, cell) as usize
+        rt.st64(sorted, pos, rt.ld64((*c).gset, k))
+        rt.st32(cur, cell, (pos + 1) as u32)
+        k = k + 1
+    }
+    rt.mem_copy((*c).gset, sorted, n * 8)
+    rt.heap_free(tmp, tn + 8)
+}
+
 fn graph_rebuild(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool, ccx: i32, csy: i32, ccz: i32) {
     let n: usize = cull_search(c, cam, dist, setback, false)
     out_sort(c)
@@ -974,6 +1026,7 @@ fn graph_rebuild(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: b
         if cull_get(c, cull_out_cx(key), cull_out_sy(key), cull_out_cz(key)) != 4294967295 as u32 { kn = kn + 1 as u32 }
         k = k + 1
     }
+    group_by_column(c, n, dist, ccx, ccz)
     (*c).gn = n
     (*c).st.known = kn
     (*c).gsig = GraphSig { valid: true, gen: (*c).gen, dist: dist, setback: setback, cx: ccx, sy: csy, cz: ccz }
@@ -1016,26 +1069,38 @@ fn cull_run_graph(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: 
     let out: u64 = (*c).out
     let gset: u64 = (*c).gset
     let cmask: u64 = (*c).cmask
-    let ox0: i32 = ccx - dist
-    let oz0: i32 = ccz - dist
     let gn: usize = (*c).gn
+    let gcs: u64 = (*c).gcstart
+    let ncol: usize = (cw * cw) as usize
     var no: usize = 0
     var mx: u64 = 0 as u64
-    var k: usize = 0
-    while k < gn {
-        let key: u64 = rt.ld64(gset, k)
-        k = k + 1
-        let cx: i32 = cull_out_cx(key)
-        let sy: i32 = cull_out_sy(key)
-        let cz: i32 = cull_out_cz(key)
-        let ix: i32 = cx - ox0
-        let iz: i32 = cz - oz0
-        var inside: bool = false
-        if ix >= 0 && ix < cw && iz >= 0 && iz < cw && sy >= 0 && sy < (*c).nsec { inside = true }
+    var col: usize = 0
+    while col <= ncol {
+        let k0: usize = rt.ld32(gcs, col) as usize
+        let k1: usize = rt.ld32(gcs, col + 1) as usize
+        if k0 == k1 {
+            col = col + 1
+            continue
+        }
+        let inside: bool = col < ncol
         var cm: u8 = 1 as u8
-        if inside { cm = rt.ld8(cmask, (iz * cw + ix) as usize) }
+        var ix: i32 = 0
+        var iz: i32 = 0
+        if inside {
+            cm = rt.ld8(cmask, col)
+            iz = (col as i32) / cw
+            ix = (col as i32) - iz * cw
+        }
+        col = col + 1
         if cm == 0 as u8 { continue }
-        if cm == 2 as u8 || mc_camera.camera_section_visible(cam, cx, sy, cz, (*c).min_y) != 0 {
+        var k: usize = k0
+        while k < k1 {
+            let key: u64 = rt.ld64(gset, k)
+            k = k + 1
+            let cx: i32 = cull_out_cx(key)
+            let sy: i32 = cull_out_sy(key)
+            let cz: i32 = cull_out_cz(key)
+            if cm == 1 as u8 && mc_camera.camera_section_visible(cam, cx, sy, cz, (*c).min_y) == 0 { continue }
             var d: u64 = 0 as u64
             if inside {
                 d = (ldd(tx, ix as usize) + ldd(ty, sy as usize) + ldd(tz, iz as usize)) as u64
