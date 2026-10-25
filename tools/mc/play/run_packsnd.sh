@@ -78,7 +78,7 @@ run() {
     if [ "$reload" = 1 ]; then
         sleep 9
         cp "$W/q.zip" "$W/cur.zip"
-        xdotool mousemove 320 180 2>/dev/null; xdotool key F5; sleep 0.5
+        xdotool mousemove 320 180 2>/dev/null; xdotool key ctrl+F5; sleep 0.5
     elif [ "$reload" = 2 ]; then
         # O key twice: packs off (synth bank back), packs on again
         sleep 9

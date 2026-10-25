@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.math
+import mc.mc_world
+import mc.mc_world_view
+import mc.mc_input
+import mc.mc_camera
+
+export {
+    Cam3p, MODE_FIRST, MODE_BACK, MODE_FRONT, MODE_COUNT, CAM_DISTANCE, mode_next, mode_is_third, mode_name,
+    cam3p_new, cam3p_place, cam3p_apply,
+}
+
+const MODE_FIRST: i32 = 0
+const MODE_BACK: i32 = 1
+const MODE_FRONT: i32 = 2
+const MODE_COUNT: i32 = 3
+const CAM_DISTANCE: f64 = 4.0
+const CORNER: f64 = 0.1
+const DEG: f64 = 0.017453292519943295
+
+struct Cam3p {
+    x: f64, y: f64, z: f64,
+    yaw: f64, pitch: f64,
+    dist: f64,
+    clipped: bool,
+}
+
+fn cam3p_new() -> Cam3p {
+    return Cam3p { x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, pitch: 0.0, dist: 0.0, clipped: false }
+}
+
+fn mode_next(m: i32) -> i32 {
+    return (m + 1) % MODE_COUNT
+}
+
+fn mode_is_third(m: i32) -> bool {
+    return m == MODE_BACK || m == MODE_FRONT
+}
+
+fn mode_name(m: i32) -> str {
+    if m == MODE_BACK { return "third_back" }
+    if m == MODE_FRONT { return "third_front" }
+    return "first"
+}
+
+const FAR: f64 = 1.0e30
+
+fn cell_solid(v: *mut mc_world_view.WorldView, solid: u64, n: usize, x: i32, y: i32, z: i32) -> bool {
+    let id: i32 = mc_world_view.view_id(v, x, y, z)
+    if id < 0 || (id as usize) >= n { return false }
+    return rt.ld16(solid, id as usize) != 0 as u16
+}
+
+fn first_t(o: f64, c: i32, d: f64) -> f64 {
+    if d > 0.0 { return (((c + 1) as f64) - o) / d }
+    if d < 0.0 { return (o - (c as f64)) / (0.0 - d) }
+    return FAR
+}
+
+fn delta_t(d: f64) -> f64 {
+    if d == 0.0 { return FAR }
+    return 1.0 / math.fabs(d)
+}
+
+fn ray_solid_dist(v: *mut mc_world_view.WorldView, solid: u64, n: usize, ox: f64, oy: f64, oz: f64,
+    dx: f64, dy: f64, dz: f64, max_dist: f64) -> f64 {
+    var cx: i32 = math.floor(ox) as i32
+    var cy: i32 = math.floor(oy) as i32
+    var cz: i32 = math.floor(oz) as i32
+    if cell_solid(v, solid, n, cx, cy, cz) { return 0.0 }
+    var sx: i32 = 1
+    var sy: i32 = 1
+    var sz: i32 = 1
+    if dx < 0.0 { sx = 0 - 1 }
+    if dy < 0.0 { sy = 0 - 1 }
+    if dz < 0.0 { sz = 0 - 1 }
+    var tx: f64 = first_t(ox, cx, dx)
+    var ty: f64 = first_t(oy, cy, dy)
+    var tz: f64 = first_t(oz, cz, dz)
+    let ax: f64 = delta_t(dx)
+    let ay: f64 = delta_t(dy)
+    let az: f64 = delta_t(dz)
+    var steps: i32 = 0
+    while steps < 96 {
+        var t: f64 = tx
+        if ty < t { t = ty }
+        if tz < t { t = tz }
+        if t > max_dist { return max_dist }
+        if tx <= ty && tx <= tz {
+            cx = cx + sx
+            tx = tx + ax
+        } else if ty <= tz {
+            cy = cy + sy
+            ty = ty + ay
+        } else {
+            cz = cz + sz
+            tz = tz + az
+        }
+        if cell_solid(v, solid, n, cx, cy, cz) { return t }
+        steps = steps + 1
+    }
+    return max_dist
+}
+
+fn clip_distance(w: *mut mc_world.World, min_y: i32, tb: *mut mc_input.InputTables, ex: f64, ey: f64, ez: f64,
+    dx: f64, dy: f64, dz: f64, max_dist: f64) -> f64 {
+    var v: mc_world_view.WorldView = mc_world_view.view_new(w, min_y)
+    var best: f64 = max_dist
+    var i: i32 = 0
+    while i < 8 {
+        var ox: f64 = 0.0 - CORNER
+        var oy: f64 = 0.0 - CORNER
+        var oz: f64 = 0.0 - CORNER
+        if (i & 1) != 0 { ox = CORNER }
+        if (i & 2) != 0 { oy = CORNER }
+        if (i & 4) != 0 { oz = CORNER }
+        let d: f64 = ray_solid_dist(&v, (*tb).solid, (*tb).n, ex + ox, ey + oy, ez + oz, dx, dy, dz, max_dist)
+        if d < best { best = d }
+        i = i + 1
+    }
+    return best
+}
+
+fn cam3p_place(w: *mut mc_world.World, min_y: i32, tb: *mut mc_input.InputTables, ex: f64, ey: f64, ez: f64,
+    yaw: f64, pitch: f64, mode: i32, max_dist: f64, out: *mut Cam3p) {
+    (*out).x = ex
+    (*out).y = ey
+    (*out).z = ez
+    (*out).yaw = yaw
+    (*out).pitch = pitch
+    (*out).dist = 0.0
+    (*out).clipped = false
+    if !mode_is_third(mode) { return }
+    let yr: f64 = yaw * DEG
+    let pr: f64 = pitch * DEG
+    var dx: f64 = 0.0 - math.sin(yr) * math.cos(pr)
+    var dy: f64 = 0.0 - math.sin(pr)
+    var dz: f64 = math.cos(yr) * math.cos(pr)
+    if mode == MODE_BACK {
+        dx = 0.0 - dx
+        dy = 0.0 - dy
+        dz = 0.0 - dz
+    } else {
+        var fy: f64 = yaw + 180.0
+        if fy >= 180.0 { fy = fy - 360.0 }
+        (*out).yaw = fy
+        (*out).pitch = 0.0 - pitch
+    }
+    let d: f64 = clip_distance(w, min_y, tb, ex, ey, ez, dx, dy, dz, max_dist)
+    (*out).dist = d
+    (*out).clipped = d < max_dist
+    (*out).x = ex + dx * d
+    (*out).y = ey + dy * d
+    (*out).z = ez + dz * d
+}
+
+fn cam3p_apply(cam: *mut mc_camera.Camera, w: *mut mc_world.World, min_y: i32, tb: *mut mc_input.InputTables,
+    ex: f64, ey: f64, ez: f64, yaw: f64, pitch: f64, mode: i32, max_dist: f64, out: *mut Cam3p) {
+    cam3p_place(w, min_y, tb, ex, ey, ez, yaw, pitch, mode, max_dist, out)
+    if !mode_is_third(mode) { return }
+    mc_camera.camera_set_pos(cam, (*out).x, (*out).y, (*out).z)
+    mc_camera.camera_set_angles(cam, (*out).yaw, (*out).pitch)
+    mc_camera.camera_update(cam)
+}
