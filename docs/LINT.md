@@ -13,7 +13,7 @@ Output: `path:line: rule: message`. Exit 0 = clean, 1 = findings, 2 = I/O, 3 = a
 |---|---|
 | `unused-import` | import (except `pystr`, which the compiler needs for step slices) whose module name is never mentioned and none of whose exported names occurs in the file (`--lib` is the fallback search directory for the module) |
 | `duplicate-import` | two imports that bind the same name |
-| `unused-variable` | `let`/`var` without side effects (no call, `try`, `catch`) that is never read |
+| `unused-variable` | `let`/`var` never read; auto-fix only when the initializer is side-effect-free (literal, or plain scalar/str/pointer type without call, `try`, `catch`, struct literal); otherwise reported as `(kept: initializer may have effects)` and skipped by `fix.sh` |
 | `shadowed-variable` | `let`/`var` that hides a live binding or parameter of the same function |
 | `unreachable-code` | statement directly after `return`/`break`/`continue` in the same block |
 | `unused-private-item` | top-level `fn`/`static` of a file with an `export { ... }` list that is neither exported nor mentioned anywhere in the file (also in strings); skipped: attributed items, `main`, names starting with `_`; files without an export list export everything and are not checked |

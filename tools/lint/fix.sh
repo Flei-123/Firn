@@ -16,7 +16,7 @@ EDIT="$ROOT/tools/lint/edit.py"
 fixed=0; skipped=0; files=0; left=0
 fix_file() {
     local f=$1 n kept l
-    "$LINT" --rules "$RULE" --lib lib "$f" 2>/dev/null | cut -d: -f2 | sort -un > "$T/lines.txt"
+    "$LINT" --rules "$RULE" --lib lib "$f" 2>/dev/null | grep -v '(kept:' | cut -d: -f2 | sort -un > "$T/lines.txt"
     [ -s "$T/lines.txt" ] || return 1
     if ! ctx_probe "$f"; then
         skipped=$((skipped + 1))
