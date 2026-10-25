@@ -1,27 +1,42 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/mc/mc_chat_ui.fi -- chat overlay (lines, input line, action bar) drawn through mc_hud, and the keyboard side of the input line.
+// lib/mc/mc_chat_ui.fi -- vanilla chat overlay: wrapped lines with fade, input line with history, suggestion popup, action bar.
 //
-//   chat_ui_keys(&ch, &raw, allow)            once per frame after the window events: Enter / T open, Esc closes, editing keys, scrolling;
-//                                             returns CK_CONSUMED (keys belong to the chat: clear them) | CK_SUBMIT (send the input line)
-//   chat_ui_char(&ch, code, allow)            one EV_CHAR code point: typed into the open line; '/' opens the chat with a slash
-//   chat_ui_draw(&ch, r, scale, now_ms)       lines (the last 10 s when closed, 20 rows when open), input line, action bar
+//   chatui_new() / chatui_free(&ui)            history + suggestion state that lives next to the Chat
+//   chat_ui_keys(&ch, &ui, &kb, &raw, allow)   once per frame after the window events; returns CK_* flags
+//   chat_ui_char(&ch, &ui, code, allow)        one EV_CHAR code point typed into the open line
+//   chat_ui_draw(&ch, &ui, r, scale, now_ms)   lines, input line, popup, action bar (all through mc_hud_vfont / mc_hud.hud_rect)
+//   chat_ui_rows(&ch, wrap_w)                  number of wrapped rows held (needs the font loaded for exact widths)
 //
-// Everything is drawn with mc_hud.hud_rect / hud_text_bytes, so the CPU raster and the GPU record path show the same overlay.
+// Layout in unscaled GUI pixels like vanilla: newest row bottom at h - 40, 9 px rows, 10 rows closed / 20 open, 320 px wide, row background
+// 0x80000000 * fade, fade = (clamp((200 - age_ticks) / 200 * 10, 0, 1))^2, input box 2..w-2 x h-14..h-2, popup rows 12 px.
 
+import std.rt
 import mc.mc_raster
 import mc.mc_hud
+import mc.mc_hud_vfont
+import mc.mc_fontmap
 import mc.mc_chat
+import mc.mc_chat_hist
+import mc.mc_chat_suggest
+import mc.mc_keybinds
 import input.raw
 
-export { chat_ui_keys, chat_ui_char, chat_ui_draw, CK_CONSUMED, CK_SUBMIT, SHOW_MS }
+export {
+    ChatUi, chatui_new, chatui_free, chat_ui_keys, chat_ui_char, chat_ui_draw, chat_ui_rows, chat_ui_fade, chat_ui_wrap_rows,
+    CK_CONSUMED, CK_SUBMIT, CK_REQUEST, CK_TAB, CHAT_W, ROWS_CLOSED, ROWS_OPEN, FADE_TICKS,
+}
 
 const CK_CONSUMED: i32 = 1
 const CK_SUBMIT: i32 = 2
-const SHOW_MS: u32 = 10000
+const CK_REQUEST: i32 = 4
+const CK_TAB: i32 = 8
+const CHAT_W: i32 = 320
 const ROWS_CLOSED: i32 = 10
 const ROWS_OPEN: i32 = 20
+const FADE_TICKS: u32 = 200
+const MAX_ROW_SPLITS: usize = 32
 const SC_BACKSPACE: u32 = 14
-const SC_T: u32 = 20
+const SC_TAB: u32 = 15
 const SC_KP_ENTER: u32 = 96
 const SC_HOME: u32 = 102
 const SC_UP: u32 = 103
@@ -32,43 +47,113 @@ const SC_END: u32 = 107
 const SC_DOWN: u32 = 108
 const SC_PGDN: u32 = 109
 const SC_DELETE: u32 = 111
-const COL_SHADOW: u32 = 0xFF3F3F3F
+const SC_RSHIFT: u32 = 54
 const COL_BG: u32 = 0x80000000
+const COL_POPUP_BG: u32 = 0xD0000000
+const COL_POPUP_SEL: u32 = 0xFF00FFFF
+const COL_POPUP_ITEM: u32 = 0xFFAAAAAA
+const COL_WHITE: u32 = 0xFFFFFFFF
+const POPUP_ROW_H: i32 = 12
 
-fn open_chat(ch: *mut mc_chat.Chat) {
+struct ChatUi {
+    hist: mc_chat_hist.ChatHist,
+    sugg: mc_chat_suggest.Suggest,
+    req_text: rt.Buf,
+    glyphs: rt.Buf,
+    cols: rt.Buf,
+    wrap_w: i32,
+    max_scroll: i32,
+    last_req_ok: bool,
+}
+
+fn chatui_new() -> ChatUi {
+    return ChatUi { hist: mc_chat_hist.hist_new(), sugg: mc_chat_suggest.sugg_new(), req_text: rt.buf_new(), glyphs: rt.buf_new(), cols: rt.buf_new(), wrap_w: CHAT_W, max_scroll: 0, last_req_ok: false }
+}
+
+fn chatui_free(ui: *mut ChatUi) {
+    mc_chat_hist.hist_free(&(*ui).hist)
+    mc_chat_suggest.sugg_free(&(*ui).sugg)
+    rt.buf_free(&(*ui).req_text)
+    rt.buf_free(&(*ui).glyphs)
+    rt.buf_free(&(*ui).cols)
+}
+
+fn shift_down(rw: *mut raw.Raw) -> bool {
+    return raw.key_down(rw, raw.KEY_LEFTSHIFT) || raw.key_down(rw, SC_RSHIFT)
+}
+
+fn open_chat(ch: *mut mc_chat.Chat, ui: *mut ChatUi) {
     (*ch).open = true
     (*ch).scroll = 0
+    mc_chat_hist.hist_reset(&(*ui).hist)
+    mc_chat_suggest.sugg_clear(&(*ui).sugg)
+    rt.buf_clear(&(*ui).req_text)
+    (*ui).last_req_ok = false
 }
 
-fn clamp_scroll(ch: *mut mc_chat.Chat) {
-    let top: i32 = (mc_chat.chat_line_count(ch) as i32) - 1
-    if (*ch).scroll > top { (*ch).scroll = top }
-    if (*ch).scroll < 0 { (*ch).scroll = 0 }
+fn close_chat(ch: *mut mc_chat.Chat, ui: *mut ChatUi) {
+    (*ch).open = false
+    (*ch).scroll = 0
+    mc_chat.chat_input_clear(ch)
+    mc_chat_suggest.sugg_clear(&(*ui).sugg)
+    mc_chat_hist.hist_reset(&(*ui).hist)
 }
 
-fn chat_ui_keys(ch: *mut mc_chat.Chat, rw: *mut raw.Raw, allow: bool) -> i32 {
+fn popup_visible(ui: *mut ChatUi) -> bool {
+    return mc_chat_suggest.sugg_count(&(*ui).sugg) > 0
+}
+
+fn history_step(ch: *mut mc_chat.Chat, ui: *mut ChatUi, dir: i32) {
+    var out: rt.Buf = rt.buf_new()
+    if mc_chat_hist.hist_step(&(*ui).hist, mc_chat.chat_input_ptr(ch), mc_chat.chat_input_len(ch), dir, &out) {
+        mc_chat.chat_input_set(ch, rt.buf_ptr(&out), rt.buf_len(&out))
+    }
+    rt.buf_free(&out)
+}
+
+fn wants_request(ch: *mut mc_chat.Chat, ui: *mut ChatUi) -> bool {
+    let cur: usize = mc_chat.chat_input_cursor(ch)
+    if cur == 0 || rt.ld8(mc_chat.chat_input_ptr(ch), 0) != 47 as u8 { return false }
+    if (*ui).last_req_ok && rt.buf_len(&(*ui).req_text) == cur && rt.mem_eq(rt.buf_ptr(&(*ui).req_text), mc_chat.chat_input_ptr(ch), cur) { return false }
+    return true
+}
+
+fn mark_requested(ch: *mut mc_chat.Chat, ui: *mut ChatUi) {
+    rt.buf_clear(&(*ui).req_text)
+    rt.buf_push_bytes(&(*ui).req_text, mc_chat.chat_input_ptr(ch), mc_chat.chat_input_cursor(ch))
+    (*ui).last_req_ok = true
+}
+
+fn chat_ui_keys(ch: *mut mc_chat.Chat, ui: *mut ChatUi, kb: *mut mc_keybinds.Keybinds, rw: *mut raw.Raw, allow: bool) -> i32 {
     if (*ch).guard > 0 { (*ch).guard = (*ch).guard - 1 }
     if !(*ch).open {
         if allow {
-            if raw.key_pressed(rw, raw.KEY_ENTER) || raw.key_pressed(rw, SC_KP_ENTER) {
-                open_chat(ch)
-            } else if raw.key_pressed(rw, SC_T) {
-                open_chat(ch)
+            if mc_keybinds.kb_pressed(kb, rw, mc_keybinds.KB_COMMAND) {
+                open_chat(ch, ui)
+                mc_chat.chat_input_set(ch, "/".p as u64, 1)
+                (*ch).guard = 2
+            } else if mc_keybinds.kb_pressed(kb, rw, mc_keybinds.KB_CHAT) || raw.key_pressed(rw, raw.KEY_ENTER) || raw.key_pressed(rw, SC_KP_ENTER) {
+                open_chat(ch, ui)
                 (*ch).guard = 2
             }
         }
         if (*ch).open { return CK_CONSUMED }
         return 0
     }
+    var flags: i32 = CK_CONSUMED
     if raw.key_pressed(rw, raw.KEY_ESC) {
-        (*ch).open = false
-        mc_chat.chat_input_clear(ch)
-        return CK_CONSUMED
+        close_chat(ch, ui)
+        return flags
     }
     if raw.key_pressed(rw, raw.KEY_ENTER) || raw.key_pressed(rw, SC_KP_ENTER) {
         (*ch).open = false
-        if mc_chat.chat_input_len(ch) > 0 { return CK_CONSUMED | CK_SUBMIT }
-        return CK_CONSUMED
+        (*ch).scroll = 0
+        mc_chat_suggest.sugg_clear(&(*ui).sugg)
+        if mc_chat.chat_input_len(ch) > 0 {
+            mc_chat_hist.hist_push(&(*ui).hist, mc_chat.chat_input_ptr(ch), mc_chat.chat_input_len(ch))
+            return flags | CK_SUBMIT
+        }
+        return flags
     }
     if raw.key_pressed(rw, SC_BACKSPACE) { mc_chat.chat_input_backspace(ch) }
     if raw.key_pressed(rw, SC_DELETE) { mc_chat.chat_input_delete(ch) }
@@ -76,98 +161,222 @@ fn chat_ui_keys(ch: *mut mc_chat.Chat, rw: *mut raw.Raw, allow: bool) -> i32 {
     if raw.key_pressed(rw, SC_RIGHT) { mc_chat.chat_input_right(ch) }
     if raw.key_pressed(rw, SC_HOME) { mc_chat.chat_input_home(ch) }
     if raw.key_pressed(rw, SC_END) { mc_chat.chat_input_end(ch) }
-    if raw.key_pressed(rw, SC_PGUP) || raw.key_pressed(rw, SC_UP) { (*ch).scroll = (*ch).scroll + 5 }
-    if raw.key_pressed(rw, SC_PGDN) || raw.key_pressed(rw, SC_DOWN) { (*ch).scroll = (*ch).scroll - 5 }
-    (*ch).scroll = (*ch).scroll + (raw.wheel_y(rw) as i32) * 3
-    clamp_scroll(ch)
-    return CK_CONSUMED
-}
-
-fn chat_ui_char(ch: *mut mc_chat.Chat, code: u32, allow: bool) {
-    if (*ch).open {
-        if (*ch).guard == 0 { mc_chat.chat_input_char(ch, code) }
-        return
+    if raw.key_pressed(rw, SC_UP) {
+        if popup_visible(ui) { mc_chat_suggest.sugg_move(&(*ui).sugg, 0 - 1) } else { history_step(ch, ui, 0 - 1) }
     }
-    if allow && code == 47 as u32 {
-        open_chat(ch)
-        mc_chat.chat_input_clear(ch)
-        mc_chat.chat_input_char(ch, code)
+    if raw.key_pressed(rw, SC_DOWN) {
+        if popup_visible(ui) { mc_chat_suggest.sugg_move(&(*ui).sugg, 1) } else { history_step(ch, ui, 1) }
+    }
+    if raw.key_pressed(rw, SC_PGUP) { (*ch).scroll = (*ch).scroll + ROWS_OPEN - 1 }
+    if raw.key_pressed(rw, SC_PGDN) { (*ch).scroll = (*ch).scroll - (ROWS_OPEN - 1) }
+    var wheel: i64 = raw.wheel_y(rw)
+    if wheel > 1 as i64 { wheel = 1 as i64 }
+    if wheel < (0 - 1) as i64 { wheel = (0 - 1) as i64 }
+    if wheel != 0 as i64 {
+        var step: i32 = 7
+        if shift_down(rw) { step = 1 }
+        (*ch).scroll = (*ch).scroll + (wheel as i32) * step
+    }
+    if (*ch).scroll > (*ui).max_scroll { (*ch).scroll = (*ui).max_scroll }
+    if (*ch).scroll < 0 { (*ch).scroll = 0 }
+    if raw.key_pressed(rw, SC_TAB) { flags = flags | CK_TAB } else if wants_request(ch, ui) {
+        mark_requested(ch, ui)
+        flags = flags | CK_REQUEST
+    }
+    return flags
+}
+
+fn chat_ui_char(ch: *mut mc_chat.Chat, ui: *mut ChatUi, code: u32, allow: bool) {
+    if !(*ch).open || (*ch).guard != 0 { return }
+    if mc_chat.chat_input_char(ch, code) { mc_chat_hist.hist_reset(&(*ui).hist) }
+}
+
+fn fill_colors(b: *mut rt.Buf, n: usize, argb: u32) {
+    rt.buf_clear(b)
+    var i: usize = 0
+    while i < n * 4 {
+        rt.buf_push(b, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        rt.st32(rt.buf_ptr(b), i, argb)
+        i = i + 1
     }
 }
 
-fn rows_of(len: usize, cols: usize) -> i32 {
-    if len == 0 || cols == 0 { return 1 }
-    return ((len + cols - 1) / cols) as i32
+fn chat_ui_fade(age_ticks: u32, open: bool) -> i32 {
+    if open { return 255 }
+    if age_ticks >= FADE_TICKS { return 0 }
+    var d: i32 = (((FADE_TICKS - age_ticks) as i32) * 10) / (FADE_TICKS as i32)
+    if d > 10 { d = 10 }
+    if d < 0 { d = 0 }
+    return (255 * d * d) / 100
 }
 
-fn draw_run(r: *mut mc_raster.Raster, ch: *mut mc_chat.Chat, k: usize, from: usize, to: usize, x: i32, y: i32, s: i32) {
-    let base: u64 = mc_chat.chat_line_ptr(ch, k)
-    var i: usize = from
-    while i < to {
-        let col: u32 = mc_chat.chat_line_color(ch, k, i)
-        var j: usize = i + 1
-        while j < to && mc_chat.chat_line_color(ch, k, j) == col { j = j + 1 }
-        mc_hud.hud_text_bytes(r, x + ((i - from) as i32) * 6 * s, y, s, col, COL_SHADOW, base + i as u64, j - i)
-        i = j
+fn chat_ui_wrap_rows(ch: *mut mc_chat.Chat, k: usize, wrap_w: i32, starts: u64) -> usize {
+    let len: usize = mc_chat.chat_line_len(ch, k)
+    let p: u64 = mc_chat.chat_line_ptr(ch, k)
+    let fl: u64 = mc_chat.chat_line_flags_ptr(ch, k)
+    var n: usize = 0
+    var from: usize = 0
+    while from < len && n < MAX_ROW_SPLITS {
+        rt.st64(starts, n, from as u64)
+        n = n + 1
+        var used: usize = mc_hud_vfont.vtext_wrap(p, fl, from, len - from, wrap_w)
+        if used == 0 { used = 1 }
+        from = from + used
     }
+    if n == 0 {
+        rt.st64(starts, 0, 0 as u64)
+        n = 1
+    }
+    return n
 }
 
-fn draw_lines(ch: *mut mc_chat.Chat, r: *mut mc_raster.Raster, s: i32, now: u64, x: i32, ybot: i32, width: i32, cols: usize) {
+fn chat_ui_rows(ch: *mut mc_chat.Chat, wrap_w: i32) -> i32 {
+    var starts: [u64; 32] = [0 as u64; 32]
+    var total: i32 = 0
+    var k: usize = 0
+    while k < mc_chat.chat_line_count(ch) {
+        total = total + (chat_ui_wrap_rows(ch, k, wrap_w, (&starts[0]) as u64) as i32)
+        k = k + 1
+    }
+    return total
+}
+
+fn draw_lines(ch: *mut mc_chat.Chat, ui: *mut ChatUi, r: *mut mc_raster.Raster, s: i32, now: u64, ybot: i32) {
     var budget: i32 = ROWS_CLOSED
     if (*ch).open { budget = ROWS_OPEN }
+    let now32: u32 = (now & 4294967295 as u64) as u32
+    let wrap_w: i32 = (*ui).wrap_w
+    var starts: [u64; 32] = [0 as u64; 32]
+    var skipped: i32 = 0
     var y: i32 = ybot
     var k: usize = 0
-    if (*ch).open { k = (*ch).scroll as usize }
-    let now32: u32 = (now & 4294967295 as u64) as u32
-    while k < mc_chat.chat_line_count(ch) && budget > 0 {
-        if !(*ch).open && now32 -% mc_chat.chat_line_time(ch, k) > SHOW_MS { return }
+    let count: usize = mc_chat.chat_line_count(ch)
+    while k < count && budget > 0 {
+        let age: u32 = (now32 -% mc_chat.chat_line_time(ch, k)) / 50 as u32
+        let alpha: i32 = chat_ui_fade(age, (*ch).open)
+        if !(*ch).open && alpha <= 0 { return }
         let len: usize = mc_chat.chat_line_len(ch, k)
-        let nrows: i32 = rows_of(len, cols)
-        var row: i32 = nrows - 1
+        let nrows: usize = chat_ui_wrap_rows(ch, k, wrap_w, (&starts[0]) as u64)
+        var row: i32 = (nrows as i32) - 1
         while row >= 0 && budget > 0 {
-            y = y - 9 * s
-            mc_hud.hud_rect(r, x, y, width, 9 * s, COL_BG)
-            let from: usize = (row as usize) * cols
-            var to: usize = from + cols
-            if to > len { to = len }
-            draw_run(r, ch, k, from, to, x + 2 * s, y + s, s)
-            budget = budget - 1
+            if skipped < (*ch).scroll {
+                skipped = skipped + 1
+            } else {
+                let from: usize = rt.ld64((&starts[0]) as u64, row as usize) as usize
+                var to: usize = len
+                if (row as usize) + 1 < nrows { to = rt.ld64((&starts[0]) as u64, (row as usize) + 1) as usize }
+                mc_hud.hud_rect(r, 0, (y - 9) * s, (wrap_w + 8) * s, 9 * s, mc_hud_vfont.vtext_colour_alpha(COL_BG, alpha))
+                mc_hud_vfont.vtext_line(r, 4 * s, (y - 8) * s, s, alpha, mc_chat.chat_line_ptr(ch, k), mc_chat.chat_line_colors_ptr(ch, k), mc_chat.chat_line_flags_ptr(ch, k), from, to, true, now32 / 50 as u32)
+                y = y - 9
+                budget = budget - 1
+            }
             row = row - 1
         }
         k = k + 1
     }
 }
 
-fn draw_input(ch: *mut mc_chat.Chat, r: *mut mc_raster.Raster, s: i32, now: u64, x: i32, y: i32, width: i32) {
-    mc_hud.hud_rect(r, x, y, width, 12 * s, COL_BG)
-    let vis: usize = ((width - 8 * s) / (6 * s)) as usize
-    let cur: usize = mc_chat.chat_input_cursor(ch)
-    let len: usize = mc_chat.chat_input_len(ch)
+fn draw_input(ch: *mut mc_chat.Chat, ui: *mut ChatUi, r: *mut mc_raster.Raster, s: i32, now: u64, sw: i32, sh: i32) {
+    mc_hud.hud_rect(r, 2 * s, (sh - 14) * s, (sw - 4) * s, 12 * s, COL_BG)
+    rt.buf_clear(&(*ui).glyphs)
+    var cur_g: usize = 0
+    mc_fontmap.fontmap_utf8_to_glyphs(mc_chat.chat_input_ptr(ch), mc_chat.chat_input_len(ch), &(*ui).glyphs, mc_chat.chat_input_cursor(ch), &cur_g)
+    let n: usize = rt.buf_len(&(*ui).glyphs)
+    fill_colors(&(*ui).cols, n, COL_WHITE)
+    let p: u64 = rt.buf_ptr(&(*ui).glyphs)
+    let room: i32 = sw - 4 - 8
     var start: usize = 0
-    if vis > 1 && cur > vis - 1 { start = cur - (vis - 1) }
-    var n: usize = len - start
-    if n > vis { n = vis }
-    mc_hud.hud_text_bytes(r, x + 4 * s, y + 2 * s, s, mc_chat.WHITE, COL_SHADOW, mc_chat.chat_input_ptr(ch) + start as u64, n)
-    if (now / 500 as u64) % 2 as u64 == 0 as u64 {
-        mc_hud.hud_rect(r, x + 4 * s + ((cur - start) as i32) * 6 * s, y + 2 * s, s, 9 * s, mc_chat.WHITE)
+    while start < cur_g && mc_hud_vfont.vtext_width(p, 0 as u64, start, cur_g) > room { start = start + 1 }
+    var end: usize = start
+    while end < n && mc_hud_vfont.vtext_width(p, 0 as u64, start, end + 1) <= room { end = end + 1 }
+    mc_hud_vfont.vtext_line(r, 4 * s, (sh - 10) * s, s, 255, p, rt.buf_ptr(&(*ui).cols), 0 as u64, start, end, true, 0 as u32)
+    if (now / 300 as u64) % 2 as u64 == 0 as u64 {
+        let cx: i32 = 4 + mc_hud_vfont.vtext_width(p, 0 as u64, start, cur_g)
+        if cur_g < n {
+            mc_hud.hud_rect(r, cx * s, (sh - 11) * s, s, 10 * s, COL_WHITE)
+        } else {
+            mc_hud.hud_rect(r, cx * s, (sh - 3) * s, 6 * s, s, COL_WHITE)
+        }
     }
 }
 
-fn chat_ui_draw(ch: *mut mc_chat.Chat, r: *mut mc_raster.Raster, s: i32, now: u64) {
-    let x: i32 = 2 * s
-    var width: i32 = (*r).w - 4 * s
-    if width > 330 * s { width = 330 * s }
-    if width < 40 * s { return }
-    let cols: usize = ((width - 4 * s) / (6 * s)) as usize
-    if mc_chat.chat_action_live(ch, now) {
-        let n: usize = mc_chat.chat_action_len(ch)
-        let w: i32 = mc_hud.hud_text_width(n, s)
-        mc_hud.hud_text_bytes(r, ((*r).w - w) / 2, (*r).h - 59 * s, s, mc_chat.chat_action_color(ch), COL_SHADOW, mc_chat.chat_action_ptr(ch), n)
+fn draw_popup(ch: *mut mc_chat.Chat, ui: *mut ChatUi, r: *mut mc_raster.Raster, s: i32, sw: i32, sh: i32) {
+    let sg: *mut mc_chat_suggest.Suggest = &(*ui).sugg
+    let total: usize = mc_chat_suggest.sugg_count(sg)
+    if total == 0 { return }
+    var rows: i32 = total as i32
+    if rows > mc_chat_suggest.SG_VISIBLE { rows = mc_chat_suggest.SG_VISIBLE }
+    var widest: i32 = 0
+    var tmp: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < total {
+        rt.buf_clear(&tmp)
+        var c0: usize = 0
+        mc_fontmap.fontmap_utf8_to_glyphs(mc_chat_suggest.sugg_item_ptr(sg, k), mc_chat_suggest.sugg_item_len(sg, k), &tmp, 0, &c0)
+        let w: i32 = mc_hud_vfont.vtext_width(rt.buf_ptr(&tmp), 0 as u64, 0, rt.buf_len(&tmp))
+        if w > widest { widest = w }
+        k = k + 1
     }
-    var ybot: i32 = (*r).h - 40 * s
+    rt.buf_clear(&tmp)
+    var c1: usize = 0
+    var before: usize = (*sg).start as usize
+    if before > mc_chat.chat_input_len(ch) { before = mc_chat.chat_input_len(ch) }
+    mc_fontmap.fontmap_utf8_to_glyphs(mc_chat.chat_input_ptr(ch), before, &tmp, 0, &c1)
+    var x: i32 = 4 + mc_hud_vfont.vtext_width(rt.buf_ptr(&tmp), 0 as u64, 0, rt.buf_len(&tmp)) - 1
+    if x + widest + 2 > sw { x = sw - widest - 2 }
+    if x < 0 { x = 0 }
+    let top: i32 = sh - 12 - rows * POPUP_ROW_H
+    mc_hud.hud_rect(r, x * s, top * s, (widest + 2) * s, rows * POPUP_ROW_H * s, COL_POPUP_BG)
+    var i: i32 = 0
+    while i < rows {
+        let idx: usize = ((*sg).first + i) as usize
+        if idx < total {
+            rt.buf_clear(&tmp)
+            var c2: usize = 0
+            mc_fontmap.fontmap_utf8_to_glyphs(mc_chat_suggest.sugg_item_ptr(sg, idx), mc_chat_suggest.sugg_item_len(sg, idx), &tmp, 0, &c2)
+            let n: usize = rt.buf_len(&tmp)
+            var col: u32 = COL_POPUP_ITEM
+            if (idx as i32) == (*sg).sel { col = COL_POPUP_SEL }
+            fill_colors(&(*ui).cols, n, col)
+            mc_hud_vfont.vtext_line(r, (x + 1) * s, (top + i * POPUP_ROW_H + 2) * s, s, 255, rt.buf_ptr(&tmp), rt.buf_ptr(&(*ui).cols), 0 as u64, 0, n, true, 0 as u32)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&tmp)
+}
+
+fn draw_action(ch: *mut mc_chat.Chat, ui: *mut ChatUi, r: *mut mc_raster.Raster, s: i32, now: u64, sw: i32, sh: i32) {
+    if !mc_chat.chat_action_live(ch, now) { return }
+    let n: usize = mc_chat.chat_action_len(ch)
+    let p: u64 = mc_chat.chat_action_ptr(ch)
+    fill_colors(&(*ui).cols, n, mc_chat.chat_action_color(ch))
+    let w: i32 = mc_hud_vfont.vtext_width(p, 0 as u64, 0, n)
+    mc_hud_vfont.vtext_line(r, ((sw - w) / 2) * s, (sh - 59) * s, s, 255, p, rt.buf_ptr(&(*ui).cols), 0 as u64, 0, n, true, 0 as u32)
+}
+
+fn chat_ui_draw(ch: *mut mc_chat.Chat, ui: *mut ChatUi, r: *mut mc_raster.Raster, s: i32, now: u64) {
+    let sw: i32 = (*r).w / s
+    let sh: i32 = (*r).h / s
+    var wrap_w: i32 = CHAT_W
+    if wrap_w > sw - 8 { wrap_w = sw - 8 }
+    if wrap_w < 40 { return }
+    (*ui).wrap_w = wrap_w
+    draw_action(ch, ui, r, s, now, sw, sh)
     if (*ch).open {
-        draw_input(ch, r, s, now, x, (*r).h - 14 * s, width)
-        ybot = (*r).h - 14 * s
+        var ms: i32 = chat_ui_rows(ch, wrap_w) - ROWS_OPEN
+        if ms < 0 { ms = 0 }
+        (*ui).max_scroll = ms
+        if (*ch).scroll > ms { (*ch).scroll = ms }
+    } else {
+        (*ui).max_scroll = 0
     }
-    draw_lines(ch, r, s, now, x, ybot, width, cols)
+    draw_lines(ch, ui, r, s, now, sh - 40)
+    if (*ch).open {
+        draw_input(ch, ui, r, s, now, sw, sh)
+        draw_popup(ch, ui, r, s, sw, sh)
+    }
 }
