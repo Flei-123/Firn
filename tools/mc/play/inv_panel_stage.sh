@@ -4,7 +4,8 @@ panel_case() {
   env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=$mode MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
       timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" "$nm" > "$W/$nm.out" 2>&1 &
   PP=$!
-  sleep 5
+  for i in $(seq 1 90); do grep -q "$nm joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
+  sleep 2
   echo "kill @e[type=minecraft:item]" >&3
   echo "execute at $nm run setblock ~1 ~ ~ minecraft:air" >&3
   echo "gamemode survival $nm" >&3
