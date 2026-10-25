@@ -69,6 +69,8 @@ srv_cmd "fill -2 -60 41 2 -48 41 minecraft:stone" "Successfully filled" || fail 
 srv_cmd "fill 0 -60 40 0 -49 40 minecraft:vine[south=true]" "Successfully filled" || fail "vines"
 srv_cmd "setblock 50 -60 20 minecraft:water" "Changed the block" || fail "flow source"
 srv_cmd "fill 70 -60 20 70 -55 20 minecraft:scaffolding" "Successfully filled" || fail "scaffolding column"
+srv_cmd "forceload add 64 0 127 63" "force loaded" || fail "forceload"
+sleep 4
 srv_cmd "fill 78 -61 18 110 -61 22 minecraft:packed_ice" "Successfully filled" || fail "ice floor"
 srv_cmd "fill 89 -61 29 91 -48 31 minecraft:stone" "Successfully filled" || fail "bubble walls"
 srv_cmd "fill 90 -60 30 90 -52 30 minecraft:water" "Changed the block|Successfully filled" || fail "bubble water"

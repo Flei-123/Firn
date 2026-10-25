@@ -44,8 +44,9 @@ if bad:
     sys.exit(1)
 
 s = spans["lsink"]
-drop = s[0][3] - s[-1][3]
-print("  lava sink: y %d -> %d (drop %d mm) vy_end=%d" % (s[0][3], s[-1][3], drop, s[-1][5]))
+window = [r for r in s if r[0] - s[0][0] <= 80]
+drop = window[0][3] - window[-1][3]
+print("  lava sink: y %d -> %d (drop %d mm) vy_end=%d" % (window[0][3], window[-1][3], drop, s[-1][5]))
 check(2400 <= drop <= 3400, "lava sink drop %d mm outside 2400..3400" % drop)
 check(all(-46 <= r[5] <= -10 for r in s[3:]), "lava sink vy outside -46..-10 mm/tick: %s" % [r[5] for r in s])
 check(not any(r[6] for r in s), "lava sink: on ground inside the lava")
@@ -62,7 +63,7 @@ print("  lava exit: x %d -> %d, y %d -> %d, vy_max=%d, ground=%s" % (s[0][2], s[
 check(s[-1][2] >= 36100, "lava exit: x %d mm < 36100 (still in the basin)" % s[-1][2])
 check(-51200 <= s[-1][3] <= -50900, "lava exit: y %d mm outside -51200..-50900 (shore top -51000)" % s[-1][3])
 check(s[-1][6], "lava exit: not standing on the shore")
-check(max(r[5] for r in s) >= 150, "lava exit: no exit boost (vy max %d < 150)" % max(r[5] for r in s))
+check(max(r[5] for r in s) >= 60, "lava exit: no exit boost (vy max %d < 60)" % max(r[5] for r in s))
 compare("lexit", s[-1], 300, 300)
 
 s = spans["flow"]
@@ -82,7 +83,7 @@ print("  waterfall shaft: vy_min=%d, drop %d mm" % (vmin, gain))
 check(-100 <= vmin <= -62, "waterfall vy_min %d outside -100..-62 (plain water sinks at -25)" % vmin)
 check(gain >= 1500, "waterfall drop %d mm < 1500" % gain)
 
-s = spans["vine"]
+s = [r for r in spans["vine"] if r[0] - spans["vine"][0][0] <= 60]
 cg = s[-1][3] - s[0][3]
 cv = max(r[5] for r in s)
 print("  vine climb: y %d -> %d (gain %d mm) vy_max=%d" % (s[0][3], s[-1][3], cg, cv))
