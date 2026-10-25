@@ -124,6 +124,13 @@ fi
 lines=$(wc -l < "$F2.s")
 echo "FIXPOINT:  stage 2 == stage 3, character-identical ($lines lines of assembly)"
 
+if [ -n "${FIXPOINT_EXPORT:-}" ]; then
+    cp -f "$F2" "$FIXPOINT_EXPORT" || exit 1
+fi
+if [ "${FIXPOINT_STAGES_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
 # --- the self-compiled compiler over the whole corpus ----------------------
 FIRNC1="$F2" bash tools/self_compare.sh > "$TMPD"/fixpoint_corpus.txt 2>&1
 krc=$?
