@@ -1,0 +1,380 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_text
+import mc.mc_text_nbt
+import mc.mc_nbt
+import mc.mc_styled
+import mc.mc_chat_net
+
+export {
+    TabList, tab_new, tab_free, tab_on_packet, tab_count, tab_name_ptr, tab_name_len, tab_gamemode, tab_latency, tab_uuid_hash, tab_has_display, tab_display_styled,
+    tab_header, tab_footer, tab_order, tab_ping_level, tab_find_name, TAB_MAX, TAB_NAME_MAX, TAB_SHOWN_MAX, GM_SPECTATOR,
+}
+
+const TAB_MAX: usize = 256
+const TAB_NAME_MAX: usize = 48
+const TAB_SHOWN_MAX: usize = 80
+const GM_SPECTATOR: i32 = 3
+const NBT_PROTOCOL: i32 = 765
+const PLAYER_INFO_MIN_PROTOCOL: i32 = 761
+const A_ADD: u32 = 1
+const A_CHAT: u32 = 2
+const A_MODE: u32 = 4
+const A_LISTED: u32 = 8
+const A_LATENCY: u32 = 16
+const A_DISPLAY: u32 = 32
+const A_ORDER: u32 = 64
+const A_HAT: u32 = 128
+
+struct TabList {
+    entries: rt.Buf,
+    header: mc_styled.Styled,
+    footer: mc_styled.Styled,
+    shown: bool,
+    added: u64,
+    removed: u64,
+}
+
+fn entry_size() -> usize { return 256 }
+
+fn tab_new() -> TabList {
+    var t: TabList = TabList { entries: rt.buf_new(), header: mc_styled.styled_new(), footer: mc_styled.styled_new(), shown: false, added: 0 as u64, removed: 0 as u64 }
+    var i: usize = 0
+    while i < TAB_MAX * entry_size() {
+        rt.buf_push(&t.entries, 0)
+        i = i + 1
+    }
+    return t
+}
+
+fn tab_free(t: *mut TabList) {
+    rt.buf_free(&(*t).entries)
+    mc_styled.styled_free(&(*t).header)
+    mc_styled.styled_free(&(*t).footer)
+}
+
+fn rec(t: *mut TabList, k: usize) -> u64 { return rt.buf_ptr(&(*t).entries) + (k * entry_size()) as u64 }
+
+const O_USED: usize = 0
+const O_HI: usize = 1
+const O_LO: usize = 3
+const O_MODE: usize = 5
+const O_LAT: usize = 6
+const O_LISTED: usize = 7
+const O_NAME_N: usize = 8
+const O_DISP_N: usize = 9
+const O_DISP_COLOR: usize = 10
+const O_HAS_DISP: usize = 11
+const O_NAME: usize = 64
+const O_DISP: usize = 112
+
+fn w32(t: *mut TabList, k: usize, w: usize) -> u32 { return rt.ld32(rec(t, k), w) }
+fn s32(t: *mut TabList, k: usize, w: usize, v: u32) { rt.st32(rec(t, k), w, v) }
+
+fn find_uuid(t: *mut TabList, hi: u64, lo: u64) -> i32 {
+    var k: usize = 0
+    while k < TAB_MAX {
+        if w32(t, k, O_USED) != 0 as u32 && rt.ld64(rec(t, k), O_HI / 2) == hi && rt.ld64(rec(t, k), O_LO / 2) == lo { return k as i32 }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn find_free(t: *mut TabList) -> i32 {
+    var k: usize = 0
+    while k < TAB_MAX {
+        if w32(t, k, O_USED) == 0 as u32 { return k as i32 }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn tab_count(t: *mut TabList) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < TAB_MAX {
+        if w32(t, k, O_USED) != 0 as u32 { n = n + 1 }
+        k = k + 1
+    }
+    return n
+}
+
+fn tab_name_ptr(t: *mut TabList, k: usize) -> u64 { return rec(t, k) + O_NAME as u64 * 4 as u64 }
+fn tab_name_len(t: *mut TabList, k: usize) -> usize { return w32(t, k, O_NAME_N) as usize }
+fn tab_gamemode(t: *mut TabList, k: usize) -> i32 { return w32(t, k, O_MODE) as i32 }
+fn tab_latency(t: *mut TabList, k: usize) -> i32 { return w32(t, k, O_LAT) as i32 }
+fn tab_has_display(t: *mut TabList, k: usize) -> bool { return w32(t, k, O_HAS_DISP) != 0 as u32 }
+
+fn tab_uuid_hash(t: *mut TabList, k: usize) -> i32 {
+    let hi: u64 = rt.ld64(rec(t, k), O_HI / 2)
+    let lo: u64 = rt.ld64(rec(t, k), O_LO / 2)
+    let x: u64 = hi ^ lo
+    return (((x >> 32 as u64) ^ x) & 4294967295 as u64) as u32 as i32
+}
+
+fn tab_display_styled(t: *mut TabList, k: usize, out: *mut mc_styled.Styled) {
+    mc_styled.styled_clear(out)
+    let n: usize = w32(t, k, O_DISP_N) as usize
+    let p: u64 = rec(t, k) + O_DISP as u64 * 4 as u64
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&(*out).text, rt.ld8(p, i))
+        rt.buf_push(&(*out).flags, 0)
+        var j: usize = 0
+        while j < 4 {
+            rt.buf_push(&(*out).colors, 0)
+            j = j + 1
+        }
+        rt.st32(rt.buf_ptr(&(*out).colors), i, w32(t, k, O_DISP_COLOR))
+        i = i + 1
+    }
+}
+
+fn tab_header(t: *mut TabList) -> *mut mc_styled.Styled { return &(*t).header }
+fn tab_footer(t: *mut TabList) -> *mut mc_styled.Styled { return &(*t).footer }
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+fn name_less(t: *mut TabList, a: usize, b: usize) -> bool {
+    let sa: bool = tab_gamemode(t, a) == GM_SPECTATOR
+    let sb: bool = tab_gamemode(t, b) == GM_SPECTATOR
+    if sa != sb { return sb }
+    let pa: u64 = tab_name_ptr(t, a)
+    let pb: u64 = tab_name_ptr(t, b)
+    let la: usize = tab_name_len(t, a)
+    let lb: usize = tab_name_len(t, b)
+    var i: usize = 0
+    while i < la && i < lb {
+        let ca: u8 = lower(rt.ld8(pa, i))
+        let cb: u8 = lower(rt.ld8(pb, i))
+        if ca != cb { return ca < cb }
+        i = i + 1
+    }
+    return la < lb
+}
+
+fn tab_order(t: *mut TabList, out: u64) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < TAB_MAX {
+        if w32(t, k, O_USED) != 0 as u32 && w32(t, k, O_LISTED) != 0 as u32 {
+            var j: usize = n
+            while j > 0 && name_less(t, k, rt.ld32(out, j - 1) as usize) {
+                rt.st32(out, j, rt.ld32(out, j - 1))
+                j = j - 1
+            }
+            rt.st32(out, j, k as u32)
+            n = n + 1
+        }
+        k = k + 1
+    }
+    if n > TAB_SHOWN_MAX { n = TAB_SHOWN_MAX }
+    return n
+}
+
+fn tab_find_name(t: *mut TabList, p: u64, n: usize) -> i32 {
+    var k: usize = 0
+    while k < TAB_MAX {
+        if w32(t, k, O_USED) != 0 as u32 && tab_name_len(t, k) == n && rt.mem_eq(tab_name_ptr(t, k), p, n) { return k as i32 }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn tab_ping_level(latency: i32) -> i32 {
+    if latency < 0 { return 5 }
+    if latency < 150 { return 0 }
+    if latency < 300 { return 1 }
+    if latency < 600 { return 2 }
+    if latency < 1000 { return 3 }
+    return 4
+}
+
+fn read_uuid(b: *mut bytes.Bytes, hi: *mut u64, lo: *mut u64) -> bool {
+    return bytes.get_uuid(b, hi, lo) catch false
+}
+
+fn skip_string(b: *mut bytes.Bytes) -> bool {
+    var n: usize = 0
+    let p: u64 = bytes.get_string(b, &n) catch 0
+    return p != 0 as u64 || (n == 0 && bytes.bytes_ok(b))
+}
+
+fn read_profile(t: *mut TabList, k: usize, b: *mut bytes.Bytes) -> bool {
+    var n: usize = 0
+    let p: u64 = bytes.get_string(b, &n) catch 0
+    if p == 0 as u64 && n != 0 { return false }
+    var m: usize = n
+    if m > 16 { m = 16 }
+    var i: usize = 0
+    while i < m {
+        rt.st8(tab_name_ptr(t, k), i, rt.ld8(p, i))
+        i = i + 1
+    }
+    s32(t, k, O_NAME_N, m as u32)
+    let props: i32 = bytes.get_varint(b) catch 0 - 1
+    if props < 0 || props > 64 { return false }
+    var j: i32 = 0
+    while j < props {
+        if !skip_string(b) || !skip_string(b) { return false }
+        let signed: bool = bytes.get_bool(b) catch false
+        if signed && !skip_string(b) { return false }
+        j = j + 1
+    }
+    return bytes.bytes_ok(b)
+}
+
+fn skip_n(b: *mut bytes.Bytes, n: usize) -> bool {
+    let got: usize = bytes.bytes_skip(b, n) catch 0
+    return got == n && bytes.bytes_ok(b)
+}
+
+fn skip_chat_session(b: *mut bytes.Bytes) -> bool {
+    let has: bool = bytes.get_bool(b) catch false
+    if !has { return bytes.bytes_ok(b) }
+    var hi: u64 = 0 as u64
+    var lo: u64 = 0 as u64
+    if !read_uuid(b, &hi, &lo) { return false }
+    bytes.get_i64(b) catch 0 as i64
+    let kl: i32 = bytes.get_varint(b) catch 0 - 1
+    if kl < 0 || !skip_n(b, kl as usize) { return false }
+    let sl: i32 = bytes.get_varint(b) catch 0 - 1
+    if sl < 0 || !skip_n(b, sl as usize) { return false }
+    return bytes.bytes_ok(b)
+}
+
+fn read_display(t: *mut TabList, k: usize, b: *mut bytes.Bytes, protocol: i32, tr: *mut mc_text.Translations) -> bool {
+    let has: bool = bytes.get_bool(b) catch false
+    s32(t, k, O_HAS_DISP, 0 as u32)
+    s32(t, k, O_DISP_N, 0 as u32)
+    if !has { return bytes.bytes_ok(b) }
+    var doc: mc_text.TextDoc = mc_text.text_new()
+    var ok: bool = false
+    if protocol >= NBT_PROTOCOL {
+        let start: usize = bytes.bytes_pos(b)
+        var d: mc_nbt.Doc = mc_nbt.doc_new()
+        ok = mc_nbt.doc_parse(&d, b, true, false) catch false
+        mc_nbt.doc_free(&d)
+        if ok { mc_text_nbt.text_from_nbt(&doc, bytes.bytes_ptr(b) + start as u64, bytes.bytes_pos(b) - start, tr) }
+    } else {
+        var n: usize = 0
+        let p: u64 = bytes.get_string(b, &n) catch 0
+        ok = p != 0 as u64
+        if ok { mc_text.text_from_json(&doc, p, n, tr) }
+    }
+    if ok {
+        var st: mc_styled.Styled = mc_styled.styled_new()
+        mc_styled.styled_from_doc(&st, &doc, 0xFFFFFFFF)
+        var n2: usize = mc_styled.styled_len(&st)
+        if n2 > 96 { n2 = 96 }
+        var i: usize = 0
+        while i < n2 {
+            rt.st8(rec(t, k) + O_DISP as u64 * 4 as u64, i, rt.ld8(mc_styled.styled_text(&st), i))
+            i = i + 1
+        }
+        s32(t, k, O_DISP_N, n2 as u32)
+        s32(t, k, O_HAS_DISP, 1 as u32)
+        if n2 > 0 { s32(t, k, O_DISP_COLOR, rt.ld32(mc_styled.styled_colors(&st), 0)) } else { s32(t, k, O_DISP_COLOR, 0xFFFFFFFF) }
+        mc_styled.styled_free(&st)
+    }
+    mc_text.text_free(&doc)
+    return ok
+}
+
+fn on_info(t: *mut TabList, cl: *mut mc_client.Client, tr: *mut mc_text.Translations) {
+    let protocol: i32 = (*cl).ver.protocol
+    if protocol < PLAYER_INFO_MIN_PROTOCOL { return }
+    var b: bytes.Bytes = *mc_client.client_body(cl)
+    let action: u32 = (bytes.get_u8(&b) catch 0 as u8) as u32
+    let count: i32 = bytes.get_varint(&b) catch 0
+    var i: i32 = 0
+    while i < count && i < 1024 {
+        var hi: u64 = 0 as u64
+        var lo: u64 = 0 as u64
+        if !read_uuid(&b, &hi, &lo) { return }
+        var k: i32 = find_uuid(t, hi, lo)
+        if k < 0 {
+            if (action & A_ADD) == 0 as u32 { k = 0 - 1 } else { k = find_free(t) }
+            if k < 0 {
+                if (action & A_ADD) == 0 as u32 { return }
+                return
+            }
+            rt.mem_set(rec(t, k as usize), 0 as u8, entry_size())
+            rt.st64(rec(t, k as usize), O_HI / 2, hi)
+            rt.st64(rec(t, k as usize), O_LO / 2, lo)
+            s32(t, k as usize, O_USED, 1 as u32)
+            s32(t, k as usize, O_LISTED, 1 as u32)
+            (*t).added = (*t).added + 1 as u64
+        }
+        let e: usize = k as usize
+        if (action & A_ADD) != 0 as u32 && !read_profile(t, e, &b) { return }
+        if (action & A_CHAT) != 0 as u32 && !skip_chat_session(&b) { return }
+        if (action & A_MODE) != 0 as u32 { s32(t, e, O_MODE, (bytes.get_varint(&b) catch 0) as u32) }
+        if (action & A_LISTED) != 0 as u32 {
+            let v: i32 = bytes.get_varint(&b) catch 1
+            var lv: u32 = 0 as u32
+            if v != 0 { lv = 1 as u32 }
+            s32(t, e, O_LISTED, lv)
+        }
+        if (action & A_LATENCY) != 0 as u32 { s32(t, e, O_LAT, (bytes.get_varint(&b) catch 0) as u32) }
+        if (action & A_DISPLAY) != 0 as u32 && !read_display(t, e, &b, protocol, tr) { return }
+        if protocol >= 768 {
+            if (action & A_ORDER) != 0 as u32 { bytes.get_varint(&b) catch 0 }
+            if (action & A_HAT) != 0 as u32 { bytes.get_bool(&b) catch false }
+        }
+        if !bytes.bytes_ok(&b) { return }
+        i = i + 1
+    }
+}
+
+fn on_remove(t: *mut TabList, cl: *mut mc_client.Client) {
+    var b: bytes.Bytes = *mc_client.client_body(cl)
+    let count: i32 = bytes.get_varint(&b) catch 0
+    var i: i32 = 0
+    while i < count && i < 1024 {
+        var hi: u64 = 0 as u64
+        var lo: u64 = 0 as u64
+        if !read_uuid(&b, &hi, &lo) { return }
+        let k: i32 = find_uuid(t, hi, lo)
+        if k >= 0 {
+            s32(t, k as usize, O_USED, 0 as u32)
+            (*t).removed = (*t).removed + 1 as u64
+        }
+        i = i + 1
+    }
+}
+
+fn set_styled(dst: *mut mc_styled.Styled, cl: *mut mc_client.Client, id: i32, name: str, tr: *mut mc_text.Translations) {
+    mc_styled.styled_clear(dst)
+    var p: u64 = 0
+    var n: usize = 0
+    if !mc_chat_net.field_of(cl, id, name, &p, &n) { return }
+    var doc: mc_text.TextDoc = mc_text.text_new()
+    var ok: bool = false
+    if (*cl).ver.protocol >= NBT_PROTOCOL { ok = mc_text_nbt.text_from_nbt(&doc, p, n, tr) } else { ok = mc_text.text_from_json(&doc, p, n, tr) }
+    if ok { mc_styled.styled_from_doc(dst, &doc, 0xFFFFFFFF) }
+    mc_text.text_free(&doc)
+}
+
+fn tab_on_packet(t: *mut TabList, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32) -> bool {
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_PLAYER_INFO) {
+        on_info(t, cl, &(*net).tr)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_PLAYER_REMOVE) {
+        on_remove(t, cl)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_PLAYERLIST_HEADER) {
+        set_styled(&(*t).header, cl, id, "header", &(*net).tr)
+        set_styled(&(*t).footer, cl, id, "footer", &(*net).tr)
+        return true
+    }
+    return false
+}
