@@ -98,6 +98,10 @@ if [ -n "$WP" ]; then
   shot "$WP" pause && { python3 -I tools/mc/menu/pause_check.py "$W/pause.ppm" "$MC_VANILLA_JAR" pause || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/pause.ppm').save('$W/pause.png')"; }; } || { echo "  FAIL  screenshot pause"; ERR=1; }
   key "$WP" Escape
   sleep 1
+  key "$WP" e
+  hudcheck "$WP" inv inv
+  key "$WP" e
+  sleep 1
   hudcheck "$WP" bars2 bars
   xdotool windowfocus "$WP" 2>/dev/null
   printf '%s\n' 'bossbar add hudtest {"text":"Boss"}' 'bossbar set minecraft:hudtest players @a' 'bossbar set minecraft:hudtest color red' 'bossbar set minecraft:hudtest value 100' 'scoreboard objectives add hudobj dummy {"text":"Sidebar"}' 'scoreboard objectives setdisplay sidebar hudobj' 'scoreboard players set Alpha hudobj 7' 'title @a title {"text":"HELLO"}' >&3

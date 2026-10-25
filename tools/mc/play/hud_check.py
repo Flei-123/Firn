@@ -11,6 +11,7 @@ import layout_check as lc
 
 WIDGETS = "assets/minecraft/textures/gui/widgets.png"
 ICONS = "assets/minecraft/textures/gui/icons.png"
+INVENTORY = "assets/minecraft/textures/gui/container/inventory.png"
 
 
 def load(jar, name):
@@ -66,6 +67,27 @@ def check_bars(img, jar, errors):
     expect("food full", g, t, errors, 0.9)
 
 
+def check_inventory(img, jar, errors):
+    w, h = img.size
+    s = lc.scale_for(w, h)
+    gw = (w + s - 1) // s
+    gh = (h + s - 1) // s
+    left = (gw - 176) // 2
+    top = (gh - 166) // 2
+    if os.path.isfile(jar):
+        tex = load(jar, INVENTORY)
+        g1, t1 = match(img, tex, s, left, top + 82, 0, 82, 176, 84, 255)
+        expect("inventory slots area", g1, t1, errors, 0.85)
+        g2, t2 = match(img, tex, s, left + 76, top, 76, 0, 100, 80, 255)
+        expect("inventory crafting area", g2, t2, errors, 0.8)
+        return
+    grey = sum(1 for x in range(left * s, (left + 176) * s, 2) for y in range((top + 84) * s, (top + 160) * s, 2) if img.getpixel((x, y)) == (198, 198, 198))
+    ok = grey > 200
+    print(f"  {'ok  ' if ok else 'FAIL'}  plain inventory panel grey pixels={grey}")
+    if not ok:
+        errors.append("inv")
+
+
 def has_hotbar(img, jar):
     widgets = load(jar, WIDGETS)
     w, h = img.size
@@ -109,6 +131,8 @@ def main():
         sys.exit(1 if errors else 0)
     if mode == "bars":
         check_bars(img, jar, errors)
+    elif mode == "inv":
+        check_inventory(img, jar, errors)
     elif mode == "hidden":
         ok = not has_hotbar(img, jar)
         print(f"  {'ok  ' if ok else 'FAIL'}  hud hidden with F1")

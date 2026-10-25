@@ -22,6 +22,9 @@ else
     $FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
 fi
 MCV=${MC_VERSION:-1.20.1}; VIEW=${MC_VIEW:-4}
+case "$MCV" in 1.20.1) PROTO=763;; 1.21.1) PROTO=767;; 1.21.4) PROTO=769;; 1.21.5) PROTO=770;; 1.21.8) PROTO=772;; 1.21.11) PROTO=774;; *) PROTO=${MCPLAY_PROTOCOL:-763};; esac
+export MCPLAY_PROTOCOL=$PROTO
+JAVA=${JAVA:-/usr/bin/java}; [ -x /root/tools/jdk25/bin/java ] && case "$MCV" in 1.2[1-9]*|26*) JAVA=/root/tools/jdk25/bin/java ;; esac
 mkdir -p "$W/srv"
 bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
@@ -44,7 +47,7 @@ enable-rcon=false
 enable-query=false
 PROPS
 mkfifo "$W/in"; exec 3<>"$W/in"
-( cd "$W/srv" && exec "${JAVA:-/usr/bin/java}" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
+( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
