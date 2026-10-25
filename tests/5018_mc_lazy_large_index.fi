@@ -1,0 +1,216 @@
+// expect_exit: 0
+import std.rt
+import std.io
+import zip.zip
+import audio.engine
+import audio.bank
+import mc.mc_audio
+import mc.mc_assets
+import mc.mc_packs
+import mc.mc_packsnd
+import mc.mc_lazysnd
+import jobs.jobs
+import std.time
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+const EVENTS: i32 = 1360
+const VARIANTS: i32 = 3
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const OGG_A: str = "tests/data/vorbis/sine_m22k_q3.ogg"
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    let ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn build_sounds_json(b: *mut rt.Buf) {
+    push_str(b, "{")
+    var ev: i32 = 0
+    while ev < EVENTS {
+        if ev > 0 { push_str(b, ",") }
+        push_str(b, "\"t.e")
+        rt.buf_push_dec_i64(b, ev as i64)
+        push_str(b, "\":{\"sounds\":[")
+        var v: i32 = 0
+        while v < VARIANTS {
+            if v > 0 { push_str(b, ",") }
+            push_str(b, "\"s/f")
+            rt.buf_push_dec_i64(b, ev as i64)
+            push_str(b, "_")
+            rt.buf_push_dec_i64(b, v as i64)
+            push_str(b, "\"")
+            v = v + 1
+        }
+        push_str(b, "]}")
+        ev = ev + 1
+    }
+    push_str(b, "}")
+}
+
+fn read_ogg(out: *mut rt.Buf) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, OGG_A.p as u64, OGG_A.length())
+    rt.buf_push(&p, 0 as u8)
+    let ok: bool = rt.read_file(rt.buf_ptr(&p), out)
+    rt.buf_free(&p)
+    return ok
+}
+
+fn build_pack(b: *mut rt.Buf, stack: *mut mc_assets.PackStack) -> bool {
+    var js: rt.Buf = rt.buf_new()
+    build_sounds_json(&js)
+    var src: rt.Buf = rt.buf_new()
+    var ok: bool = read_ogg(&src)
+    var w: zip.ZipWriter = zip.zip_writer_new(b)
+    ok = add_str(&w, "pack.mcmeta", META) && ok
+    let jok: bool = zip.zip_add(&w, "assets/minecraft/sounds.json", rt.buf_ptr(&js), rt.buf_len(&js), true) catch | e | (false)
+    ok = jok && ok
+    var ev: i32 = 0
+    while ev < EVENTS {
+        var v: i32 = 0
+        while v < VARIANTS {
+            var nb: rt.Buf = rt.buf_new()
+            push_str(&nb, "assets/minecraft/sounds/s/f")
+            rt.buf_push_dec_i64(&nb, ev as i64)
+            push_str(&nb, "_")
+            rt.buf_push_dec_i64(&nb, v as i64)
+            push_str(&nb, ".ogg")
+            let nm: str = str { p: rt.buf_data(&nb) as *u8, n: rt.buf_len(&nb) }
+            let aok: bool = zip.zip_add(&w, nm, rt.buf_ptr(&src), rt.buf_len(&src), false) catch | e | (false)
+            rt.buf_free(&nb)
+            ok = aok && ok
+            v = v + 1
+        }
+        ev = ev + 1
+    }
+    let n: usize = zip.zip_finish(&w) catch | e | (0)
+    zip.zip_writer_free(&w)
+    rt.buf_free(&js)
+    rt.buf_free(&src)
+    if n == 0 || !ok { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    return mc_assets.stack_push(stack, &pk) == mc_assets.ASSET_OK
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn wait_idle(lz: *mut mc_lazysnd.Lazy) {
+    var i: i32 = 0
+    while i < 4000 {
+        mc_lazysnd.lazy_poll(lz)
+        if mc_lazysnd.lazy_inflight(lz) == 0 { return }
+        time.sleep_ms(1 as u64)
+        i = i + 1
+    }
+}
+
+fn step(lz: *mut mc_lazysnd.Lazy, ev: i32) {
+    mc_lazysnd.lazy_ensure(lz, ev)
+    wait_idle(lz)
+}
+
+fn find_event(e: *mut engine.Engine, i: i32) -> i32 {
+    var nb: rt.Buf = rt.buf_new()
+    push_str(&nb, "t.e")
+    rt.buf_push_dec_i64(&nb, i as i64)
+    let nm: str = str { p: rt.buf_data(&nb) as *u8, n: rt.buf_len(&nb) }
+    let id: i32 = engine.engine_find_event(e, nm)
+    rt.buf_free(&nb)
+    return id
+}
+
+fn silent_slots(e: *mut engine.Engine, ev: i32, ph: i32) -> i32 {
+    let n: usize = (*engine.engine_event(e, ev)).sample_n as usize
+    var c: i32 = 0
+    var k: usize = 0
+    while k < n {
+        if engine.engine_event_slot_sample(e, ev, k) == ph { c = c + 1 }
+        k = k + 1
+    }
+    return c
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+    var raw: rt.Buf = rt.buf_new()
+    var stack: mc_assets.PackStack = mc_assets.stack_new()
+    check(&t, build_pack(&raw, &stack), "pack built")
+    var pool: jobs.Jobs = jobs.create(2 as u64)
+    check(&t, pool.blk != 0, "pool up")
+    let pool_addr: u64 = ((&pool) as *mut jobs.Jobs) as u64
+
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    mc_audio.mca_set_lazy_sounds(&m, true, 0 as u64, 0)
+    mc_audio.mca_set_lazy_pool(&m, pool_addr, 0)
+    let lz: *mut mc_lazysnd.Lazy = mc_audio.mca_lazy(&m)
+    mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH)
+    let ph: i32 = (*lz).placeholder
+    check(&t, ph >= 0 && engine.engine_sample_count(&e) == 1, "start: only the placeholder")
+    check(&t, mc_lazysnd.lazy_pending(lz) as i32 == EVENTS && find_event(&e, EVENTS - 1) >= 0, "all events registered and pending")
+
+    var peak: usize = 0
+    var base: i32 = 0
+    while base < EVENTS {
+        var v: i32 = 0
+        while v < VARIANTS {
+            var k: i32 = 0
+            while k < 8 && base + k < EVENTS {
+                mc_lazysnd.lazy_ensure(lz, find_event(&e, base + k))
+                k = k + 1
+            }
+            wait_idle(lz)
+            let cnt: usize = engine.engine_sample_count(&e)
+            if cnt > peak { peak = cnt }
+            v = v + 1
+        }
+        base = base + 8
+    }
+    let files: i32 = EVENTS * VARIANTS
+    check(&t, files + 48 > engine.MAX_SAMPLES as i32, "index fills the sample table almost completely")
+    check(&t, (*lz).decoded >= files, "every file was decoded at least once")
+    check(&t, peak <= engine.MAX_SAMPLES as usize, "sample table never exceeds its capacity")
+    check(&t, (*lz).evicted > 0, "eviction ran")
+    check(&t, (*lz).failed == 0, "no failed decode")
+    io.fmt_print(f"info decoded={(*lz).decoded} evicted={(*lz).evicted} full={(*lz).full} peak={peak}\n")
+
+    let last: i32 = find_event(&e, EVENTS - 1)
+    check(&t, silent_slots(&e, last, ph) == 0, "newest event has real samples")
+    let first: i32 = find_event(&e, 0)
+    check(&t, silent_slots(&e, first, ph) > 0, "oldest event was evicted back to silence")
+    step(lz, first)
+    step(lz, first)
+    step(lz, first)
+    check(&t, silent_slots(&e, first, ph) < (*engine.engine_event(&e, first)).sample_n as i32, "evicted event decodes again")
+
+    mc_audio.mca_set_lazy_pool(&m, 0 as u64, 0)
+    jobs.destroy(&pool)
+    if t.fails != 0 {
+        io.fmt_print(f"mc_lazy_large_index FAIL {t.fails}\n")
+        return 1
+    }
+    io.fmt_print(f"mc_lazy_large_index ok\n")
+    return 0
+}
