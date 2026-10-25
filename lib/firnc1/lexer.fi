@@ -661,6 +661,29 @@ fn skip_line(l: *mut Lexer) {
     (*l).col = c
 }
 
+const HIGH_BITS: u64 = 9259542123273814144
+const ALL_ONES: u64 = 18446744073709551615
+const QUOTES8: u64 = 2459565876494606882
+const BACKSLASHES8: u64 = 6655295901103053916
+
+fn zero_byte_mask(x: u64) -> u64 {
+    return (x -% LOW_ONES) & (x ^ ALL_ONES)
+}
+
+fn find_newline(from: u64, end: u64) -> u64 {
+    var s: u64 = from
+    while s +% 8 <= end {
+        let x: u64 = *(s as *mut u64) ^ NEWLINES
+        if (zero_byte_mask(x) & HIGH_BITS) != 0 { break }
+        s = s + 8
+    }
+    while s < end {
+        if *(s as *mut u8) == 10 as u8 { return s }
+        s = s + 1
+    }
+    return end
+}
+
 fn skip_blanks(l: *mut Lexer) {
     var p: usize = (*l).p
     let n: usize = (*l).n
@@ -1971,6 +1994,81 @@ fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
     return good
 }
 
+fn plain_text_end(q: u64, from: usize, n: usize) -> usize {
+    var s: usize = from
+    while s + 8 <= n {
+        let w: u64 = *((q +% s as u64) as *mut u64)
+        let quote: u64 = zero_byte_mask(w ^ QUOTES8)
+        let slash: u64 = zero_byte_mask(w ^ BACKSLASHES8)
+        let eol: u64 = zero_byte_mask(w ^ NEWLINES)
+        if ((quote | slash | eol | w) & HIGH_BITS) != 0 { break }
+        s = s + 8
+    }
+    while s < n {
+        let x: u8 = *((q +% s as u64) as *mut u8)
+        if x == 34 as u8 || x == 92 as u8 || x == 10 as u8 || x >= 128 as u8 { break }
+        s = s + 1
+    }
+    return s
+}
+
+fn simple_escape(e: u8) -> i32 {
+    if e == 110 as u8 { return 10 }
+    if e == 114 as u8 { return 13 }
+    if e == 116 as u8 { return 9 }
+    if e == 48 as u8 { return 0 }
+    if e == 92 as u8 { return 92 }
+    if e == 34 as u8 { return 34 }
+    if e == 39 as u8 { return 39 }
+    return -1
+}
+
+fn lex_text_plain(l: *mut Lexer, kind: u32, front: usize) -> bool {
+    let q: u64 = (*l).q
+    let n: usize = (*l).n
+    let bs: usize = (*l).p + front + 1
+    let offset: usize = rt.buf_len(&(*l).lit)
+    var s: usize = bs
+    var run: usize = bs
+    while true {
+        s = plain_text_end(q, s, n)
+        if s >= n { break }
+        let b: u8 = *((q +% s as u64) as *mut u8)
+        if s > run {
+            rt.buf_push_bytes(&(*l).lit, q +% run as u64, s - run)
+        }
+        if b == 34 as u8 { break }
+        if b != 92 as u8 || s + 1 >= n {
+            s = n
+            break
+        }
+        let v: i32 = simple_escape(*((q +% (s + 1) as u64) as *mut u8))
+        if v < 0 {
+            s = n
+            break
+        }
+        rt.buf_push(&(*l).lit, v as u8)
+        s = s + 2
+        run = s
+    }
+    if s >= n {
+        rt.buf_set_len(&(*l).lit, offset)
+        return false
+    }
+    let body: usize = rt.buf_len(&(*l).lit) - offset
+    let chars: usize = front + 2 + (s - bs)
+    let line: u32 = (*l).line
+    let col: u32 = (*l).col
+    let k: usize = vec_len[u32](&(*l).lit_off)
+    vec_push[u32](&(*l).lit_off, offset as u32)
+    vec_push[u32](&(*l).lit_len, body as u32)
+    vec_push[u32](&(*l).lit_kind, kind)
+    (*l).p = s + 1
+    (*l).col = col + chars as u32
+    tok(l, A_STR, line, col, chars as u32, 0, k as u32)
+    return true
+}
+
 // `false` if there is no literal at this position.
 fn lex_text(l: *mut Lexer) -> bool {
     let c0: u32 = look(l, 0)
@@ -1990,6 +2088,9 @@ fn lex_text(l: *mut Lexer) -> bool {
         front = 1
     } else {
         return false
+    }
+    if (kind == L_STR || kind == L_BYTES) && lex_text_plain(l, kind, front) {
+        return true
     }
     let line: u32 = (*l).line
     let col: u32 = (*l).col
@@ -2216,11 +2317,18 @@ fn lex_run(l: *mut Lexer) {
                     e = e + 1
                 }
                 if e - cur > 18 { break }
+                var hexed: bool = false
                 if e < end {
                     let fb: u8 = *(e as *mut u8)
                     let fv: u8 = *((cls +% fb as u64) as *mut u8)
                     let fvv: u32 = fv as u32
-                    if (fvv & 3) != 0 { break }
+                    if (fvv & 3) != 0 {
+                        if e == cur + 1 && c == 48 && (fb == 120 as u8 || fb == 88 as u8) {
+                            hexed = true
+                        } else {
+                            break
+                        }
+                    }
                     if fb == 46 as u8 && e +% 1 < end {
                         let sb: u8 = *((e +% 1) as *mut u8)
                         let sv: u8 = *((cls +% sb as u64) as *mut u8)
@@ -2228,20 +2336,57 @@ fn lex_run(l: *mut Lexer) {
                         if (svv & 8) != 0 { break }
                     }
                 }
-                var value: u64 = 0
-                var d: u64 = cur
-                while d < e {
-                    let vb: u8 = *(d as *mut u8)
-                    value = value * 10 + (vb as u64 - 48)
-                    d = d + 1
+                if hexed {
+                    let hs: u64 = e + 1
+                    var h: u64 = hs
+                    var hv: u64 = 0
+                    while h < end {
+                        let hb8: u8 = *(h as *mut u8)
+                        let hb: u32 = hb8 as u32
+                        var dv: u32 = 99
+                        if hb >= 48 && hb <= 57 {
+                            dv = hb - 48
+                        } else if hb >= 97 && hb <= 102 {
+                            dv = hb - 87
+                        } else if hb >= 65 && hb <= 70 {
+                            dv = hb - 55
+                        }
+                        if dv == 99 { break }
+                        hv = (hv << 4 as u64) | dv as u64
+                        h = h + 1
+                    }
+                    if h == hs || h - hs > 16 { break }
+                    if h < end {
+                        let tb: u8 = *(h as *mut u8)
+                        let tv: u8 = *((cls +% tb as u64) as *mut u8)
+                        let tvv: u32 = tv as u32
+                        if (tvv & 3) != 0 { break }
+                    }
+                    kind = A_INT
+                    num = hv
+                    length = (h - cur) as u32
+                } else {
+                    var value: u64 = 0
+                    var d: u64 = cur
+                    while d < e {
+                        let vb: u8 = *(d as *mut u8)
+                        value = value * 10 + (vb as u64 - 48)
+                        d = d + 1
+                    }
+                    kind = A_INT
+                    num = value
+                    length = (e - cur) as u32
                 }
-                kind = A_INT
-                num = value
-                length = (e - cur) as u32
             } else {
                 let eb: u8 = *((punct +% c as u64) as *mut u8)
                 let ev: u32 = eb as u32
-                if ev == 32 { break }
+                if ev == 32 {
+                    if c == 13 {
+                        cur = cur + 1
+                        continue
+                    }
+                    break
+                }
                 kind = ev - 40
                 if cur + 1 < end {
                     let nbb: u8 = *((cur +% 1) as *mut u8)
@@ -2258,9 +2403,22 @@ fn lex_run(l: *mut Lexer) {
                         } else if cb == 45 as u8 && nbb == 62 as u8 {
                             pair = A_ARROW + 40
                         }
-                        if pair == 32 { break }
-                        kind = pair - 40
-                        length = 2
+                        if pair != 32 {
+                            kind = pair - 40
+                            length = 2
+                        } else if cb == 47 as u8 {
+                            if nbb == 47 as u8 {
+                                let eol: u64 = find_newline(cur + 2, end)
+                                if eol == end { break }
+                                cur = eol
+                                continue
+                            }
+                            if nbb == 42 as u8 { break }
+                        } else if nbb == cb {
+                            if cb == 60 as u8 || cb == 62 as u8 { break }
+                        } else if nbb == 37 as u8 || nbb == 124 as u8 {
+                            if cb == 43 as u8 || cb == 45 as u8 || cb == 42 as u8 { break }
+                        }
                     }
                 }
             }
