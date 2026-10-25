@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -eu
+cd "$(dirname "$0")/../.."
+O="${1:-tests/data/av1}"
+mkdir -p "$O"
+enc() {
+  name="$1"; src="$2"; fmt="$3"; crf="$4"; cpu="$5"; params="$6"
+  ffmpeg -v error -y -f lavfi -i "$src" -frames:v 1 -pix_fmt "$fmt" -c:v libaom-av1 -crf "$crf" -cpu-used "$cpu" -still-picture 1 -aom-params "$params" "$O/$name.avif"
+}
+P="enable-cdef=1:enable-restoration=0:enable-palette=0:sb-size=64"
+PN="enable-cdef=0:enable-restoration=0:enable-palette=0:sb-size=64"
+PR="enable-cdef=1:enable-restoration=1:enable-palette=0:sb-size=64"
+G() { echo "gradients=s=$1:d=1:seed=$2,noise=alls=${3:-14}:allf=t:all_seed=$2"; }
+enc c16_420 "$(G 16x16 1)" yuv420p 30 4 "$P"
+enc c37_420 "$(G 37x37 2)" yuv420p 30 4 "$P"
+enc c64_420 "$(G 64x64 3)" yuv420p 30 4 "$P"
+enc c64_420_nf "$(G 64x64 4)" yuv420p 40 4 "$PN"
+enc c129_420 "$(G 129x129 5)" yuv420p 25 3 "$P"
+enc c200_420 "$(G 200x200 6 8)" yuv420p 35 3 "$P"
+enc c51x35_420 "$(G 51x35 7)" yuv420p 30 4 "$P"
+enc c131x77_420 "$(G 131x77 8 20)" yuv420p 45 2 "$P"
+enc c256_420_smooth "gradients=s=256x256:d=1:seed=9" yuv420p 30 2 "$P"
+enc c256_420_mandel "mandelbrot=s=256x256" yuv420p 28 2 "$P"
+enc c200_420_lr "$(G 200x200 10 10)" yuv420p 35 3 "$PR"
+enc c300_420_lr "mandelbrot=s=300x300" yuv420p 30 3 "$PR"
+enc c64_420_lossless "$(G 64x64 11)" yuv420p 0 4 "lossless=1:enable-palette=0:sb-size=64"
+enc c37_420_lossless "$(G 37x37 12)" yuv420p 0 4 "lossless=1:enable-palette=0:sb-size=64"
+enc c64_400 "$(G 64x64 13)" gray 30 4 "$P"
+enc c50_400 "$(G 50x50 14)" gray 40 4 "$P"
+enc c64_400_lossless "$(G 64x64 15)" gray 0 4 "lossless=1:enable-palette=0:sb-size=64"
