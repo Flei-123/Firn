@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dnsd_main.fi -- the authoritative DNS server as a PROGRAM.
+//
+//     dnsd_main <zonefile> [--port N] [--bind A.B.C.D] [--verbose] [--check]
+//
+// `--check` parses the zone, prints the rule count and exits (0 = ok, 2 = bad line, the line
+// number goes to standard error). Without it the server answers on UDP and TCP of the port
+// (default 53) until it is killed. The zone format is documented in lib/net/dnszone.fi.
+import std.rt
+import std.net
+import net.dnszone
+import net.dnsd_serve
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let st: *mut dnsd_serve.State = arg as *mut dnsd_serve.State
+    if kind == 1 {
+        dnsd_serve.run_udp(st)
+    } else {
+        dnsd_serve.run_tcp(st)
+    }
+    return 0
+}
+
+fn arg_is(start: u64, i: usize, lit: str) -> bool {
+    let p: u64 = rt.arg_ptr(start, i)
+    let n: usize = rt.c_length(p)
+    if n != lit.n {
+        return false
+    }
+    return rt.mem_eq(p, lit.p as u64, n)
+}
+
+fn parse_port(p: u64, n: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 || v > 6553 as u32 {
+            return 0 as u32
+        }
+        v = v * 10 as u32 + (c - 48 as u8) as u32
+        i = i + 1
+    }
+    if v > 65535 as u32 {
+        return 0 as u32
+    }
+    return v
+}
+
+fn parse_ipv4(p: u64, n: usize, out: *mut u32) -> bool {
+    var parts: [u32; 4] = [0; 4]
+    var idx: usize = 0
+    var cur: u32 = 0
+    var digits: usize = 0
+    var i: usize = 0
+    while i <= n {
+        let c: u8 = if i < n { rt.ld8(p, i) } else { 46 as u8 }
+        if c == 46 as u8 {
+            if digits == 0 || idx >= 4 {
+                return false
+            }
+            parts[idx] = cur
+            idx = idx + 1
+            cur = 0 as u32
+            digits = 0
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            cur = cur * 10 as u32 + (c - 48 as u8) as u32
+            digits = digits + 1
+            if cur > 255 as u32 || digits > 3 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if idx != 4 {
+        return false
+    }
+    *out = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8)
+    return true
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc < 2 {
+        return 64
+    }
+    var port: u32 = 53 as u32
+    var bind: u32 = net.ADDR_ANY
+    var verbose: bool = false
+    var check: bool = false
+    var i: usize = 2
+    while i < argc {
+        if arg_is(start, i, "--verbose") {
+            verbose = true
+        } else if arg_is(start, i, "--check") {
+            check = true
+        } else if arg_is(start, i, "--port") && i + 1 < argc {
+            let pp: u64 = rt.arg_ptr(start, i + 1)
+            port = parse_port(pp, rt.c_length(pp))
+            if port == 0 as u32 {
+                return 64
+            }
+            i = i + 1
+        } else if arg_is(start, i, "--bind") && i + 1 < argc {
+            let bp: u64 = rt.arg_ptr(start, i + 1)
+            if !parse_ipv4(bp, rt.c_length(bp), &bind) {
+                return 64
+            }
+            i = i + 1
+        } else {
+            return 64
+        }
+        i = i + 1
+    }
+    var text: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 1), &text) {
+        return 66
+    }
+    var zone: dnszone.Zone = dnszone.zone_new()
+    let bad: usize = dnszone.zone_parse(&zone, text.ptr, text.len)
+    rt.buf_free(&text)
+    if bad != 0 {
+        var msg: rt.Buf = rt.buf_new()
+        var pre: str = "zone error in line "
+        rt.buf_push_bytes(&msg, pre.p as u64, pre.n)
+        rt.buf_push_dec_u64(&msg, bad as u64)
+        rt.buf_push(&msg, 10 as u8)
+        rt.write_everything(2, msg.ptr, msg.len)
+        rt.buf_free(&msg)
+        return 2
+    }
+    if check {
+        var ok: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&ok, zone.n as u64)
+        var post: str = " rules\n"
+        rt.buf_push_bytes(&ok, post.p as u64, post.n)
+        rt.write_everything(1, ok.ptr, ok.len)
+        rt.buf_free(&ok)
+        return 0
+    }
+    if !thread_init() {
+        return 70
+    }
+    var st: dnsd_serve.State = dnsd_serve.state_new(&zone)
+    if verbose {
+        st.verbose = 1 as u64
+    }
+    if dnsd_serve.open(&st, bind, port as u16) != 0 {
+        var emsg: str = "cannot bind\n"
+        rt.write_everything(2, emsg.p as u64, emsg.n)
+        return 71
+    }
+    let hu: u64 = thread_start(1, (&st) as u64)
+    let ht: u64 = thread_start(2, (&st) as u64)
+    if hu == 0 || ht == 0 {
+        return 72
+    }
+    thread_wait(hu)
+    thread_wait(ht)
+    dnsd_serve.close_all(&st)
+    return 0
+}
