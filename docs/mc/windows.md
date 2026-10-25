@@ -32,7 +32,7 @@ Audio under Wine: no sound card here; FIRN_AUDIO=device works with a pulseaudio 
 - `mcplay-win.zip` (pack.py win-zip) and `mcplay-setup.exe` (pack.py win-installer: Start-menu shortcut, desktop shortcut, uninstall.exe; needs the mingw binutils).
 Sound bank search order: `MCPLAY_SOUNDS` -> `<exe dir>/sounds` -> `$HOME/.cache/mcplay/sounds` / `%LOCALAPPDATA%/mcplay/sounds`.
 Log: `MCPLAY_LOG=<file>` (`-` = never); unset and no console (fd 1 dead, GUI exe from a shortcut) -> `%LOCALAPPDATA%/mcplay/mcplay.log`.
-Open: the exe still needs `<host-ipv4> <port> <name>` arguments (a shortcut without them prints usage into the log); a server-pick screen is not built.
+`mcplay.exe` without arguments opens the start screen (lib/mc/mc_startscreen_run.fi): host, port, name, saved server list, config in `%LOCALAPPDATA%\mcplay\mcplay.cfg` (MCPLAY_CONFIG overrides, MCPLAY_START_AUTO=1 skips the form when the config is complete). Shortcuts need no arguments. Gate: tools/mc/play/run_wine.sh (typed form under Wine, config saved, second launch prefilled).
 
 ## Input under Wine (r135)
 `run_wine.sh` stage `input` drives mcplay.exe with xdotool (X11 -> Wine): 8 relative moves of (12,5) arrive as raw_dx=96 raw_dy=40 (exact), look yaw/pitch follow,
