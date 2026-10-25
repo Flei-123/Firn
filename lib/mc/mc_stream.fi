@@ -39,6 +39,7 @@ export {
 }
 
 const STREAM_NREC: usize = 64
+const PEND_CHECK_EVERY: u32 = 64
 const NSLOT: usize = 32
 const SLOT_WORDS: usize = 8 // busy, pad, mask, verts, idx, scratch, lpad
 const EW: usize = 10 // section entry: key, handle, state, seq, job, quads, flags, translucent handle (0 = none), model quad handle, translucent model quad handle
@@ -170,6 +171,12 @@ struct Stream {
     lsc: u64, // scratch: neighbour pointers, binned arrays
     lcand: u64, // LOD_MAXQ candidates (distance << 32 | column slot)
     lncand: usize,
+    lod_epoch: u64,
+    lq_valid: bool,
+    lq_sig: u64,
+    lq_epoch: u64,
+    lq_cx: i32,
+    lq_cz: i32,
     light: bool, // light on: snapshots carry a light pad (stream_set_light)
     wl: u64, // *mut mc_wlight.WorldLight (region volume + tables; its nsec must equal the stream's)
     models: u64, // *mut mc_model_mesh.ModelSet or 0 (stream_set_models; CPU back end only)
@@ -199,7 +206,7 @@ fn stream_new(min_y: i32, nsec: i32, dist: i32, t: *mut mc_mesh.MeshTables, pool
         sync: false, setback: false, use_cull: true, measure: false, frame: 0 as u32, inflight: 0,
         tbl: 0, cap: 0, used: 0, live: 0, ctbl: 0, ccap: 0, cused: 0, clive: 0, pend: 0, npend: 0, pcap: 0,
         recs: 0, slots: 0, sp: 0, rr: 0, cull: mc_cull.cull_new(min_y, nsec), st: zero_stats(),
-        trans_tab: 0, src_opaque: 0, lod_dist: 0, lod_hyst: 1, lod_bin_near: 1, lod_bin: 4, lod_bin_mid: 2, lod_mid_w: 5, lod_bin_far: 8, lod_far_at: 24, lod_fade_frames: 10, lod_ahead: 2, lod_budget_us: 1500 as u64,
+        trans_tab: 0, src_opaque: 0, lod_dist: 0, lod_hyst: 1, lod_bin_near: 1, lod_bin: 4, lod_bin_mid: 2, lod_mid_w: 5, lod_bin_far: 8, lod_far_at: 24, lod_fade_frames: 10, lod_ahead: 2, lod_budget_us: 1500 as u64, lod_epoch: 0 as u64, lq_valid: false, lq_sig: 0 as u64, lq_epoch: 0 as u64, lq_cx: 0, lq_cz: 0,
         lodm: mc_mesh.mesher_new(), lsc: rt.heap_alloc(4096), lcand: rt.heap_alloc(LOD_MAXQ * 8), lncand: 0, light: false, wl: 0, models: 0 }
     s.recs = rt.heap_alloc(STREAM_NREC * REC_WORDS * 8)
     var i: usize = 0
@@ -524,6 +531,7 @@ fn col_put(s: *mut Stream, cx: i32, cz: i32, chunk: u64) -> bool {
     let key: u64 = col_key(cx, cz)
     let f: i64 = col_find(s, key)
     if f >= 0 {
+        (*s).lod_epoch = (*s).lod_epoch + 1 as u64
         rt.st64((*s).ctbl, (f as usize) * CW + 1, chunk)
         return false
     }
@@ -534,6 +542,7 @@ fn col_put(s: *mut Stream, cx: i32, cz: i32, chunk: u64) -> bool {
         if ((*s).clive + 1) * 4 > (*s).ccap { ncap = (*s).ccap * 2 }
         col_rebuild(s, ncap)
     }
+    (*s).lod_epoch = (*s).lod_epoch + 1 as u64
     let slot: usize = col_free_slot(s, key)
     rt.st64((*s).ctbl, slot * CW, key)
     rt.st64((*s).ctbl, slot * CW + 1, chunk)
@@ -1395,8 +1404,10 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     // 1b LOD ring state machine (before scheduling: far columns stop meshing, near ones start)
     let tl0: u64 = now_ns()
     lod_modes(s, b, cam)
-    (*s).st.lod_us = (now_ns() - tl0) / 1000 as u64
-    // 2 stale queued jobs (camera moved)
+    let tl0b: u64 = now_ns()
+    (*s).st.lod_us = (tl0b - tl0) / 1000 as u64
+    mc_prof.prof_add(mc_prof.PH_SLODM, tl0b - tl0)
+    let ts0: u64 = now_ns()
     var r: usize = 0
     while r < STREAM_NREC {
         if rt.ld64((*s).recs, r * REC_WORDS + R_STATE) == 1 as u64 {
@@ -1404,8 +1415,12 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         }
         r = r + 1
     }
+    let ts1: u64 = now_ns()
+    mc_prof.prof_add(mc_prof.PH_SSTALE, ts1 - ts0)
     // 3 schedule: visible sections front to back, then the nearest pending ones
     let snap_deadline: u64 = t1 + (*s).snap_budget_us * 1000 as u64
+    let pcx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
+    let pcz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
     var started: usize = 0
     var k: usize = 0
     let idle_sched: bool = (*s).npend == 0 && (*s).lod_dist == 0
@@ -1418,6 +1433,8 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
             if now_ns() > snap_deadline { break }
         }
     }
+    let ts2: u64 = now_ns()
+    mc_prof.prof_add(mc_prof.PH_SSCHED, ts2 - ts1)
     if started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline && (*s).npend > 0 {
         // pending sections outside the draw list (behind the camera, culled): nearest first. ONE pass over the list collects
         // the nearest candidates (sorted by distance, ties in list order = the order the one-by-one search would pick them).
@@ -1430,6 +1447,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         while i < (*s).npend {
             let key: u64 = rt.ld64((*s).pend, i)
             i = i + 1
+            if abs_i(key_cx(key) - pcx) > (*s).dist || abs_i(key_cz(key) - pcz) > (*s).dist { continue }
             let e: i64 = sec_find(s, key)
             if e >= 0 && wants_mesh(s, e as usize) {
                 let ox: f64 = (key_cx(key) * 16 + 8) as f64 - (*cam).x
@@ -1437,11 +1455,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
                 let oy: f64 = ((*s).min_y + key_sy(key) * 16 + 8) as f64 - (*cam).y
                 let d: u64 = (ox * ox + oy * oy + oz * oz) as u64
                 if nc < cap || d < rt.ld64(cd, nc - 1) {
-                    var ax: i32 = key_cx(key) - mc_world.block_to_chunk(floor_i((*cam).x))
-                    var az: i32 = key_cz(key) - mc_world.block_to_chunk(floor_i((*cam).z))
-                    if ax < 0 { ax = 0 - ax }
-                    if az < 0 { az = 0 - az }
-                    if ax <= (*s).dist && az <= (*s).dist && nbr_peek(s, key) {
+                    if nbr_peek(s, key) {
                         var pos: usize = nc
                         if nc == cap { pos = nc - 1 } else { nc = nc + 1 }
                         while pos > 0 && d < rt.ld64(cd, pos - 1) {
@@ -1465,6 +1479,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         rt.heap_free(cd, 64 * 8 * 2)
     }
     let t2: u64 = now_ns()
+    mc_prof.prof_add(mc_prof.PH_SPSCAN, t2 - ts2)
     (*s).st.submit_us = (t2 - t1) / 1000 as u64
     // 4 inline wait (tests / no pool)
     if (*s).sync && (*s).pool != 0 {
@@ -1481,8 +1496,15 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     (*s).st.upload_us = (t4 - t3) / 1000 as u64
     var wi: usize = 0
     var ri: usize = 0
+    let full_check: bool = (*s).sync || (*s).frame % PEND_CHECK_EVERY == 0 as u32
     while ri < (*s).npend {
         let key: u64 = rt.ld64((*s).pend, ri)
+        if !full_check && (abs_i(key_cx(key) - pcx) > (*s).dist || abs_i(key_cz(key) - pcz) > (*s).dist) {
+            rt.st64((*s).pend, wi, key)
+            wi = wi + 1
+            ri = ri + 1
+            continue
+        }
         let e: i64 = sec_find(s, key)
         if e >= 0 {
             var gated: bool = false
@@ -1671,6 +1693,7 @@ fn max_i(a: i32, b: i32) -> i32 {
 
 // the LOD mesh of the column is outdated (self: the height map too, neighbours: only their skirts toward it)
 fn lod_invalidate5(s: *mut Stream, cx: i32, cz: i32) {
+    (*s).lod_epoch = (*s).lod_epoch + 1 as u64
     var k: i32 = 0
     while k < 5 {
         var dx: i32 = 0
@@ -1691,6 +1714,7 @@ fn lod_invalidate5(s: *mut Stream, cx: i32, cz: i32) {
 
 // frees the LOD mesh and the height map of the column slot `ci`
 fn lod_release(s: *mut Stream, b: *mut mc_backend.Backend, ci: usize) {
+    (*s).lod_epoch = (*s).lod_epoch + 1 as u64
     let h: usize = rt.ld64((*s).ctbl, ci * CW + C_LH) as usize
     if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
     let oh: usize = rt.ld64((*s).ctbl, ci * CW + C_OLH) as usize
@@ -1825,11 +1849,35 @@ fn lod_want_bin(s: *mut Stream, ci: usize, d: i32) -> i32 {
 }
 
 // ring state machine + collects the build candidates (nearest first) for lod_builds
+fn lod_cfg_sig(s: *mut Stream) -> u64 {
+    var h: u64 = (*s).dist as u64
+    h = h *% 1000003 as u64 +% ((*s).lod_dist as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_hyst as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_bin_near as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_bin as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_bin_mid as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_mid_w as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_bin_far as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_far_at as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_fade_frames as u64)
+    h = h *% 1000003 as u64 +% ((*s).lod_ahead as u64)
+    return h
+}
+
 fn lod_modes(s: *mut Stream, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) {
     (*s).lncand = 0
     if (*s).lod_dist <= 0 { return }
     let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
     let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
+    let cfg: u64 = lod_cfg_sig(s)
+    if (*s).lq_valid && (*s).lq_cx == ccx && (*s).lq_cz == ccz && (*s).lq_sig == cfg && (*s).lq_epoch == (*s).lod_epoch {
+        (*s).st.lod_todo = 0 as u32
+        (*s).st.lod_fading = 0 as u32
+        return
+    }
+    (*s).lq_valid = false
+    var busy: bool = false
+    var nfade: u32 = 0 as u32
     let hy: i32 = (*s).lod_hyst
     var fstep: u64 = 256 as u64
     if (*s).lod_fade_frames > 0 { fstep = (256 as u64 + ((*s).lod_fade_frames as u64) - 1 as u64) / ((*s).lod_fade_frames as u64) }
@@ -1896,17 +1944,20 @@ fn lod_modes(s: *mut Stream, b: *mut mc_backend.Backend, cam: *mut mc_camera.Cam
                     }
                 }
             }
+            if mode == 2 as u64 || rt.ld64((*s).ctbl, i * CW + C_MODE) != mode { busy = true }
+            if rt.ld64((*s).ctbl, i * CW + C_FK) != 0 as u64 { nfade = nfade + 1 as u32 }
         }
         i = i + 1
     }
     (*s).st.lod_todo = todo
-    var nfade: u32 = 0 as u32
-    var q: usize = 0
-    while q < (*s).ccap {
-        if rt.ld64((*s).ctbl, q * CW + 3) != 0 as u64 && rt.ld64((*s).ctbl, q * CW + 3) != ST_TOMB && rt.ld64((*s).ctbl, q * CW + C_FK) != 0 as u64 { nfade = nfade + 1 as u32 }
-        q = q + 1
-    }
     (*s).st.lod_fading = nfade
+    if !busy && todo == 0 as u32 && nfade == 0 as u32 {
+        (*s).lq_valid = true
+        (*s).lq_cx = ccx
+        (*s).lq_cz = ccz
+        (*s).lq_sig = cfg
+        (*s).lq_epoch = (*s).lod_epoch
+    }
 }
 
 // the height map of the column slot `ci` (built on demand), 0 when the column has no chunk
