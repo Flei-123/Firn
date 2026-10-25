@@ -349,6 +349,47 @@ print("  server chest (ui): " + " ".join("%d=%s" % (n, got[n]) for n in sorted(g
 ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",1) and got[6]==("stone",21) and got[7]==("stone",21) and got[8]==("stone",21) and hot[0]==("stone",30) and hot[1] is None
 sys.exit(0 if ok else 1)
 PY
+# ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &
+PP=$!
+sleep 6
+echo "gamemode creative Player15" >&3
+echo "clear Player15" >&3
+sleep 3
+crcell() { grep "crui cell $1 " "$W/cr.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
+crclick() { local xy; xy=$(crcell "$1"); [ -n "$xy" ] || { echo "  FAIL  creative ui: no cell $1"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.5; }
+xdotool key e; sleep 1.5
+for i in $(seq 1 30); do grep -q 'crui cell delete ' "$W/cr.out" 2>/dev/null && break; sleep 1; done
+if grep -q 'crui cell delete ' "$W/cr.out"; then
+    crclick tab=2; crclick tab=0
+    crclick pick=0; crclick ws=36
+    crclick pick=1; crclick ws=37
+    xdotool key Escape; sleep 1.5
+    echo "data get entity Player15 Inventory" >&3
+    sleep 2
+else
+    echo "  FAIL  creative ui: screen did not open"; ERR=1
+fi
+wait $PP
+CRS=$(grep 'mcplay: crui state' "$W/cr.out" | head -1)
+echo "  $CRS"
+case "$CRS" in *"tab=0 n="*"h0="*"x1 h1="*"x1 cursor=-1x0"*) ;; *) echo "  FAIL  creative ui: local state $CRS"; ERR=1;; esac
+CRN=$(echo "$CRS" | sed -n 's/.* n=\([0-9]*\) .*/\1/p'); [ "${CRN:-0}" -gt 200 ] || { echo "  FAIL  creative ui: building tab list too short ($CRN)"; ERR=1; }
+CI=$(grep 'Player15 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$CI" <<'PY' || ERR=1
+import re,sys
+def slot(t, n):
+    for m in re.finditer(r'\{[^{}]*Slot: %db[^{}]*\}' % n, t):
+        c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+        i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+        if c and i: return (i.group(1), int(c.group(1)))
+    return None
+t=sys.argv[1]
+a,b=slot(t,0),slot(t,1)
+print("  server creative hotbar: 0=%s 1=%s" % (a,b))
+sys.exit(0 if a and b and a[1]==1 and b[1]==1 and a[0]!=b[0] else 1)
+PY
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR
