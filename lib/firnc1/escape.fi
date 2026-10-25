@@ -146,9 +146,11 @@ fn t_unite(a: Taint, o: Taint) -> Taint {
     return r
 }
 
+const MK: usize = 6
+
 struct Snap {
-    p_off: Vec[u32], p_len: Vec[u32],
-    t_mask: Vec[u64], t_lname: Vec[u32], t_ldecl: Vec[u64], t_ltake: Vec[u64],
+    start: usize,
+    words: usize,
 }
 
 struct Esc {
@@ -172,8 +174,8 @@ struct Esc {
 
     // --- the marks: place path -> taint, insertion ordered
     pcomp: Vec[u32], // the components of every path, one after another
-    p_off: Vec[u32], p_len: Vec[u32],
-    t_mask: Vec[u64], t_lname: Vec[u32], t_ldecl: Vec[u64], t_ltake: Vec[u64],
+    marks: Vec[u64], // MK words per mark: off, len, mask, lname, ldecl, ltake
+    snaps: Vec[u64], // stack of saved `marks` copies
     // scratch for the path currently being built
     pbuf: Vec[u32],
 
@@ -395,11 +397,11 @@ fn path_of(e: *mut Esc, x: u32) -> bool {
 // Is the path `off..off+len` below the stored path `i`? (the other
 // direction of `is_under`)
 fn is_above(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
-    let mine_len: u32 = vec_at[u32](&(*e).p_len, i)
+    let mine_len: u32 = m_len(e, i)
     if len < mine_len {
         return false
     }
-    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    let mine: u32 = m_off(e, i)
     var k: u32 = 0
     while k < mine_len {
         if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
@@ -413,10 +415,10 @@ fn is_above(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
 
 // Is the stored path `i` the path `off..off+len` of `pcomp`, or below it?
 fn is_under(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
-    if vec_at[u32](&(*e).p_len, i) < len {
+    if m_len(e, i) < len {
         return false
     }
-    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    let mine: u32 = m_off(e, i)
     var k: u32 = 0
     while k < len {
         if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
@@ -438,24 +440,20 @@ fn is_under(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
 // keeps lib/firnc1/parser.fi and lib/js/regexp.fi buildable.
 fn taint_under(e: *mut Esc, off: u32, len: u32) -> Taint {
     var out: Taint = t_none()
-    let count: usize = vec_len[u32](&(*e).p_len)
+    let count: usize = m_count(e)
     var root: u32 = NOTHING
     if len > 0 {
         root = vec_at[u32](&(*e).pcomp, off as usize)
     }
     var i: usize = 0
     while i < count {
-        if root != NOTHING && vec_at[u32](&(*e).p_len, i) > 0
-        && vec_at[u32](&(*e).pcomp, vec_at[u32](&(*e).p_off, i) as usize) != root {
+        if root != NOTHING && m_len(e, i) > 0
+        && vec_at[u32](&(*e).pcomp, m_off(e, i) as usize) != root {
             i = i + 1
             continue
         }
         if is_under(e, i, off, len) || is_above(e, i, off, len) {
-            let o: Taint = Taint { mask: vec_at[u64](&(*e).t_mask, i),
-                lname: vec_at[u32](&(*e).t_lname, i),
-                ldecl: vec_at[u64](&(*e).t_ldecl, i),
-                ltake: vec_at[u64](&(*e).t_ltake, i) }
-            out = t_unite(out, o)
+            out = t_unite(out, m_taint(e, i))
         }
         i = i + 1
     }
@@ -470,9 +468,9 @@ fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
         root = vec_at[u32](&(*e).pcomp, off as usize)
     }
     var i: usize = 0
-    while i < vec_len[u32](&(*e).p_len) {
-        if root != NOTHING && vec_at[u32](&(*e).p_len, i) > 0
-        && vec_at[u32](&(*e).pcomp, vec_at[u32](&(*e).p_off, i) as usize) != root {
+    while i < m_count(e) {
+        if root != NOTHING && m_len(e, i) > 0
+        && vec_at[u32](&(*e).pcomp, m_off(e, i) as usize) != root {
             i = i + 1
         } else if is_under(e, i, off, len) {
             mark_remove(e, i)
@@ -489,23 +487,67 @@ fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
         vec_push[u32](&(*e).pcomp, vec_at[u32](&(*e).pcomp, (off + k) as usize))
         k = k + 1
     }
-    vec_push[u32](&(*e).p_off, new)
-    vec_push[u32](&(*e).p_len, len)
-    vec_push[u64](&(*e).t_mask, t.mask)
-    vec_push[u32](&(*e).t_lname, t.lname)
-    vec_push[u64](&(*e).t_ldecl, t.ldecl)
-    vec_push[u64](&(*e).t_ltake, t.ltake)
+    m_push(e, new, len, t)
 }
 
 // Remove mark `i`, keeping the ORDER of the rest -- the order is part of the
 // agreement with the Rust twin.
 fn mark_remove(e: *mut Esc, i: usize) {
-    vec_remove[u32](&(*e).p_off, i)
-    vec_remove[u32](&(*e).p_len, i)
-    vec_remove[u64](&(*e).t_mask, i)
-    vec_remove[u32](&(*e).t_lname, i)
-    vec_remove[u64](&(*e).t_ldecl, i)
-    vec_remove[u64](&(*e).t_ltake, i)
+    let n: usize = (*e).marks.len
+    let base: u64 = (*e).marks.ptr
+    let from: usize = (i + 1) * MK
+    if from < n {
+        rt.mem_copy(base + ((i * MK) as u64) * 8, base + (from as u64) * 8, (n - from) * 8)
+    }
+    (*e).marks.len = n - MK
+}
+
+#[inline]
+fn rd_word(q: u64) -> u64 {
+    return *(q as *mut u64)
+}
+
+#[inline]
+fn wr_word(q: u64, v: u64) {
+    *(q as *mut u64) = v
+}
+
+#[inline]
+fn m_count(e: *mut Esc) -> usize {
+    return (*e).marks.len / MK
+}
+
+#[inline]
+fn m_off(e: *mut Esc, i: usize) -> u32 {
+    return vec_at[u64](&(*e).marks, i * MK) as u32
+}
+
+#[inline]
+fn m_len(e: *mut Esc, i: usize) -> u32 {
+    return vec_at[u64](&(*e).marks, i * MK + 1) as u32
+}
+
+fn m_taint(e: *mut Esc, i: usize) -> Taint {
+    let q: u64 = (*e).marks.ptr + ((i * MK) as u64) * 8
+    return Taint { mask: rd_word(q + 16), lname: rd_word(q + 24) as u32,
+        ldecl: rd_word(q + 32), ltake: rd_word(q + 40) }
+}
+
+fn m_set_taint(e: *mut Esc, i: usize, t: Taint) {
+    let q: u64 = (*e).marks.ptr + ((i * MK) as u64) * 8
+    wr_word(q + 16, t.mask)
+    wr_word(q + 24, t.lname as u64)
+    wr_word(q + 32, t.ldecl)
+    wr_word(q + 40, t.ltake)
+}
+
+fn m_push(e: *mut Esc, off: u32, len: u32, t: Taint) {
+    vec_push[u64](&(*e).marks, off as u64)
+    vec_push[u64](&(*e).marks, len as u64)
+    vec_push[u64](&(*e).marks, t.mask)
+    vec_push[u64](&(*e).marks, t.lname as u64)
+    vec_push[u64](&(*e).marks, t.ldecl)
+    vec_push[u64](&(*e).marks, t.ltake)
 }
 
 // The taint of a place given as an expression, or the empty one.
@@ -961,8 +1003,8 @@ fn walk_stmt(e: *mut Esc, s: u32) {
             walk_stmt(e, ast.s_c(b, s))
         }
         snap_merge(e, &after_then)
-        snap_free(&before)
-        snap_free(&after_then)
+        snap_free(e, &after_then)
+        snap_free(e, &before)
         return
     }
     if a == ast.S_WHILE {
@@ -973,11 +1015,11 @@ fn walk_stmt(e: *mut Esc, s: u32) {
         var w1: Snap = snap_take(e)
         walk_block(e, ast.s_b(b, s))
         snap_merge(e, &w1)
-        snap_free(&w1)
+        snap_free(e, &w1)
         var w2: Snap = snap_take(e)
         walk_block(e, ast.s_b(b, s))
         snap_merge(e, &w2)
-        snap_free(&w2)
+        snap_free(e, &w2)
         return
     }
     if a == ast.S_FOR {
@@ -987,11 +1029,11 @@ fn walk_stmt(e: *mut Esc, s: u32) {
         var g1: Snap = snap_take(e)
         walk_block(e, ast.s_d(b, s))
         snap_merge(e, &g1)
-        snap_free(&g1)
+        snap_free(e, &g1)
         var g2: Snap = snap_take(e)
         walk_block(e, ast.s_d(b, s))
         snap_merge(e, &g2)
-        snap_free(&g2)
+        snap_free(e, &g2)
         return
     }
     if a == ast.S_RET {
@@ -1165,7 +1207,7 @@ fn walk_match_cases(e: *mut Esc, name: u32) {
         var before: Snap = snap_take(e)
         walk_block(e, pattern.pat_a_block(m, aoff + k))
         snap_merge(e, &before)
-        snap_free(&before)
+        snap_free(e, &before)
         k = k + 1
     }
     (*e).depth = (*e).depth - 1
@@ -1174,57 +1216,55 @@ fn walk_match_cases(e: *mut Esc, name: u32) {
 // ------------------------------------------------------------- snapshots
 
 fn snap_take(e: *mut Esc) -> Snap {
-    var s: Snap = Snap {
-        p_off: vec_new[u32](), p_len: vec_new[u32](), t_mask: vec_new[u64](),
-        t_lname: vec_new[u32](), t_ldecl: vec_new[u64](), t_ltake: vec_new[u64](),
+    let words: usize = (*e).marks.len
+    let start: usize = (*e).snaps.len
+    if words > 0 {
+        vec_reserve[u64](&(*e).snaps, start + words)
+        rt.mem_copy((*e).snaps.ptr + (start as u64) * 8, (*e).marks.ptr, words * 8)
+        (*e).snaps.len = start + words
     }
-    vec_copy[u32](&(*e).p_off, &s.p_off)
-    vec_copy[u32](&(*e).p_len, &s.p_len)
-    vec_copy[u64](&(*e).t_mask, &s.t_mask)
-    vec_copy[u32](&(*e).t_lname, &s.t_lname)
-    vec_copy[u64](&(*e).t_ldecl, &s.t_ldecl)
-    vec_copy[u64](&(*e).t_ltake, &s.t_ltake)
-    return s
+    return Snap { start: start, words: words }
 }
 
 fn marks_clear(e: *mut Esc) {
-    vec_clear[u32](&(*e).p_off)
-    vec_clear[u32](&(*e).p_len)
-    vec_clear[u64](&(*e).t_mask)
-    vec_clear[u32](&(*e).t_lname)
-    vec_clear[u64](&(*e).t_ldecl)
-    vec_clear[u64](&(*e).t_ltake)
+    vec_clear[u64](&(*e).marks)
 }
 
 fn snap_put(e: *mut Esc, s: *mut Snap) {
-    vec_copy[u32](&(*s).p_off, &(*e).p_off)
-    vec_copy[u32](&(*s).p_len, &(*e).p_len)
-    vec_copy[u64](&(*s).t_mask, &(*e).t_mask)
-    vec_copy[u32](&(*s).t_lname, &(*e).t_lname)
-    vec_copy[u64](&(*s).t_ldecl, &(*e).t_ldecl)
-    vec_copy[u64](&(*s).t_ltake, &(*e).t_ltake)
+    let words: usize = (*s).words
+    if words > 0 {
+        vec_reserve[u64](&(*e).marks, words)
+        rt.mem_copy((*e).marks.ptr, (*e).snaps.ptr + ((*s).start as u64) * 8, words * 8)
+    }
+    (*e).marks.len = words
 }
 
 // Union of two markings -- what one branch marks counts afterwards. `s` is
 // the state that was there BEFORE, so its entries come first; the Rust twin
 // merges in the same direction.
 fn snap_merge(e: *mut Esc, s: *mut Snap) {
+    let words: usize = (*s).words
+    let sb: u64 = (*e).snaps.ptr + ((*s).start as u64) * 8
+    if words <= (*e).marks.len && rt.mem_eq(sb, (*e).marks.ptr, words * 8) {
+        return
+    }
+    let count: usize = words / MK
     var i: usize = 0
-    while i < vec_len[u32](&(*s).p_len) {
-        let off: u32 = vec_at[u32](&(*s).p_off, i)
-        let len: u32 = vec_at[u32](&(*s).p_len, i)
-        var o: Taint = Taint { mask: vec_at[u64](&(*s).t_mask, i),
-            lname: vec_at[u32](&(*s).t_lname, i),
-            ldecl: vec_at[u64](&(*s).t_ldecl, i),
-            ltake: vec_at[u64](&(*s).t_ltake, i) }
+    while i < count {
+        let q: u64 = sb + ((i * MK) as u64) * 8
+        let off: u32 = rd_word(q) as u32
+        let len: u32 = rd_word(q + 8) as u32
+        let o: Taint = Taint { mask: rd_word(q + 16),
+            lname: rd_word(q + 24) as u32,
+            ldecl: rd_word(q + 32), ltake: rd_word(q + 40) }
         var hit: bool = false
         var j: usize = i
-        if j < vec_len[u32](&(*e).p_len) && same_path(e, j, off, len) {
+        if j < m_count(e) && same_path(e, j, off, len) {
             hit = true
         } else {
             j = 0
-            while j < vec_len[u32](&(*e).p_len) {
-                if vec_at[u32](&(*e).p_len, j) == len && same_path(e, j, off, len) {
+            while j < m_count(e) {
+                if m_len(e, j) == len && same_path(e, j, off, len) {
                     hit = true
                     break
                 }
@@ -1232,33 +1272,20 @@ fn snap_merge(e: *mut Esc, s: *mut Snap) {
             }
         }
         if hit {
-            var cur: Taint = Taint { mask: vec_at[u64](&(*e).t_mask, j),
-                lname: vec_at[u32](&(*e).t_lname, j),
-                ldecl: vec_at[u64](&(*e).t_ldecl, j),
-                ltake: vec_at[u64](&(*e).t_ltake, j) }
-            cur = t_unite(cur, o)
-            vec_set[u64](&(*e).t_mask, j, cur.mask)
-            vec_set[u32](&(*e).t_lname, j, cur.lname)
-            vec_set[u64](&(*e).t_ldecl, j, cur.ldecl)
-            vec_set[u64](&(*e).t_ltake, j, cur.ltake)
+            m_set_taint(e, j, t_unite(m_taint(e, j), o))
         }
         if !hit {
-            vec_push[u32](&(*e).p_off, off)
-            vec_push[u32](&(*e).p_len, len)
-            vec_push[u64](&(*e).t_mask, o.mask)
-            vec_push[u32](&(*e).t_lname, o.lname)
-            vec_push[u64](&(*e).t_ldecl, o.ldecl)
-            vec_push[u64](&(*e).t_ltake, o.ltake)
+            m_push(e, off, len, o)
         }
         i = i + 1
     }
 }
 
 fn same_path(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
-    if vec_at[u32](&(*e).p_len, i) != len {
+    if m_len(e, i) != len {
         return false
     }
-    let mine: u32 = vec_at[u32](&(*e).p_off, i)
+    let mine: u32 = m_off(e, i)
     var k: u32 = 0
     while k < len {
         if vec_at[u32](&(*e).pcomp, (mine + k) as usize)
@@ -1270,13 +1297,8 @@ fn same_path(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
     return true
 }
 
-fn snap_free(s: *mut Snap) {
-    vec_free[u32](&(*s).p_off)
-    vec_free[u32](&(*s).p_len)
-    vec_free[u64](&(*s).t_mask)
-    vec_free[u32](&(*s).t_lname)
-    vec_free[u64](&(*s).t_ldecl)
-    vec_free[u64](&(*s).t_ltake)
+fn snap_free(e: *mut Esc, s: *mut Snap) {
+    (*e).snaps.len = (*s).start
 }
 
 // ------------------------------------------------------------ the messages
@@ -1406,9 +1428,7 @@ fn esc_empty() -> Esc {
         sum_off: vec_new[u32](), sum: vec_new[u64](),
         who: NOTHING, fend: 0, np: 0, poff: 0, found: vec_new[u64](),
         lname: vec_new[u32](), ldecl: vec_new[u64](), lidx: vec_new[u32](),
-        pcomp: vec_new[u32](), p_off: vec_new[u32](), p_len: vec_new[u32](),
-        t_mask: vec_new[u64](), t_lname: vec_new[u32](),
-        t_ldecl: vec_new[u64](), t_ltake: vec_new[u64](),
+        pcomp: vec_new[u32](), marks: vec_new[u64](), snaps: vec_new[u64](),
         pbuf: vec_new[u32](),
         f_pos: vec_new[u64](), f_lname: vec_new[u32](),
         f_ldecl: vec_new[u64](), f_ltake: vec_new[u64](),
@@ -1426,12 +1446,8 @@ fn esc_free(e: *mut Esc) {
     vec_free[u64](&(*e).ldecl)
     vec_free[u32](&(*e).lidx)
     vec_free[u32](&(*e).pcomp)
-    vec_free[u32](&(*e).p_off)
-    vec_free[u32](&(*e).p_len)
-    vec_free[u64](&(*e).t_mask)
-    vec_free[u32](&(*e).t_lname)
-    vec_free[u64](&(*e).t_ldecl)
-    vec_free[u64](&(*e).t_ltake)
+    vec_free[u64](&(*e).marks)
+    vec_free[u64](&(*e).snaps)
     vec_free[u32](&(*e).pbuf)
     vec_free[u64](&(*e).f_pos)
     vec_free[u32](&(*e).f_lname)
