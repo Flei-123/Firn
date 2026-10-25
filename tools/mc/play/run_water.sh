@@ -103,6 +103,9 @@ for s in $SCENES; do
             t1) E="MCPLAY_WATER_TINT=1";;
             gl) E="MCPLAY_GL=1";;
             vk) E="MCPLAY_GFX=vk";;
+            vkt0) E="MCPLAY_GFX=vk MCPLAY_WATER_TINT=0";;
+            vkm0) E="MCPLAY_GFX=vk MCPLAY_MODELS=0";;
+            m0) E="MCPLAY_MODELS=0";;
         esac
         run_one "${s}_$v" "$P" "$R" $E
     done

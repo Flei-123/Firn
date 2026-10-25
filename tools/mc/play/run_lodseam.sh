@@ -151,12 +151,13 @@ for bk in $BACKENDS; do
         *) fail "unknown back end '$bk' (cpu|gl|vk)" ;;
     esac
     run_one A$sfx "" $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
+    run_one A0$sfx "" $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9 MCPLAY_LOD_TINT=0
     run_one B$sfx "" $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
     run_one B2$sfx "" $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
     run_one R$sfx 59.5 $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
     FIRST_Z=59.5 run_one S$sfx "" $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
     run_one T$sfx 59.5 $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
-    for n in A B B2 R S T; do NAMES="$NAMES $n$sfx"; done
+    for n in A A0 B B2 R S T; do NAMES="$NAMES $n$sfx"; done
 done
 # r261: exact-rule CPU reference (MCPLAY_EDGE_EXP=0, no edge expansion) for the GL / Vulkan comparison: the CPU raster deliberately grows every opaque
 # triangle by ~1/48 px (LOD pass 1/16 px, mc_raster.fi draw_clipped_tri) so shared edges never leave see-through slits; GL / Vulkan use the exact rule.
@@ -179,7 +180,7 @@ for n in $NAMES; do
 done
 for n in $NAMES; do
     case ${n%%_*} in
-        A|R|S) grep -q "^mcplay: models on.*lod=9" "$W/$n.out" || { echo "  FAIL  $n: 'models on ... lod=9' line missing"; ERR=1; } ;;
+        A|A0|R|S) grep -q "^mcplay: models on.*lod=9" "$W/$n.out" || { echo "  FAIL  $n: 'models on ... lod=9' line missing"; ERR=1; } ;;
         *) grep -q "^mcplay: models" "$W/$n.out" && { echo "  FAIL  $n (MCPLAY_MODELS=0) printed a models line"; ERR=1; } ;;
     esac
 done
@@ -229,19 +230,20 @@ TOT = 640 * 270
 allim = {}
 for bk in backends:
     s = SFX[bk]
-    im = {n: crop(n + s) for n in ("A", "B", "B2", "R", "S", "T")}
+    im = {n: crop(n + s) for n in ("A", "A0", "B", "B2", "R", "S", "T")}
     allim[bk] = im
     ca, ma = fixture_mask(im["A"]); cb, mb = fixture_mask(im["B"])
     cr, _ = fixture_mask(im["R"]); cs, _ = fixture_mask(im["S"])
     bb = ImageChops.lighter(ma, mb).getbbox()
-    dab = dmask(im["A"], im["B"])
+    dab = dmask(im["A0"], im["B"])
+    out_tint = nz(dmask(im["A"], im["A0"]))
     out_ab = 0
     if bb:
         x0, y0, x1, y1 = bb; pad = 8
         r = (max(0, x0 - pad), max(0, y0 - pad), min(640, x1 + pad), min(270, y1 + pad))
         out_ab = nz(dab) - nz(dab.crop(r))
     bb2 = nz(dmask(im["B"], im["B2"])); rt = nz(dmask(im["R"], im["T"])); rs = nz(dmask(im["R"], im["S"]))
-    print(f"  [{bk}] fixA {ca} fixR {cr} fixS {cs} diffAB {nz(dab)} outAB {out_ab} diffBB2 {bb2} diffRT {rt} diffRS {rs} total {TOT} bbox {bb}")
+    print(f"  [{bk}] fixA {ca} fixR {cr} fixS {cs} diffAB {nz(dab)} outAB {out_ab} lodTint {out_tint} diffBB2 {bb2} diffRT {rt} diffRS {rs} total {TOT} bbox {bb}")
     for i, c in enumerate(ca):
         if c < 100: print(f"  FAIL  [{bk}] A: fixture colour #{i + 1} only {c} pixels"); bad = 1
     for i, c in enumerate(cr):
@@ -249,7 +251,8 @@ for bk in backends:
     for i, c in enumerate(cs):
         if c < 60: print(f"  FAIL  [{bk}] S (direct): fixture colour #{i + 1} only {c} pixels"); bad = 1
     if bb2 > (0 if bk == "cpu" else TOT // 10000): print(f"  FAIL  [{bk}] B vs B2 (cubes + LOD, same config) differ by {bb2} px: the LOD picture is not deterministic"); bad = 1
-    if out_ab > (0 if bk == "cpu" else TOT // 100000): print(f"  FAIL  [{bk}] A vs B differ by {out_ab} px OUTSIDE the stairs (seam hole / double drawing / colour jump)"); bad = 1
+    if out_ab > (0 if bk == "cpu" else TOT // 100000): print(f"  FAIL  [{bk}] A0 vs B differ by {out_ab} px OUTSIDE the stairs (seam hole / double drawing / colour jump)"); bad = 1
+    if out_tint < 100: print(f"  FAIL  [{bk}] LOD tint changed only {out_tint} px (A vs A0): the tint twins are not drawn"); bad = 1
     if rt < TOT // 500: print(f"  FAIL  [{bk}] R equals T: models did not appear after the ring change ({rt} px)"); bad = 1
     tol = 0 if bk == "cpu" else TOT // 10000  # GL / Vulkan (llvmpipe / lavapipe): single noise pixels allowed (r259: 1 px, 21 levels, sky / far terrain edge)
     if rs > tol: print(f"  FAIL  [{bk}] R (late remesh) differs from S (direct load) by {rs} px (> {tol})"); bad = 1
