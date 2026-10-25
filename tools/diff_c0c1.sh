@@ -71,6 +71,7 @@ if [ -z "${DIFF_SHARD:-}" ]; then
         printf "SOFT (panic text / message class): %d\n", c["soft"]
         printf "UNSUPPORTED by firnc1: %d\n", c["unsupported"]
         printf "OPT-LEVEL deviations: %d\n", c["optdev"]
+        printf "neg position equal: %d / %d  text equal: %d / %d\n", c["negpos"], c["negcmp"], c["negtext"], c["negcmp"]
         if (c["a64"] > 0) printf "aarch64 checked: %d  differences: %d\n", c["a64"], c["a64dev"]
     }' <(cat "$WORK"/out.* | grep '^@@')
     dev=$(cat "$WORK"/out.* | grep '^@@ deviation ' | awk '{s+=$3} END {print s+0}')
@@ -132,6 +133,10 @@ do_neg() {
         if [ "$c0" != "$c1" ]; then
             inc soft
             echo "SOFT       $b: error class firnc0=$c0 firnc1=$c1 ($(first_line "$W/n0.out"))"
+        else
+            inc negcmp
+            if [ "$(sed -n 2p "$W/n0.out")" = "$(sed -n 2p "$W/n1.out")" ]; then inc negpos; else echo "POSDIFF    $b: $(sed -n 2p "$W/n0.out") | $(sed -n 2p "$W/n1.out")"; fi
+            if [ "$(sed -n 1p "$W/n0.out")" = "$(sed -n 1p "$W/n1.out")" ]; then inc negtext; else echo "TEXTDIFF   $b: $(first_line "$W/n0.out") | $(first_line "$W/n1.out")"; fi
         fi
     elif [ "$r0" -ne 0 ] && [ "$r1" -eq 0 ]; then
         dev "$f" "firnc0 rejects ($(first_line "$W/n0.out")), firnc1 ACCEPTS"
