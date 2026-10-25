@@ -44,8 +44,33 @@ SPECIAL = {
     "magma_block": (["magma"], ["magma"], ["magma"]),
     "smooth_stone": (["smooth_stone"], ["smooth_stone"], ["smooth_stone"]),
     "petrified_oak": (["oak_planks"], ["oak_planks"], ["oak_planks"]),
-    "quartz": (["quartz_block_side"], ["quartz_block_top"], ["quartz_block_bottom"]),
-    "quartz_block": (["quartz_block_side"], ["quartz_block_top"], ["quartz_block_bottom"]),
+    "quartz": (["quartz_block_side"], ["quartz_block_top"], ["quartz_block_top"]),
+    "quartz_block": (["quartz_block_side"], ["quartz_block_top"], ["quartz_block_top"]),
+    "cartography_table": (["cartography_table_side3", "cartography_table_side"], ["cartography_table_top"], ["dark_oak_planks", "oak_planks"]),
+    "fletching_table": (["fletching_table_side", "fletching_table_front"], ["fletching_table_top"], ["birch_planks", "oak_planks"]),
+    "smithing_table": (["smithing_table_side", "smithing_table_front"], ["smithing_table_top"], ["smithing_table_bottom", "dark_oak_planks"]),
+    "crafter": (["crafter_east", "crafter_north"], ["crafter_top"], ["crafter_bottom"]),
+    "jukebox": (["jukebox_side"], ["jukebox_top"], ["jukebox_side"]),
+    "crimson_nylium": (["crimson_nylium_side"], ["crimson_nylium"], ["netherrack"]),
+    "warped_nylium": (["warped_nylium_side"], ["warped_nylium"], ["netherrack"]),
+    "dried_kelp_block": (["dried_kelp_side"], ["dried_kelp_top"], ["dried_kelp_bottom"]),
+    "frosted_ice": (["frosted_ice_0", "frosted_ice"], ["frosted_ice_0", "frosted_ice"], ["frosted_ice_0", "frosted_ice"]),
+    "suspicious_sand": (["suspicious_sand_0"], ["suspicious_sand_0"], ["suspicious_sand_0"]),
+    "suspicious_gravel": (["suspicious_gravel_0"], ["suspicious_gravel_0"], ["suspicious_gravel_0"]),
+    "respawn_anchor": (["respawn_anchor_side0"], ["respawn_anchor_top_off", "respawn_anchor_top"], ["respawn_anchor_bottom"]),
+    "sticky_piston": (["piston_side"], ["piston_top_sticky", "piston_top"], ["piston_bottom"]),
+    "beehive": (["beehive_side"], ["beehive_end"], ["beehive_end"]),
+    "bee_nest": (["bee_nest_side"], ["bee_nest_top"], ["bee_nest_bottom"]),
+    "carved_pumpkin": (["pumpkin_side"], ["pumpkin_top"], ["pumpkin_top"]),
+    "jack_o_lantern": (["pumpkin_side"], ["pumpkin_top"], ["pumpkin_top"]),
+    "blackstone": (["blackstone"], ["blackstone_top"], ["blackstone_top"]),
+    "deepslate": (["deepslate"], ["deepslate_top"], ["deepslate_top"]),
+    "ochre_froglight": (["ochre_froglight_side"], ["ochre_froglight_top"], ["ochre_froglight_top"]),
+    "pearlescent_froglight": (["pearlescent_froglight_side"], ["pearlescent_froglight_top"], ["pearlescent_froglight_top"]),
+    "verdant_froglight": (["verdant_froglight_side"], ["verdant_froglight_top"], ["verdant_froglight_top"]),
+    "command_block": (["command_block_side"], ["command_block_side"], ["command_block_side"]),
+    "chain_command_block": (["chain_command_block_side"], ["chain_command_block_side"], ["chain_command_block_side"]),
+    "repeating_command_block": (["repeating_command_block_side"], ["repeating_command_block_side"], ["repeating_command_block_side"]),
     "smooth_quartz": (["quartz_block_bottom"], ["quartz_block_bottom"], ["quartz_block_bottom"]),
     "purpur": (["purpur_block"], ["purpur_block"], ["purpur_block"]),
     "copper": (["copper_block"], ["copper_block"], ["copper_block"]),
@@ -91,6 +116,8 @@ def resolve(n, depth=0):
         n = n[7:]
     if n.startswith("wall_") and not n.endswith("_wall"):
         n = n[5:]
+    if n.startswith("infested_"):
+        return resolve(n[9:], depth)
     if n in SPECIAL:
         return SPECIAL[n]
     if n.endswith(("_log", "_stem", "_pillar")) or n in ("bamboo_block", "stripped_bamboo_block"):
