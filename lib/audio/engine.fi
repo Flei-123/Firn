@@ -49,7 +49,7 @@ export {
     engine_set_bus_volume, engine_get_bus_volume, engine_set_bus_mute, engine_get_bus_mute,
     engine_bus_effective_volume,
     engine_add_sample, engine_load_wav, engine_load_mp3, engine_sample_frames, engine_sample_count, engine_event_count,
-    engine_sample_adopt_last, engine_event_set_sample, engine_event_slot_sample, MAX_SAMPLES, MAX_EVENTS, engine_event_set_slot, engine_event_slot_volume, engine_event_slot_pitch, engine_events_clear, engine_param_pool_used, engine_sample_id_pool_used,
+    engine_sample_adopt_last, engine_sample_in_use, engine_sample_release, engine_sample_retarget, engine_sample_room, engine_sample_free_slots, engine_event_set_sample, engine_event_slot_sample, MAX_SAMPLES, MAX_EVENTS, engine_event_set_slot, engine_event_slot_volume, engine_event_slot_pitch, engine_events_clear, engine_param_pool_used, engine_sample_id_pool_used,
     engine_add_event, engine_event_add_sample, engine_event_add_param, engine_event, engine_find_event,
     engine_set_listener, engine_play, engine_play_3d, engine_stop, engine_stop_all, engine_is_playing,
     engine_set_position, engine_set_volume, engine_set_pitch, engine_set_param,
@@ -235,6 +235,7 @@ struct Engine {
     max_voices: u32,
     lock: u64, // address of one word (futex mutex)
     samples: u64, n_samples: usize,
+    free_ids: u64, n_free_samples: usize,
     events: u64, n_events: usize,
     name_tab: u64, // NAME_TAB * i32, see engine_find_event
     buses: u64, n_buses: usize,
@@ -385,7 +386,7 @@ fn engine_new(rate: u32, max_voices: u32) -> Engine {
     }
     var e: Engine = Engine {
         rate: r, max_voices: mv, lock: alloc_zero[u64](1),
-        samples: alloc_zero[Sample](MAX_SAMPLES), n_samples: 0,
+        samples: alloc_zero[Sample](MAX_SAMPLES), n_samples: 0, free_ids: alloc_zero[i32](MAX_SAMPLES), n_free_samples: 0,
         events: alloc_zero[EventDef](MAX_EVENTS), n_events: 0,
         name_tab: alloc_zero[i32](NAME_TAB),
         buses: alloc_zero[Bus](MAX_BUSES), n_buses: 0,
@@ -469,6 +470,7 @@ fn engine_free(e: *mut Engine) {
     let mv: usize = (*e).max_voices as usize
     rt.heap_free((*e).lock, 8)
     rt.heap_free((*e).samples, bytes_of[Sample](MAX_SAMPLES))
+    rt.heap_free((*e).free_ids, bytes_of[i32](MAX_SAMPLES))
     rt.heap_free((*e).events, bytes_of[EventDef](MAX_EVENTS))
     rt.heap_free((*e).name_tab, NAME_TAB * 4)
     rt.heap_free((*e).buses, bytes_of[Bus](MAX_BUSES))
@@ -497,6 +499,7 @@ fn engine_free(e: *mut Engine) {
     rt.heap_free((*e).stream_claim, MAX_STREAMS * 8)
     rt.heap_free((*e).stream_done, MAX_STREAMS * 8)
     (*e).n_samples = 0
+    (*e).n_free_samples = 0
     (*e).n_buses = 0
     (*e).n_events = 0
     (*e).n_params = 0
@@ -645,7 +648,7 @@ fn engine_bus_effective_volume(e: *mut Engine, name: str) -> f32 {
 
 // Copies `frames` frames (interleaved f32, 1 or 2 channels) into the engine. Id or -1.
 fn engine_add_sample(e: *mut Engine, data: u64, frames: u64, channels: u32) -> i32 {
-    if (*e).n_samples >= MAX_SAMPLES || frames == 0 || channels == 0 as u32 {
+    if ((*e).n_samples >= MAX_SAMPLES && (*e).n_free_samples == 0) || frames == 0 || channels == 0 as u32 {
         return -1
     }
     let n: usize = (frames * channels as u64 * 4) as usize
@@ -654,13 +657,71 @@ fn engine_add_sample(e: *mut Engine, data: u64, frames: u64, channels: u32) -> i
         return -1
     }
     rt.mem_copy(p, data, n)
-    let i: usize = (*e).n_samples
+    var i: usize = (*e).n_samples
+    if (*e).n_free_samples > 0 {
+        (*e).n_free_samples = (*e).n_free_samples - 1
+        let fid: i32 = *at[i32]((*e).free_ids, (*e).n_free_samples)
+        i = fid as usize
+    } else {
+        (*e).n_samples = i + 1
+    }
     let s: *mut Sample = at[Sample]((*e).samples, i)
-    (*s).data = p
-    (*s).frames = frames
     (*s).channels = channels
-    (*e).n_samples = i + 1
+    (*s).frames = frames
+    (*s).data = p
     return i as i32
+}
+
+fn engine_sample_room(e: *mut Engine) -> usize {
+    return MAX_SAMPLES - (*e).n_samples + (*e).n_free_samples
+}
+
+fn engine_sample_free_slots(e: *mut Engine) -> usize {
+    return (*e).n_free_samples
+}
+
+fn engine_sample_in_use(e: *mut Engine, id: i32) -> bool {
+    var i: u32 = 0 as u32
+    while i < (*e).max_voices {
+        let v: *mut Voice = at[Voice]((*e).voices, i as usize)
+        if (*v).playing && (*v).sample_id == id {
+            return true
+        }
+        i = i + 1 as u32
+    }
+    return false
+}
+
+fn engine_sample_retarget(e: *mut Engine, from: i32, to: i32) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*e).n_sample_ids {
+        let q: *mut i32 = at[i32]((*e).sample_ids, i)
+        if *q == from {
+            *q = to
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn engine_sample_release(e: *mut Engine, id: i32) -> bool {
+    if id < 0 || id as usize >= (*e).n_samples || (*e).n_free_samples >= MAX_SAMPLES {
+        return false
+    }
+    let s: *mut Sample = at[Sample]((*e).samples, id as usize)
+    if (*s).data == 0 || engine_sample_in_use(e, id) {
+        return false
+    }
+    let d: u64 = (*s).data
+    let n: usize = ((*s).frames * (*s).channels as u64 * 4) as usize
+    (*s).frames = 0 as u64
+    (*s).data = 0
+    rt.heap_free(d, n)
+    *at[i32]((*e).free_ids, (*e).n_free_samples) = id
+    (*e).n_free_samples = (*e).n_free_samples + 1
+    return true
 }
 
 fn engine_sample_frames(e: *mut Engine, id: i32) -> u64 {
@@ -682,7 +743,7 @@ fn engine_event_count(e: *mut Engine) -> usize {
 // so every event that points at `old` plays the new data. Refused (false) while the audio thread runs (it may read the old PCM),
 // when `old` is the last slot itself or out of range. The caller then keeps the new sample as an extra id.
 fn engine_sample_adopt_last(e: *mut Engine, old: i32) -> bool {
-    if old < 0 || (old as usize) + 1 >= (*e).n_samples || (*e).n_samples == 0 {
+    if old < 0 || (old as usize) + 1 >= (*e).n_samples || (*e).n_samples == 0 || (*e).n_free_samples > 0 {
         return false
     }
     if engine_audio_running(e) {

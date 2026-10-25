@@ -1,0 +1,207 @@
+// expect_exit: 0
+import std.rt
+import std.io
+import zip.zip
+import audio.engine
+import audio.bank
+import mc.mc_audio
+import mc.mc_assets
+import mc.mc_packs
+import mc.mc_packsnd
+import mc.mc_lazysnd
+import jobs.jobs
+import std.time
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const OGG_A: str = "tests/data/vorbis/sine_m22k_q3.ogg"
+const OGG_B: str = "tests/data/vorbis/impulse_m44k_q4.ogg"
+const SOUNDS: str = "{\"ui.button.click\":{\"sounds\":[\"s/a1\"]},\"block.stone.step\":{\"sounds\":[\"s/a1\",\"s/b1\"]},\"ambient.cave\":{\"sounds\":[\"s/a1\",{\"name\":\"s/b1\",\"volume\":0.5},\"s/a2\",{\"name\":\"s/b2\",\"weight\":2}]},\"entity.cow.moo\":{\"sounds\":[\"s/missing\"]},\"entity.zombie.ambient\":{\"sounds\":[\"s/b2\"]}}"
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    let ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_file(w: *mut zip.ZipWriter, name: str, src: str) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, src.p as u64, src.length())
+    rt.buf_push(&p, 0 as u8)
+    var d: rt.Buf = rt.buf_new()
+    var ok: bool = rt.read_file(rt.buf_ptr(&p), &d)
+    if ok { ok = zip.zip_add(w, name, rt.buf_ptr(&d), rt.buf_len(&d), false) catch | e | (false) }
+    rt.buf_free(&p)
+    rt.buf_free(&d)
+    return ok
+}
+
+fn build_pack(b: *mut rt.Buf, stack: *mut mc_assets.PackStack) -> bool {
+    var w: zip.ZipWriter = zip.zip_writer_new(b)
+    var ok: bool = add_str(&w, "pack.mcmeta", META)
+    ok = add_str(&w, "assets/minecraft/sounds.json", SOUNDS) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/a1.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/a2.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/b1.ogg", OGG_B) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/s/b2.ogg", OGG_B) && ok
+    let n: usize = zip.zip_finish(&w) catch | e | (0)
+    zip.zip_writer_free(&w)
+    if n == 0 || !ok { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    return mc_assets.stack_push(stack, &pk) == mc_assets.ASSET_OK
+}
+
+fn distinct_slots(e: *mut engine.Engine, ev: i32) -> i32 {
+    let n: usize = (*engine.engine_event(e, ev)).sample_n as usize
+    var seen: [i32; 16] = [0 - 1; 16]
+    var d: i32 = 0
+    var k: usize = 0
+    while k < n {
+        let id: i32 = engine.engine_event_slot_sample(e, ev, k)
+        var j: i32 = 0
+        var dup: bool = false
+        while j < d {
+            if seen[j as usize] == id { dup = true }
+            j = j + 1
+        }
+        if !dup { seen[d as usize] = id; d = d + 1 }
+        k = k + 1
+    }
+    return d
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn wait_idle(lz: *mut mc_lazysnd.Lazy) {
+    var i: i32 = 0
+    while i < 2000 {
+        mc_lazysnd.lazy_poll(lz)
+        if mc_lazysnd.lazy_inflight(lz) == 0 { return }
+        time.sleep_ms(5 as u64)
+        i = i + 1
+    }
+}
+
+fn step(lz: *mut mc_lazysnd.Lazy, ev: i32) {
+    mc_lazysnd.lazy_ensure(lz, ev)
+    wait_idle(lz)
+}
+
+fn count_ph(e: *mut engine.Engine, ev: i32, ph: i32) -> i32 {
+    let n: usize = (*engine.engine_event(e, ev)).sample_n as usize
+    var c: i32 = 0
+    var k: usize = 0
+    while k < n {
+        if engine.engine_event_slot_sample(e, ev, k) == ph { c = c + 1 }
+        k = k + 1
+    }
+    return c
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+    var raw: rt.Buf = rt.buf_new()
+    var stack: mc_assets.PackStack = mc_assets.stack_new()
+    check(&t, build_pack(&raw, &stack), "pack built")
+    var pool: jobs.Jobs = jobs.create(2 as u64)
+    check(&t, pool.blk != 0, "pool up")
+    let pool_addr: u64 = ((&pool) as *mut jobs.Jobs) as u64
+
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    mc_audio.mca_set_lazy_sounds(&m, true, 0 as u64, 0)
+    mc_audio.mca_set_lazy_pool(&m, pool_addr, 0)
+    let lz: *mut mc_lazysnd.Lazy = mc_audio.mca_lazy(&m)
+    mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH)
+    let ev_ui: i32 = engine.engine_find_event(&e, "ui.button.click")
+    let ev_st: i32 = engine.engine_find_event(&e, "block.stone.step")
+    let ev_cv: i32 = engine.engine_find_event(&e, "ambient.cave")
+    let ph: i32 = (*lz).placeholder
+    check(&t, ph >= 0 && engine.engine_sample_count(&e) == 1, "start: only the placeholder")
+
+    mc_lazysnd.lazy_ensure(lz, ev_ui)
+    check(&t, mc_lazysnd.lazy_inflight(lz) == 1 && (*lz).async_jobs == 1, "first play queues a job")
+    check(&t, engine.engine_event_slot_sample(&e, ev_ui, 0) == ph, "until the job lands the slot is the silent placeholder")
+    mc_lazysnd.lazy_ensure(lz, ev_ui)
+    check(&t, (*lz).async_jobs == 1, "second play while the job runs queues nothing")
+    wait_idle(lz)
+    check(&t, engine.engine_event_slot_sample(&e, ev_ui, 0) != ph && engine.engine_sample_count(&e) == 2, "job landed: click has its sample")
+    check(&t, (*lz).decoded == 1 && (*lz).async_done == 1 && mc_lazysnd.lazy_pending(lz) == 3, "one decode counted, 3 events pending")
+
+    step(lz, ev_cv)
+    step(lz, ev_cv)
+    step(lz, ev_cv)
+    step(lz, ev_cv)
+    check(&t, distinct_slots(&e, ev_cv) == 4 && engine.engine_sample_count(&e) == 5, "cave: 4 steps give 4 distinct samples")
+    step(lz, ev_st)
+    step(lz, ev_st)
+    check(&t, distinct_slots(&e, ev_st) == 2 && mc_lazysnd.lazy_pending(lz) == 1, "stone.step shares the samples of cave and click")
+    step(lz, ev_ui)
+
+    check(&t, mc_audio.mca_play_ui(&m, "ui.button.click", 1.0, 1.0) != 0 as u32, "voice playing the click sample")
+    let out: u64 = rt.heap_alloc(256 * 2 * 4)
+    engine.engine_render(&e, out, 256)
+    rt.heap_free(out, 256 * 2 * 4)
+    let used: i32 = engine.engine_event_slot_sample(&e, ev_ui, 0)
+    check(&t, engine.engine_sample_in_use(&e, used) && !engine.engine_sample_in_use(&e, ph), "engine reports the playing sample as in use")
+    check(&t, mc_lazysnd.lazy_evict(lz, 1) == 1, "evict 1 sample")
+    check(&t, engine.engine_event_slot_sample(&e, ev_ui, 0) == used, "least recently used goes first: click sample stays")
+    check(&t, count_ph(&e, ev_cv, ph) + count_ph(&e, ev_st, ph) > 0, "one cave/stone sample is silent again")
+    check(&t, mc_lazysnd.lazy_pending(lz) >= 2, "its events wait for a new decode")
+    let left: usize = mc_lazysnd.lazy_evict(lz, 100)
+    check(&t, left == 2 && engine.engine_event_slot_sample(&e, ev_ui, 0) == used, "all but the playing sample are evicted")
+
+    var e2: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b2: bank.Bank = bank.bank_new()
+    var m2: mc_audio.McAudio = mc_audio.mca_new(&e2)
+    mc_audio.mca_set_lazy_sounds(&m2, true, 0 as u64, 0)
+    mc_audio.mca_set_lazy_pool(&m2, pool_addr, 0)
+    let lz2: *mut mc_lazysnd.Lazy = mc_audio.mca_lazy(&m2)
+    mc_packsnd.packsnd_apply(&m2, &b2, &e2, &stack, mc_packs.SOUNDS_BOTH)
+    let cv2: i32 = engine.engine_find_event(&e2, "ambient.cave")
+    let ph2: i32 = (*lz2).placeholder
+    step(lz2, cv2)
+    step(lz2, cv2)
+    step(lz2, cv2)
+    step(lz2, cv2)
+    let cnt: usize = engine.engine_sample_count(&e2)
+    check(&t, cnt == 5 && engine.engine_sample_room(&e2) == engine.MAX_SAMPLES - 5, "cave decoded: 5 samples with the placeholder")
+    check(&t, mc_lazysnd.lazy_evict(lz2, 100) == 4 && count_ph(&e2, cv2, ph2) == 5, "all 4 evicted, every slot silent")
+    mc_lazysnd.lazy_poll(lz2)
+    check(&t, engine.engine_sample_free_slots(&e2) == 0, "no slot is reused inside the grace period")
+    time.sleep_ms(1700 as u64)
+    mc_lazysnd.lazy_poll(lz2)
+    check(&t, engine.engine_sample_free_slots(&e2) == 4 && engine.engine_sample_room(&e2) == engine.MAX_SAMPLES - 1, "after the grace period 4 slots are free")
+    step(lz2, cv2)
+    step(lz2, cv2)
+    step(lz2, cv2)
+    step(lz2, cv2)
+    check(&t, engine.engine_sample_count(&e2) == cnt && distinct_slots(&e2, cv2) == 4 && engine.engine_sample_free_slots(&e2) == 0, "re-decode reuses the freed slots")
+
+    mc_audio.mca_set_lazy_pool(&m, 0 as u64, 0)
+    mc_audio.mca_set_lazy_pool(&m2, 0 as u64, 0)
+    jobs.destroy(&pool)
+    if t.fails != 0 {
+        io.fmt_print(f"mc_lazy_threaded FAIL {t.fails}\n")
+        return 1
+    }
+    io.fmt_print(f"mc_lazy_threaded ok\n")
+    return 0
+}
