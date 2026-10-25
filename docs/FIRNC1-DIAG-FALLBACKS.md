@@ -12,8 +12,4 @@
 | `const_eval` failed without `ce_say` text (static/const/array count) | Every failing branch of `const_eval` records its own text first; the fallback guards a future branch. |
 | `match_check`: match index out of range | Internal registry invariant. |
 
-Known remaining deviations from firnc0 (not fallbacks):
-
-- `f"{x!r}"` / `!s` conversions are not parsed by firnc1 (`tests/neg/fstring_repr_bad_type`).
-- `"a" + f"{n}"` is accepted by firnc1 (`tests/neg/fstring_plus_str`: firnc0 says "an f-string is a Fmt builder, not a str").
-- Lexer errors inside an interpolation fragment still use the generic parser message.
+Known remaining deviations from firnc0: none for f-strings (`!r`/`!s`, `"a" + f"{n}"`, lexer errors inside an interpolation fragment and closure bodies in `#[no_gc]` match firnc0).

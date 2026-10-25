@@ -900,6 +900,14 @@ NEG = [
     ('fs_spec_type', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:q}"))\n    return 0\n}\n'),
     ('fs_brace', 'import std.io\nfn main() -> i32 {\n    io.fmt_print(f"}")\n    return 0\n}\n'),
     ('arr_empty_infer', 'fn main() -> i32 {\n    let a = []\n    return 0\n}\n'),
+    ('fs_repr_type', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{"a"!r:d}"\n    return 0\n}\n'),
+    ('fs_plus_str', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 5\n    let s: str = "a" + f"{n}"\n    return 0\n}\n'),
+    ('fs_plus_str_left', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 5\n    let s: str = f"{n}" + "a"\n    return 0\n}\n'),
+    ('fs_lex_dollar', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{1 $ 2}"\n    return 0\n}\n'),
+    ('fs_lex_at', 'import std.io\nfn main() -> i32 {\n    let s: str = f"ab {1 @ 2} {3 $ 4}"\n    return 0\n}\n'),
+    ('fs_lex_backslash', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{\\x27a}"\n    return 0\n}\n'),
+    ('nogc_lambda_call', 'fn cold(a: i32) -> i32 { return a }\n#[no_gc]\nfn quick(n: i32) -> i32 {\n    let f: fn(i32) -> i32 = fn(a: i32) -> i32 { return cold(a) }\n    return f(n)\n}\nfn main() -> i32 {\n    return quick(2)\n}\n'),
+    ('nogc_lambda_alloc', 'gc class Dummy { v: i64 }\n#[no_gc]\nfn quick(n: i32) -> AllocError!i32 {\n    let f: fn(i32) -> AllocError!i32 = fn(a: i32) -> AllocError!i32 {\n        let d: Gc[Dummy] = try gc Dummy { v: 1 }\n        return a\n    }\n    return f(n)\n}\nfn main() -> i32 {\n    return quick(2) catch 91\n}\n'),
 ]
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)
