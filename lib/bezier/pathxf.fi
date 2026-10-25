@@ -1,0 +1,354 @@
+import std.vec
+import std.math
+import html.mem
+import svg.path
+import bezier.geom
+import bezier.cubic
+import bezier.nodes
+
+export {
+    KIND_ANCHOR, KIND_HANDLE,
+    path_apply, path_transformed, path_translate, path_scale, path_rotate,
+    path_mirror_h, path_mirror_v, path_bounds,
+    path_nearest, path_point_kind, path_hit_segment,
+    path_split_at, path_move_node, path_delete_node, path_set_mode,
+}
+
+const KIND_ANCHOR: u32 = 0
+const KIND_HANDLE: u32 = 1
+
+fn pt_ptr(p: *mut path.Path, i: usize) -> *mut f64 {
+    return (mem.buf_ptr(&(*p).pt) as u64 + (i * 16) as u64) as *mut f64
+}
+
+fn path_apply(p: *mut path.Path, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
+    let n: usize = path.path_points(p)
+    var i: usize = 0
+    while i < n {
+        let q: *mut f64 = pt_ptr(p, i)
+        let x: f64 = *q
+        let y: f64 = *((q as u64 + 8) as *mut f64)
+        *q = a * x + c * y + e
+        *((q as u64 + 8) as *mut f64) = b * x + d * y + f
+        i = i + 1
+    }
+    let lx: f64 = (*p).lx
+    let ly: f64 = (*p).ly
+    (*p).lx = a * lx + c * ly + e
+    (*p).ly = b * lx + d * ly + f
+    let ax: f64 = (*p).ax
+    let ay: f64 = (*p).ay
+    (*p).ax = a * ax + c * ay + e
+    (*p).ay = b * ax + d * ay + f
+}
+
+fn path_transformed(src: *mut path.Path, dst: *mut path.Path, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
+    path.path_empty(dst)
+    path.path_copy(dst, src)
+    path_apply(dst, a, b, c, d, e, f)
+}
+
+fn path_translate(p: *mut path.Path, dx: f64, dy: f64) {
+    path_apply(p, 1.0, 0.0, 0.0, 1.0, dx, dy)
+}
+
+fn path_scale(p: *mut path.Path, sx: f64, sy: f64, cx: f64, cy: f64) {
+    path_apply(p, sx, 0.0, 0.0, sy, cx - sx * cx, cy - sy * cy)
+}
+
+fn path_rotate(p: *mut path.Path, angle: f64, cx: f64, cy: f64) {
+    let co: f64 = math.cos(angle)
+    let si: f64 = math.sin(angle)
+    path_apply(p, co, si, -si, co, cx - co * cx + si * cy, cy - si * cx - co * cy)
+}
+
+fn path_mirror_h(p: *mut path.Path, cx: f64) {
+    path_apply(p, -1.0, 0.0, 0.0, 1.0, 2.0 * cx, 0.0)
+}
+
+fn path_mirror_v(p: *mut path.Path, cy: f64) {
+    path_apply(p, 1.0, 0.0, 0.0, -1.0, 0.0, 2.0 * cy)
+}
+
+fn path_bounds(p: *mut path.Path, out: *mut Vec[f64]) {
+    vec_clear[f64](out)
+    let n: usize = path.path_points(p)
+    if n == 0 {
+        return
+    }
+    var x0: f64 = path.path_px(p, 0)
+    var y0: f64 = path.path_py(p, 0)
+    var x1: f64 = x0
+    var y1: f64 = y0
+    var i: usize = 1
+    while i < n {
+        let x: f64 = path.path_px(p, i)
+        let y: f64 = path.path_py(p, i)
+        if x < x0 { x0 = x }
+        if y < y0 { y0 = y }
+        if x > x1 { x1 = x }
+        if y > y1 { y1 = y }
+        i = i + 1
+    }
+    geom.pts_add(out, x0, y0)
+    geom.pts_add(out, x1, y1)
+}
+
+fn path_nearest(p: *mut path.Path, x: f64, y: f64, idx: *mut usize, d: *mut f64) -> bool {
+    let n: usize = path.path_points(p)
+    if n == 0 {
+        return false
+    }
+    var best: f64 = 1e300
+    var bi: usize = 0
+    var i: usize = 0
+    while i < n {
+        let q: f64 = geom.dist2(x, y, path.path_px(p, i), path.path_py(p, i))
+        if q < best {
+            best = q
+            bi = i
+        }
+        i = i + 1
+    }
+    *idx = bi
+    *d = math.sqrt(best)
+    return true
+}
+
+fn path_point_kind(p: *mut path.Path, idx: usize) -> u32 {
+    let nv: usize = path.path_verbs(p)
+    var pi: usize = 0
+    var i: usize = 0
+    while i < nv {
+        let v: u32 = path.path_verb(p, i)
+        var cnt: usize = 0
+        if v == path.V_ZUG || v == path.V_LINE {
+            cnt = 1
+        } else if v == path.V_QUAD {
+            cnt = 2
+        } else if v == path.V_CUBIC {
+            cnt = 3
+        }
+        if idx < pi + cnt {
+            if idx == pi + cnt - 1 {
+                return KIND_ANCHOR
+            }
+            return KIND_HANDLE
+        }
+        pi = pi + cnt
+        i = i + 1
+    }
+    return KIND_ANCHOR
+}
+
+fn segment_cubic(p: *mut path.Path, seg: usize, c: *mut cubic.Cub) -> bool {
+    let nv: usize = path.path_verbs(p)
+    var pi: usize = 0
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var i: usize = 0
+    while i < nv {
+        let v: u32 = path.path_verb(p, i)
+        var ex: f64 = cx
+        var ey: f64 = cy
+        var ok: bool = false
+        if v == path.V_ZUG {
+            cx = path.path_px(p, pi)
+            cy = path.path_py(p, pi)
+            sx = cx
+            sy = cy
+            pi = pi + 1
+        } else if v == path.V_LINE {
+            ex = path.path_px(p, pi)
+            ey = path.path_py(p, pi)
+            pi = pi + 1
+            if i == seg {
+                cubic.cub_set(c, cx, cy, cx, cy, ex, ey, ex, ey)
+                ok = true
+            }
+        } else if v == path.V_QUAD {
+            let qx: f64 = path.path_px(p, pi)
+            let qy: f64 = path.path_py(p, pi)
+            ex = path.path_px(p, pi + 1)
+            ey = path.path_py(p, pi + 1)
+            pi = pi + 2
+            if i == seg {
+                cubic.cub_set(c, cx, cy, cx + (qx - cx) * 2.0 / 3.0, cy + (qy - cy) * 2.0 / 3.0, ex + (qx - ex) * 2.0 / 3.0, ey + (qy - ey) * 2.0 / 3.0, ex, ey)
+                ok = true
+            }
+        } else if v == path.V_CUBIC {
+            ex = path.path_px(p, pi + 2)
+            ey = path.path_py(p, pi + 2)
+            if i == seg {
+                cubic.cub_set(c, cx, cy, path.path_px(p, pi), path.path_py(p, pi), path.path_px(p, pi + 1), path.path_py(p, pi + 1), ex, ey)
+                ok = true
+            }
+            pi = pi + 3
+        } else if v == path.V_ZU {
+            ex = sx
+            ey = sy
+            if i == seg {
+                cubic.cub_set(c, cx, cy, cx, cy, sx, sy, sx, sy)
+                ok = true
+            }
+        }
+        if ok {
+            return true
+        }
+        if v != path.V_ZUG {
+            cx = ex
+            cy = ey
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn path_hit_segment(p: *mut path.Path, x: f64, y: f64, seg: *mut usize, t: *mut f64, d: *mut f64) -> bool {
+    let nv: usize = path.path_verbs(p)
+    var c: cubic.Cub = cubic.Cub { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, x2: 0.0, y2: 0.0, x3: 0.0, y3: 0.0 }
+    var best: f64 = 1e300
+    var bs: usize = 0
+    var bt: f64 = 0.0
+    var found: bool = false
+    var i: usize = 0
+    while i < nv {
+        let v: u32 = path.path_verb(p, i)
+        if v != path.V_ZUG && segment_cubic(p, i, &c) {
+            var lo: f64 = 0.0
+            var hi: f64 = 1.0
+            var round: usize = 0
+            var seg_best: f64 = 1e300
+            var seg_t: f64 = 0.0
+            while round < 3 {
+                var k: usize = 0
+                var px: f64 = cubic.cub_x(&c, lo)
+                var py: f64 = cubic.cub_y(&c, lo)
+                var round_t: f64 = seg_t
+                while k < 32 {
+                    let t1: f64 = lo + (hi - lo) * ((k + 1) as f64) / 32.0
+                    let t0: f64 = lo + (hi - lo) * (k as f64) / 32.0
+                    let nx: f64 = cubic.cub_x(&c, t1)
+                    let ny: f64 = cubic.cub_y(&c, t1)
+                    let s: f64 = geom.seg_param(x, y, px, py, nx, ny)
+                    let dd: f64 = geom.seg_dist(x, y, px, py, nx, ny)
+                    if dd < seg_best {
+                        seg_best = dd
+                        round_t = t0 + (t1 - t0) * s
+                    }
+                    px = nx
+                    py = ny
+                    k = k + 1
+                }
+                seg_t = round_t
+                let w: f64 = (hi - lo) / 16.0
+                lo = seg_t - w
+                hi = seg_t + w
+                if lo < 0.0 { lo = 0.0 }
+                if hi > 1.0 { hi = 1.0 }
+                round = round + 1
+            }
+            if seg_best < best {
+                best = seg_best
+                bs = i
+                bt = seg_t
+                found = true
+            }
+        }
+        i = i + 1
+    }
+    if found {
+        *seg = bs
+        *t = bt
+        *d = best
+    }
+    return found
+}
+
+fn path_split_at(src: *mut path.Path, seg: usize, t: f64, dst: *mut path.Path) -> bool {
+    var ns: nodes.NodeSet = nodes.ns_new()
+    var pmap: Vec[u32] = vec_new[u32]()
+    var smap: Vec[u32] = vec_new[u32]()
+    nodes.ns_from_path(src, &ns, &pmap, &smap)
+    var ok: bool = false
+    if seg < vec_len[u32](&smap) && smap[seg] != nodes.NONE as u32 {
+        ok = nodes.ns_insert(&ns, smap[seg] as usize, t) != nodes.NONE
+    }
+    path.path_empty(dst)
+    nodes.ns_to_path(&ns, dst)
+    nodes.ns_free(&ns)
+    vec_free[u32](&pmap)
+    vec_free[u32](&smap)
+    return ok
+}
+
+fn path_move_node(src: *mut path.Path, idx: usize, x: f64, y: f64, mode: u32, dst: *mut path.Path) -> bool {
+    var ns: nodes.NodeSet = nodes.ns_new()
+    var pmap: Vec[u32] = vec_new[u32]()
+    var smap: Vec[u32] = vec_new[u32]()
+    nodes.ns_from_path(src, &ns, &pmap, &smap)
+    var ok: bool = false
+    if idx < vec_len[u32](&pmap) {
+        let node: usize = pmap[idx] as usize / 3
+        let role: usize = pmap[idx] as usize % 3
+        if role == 0 {
+            nodes.ns_move_anchor(&ns, node, x, y)
+        } else {
+            nodes.ns_move_handle(&ns, node, role, x, y, mode)
+        }
+        ok = true
+    }
+    path.path_empty(dst)
+    nodes.ns_to_path(&ns, dst)
+    nodes.ns_free(&ns)
+    vec_free[u32](&pmap)
+    vec_free[u32](&smap)
+    return ok
+}
+
+fn path_delete_node(src: *mut path.Path, idx: usize, dst: *mut path.Path) -> bool {
+    var ns: nodes.NodeSet = nodes.ns_new()
+    var pmap: Vec[u32] = vec_new[u32]()
+    var smap: Vec[u32] = vec_new[u32]()
+    nodes.ns_from_path(src, &ns, &pmap, &smap)
+    var ok: bool = false
+    if idx < vec_len[u32](&pmap) {
+        let node: usize = pmap[idx] as usize / 3
+        let role: usize = pmap[idx] as usize % 3
+        if role == 0 {
+            nodes.ns_delete(&ns, node)
+        } else {
+            nodes.ns_retract_handle(&ns, node, role)
+        }
+        ok = true
+    }
+    path.path_empty(dst)
+    nodes.ns_to_path(&ns, dst)
+    nodes.ns_free(&ns)
+    vec_free[u32](&pmap)
+    vec_free[u32](&smap)
+    return ok
+}
+
+fn path_set_mode(src: *mut path.Path, idx: usize, mode: u32, dst: *mut path.Path) -> bool {
+    var ns: nodes.NodeSet = nodes.ns_new()
+    var pmap: Vec[u32] = vec_new[u32]()
+    var smap: Vec[u32] = vec_new[u32]()
+    nodes.ns_from_path(src, &ns, &pmap, &smap)
+    var ok: bool = false
+    if idx < vec_len[u32](&pmap) {
+        let node: usize = pmap[idx] as usize / 3
+        if nodes.ns_has_out(&ns, node) && nodes.ns_has_in(&ns, node) && mode != nodes.NODE_CORNER {
+            nodes.ns_move_handle(&ns, node, 2, nodes.ns_get(&ns, node, 4), nodes.ns_get(&ns, node, 5), mode)
+            ok = true
+        }
+    }
+    path.path_empty(dst)
+    nodes.ns_to_path(&ns, dst)
+    nodes.ns_free(&ns)
+    vec_free[u32](&pmap)
+    vec_free[u32](&smap)
+    return ok
+}

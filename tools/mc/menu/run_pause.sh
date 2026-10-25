@@ -85,5 +85,60 @@ fi
 wait $PP; [ $? -eq 0 ] || { echo "  FAIL  exit code"; ERR=1; }
 grep -q '^opt_fov=110' "$W/p.cfg" || { echo "  FAIL  opt_fov=110 not in cfg"; grep opt_ "$W/p.cfg"; ERR=1; }
 grep -q 'key.forward=36' "$W/p_keys.cfg" 2>/dev/null || { echo "  FAIL  key.forward=36 not in key file"; cat "$W/p_keys.cfg" 2>/dev/null | head -5; ERR=1; }
+
+printf 'name=ReturnR\nprotocol=763\nview=3\nhost=127.0.0.1\nport=%s\n' "$PORT" > "$W/r.cfg"
+joins() { grep -c "ReturnR joined the game" "$W/server.log"; }
+wait_joins() { local i; for i in $(seq 1 "$2"); do [ "$(joins)" -ge "$1" ] && return 0; sleep 1; done; return 1; }
+sample() { echo "$(awk '/VmRSS/{print $2}' /proc/$RP/status 2>/dev/null) $(ls /proc/$RP/fd 2>/dev/null | wc -l)"; }
+disconnect() { sleep 8; key "$1" Escape; click "$1" 426 348; sleep 4; }
+join_row() { local w; w=$(win) || return 1; xdotool windowfocus "$w" 2>/dev/null; xdotool mousemove --window "$w" 5 5; sleep 1.5; click "$w" 426 284; click "$w" 426 92; click "$w" 218 396; }
+MCPLAY_CONFIG="$W/r.cfg" MCPLAY_START_AUTO=1 "$W/mcplay" > "$W/R.out" 2>&1 & RP=$!
+( sleep 600; kill "$RP" 2>/dev/null ) & WD=$!
+if wait_joins 1 120; then
+  WR=$(win) || WR=""
+  [ -n "$WR" ] || { echo "  FAIL  R: no window in session 1"; ERR=1; }
+  [ -n "$WR" ] && { xdotool windowfocus "$WR" 2>/dev/null; disconnect "$WR"; }
+  kill -0 "$RP" 2>/dev/null || { echo "  FAIL  R: mcplay exited on Disconnect instead of returning to the title screen"; ERR=1; }
+  S1=$(sample)
+  WR=$(win) || WR=""
+  if [ -n "$WR" ]; then
+    xdotool windowfocus "$WR" 2>/dev/null; xdotool mousemove --window "$WR" 5 5; sleep 1.5
+    click "$WR" 426 284; click "$WR" 634 396
+    xdotool type --delay 80 "127.0.0.1:$PORT"; sleep 0.5
+    click "$WR" 426 356; click "$WR" 426 92; click "$WR" 218 396
+  fi
+  wait_joins 2 120 || { echo "  FAIL  R: no second join after Disconnect"; ERR=1; }
+  WR=$(win) || WR=""
+  [ -n "$WR" ] && { xdotool windowfocus "$WR" 2>/dev/null; disconnect "$WR"; }
+  S2=$(sample)
+  join_row
+  wait_joins 3 120 || { echo "  FAIL  R: no third join"; ERR=1; }
+  WR=$(win) || WR=""
+  [ -n "$WR" ] && { xdotool windowfocus "$WR" 2>/dev/null; disconnect "$WR"; }
+  S3=$(sample)
+  join_row
+  wait_joins 4 120 || { echo "  FAIL  R: no fourth join"; ERR=1; }
+  sleep 6
+  echo "kick ReturnR Boom" >&3
+  sleep 5
+  grep -q "returning to the title screen: Boom" "$W/R.out" || { echo "  FAIL  R: kick reason not shown"; grep "returning" "$W/R.out" | head -3; ERR=1; }
+  WR=$(win) || WR=""
+  if [ -n "$WR" ]; then
+    xdotool windowfocus "$WR" 2>/dev/null; xdotool mousemove --window "$WR" 5 5; sleep 1
+    shot "$WR" kicked && python3 -I -c "from PIL import Image; Image.open('$W/kicked.ppm').save('$W/kicked.png')" 2>/dev/null
+    key "$WR" Escape; key "$WR" Escape
+    click "$WR" 528 404
+  fi
+  echo "  samples rss_kb/fds: $S1 | $S2 | $S3"
+  R1=${S1% *}; F1=${S1#* }; R3=${S3% *}; F3=${S3#* }
+  [ -n "$R1" ] && [ -n "$R3" ] && [ $((R3 - R1)) -le 20000 ] || { echo "  FAIL  R: RSS grew by more than 20 MB over 2 cycles ($R1 -> $R3 kB)"; ERR=1; }
+  [ -n "$F1" ] && [ -n "$F3" ] && [ $((F3 - F1)) -le 2 ] || { echo "  FAIL  R: open handles grew ($F1 -> $F3)"; ERR=1; }
+else
+  echo "  FAIL  R: no join"; ERR=1
+fi
+wait $RP; RC=$?
+kill $WD 2>/dev/null
+[ $RC -eq 0 ] || { echo "  FAIL  R: exit code $RC"; ERR=1; }
+[ "$(grep -c '^mcplay: end frames=' "$W/R.out")" -ge 4 ] || { echo "  FAIL  R: fewer than 4 session ends"; ERR=1; }
 [ $ERR -eq 0 ] && echo "RESULT mc-pause: ok" || echo "RESULT mc-pause: FAIL"
 exit $ERR

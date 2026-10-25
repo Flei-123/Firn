@@ -1,0 +1,311 @@
+import std.vec
+import std.math
+import std.mathx
+import svg.path
+import bezier.geom
+import bezier.fit
+import bezier.flatten
+import bezier.simplify
+
+export {
+    CAP_ROUND, CAP_FLAT, CAP_SQUARE, JOIN_ROUND, JOIN_BEVEL, JOIN_MITER,
+    stroke, stroke_uniform, stroke_path,
+}
+
+const CAP_ROUND: u32 = 0
+const CAP_FLAT: u32 = 1
+const CAP_SQUARE: u32 = 2
+const JOIN_ROUND: u32 = 0
+const JOIN_BEVEL: u32 = 1
+const JOIN_MITER: u32 = 2
+
+const SHARP_TURN: f64 = 0.5
+const MITER_LIMIT: f64 = 4.0
+
+struct Side {
+    pts: Vec[f64],
+    hard: Vec[u32],
+}
+
+fn side_new() -> Side {
+    return Side { pts: geom.pts_new(), hard: vec_new[u32]() }
+}
+
+fn side_free(s: *mut Side) {
+    geom.pts_free(&(*s).pts)
+    vec_free[u32](&(*s).hard)
+}
+
+fn side_add(s: *mut Side, x: f64, y: f64, hard: bool) {
+    if hard {
+        vec_push[u32](&(*s).hard, geom.pts_n(&(*s).pts) as u32)
+    }
+    geom.pts_add(&(*s).pts, x, y)
+}
+
+fn arc_step(r: f64, maxerr: f64) -> f64 {
+    if r <= maxerr {
+        return 1.0
+    }
+    var c: f64 = 1.0 - maxerr / r
+    if c < 0.0 {
+        c = 0.0
+    }
+    var st: f64 = 2.0 * mathx.acos(c)
+    if st > 0.5 {
+        st = 0.5
+    }
+    if st < 0.02 {
+        st = 0.02
+    }
+    return st
+}
+
+fn arc_add(s: *mut Side, cx: f64, cy: f64, r: f64, a0: f64, sweep: f64, maxerr: f64, with_ends: bool) {
+    let st: f64 = arc_step(r, maxerr)
+    var n: usize = math.ceil(math.fabs(sweep) / st) as usize
+    if n < 1 {
+        n = 1
+    }
+    var k: usize = if with_ends { 0 } else { 1 }
+    let top: usize = if with_ends { n } else { n - 1 }
+    while k <= top {
+        let a: f64 = a0 + sweep * (k as f64) / (n as f64)
+        side_add(s, cx + r * math.cos(a), cy + r * math.sin(a), with_ends && (k == 0 || k == n))
+        k = k + 1
+    }
+}
+
+fn offset_vertex(s: *mut Side, px: f64, py: f64, hw: f64, side_sign: f64, n0x: f64, n0y: f64, n1x: f64, n1y: f64, turn: f64, join: u32, maxerr: f64) {
+    let ax: f64 = n0x * side_sign
+    let ay: f64 = n0y * side_sign
+    let bx: f64 = n1x * side_sign
+    let by: f64 = n1y * side_sign
+    if math.fabs(turn) <= SHARP_TURN {
+        let k: f64 = 1.0 + ax * bx + ay * by
+        side_add(s, px + hw * (ax + bx) / k, py + hw * (ay + by) / k, false)
+        return
+    }
+    let outer: bool = turn * side_sign < 0.0
+    if !outer {
+        side_add(s, px + ax * hw, py + ay * hw, true)
+        side_add(s, px, py, true)
+        side_add(s, px + bx * hw, py + by * hw, true)
+        return
+    }
+    if join == JOIN_ROUND {
+        arc_add(s, px, py, hw, math.atan2(ay, ax), turn, maxerr, true)
+        return
+    }
+    if join == JOIN_MITER {
+        let k: f64 = 1.0 + ax * bx + ay * by
+        let ml: f64 = 2.0 / k
+        if ml <= MITER_LIMIT * MITER_LIMIT {
+            side_add(s, px + hw * (ax + bx) / k, py + hw * (ay + by) / k, true)
+            return
+        }
+    }
+    side_add(s, px + ax * hw, py + ay * hw, true)
+    side_add(s, px + bx * hw, py + by * hw, true)
+}
+
+fn build_side(xs: *mut Vec[f64], ws: *mut Vec[f64], m: usize, side_sign: f64, join: u32, maxerr: f64, out: *mut Side) {
+    var i: usize = 0
+    while i < m {
+        let px: f64 = geom.pts_x(xs, i)
+        let py: f64 = geom.pts_y(xs, i)
+        let hw: f64 = (*ws)[i] * 0.5
+        var n0x: f64 = 0.0
+        var n0y: f64 = 0.0
+        var n1x: f64 = 0.0
+        var n1y: f64 = 0.0
+        if i > 0 {
+            let dx: f64 = px - geom.pts_x(xs, i - 1)
+            let dy: f64 = py - geom.pts_y(xs, i - 1)
+            let l: f64 = geom.len2(dx, dy)
+            n0x = -dy / l
+            n0y = dx / l
+        }
+        if i + 1 < m {
+            let dx: f64 = geom.pts_x(xs, i + 1) - px
+            let dy: f64 = geom.pts_y(xs, i + 1) - py
+            let l: f64 = geom.len2(dx, dy)
+            n1x = -dy / l
+            n1y = dx / l
+        }
+        if i == 0 {
+            n0x = n1x
+            n0y = n1y
+        }
+        if i + 1 == m {
+            n1x = n0x
+            n1y = n0y
+        }
+        let turn: f64 = math.atan2(n0x * n1y - n0y * n1x, n0x * n1x + n0y * n1y)
+        offset_vertex(out, px, py, hw, side_sign, n0x, n0y, n1x, n1y, turn, join, maxerr)
+        i = i + 1
+    }
+}
+
+fn dot_shape(px: f64, py: f64, w: f64, cap: u32, maxerr: f64, out: *mut path.Path) {
+    var s: Side = side_new()
+    let hw: f64 = w * 0.5
+    if cap == CAP_ROUND {
+        arc_add(&s, px, py, hw, 0.0, 2.0 * math.PI(), maxerr, true)
+        s.pts.len = s.pts.len - 2
+        fit.fit_loop(&s.pts, geom.pts_n(&s.pts), maxerr, 50.0, out)
+    } else {
+        side_add(&s, px - hw, py - hw, true)
+        side_add(&s, px + hw, py - hw, true)
+        side_add(&s, px + hw, py + hw, true)
+        side_add(&s, px - hw, py + hw, true)
+        fit.fit_loop_cuts(&s.pts, 4, &s.hard, maxerr, out)
+    }
+    side_free(&s)
+}
+
+fn mark(v: *mut Vec[u32], i: usize) {
+    vec_push[u32](v, i as u32)
+}
+
+fn stroke(pts: *mut Vec[f64], widths: *mut Vec[f64], n: usize, cap: u32, join: u32, maxerr: f64, out: *mut path.Path) {
+    var xs: Vec[f64] = geom.pts_new()
+    var ws: Vec[f64] = geom.pts_new()
+    var i: usize = 0
+    while i < n {
+        let x: f64 = geom.pts_x(pts, i)
+        let y: f64 = geom.pts_y(pts, i)
+        let m: usize = geom.pts_n(&xs)
+        if m == 0 || geom.dist(x, y, geom.pts_x(&xs, m - 1), geom.pts_y(&xs, m - 1)) > 1e-6 {
+            geom.pts_add(&xs, x, y)
+            vec_push[f64](&ws, (*widths)[i])
+        }
+        i = i + 1
+    }
+    let m: usize = geom.pts_n(&xs)
+    if m == 1 {
+        dot_shape(geom.pts_x(&xs, 0), geom.pts_y(&xs, 0), ws[0], cap, maxerr, out)
+    }
+    if m >= 2 {
+        var left: Side = side_new()
+        var right: Side = side_new()
+        build_side(&xs, &ws, m, 1.0, join, maxerr, &left)
+        build_side(&xs, &ws, m, -1.0, join, maxerr, &right)
+        var loop_pts: Vec[f64] = geom.pts_new()
+        var hard: Vec[u32] = vec_new[u32]()
+        let ln: usize = geom.pts_n(&left.pts)
+        let rn: usize = geom.pts_n(&right.pts)
+        i = 0
+        while i < ln {
+            geom.pts_add(&loop_pts, geom.pts_x(&left.pts, i), geom.pts_y(&left.pts, i))
+            i = i + 1
+        }
+        i = 0
+        while i < vec_len[u32](&left.hard) {
+            mark(&hard, left.hard[i] as usize)
+            i = i + 1
+        }
+        let ex: f64 = geom.pts_x(&xs, m - 1)
+        let ey: f64 = geom.pts_y(&xs, m - 1)
+        let ehw: f64 = ws[m - 1] * 0.5
+        var edx: f64 = ex - geom.pts_x(&xs, m - 2)
+        var edy: f64 = ey - geom.pts_y(&xs, m - 2)
+        var el: f64 = geom.len2(edx, edy)
+        edx = edx / el
+        edy = edy / el
+        if cap == CAP_ROUND {
+            var cs: Side = side_new()
+            arc_add(&cs, ex, ey, ehw, math.atan2(edx, -edy), -math.PI(), maxerr, false)
+            i = 0
+            while i < geom.pts_n(&cs.pts) {
+                geom.pts_add(&loop_pts, geom.pts_x(&cs.pts, i), geom.pts_y(&cs.pts, i))
+                i = i + 1
+            }
+            side_free(&cs)
+        } else {
+            mark(&hard, geom.pts_n(&loop_pts) - 1)
+            if cap == CAP_SQUARE {
+                geom.pts_add(&loop_pts, geom.pts_x(&left.pts, ln - 1) + edx * ehw, geom.pts_y(&left.pts, ln - 1) + edy * ehw)
+                mark(&hard, geom.pts_n(&loop_pts) - 1)
+                geom.pts_add(&loop_pts, geom.pts_x(&right.pts, rn - 1) + edx * ehw, geom.pts_y(&right.pts, rn - 1) + edy * ehw)
+                mark(&hard, geom.pts_n(&loop_pts) - 1)
+            }
+            mark(&hard, geom.pts_n(&loop_pts))
+        }
+        let base: usize = geom.pts_n(&loop_pts)
+        i = 0
+        while i < rn {
+            let j: usize = rn - 1 - i
+            geom.pts_add(&loop_pts, geom.pts_x(&right.pts, j), geom.pts_y(&right.pts, j))
+            i = i + 1
+        }
+        i = 0
+        while i < vec_len[u32](&right.hard) {
+            mark(&hard, base + (rn - 1 - right.hard[i] as usize))
+            i = i + 1
+        }
+        let sx: f64 = geom.pts_x(&xs, 0)
+        let sy: f64 = geom.pts_y(&xs, 0)
+        let shw: f64 = ws[0] * 0.5
+        var sdx: f64 = geom.pts_x(&xs, 1) - sx
+        var sdy: f64 = geom.pts_y(&xs, 1) - sy
+        let sl: f64 = geom.len2(sdx, sdy)
+        sdx = sdx / sl
+        sdy = sdy / sl
+        if cap == CAP_ROUND {
+            var cs: Side = side_new()
+            arc_add(&cs, sx, sy, shw, math.atan2(-sdx, sdy), -math.PI(), maxerr, false)
+            i = 0
+            while i < geom.pts_n(&cs.pts) {
+                geom.pts_add(&loop_pts, geom.pts_x(&cs.pts, i), geom.pts_y(&cs.pts, i))
+                i = i + 1
+            }
+            side_free(&cs)
+        } else {
+            mark(&hard, geom.pts_n(&loop_pts) - 1)
+            if cap == CAP_SQUARE {
+                geom.pts_add(&loop_pts, geom.pts_x(&right.pts, 0) - sdx * shw, geom.pts_y(&right.pts, 0) - sdy * shw)
+                mark(&hard, geom.pts_n(&loop_pts) - 1)
+                geom.pts_add(&loop_pts, geom.pts_x(&left.pts, 0) - sdx * shw, geom.pts_y(&left.pts, 0) - sdy * shw)
+                mark(&hard, geom.pts_n(&loop_pts) - 1)
+            }
+            mark(&hard, 0)
+        }
+        fit.fit_loop_cuts(&loop_pts, geom.pts_n(&loop_pts), &hard, maxerr, out)
+        side_free(&left)
+        side_free(&right)
+        geom.pts_free(&loop_pts)
+        vec_free[u32](&hard)
+    }
+    geom.pts_free(&xs)
+    geom.pts_free(&ws)
+}
+
+fn stroke_uniform(pts: *mut Vec[f64], n: usize, width: f64, cap: u32, join: u32, maxerr: f64, out: *mut path.Path) {
+    var ws: Vec[f64] = geom.pts_new()
+    var i: usize = 0
+    while i < n {
+        vec_push[f64](&ws, width)
+        i = i + 1
+    }
+    stroke(pts, &ws, n, cap, join, maxerr, out)
+    geom.pts_free(&ws)
+}
+
+fn stroke_path(p: *mut path.Path, width: f64, cap: u32, join: u32, maxerr: f64, out: *mut path.Path) {
+    var poly: geom.Poly = geom.poly_new()
+    flatten.path_flatten(p, maxerr * 0.25, &poly)
+    var c: usize = 0
+    while c < geom.poly_contours(&poly) {
+        var v: Vec[f64] = geom.pts_new()
+        var i: usize = geom.poly_start(&poly, c)
+        while i < geom.poly_end(&poly, c) {
+            geom.pts_add(&v, geom.poly_x(&poly, i), geom.poly_y(&poly, i))
+            i = i + 1
+        }
+        stroke_uniform(&v, geom.pts_n(&v), width, cap, join, maxerr, out)
+        geom.pts_free(&v)
+        c = c + 1
+    }
+    geom.poly_free(&poly)
+}
