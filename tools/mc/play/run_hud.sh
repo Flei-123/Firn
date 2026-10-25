@@ -24,7 +24,13 @@ fail() { echo "  FAIL  $1"; echo "RESULT mc-hud: FAIL"; exit 1; }
 for t in Xvfb java xdotool xwd python3; do command -v $t >/dev/null || fail "missing tool: $t"; done
 [ $PLAIN -eq 1 ] || [ -f "$MC_VANILLA_JAR" ] || fail "missing $MC_VANILLA_JAR"
 ERR=0
-$FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
+WINE_RUN=${HUD_WINE:-0}
+if [ "$WINE_RUN" = 1 ]; then
+  command -v wine >/dev/null || fail "missing tool: wine"
+  $FIRNC --target=x86_64-windows --opt-level=dev-fast -o "$W/mcplay.exe" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not cross-compile"; }
+else
+  $FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
+fi
 mkdir -p "$W/srv"
 MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
@@ -51,20 +57,28 @@ SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
 DN=$(bash tools/mc/pick_display.sh 90 100)
-Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
+Xvfb :$DN -screen 0 ${HUD_XVFB:-1024x600x24} >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
-export FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_FPS=30 MCPLAY_W=854 MCPLAY_H=480 MCPLAY_LOG=- MCPLAY_CREATIVE=0
+export FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_FPS=30 MCPLAY_W=854 MCPLAY_H=${HUD_WIN_H:-480} MCPLAY_LOG=- MCPLAY_CREATIVE=0
 CHECK=tools/mc/play/hud_check.py
 wait_log() { local i; for i in $(seq 1 "$2"); do grep -qE "$1" "$W/server.log" && return 0; sleep 1; done; return 1; }
 win() { local i w; for i in $(seq 1 30); do w=$(xdotool search --name mcplay 2>/dev/null | head -1); [ -n "$w" ] && { echo "$w"; return 0; }; sleep 0.5; done; return 1; }
 click() { xdotool mousemove --window "$1" "$2" "$3"; sleep 0.25; xdotool mousedown 1; sleep 0.2; xdotool mouseup 1; sleep 0.6; }
 shot() { xwd -id "$1" -silent -out "$W/$2.xwd" && python3 -I tools/mc/menu/xwd_to_ppm.py "$W/$2.xwd" "$W/$2.ppm"; }
 check() { xdotool mousemove --window "$1" 5 5; sleep 0.8; if shot "$1" "$2"; then python3 -I "$CHECK" "$W/$2.ppm" "$MC_VANILLA_JAR" "$2" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')"; }; else echo "  FAIL  screenshot $2"; ERR=1; fi; }
-key() { xdotool key --window "$1" "$2"; sleep 0.8; }
+key() { if [ "$WINE_RUN" = 1 ]; then xdotool windowfocus "$1" 2>/dev/null; xdotool key "$2"; else xdotool key --window "$1" "$2"; fi; sleep 0.8; }
 
 printf 'name=HudP\nprotocol=%s\nview=3\n' "$PROTO" > "$W/p.cfg"
-MCPLAY_CONFIG="$W/p.cfg" MCPLAY_PROTOCOL=$PROTO MCPLAY_RUN_S=90 "$W/mcplay" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
+if [ "$WINE_RUN" = 1 ]; then
+  export WINEPREFIX="$W/wp" WINEDEBUG=-all WINEARCH=win64
+  wine wineboot -i >/dev/null 2>&1
+  [ $PLAIN -eq 1 ] || export MC_VANILLA_JAR="Z:$MC_VANILLA_JAR"
+  MCPLAY_CONFIG="Z:$W/p.cfg" MCPLAY_PROTOCOL=$PROTO MCPLAY_RUN_S=90 wine "$W/mcplay.exe" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
+  MC_VANILLA_JAR=${MC_VANILLA_JAR#Z:}
+else
+  MCPLAY_CONFIG="$W/p.cfg" MCPLAY_PROTOCOL=$PROTO MCPLAY_RUN_S=90 "$W/mcplay" 127.0.0.1 $PORT HudP > "$W/P.out" 2>&1 & PP=$!
+fi
 wait_log "HudP joined the game" 120 || { echo "  FAIL  no join"; ERR=1; }
 WP=$(win) || { echo "  FAIL  no window"; ERR=1; WP=""; }
 hudcheck() { xdotool mousemove --window "$1" 5 5; sleep 0.8; shot "$1" "$2" && python3 -I "$CHECK" "$3" "$W/$2.ppm" "$MC_VANILLA_JAR" "$W/bars.ppm" || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/$2.ppm').save('$W/$2.png')" 2>/dev/null; }; }
@@ -79,6 +93,12 @@ if [ -n "$WP" ]; then
   key "$WP" F1
   hudcheck "$WP" hidden hidden
   key "$WP" F1
+  key "$WP" Escape
+  xdotool mousemove --window "$WP" 5 5; sleep 0.8
+  shot "$WP" pause && { python3 -I tools/mc/menu/pause_check.py "$W/pause.ppm" "$MC_VANILLA_JAR" pause || { ERR=1; python3 -I -c "from PIL import Image; Image.open('$W/pause.ppm').save('$W/pause.png')"; }; } || { echo "  FAIL  screenshot pause"; ERR=1; }
+  key "$WP" Escape
+  sleep 1
+  hudcheck "$WP" bars2 bars
   xdotool windowfocus "$WP" 2>/dev/null
   printf '%s\n' 'bossbar add hudtest {"text":"Boss"}' 'bossbar set minecraft:hudtest players @a' 'bossbar set minecraft:hudtest color red' 'bossbar set minecraft:hudtest value 100' 'scoreboard objectives add hudobj dummy {"text":"Sidebar"}' 'scoreboard objectives setdisplay sidebar hudobj' 'scoreboard players set Alpha hudobj 7' 'title @a title {"text":"HELLO"}' >&3
   sleep 1
