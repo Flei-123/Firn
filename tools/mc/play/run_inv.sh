@@ -352,9 +352,14 @@ PY
 # ---- anvil + enchanting table UI (MCPLAY_CONT_UI=1|2): the block is set next to the player, mcplay opens it with a right click packet and prints the cell centres.
 # anvil: pickaxe into the input slot, type "Bo e1" into the name field (E and the digit must not close the panel / swap), the server's result slot must fill (rename accepted).
 # enchanting table: pickaxe + 3 lapis in, click the first option; the server must enchant the pickaxe and take one lapis
+if [ "${RUN_INV_CONT:-0}" = 1 ]; then
+CJD="$W/cj"; CJAR=""
+MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_client.sh "$CJD" "$MCV" >/dev/null 2>&1 && CJAR="$CJD/client.jar"
+CJENV=(MC_VANILLA=1 "MC_VANILLA_JAR=$CJAR" "MC_VANILLA_ASSETS=${MC_VANILLA_ASSETS:-/root/.w5/menu-assets}" MC_VANILLA_INDEX=5)
+[ -n "$CJAR" ] || { echo "  FAIL  cont ui: no client jar for $MCV"; ERR=1; }
 ccell() { grep "contui cell $2 " "$W/$1.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
 cclick() { local xy; xy=$(ccell "$1" "$2"); [ -n "$xy" ] || { echo "  FAIL  cont ui: no cell $2"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.8; }
-MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player16 > "$W/an.out" 2>&1 &
 PP=$!
 sleep 5
@@ -385,7 +390,7 @@ ok=bool(w0) and int(w0.group(1))>=0 and int(w0.group(2))==1 and bool(w2) and int
 sys.exit(0 if ok else 1)
 PY
 case "$ANE" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;; *) echo "  FAIL  anvil ui: panel did not close / mouse not captured again: $ANE"; ERR=1;; esac
-MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=2 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=2 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player17 > "$W/en.out" 2>&1 &
 PP=$!
 sleep 5
@@ -420,6 +425,7 @@ cnt=re.search(r'(?:Count: |count: )(\d+)', lap.group(0)) if lap else None
 print("  server: pickaxe enchanted=%s lapis=%s" % (ench, cnt.group(1) if cnt else None))
 sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
 PY
+fi
 # ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &
