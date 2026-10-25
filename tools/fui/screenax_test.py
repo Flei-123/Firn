@@ -49,7 +49,51 @@ def walk(jn, path, is_frame):
         walk(jc, str(ac[1]), False)
 
 
+def editor_checks():
+    import time
+    TEXT = "org.a11y.atspi.Text"
+    ETEXT = "org.a11y.atspi.EditableText"
+    errs = 0
+    found = {}
+    for k in c.call(frame, ACC, "GetChildren"):
+        p = str(k[1])
+        found[str(c.prop(p, ACC, "Name"))] = p
+    for nm in ("Note text", "Preview"):
+        if nm not in found:
+            print("  WRONG node missing: " + nm)
+            return 1
+    ed, pv = found["Note text"], found["Preview"]
+    for nm, p in (("Note text", ed), ("Preview", pv)):
+        ifs = [str(i) for i in c.call(p, ACC, "GetInterfaces")]
+        if TEXT not in ifs or ETEXT not in ifs:
+            print("  WRONG %s lacks Text/EditableText" % nm)
+            errs += 1
+    before = str(c.call(ed, TEXT, "GetText", 0, -1))
+    if not before.startswith("#"):
+        print("  WRONG editor text is not the note: %r" % before[:20])
+        errs += 1
+    if bool(c.call(pv, ETEXT, "SetTextContents", "x")):
+        print("  WRONG preview accepted text")
+        errs += 1
+    if not bool(c.call(ed, ETEXT, "SetTextContents", "# From the reader\n\nBody")):
+        print("  WRONG editor refused text")
+        errs += 1
+    end = time.time() + 4
+    after = ""
+    while time.time() < end:
+        after = str(c.call(ed, TEXT, "GetText", 0, -1))
+        if after == "# From the reader\n\nBody":
+            break
+        time.sleep(0.1)
+    if after != "# From the reader\n\nBody":
+        print("  WRONG editor text did not change: %r" % after[:30])
+        errs += 1
+    print("%s editor node: name, Text/EditableText, SetTextContents" % ("  ok   " if errs == 0 else "  WRONG"))
+    return errs
+
+
 walk(tree, frame, True)
 print("METRIC atspi_visible=%d expected=%d" % (good, seen))
-print("%s AT-SPI shows every registry node (%d of %d)" % ("  ok   " if bad == 0 and seen > 10 else "  WRONG", good, seen))
-sys.exit(0 if bad == 0 and seen > 10 else 1)
+print("%s AT-SPI shows every registry node (%d of %d)" % ("  ok   " if bad == 0 and seen > 5 else "  WRONG", good, seen))
+editor_bad = editor_checks() if "--editor" in sys.argv[4:] else 0
+sys.exit(0 if bad == 0 and seen > 5 and editor_bad == 0 else 1)

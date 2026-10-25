@@ -27,4 +27,12 @@ R=$?
 DISPLAY=":$(cat "$D/disp")" xdotool search --name Settings windowfocus key Tab key Tab 2>/dev/null
 sleep 1
 kill -0 "$APID" 2>/dev/null || { echo "  WRONG the app died on Tab"; R=1; }
-exit $R
+[ $R -eq 0 ] || exit $R
+FIRNLIB="$PWD/lib" "$FIRNC" --opt-level=dev -o "$D/notes" examples/fui_apps/notes/main.fi || { echo "screenax: notes build failed"; exit 1; }
+FUI_DATA_DIR="$PWD/examples/fui_apps/data" "$D/notes" --theme dark --shot "$D/n.png" --ax "$D/ntree.json" || { echo "screenax: notes oracle failed"; exit 1; }
+kill "$APID" 2>/dev/null; wait "$APID" 2>/dev/null; sleep 1
+DISPLAY=":$(cat "$D/disp")" FUI_DATA_DIR="$PWD/examples/fui_apps/data" FUI_ATSPI="unix:path=$D/bus" "$D/notes" --theme dark >"$D/napp.log" 2>&1 &
+APID=$!
+sleep 3
+python3 -I tools/fui/screenax_test.py "unix:path=$D/bus" "$D/ntree.json" Notes --editor
+exit $?
