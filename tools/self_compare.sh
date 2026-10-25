@@ -107,6 +107,10 @@ while IFS= read -r f; do
     # different inputs. Since round 29 files with `import` count
     # as well: `firnc1` resolves them itself.
     if ! "$FIRNC" "$f" -o "$WORK/ref" 2>/dev/null; then
+        if [ ! -x "$FIRNC" ] || [ ! -x "$FC1" ]; then
+            echo "ABORT: compiler binary vanished mid-run (worktree or target dir removed): $FIRNC / $FC1"
+            exit 2
+        fi
         skipped=$((skipped+1))
         continue
     fi

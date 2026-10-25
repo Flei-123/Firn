@@ -1,0 +1,297 @@
+import std.rt
+import std.vec
+import svg.path
+import fontsrc.model
+import fontgen.fgbytes
+import fontgen.outline
+import fontgen.fgflatten
+
+export {
+    GInfo, GlyphSet,
+    glyphset_new, glyphset_free, glyphset_build,
+    glyphset_count, glyphset_info, gid_of_cp, glyphset_loca_count, glyphset_loca_at,
+}
+
+const QUAD_TOLERANCE: f64 = 1.0
+const FLAG_ON: u32 = 1
+const FLAG_X_SHORT: u32 = 2
+const FLAG_Y_SHORT: u32 = 4
+const FLAG_REPEAT: u32 = 8
+const FLAG_X_SAME: u32 = 16
+const FLAG_Y_SAME: u32 = 32
+const FLAG_OVERLAP: u32 = 64
+const COMP_WORDS: u32 = 1
+const COMP_XY: u32 = 2
+const COMP_MORE: u32 = 32
+
+struct GInfo {
+    cp: u32,
+    advance: i64,
+    xmin: i64,
+    ymin: i64,
+    xmax: i64,
+    ymax: i64,
+    points: i64,
+    contours: i64,
+    components: i64,
+    depth: i64,
+}
+
+struct GlyphSet {
+    infos: vec.Vec[GInfo],
+    glyf: rt.Buf,
+    loca: vec.Vec[u32],
+}
+
+fn glyphset_new() -> GlyphSet {
+    return GlyphSet { infos: vec.vec_new[GInfo](), glyf: rt.buf_new(), loca: vec.vec_new[u32]() }
+}
+
+fn glyphset_free(s: *mut GlyphSet) {
+    vec.vec_free[GInfo](&(*s).infos)
+    vec.vec_free[u32](&(*s).loca)
+    rt.buf_free(&(*s).glyf)
+}
+
+fn glyphset_count(s: *mut GlyphSet) -> usize {
+    return vec.vec_len[GInfo](&(*s).infos)
+}
+
+fn glyphset_loca_count(s: *mut GlyphSet) -> usize {
+    return vec.vec_len[u32](&(*s).loca)
+}
+
+fn glyphset_loca_at(s: *mut GlyphSet, i: usize) -> u32 {
+    return *vec.vec_elem_ptr[u32](&(*s).loca, i)
+}
+
+fn glyphset_info(s: *mut GlyphSet, gid: usize) -> *mut GInfo {
+    return vec.vec_elem_ptr[GInfo](&(*s).infos, gid)
+}
+
+fn gid_of_cp(f: *mut model.Font, cp: u32) -> i64 {
+    let i: i64 = model.font_find_index(f, cp)
+    if i < 0 {
+        return -1
+    }
+    return i + 1
+}
+
+fn coordinate_flag(delta: i64, short_bit: u32, same_bit: u32) -> u32 {
+    if delta == 0 {
+        return same_bit
+    }
+    if delta > -256 && delta < 256 {
+        if delta > 0 {
+            return short_bit | same_bit
+        }
+        return short_bit
+    }
+    return 0
+}
+
+fn put_coordinates(b: *mut rt.Buf, o: *mut outline.Outline, horizontal: bool) {
+    var prev: i64 = 0
+    var i: usize = 0
+    let n: usize = outline.outline_point_count(o)
+    while i < n {
+        let p: *mut outline.Pt = outline.outline_pt(o, i)
+        var cur: i64 = (*p).y
+        if horizontal {
+            cur = (*p).x
+        }
+        let delta: i64 = cur - prev
+        if delta != 0 {
+            if delta > -256 && delta < 256 {
+                if delta < 0 {
+                    fgbytes.put8(b, (0 - delta) as u32)
+                } else {
+                    fgbytes.put8(b, delta as u32)
+                }
+            } else {
+                fgbytes.put_i16(b, delta)
+            }
+        }
+        prev = cur
+        i = i + 1
+    }
+}
+
+fn point_flag(o: *mut outline.Outline, i: usize, px: i64, py: i64) -> u32 {
+    let p: *mut outline.Pt = outline.outline_pt(o, i)
+    var flag: u32 = 0
+    if (*p).on {
+        flag = FLAG_ON
+    }
+    flag = flag | coordinate_flag((*p).x - px, FLAG_X_SHORT, FLAG_X_SAME)
+    flag = flag | coordinate_flag((*p).y - py, FLAG_Y_SHORT, FLAG_Y_SAME)
+    return flag
+}
+
+fn put_flags(b: *mut rt.Buf, o: *mut outline.Outline) {
+    let n: usize = outline.outline_point_count(o)
+    var px: i64 = 0
+    var py: i64 = 0
+    var i: usize = 0
+    while i < n {
+        var flag: u32 = point_flag(o, i, px, py)
+        if i == 0 {
+            flag = flag | FLAG_OVERLAP
+        }
+        var run: usize = 0
+        var qx: i64 = (*outline.outline_pt(o, i)).x
+        var qy: i64 = (*outline.outline_pt(o, i)).y
+        while i + run + 1 < n && run < 255 {
+            var next: u32 = point_flag(o, i + run + 1, qx, qy)
+            if next != flag {
+                break
+            }
+            qx = (*outline.outline_pt(o, i + run + 1)).x
+            qy = (*outline.outline_pt(o, i + run + 1)).y
+            run = run + 1
+        }
+        if run > 0 {
+            fgbytes.put8(b, flag | FLAG_REPEAT)
+            fgbytes.put8(b, run as u32)
+        } else {
+            fgbytes.put8(b, flag)
+        }
+        px = qx
+        py = qy
+        i = i + run + 1
+    }
+}
+
+fn write_simple(b: *mut rt.Buf, o: *mut outline.Outline) {
+    let contours: usize = outline.outline_contour_count(o)
+    fgbytes.put_i16(b, contours as i64)
+    fgbytes.put_i16(b, (*o).xmin)
+    fgbytes.put_i16(b, (*o).ymin)
+    fgbytes.put_i16(b, (*o).xmax)
+    fgbytes.put_i16(b, (*o).ymax)
+    var c: usize = 0
+    while c < contours {
+        fgbytes.put16(b, outline.outline_end(o, c) as u32)
+        c = c + 1
+    }
+    fgbytes.put16(b, 0)
+    put_flags(b, o)
+    put_coordinates(b, o, true)
+    put_coordinates(b, o, false)
+}
+
+fn write_composite(b: *mut rt.Buf, f: *mut model.Font, g: *mut model.Glyph, info: *mut GInfo) -> i64 {
+    var emitted: i64 = 0
+    var r: usize = 0
+    let n: usize = model.glyph_ref_count(g)
+    fgbytes.put_i16(b, -1)
+    fgbytes.put_i16(b, (*info).xmin)
+    fgbytes.put_i16(b, (*info).ymin)
+    fgbytes.put_i16(b, (*info).xmax)
+    fgbytes.put_i16(b, (*info).ymax)
+    var last: usize = 0
+    while r < n {
+        if gid_of_cp(f, (*model.glyph_ref_at(g, r)).cp) >= 0 {
+            last = r
+        }
+        r = r + 1
+    }
+    r = 0
+    while r < n {
+        let ref: *mut model.Ref = model.glyph_ref_at(g, r)
+        let gid: i64 = gid_of_cp(f, (*ref).cp)
+        if gid >= 0 {
+            let dx: i64 = fgbytes.round_i64((*ref).dx)
+            let dy: i64 = fgbytes.round_i64((*ref).dy)
+            var flags: u32 = COMP_XY
+            if dx < -128 || dx > 127 || dy < -128 || dy > 127 {
+                flags = flags | COMP_WORDS
+            }
+            if r != last {
+                flags = flags | COMP_MORE
+            }
+            fgbytes.put16(b, flags)
+            fgbytes.put16(b, gid as u32)
+            if (flags & COMP_WORDS) != 0 as u32 {
+                fgbytes.put_i16(b, dx)
+                fgbytes.put_i16(b, dy)
+            } else {
+                fgbytes.put8(b, (dx + 256) as u32)
+                fgbytes.put8(b, (dy + 256) as u32)
+            }
+            emitted = emitted + 1
+        }
+        r = r + 1
+    }
+    return emitted
+}
+
+fn is_composite(g: *mut model.Glyph) -> bool {
+    return model.glyph_ref_count(g) > 0 && path.path_is_empty(&(*g).path)
+}
+
+fn notdef_path(f: *mut model.Font, p: *mut path.Path) {
+    let w: f64 = ((*f).upem / 2) as f64
+    let m: f64 = w / 8.0
+    let top: f64 = (*f).capheight as f64
+    path.path_move(p, m, 0.0)
+    path.path_line(p, m, top)
+    path.path_line(p, w - m, top)
+    path.path_line(p, w - m, 0.0)
+    path.path_too(p)
+    path.path_move(p, m * 2.0, m)
+    path.path_line(p, w - m * 2.0, m)
+    path.path_line(p, w - m * 2.0, top - m)
+    path.path_line(p, m * 2.0, top - m)
+    path.path_too(p)
+}
+
+fn add_entry(s: *mut GlyphSet, f: *mut model.Font, cp: u32, advance: f64, g: *mut model.Glyph, p: *mut path.Path) {
+    var o: outline.Outline = outline.outline_new()
+    var flat: path.Path = path.path_new()
+    var info: GInfo = GInfo {
+        cp: cp, advance: fgbytes.round_i64(advance), xmin: 0, ymin: 0, xmax: 0, ymax: 0,
+        points: 0, contours: 0, components: 0, depth: 0,
+    }
+    if g as usize != 0 {
+        fgflatten.append_glyph_path(f, g, &flat, 0.0, 0.0, 0)
+        outline.outline_from_path(&flat, &o, QUAD_TOLERANCE)
+    } else {
+        outline.outline_from_path(p, &o, QUAD_TOLERANCE)
+    }
+    info.xmin = o.xmin
+    info.ymin = o.ymin
+    info.xmax = o.xmax
+    info.ymax = o.ymax
+    info.points = outline.outline_point_count(&o) as i64
+    info.contours = outline.outline_contour_count(&o) as i64
+    fgbytes.put_pad4(&(*s).glyf)
+    vec.vec_push[u32](&(*s).loca, rt.buf_len(&(*s).glyf) as u32)
+    if g as usize != 0 && is_composite(g) {
+        info.components = write_composite(&(*s).glyf, f, g, &info)
+        info.depth = fgflatten.glyph_ref_depth(f, g, 0) as i64
+    } else if info.contours > 0 {
+        write_simple(&(*s).glyf, &o)
+    }
+    vec.vec_push[GInfo](&(*s).infos, info)
+    outline.outline_free(&o)
+    path.path_free(&flat)
+}
+
+fn glyphset_build(s: *mut GlyphSet, f: *mut model.Font) {
+    var notdef: path.Path = path.path_new()
+    notdef_path(f, &notdef)
+    add_entry(s, f, 0 as u32, ((*f).upem / 2) as f64, 0 as *mut model.Glyph, &notdef)
+    path.path_free(&notdef)
+    var empty: path.Path = path.path_new()
+    var i: usize = 0
+    let n: usize = model.font_glyph_count(f)
+    while i < n {
+        let g: *mut model.Glyph = model.font_glyph_at(f, i)
+        add_entry(s, f, (*g).cp, (*g).advance, g, &empty)
+        i = i + 1
+    }
+    path.path_free(&empty)
+    fgbytes.put_pad4(&(*s).glyf)
+    vec.vec_push[u32](&(*s).loca, rt.buf_len(&(*s).glyf) as u32)
+}

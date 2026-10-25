@@ -1,0 +1,144 @@
+import std.rt
+import std.vec
+import fontgen.brotli_bits
+import fontgen.brotli_huff
+import fontgen.brotli_codes
+import fontgen.brotli_lz
+
+export { brotli_encode }
+
+const CHUNK: usize = 65536
+const LIT_ALPHA: usize = 256
+const CMD_ALPHA: usize = 704
+const DIST_ALPHA: usize = 64
+const MAX_CODE_LEN: u32 = 15
+
+fn put_uncompressed(w: *mut brotli_bits.BitW, src: u64, n: usize) {
+    brotli_bits.bw_put(w, 0 as u32, 1 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 2 as u32)
+    brotli_bits.bw_put(w, (n - 1) as u32, 16 as u32)
+    brotli_bits.bw_put(w, 1 as u32, 1 as u32)
+    brotli_bits.bw_align(w)
+    brotli_bits.bw_push_bytes(w, src, n)
+}
+
+fn command_copy_code(c: *mut brotli_lz.Cmd) -> u32 {
+    if (*c).copy == (0 as u32) {
+        return 0
+    }
+    return brotli_codes.copy_code((*c).copy)
+}
+
+fn count_stats(src: u64, start: usize, cmds: *mut vec.Vec[brotli_lz.Cmd], lit: *mut [u32; 704], cmd: *mut [u32; 704], dist: *mut [u32; 704]) {
+    var lp: usize = start
+    var i: usize = 0
+    let n: usize = vec.vec_len[brotli_lz.Cmd](cmds)
+    while i < n {
+        let c: *mut brotli_lz.Cmd = vec.vec_elem_ptr[brotli_lz.Cmd](cmds, i)
+        let sym: u32 = brotli_codes.command_symbol(brotli_codes.insert_code((*c).insert), command_copy_code(c))
+        (*cmd)[sym as usize] = (*cmd)[sym as usize] + (1 as u32)
+        var k: u32 = 0
+        while k < (*c).insert {
+            let b: usize = rt.ld8(src, lp + k as usize) as usize
+            (*lit)[b] = (*lit)[b] + (1 as u32)
+            k = k + (1 as u32)
+        }
+        lp = lp + (*c).insert as usize + (*c).copy as usize
+        if (*c).copy > (0 as u32) {
+            let d: u32 = brotli_codes.distance_code((*c).dist)
+            (*dist)[d as usize] = (*dist)[d as usize] + (1 as u32)
+        }
+        i = i + 1
+    }
+}
+
+fn emit_header(w: *mut brotli_bits.BitW, mlen: usize) {
+    brotli_bits.bw_put(w, 0 as u32, 1 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 2 as u32)
+    brotli_bits.bw_put(w, (mlen - 1) as u32, 16 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 1 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 3 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 2 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 4 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 2 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 1 as u32)
+    brotli_bits.bw_put(w, 0 as u32, 1 as u32)
+}
+
+fn encode_chunk(w: *mut brotli_bits.BitW, src: u64, start: usize, end: usize, total: usize) {
+    var cmds: vec.Vec[brotli_lz.Cmd] = vec.vec_new[brotli_lz.Cmd]()
+    brotli_lz.lz_parse(src, start, end, total, &cmds)
+    var lit_f: [u32; 704] = [0; 704]
+    var cmd_f: [u32; 704] = [0; 704]
+    var dist_f: [u32; 704] = [0; 704]
+    count_stats(src, start, &cmds, &lit_f, &cmd_f, &dist_f)
+    var lit_len: [u8; 704] = [0; 704]
+    var lit_rev: [u32; 704] = [0; 704]
+    var cmd_len: [u8; 704] = [0; 704]
+    var cmd_rev: [u32; 704] = [0; 704]
+    var dist_len: [u8; 704] = [0; 704]
+    var dist_rev: [u32; 704] = [0; 704]
+    let lit_only: i64 = brotli_huff.build_code(&lit_f, LIT_ALPHA, MAX_CODE_LEN, &lit_len, &lit_rev)
+    let cmd_only: i64 = brotli_huff.build_code(&cmd_f, CMD_ALPHA, MAX_CODE_LEN, &cmd_len, &cmd_rev)
+    let dist_only: i64 = brotli_huff.build_code(&dist_f, DIST_ALPHA, MAX_CODE_LEN, &dist_len, &dist_rev)
+    let mark: brotli_bits.BitMark = brotli_bits.bw_mark(w)
+    emit_header(w, end - start)
+    brotli_huff.put_tree(w, &lit_len, LIT_ALPHA, 8 as u32, lit_only)
+    brotli_huff.put_tree(w, &cmd_len, CMD_ALPHA, 10 as u32, cmd_only)
+    brotli_huff.put_tree(w, &dist_len, DIST_ALPHA, 6 as u32, dist_only)
+    var lp: usize = start
+    var i: usize = 0
+    let n: usize = vec.vec_len[brotli_lz.Cmd](&cmds)
+    while i < n {
+        let c: *mut brotli_lz.Cmd = vec.vec_elem_ptr[brotli_lz.Cmd](&cmds, i)
+        let ic: u32 = brotli_codes.insert_code((*c).insert)
+        let cc: u32 = command_copy_code(c)
+        if cmd_only < 0 {
+            brotli_huff.put_sym(w, &cmd_len, &cmd_rev, brotli_codes.command_symbol(ic, cc))
+        }
+        brotli_bits.bw_put(w, (*c).insert - brotli_codes.insert_base(ic), brotli_codes.insert_extra_bits(ic))
+        if (*c).copy > (0 as u32) {
+            brotli_bits.bw_put(w, (*c).copy - brotli_codes.copy_base(cc), brotli_codes.copy_extra_bits(cc))
+        } else {
+            brotli_bits.bw_put(w, 0 as u32, brotli_codes.copy_extra_bits(cc))
+        }
+        var k: u32 = 0
+        while k < (*c).insert {
+            if lit_only < 0 {
+                brotli_huff.put_sym(w, &lit_len, &lit_rev, rt.ld8(src, lp + k as usize) as u32)
+            }
+            k = k + (1 as u32)
+        }
+        lp = lp + (*c).insert as usize + (*c).copy as usize
+        if (*c).copy > (0 as u32) {
+            let dc: u32 = brotli_codes.distance_code((*c).dist)
+            if dist_only < 0 {
+                brotli_huff.put_sym(w, &dist_len, &dist_rev, dc)
+            }
+            brotli_bits.bw_put(w, brotli_codes.distance_extra_value((*c).dist), brotli_codes.distance_extra_bits(dc))
+        }
+        i = i + 1
+    }
+    vec.vec_free[brotli_lz.Cmd](&cmds)
+    if rt.buf_len((*w).out) - mark.len > end - start + 5 {
+        brotli_bits.bw_rewind(w, mark)
+        put_uncompressed(w, src + start as u64, end - start)
+    }
+}
+
+fn brotli_encode(src: u64, n: usize, out: *mut rt.Buf) {
+    var w: brotli_bits.BitW = brotli_bits.bw_new(out)
+    brotli_bits.bw_put(&w, 0 as u32, 1 as u32)
+    brotli_lz.lz_reset()
+    var at: usize = 0
+    while at < n {
+        var end: usize = at + CHUNK
+        if end > n {
+            end = n
+        }
+        encode_chunk(&w, src, at, end, n)
+        at = end
+    }
+    brotli_bits.bw_put(&w, 3 as u32, 2 as u32)
+    brotli_bits.bw_align(&w)
+}

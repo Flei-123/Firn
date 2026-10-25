@@ -1,0 +1,150 @@
+import std.rt
+import std.vec
+import fontsrc.model
+import fontgen.fgbytes
+import fontgen.glyf
+
+export { build_cmap }
+
+struct Segment {
+    start: u32,
+    end: u32,
+    gid: u32,
+}
+
+fn collect_segments(f: *mut model.Font, bmp: bool, out: *mut vec.Vec[Segment]) {
+    let n: usize = model.font_glyph_count(f)
+    var i: usize = 0
+    while i < n {
+        let cp: u32 = (*model.font_glyph_at(f, i)).cp
+        let gid: u32 = (i + 1) as u32
+        let in_bmp: bool = cp < 65534 as u32 && !(cp >= 55296 as u32 && cp <= 57343 as u32)
+        if !bmp || in_bmp {
+            let count: usize = vec.vec_len[Segment](out)
+            var extended: bool = false
+            if count > 0 {
+                let last: *mut Segment = vec.vec_elem_ptr[Segment](out, count - 1)
+                if (*last).end + 1 as u32 == cp && (*last).gid + ((*last).end - (*last).start) + 1 as u32 == gid {
+                    (*last).end = cp
+                    extended = true
+                }
+            }
+            if !extended {
+                vec.vec_push[Segment](out, Segment { start: cp, end: cp, gid: gid })
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn log2_floor(v: u32) -> u32 {
+    var r: u32 = 0
+    var x: u32 = v
+    while x > 1 as u32 {
+        x = x >> 1
+        r = r + 1
+    }
+    return r
+}
+
+fn build_format4(f: *mut model.Font, out: *mut rt.Buf) {
+    var segs: vec.Vec[Segment] = vec.vec_new[Segment]()
+    collect_segments(f, true, &segs)
+    vec.vec_push[Segment](&segs, Segment { start: 65535 as u32, end: 65535 as u32, gid: 0 })
+    let count: u32 = vec.vec_len[Segment](&segs) as u32
+    let pow: u32 = log2_floor(count)
+    let search: u32 = 2 * (1 << pow)
+    fgbytes.put16(out, 4)
+    fgbytes.put16(out, 16 + 8 * count)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, count * 2)
+    fgbytes.put16(out, search)
+    fgbytes.put16(out, pow)
+    fgbytes.put16(out, count * 2 - search)
+    var i: usize = 0
+    while i < count as usize {
+        fgbytes.put16(out, (*vec.vec_elem_ptr[Segment](&segs, i)).end)
+        i = i + 1
+    }
+    fgbytes.put16(out, 0)
+    i = 0
+    while i < count as usize {
+        fgbytes.put16(out, (*vec.vec_elem_ptr[Segment](&segs, i)).start)
+        i = i + 1
+    }
+    i = 0
+    while i < count as usize {
+        let s: *mut Segment = vec.vec_elem_ptr[Segment](&segs, i)
+        fgbytes.put16(out, ((*s).gid + 65536 as u32 - (*s).start) & 65535 as u32)
+        i = i + 1
+    }
+    i = 0
+    while i < count as usize {
+        fgbytes.put16(out, 0)
+        i = i + 1
+    }
+    vec.vec_free[Segment](&segs)
+}
+
+fn has_supplementary(f: *mut model.Font) -> bool {
+    let n: usize = model.font_glyph_count(f)
+    return n > 0 && (*model.font_glyph_at(f, n - 1)).cp >= 65536 as u32
+}
+
+fn build_format12(f: *mut model.Font, out: *mut rt.Buf) {
+    var segs: vec.Vec[Segment] = vec.vec_new[Segment]()
+    collect_segments(f, false, &segs)
+    let count: u32 = vec.vec_len[Segment](&segs) as u32
+    fgbytes.put16(out, 12)
+    fgbytes.put16(out, 0)
+    fgbytes.put32(out, 16 + 12 * count)
+    fgbytes.put32(out, 0)
+    fgbytes.put32(out, count)
+    var i: usize = 0
+    while i < count as usize {
+        let s: *mut Segment = vec.vec_elem_ptr[Segment](&segs, i)
+        fgbytes.put32(out, (*s).start)
+        fgbytes.put32(out, (*s).end)
+        fgbytes.put32(out, (*s).gid)
+        i = i + 1
+    }
+    vec.vec_free[Segment](&segs)
+}
+
+fn build_cmap(f: *mut model.Font, out: *mut rt.Buf) {
+    var four: rt.Buf = rt.buf_new()
+    var twelve: rt.Buf = rt.buf_new()
+    build_format4(f, &four)
+    let wide: bool = has_supplementary(f)
+    if wide {
+        build_format12(f, &twelve)
+    }
+    var records: u32 = 2
+    if wide {
+        records = 4
+    }
+    let base: u32 = 4 + 8 * records
+    let wide_at: u32 = base + rt.buf_len(&four) as u32
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, records)
+    fgbytes.put16(out, 0)
+    fgbytes.put16(out, 3)
+    fgbytes.put32(out, base)
+    if wide {
+        fgbytes.put16(out, 0)
+        fgbytes.put16(out, 4)
+        fgbytes.put32(out, wide_at)
+    }
+    fgbytes.put16(out, 3)
+    fgbytes.put16(out, 1)
+    fgbytes.put32(out, base)
+    if wide {
+        fgbytes.put16(out, 3)
+        fgbytes.put16(out, 10)
+        fgbytes.put32(out, wide_at)
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&four), rt.buf_len(&four))
+    rt.buf_push_bytes(out, rt.buf_ptr(&twelve), rt.buf_len(&twelve))
+    rt.buf_free(&four)
+    rt.buf_free(&twelve)
+}
