@@ -617,6 +617,11 @@ fn load_slot_plain(c: *mut Cg, r: u32, off: u64) {
         (*b).len = len + pre + nd + 2
         return
     }
+    load_slot_cold(c, r, off)
+}
+
+#[no_inline]
+fn load_slot_cold(c: *mut Cg, r: u32, off: u64) {
     t(c, (&TPL_MOV_REG[0]) as u64, 8)
     reg64(c, r)
     t(c, (&TPL_SLOT_SRC[0]) as u64, 17)
@@ -642,14 +647,19 @@ fn store_slot(c: *mut Cg, off: u64, r: u32) {
         let rl: u8 = *(((&REG64_LEN[0]) as u64 +% r as u64) as *mut u8)
         (*b).len = len + 23 + nd + 4 + rl as usize - 48
     } else {
-        t(c, (&TPL_SLOT_DST[0]) as u64, 23)
-        slot_tail(c, off, (&TPL_CLOSE_DST[0]) as u64, 3)
-        reg64(c, r)
-        nl(c)
+        store_slot_cold(c, off, r)
     }
     (*c).kpos = rt.buf_len(&(*c).out)
     (*c).koff = off
     (*c).kreg = r
+}
+
+#[no_inline]
+fn store_slot_cold(c: *mut Cg, off: u64, r: u32) {
+    t(c, (&TPL_SLOT_DST[0]) as u64, 23)
+    slot_tail(c, off, (&TPL_CLOSE_DST[0]) as u64, 3)
+    reg64(c, r)
+    nl(c)
 }
 
 fn slot_of(c: *mut Cg, v: u32) -> u64 {
@@ -1415,14 +1425,33 @@ fn arg_regnum(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> u32 {
     return fir.NONE
 }
 
+fn sse_mask(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u64 {
+    var m: u64 = 0
+    var j: u32 = 0
+    while j < alen && j < 64 {
+        if arg_is_sse(f, fnr, aoff, j) {
+            m = m | (1 as u64) << (j as u64)
+        }
+        j = j + 1
+    }
+    return m
+}
+
+fn arg_class(f: *mut fir.Fir, fnr: u32, aoff: u32, sm: u64, j: u32) -> bool {
+    if j < 64 {
+        return ((sm >> (j as u64)) & 1) != 0
+    }
+    return arg_is_sse(f, fnr, aoff, j)
+}
+
 // How many arguments end up on the stack in all?
-fn stack_args(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u32 {
+fn stack_args(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32, sm: u64) -> u32 {
     var n: u32 = 0
     var sn: u32 = 0
     var inr: u32 = 0
     var j: u32 = 0
     while j < alen {
-        if arg_is_sse(f, fnr, aoff, j) {
+        if arg_class(f, fnr, aoff, sm, j) {
             if sn >= 8 {
                 n = n + 1
             }
@@ -1438,13 +1467,13 @@ fn stack_args(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u32 {
     return n
 }
 
-fn stack_mask(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u64 {
+fn stack_mask(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32, sm: u64) -> u64 {
     var mask: u64 = 0
     var sn: u32 = 0
     var inr: u32 = 0
     var j: u32 = 0
     while j < alen {
-        if arg_is_sse(f, fnr, aoff, j) {
+        if arg_class(f, fnr, aoff, sm, j) {
             if sn >= 8 {
                 mask = mask | (1 as u64) << (j as u64)
             }
@@ -1462,10 +1491,10 @@ fn stack_mask(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u64 {
 
 // The stack arguments in REVERSE order, so that the first of them ends up
 // at [rsp+0] after the pushes.
-fn push_stack_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+fn push_stack_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32, sm: u64) {
     var mask: u64 = 0
     if alen <= 64 {
-        mask = stack_mask(f, fnr, aoff, alen)
+        mask = stack_mask(f, fnr, aoff, alen, sm)
     }
     var j: u32 = alen
     while j > 0 {
@@ -1490,11 +1519,11 @@ fn push_stack_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) 
 // The arguments that DO get a register. SSE first, so that `rax`, which
 // `store_xmm_w` uses as a ferry, cannot overwrite an integer argument that
 // is already in place.
-fn load_reg_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+fn load_reg_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32, sm: u64) {
     var k: u32 = 0
     var sn: u32 = 0
-    while k < alen {
-        if arg_is_sse(f, fnr, aoff, k) {
+    while k < alen && (sm != 0 || alen > 64) {
+        if arg_class(f, fnr, aoff, sm, k) {
             if sn < 8 {
                 load_xmm_w(c, sn, fir.arg_at(f, aoff + k), arg_is_single(f, fnr, aoff, k))
             }
@@ -1505,7 +1534,7 @@ fn load_reg_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
     k = 0
     var inr: u32 = 0
     while k < alen {
-        if !arg_is_sse(f, fnr, aoff, k) {
+        if !arg_class(f, fnr, aoff, sm, k) {
             if inr < 6 {
                 load_slot_plain(c, argreg_index(inr), slot_of(c, fir.arg_at(f, aoff + k)))
             }
@@ -1529,15 +1558,18 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
     // Stack arguments: push them in reverse, with a filler word in front if needed.
-    let stack: u32 = stack_args(f, fnr, aoff, alen)
+    let sm: u64 = sse_mask(f, fnr, aoff, alen)
+    let stack: u32 = stack_args(f, fnr, aoff, alen, sm)
     var fill: u32 = 0
     if stack % 2 == 1 {
         fill = 1
         var sp: [u8; 10] = "sub rsp, 8"
         raw(c, (&sp[0]) as u64, 10)
     }
-    push_stack_args(c, f, fnr, aoff, alen)
-    load_reg_args(c, f, fnr, aoff, alen)
+    if stack > 0 {
+        push_stack_args(c, f, fnr, aoff, alen, sm)
+    }
+    load_reg_args(c, f, fnr, aoff, alen, sm)
     ins(c)
     var cl: [u8; 5] = "call "
     w(c, (&cl[0]) as u64, 5)
@@ -1562,15 +1594,18 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
 fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
-    let stack: u32 = stack_args(f, fnr, aoff, alen)
+    let sm: u64 = sse_mask(f, fnr, aoff, alen)
+    let stack: u32 = stack_args(f, fnr, aoff, alen, sm)
     var fill: u32 = 0
     if stack % 2 == 1 {
         fill = 1
         var sp: [u8; 10] = "sub rsp, 8"
         raw(c, (&sp[0]) as u64, 10)
     }
-    push_stack_args(c, f, fnr, aoff, alen)
-    load_reg_args(c, f, fnr, aoff, alen)
+    if stack > 0 {
+        push_stack_args(c, f, fnr, aoff, alen, sm)
+    }
+    load_reg_args(c, f, fnr, aoff, alen, sm)
     load_slot(c, R_AX, slot_of(c, fir.i_a_of(f, i)))
     var cl: [u8; 8] = "call rax"
     raw(c, (&cl[0]) as u64, 8)
@@ -3256,156 +3291,136 @@ fn emit_wrapsat(c: *mut Cg, ty: u32, kind: u64, op: u32, a: u32, b: u32, dst: u3
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
+fn col_kind(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_kind.ptr +% k4) as *mut u32) }
+fn col_ty(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_ty.ptr +% k4) as *mut u32) }
+fn col_dst(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_dst.ptr +% k4) as *mut u32) }
+fn col_a(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_a.ptr +% k4) as *mut u32) }
+fn col_b(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_b.ptr +% k4) as *mut u32) }
+fn col_c(f: *mut fir.Fir, k4: u64) -> u32 { return *(((*f).i_c.ptr +% k4) as *mut u32) }
+fn col_number(f: *mut fir.Fir, k8: u64) -> u64 { return *(((*f).i_number.ptr +% k8) as *mut u64) }
+
 fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     let f: *mut fir.Fir = ff(c)
-    let kind: u32 = fir.i_kind_of(f, i)
-    let ty: u32 = fir.i_ty_of(f, i)
-    let dst: u32 = fir.i_dst_of(f, i)
-    if kind == fir.O_CONST {
-        emit_const(c, ty, fir.i_number_of(f, i), dst)
+    if (i as usize) >= (*f).i_kind.len {
+        (*c).unsuitable = true
         return
     }
-    if kind == fir.O_BIN {
-        emit_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
-        return
+    let k4: u64 = i as u64 *% 4
+    let kind: u32 = col_kind(f, k4)
+    let ty: u32 = col_ty(f, k4)
+    let dst: u32 = col_dst(f, k4)
+    match kind {
+        fir.O_CONST => {
+            emit_const(c, ty, col_number(f, i as u64 *% 8), dst)
+        }
+        fir.O_BIN => {
+            emit_bin(c, ty, col_c(f, k4), col_a(f, k4), col_b(f, k4), dst)
+        }
+        fir.O_LOAD => {
+            emit_load(c, ty, col_a(f, k4), dst)
+        }
+        fir.O_STORE => {
+            emit_store(c, ty, col_a(f, k4), col_b(f, k4))
+        }
+        fir.O_CALL => {
+            emit_call(c, f, i, fnr)
+        }
+        fir.O_CHECKEDBIN => {
+            emit_checked_bin(c, ty, col_c(f, k4), col_a(f, k4), col_b(f, k4),
+                dst, col_number(f, i as u64 *% 8) as u32, fir.f_name_of(f, fnr))
+        }
+        fir.O_CMP => {
+            emit_cmp(c, col_number(f, i as u64 *% 8) as u32, col_c(f, k4), col_a(f, k4), col_b(f, k4), dst)
+        }
+        fir.O_PTRADD => {
+            emit_ptradd(c, col_a(f, k4), col_b(f, k4), dst)
+        }
+        fir.O_CAST => {
+            emit_cast(c, col_c(f, k4), ty, col_a(f, k4), dst)
+        }
+        fir.O_ALLOCA => {
+            emit_alloca(c, dst)
+        }
+        fir.O_BINWRAPSAT => {
+            emit_wrapsat(c, ty, col_number(f, i as u64 *% 8), col_c(f, k4),
+                col_a(f, k4), col_b(f, k4), dst, fir.f_name_of(f, fnr))
+        }
+        fir.O_CHECKEDDIV => {
+            let both: u64 = col_number(f, i as u64 *% 8)
+            emit_checked_div(c, ty, col_c(f, k4), col_a(f, k4), col_b(f, k4),
+                dst, (both & 4294967295) as u32, (both >> 32) as u32,
+                fir.f_name_of(f, fnr))
+        }
+        fir.O_CHECKEDCAST => {
+            emit_checked_cast(c, col_c(f, k4), ty, col_a(f, k4), dst,
+                col_number(f, i as u64 *% 8) as u32, fir.f_name_of(f, fnr))
+        }
+        fir.O_CHECKEDIDX => {
+            emit_checked_idx(c, ty, col_a(f, k4), col_c(f, k4) as u64, dst,
+                col_number(f, i as u64 *% 8) as u32, fir.f_name_of(f, fnr))
+        }
+        fir.O_CHECKEDIDXV => {
+            emit_checked_idx_v(c, ty, col_a(f, k4), col_b(f, k4), dst,
+                col_number(f, i as u64 *% 8) as u32, fir.f_name_of(f, fnr))
+        }
+        fir.O_UN => {
+            emit_un(c, ty, col_c(f, k4), col_a(f, k4), dst)
+        }
+        fir.O_SYSCALL => {
+            emit_syscall(c, f, i)
+        }
+        fir.O_COPYMEM => {
+            emit_copymem(c, col_a(f, k4), col_b(f, k4), col_number(f, i as u64 *% 8))
+        }
+        fir.O_GCADDR => {
+            emit_gcaddr(c, col_number(f, i as u64 *% 8), dst)
+        }
+        fir.O_SELECT => {
+            emit_select(c, col_a(f, k4), col_b(f, k4), col_c(f, k4), dst)
+        }
+        fir.O_BARRIER => {
+            emit_barrier(c, col_a(f, k4), dst)
+        }
+        fir.O_SECZERO => {
+            emit_seczero(c, col_a(f, k4), col_b(f, k4))
+        }
+        fir.O_ATOMADD => {
+            emit_atomadd(c, col_a(f, k4), col_b(f, k4), dst)
+        }
+        fir.O_ATOMCAS => {
+            emit_atomcas(c, col_a(f, k4), col_b(f, k4), col_c(f, k4), dst)
+        }
+        fir.O_SPAWN => {
+            emit_spawn(c, col_a(f, k4), col_b(f, k4), col_c(f, k4), dst)
+        }
+        fir.O_TLS => {
+            emit_tls(c, dst)
+        }
+        fir.O_CALLI => {
+            emit_calli(c, f, i, fnr)
+        }
+        fir.O_VTAB => {
+            emit_vtab(c, col_a(f, k4), col_b(f, k4), dst)
+        }
+        fir.O_FNREF => {
+            emit_fnref(c, col_a(f, k4), dst)
+        }
+        fir.O_GLOBAL => {
+            emit_global(c, col_a(f, k4), dst)
+        }
+        fir.O_ASM => {
+            emit_asm(c, f, i, dst)
+        }
+        fir.O_MMIOLD => {
+            emit_mmio_load(c, ty, col_a(f, k4), dst)
+        }
+        fir.O_MMIOST => {
+            emit_mmio_store(c, ty, col_a(f, k4), col_b(f, k4))
+        }
+        _ => {
+            (*c).unsuitable = true
+        }
     }
-    if kind == fir.O_LOAD {
-        emit_load(c, ty, fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_STORE {
-        emit_store(c, ty, fir.i_a_of(f, i), fir.i_b_of(f, i))
-        return
-    }
-    if kind == fir.O_CALL {
-        emit_call(c, f, i, fnr)
-        return
-    }
-    if kind == fir.O_CHECKEDBIN {
-        emit_checked_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
-            dst, fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
-        return
-    }
-    if kind == fir.O_CMP {
-        emit_cmp(c, fir.i_number_of(f, i) as u32, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_PTRADD {
-        emit_ptradd(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_CAST {
-        emit_cast(c, fir.i_c_of(f, i), ty, fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_ALLOCA {
-        emit_alloca(c, dst)
-        return
-    }
-    // ROUND 72 (SPEC 13, item L9) -- checked and explicitly unchecked
-    // integer arithmetic.
-    if kind == fir.O_BINWRAPSAT {
-        emit_wrapsat(c, ty, fir.i_number_of(f, i), fir.i_c_of(f, i),
-            fir.i_a_of(f, i), fir.i_b_of(f, i), dst, fir.f_name_of(f, fnr))
-        return
-    }
-    if kind == fir.O_CHECKEDDIV {
-        let both: u64 = fir.i_number_of(f, i)
-        emit_checked_div(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
-            dst, (both & 4294967295) as u32, (both >> 32) as u32,
-            fir.f_name_of(f, fnr))
-        return
-    }
-    if kind == fir.O_CHECKEDCAST {
-        emit_checked_cast(c, fir.i_c_of(f, i), ty, fir.i_a_of(f, i), dst,
-            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
-        return
-    }
-    // ROUND 89 -- the checked ARRAY INDEX (SPEC 13, item L9).
-    if kind == fir.O_CHECKEDIDX {
-        emit_checked_idx(c, ty, fir.i_a_of(f, i), fir.i_c_of(f, i) as u64, dst,
-            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
-        return
-    }
-    if kind == fir.O_CHECKEDIDXV {
-        emit_checked_idx_v(c, ty, fir.i_a_of(f, i), fir.i_b_of(f, i), dst,
-            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
-        return
-    }
-    if kind == fir.O_UN {
-        emit_un(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_SYSCALL {
-        emit_syscall(c, f, i)
-        return
-    }
-    if kind == fir.O_COPYMEM {
-        emit_copymem(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_number_of(f, i))
-        return
-    }
-    if kind == fir.O_GCADDR {
-        emit_gcaddr(c, fir.i_number_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_SELECT {
-        emit_select(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_BARRIER {
-        emit_barrier(c, fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_SECZERO {
-        emit_seczero(c, fir.i_a_of(f, i), fir.i_b_of(f, i))
-        return
-    }
-    if kind == fir.O_ATOMADD {
-        emit_atomadd(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_ATOMCAS {
-        emit_atomcas(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_SPAWN {
-        emit_spawn(c, fir.i_a_of(f, i), fir.i_b_of(f, i), fir.i_c_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_TLS {
-        emit_tls(c, dst)
-        return
-    }
-    if kind == fir.O_CALLI {
-        emit_calli(c, f, i, fnr)
-        return
-    }
-    if kind == fir.O_VTAB {
-        emit_vtab(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_FNREF {
-        emit_fnref(c, fir.i_a_of(f, i), dst)
-        return
-    }
-    // ROUND 89 (statics.rs): the address of a global variable.
-    if kind == fir.O_GLOBAL {
-        emit_global(c, fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_ASM {
-        emit_asm(c, f, i, dst)
-        return
-    }
-    if kind == fir.O_MMIOLD {
-        emit_mmio_load(c, ty, fir.i_a_of(f, i), dst)
-        return
-    }
-    if kind == fir.O_MMIOST {
-        emit_mmio_store(c, ty, fir.i_a_of(f, i), fir.i_b_of(f, i))
-        return
-    }
-    (*c).unsuitable = true
 }
 
 fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
