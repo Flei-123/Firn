@@ -1707,6 +1707,17 @@ else
     grep -E 'FAIL' "$WORK/dns.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 75b. authoritative DNS server (tools/dnsd/run.sh, lib/net/dnsd*.fi) =="
+# tests/5070 (wire format) and tests/5071 (real sockets) are in section 3. Here: the finished
+# program in three build stages, raw UDP/TCP octets decoded by check.py and by dig.
+if bash tools/dnsd/run.sh > "$WORK/dnsd.log" 2>&1; then
+    grep -E '^DNSD ' "$WORK/dnsd.log" | head -1 | sed 's/^/   /'
+    ok
+else
+    bad "tools/dnsd/run.sh failed (see .test-work/dnsd.log)"
+    grep -E 'FAIL' "$WORK/dnsd.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 76. appkit: the platform files agree, and the update runs end to end against a local store (tools/appkit/, lib/appkit) =="
 # lib/appkit's unit tests are in tests/2050-2056 (section 3). Here: (1) the five platform files
 # (Linux, Windows, Android, macOS, OrientOS) export the same names with the same signatures and

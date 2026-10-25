@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dnsd_serve.fi -- the sockets of the authoritative DNS server (net.dnsd).
+//
+//     var st: dnsd_serve.State = dnsd_serve.state_new(&zone)
+//     dnsd_serve.open(&st, net.ADDR_ANY, 53 as u16)        // 0 = ok, else a step number
+//     // two threads: dnsd_serve.run_udp(&st) and dnsd_serve.run_tcp(&st)
+//     dnsd_serve.stop(&st)                                // wakes both and lets them end
+//
+// The program starts the two threads itself (the thread hook `__thread_work` has to live
+// in the program's root file); lib/net/dnsd_main.fi is the finished example.
+//
+// HONEST
+//   V1 UDP is one datagram at a time on one thread. DNS answers here are a table lookup, so
+//      that is thousands per second, but there is no rate limiting (see dnsd S4).
+//   V2 TCP serves ONE connection at a time, at most 4 queries on it, 3 s receive/send
+//      timeout each. A hostile client can hold the TCP side for a few seconds; UDP is
+//      a separate thread and does not notice.
+//   V3 IPv4 only (like net.udp). The query log goes to standard error when `verbose` is set.
+import std.rt
+import std.net
+import net.udp
+import net.dnszone
+import net.dnsd
+
+export {
+    State, state_new, open, stop, run_udp, run_tcp, close_all, bound_port,
+}
+
+const UDP_BUF: usize = 4096
+const TCP_MAX_QUERIES: usize = 4
+const TCP_TIMEOUT_MS: u64 = 3000
+const MAX_RECV_ERRORS: usize = 200
+
+struct State {
+    zone: u64,
+    udp_fd: i64,
+    tcp_fd: i64,
+    port: u16,
+    stop_flag: u64,
+    verbose: u64,
+    n_udp: u64,
+    n_tcp: u64,
+    n_drop: u64,
+}
+
+fn state_new(z: *mut dnszone.Zone) -> State {
+    return State { zone: z as u64, udp_fd: 0 - 1, tcp_fd: 0 - 1, port: 0 as u16,
+        stop_flag: 0 as u64, verbose: 0 as u64, n_udp: 0 as u64, n_tcp: 0 as u64, n_drop: 0 as u64 }
+}
+
+fn bound_port(st: *mut State) -> u16 {
+    return (*st).port
+}
+
+fn open(st: *mut State, addr: u32, port: u16) -> i32 {
+    var l: net.Listener = net.listen_tcp(addr, port) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&l) {
+        return 1
+    }
+    let bound: u16 = net.listener_port(&l)
+    let fd: i64 = udp.udp_open()
+    if fd < 0 {
+        net.close_listener(&l)
+        return 2
+    }
+    if udp.udp_bind(fd, addr, bound) < 0 {
+        udp.udp_close(fd)
+        net.close_listener(&l)
+        return 3
+    }
+    (*st).udp_fd = fd
+    (*st).tcp_fd = net.listener_fd(&l) as i64
+    (*st).port = bound
+    return 0
+}
+
+fn log_query(st: *mut State, req: u64, n: usize, reply: *mut rt.Buf, proto: str) {
+    if (*st).verbose == 0 as u64 {
+        return
+    }
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&line, proto.p as u64, proto.n)
+    rt.buf_push(&line, 32 as u8)
+    var text: [u8; 256] = [0; 256]
+    var tn: usize = 0
+    var qt: u32 = 0
+    if dnsd.dnsd_question(req, n, (&text[0]) as u64, &tn, &qt) {
+        rt.buf_push_bytes(&line, (&text[0]) as u64, tn)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, qt as u64)
+    } else {
+        var bad: str = "?"
+        rt.buf_push_bytes(&line, bad.p as u64, bad.n)
+    }
+    rt.buf_push(&line, 32 as u8)
+    if (*reply).len >= 4 {
+        let name: str = dnsd.dnsd_status_name((((rt.ld8((*reply).ptr, 2) as u32) << 8) | (rt.ld8((*reply).ptr, 3) as u32)) & 15 as u32)
+        rt.buf_push_bytes(&line, name.p as u64, name.n)
+    }
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(2, line.ptr, line.len)
+    rt.buf_free(&line)
+}
+
+fn run_udp(st: *mut State) {
+    let fd: i64 = (*st).udp_fd
+    let buf: u64 = rt.heap_alloc(UDP_BUF)
+    let zone: *mut dnszone.Zone = (*st).zone as *mut dnszone.Zone
+    var errors: usize = 0
+    var go: bool = true
+    while go {
+        var fa: u32 = 0
+        var fp: u16 = 0 as u16
+        thread_blocking_an()
+        let k: i64 = udp.udp_recvfrom(fd, buf, UDP_BUF, &fa, &fp)
+        thread_blocking_out()
+        if (*st).stop_flag != 0 as u64 {
+            go = false
+        } else if k < 0 {
+            errors = errors + 1
+            if errors > MAX_RECV_ERRORS {
+                go = false
+            }
+        } else {
+            errors = 0
+            var out: rt.Buf = rt.buf_new()
+            if dnsd.dnsd_answer(zone, buf, k as usize, &out, true) {
+                udp.udp_sendto(fd, out.ptr, out.len, fa, fp)
+                (*st).n_udp = (*st).n_udp + 1 as u64
+                log_query(st, buf, k as usize, &out, "udp")
+            } else {
+                (*st).n_drop = (*st).n_drop + 1 as u64
+            }
+            rt.buf_free(&out)
+        }
+    }
+    rt.heap_free(buf, UDP_BUF)
+}
+
+fn serve_connection(st: *mut State, c: *mut net.Conn, buf: u64, zone: *mut dnszone.Zone) {
+    var q: usize = 0
+    var go: bool = true
+    let timeout_set: bool = net.set_timeout(c, TCP_TIMEOUT_MS) catch false
+    while go && q < TCP_MAX_QUERIES {
+        let h: usize = net.read_full(c, buf, 2) catch 0 as usize
+        if h != 2 {
+            go = false
+        } else {
+            let len: usize = ((rt.ld8(buf, 0) as usize) << 8) | (rt.ld8(buf, 1) as usize)
+            if len < 12 || len > UDP_BUF - 2 {
+                go = false
+            } else {
+                let g: usize = net.read_full(c, buf + 2 as u64, len) catch 0 as usize
+                if g != len {
+                    go = false
+                } else {
+                    var out: rt.Buf = rt.buf_new()
+                    var body: rt.Buf = rt.buf_new()
+                    if dnsd.dnsd_answer(zone, buf + 2 as u64, len, &body, false) && body.len <= 65535 {
+                        rt.buf_push(&out, ((body.len >> 8) & 255) as u8)
+                        rt.buf_push(&out, (body.len & 255) as u8)
+                        rt.buf_push_bytes(&out, body.ptr, body.len)
+                        let w: usize = net.write_all(c, out.ptr, out.len) catch 0 as usize
+                        if w == 0 {
+                            go = false
+                        }
+                        (*st).n_tcp = (*st).n_tcp + 1 as u64
+                        log_query(st, buf + 2 as u64, len, &body, "tcp")
+                    } else {
+                        go = false
+                        (*st).n_drop = (*st).n_drop + 1 as u64
+                    }
+                    rt.buf_free(&body)
+                    rt.buf_free(&out)
+                }
+            }
+        }
+        q = q + 1
+    }
+}
+
+fn run_tcp(st: *mut State) {
+    var l: net.Listener = net.listener_from_fd((*st).tcp_fd as i32)
+    let buf: u64 = rt.heap_alloc(UDP_BUF)
+    let zone: *mut dnszone.Zone = (*st).zone as *mut dnszone.Zone
+    var errors: usize = 0
+    var go: bool = true
+    while go {
+        thread_blocking_an()
+        var c: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+        thread_blocking_out()
+        if (*st).stop_flag != 0 as u64 {
+            if net.conn_is_open(&c) {
+                net.close(&c)
+            }
+            go = false
+        } else if !net.conn_is_open(&c) {
+            errors = errors + 1
+            if errors > MAX_RECV_ERRORS {
+                go = false
+            }
+        } else {
+            errors = 0
+            serve_connection(st, &c, buf, zone)
+            net.close(&c)
+        }
+    }
+    rt.heap_free(buf, UDP_BUF)
+}
+
+fn stop(st: *mut State) {
+    (*st).stop_flag = 1 as u64
+    var wake: [u8; 1] = [0]
+    let qfd: i64 = udp.udp_open()
+    if qfd >= 0 {
+        udp.udp_sendto(qfd, (&wake[0]) as u64, 1, net.ADDR_LOCAL, (*st).port)
+        udp.udp_close(qfd)
+    }
+    var qc: net.Conn = net.connect_tcp(net.ADDR_LOCAL, (*st).port) catch net.conn_from_fd(0 - 1)
+    if net.conn_is_open(&qc) {
+        net.close(&qc)
+    }
+}
+
+fn close_all(st: *mut State) {
+    if (*st).udp_fd >= 0 {
+        udp.udp_close((*st).udp_fd)
+        (*st).udp_fd = 0 - 1
+    }
+    if (*st).tcp_fd >= 0 {
+        var l: net.Listener = net.listener_from_fd((*st).tcp_fd as i32)
+        net.close_listener(&l)
+        (*st).tcp_fd = 0 - 1
+    }
+}

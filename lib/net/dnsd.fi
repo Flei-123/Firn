@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dnsd.fi -- an AUTHORITATIVE DNS answerer over octets (net.dnsd).
+//
+//     var z: dnszone.Zone = dnszone.zone_new()
+//     let bad_line: usize = dnszone.zone_parse(&z, text_ptr, text_len)
+//     var reply: rt.Buf = rt.buf_new()
+//     if dnsd.dnsd_answer(&z, request_ptr, request_len, &reply, true) { /* send reply */ }
+//
+// `dnsd_answer` is a pure function of the zone and one datagram: no sockets, no clock.
+// The sockets are in lib/net/dnsd_serve.fi. The zone rules (wildcards, `%1`) are in
+// lib/net/dnszone.fi -- that is what lets one rule answer a whole family of names, e.g.
+// the SRV record of `_minecraft._tcp.<anything>.zone` pointing back at `<anything>.zone`.
+//
+// ANSWERS: A AAAA NS CNAME SOA MX TXT SRV and ANY (every record of the name). A CNAME
+// at a name is returned for any other type. NODATA and NXDOMAIN carry the SOA. Names
+// outside the zone are REFUSED, AXFR/IXFR are REFUSED. AA is set on everything we own.
+// The question is echoed byte for byte (so 0x20 case randomisation works).
+//
+// HONEST
+//   S1 no compression in the answers except the owner pointer to the question; names in
+//      the data are written out in full.
+//   S2 EDNS0: an OPT in the request is answered with an OPT (payload 1232, version 0, no
+//      options). A request with another EDNS version is answered as version 0, no BADVERS.
+//   S3 UDP: the answer is cut to 512 octets (or the client's EDNS payload, at most 1232);
+//      what does not fit becomes an empty answer with TC set. TCP has no cut.
+//   S4 no DNSSEC, no NOTIFY/UPDATE (NOTIMP), no zone transfer, no rate limiting.
+//   S5 a request with the QR bit set is dropped, so two of these servers cannot talk each
+//      other into a loop. A request shorter than a header is dropped.
+//   S6 CNAMEs are not chased, not even inside the zone.
+import std.rt
+import net.dnszone
+
+export {
+    dnsd_answer, dnsd_status_name, dnsd_question,
+    RC_OK, RC_FORMERR, RC_SERVFAIL, RC_NXDOMAIN, RC_NOTIMP, RC_REFUSED,
+}
+
+const RC_OK: u32 = 0
+const RC_FORMERR: u32 = 1
+const RC_SERVFAIL: u32 = 2
+const RC_NXDOMAIN: u32 = 3
+const RC_NOTIMP: u32 = 4
+const RC_REFUSED: u32 = 5
+
+const F_QR: u32 = 32768
+const F_AA: u32 = 1024
+const F_TC: u32 = 512
+const F_RD: u32 = 256
+
+const T_ANY: u32 = 255
+const T_AXFR: u32 = 252
+const T_IXFR: u32 = 251
+const T_OPT: u32 = 41
+const CLASS_IN: u32 = 1
+const CLASS_ANY: u32 = 255
+
+const EDNS_PAYLOAD: u32 = 1232
+const UDP_PLAIN: usize = 512
+
+fn dnsd_status_name(rc: u32) -> str {
+    if rc == RC_OK { return "NOERROR" }
+    if rc == RC_FORMERR { return "FORMERR" }
+    if rc == RC_SERVFAIL { return "SERVFAIL" }
+    if rc == RC_NXDOMAIN { return "NXDOMAIN" }
+    if rc == RC_NOTIMP { return "NOTIMP" }
+    if rc == RC_REFUSED { return "REFUSED" }
+    return "OTHER"
+}
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    put16(b, v >> 16)
+    put16(b, v & 65535 as u32)
+}
+
+fn be16(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+fn put_name(b: *mut rt.Buf, p: u64, n: usize) -> bool {
+    if n > 253 {
+        return false
+    }
+    if n == 0 {
+        rt.buf_push(b, 0 as u8)
+        return true
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 46 as u8 {
+            let l: usize = i - start
+            if l == 0 || l > 63 {
+                return false
+            }
+            rt.buf_push(b, l as u8)
+            rt.buf_push_bytes(b, p + start as u64, l)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    rt.buf_push(b, 0 as u8)
+    return true
+}
+
+fn put_rendered_name(z: *mut dnszone.Zone, b: *mut rt.Buf, tp: u64, tn: usize, cap: u64, capn: usize) -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    dnszone.zone_render(z, tp, tn, cap, capn, &tmp)
+    let ok: bool = put_name(b, tmp.ptr, tmp.len)
+    rt.buf_free(&tmp)
+    return ok
+}
+
+fn parse_question(req: u64, n: usize, text: u64, tn: *mut usize, qend: *mut usize) -> bool {
+    var pos: usize = 12
+    var w: usize = 0
+    var total: usize = 0
+    while true {
+        if pos >= n {
+            return false
+        }
+        let l: usize = rt.ld8(req, pos) as usize
+        if l == 0 {
+            pos = pos + 1
+            break
+        }
+        if l > 63 || pos + 1 + l > n {
+            return false
+        }
+        total = total + l + 1
+        if total > 254 {
+            return false
+        }
+        if w > 0 {
+            rt.st8(text, w, 46 as u8)
+            w = w + 1
+        }
+        var k: usize = 0
+        while k < l {
+            let c: u8 = rt.ld8(req, pos + 1 + k)
+            var lc: u8 = c
+            if c >= 65 as u8 && c <= 90 as u8 {
+                lc = c + 32 as u8
+            }
+            rt.st8(text, w, lc)
+            w = w + 1
+            k = k + 1
+        }
+        pos = pos + 1 + l
+    }
+    if pos + 4 > n {
+        return false
+    }
+    *tn = w
+    *qend = pos + 4
+    return true
+}
+
+fn dnsd_question(req: u64, n: usize, text: u64, tn: *mut usize, qtype: *mut u32) -> bool {
+    if n < 12 {
+        return false
+    }
+    var qend: usize = 0
+    if !parse_question(req, n, text, tn, &qend) {
+        return false
+    }
+    *qtype = be16(req, qend - 4)
+    return true
+}
+
+fn find_opt(req: u64, n: usize, qend: usize, payload: *mut u32) -> bool {
+    if be16(req, 10) == 0 as u32 || qend + 11 > n {
+        return false
+    }
+    if rt.ld8(req, qend) != 0 as u8 || be16(req, qend + 1) != T_OPT {
+        return false
+    }
+    *payload = be16(req, qend + 3)
+    return true
+}
+
+fn begin_rr(b: *mut rt.Buf, owner_ptr: bool, z: *mut dnszone.Zone, rtype: u32, ttl: u32, lenpos: *mut usize) -> bool {
+    if owner_ptr {
+        rt.buf_push(b, 192 as u8)
+        rt.buf_push(b, 12 as u8)
+    } else {
+        if !put_name(b, ((&(*z).origin[0]) as u64), (*z).origin_len) {
+            return false
+        }
+    }
+    put16(b, rtype)
+    put16(b, CLASS_IN)
+    put32(b, ttl)
+    *lenpos = (*b).len
+    put16(b, 0 as u32)
+    return true
+}
+
+fn end_rr(b: *mut rt.Buf, lenpos: usize) {
+    let l: usize = (*b).len - lenpos - 2
+    rt.st8((*b).ptr, lenpos, ((l >> 8) & 255) as u8)
+    rt.st8((*b).ptr, lenpos + 1, (l & 255) as u8)
+}
+
+fn emit_soa_data(z: *mut dnszone.Zone, b: *mut rt.Buf, j: usize) -> bool {
+    let tp: u64 = dnszone.zone_text_ptr(z, j)
+    let tn: usize = (*z).r_tlen[j]
+    var sp: usize = 0
+    while sp < tn && rt.ld8(tp, sp) != 32 as u8 {
+        sp = sp + 1
+    }
+    if sp >= tn {
+        return false
+    }
+    if !put_name(b, tp, sp) || !put_name(b, tp + (sp + 1) as u64, tn - sp - 1) {
+        return false
+    }
+    var k: usize = 0
+    while k < 5 {
+        put32(b, (*z).r_num[j * 5 + k])
+        k = k + 1
+    }
+    return true
+}
+
+fn emit_rule(z: *mut dnszone.Zone, b: *mut rt.Buf, j: usize, cap: u64, capn: usize, owner_ptr: bool) -> bool {
+    let t: u32 = (*z).r_type[j]
+    var lenpos: usize = 0
+    if !begin_rr(b, owner_ptr, z, t, (*z).ttl, &lenpos) {
+        return false
+    }
+    let tp: u64 = dnszone.zone_text_ptr(z, j)
+    let tn: usize = (*z).r_tlen[j]
+    if t == dnszone.RT_A {
+        rt.buf_push_bytes(b, dnszone.zone_addr_ptr(z, j), 4)
+    } else if t == dnszone.RT_AAAA {
+        rt.buf_push_bytes(b, dnszone.zone_addr_ptr(z, j), 16)
+    } else if t == dnszone.RT_NS || t == dnszone.RT_CNAME {
+        if !put_rendered_name(z, b, tp, tn, cap, capn) {
+            return false
+        }
+    } else if t == dnszone.RT_MX {
+        put16(b, (*z).r_num[j * 5])
+        if !put_rendered_name(z, b, tp, tn, cap, capn) {
+            return false
+        }
+    } else if t == dnszone.RT_SRV {
+        put16(b, (*z).r_num[j * 5])
+        put16(b, (*z).r_num[j * 5 + 1])
+        put16(b, (*z).r_num[j * 5 + 2])
+        if !put_rendered_name(z, b, tp, tn, cap, capn) {
+            return false
+        }
+    } else if t == dnszone.RT_TXT {
+        var tmp: rt.Buf = rt.buf_new()
+        dnszone.zone_render(z, tp, tn, cap, capn, &tmp)
+        if tmp.len == 0 || tmp.len > 255 {
+            rt.buf_free(&tmp)
+            return false
+        }
+        rt.buf_push(b, tmp.len as u8)
+        rt.buf_push_bytes(b, tmp.ptr, tmp.len)
+        rt.buf_free(&tmp)
+    } else if t == dnszone.RT_SOA {
+        if !emit_soa_data(z, b, j) {
+            return false
+        }
+    } else {
+        return false
+    }
+    end_rr(b, lenpos)
+    return true
+}
+
+fn find_soa(z: *mut dnszone.Zone) -> usize {
+    var i: usize = 0
+    while i < (*z).n {
+        if (*z).r_type[i] == dnszone.RT_SOA && (*z).r_plen[i] == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return 18446744073709551615 as usize
+}
+
+fn emit_negative_soa(z: *mut dnszone.Zone, b: *mut rt.Buf) -> bool {
+    let s: usize = find_soa(z)
+    if s == 18446744073709551615 as usize {
+        return true
+    }
+    var lenpos: usize = 0
+    var ttl: u32 = (*z).ttl
+    if (*z).r_num[s * 5 + 4] < ttl {
+        ttl = (*z).r_num[s * 5 + 4]
+    }
+    if !begin_rr(b, false, z, dnszone.RT_SOA, ttl, &lenpos) {
+        return false
+    }
+    if !emit_soa_data(z, b, s) {
+        return false
+    }
+    end_rr(b, lenpos)
+    return true
+}
+
+fn assemble(out: *mut rt.Buf, req: u64, qend: usize, id: u32, flags: u32, an: u32, ns: u32,
+    edns: bool, body: u64, body_len: usize) {
+    rt.buf_clear(out)
+    put16(out, id)
+    put16(out, flags)
+    put16(out, 1 as u32)
+    put16(out, an)
+    put16(out, ns)
+    put16(out, if edns { 1 as u32 } else { 0 as u32 })
+    rt.buf_push_bytes(out, req + 12 as u64, qend - 12)
+    rt.buf_push_bytes(out, body, body_len)
+    if edns {
+        rt.buf_push(out, 0 as u8)
+        put16(out, T_OPT)
+        put16(out, EDNS_PAYLOAD)
+        put32(out, 0 as u32)
+        put16(out, 0 as u32)
+    }
+}
+
+fn header_only(out: *mut rt.Buf, id: u32, rd: u32, rcode: u32) {
+    rt.buf_clear(out)
+    put16(out, id)
+    put16(out, F_QR | rd | rcode)
+    put16(out, 0 as u32)
+    put16(out, 0 as u32)
+    put16(out, 0 as u32)
+    put16(out, 0 as u32)
+}
+
+fn dnsd_answer(z: *mut dnszone.Zone, req: u64, n: usize, out: *mut rt.Buf, udp: bool) -> bool {
+    if n < 12 {
+        return false
+    }
+    let flags_in: u32 = be16(req, 2)
+    if (flags_in & F_QR) != 0 as u32 {
+        return false
+    }
+    let id: u32 = be16(req, 0)
+    let rd: u32 = flags_in & F_RD
+    if ((flags_in >> 11) & 15 as u32) != 0 as u32 {
+        header_only(out, id, rd, RC_NOTIMP)
+        return true
+    }
+    if be16(req, 4) != 1 as u32 {
+        header_only(out, id, rd, RC_FORMERR)
+        return true
+    }
+    var qtext: [u8; 256] = [0; 256]
+    var qn: usize = 0
+    var qend: usize = 0
+    if !parse_question(req, n, (&qtext[0]) as u64, &qn, &qend) {
+        header_only(out, id, rd, RC_FORMERR)
+        return true
+    }
+    let qtype: u32 = be16(req, qend - 4)
+    let qclass: u32 = be16(req, qend - 2)
+    var payload: u32 = 0
+    let edns: bool = find_opt(req, n, qend, &payload)
+    var limit: usize = UDP_PLAIN
+    if edns {
+        limit = payload as usize
+        if limit < UDP_PLAIN {
+            limit = UDP_PLAIN
+        }
+        if limit > EDNS_PAYLOAD as usize {
+            limit = EDNS_PAYLOAD as usize
+        }
+    }
+    var body: rt.Buf = rt.buf_new()
+    var an: u32 = 0
+    var ns: u32 = 0
+    var rcode: u32 = RC_OK
+    var aa: u32 = F_AA
+    var rel: u64 = 0
+    var rlen: usize = 0
+    if (qclass != CLASS_IN && qclass != CLASS_ANY) || qtype == T_AXFR || qtype == T_IXFR
+        || !dnszone.zone_relative(z, (&qtext[0]) as u64, qn, &rel, &rlen) {
+        rcode = RC_REFUSED
+        aa = 0 as u32
+    } else {
+        var lk: dnszone.Lookup = dnszone.lookup_new()
+        dnszone.zone_lookup(z, rel, rlen, &lk)
+        if !lk.found {
+            rcode = RC_NXDOMAIN
+            if emit_negative_soa(z, &body) {
+                if find_soa(z) != 18446744073709551615 as usize {
+                    ns = 1 as u32
+                }
+            } else {
+                rcode = RC_SERVFAIL
+            }
+        } else {
+            let capp: u64 = (&lk.cap[0]) as u64
+            var wanted: bool = false
+            var has_cname: usize = 18446744073709551615 as usize
+            var j: usize = 0
+            while j < (*z).n && rcode == RC_OK {
+                if dnszone.zone_same_owner(z, lk.best, j) {
+                    let t: u32 = (*z).r_type[j]
+                    if t == dnszone.RT_CNAME {
+                        has_cname = j
+                    }
+                    if qtype == T_ANY || t == qtype {
+                        wanted = true
+                        if emit_rule(z, &body, j, capp, lk.cap_len, true) {
+                            an = an + 1 as u32
+                        } else {
+                            rcode = RC_SERVFAIL
+                        }
+                    }
+                }
+                j = j + 1
+            }
+            if rcode == RC_OK && !wanted {
+                if has_cname != 18446744073709551615 as usize {
+                    if emit_rule(z, &body, has_cname, capp, lk.cap_len, true) {
+                        an = 1 as u32
+                    } else {
+                        rcode = RC_SERVFAIL
+                    }
+                } else if emit_negative_soa(z, &body) {
+                    if find_soa(z) != 18446744073709551615 as usize {
+                        ns = 1 as u32
+                    }
+                } else {
+                    rcode = RC_SERVFAIL
+                }
+            }
+        }
+    }
+    if rcode == RC_SERVFAIL {
+        rt.buf_clear(&body)
+        an = 0 as u32
+        ns = 0 as u32
+    }
+    assemble(out, req, qend, id, F_QR | aa | rd | rcode, an, ns, edns, body.ptr, body.len)
+    if udp && (*out).len > limit {
+        assemble(out, req, qend, id, F_QR | aa | rd | F_TC | rcode, 0 as u32, 0 as u32, edns, 0 as u64, 0)
+    }
+    rt.buf_free(&body)
+    return true
+}

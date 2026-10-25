@@ -1,0 +1,98 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/5071_dnsd_loopback.fi -- the DNS server over real sockets: lib/net/dnsd_serve.fi in
+// two threads, the resolver of lib/net/dns.fi (written by somebody else, tested against other
+// servers) as the client. Checks the Minecraft case end to end: a wildcard SRV that points
+// every name back at itself, over UDP and over TCP (TC fallback).
+import std.rt
+import std.net
+import net.dns
+import net.udp
+import net.dnszone
+import net.dnsd_serve
+
+const ZONE_TEXT: str = "zone mc.example.com\nttl 60\nsoa @ ns1.example.com hostmaster.example.com 7 3600 600 86400 30\nns @ ns1.example.com\na @ 192.0.2.1\na * 192.0.2.7\nsrv _minecraft._tcp.* 0 5 443 %1.mc.example.com\ntxt big 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\ntxt big 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\ntxt big 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\ntxt big 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\n"
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let st: *mut dnsd_serve.State = arg as *mut dnsd_serve.State
+    if kind == 1 {
+        dnsd_serve.run_udp(st)
+    } else {
+        dnsd_serve.run_tcp(st)
+    }
+    return 0
+}
+
+fn srv_eq(set: *mut dns.SrvSet, i: usize, want: str) -> bool {
+    if (*set).nlen[i] != want.n {
+        return false
+    }
+    return rt.mem_eq(dns.srv_target(set, i), want.p as u64, want.n)
+}
+
+fn client_checks(port: u16) -> i32 {
+    var res: dns.Resolver = dns.resolver_new()
+    dns.resolver_clear_servers(&res)
+    dns.resolver_add_server(&res, net.ADDR_LOCAL)
+    dns.resolver_set_port(&res, port)
+    dns.resolver_set_timeout(&res, 1000 as u64)
+    dns.resolver_set_retries(&res, 2 as u32)
+    dns.resolver_use_cache(&res, false)
+
+    var set: dns.SrvSet = dns.srvset_new()
+    var n1: str = "_minecraft._tcp.thunder.mc.example.com"
+    let ok1: bool = dns.dns_resolve_srv(&res, n1.p as u64, n1.n, &set) catch false
+    if !ok1 || set.n != 1 { return 10 }
+    if set.port[0] != 443 as u32 || set.prio[0] != 0 as u32 || set.weight[0] != 5 as u32 { return 11 }
+    if !srv_eq(&set, 0, "thunder.mc.example.com") { return 12 }
+    if set.via != dns.VIA_UDP { return 13 }
+
+    var out: dns.Resolved = dns.resolved_new()
+    var n2: str = "thunder.mc.example.com"
+    let ok2: bool = dns.dns_resolve_a(&res, n2.p as u64, n2.n, &out) catch false
+    if !ok2 || out.n != 1 || out.addr[0] != net.ipv4(192 as u8, 0 as u8, 2 as u8, 7 as u8) { return 20 }
+    var n3: str = "mc.example.com"
+    let ok3: bool = dns.dns_resolve_a(&res, n3.p as u64, n3.n, &out) catch false
+    if !ok3 || out.addr[0] != net.ipv4(192 as u8, 0 as u8, 2 as u8, 1 as u8) { return 21 }
+
+    var n4: str = "_minecraft._tcp.a.b.mc.example.com"
+    let ok4: bool = dns.dns_resolve_srv(&res, n4.p as u64, n4.n, &set) catch false
+    if ok4 { return 30 }
+    if dns.resolver_last_error(&res) != 7 as u32 { return 31 }
+
+    var n5: str = "example.org"
+    let ok5: bool = dns.dns_resolve_a(&res, n5.p as u64, n5.n, &out) catch false
+    if ok5 { return 32 }
+
+    var n6: str = "big.mc.example.com"
+    let ok6: bool = dns.dns_resolve(&res, n6.p as u64, n6.n, dns.T_AAAA, &out) catch false
+    if ok6 { return 40 }
+
+    dns.resolver_set_edns(&res, 0 as u32)
+    let tcp0: u64 = dns.resolver_tcp_used(&res)
+    var o7: dns.Resolved = dns.resolved_new()
+    let ok7: bool = dns.dns_resolve(&res, n6.p as u64, n6.n, 16 as u32, &o7) catch false
+    if dns.resolver_tcp_used(&res) != tcp0 + 1 as u64 { return 41 }
+    dns.resolver_free(&res)
+    return 0
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    if !thread_init() { return 1 }
+    var zone: dnszone.Zone = dnszone.zone_new()
+    if dnszone.zone_parse(&zone, ZONE_TEXT.p as u64, ZONE_TEXT.n) != 0 { return 2 }
+    var st: dnsd_serve.State = dnsd_serve.state_new(&zone)
+    if dnsd_serve.open(&st, net.ADDR_LOCAL, 0 as u16) != 0 { return 3 }
+    let port: u16 = dnsd_serve.bound_port(&st)
+    let hu: u64 = thread_start(1, (&st) as u64)
+    let ht: u64 = thread_start(2, (&st) as u64)
+    if hu == 0 || ht == 0 { return 4 }
+    let rc: i32 = client_checks(port)
+    dnsd_serve.stop(&st)
+    thread_wait(hu)
+    thread_wait(ht)
+    dnsd_serve.close_all(&st)
+    if rc == 0 && (st.n_udp < 5 as u64 || st.n_tcp < 1 as u64) { return 5 }
+    return rc
+}
