@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bluetooth/bt_transport_linux.fi -- bt_transport_linux: raw HCI user channel socket and serial (UART H4) transports for Linux
+import std.rt
+import bluetooth.bt_transport
+
+export { open_hci_user_channel, open_uart, uart_baud_constant }
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_POLL: i64 = 7
+const SYS_IOCTL: i64 = 16
+const SYS_SOCKET: i64 = 41
+const SYS_BIND: i64 = 49
+
+const AF_BLUETOOTH: i64 = 31
+const SOCK_RAW_CLOEXEC: i64 = 524291
+const BTPROTO_HCI: i64 = 1
+const HCI_CHANNEL_USER: u32 = 1
+const HCI_DEV_NONE: u32 = 65535
+
+const O_RDWR_NOCTTY_CLOEXEC: i64 = 524546
+const TCGETS: i64 = 21505
+const TCSETS: i64 = 21506
+
+const POLLIN: u32 = 1
+
+fn fd_send(ctx: u64, p: u64, n: usize) -> bool {
+    var done: usize = 0
+    var spins: u32 = 0
+    while done < n {
+        let r: i64 = syscall(SYS_WRITE, ctx as i64, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r < 0 {
+            if r == -11 && spins < 1000 {
+                spins = spins + 1
+            } else {
+                return false
+            }
+        } else {
+            done = done + r as usize
+        }
+    }
+    return true
+}
+
+fn fd_recv(ctx: u64, p: u64, cap: usize, timeout_ms: i32) -> i64 {
+    var pfd: [u8; 8] = [0; 8]
+    let pp: u64 = (&pfd[0]) as u64
+    rt.st8(pp, 0, (ctx & 255) as u8)
+    rt.st8(pp, 1, ((ctx >> 8) & 255) as u8)
+    rt.st8(pp, 2, ((ctx >> 16) & 255) as u8)
+    rt.st8(pp, 3, ((ctx >> 24) & 255) as u8)
+    rt.st8(pp, 4, POLLIN as u8)
+    let pr: i64 = syscall(SYS_POLL, pp as i64, 1, timeout_ms as i64, 0, 0, 0)
+    if pr < 0 {
+        return -1
+    }
+    if pr == 0 {
+        return 0
+    }
+    let r: i64 = syscall(SYS_READ, ctx as i64, p as i64, cap as i64, 0, 0, 0)
+    if r < 0 {
+        if r == -11 || r == -4 {
+            return 0
+        }
+        return -1
+    }
+    if r == 0 {
+        return -1
+    }
+    return r
+}
+
+fn fd_close(ctx: u64) {
+    syscall(SYS_CLOSE, ctx as i64, 0, 0, 0, 0, 0)
+}
+
+fn open_hci_user_channel(dev: u32, out: *mut bt_transport.Transport) -> i32 {
+    let fd: i64 = syscall(SYS_SOCKET, AF_BLUETOOTH, SOCK_RAW_CLOEXEC, BTPROTO_HCI, 0, 0, 0)
+    if fd < 0 {
+        return bt_transport.TR_ERR_OPEN
+    }
+    var sa: [u8; 6] = [0; 6]
+    let sp: u64 = (&sa[0]) as u64
+    rt.st8(sp, 0, AF_BLUETOOTH as u8)
+    rt.st8(sp, 2, (dev & 255) as u8)
+    rt.st8(sp, 3, ((dev >> 8) & 255) as u8)
+    rt.st8(sp, 4, HCI_CHANNEL_USER as u8)
+    let r: i64 = syscall(SYS_BIND, fd, sp as i64, 6, 0, 0, 0)
+    if r < 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return bt_transport.TR_ERR_OPEN
+    }
+    *out = bt_transport.Transport { kind: bt_transport.TR_LINUX_HCI, ctx: fd as u64,
+        send: fd_send, recv: fd_recv, close: fd_close }
+    return bt_transport.TR_OK
+}
+
+fn uart_baud_constant(baud: u32) -> u32 {
+    if baud == 9600 { return 13 }
+    if baud == 19200 { return 14 }
+    if baud == 38400 { return 15 }
+    if baud == 57600 { return 4097 }
+    if baud == 115200 { return 4098 }
+    if baud == 230400 { return 4099 }
+    if baud == 460800 { return 4100 }
+    if baud == 500000 { return 4101 }
+    if baud == 576000 { return 4102 }
+    if baud == 921600 { return 4103 }
+    if baud == 1000000 { return 4104 }
+    if baud == 1500000 { return 4106 }
+    if baud == 2000000 { return 4107 }
+    if baud == 3000000 { return 4109 }
+    return 0
+}
+
+fn put32(p: u64, at: usize, v: u32) {
+    rt.st8(p, at, (v & 255) as u8)
+    rt.st8(p, at + 1, ((v >> 8) & 255) as u8)
+    rt.st8(p, at + 2, ((v >> 16) & 255) as u8)
+    rt.st8(p, at + 3, ((v >> 24) & 255) as u8)
+}
+
+fn open_uart(path: str, baud: u32, flow_control: bool, out: *mut bt_transport.Transport) -> i32 {
+    let speed: u32 = uart_baud_constant(baud)
+    if speed == 0 {
+        return bt_transport.TR_ERR_UNSUPPORTED
+    }
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.length())
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDWR_NOCTTY_CLOEXEC, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return bt_transport.TR_ERR_OPEN
+    }
+    var tio: [u8; 64] = [0; 64]
+    let tp: u64 = (&tio[0]) as u64
+    if syscall(SYS_IOCTL, fd, TCGETS, tp as i64, 0, 0, 0) < 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return bt_transport.TR_ERR_OPEN
+    }
+    var cflag: u32 = 0x30 | 0x80 | 0x800 | speed
+    if flow_control {
+        cflag = cflag | 0x80000000
+    }
+    put32(tp, 0, 0)
+    put32(tp, 4, 0)
+    put32(tp, 8, cflag)
+    put32(tp, 12, 0)
+    rt.st8(tp, 17 + 5, 1 as u8)
+    rt.st8(tp, 17 + 6, 0 as u8)
+    if syscall(SYS_IOCTL, fd, TCSETS, tp as i64, 0, 0, 0) < 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return bt_transport.TR_ERR_OPEN
+    }
+    *out = bt_transport.Transport { kind: bt_transport.TR_UART, ctx: fd as u64,
+        send: fd_send, recv: fd_recv, close: fd_close }
+    return bt_transport.TR_OK
+}

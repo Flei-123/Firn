@@ -1,0 +1,420 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bluetooth/bt_fake_controller.fi -- bt_fake_controller: in-memory LE controller with simulated advertisers, connections and HCI trace recording
+import std.rt
+import bluetooth.bt_le
+import bluetooth.bt_hci
+import bluetooth.bt_h4
+import bluetooth.bt_trace
+import bluetooth.bt_transport
+
+export {
+    FakeController, fake_new, fake_free, fake_add_peer, fake_transport, fake_trace,
+    fake_set_address, fake_is_connected, FAKE_MAX_PEERS,
+}
+
+const FAKE_MAX_PEERS: usize = 4
+
+struct FakeController {
+    addr: [u8; 6],
+    outq: rt.Buf,
+    out_pos: usize,
+    trace: rt.Buf,
+    de: bt_h4.H4Deframer,
+    peer_used: [u8; 4],
+    peer_type: [u8; 4],
+    peer_addr: [u8; 24],
+    peer_data: [u8; 124],
+    peer_dlen: [u8; 4],
+    peer_rssi: [u8; 4],
+    conn_used: [u8; 4],
+    conn_peer: [u8; 4],
+    adv_on: bool,
+    adv_len: usize,
+    adv_data: [u8; 31],
+    scan_on: bool,
+    scan_active: bool,
+    rng: u32,
+}
+
+fn fake_new() -> FakeController {
+    return FakeController { addr: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66], outq: rt.buf_new(), out_pos: 0,
+        trace: rt.buf_new(), de: bt_h4.h4_new(), peer_used: [0; 4], peer_type: [0; 4],
+        peer_addr: [0; 24], peer_data: [0; 124], peer_dlen: [0; 4], peer_rssi: [0; 4],
+        conn_used: [0; 4], conn_peer: [0; 4], adv_on: false, adv_len: 0, adv_data: [0; 31],
+        scan_on: false, scan_active: false, rng: 2463534242 }
+}
+
+fn fake_free(c: *mut FakeController) {
+    rt.buf_free(&(*c).outq)
+    rt.buf_free(&(*c).trace)
+    bt_h4.h4_free(&(*c).de)
+}
+
+fn fake_set_address(c: *mut FakeController, addr: u64) {
+    rt.mem_copy((&(*c).addr[0]) as u64, addr, 6)
+}
+
+fn fake_add_peer(c: *mut FakeController, addr: u64, addr_type: u32, data: u64, n: usize, rssi: i32) -> bool {
+    if n > 31 {
+        return false
+    }
+    var i: usize = 0
+    while i < FAKE_MAX_PEERS {
+        if (*c).peer_used[i] == 0 as u8 {
+            (*c).peer_used[i] = 1 as u8
+            (*c).peer_type[i] = addr_type as u8
+            rt.mem_copy((&(*c).peer_addr[0]) as u64 + (i * 6) as u64, addr, 6)
+            rt.mem_copy((&(*c).peer_data[0]) as u64 + (i * 31) as u64, data, n)
+            (*c).peer_dlen[i] = n as u8
+            (*c).peer_rssi[i] = (rssi & 255) as u8
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn fake_trace(c: *mut FakeController) -> str {
+    return rt.buf_str(&(*c).trace)
+}
+
+fn fake_is_connected(c: *mut FakeController, handle: u32) -> bool {
+    if handle < 64 || handle >= 68 {
+        return false
+    }
+    return (*c).conn_used[(handle - 64) as usize] != 0 as u8
+}
+
+fn emit(c: *mut FakeController, b: *mut rt.Buf) {
+    bt_trace.trace_add(&(*c).trace, false, rt.buf_ptr(b), rt.buf_len(b))
+    rt.buf_push_bytes(&(*c).outq, rt.buf_ptr(b), rt.buf_len(b))
+    rt.buf_clear(b)
+}
+
+fn event_begin(b: *mut rt.Buf, code: u32) {
+    bt_le.le_put8(b, bt_hci.H4_EVENT)
+    bt_le.le_put8(b, code)
+    bt_le.le_put8(b, 0)
+}
+
+fn event_end(b: *mut rt.Buf) {
+    rt.st8(rt.buf_ptr(b), 2, (rt.buf_len(b) - 3) as u8)
+}
+
+fn complete(c: *mut FakeController, op: u32, ret: u64, retn: usize) {
+    var b: rt.Buf = rt.buf_new()
+    event_begin(&b, 0x0E)
+    bt_le.le_put8(&b, 1)
+    bt_le.le_put16(&b, op)
+    if retn == 0 {
+        bt_le.le_put8(&b, 0)
+    } else {
+        bt_le.le_put_raw(&b, ret, retn)
+    }
+    event_end(&b)
+    emit(c, &b)
+    rt.buf_free(&b)
+}
+
+fn complete_status(c: *mut FakeController, op: u32, status: u32) {
+    var s: [u8; 1] = [status as u8]
+    complete(c, op, (&s[0]) as u64, 1)
+}
+
+fn command_status(c: *mut FakeController, op: u32, status: u32) {
+    var b: rt.Buf = rt.buf_new()
+    event_begin(&b, 0x0F)
+    bt_le.le_put8(&b, status)
+    bt_le.le_put8(&b, 1)
+    bt_le.le_put16(&b, op)
+    event_end(&b)
+    emit(c, &b)
+    rt.buf_free(&b)
+}
+
+fn next_random(c: *mut FakeController) -> u32 {
+    var x: u32 = (*c).rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 17)
+    x = x ^ (x << 5)
+    (*c).rng = x
+    return x
+}
+
+fn find_peer(c: *mut FakeController, addr: u64, addr_type: u32) -> usize {
+    var i: usize = 0
+    while i < FAKE_MAX_PEERS {
+        if (*c).peer_used[i] != 0 as u8 && (*c).peer_type[i] as u32 == addr_type
+            && bt_le.le_bytes_eq((&(*c).peer_addr[0]) as u64 + (i * 6) as u64, addr, 6) {
+            return i
+        }
+        i = i + 1
+    }
+    return bt_le.NONE
+}
+
+fn emit_reports(c: *mut FakeController) {
+    var i: usize = 0
+    while i < FAKE_MAX_PEERS {
+        if (*c).peer_used[i] != 0 as u8 {
+            var b: rt.Buf = rt.buf_new()
+            event_begin(&b, 0x3E)
+            bt_le.le_put8(&b, 0x02)
+            bt_le.le_put8(&b, 1)
+            bt_le.le_put8(&b, bt_hci.ADV_IND)
+            bt_le.le_put8(&b, (*c).peer_type[i] as u32)
+            bt_le.le_put_raw(&b, (&(*c).peer_addr[0]) as u64 + (i * 6) as u64, 6)
+            let dl: usize = (*c).peer_dlen[i] as usize
+            bt_le.le_put8(&b, dl as u32)
+            bt_le.le_put_raw(&b, (&(*c).peer_data[0]) as u64 + (i * 31) as u64, dl)
+            bt_le.le_put8(&b, (*c).peer_rssi[i] as u32)
+            event_end(&b)
+            emit(c, &b)
+            rt.buf_free(&b)
+        }
+        i = i + 1
+    }
+}
+
+fn le_conn_complete(c: *mut FakeController, status: u32, handle: u32, peer_type: u32, addr: u64) {
+    var b: rt.Buf = rt.buf_new()
+    event_begin(&b, 0x3E)
+    bt_le.le_put8(&b, 0x01)
+    bt_le.le_put8(&b, status)
+    bt_le.le_put16(&b, handle)
+    bt_le.le_put8(&b, 0)
+    bt_le.le_put8(&b, peer_type)
+    bt_le.le_put_raw(&b, addr, 6)
+    bt_le.le_put16(&b, 24)
+    bt_le.le_put16(&b, 0)
+    bt_le.le_put16(&b, 72)
+    bt_le.le_put8(&b, 0)
+    event_end(&b)
+    emit(c, &b)
+    rt.buf_free(&b)
+}
+
+fn on_create_connection(c: *mut FakeController, p: u64) {
+    command_status(c, bt_hci.OP_LE_CREATE_CONNECTION, 0)
+    let ptype: u32 = rt.ld8(p, 9) as u32
+    let idx: usize = find_peer(c, p + 10, ptype)
+    var slot: usize = bt_le.NONE
+    var i: usize = 0
+    while i < FAKE_MAX_PEERS {
+        if (*c).conn_used[i] == 0 as u8 && slot == bt_le.NONE {
+            slot = i
+        }
+        i = i + 1
+    }
+    if idx == bt_le.NONE || slot == bt_le.NONE {
+        le_conn_complete(c, 0x3E, 0, ptype, p + 10)
+        return
+    }
+    (*c).conn_used[slot] = 1 as u8
+    (*c).conn_peer[slot] = idx as u8
+    le_conn_complete(c, 0, 64 + slot as u32, ptype, p + 10)
+}
+
+fn on_disconnect(c: *mut FakeController, p: u64) {
+    let handle: u32 = bt_le.le_get16(p, 4) & 4095
+    let reason: u32 = rt.ld8(p, 6) as u32
+    if !fake_is_connected(c, handle) {
+        command_status(c, bt_hci.OP_DISCONNECT, 0x02)
+        return
+    }
+    command_status(c, bt_hci.OP_DISCONNECT, 0)
+    (*c).conn_used[(handle - 64) as usize] = 0 as u8
+    var b: rt.Buf = rt.buf_new()
+    event_begin(&b, 0x05)
+    bt_le.le_put8(&b, 0)
+    bt_le.le_put16(&b, handle)
+    bt_le.le_put8(&b, 0x16)
+    event_end(&b)
+    emit(c, &b)
+    rt.buf_free(&b)
+}
+
+fn on_acl(c: *mut FakeController, p: u64, n: usize) {
+    let handle: u32 = bt_le.le_get16(p, 1) & 4095
+    if !fake_is_connected(c, handle) {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, p, n)
+    emit(c, &b)
+    event_begin(&b, 0x13)
+    bt_le.le_put8(&b, 1)
+    bt_le.le_put16(&b, handle)
+    bt_le.le_put16(&b, 1)
+    event_end(&b)
+    emit(c, &b)
+    rt.buf_free(&b)
+}
+
+fn ret_bytes(c: *mut FakeController, op: u32, tail: u64, n: usize) {
+    var b: rt.Buf = rt.buf_new()
+    bt_le.le_put8(&b, 0)
+    if n > 0 {
+        bt_le.le_put_raw(&b, tail, n)
+    }
+    complete(c, op, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn on_command(c: *mut FakeController, p: u64, n: usize) {
+    let op: u32 = bt_le.le_get16(p, 1)
+    let params: u64 = p + 4
+    var z: [u8; 64] = [0; 64]
+    let zp: u64 = (&z[0]) as u64
+    if op == bt_hci.OP_RESET {
+        (*c).adv_on = false
+        (*c).scan_on = false
+        var i: usize = 0
+        while i < FAKE_MAX_PEERS {
+            (*c).conn_used[i] = 0 as u8
+            i = i + 1
+        }
+        complete_status(c, op, 0)
+        return
+    }
+    if op == bt_hci.OP_SET_EVENT_MASK || op == bt_hci.OP_WRITE_LE_HOST_SUPPORT
+        || op == bt_hci.OP_LE_SET_EVENT_MASK || op == bt_hci.OP_LE_SET_RANDOM_ADDRESS
+        || op == bt_hci.OP_LE_SET_ADV_PARAMS || op == bt_hci.OP_LE_SET_SCAN_RSP_DATA
+        || op == bt_hci.OP_LE_CLEAR_FILTER_ACCEPT_LIST || op == bt_hci.OP_LE_ADD_FILTER_ACCEPT_LIST
+        || op == bt_hci.OP_LE_CREATE_CONNECTION_CANCEL {
+        complete_status(c, op, 0)
+        return
+    }
+    if op == bt_hci.OP_LE_SET_SCAN_PARAMS {
+        (*c).scan_active = rt.ld8(params, 0) == 1 as u8
+        complete_status(c, op, 0)
+        return
+    }
+    if op == bt_hci.OP_LE_SET_ADV_DATA {
+        (*c).adv_len = rt.ld8(params, 0) as usize
+        rt.mem_copy((&(*c).adv_data[0]) as u64, params + 1, 31)
+        complete_status(c, op, 0)
+        return
+    }
+    if op == bt_hci.OP_LE_SET_ADV_ENABLE {
+        (*c).adv_on = rt.ld8(params, 0) == 1 as u8
+        complete_status(c, op, 0)
+        return
+    }
+    if op == bt_hci.OP_LE_SET_SCAN_ENABLE {
+        (*c).scan_on = rt.ld8(params, 0) == 1 as u8
+        complete_status(c, op, 0)
+        if (*c).scan_on {
+            emit_reports(c)
+        }
+        return
+    }
+    if op == bt_hci.OP_LE_CREATE_CONNECTION {
+        on_create_connection(c, p)
+        return
+    }
+    if op == bt_hci.OP_DISCONNECT {
+        on_disconnect(c, p)
+        return
+    }
+    if op == bt_hci.OP_READ_LOCAL_VERSION {
+        var v: [u8; 8] = [0x0B, 0x01, 0x00, 0x0B, 0xFF, 0xFF, 0x01, 0x00]
+        ret_bytes(c, op, (&v[0]) as u64, 8)
+        return
+    }
+    if op == bt_hci.OP_READ_LOCAL_COMMANDS {
+        ret_bytes(c, op, zp, 64)
+        return
+    }
+    if op == bt_hci.OP_READ_LOCAL_FEATURES {
+        var f: [u8; 8] = [0, 0, 0, 0, 0x60, 0, 0, 0]
+        ret_bytes(c, op, (&f[0]) as u64, 8)
+        return
+    }
+    if op == bt_hci.OP_READ_BUFFER_SIZE {
+        var s: [u8; 7] = [27, 0, 0, 8, 0, 0, 0]
+        ret_bytes(c, op, (&s[0]) as u64, 7)
+        return
+    }
+    if op == bt_hci.OP_READ_BD_ADDR {
+        ret_bytes(c, op, (&(*c).addr[0]) as u64, 6)
+        return
+    }
+    if op == bt_hci.OP_LE_READ_BUFFER_SIZE {
+        var s: [u8; 3] = [251, 0, 8]
+        ret_bytes(c, op, (&s[0]) as u64, 3)
+        return
+    }
+    if op == bt_hci.OP_LE_READ_LOCAL_FEATURES {
+        var f: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0]
+        ret_bytes(c, op, (&f[0]) as u64, 8)
+        return
+    }
+    if op == bt_hci.OP_LE_RAND {
+        var r: [u8; 8] = [0; 8]
+        bt_le.le_copy((&r[0]) as u64, (&(*c).rng) as u64, 0)
+        let a: u32 = next_random(c)
+        let b2: u32 = next_random(c)
+        rt.st8((&r[0]) as u64, 0, (a & 255) as u8)
+        rt.st8((&r[0]) as u64, 1, ((a >> 8) & 255) as u8)
+        rt.st8((&r[0]) as u64, 2, ((a >> 16) & 255) as u8)
+        rt.st8((&r[0]) as u64, 3, ((a >> 24) & 255) as u8)
+        rt.st8((&r[0]) as u64, 4, (b2 & 255) as u8)
+        rt.st8((&r[0]) as u64, 5, ((b2 >> 8) & 255) as u8)
+        rt.st8((&r[0]) as u64, 6, ((b2 >> 16) & 255) as u8)
+        rt.st8((&r[0]) as u64, 7, ((b2 >> 24) & 255) as u8)
+        ret_bytes(c, op, (&r[0]) as u64, 8)
+        return
+    }
+    complete_status(c, op, 0x01)
+}
+
+fn process(c: *mut FakeController, pkt: *mut rt.Buf) {
+    let p: u64 = rt.buf_ptr(pkt)
+    let n: usize = rt.buf_len(pkt)
+    bt_trace.trace_add(&(*c).trace, true, p, n)
+    let ptype: u32 = rt.ld8(p, 0) as u32
+    if ptype == bt_hci.H4_COMMAND {
+        on_command(c, p, n)
+    }
+    if ptype == bt_hci.H4_ACL {
+        on_acl(c, p, n)
+    }
+}
+
+fn fake_send(ctx: u64, p: u64, n: usize) -> bool {
+    let c: *mut FakeController = ctx as *mut FakeController
+    bt_h4.h4_feed(&(*c).de, p, n)
+    var pkt: rt.Buf = rt.buf_new()
+    while bt_h4.h4_next(&(*c).de, &pkt) {
+        process(c, &pkt)
+        rt.buf_clear(&pkt)
+    }
+    rt.buf_free(&pkt)
+    return !bt_h4.h4_failed(&(*c).de)
+}
+
+fn fake_recv(ctx: u64, p: u64, cap: usize, timeout_ms: i32) -> i64 {
+    let c: *mut FakeController = ctx as *mut FakeController
+    let have: usize = rt.buf_len(&(*c).outq) - (*c).out_pos
+    if have == 0 {
+        rt.buf_clear(&(*c).outq)
+        (*c).out_pos = 0
+        return 0
+    }
+    var take: usize = have
+    if take > cap {
+        take = cap
+    }
+    rt.mem_copy(p, rt.buf_ptr(&(*c).outq) + (*c).out_pos as u64, take)
+    (*c).out_pos = (*c).out_pos + take
+    return take as i64
+}
+
+fn fake_close(ctx: u64) {
+}
+
+fn fake_transport(c: *mut FakeController) -> bt_transport.Transport {
+    return bt_transport.Transport { kind: bt_transport.TR_FAKE, ctx: c as u64,
+        send: fake_send, recv: fake_recv, close: fake_close }
+}

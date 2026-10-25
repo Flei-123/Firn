@@ -1,0 +1,92 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.testkit
+import std.str
+import bluetooth.bt_hci
+import bluetooth.bt_hci_evt
+import bluetooth.bt_h4
+import bluetooth.bt_transport
+import bluetooth.bt_transport_linux
+import bluetooth.bt_transport_stub
+import bluetooth.bt_fake_controller
+
+fn roundtrip(t: *mut bt_transport.Transport, d: *mut bt_h4.H4Deframer, cmd: *mut rt.Buf, out: *mut rt.Buf) -> bool {
+    var tmp: [u8; 512] = [0; 512]
+    if !bt_transport.transport_send(t, rt.buf_ptr(cmd), rt.buf_len(cmd)) { return false }
+    let n: i64 = bt_transport.transport_recv(t, (&tmp[0]) as u64, 512, 10)
+    if n <= 0 { return false }
+    bt_h4.h4_feed(d, (&tmp[0]) as u64, n as usize)
+    return bt_h4.h4_next(d, out)
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    var d: bt_h4.H4Deframer = bt_h4.h4_new()
+    var s: [u8; 14] = [4, 0x0E, 4, 1, 3, 0x0C, 0, 4, 0x0F, 4, 0, 1, 3, 12]
+    bt_h4.h4_feed(&d, (&s[0]) as u64, 5)
+    var pkt: rt.Buf = rt.buf_new()
+    testkit.check(!bt_h4.h4_next(&d, &pkt), "partial packet waits")
+    bt_h4.h4_feed(&d, (&s[5]) as u64, 9)
+    testkit.check(bt_h4.h4_next(&d, &pkt) && rt.buf_len(&pkt) == 7, "first packet")
+    rt.buf_clear(&pkt)
+    testkit.check(bt_h4.h4_next(&d, &pkt) && rt.buf_len(&pkt) == 7 && rt.ld8(rt.buf_ptr(&pkt), 1) == 0x0F as u8, "second packet")
+    rt.buf_clear(&pkt)
+    var bad: [u8; 1] = [9]
+    bt_h4.h4_feed(&d, (&bad[0]) as u64, 1)
+    testkit.check(!bt_h4.h4_next(&d, &pkt) && bt_h4.h4_failed(&d), "bad packet type fails")
+    bt_h4.h4_reset(&d)
+    testkit.check(!bt_h4.h4_failed(&d), "reset clears failure")
+
+    var fc: bt_fake_controller.FakeController = bt_fake_controller.fake_new()
+    var peer_addr: [u8; 6] = [1, 2, 3, 4, 5, 6]
+    var adv: [u8; 5] = [2, 1, 6, 1, 9]
+    testkit.check(bt_fake_controller.fake_add_peer(&fc, (&peer_addr[0]) as u64, 0, (&adv[0]) as u64, 5, -40), "peer added")
+    var t: bt_transport.Transport = bt_fake_controller.fake_transport(&fc)
+    testkit.check(bt_transport.transport_is_open(&t), "transport open")
+    var cmd: rt.Buf = rt.buf_new()
+    bt_hci.hci_reset(&cmd)
+    testkit.check(roundtrip(&t, &d, &cmd, &pkt), "reset answered")
+    var ev: bt_hci_evt.HciEvent = bt_hci_evt.HciEvent { code: 0, sub: 0, params: 0, n: 0 }
+    var cc: bt_hci_evt.CmdComplete = bt_hci_evt.CmdComplete { ncmd: 0, opcode: 0, status: 9, ret: 0, retn: 0 }
+    testkit.check(bt_hci_evt.event_parse(rt.buf_ptr(&pkt), rt.buf_len(&pkt), &ev) && bt_hci_evt.event_cmd_complete(&ev, &cc) && cc.opcode == bt_hci.OP_RESET && cc.status == 0, "reset complete")
+    rt.buf_clear(&pkt)
+    rt.buf_clear(&cmd)
+    bt_hci.hci_read_bd_addr(&cmd)
+    testkit.check(roundtrip(&t, &d, &cmd, &pkt), "bd addr answered")
+    testkit.check(bt_hci_evt.event_parse(rt.buf_ptr(&pkt), rt.buf_len(&pkt), &ev) && bt_hci_evt.event_cmd_complete(&ev, &cc) && cc.retn == 6 && rt.ld8(cc.ret, 0) == 0x11 as u8, "bd addr value")
+    rt.buf_clear(&pkt)
+    rt.buf_clear(&cmd)
+    bt_hci.hci_le_set_scan_enable(&cmd, true, false)
+    testkit.check(roundtrip(&t, &d, &cmd, &pkt), "scan enable complete")
+    rt.buf_clear(&pkt)
+    testkit.check(bt_h4.h4_next(&d, &pkt) || true, "drain")
+    var tmp: [u8; 512] = [0; 512]
+    let n: i64 = bt_transport.transport_recv(&t, (&tmp[0]) as u64, 512, 10)
+    testkit.check(n > 0 || rt.buf_len(&pkt) > 0, "adv report delivered")
+    var all: rt.Buf = rt.buf_new()
+    if rt.buf_len(&pkt) > 0 { rt.buf_push_bytes(&all, rt.buf_ptr(&pkt), rt.buf_len(&pkt)) }
+    if n > 0 { rt.buf_push_bytes(&all, (&tmp[0]) as u64, n as usize) }
+    testkit.check(bt_hci_evt.event_parse(rt.buf_ptr(&all), rt.buf_len(&all), &ev) && bt_hci_evt.event_adv_report_count(&ev) == 1, "one adv report")
+    var rep: bt_hci_evt.AdvReport = bt_hci_evt.AdvReport { kind: 0, addr_type: 9, addr: 0, data: 0, dlen: 0, rssi: 0 }
+    testkit.check(bt_hci_evt.event_adv_report_next(&ev, 0, &rep) != 0 && rep.dlen == 5 && rep.rssi == -40 && rep.addr == 0x060504030201, "adv report fields")
+    rt.buf_free(&all)
+    rt.buf_clear(&cmd)
+    bt_hci.hci_le_create_connection(&cmd, 16, 16, false, 0, 0x060504030201, 0, 24, 40, 0, 72, 0, 0)
+    testkit.check(bt_transport.transport_send(&t, rt.buf_ptr(&cmd), rt.buf_len(&cmd)), "create connection sent")
+    testkit.check(bt_fake_controller.fake_is_connected(&fc, 64), "connected handle 64")
+    testkit.check(bt_transport.transport_send(&t, rt.buf_ptr(&cmd), 3) == true, "partial send accepted")
+    testkit.check(bt_fake_controller.fake_trace(&fc).length() > 100, "trace recorded")
+    bt_transport.transport_close(&t)
+    testkit.check(!bt_transport.transport_is_open(&t) && !bt_transport.transport_send(&t, 0, 0), "closed transport")
+
+    var lt: bt_transport.Transport = bt_transport.transport_closed()
+    testkit.check(bt_transport_linux.open_hci_user_channel(65000, &lt) != bt_transport.TR_OK, "missing hci device refused")
+    testkit.check(bt_transport_linux.open_uart("/dev/does-not-exist", 115200, false, &lt) == bt_transport.TR_ERR_OPEN, "missing uart refused")
+    testkit.check(bt_transport_linux.open_uart("/dev/null", 12345, false, &lt) == bt_transport.TR_ERR_UNSUPPORTED, "odd baud refused")
+    testkit.check(bt_transport_stub.open_windows(&lt) == bt_transport.TR_ERR_UNSUPPORTED && bt_transport_stub.open_android(&lt) == bt_transport.TR_ERR_UNSUPPORTED, "stubs unsupported")
+    testkit.check(bt_transport_linux.uart_baud_constant(115200) == 4098, "baud constant")
+    bt_fake_controller.fake_free(&fc)
+    bt_h4.h4_free(&d)
+    return testkit.finish()
+}
