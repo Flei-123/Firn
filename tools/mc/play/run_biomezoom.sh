@@ -116,7 +116,7 @@ run_one() { # name, env...
     local att pn pp rc ok py nl tries
     for att in 1 2 3; do
         pn="B${name}${att}"; ok=1; rm -f "$W/$name.png"
-        env FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_RUN_S=${RUN_S:-35} MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_VIEW=3 \
+        env FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_RUN_S=${RUN_S:-35} MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_VIEW=3 \
             MC_PACKS="$W/pack.zip" MCPLAY_SHOT="$W/$name.png" "$@" "$W/mcplay" 127.0.0.1 "$PORT" "$pn" > "$W/$name.out" 2>&1 &
         pp=$!
         if wait_log "$pn joined the game" 120; then
