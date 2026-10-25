@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/av1/still.fi -- AV1 still picture (AVIF) decoder API: bytes in, planar 8 bit YUV out.
+import rt.rt
+import av1.av1mem
+import av1.avif
+import av1.av1tile
+import av1.av1lf
+import av1.av1cdef
+import av1.av1lr
+
+export { Frame, frame_new, frame_free, still_decode, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR }
+
+const STILL_OK: i32 = 0
+const STILL_NOT_AVIF: i32 = 1
+const STILL_UNSUPPORTED: i32 = 2
+const STILL_TILE_ERROR: i32 = 10
+
+struct Frame {
+    width: i64,
+    height: i64,
+    planes: i64,
+    sub_x: i64,
+    sub_y: i64,
+    depth: i64,
+    y: u64,
+    u: u64,
+    v: u64,
+    y_bytes: usize,
+    u_bytes: usize,
+    v_bytes: usize,
+}
+
+fn frame_new() -> Frame {
+    return Frame { width: 0, height: 0, planes: 0, sub_x: 0, sub_y: 0, depth: 8, y: 0, u: 0, v: 0, y_bytes: 0, u_bytes: 0, v_bytes: 0 }
+}
+
+fn frame_free(f: *mut Frame) {
+    av1mem.heap_free((*f).y as *mut u8, (*f).y_bytes)
+    av1mem.heap_free((*f).u as *mut u8, (*f).u_bytes)
+    av1mem.heap_free((*f).v as *mut u8, (*f).v_bytes)
+    *f = frame_new()
+}
+
+fn cell(info: u64, i: usize) -> i64 {
+    return avif.avif_cell(info, i)
+}
+
+fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bytes: *mut usize) -> u64 {
+    let n: usize = (w * h) as usize
+    let dst: u64 = av1mem.heap_alloc(n) as u64
+    *bytes = n
+    if dst == 0 {
+        return 0
+    }
+    var row: i64 = 0
+    while row < h {
+        av1mem.mem_copy((dst + ((row * w) as u64)) as *mut u8, (src + ((row * stride) as u64)) as *mut u8, w as usize)
+        row = row + 1
+    }
+    return dst
+}
+
+fn still_decode(src: u64, n: usize, f: *mut Frame) -> i32 {
+    let info: u64 = avif.avif_parse(src, n)
+    if info == 0 {
+        return STILL_NOT_AVIF
+    }
+    let rc: i32 = decode_info(src, info, f)
+    avif.avif_info_free(info)
+    return rc
+}
+
+fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
+    let fb: usize = avif.FH_BASE
+    if cell(info, fb + avif.FH_OK) == 0 {
+        return STILL_UNSUPPORTED
+    }
+    let off: i64 = cell(info, avif.AI_PRIM_OFF) + cell(info, fb + avif.FH_OBU_OFF) + cell(info, fb + avif.FH_HDR_END)
+    let tlen: i64 = cell(info, fb + avif.FH_OBU_LEN) - cell(info, fb + avif.FH_HDR_END)
+    let mc: i64 = cell(info, fb + avif.FH_MI_COLS)
+    let mr: i64 = cell(info, fb + avif.FH_MI_ROWS)
+    let w: i64 = cell(info, avif.AI_WIDTH)
+    let h: i64 = cell(info, avif.AI_HEIGHT)
+    var upd: i64 = 1
+    if cell(info, fb + avif.FH_DIS_CDF) != 0 {
+        upd = 0
+    }
+    var np: i64 = 3
+    if cell(info, avif.AI_MONO) != 0 {
+        np = 1
+    }
+    let lossless: bool = cell(info, fb + avif.FH_LOSSLESS) != 0
+    let t: u64 = av1tile.tile_new(src + (off as u64), tlen, mc, mr, cell(info, avif.AI_FILTER_INTRA), cell(info, avif.AI_EDGE_FILTER), upd)
+    var lrctx: u64 = 0
+    var rc: i32 = STILL_OK
+    if !lossless {
+        var unsup: i64 = cell(info, fb + avif.FH_SEG_EN) | cell(info, fb + avif.FH_DQ_PRES) | cell(info, fb + avif.FH_QM) | cell(info, fb + avif.FH_INTRABC)
+        unsup = unsup | cell(info, avif.AI_SB128)
+        let lrt0: i64 = cell(info, fb + avif.FH_LR_TYPE)
+        let lrt1: i64 = cell(info, fb + avif.FH_LR_TYPE + 1)
+        let lrt2: i64 = cell(info, fb + avif.FH_LR_TYPE + 2)
+        let uses_lr: bool = (lrt0 | lrt1 | lrt2) != 0
+        if uses_lr {
+            unsup = unsup | cell(info, avif.AI_SUPERRES)
+        }
+        let bad: i64 = av1tile.tile_set_frame(t, cell(info, fb + avif.FH_BASE_Q), cell(info, fb + avif.FH_TX_MODE), cell(info, fb + avif.FH_REDUCED_TX),
+                                              cell(info, fb + avif.FH_SCT), 0, cell(info, fb + avif.FH_DQ_YDC), cell(info, fb + avif.FH_DQ_UDC),
+                                              cell(info, fb + avif.FH_DQ_UAC), cell(info, fb + avif.FH_DQ_VDC), cell(info, fb + avif.FH_DQ_VAC),
+                                              cell(info, avif.AI_BITDEPTH), cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY),
+                                              cell(info, fb + avif.FH_CDEF_BITS), cell(info, avif.AI_CDEF), unsup)
+        if bad != 0 {
+            av1tile.tile_free(t)
+            return STILL_UNSUPPORTED
+        }
+        if uses_lr {
+            lrctx = av1lr.lr_new(np, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), cell(info, fb + avif.FH_FRAME_W),
+                                 cell(info, fb + avif.FH_FRAME_H), lrt0, lrt1, lrt2, cell(info, fb + avif.FH_LR_UNIT_SHIFT),
+                                 cell(info, fb + avif.FH_LR_UV_SHIFT))
+            av1tile.tile_set_lr(t, lrctx)
+        }
+    }
+    av1tile.tile_run(t)
+    if av1tile.tile_err(t) != 0 {
+        rc = STILL_TILE_ERROR + (av1tile.tile_err(t) as i32)
+        av1tile.tile_free(t)
+        return rc
+    }
+    if !lossless {
+        post_filters(t, info, lrctx, np, mc, mr)
+    }
+    let st: i64 = av1tile.tile_stride(t)
+    (*f).width = w
+    (*f).height = h
+    (*f).planes = np
+    (*f).sub_x = cell(info, avif.AI_SUBX)
+    (*f).sub_y = cell(info, avif.AI_SUBY)
+    (*f).depth = cell(info, avif.AI_BITDEPTH)
+    (*f).y = crop_plane(av1tile.tile_plane(t, 0), st, w, h, &(*f).y_bytes)
+    if np == 3 {
+        (*f).u = crop_plane(av1tile.tile_plane(t, 1), st, w, h, &(*f).u_bytes)
+        (*f).v = crop_plane(av1tile.tile_plane(t, 2), st, w, h, &(*f).v_bytes)
+    }
+    av1tile.tile_free(t)
+    return STILL_OK
+}
+
+fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64) {
+    let fb: usize = avif.FH_BASE
+    let st: i64 = av1tile.tile_stride(t)
+    let lv: u64 = av1mem.heap_alloc(64) as u64
+    let scr: u64 = av1mem.heap_alloc(512) as u64
+    var li: usize = 0
+    while li < 4 {
+        *((lv + (li as u64)) as *mut u8) = cell(info, fb + avif.FH_LF0 + li) as u8
+        li = li + 1
+    }
+    av1lf.lf_frame(av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), st,
+                   av1tile.tile_lftx(t, 0), av1tile.tile_lftx(t, 1), av1tile.tile_lftx(t, 2), mc, mr,
+                   cell(info, fb + avif.FH_FRAME_W), cell(info, fb + avif.FH_FRAME_H),
+                   cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np, lv,
+                   cell(info, fb + avif.FH_LF_SHARP), cell(info, fb + avif.FH_LF_DELTA_EN),
+                   cell(info, fb + avif.FH_LF_RD0) - 128, scr)
+    av1mem.heap_free(lv as *mut u8, 64)
+    av1mem.heap_free(scr as *mut u8, 512)
+    var s0: u64 = 0
+    var s1: u64 = 0
+    var s2: u64 = 0
+    let cdef_on: bool = cell(info, avif.AI_CDEF) != 0
+    if lrctx != 0 && cdef_on {
+        s0 = av1lr.lr_snapshot(av1tile.tile_plane(t, 0), st, mr * 4)
+        s1 = av1lr.lr_snapshot(av1tile.tile_plane(t, 1), st, mr * 4)
+        s2 = av1lr.lr_snapshot(av1tile.tile_plane(t, 2), st, mr * 4)
+    }
+    if cdef_on {
+        let par: u64 = av1mem.heap_alloc(av1cdef.CDEF_PAR_BYTES as usize) as u64
+        var ci: usize = 0
+        while ci < 8 {
+            *((par + (ci as u64)) as *mut u8) = cell(info, fb + avif.FH_CDEF_YP + ci) as u8
+            *((par + 8 + (ci as u64)) as *mut u8) = cell(info, fb + avif.FH_CDEF_YS + ci) as u8
+            *((par + 16 + (ci as u64)) as *mut u8) = cell(info, fb + avif.FH_CDEF_UVP + ci) as u8
+            *((par + 24 + (ci as u64)) as *mut u8) = cell(info, fb + avif.FH_CDEF_UVS + ci) as u8
+            ci = ci + 1
+        }
+        let csc: u64 = av1mem.heap_alloc(av1cdef.CDEF_SCRATCH_BYTES as usize) as u64
+        av1cdef.cdef_frame(av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), st,
+                           av1tile.tile_skp(t), av1tile.tile_cdefidx(t), av1tile.tile_sbcols(t), mc, mr,
+                           cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np,
+                           cell(info, fb + avif.FH_CDEF_DAMP), par, csc)
+        av1mem.heap_free(par as *mut u8, av1cdef.CDEF_PAR_BYTES as usize)
+        av1mem.heap_free(csc as *mut u8, av1cdef.CDEF_SCRATCH_BYTES as usize)
+    }
+    if lrctx != 0 {
+        av1lr.lr_frame(lrctx, av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), s0, s1, s2, st)
+    }
+}

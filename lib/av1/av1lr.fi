@@ -1,0 +1,683 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/av1/av1lr.fi -- AV1 loop restoration: Wiener and self-guided filters.
+import av1.av1mem
+import av1.av1sym
+
+export { lr_unit_ptr, lr_unit_count, lr_count, lr_new, lr_read_sb, lr_frame, lr_snapshot, lr_ctx_cell }
+
+const C_NP: i64 = 0
+const C_SX: i64 = 1
+const C_SY: i64 = 2
+const C_W: i64 = 3
+const C_H: i64 = 4
+const C_CDF: i64 = 5
+const P_BASE: i64 = 8
+const P_TYPE: i64 = 0
+const P_SIZE: i64 = 1
+const P_COLS: i64 = 2
+const P_ROWS: i64 = 3
+const P_UNITS: i64 = 4
+const P_REFW: i64 = 5
+const P_REFS: i64 = 11
+
+static SGR: [i16; 64] = [2, 12, 1, 4, 2, 15, 1, 6, 2, 18, 1, 8, 2, 21, 1, 9, 2, 24, 1, 10, 2, 29, 1, 11, 2, 36, 1, 12, 2, 45, 1, 13,
+                         2, 56, 1, 14, 2, 68, 1, 15, 0, 0, 1, 5, 0, 0, 1, 8, 0, 0, 1, 11, 0, 0, 1, 14, 2, 30, 0, 0, 2, 75, 0, 0]
+static WMIN: [i16; 3] = [-5, -23, -17]
+static WMAX: [i16; 3] = [10, 8, 46]
+static WK: [i16; 3] = [1, 2, 3]
+static WMID: [i16; 3] = [3, -7, 15]
+static XMIN: [i16; 2] = [-96, -32]
+static XMAX: [i16; 2] = [31, 95]
+static XMID: [i16; 2] = [-32, 31]
+static CDF0: [u16; 10] = [11570, 32768, 0, 16855, 32768, 0, 9413, 22581, 32768, 0]
+
+#[no_gc]
+fn ldq(p: u64, i: i64) -> i64 {
+    return *((p + ((i * 8) as u64)) as *mut i64)
+}
+
+#[no_gc]
+fn stq(p: u64, i: i64, v: i64) {
+    *((p + ((i * 8) as u64)) as *mut i64) = v
+}
+
+#[no_gc]
+fn ldb(p: u64, i: i64) -> i64 {
+    return (*((p + (i as u64)) as *mut u8)) as i64
+}
+
+#[no_gc]
+fn stb(p: u64, i: i64, v: i64) {
+    *((p + (i as u64)) as *mut u8) = (v & 255) as u8
+}
+
+#[no_gc]
+fn ldsb(p: u64, i: i64) -> i64 {
+    let v: i64 = (*((p + (i as u64)) as *mut u8)) as i64
+    if v > 127 {
+        return v - 256
+    }
+    return v
+}
+
+#[no_gc]
+fn ldi(p: u64, i: i64) -> i64 {
+    return (*((p + ((i * 4) as u64)) as *mut i32)) as i64
+}
+
+#[no_gc]
+fn sti(p: u64, i: i64, v: i64) {
+    *((p + ((i * 4) as u64)) as *mut i32) = v as i32
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn floor_log2(v: i64) -> i64 {
+    var n: i64 = 0
+    var x: i64 = v
+    while x > 1 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+fn r2(x: i64, n: i64) -> i64 {
+    if n == 0 {
+        return x
+    }
+    let big: i64 = 1099511627776
+    return ((x + (1 << (n - 1)) + big) >> n) - (big >> n)
+}
+
+fn count_units(us: i64, fsz: i64) -> i64 {
+    return imax((fsz + (us >> 1)) / us, 1)
+}
+
+fn lr_ctx_cell(c: u64, i: i64) -> i64 {
+    return ldq(c, i)
+}
+
+fn lr_new(np: i64, sx: i64, sy: i64, fw: i64, fh: i64, t0: i64, t1: i64, t2: i64, unit_shift: i64, uv_shift: i64) -> u64 {
+    let c: u64 = av1mem.heap_alloc(512) as u64
+    var i: i64 = 0
+    while i < 64 {
+        stq(c, i, 0)
+        i = i + 1
+    }
+    stq(c, C_NP, np)
+    stq(c, C_SX, sx)
+    stq(c, C_SY, sy)
+    stq(c, C_W, fw)
+    stq(c, C_H, fh)
+    let cdf: u64 = av1mem.heap_alloc(32) as u64
+    i = 0
+    while i < 10 {
+        av1sym.cdf_st(cdf, i, CDF0[i as usize] as i64)
+        i = i + 1
+    }
+    stq(c, C_CDF, cdf as i64)
+    var p: i64 = 0
+    while p < np {
+        var ty: i64 = t0
+        if p == 1 {
+            ty = t1
+        }
+        if p == 2 {
+            ty = t2
+        }
+        let b: i64 = P_BASE + p * 16
+        stq(c, b + P_TYPE, ty)
+        var us: i64 = 256 >> (2 - unit_shift)
+        if p > 0 {
+            us = us >> uv_shift
+        }
+        stq(c, b + P_SIZE, us)
+        var psx: i64 = 0
+        var psy: i64 = 0
+        if p > 0 {
+            psx = sx
+            psy = sy
+        }
+        let uc: i64 = count_units(us, (fw + psx) >> psx)
+        let ur: i64 = count_units(us, (fh + psy) >> psy)
+        stq(c, b + P_COLS, uc)
+        stq(c, b + P_ROWS, ur)
+        if ty != 0 {
+            let un: i64 = uc * ur * 16 + 16
+            let u: u64 = av1mem.heap_alloc(un as usize) as u64
+            var k: i64 = 0
+            while k < un {
+                stb(u, k, 0)
+                k = k + 1
+            }
+            stq(c, b + P_UNITS, u as i64)
+        }
+        var q: i64 = 0
+        while q < 2 {
+            var j: i64 = 0
+            while j < 3 {
+                stq(c, b + P_REFW + q * 3 + j, WMID[j as usize] as i64)
+                j = j + 1
+            }
+            stq(c, b + P_REFS + q, XMID[q as usize] as i64)
+            q = q + 1
+        }
+        p = p + 1
+    }
+    return c
+}
+
+fn lit(s: *mut av1sym.Sym, n: i64) -> i64 {
+    return av1sym.sym_literal(s, n)
+}
+
+fn ns_bool(s: *mut av1sym.Sym, n: i64) -> i64 {
+    let w: i64 = floor_log2(n) + 1
+    let m: i64 = (1 << w) - n
+    let v: i64 = lit(s, w - 1)
+    if v < m {
+        return v
+    }
+    let e: i64 = lit(s, 1)
+    return (v << 1) - m + e
+}
+
+fn inv_recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        return v
+    }
+    if (v & 1) != 0 {
+        return r - ((v + 1) >> 1)
+    }
+    return r + (v >> 1)
+}
+
+fn subexp_bool(s: *mut av1sym.Sym, num: i64, k: i64) -> i64 {
+    var i: i64 = 0
+    var mk: i64 = 0
+    while true {
+        var b2: i64 = k
+        if i != 0 {
+            b2 = k + i - 1
+        }
+        let a: i64 = 1 << b2
+        if num <= mk + 3 * a {
+            return ns_bool(s, num - mk) + mk
+        }
+        if lit(s, 1) != 0 {
+            i = i + 1
+            mk = mk + a
+        } else {
+            return lit(s, b2) + mk
+        }
+    }
+    return 0
+}
+
+fn signed_subexp(s: *mut av1sym.Sym, low: i64, high: i64, k: i64, r: i64) -> i64 {
+    let mx: i64 = high - low
+    let rr: i64 = r - low
+    let v: i64 = subexp_bool(s, mx, k)
+    var x: i64 = 0
+    if (rr << 1) <= mx {
+        x = inv_recenter(rr, v)
+    } else {
+        x = mx - 1 - inv_recenter(mx - 1 - rr, v)
+    }
+    return x + low
+}
+
+fn read_unit(c: u64, s: *mut av1sym.Sym, p: i64, ur: i64, uc: i64) {
+    let b: i64 = P_BASE + p * 16
+    let ft: i64 = ldq(c, b + P_TYPE)
+    let cdf: u64 = ldq(c, C_CDF) as u64
+    var rt: i64 = 0
+    if ft == 1 {
+        if av1sym.sym_read(s, cdf, 2) != 0 {
+            rt = 1
+        }
+    } else if ft == 2 {
+        if av1sym.sym_read(s, cdf + 6, 2) != 0 {
+            rt = 2
+        }
+    } else {
+        rt = av1sym.sym_read(s, cdf + 12, 3)
+    }
+    let rec: u64 = (ldq(c, b + P_UNITS) as u64) + (((ur * ldq(c, b + P_COLS) + uc) * 16) as u64)
+    stb(rec, 0, rt)
+    if rt == 1 {
+        var pass: i64 = 0
+        while pass < 2 {
+            var first: i64 = 0
+            if p > 0 {
+                first = 1
+                stb(rec, 2 + pass * 3, 0)
+            }
+            var j: i64 = first
+            while j < 3 {
+                let rf: i64 = ldq(c, b + P_REFW + pass * 3 + j)
+                let v: i64 = signed_subexp(s, WMIN[j as usize] as i64, (WMAX[j as usize] as i64) + 1, WK[j as usize] as i64, rf)
+                stb(rec, 2 + pass * 3 + j, v)
+                stq(c, b + P_REFW + pass * 3 + j, v)
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+    } else if rt == 2 {
+        let set: i64 = lit(s, 4)
+        stb(rec, 1, set)
+        var i: i64 = 0
+        while i < 2 {
+            let radius: i64 = SGR[(set * 4 + i * 2) as usize] as i64
+            let mn: i64 = XMIN[i as usize] as i64
+            let mx: i64 = XMAX[i as usize] as i64
+            var v: i64 = 0
+            if radius != 0 {
+                v = signed_subexp(s, mn, mx + 1, 4, ldq(c, b + P_REFS + i))
+            } else if i == 1 {
+                v = clip3(mn, mx, 128 - ldq(c, b + P_REFS))
+            }
+            stb(rec, 8 + i, v)
+            stq(c, b + P_REFS + i, v)
+            i = i + 1
+        }
+    }
+}
+
+fn lr_read_sb(c: u64, s: *mut av1sym.Sym, r: i64, cc: i64) {
+    let np: i64 = ldq(c, C_NP)
+    var p: i64 = 0
+    while p < np {
+        let b: i64 = P_BASE + p * 16
+        if ldq(c, b + P_TYPE) != 0 {
+            var sx: i64 = 0
+            var sy: i64 = 0
+            if p > 0 {
+                sx = ldq(c, C_SX)
+                sy = ldq(c, C_SY)
+            }
+            let us: i64 = ldq(c, b + P_SIZE)
+            let urows: i64 = ldq(c, b + P_ROWS)
+            let ucols: i64 = ldq(c, b + P_COLS)
+            let rs: i64 = (r * (4 >> sy) + us - 1) / us
+            let re: i64 = imin(urows, ((r + 16) * (4 >> sy) + us - 1) / us)
+            let cs: i64 = (cc * (4 >> sx) + us - 1) / us
+            let ce: i64 = imin(ucols, ((cc + 16) * (4 >> sx) + us - 1) / us)
+            var ur: i64 = rs
+            while ur < re {
+                var uc: i64 = cs
+                while uc < ce {
+                    read_unit(c, s, p, ur, uc)
+                    uc = uc + 1
+                }
+                ur = ur + 1
+            }
+        }
+        p = p + 1
+    }
+}
+
+fn lr_snapshot(pl: u64, stride: i64, rows: i64) -> u64 {
+    let n: i64 = stride * rows + 16
+    let d: u64 = av1mem.heap_alloc(n as usize) as u64
+    av1mem.mem_copy(d as *mut u8, pl as *mut u8, n as usize)
+    return d
+}
+
+fn build_window(win: u64, cd: u64, cu: u64, stride: i64, x0: i64, y0: i64, w: i64, h: i64, pw: i64, ph: i64, st0: i64, st1: i64) {
+    let ww: i64 = w + 6
+    var r: i64 = 0
+    while r < h + 6 {
+        var yy: i64 = y0 + r - 3
+        yy = imin(ph - 1, yy)
+        yy = imax(0, yy)
+        var src: u64 = cd
+        if yy < st0 {
+            yy = imax(st0 - 2, yy)
+            src = cu
+        } else if yy > st1 {
+            yy = imin(st1 + 2, yy)
+            src = cu
+        }
+        var cx: i64 = 0
+        while cx < ww {
+            var xx: i64 = x0 + cx - 3
+            xx = imin(pw - 1, xx)
+            xx = imax(0, xx)
+            stb(win, r * ww + cx, ldb(src, yy * stride + xx))
+            cx = cx + 1
+        }
+        r = r + 1
+    }
+}
+
+fn wiener_region(win: u64, inter: u64, dst: u64, stride: i64, x0: i64, y0: i64, w: i64, h: i64, rec: u64) {
+    let ww: i64 = w + 6
+    var vf: [i64; 7] = [0, 0, 0, 0, 0, 0, 0]
+    var hf: [i64; 7] = [0, 0, 0, 0, 0, 0, 0]
+    var pass: i64 = 0
+    while pass < 2 {
+        var f3: i64 = 128
+        var i: i64 = 0
+        while i < 3 {
+            let cf: i64 = ldsb(rec, 2 + pass * 3 + i)
+            if pass == 0 {
+                vf[i as usize] = cf
+                vf[(6 - i) as usize] = cf
+            } else {
+                hf[i as usize] = cf
+                hf[(6 - i) as usize] = cf
+            }
+            f3 = f3 - 2 * cf
+            i = i + 1
+        }
+        if pass == 0 {
+            vf[3] = f3
+        } else {
+            hf[3] = f3
+        }
+        pass = pass + 1
+    }
+    var r: i64 = 0
+    while r < h + 6 {
+        var cx: i64 = 0
+        while cx < w {
+            var s: i64 = 0
+            var t: i64 = 0
+            while t < 7 {
+                s = s + hf[t as usize] * ldb(win, r * ww + cx + t)
+                t = t + 1
+            }
+            sti(inter, r * w + cx, clip3(0 - 2048, 8191 - 2048, r2(s, 3)))
+            cx = cx + 1
+        }
+        r = r + 1
+    }
+    r = 0
+    while r < h {
+        var cx: i64 = 0
+        while cx < w {
+            var s: i64 = 0
+            var t: i64 = 0
+            while t < 7 {
+                s = s + vf[t as usize] * ldi(inter, (r + t) * w + cx)
+                t = t + 1
+            }
+            stb(dst, (y0 + r) * stride + x0 + cx, clip3(0, 255, r2(s, 11)))
+            cx = cx + 1
+        }
+        r = r + 1
+    }
+}
+
+fn box_pass(win: u64, fo: u64, aa: u64, bb: u64, w: i64, h: i64, set: i64, pass: i64) {
+    let ww: i64 = w + 6
+    let r: i64 = SGR[(set * 4 + pass * 2) as usize] as i64
+    let eps: i64 = SGR[(set * 4 + pass * 2 + 1) as usize] as i64
+    let n: i64 = (2 * r + 1) * (2 * r + 1)
+    let n2e: i64 = n * n * eps
+    let sc: i64 = ((1 << 20) + n2e / 2) / n2e
+    let one_over_n: i64 = ((1 << 12) + n / 2) / n
+    let aw: i64 = w + 2
+    var i: i64 = 0 - 1
+    while i < h + 1 {
+        var need: i64 = 1
+        if pass == 0 && ((i + 2) & 1) == 0 {
+            need = 0
+        }
+        if need != 0 {
+            var j: i64 = 0 - 1
+            while j < w + 1 {
+                var a: i64 = 0
+                var b: i64 = 0
+                var dy: i64 = 0 - r
+                while dy <= r {
+                    var dx: i64 = 0 - r
+                    while dx <= r {
+                        let cv: i64 = ldb(win, (i + 3 + dy) * ww + (j + 3 + dx))
+                        a = a + cv * cv
+                        b = b + cv
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                let p: i64 = imax(0, a * n - b * b)
+                let z: i64 = r2(p * sc, 20)
+                var a2: i64 = 0
+                if z >= 255 {
+                    a2 = 256
+                } else if z == 0 {
+                    a2 = 1
+                } else {
+                    a2 = ((z << 8) + z / 2) / (z + 1)
+                }
+                let b2: i64 = (256 - a2) * b * one_over_n
+                sti(aa, (i + 1) * aw + (j + 1), a2)
+                sti(bb, (i + 1) * aw + (j + 1), r2(b2, 12))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < h {
+        var shift: i64 = 5
+        if pass == 0 && (i & 1) != 0 {
+            shift = 4
+        }
+        var j: i64 = 0
+        while j < w {
+            var a: i64 = 0
+            var b: i64 = 0
+            var dy: i64 = 0 - 1
+            while dy <= 1 {
+                var dx: i64 = 0 - 1
+                while dx <= 1 {
+                    var wt: i64 = 0
+                    if pass == 0 {
+                        if ((i + dy + 2) & 1) != 0 {
+                            wt = 5
+                            if dx == 0 {
+                                wt = 6
+                            }
+                        }
+                    } else {
+                        wt = 3
+                        if dx == 0 || dy == 0 {
+                            wt = 4
+                        }
+                    }
+                    if wt != 0 {
+                        a = a + wt * ldi(aa, (i + dy + 1) * aw + (j + dx + 1))
+                        b = b + wt * ldi(bb, (i + dy + 1) * aw + (j + dx + 1))
+                    }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            let v: i64 = a * ldb(win, (i + 3) * ww + (j + 3)) + b
+            sti(fo, i * w + j, r2(v, 8 + shift - 4))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn sgr_region(win: u64, f0: u64, f1: u64, aa: u64, bb: u64, dst: u64, stride: i64, x0: i64, y0: i64, w: i64, h: i64, rec: u64) {
+    let set: i64 = ldb(rec, 1)
+    let r0: i64 = SGR[(set * 4) as usize] as i64
+    let r1: i64 = SGR[(set * 4 + 2) as usize] as i64
+    if r0 != 0 {
+        box_pass(win, f0, aa, bb, w, h, set, 0)
+    }
+    if r1 != 0 {
+        box_pass(win, f1, aa, bb, w, h, set, 1)
+    }
+    let w0: i64 = ldsb(rec, 8)
+    let w1: i64 = ldsb(rec, 9)
+    let w2: i64 = 128 - w0 - w1
+    let ww: i64 = w + 6
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        while j < w {
+            let u: i64 = ldb(win, (i + 3) * ww + (j + 3)) << 4
+            var v: i64 = w1 * u
+            if r0 != 0 {
+                v = v + w0 * ldi(f0, i * w + j)
+            } else {
+                v = v + w0 * u
+            }
+            if r1 != 0 {
+                v = v + w2 * ldi(f1, i * w + j)
+            } else {
+                v = v + w2 * u
+            }
+            stb(dst, (y0 + i) * stride + x0 + j, clip3(0, 255, r2(v, 11)))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn lr_frame(c: u64, p0: u64, p1: u64, p2: u64, q0: u64, q1: u64, q2: u64, stride: i64) {
+    let np: i64 = ldq(c, C_NP)
+    let fw: i64 = ldq(c, C_W)
+    let fh: i64 = ldq(c, C_H)
+    var p: i64 = 0
+    while p < np {
+        let b: i64 = P_BASE + p * 16
+        if ldq(c, b + P_TYPE) != 0 {
+            var sx: i64 = 0
+            var sy: i64 = 0
+            var dst: u64 = p0
+            var cu: u64 = q0
+            if p > 0 {
+                sx = ldq(c, C_SX)
+                sy = ldq(c, C_SY)
+            }
+            if p == 1 {
+                dst = p1
+                cu = q1
+            }
+            if p == 2 {
+                dst = p2
+                cu = q2
+            }
+            let pw: i64 = (fw + sx) >> sx
+            let ph: i64 = (fh + sy) >> sy
+            let cd: u64 = lr_snapshot(dst, stride, ph)
+            if cu == 0 {
+                cu = cd
+            }
+            let us: i64 = ldq(c, b + P_SIZE)
+            let ucols: i64 = ldq(c, b + P_COLS)
+            let urows: i64 = ldq(c, b + P_ROWS)
+            let units: u64 = ldq(c, b + P_UNITS) as u64
+            let mw: i64 = imin(pw, 2 * us) + 8
+            let wsz: i64 = mw * 72
+            let win: u64 = av1mem.heap_alloc(wsz as usize) as u64
+            let ia: u64 = av1mem.heap_alloc((wsz * 4) as usize) as u64
+            let ib: u64 = av1mem.heap_alloc((wsz * 4) as usize) as u64
+            let f0: u64 = av1mem.heap_alloc((wsz * 4) as usize) as u64
+            let f1: u64 = av1mem.heap_alloc((wsz * 4) as usize) as u64
+            var n: i64 = 0
+            while true {
+                var st0: i64 = 0 - (8 >> sy)
+                if n > 0 {
+                    st0 = (n * 64 - 8) >> sy
+                }
+                let st1: i64 = st0 + (64 >> sy) - 1
+                let ys: i64 = imax(0, st0)
+                let ye: i64 = imin(ph - 1, st1)
+                if ys > ph - 1 {
+                    break
+                }
+                let ur: i64 = imin(urows - 1, ((n * 64) >> sy) / us)
+                var uc: i64 = 0
+                while uc < ucols {
+                    let xs: i64 = uc * us
+                    var xe: i64 = (uc + 1) * us - 1
+                    if uc == ucols - 1 {
+                        xe = pw - 1
+                    }
+                    xe = imin(xe, pw - 1)
+                    let rec: u64 = units + (((ur * ucols + uc) * 16) as u64)
+                    let ty: i64 = ldb(rec, 0)
+                    if ty != 0 {
+                        let w: i64 = xe - xs + 1
+                        let h: i64 = ye - ys + 1
+                        build_window(win, cd, cu, stride, xs, ys, w, h, pw, ph, st0, st1)
+                        if ty == 1 {
+                            wiener_region(win, ia, dst, stride, xs, ys, w, h, rec)
+                        } else {
+                            sgr_region(win, f0, f1, ia, ib, dst, stride, xs, ys, w, h, rec)
+                        }
+                    }
+                    uc = uc + 1
+                }
+                n = n + 1
+            }
+            av1mem.heap_free(win as *mut u8, wsz as usize)
+            av1mem.heap_free(ia as *mut u8, (wsz * 4) as usize)
+            av1mem.heap_free(ib as *mut u8, (wsz * 4) as usize)
+            av1mem.heap_free(f0 as *mut u8, (wsz * 4) as usize)
+            av1mem.heap_free(f1 as *mut u8, (wsz * 4) as usize)
+            av1mem.heap_free(cd as *mut u8, (stride * ph + 16) as usize)
+        }
+        p = p + 1
+    }
+}
+
+fn lr_count(c: u64, p: i64, ty: i64) -> i64 {
+    let b: i64 = P_BASE + p * 16
+    if ldq(c, b + P_TYPE) == 0 {
+        return 0
+    }
+    let n: i64 = ldq(c, b + P_COLS) * ldq(c, b + P_ROWS)
+    let units: u64 = ldq(c, b + P_UNITS) as u64
+    var k: i64 = 0
+    var cnt: i64 = 0
+    while k < n {
+        if ldb(units, k * 16) == ty {
+            cnt = cnt + 1
+        }
+        k = k + 1
+    }
+    return cnt
+}
+
+fn lr_unit_ptr(c: u64, p: i64) -> u64 {
+    return ldq(c, P_BASE + p * 16 + P_UNITS) as u64
+}
+
+fn lr_unit_count(c: u64, p: i64) -> i64 {
+    let b: i64 = P_BASE + p * 16
+    if ldq(c, b + P_TYPE) == 0 {
+        return 0
+    }
+    return ldq(c, b + P_COLS) * ldq(c, b + P_ROWS)
+}
