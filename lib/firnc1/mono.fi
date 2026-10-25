@@ -34,13 +34,14 @@ import types
 import iface
 import lamsugar
 import err
+import report
 
 export { Gen, gen_new, gen_free, gen_upfront, gen_is_fn, gen_is_struct,
     gen_depth_on, gen_depth_off, gen_in_template, gen_closure_template,
     gen_bound, gen_tp_start, gen_tp_add, gen_tp_duplicate,
     gen_tp_bound_add, gen_if_set, gen_fe_set,
     gen_fn_template, gen_struct_template, gen_instance, option_none_name, coll_kind, coll_fn,
-    gen_size_of_name, gen_intr_name, gen_run, gen_error,
+    gen_size_of_name, gen_intr_name, gen_run, gen_error, gen_pend,
     gen_fn_count, gen_struct_count, gen_inst_count, gen_generated,
     // type aliases (`type X = T`, parser.fi): the registry shared by all files
     gen_alias_add, gen_alias_find }
@@ -119,6 +120,8 @@ struct Gen {
     generated: usize, // how many instantiations were really created
     err: usize,
     scratch: rt.Buf,
+    pend: report.Pend,
+    dmsg: rt.Buf,
 }
 
 fn gen_new(b: u64, it: u64) -> Gen {
@@ -143,6 +146,7 @@ fn gen_new(b: u64, it: u64) -> Gen {
         al_name: vec_new[u32](), al_node: vec_new[u32](),
         depth: 0, generated: 0, err: 0,
         scratch: rt.buf_new(),
+        pend: report.pend_new(), dmsg: rt.buf_new(),
     }
 }
 
@@ -185,6 +189,8 @@ fn gen_free(g: *mut Gen) {
     vec_free[u32](&(*g).al_name)
     vec_free[u32](&(*g).al_node)
     rt.buf_free(&(*g).scratch)
+    report.pend_free(&(*g).pend)
+    rt.buf_free(&(*g).dmsg)
 }
 
 // ---------------------------------------------------------- type aliases
@@ -211,6 +217,47 @@ fn gtree(g: *mut Gen) -> *mut ast.Tree { return (*g).b as *mut ast.Tree }
 fn gnames(g: *mut Gen) -> *mut intern.Interner { return (*g).it as *mut intern.Interner }
 
 fn gen_error(g: *mut Gen) -> usize { return (*g).err }
+
+fn gen_pend(g: *mut Gen) -> *mut report.Pend { return &(*g).pend }
+
+fn gmsg_begin(g: *mut Gen) { rt.buf_clear(&(*g).dmsg) }
+
+fn gmsg_lit(g: *mut Gen, text: u64, n: usize) { rt.buf_push_bytes(&(*g).dmsg, text, n) }
+
+fn gmsg_name(g: *mut Gen, nr: u32) {
+    rt.buf_push_bytes(&(*g).dmsg, intern.intern_ptr(gnames(g), nr), intern.intern_length(gnames(g), nr))
+}
+
+fn gmsg_pretty(g: *mut Gen, nr: u32) {
+    let it: *mut intern.Interner = gnames(g)
+    let ptr: u64 = intern.intern_ptr(it, nr)
+    let len: usize = intern.intern_length(it, nr)
+    var mw: [u8; 7] = "method "
+    if intern.intern_prefix(it, nr, (&mw[0]) as u64, 7) {
+        rt.buf_push_bytes(&(*g).dmsg, ptr + 7, len - 7)
+        return
+    }
+    var i: usize = 0
+    while i + 1 < len {
+        if *((ptr + (i as u64)) as *u8) == 95 as u8 && *((ptr + (i as u64) + 1) as *u8) == 95 as u8 {
+            rt.buf_push_bytes(&(*g).dmsg, ptr, i)
+            rt.buf_push(&(*g).dmsg, 46 as u8)
+            rt.buf_push_bytes(&(*g).dmsg, ptr + (i as u64) + 2, len - i - 2)
+            return
+        }
+        i = i + 1
+    }
+    rt.buf_push_bytes(&(*g).dmsg, ptr, len)
+}
+
+fn gmsg_end(g: *mut Gen, e: u32) {
+    let b: *mut ast.Tree = gtree(g)
+    var n: u32 = ast.expr_len(b, e)
+    if n == 0 {
+        n = 1
+    }
+    report.pend_add(&(*g).pend, ast.expr_pos(b, e), n, &(*g).dmsg)
+}
 fn gen_fn_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).fv_name) }
 fn gen_struct_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).sv_name) }
 fn gen_inst_count(g: *mut Gen) -> usize { return vec_len[u32](&(*g).iv_name) }
@@ -2042,6 +2089,7 @@ fn dargs_run(g: *mut Gen) {
         let dv: u32 = ast.param_def(b, k as u32)
         if dv != ast.NOTHING && !dargs_is_const(b, dv) {
             (*g).err = (*g).err + 1
+            dargs_const_report(g, dv)
         }
         k = k + 1
     }
@@ -2136,6 +2184,47 @@ fn dargs_is_const(b: *mut ast.Tree, e: u32) -> bool {
     return false
 }
 
+fn dargs_bad_const(g: *mut Gen, e: u32) {
+    gmsg_begin(g)
+    var dc1: [u8; 45] = "a default value must be a constant expression"
+    gmsg_lit(g, (&dc1[0]) as u64, 45)
+    gmsg_end(g, e)
+}
+
+// Twin of `check_const` in compiler/src/dargs.rs: one message per offending node.
+fn dargs_const_report(g: *mut Gen, e: u32) {
+    let b: *mut ast.Tree = gtree(g)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT || a == ast.E_FLOAT || a == ast.E_FLOAT32 || a == ast.E_BOOL || a == ast.E_TEXT {
+        return
+    }
+    if a == ast.E_ID {
+        if !dargs_is_const(b, e) {
+            dargs_bad_const(g, e)
+        }
+        return
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 0 || op == 1 || op == 4 {
+            dargs_const_report(g, ast.e_b(b, e))
+        } else {
+            dargs_bad_const(g, e)
+        }
+        return
+    }
+    if a == ast.E_BIN {
+        dargs_const_report(g, ast.e_b(b, e))
+        dargs_const_report(g, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_AS {
+        dargs_const_report(g, ast.e_a(b, e))
+        return
+    }
+    dargs_bad_const(g, e)
+}
+
 // Twin of `pick_method` in compiler/src/dargs.rs. Yields the function number,
 // or NONE - 1 (leave the call to the type checker), or NONE - 2 (ambiguous).
 fn dargs_pick(g: *mut Gen, mkey: *mut Vec[u32], name: u32, nargs: u32, has_named: bool) -> u32 {
@@ -2223,6 +2312,7 @@ fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32], mkey: *mut Vec[u32], mde
         k = k + 1
     }
     let name: u32 = ast.e_a(b, e)
+    var dq: [u8; 1] = "'"
     var fi: u32 = NONE
     if (name as usize) < vec_len[u32](fmap) {
         fi = vec_at[u32](fmap, name as usize)
@@ -2244,11 +2334,30 @@ fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32], mkey: *mut Vec[u32], mde
     if fi == NONE {
         if has_named {
             (*g).err = (*g).err + 1
+            gmsg_begin(g)
+            var dn1: [u8; 51] = "named arguments are not supported for the call to '"
+            gmsg_lit(g, (&dn1[0]) as u64, 51)
+            gmsg_pretty(g, name)
+            gmsg_lit(g, (&dq[0]) as u64, 1)
+            gmsg_end(g, e)
         }
         return false
     }
     if bad_order {
         (*g).err = (*g).err + 1
+        var first_bad: u32 = NONE
+        k = npos
+        while k < cnt && first_bad == NONE {
+            let c: u32 = ast.child_at(b, off + k)
+            if ast.e_kind(b, c) != ast.E_NAMED {
+                first_bad = c
+            }
+            k = k + 1
+        }
+        gmsg_begin(g)
+        var dn2: [u8; 37] = "positional argument after a named one"
+        gmsg_lit(g, (&dn2[0]) as u64, 37)
+        gmsg_end(g, first_bad)
         return false
     }
     let poff: u32 = ast.fn_poff(b, fi as usize)
@@ -2283,8 +2392,27 @@ fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32], mkey: *mut Vec[u32], mde
             }
             if hit == NONE {
                 ok = false
+                gmsg_begin(g)
+                gmsg_lit(g, (&dq[0]) as u64, 1)
+                gmsg_pretty(g, name)
+                var dn3: [u8; 26] = "' has no parameter named '"
+                gmsg_lit(g, (&dn3[0]) as u64, 26)
+                gmsg_name(g, pn)
+                gmsg_lit(g, (&dq[0]) as u64, 1)
+                gmsg_end(g, c)
             } else if vec_at[u32](&slots, hit as usize) != NONE {
                 ok = false
+                gmsg_begin(g)
+                var dn4: [u8; 11] = "parameter '"
+                gmsg_lit(g, (&dn4[0]) as u64, 11)
+                gmsg_name(g, pn)
+                var dn5: [u8; 6] = "' of '"
+                gmsg_lit(g, (&dn5[0]) as u64, 6)
+                gmsg_pretty(g, name)
+                gmsg_lit(g, (&dq[0]) as u64, 1)
+                var dn6: [u8; 15] = " is given twice"
+                gmsg_lit(g, (&dn6[0]) as u64, 15)
+                gmsg_end(g, c)
             } else {
                 vec_set[u32](&slots, hit as usize, ast.e_b(b, c))
             }
@@ -2300,6 +2428,15 @@ fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32], mkey: *mut Vec[u32], mde
                 ok = false
                 if has_named {
                     (*g).err = (*g).err + 1
+                    gmsg_begin(g)
+                    var dn7: [u8; 18] = "missing argument '"
+                    gmsg_lit(g, (&dn7[0]) as u64, 18)
+                    gmsg_name(g, ast.param_name(b, poff + j))
+                    var dn8: [u8; 18] = "' in the call to '"
+                    gmsg_lit(g, (&dn8[0]) as u64, 18)
+                    gmsg_pretty(g, name)
+                    gmsg_lit(g, (&dq[0]) as u64, 1)
+                    gmsg_end(g, e)
                 }
                 vec_free[u32](&slots)
                 return false
