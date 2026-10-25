@@ -8,6 +8,8 @@
 #   3. docs/LIBS.md (the lib/ index) must match lib/ -- stale means a module,
 #      purpose line, export or platform twin changed without regenerating:
 #      run bash tools/gen_libs_index.sh (quick, ~1 s, no heavy needed).
+#   4. Generated sources must equal their generators' output
+#      (tools/strlib/expand.py --check, lib/rc/gen_tests.sh --check).
 # Exit 0 = clean, 1 = a guard struck. Usage: bash tools/hygiene/check.sh
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -43,6 +45,9 @@ GONE=$(comm -13 "$T/dups" "$T/known")
 
 LIBS_OUT=$(bash tools/gen_libs_index.sh --check 2>&1) || { echo "HYGIENE: $LIBS_OUT"; rc=1; }
 case "$LIBS_OUT" in *note:*) echo "HYGIENE: $LIBS_OUT" ;; esac
+
+EXPAND_OUT=$(python3 tools/strlib/expand.py --check 2>&1) || { echo "HYGIENE: $EXPAND_OUT"; echo "HYGIENE: run: python3 tools/strlib/expand.py --all"; rc=1; }
+GEN_OUT=$(bash lib/rc/gen_tests.sh --check 2>&1) || { echo "HYGIENE: $GEN_OUT"; echo "HYGIENE: run: bash lib/rc/gen_tests.sh"; rc=1; }
 
 [ $rc = 0 ] && echo "HYGIENE: ok"
 exit $rc

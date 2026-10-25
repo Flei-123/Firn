@@ -62,6 +62,8 @@ def expand(path, seen, out, stack):
     stack.append(path)
     for line in lines:
         s = line.strip()
+        if s.startswith("// SPDX-License-Identifier:"):
+            continue
         if s.startswith("//#include"):
             inc = s[len("//#include"):].strip()
             expand(inc, seen, out, stack)
@@ -128,7 +130,8 @@ def build(src, dst):
         lines = [lines[0], header.rstrip("\n")] + lines[1:]
     else:
         lines = [header.rstrip("\n")] + lines
-    # Only now are the line numbers finally settled.
+    if dst.startswith("lib/"):
+        lines = ["// SPDX-License-Identifier: MPL-2.0"] + lines
     lines = fix_error_line(lines)
     return "\n".join(lines)
 

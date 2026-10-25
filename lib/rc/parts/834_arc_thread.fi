@@ -2,30 +2,31 @@
 // expect_exit: 0
 // ROUND 49 -- `Arc[T]` ACROSS THREAD BOUNDARIES.
 //
-// Round 47 built the atomic counter and honestly wrote down that, for want
+// Round 47 built the atomic counter and honestly wrote down that, for lack
 // of threads, it could not be checked under concurrency
-// (docs/ROUND47.md 3.2). Now there are threads -- and so what is promised
-// gets checked:
+// (docs/ROUND47.md 3.2). Now there are threads -- and with them what is
+// promised gets checked:
 //
-//   A  Six threads clone and release THE SAME `Arc` 20,000 times each.
-//      At the end the strong counter stands at exactly 1 (the reference of
-//      the main thread) and the block is NOT released.
-//   B  A counter check in the same run: the same number of increments and
+//   A  Six threads clone THE SAME `Arc` and release it 20,000 times each.
+//      At the end the strong counter reads exactly 1 (the reference of the
+//      main thread) and the block is NOT released.
+//   B  Counter-check in the same run: the same number of increments and
 //      decrements on an ordinary word WITHOUT `lock` loses some of them.
-//      Without this counter check, A would not show that the threads
+//      Without this counter-check A would not prove that the threads
 //      really ran at the same time.
 //   C  `promote_atomic` (weak -> strong) under concurrency: while six
-//      threads keep upgrading and releasing again, the counter stays
-//      consistent and nothing is released twice.
-//   D  When the last strong reference falls, `promote_atomic` returns
+//      threads keep promoting and releasing again, the counter stays
+//      consistent, and nothing is released twice.
+//   D  When the last strong reference falls, `promote_atomic` yields
 //      EMPTY -- and the block goes back into the free list exactly ONCE.
 //   E  After all of it: `arc_heap_live` == 0, `arc_heap_releases` == 1.
 //
-// The Arc heap itself has NO lock (that is what E1 says): which is why only
-// the main thread allocates here. The threads touch nothing but the
+// The arc heap itself has NO lock (that is what E1 says): which is why only
+// the main thread allocates here. The threads touch exclusively the
 // COUNTERS -- and exactly that is the subject of the promise.
 
 const AF_SYS_MMAP: i64 = 9
+const AF_SYS_SCHED_YIELD: i64 = 24
 const AF_PROT_RW: i64 = 3
 const AF_MAP_ANON: i64 = 34
 
@@ -33,6 +34,7 @@ const AF_BLOCK: u64 = 0
 const AF_RAW: u64 = 8
 const AF_HEAP: u64 = 16
 const AF_ERROR: u64 = 24
+const AF_READY: u64 = 32
 
 const AF_ROUNDS: u64 = 20000
 const AF_THREADS: u64 = 6
@@ -55,11 +57,20 @@ fn af_st(a: u64, o: u64, v: u64) {
     *((a + o) as *mut u64) = v
 }
 
-// Kind 1: clone and release. Kind 2: upgrade weakly and release.
+// Kind 1: clone and release. Kind 2: promote weakly and release.
 fn __thread_work(kind: u64, arg: u64) -> u64 {
     let block: usize = af_ld(arg, AF_BLOCK) as usize
     let h: *mut ArcHeap = af_ld(arg, AF_HEAP) as *mut ArcHeap
     if kind == 1 {
+        // Start barrier (see 860_thread_basic): all workers alive before any
+        // counts, so the lock-free counter-check cannot run the threads
+        // one after the other. Bounded: a missing worker cannot hang the test.
+        __atomic_add((arg + AF_READY) as *mut u64, 1)
+        var spins: u64 = 0
+        while af_ld(arg, AF_READY) < AF_THREADS && spins < 5000000 {
+            syscall(AF_SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+            spins = spins + 1
+        }
         var i: u64 = 0
         while i < AF_ROUNDS {
             var k: AtomicRef[Payload] = arc_clone[Payload](arc_raw_ref[Payload](block))
@@ -67,8 +78,12 @@ fn __thread_work(kind: u64, arg: u64) -> u64 {
                 af_st(arg, AF_ERROR, 1)
             }
             arc_free[Payload](h, &k)
-            // The counter check WITHOUT lock: the same number of steps.
-            af_st(arg, AF_RAW, af_ld(arg, AF_RAW) + 1)
+            // Counter-check WITHOUT lock: the same number of steps.
+            // It yields between the read and the write, so that the loss does
+            // not depend on the load of the machine.
+            let raw: u64 = af_ld(arg, AF_RAW)
+            syscall(AF_SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+            af_st(arg, AF_RAW, raw + 1)
             i = i + 1
         }
         return AF_ROUNDS
@@ -112,6 +127,13 @@ fn main() -> i32 {
     return rc
 }
 
+// ROUND 79 -- the address of `h`, a local of `main`, is put into the shared
+// page `z` that SIX THREADS read (`af_st(z, AF_HEAP, h as u64)`). That is
+// the case rule 5 of docs/ROUND79.md is about, and it is sound here for one
+// reason only: `main` waits for every thread (`thread_wait`) before its
+// frame goes away. No analysis without lifetimes can see that, so the
+// exception is said out loud instead of the check being weakened.
+#[allow_escape]
 fn run(h: *mut ArcHeap) -> AllocError!i32 {
     let z: u64 = af_page()
     if z == 0 {
@@ -124,7 +146,7 @@ fn run(h: *mut ArcHeap) -> AllocError!i32 {
     af_st(z, AF_BLOCK, arc_raw_address[Payload](a) as u64)
     af_st(z, AF_HEAP, h as u64)
 
-    // --- A/B: cloning and releasing from six threads ---------------------
+    // --- A/B: cloning and releasing from six threads --------------------------
     var f: [u64; 6] = [0; 6]
     var i: u64 = 0
     while i < AF_THREADS {
@@ -146,8 +168,8 @@ fn run(h: *mut ArcHeap) -> AllocError!i32 {
     if af_ld(z, AF_ERROR) != 0 {
         return 5
     }
-    // The counter stands at exactly 1 again -- no increment has been lost
-    // and none has been taken back too many times.
+    // The counter reads exactly 1 again -- no increment has been lost
+    // and none taken back too often.
     if arc_strong_number[Payload](a) != 1 as u64 {
         return 6
     }
@@ -157,12 +179,12 @@ fn run(h: *mut ArcHeap) -> AllocError!i32 {
     if arc_heap_releases(h) != 0 as usize {
         return 8
     }
-    // The counter check MUST have lost some.
+    // The counter-check MUST have lost some.
     if af_ld(z, AF_RAW) >= AF_THREADS * AF_ROUNDS {
         return 9
     }
 
-    // --- C: upgrading under concurrency ----------------------------------
+    // --- C: promoting under concurrency --------------------------------------
     af_st(z, AF_ERROR, 0)
     i = 0
     while i < AF_THREADS {
@@ -178,8 +200,8 @@ fn run(h: *mut ArcHeap) -> AllocError!i32 {
         strong = strong + thread_wait(f[i as usize])
         i = i + 1
     }
-    // As long as the main thread holds its strong reference, EVERY upgrade
-    // MUST succeed.
+    // As long as the main thread holds its strong reference, every
+    // promotion MUST succeed.
     if strong != AF_THREADS * AF_ROUNDS {
         return 11
     }
@@ -190,7 +212,7 @@ fn run(h: *mut ArcHeap) -> AllocError!i32 {
         return 13
     }
 
-    // --- D/E: the last strong reference falls ----------------------------
+    // --- D/E: the last strong reference falls ---------------------------------
     var w: AtomWeakRef[Payload] = aweak_of[Payload](a)
     arc_free[Payload](h, &a)
     let empty: AtomicRef[Payload] = promote_atomic[Payload](w)
