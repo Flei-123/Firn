@@ -179,6 +179,15 @@ if [ "$rc" -eq 2 ]; then ok; else bad "an unknown level must exit 2 (got $rc)"; 
 run --format yaml > /dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 2 ]; then ok; else bad "an unknown format must exit 2 (got $rc)"; fi
+run --filter 001_ --quiet --retries 2 > /dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then ok; else bad "--retries on a green selection must exit 0 (got $rc)"; fi
+run --quiet --retries 1 --format jsonl > "$D/retry.jsonl" 2> /dev/null
+rc=$?
+if [ "$rc" -eq 1 ]; then ok; else bad "a real failure must stay red after retries (got $rc)"; fi
+run --retries many > /dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 2 ]; then ok; else bad "a non-numeric --retries must exit 2 (got $rc)"; fi
 "$TR" --root "$CASES" --compiler "$D/no_such_compiler" > /dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 2 ]; then ok; else bad "a missing compiler must exit 2 (got $rc)"; fi

@@ -41,18 +41,37 @@ struct Interner {
     cnt: usize,
 }
 
-// FNV-1a, 64 bit. Byte by byte, no table lookup -- for identifiers (mostly
-// under 16 bytes) that beats every block wise method, because there the
-// overhead for the remainder is larger than the saving.
+const HASH_MUL: u64 = 11400714819323198485
+
 fn intern_hash_bytes(p: u64, n: usize) -> u64 {
-    var h: u64 = 14695981039346656037 as u64
+    let nn: u64 = n as u64
+    var h: u64 = 14695981039346656037 as u64 ^ nn
     var i: usize = 0
-    while i < n {
-        h = h ^ rt.ld8(p, i) as u64
-        h = h *% 1099511628211 as u64 // ROUND 72: FNV-1a wraps on purpose, *% says so
-        i = i + 1
+    while i + 8 <= n {
+        h = (h ^ *((p +% i as u64) as *mut u64)) *% HASH_MUL
+        h = h ^ (h >> 29 as u64)
+        i = i + 8
     }
-    return h
+    let left: usize = n - i
+    if left >= 4 {
+        let tail4: u64 = p +% nn -% 4
+        let lo32: u32 = *((p +% i as u64) as *mut u32)
+        let hi32: u32 = *(tail4 as *mut u32)
+        let lo: u64 = lo32 as u64
+        let hi: u64 = hi32 as u64
+        h = (h ^ (lo | (hi << 32 as u64))) *% HASH_MUL
+    } else if left >= 2 {
+        let tail2: u64 = p +% nn -% 2
+        let lo16: u16 = *((p +% i as u64) as *mut u16)
+        let hi16: u16 = *(tail2 as *mut u16)
+        let lo: u64 = lo16 as u64
+        let hi: u64 = hi16 as u64
+        h = (h ^ (lo | (hi << 16 as u64))) *% HASH_MUL
+    } else if left == 1 {
+        let b8: u8 = *((p +% i as u64) as *mut u8)
+        h = (h ^ b8 as u64) *% HASH_MUL
+    }
+    return h ^ (h >> 31 as u64)
 }
 
 fn intern_new() -> Interner {
@@ -169,12 +188,15 @@ fn intern_grow(t: *mut Interner, new_cap: usize) -> bool {
 // The number of an already known text; `-1` if it is missing. Unlike
 // `intern_number` this creates NOTHING -- the name resolver needs exactly
 // that when it only asks whether an identifier occurs at all.
-fn intern_find(t: *mut Interner, p: u64, n: usize) -> i64 {
+fn intern_find_hashed(t: *mut Interner, p: u64, n: usize, h: u64) -> i64 {
     if (*t).cap == 0 {
         return -1
     }
     let mask: u64 = (*t).cap as u64 - 1
-    var i: u64 = intern_hash_bytes(p, n) & mask
+    var i: u64 = h & mask
+    let lens: u64 = (*t).len.ptr
+    let offs: u64 = (*t).off.ptr
+    let text: u64 = (*t).text.ptr
     var steps: usize = 0
     while steps < (*t).cap {
         let e: u32 = rt.ld32((*t).slots, i as usize)
@@ -182,8 +204,12 @@ fn intern_find(t: *mut Interner, p: u64, n: usize) -> i64 {
             return -1
         }
         let nr: u32 = e - 1 as u32
-        if intern_equal(t, nr, p, n) {
-            return nr as i64
+        let ln: u32 = *((lens +% nr as u64 *% 4) as *mut u32)
+        if ln as usize == n {
+            let o: u32 = *((offs +% nr as u64 *% 4) as *mut u32)
+            if rt.mem_eq(text + o as u64, p, n) {
+                return nr as i64
+            }
         }
         i = (i + 1) & mask
         steps = steps + 1
@@ -191,10 +217,18 @@ fn intern_find(t: *mut Interner, p: u64, n: usize) -> i64 {
     return -1
 }
 
+fn intern_find(t: *mut Interner, p: u64, n: usize) -> i64 {
+    if (*t).cap == 0 {
+        return -1
+    }
+    return intern_find_hashed(t, p, n, intern_hash_bytes(p, n))
+}
+
 // Returns the number of the text -- existing or newly created.
 // On lack of memory `-1`.
 fn intern_number(t: *mut Interner, p: u64, n: usize) -> i64 {
-    let da: i64 = intern_find(t, p, n)
+    let h: u64 = intern_hash_bytes(p, n)
+    let da: i64 = intern_find_hashed(t, p, n, h)
     if da >= 0 {
         return da
     }
@@ -217,8 +251,7 @@ fn intern_number(t: *mut Interner, p: u64, n: usize) -> i64 {
     // CAREFUL: the hash has to be taken from our OWN buffer AFTER the copy
     // -- `p` may have been lying inside that same buffer and may have moved.
     let mask: u64 = (*t).cap as u64 - 1
-    let ep: u64 = intern_ptr(t, nr)
-    var i: u64 = intern_hash_bytes(ep, n) & mask
+    var i: u64 = h & mask
     while rt.ld32((*t).slots, i as usize) != 0 as u32 {
         i = (i + 1) & mask
     }
