@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/barcode/ean.fi -- barcode.ean: EAN-13, EAN-8 and UPC-A encoder (digits in, module string out) and run-length decoder.
+
+import std.rt
+import barcode.bcutil
+
+export { ean_check_digit, ean_encode, ean_decode_runs, ean_digits_valid }
+
+const L_WIDTHS: str = "3211222121221411113212311114131212133112"
+const PARITY: str = "LLLLLLLLGLGGLLGGLGLLGGGLLGLLGGLGGLLGLGGGLLLGLGLGLGLGGLLGGLGL"
+
+fn digit_of(s: str, i: usize) -> i64 {
+    return (rt.ld8(s.p as u64, i) as i64) - 48
+}
+
+fn ean_digits_valid(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let c: i64 = digit_of(s, i)
+        if c < 0 || c > 9 {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+fn ean_check_digit(d: u64, n: usize) -> i64 {
+    var sum: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let v: i64 = (rt.ld8(d, i) as i64) - 48
+        let from_right: usize = n - 1 - i
+        if from_right % 2 == 0 {
+            sum = sum + v * 3
+        } else {
+            sum = sum + v
+        }
+        i++
+    }
+    return (10 - sum % 10) % 10
+}
+
+fn push_digit(m: *mut rt.Buf, d: i64, kind: u8, light_first: bool) {
+    var j: i64 = 0
+    var dark: bool = !light_first
+    while j < 4 {
+        var idx: i64 = d * 4 + j
+        if kind == 71 as u8 {
+            idx = d * 4 + 3 - j
+        }
+        let w: i64 = (rt.ld8(L_WIDTHS.p as u64, idx as usize) as i64) - 48
+        bcutil.mods_push_run(m, dark, w)
+        dark = !dark
+        j = j + 1
+    }
+}
+
+fn ean_encode(text: str, kind: u32, m: *mut rt.Buf) -> BcError!bool {
+    if !ean_digits_valid(text) {
+        return BcError::BadArg
+    }
+    var d: [u8; 13] = [0 as u8; 13]
+    var n: usize = 13
+    var pad: usize = 0
+    if kind == bcutil.BC_EAN8 {
+        n = 8
+        if text.n != 7 && text.n != 8 {
+            return BcError::BadArg
+        }
+    }
+    if kind == bcutil.BC_EAN13 {
+        if text.n != 12 && text.n != 13 {
+            return BcError::BadArg
+        }
+    }
+    if kind == bcutil.BC_UPCA {
+        if text.n != 11 && text.n != 12 {
+            return BcError::BadArg
+        }
+        pad = 1
+        d[0] = 48 as u8
+    }
+    var i: usize = 0
+    while i < text.n {
+        d[i + pad] = rt.ld8(text.p as u64, i)
+        i++
+    }
+    let body: usize = n - 1
+    let have: usize = text.n + pad
+    let cd: i64 = ean_check_digit((&d) as u64, body)
+    if have == n {
+        if (d[body] as i64) - 48 != cd {
+            return BcError::BadArg
+        }
+    }
+    d[body] = (48 + cd) as u8
+    rt.buf_clear(m)
+    bcutil.mods_push_bits(m, "101")
+    if n == 8 {
+        var k: usize = 0
+        while k < 4 {
+            push_digit(m, (d[k] as i64) - 48, 76 as u8, true)
+            k++
+        }
+        bcutil.mods_push_bits(m, "01010")
+        k = 4
+        while k < 8 {
+            push_digit(m, (d[k] as i64) - 48, 82 as u8, false)
+            k++
+        }
+    } else {
+        let first: i64 = (d[0] as i64) - 48
+        var k: usize = 1
+        while k < 7 {
+            let par: u8 = rt.ld8(PARITY.p as u64, (first * 6) as usize + k - 1)
+            push_digit(m, (d[k] as i64) - 48, par, true)
+            k++
+        }
+        bcutil.mods_push_bits(m, "01010")
+        k = 7
+        while k < 13 {
+            push_digit(m, (d[k] as i64) - 48, 82 as u8, false)
+            k++
+        }
+    }
+    bcutil.mods_push_bits(m, "101")
+    return true
+}
+
+fn digit_error(r: u64, i: i64, kind: u8, d: i64, mw: f64) -> f64 {
+    var err: f64 = 0.0
+    var j: i64 = 0
+    while j < 4 {
+        var idx: i64 = d * 4 + j
+        if kind == 71 as u8 {
+            idx = d * 4 + 3 - j
+        }
+        let tw: f64 = ((rt.ld8(L_WIDTHS.p as u64, idx as usize) as i64) - 48) as f64
+        err = err + bcutil.bc_fabs(bcutil.runs_w(r, i + j) / mw - tw)
+        j = j + 1
+    }
+    return err
+}
+
+fn match_digit(r: u64, i: i64, kind: u8, perr: *mut f64) -> i64 {
+    let total: f64 = bcutil.runs_w(r, i) + bcutil.runs_w(r, i + 1) + bcutil.runs_w(r, i + 2) + bcutil.runs_w(r, i + 3)
+    let mw: f64 = total / 7.0
+    var best: f64 = 1000000.0
+    var best_d: i64 = 0 - 1
+    var d: i64 = 0
+    while d < 10 {
+        let err: f64 = digit_error(r, i, kind, d, mw)
+        if err < best {
+            best = err
+            best_d = d
+        }
+        d = d + 1
+    }
+    *(perr) = best
+    if best > 1.6 {
+        return 0 - 1
+    }
+    return best_d
+}
+
+fn guard_ok(r: u64, i: i64, n: i64, mw: f64) -> bool {
+    var j: i64 = 0
+    while j < n {
+        let x: f64 = bcutil.runs_w(r, i + j) / mw
+        if x < 0.5 || x > 1.8 {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn parity_first(par: *mut [u8; 6]) -> i64 {
+    var f: i64 = 0
+    while f < 10 {
+        var m: bool = true
+        var q: i64 = 0
+        while q < 6 {
+            if rt.ld8(PARITY.p as u64, (f * 6 + q) as usize) != (*par)[q as usize] {
+                m = false
+            }
+            q = q + 1
+        }
+        if m {
+            return f
+        }
+        f = f + 1
+    }
+    return 0 - 1
+}
+
+fn read_symbol(r: u64, s: i64, dg: i64, lf: i64, d: *mut [u8; 13], mw: f64) -> bool {
+    var rt_count: i64 = 4
+    var base: i64 = 0
+    if dg == 13 {
+        base = 1
+        rt_count = 6
+    }
+    let mid: i64 = s + 3 + lf * 4
+    var par: [u8; 6] = [0 as u8; 6]
+    var k: i64 = 0
+    while k < lf {
+        var el: f64 = 0.0
+        var eg: f64 = 0.0
+        let l: i64 = match_digit(r, s + 3 + k * 4, 76 as u8, &el)
+        var x: i64 = l
+        var p: u8 = 76 as u8
+        if dg == 13 {
+            let g: i64 = match_digit(r, s + 3 + k * 4, 71 as u8, &eg)
+            if g >= 0 && (l < 0 || eg < el) {
+                x = g
+                p = 71 as u8
+            }
+        }
+        if x < 0 {
+            return false
+        }
+        (*d)[(k + base) as usize] = (48 + x) as u8
+        par[k as usize] = p
+        k = k + 1
+    }
+    k = 0
+    while k < rt_count {
+        var er: f64 = 0.0
+        let x: i64 = match_digit(r, mid + 5 + k * 4, 82 as u8, &er)
+        if x < 0 {
+            return false
+        }
+        (*d)[(lf + base + k) as usize] = (48 + x) as u8
+        k = k + 1
+    }
+    if dg == 13 {
+        let first: i64 = parity_first(&par)
+        if first < 0 {
+            return false
+        }
+        (*d)[0] = (48 + first) as u8
+    }
+    return true
+}
+
+fn try_symbol(r: u64, nr: i64, s: i64, dg: i64, out: *mut rt.Buf, kind: *mut u32) -> bool {
+    var lf: i64 = 4
+    var rc: i64 = 4
+    if dg == 13 {
+        lf = 6
+        rc = 6
+    }
+    let total_runs: i64 = 3 + lf * 4 + 5 + rc * 4 + 3
+    if s + total_runs > nr {
+        return false
+    }
+    let mw: f64 = (bcutil.runs_w(r, s) + bcutil.runs_w(r, s + 1) + bcutil.runs_w(r, s + 2)) / 3.0
+    let mid: i64 = s + 3 + lf * 4
+    let tail: i64 = mid + 5 + rc * 4
+    if !guard_ok(r, s, 3, mw) || !guard_ok(r, mid, 5, mw) || !guard_ok(r, tail, 3, mw) {
+        return false
+    }
+    if s > 0 && bcutil.runs_w(r, s - 1) < mw * 4.0 {
+        return false
+    }
+    if tail + 3 < nr && bcutil.runs_w(r, tail + 3) < mw * 4.0 {
+        return false
+    }
+    var d: [u8; 13] = [0 as u8; 13]
+    if !read_symbol(r, s, dg, lf, &d, mw) {
+        return false
+    }
+    let body: usize = (dg - 1) as usize
+    let cd: i64 = ean_check_digit((&d) as u64, body)
+    if (d[body] as i64) - 48 != cd {
+        return false
+    }
+    rt.buf_clear(out)
+    var start: i64 = 0
+    *(kind) = bcutil.BC_EAN13
+    if dg == 8 {
+        *(kind) = bcutil.BC_EAN8
+    }
+    if dg == 13 && d[0] == 48 as u8 {
+        *(kind) = bcutil.BC_UPCA
+        start = 1
+    }
+    var q: i64 = start
+    while q < dg {
+        rt.buf_push(out, d[q as usize])
+        q = q + 1
+    }
+    return true
+}
+
+fn ean_decode_runs(r: u64, n: usize, out: *mut rt.Buf, kind: *mut u32) -> bool {
+    var s: i64 = 0
+    let nr: i64 = n as i64
+    while s + 35 <= nr {
+        if try_symbol(r, nr, s, 13, out, kind) {
+            return true
+        }
+        if try_symbol(r, nr, s, 8, out, kind) {
+            return true
+        }
+        s = s + 2
+    }
+    return false
+}

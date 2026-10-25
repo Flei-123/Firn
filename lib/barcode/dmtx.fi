@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/barcode/dmtx.fi -- barcode.dmtx: Data Matrix ECC 200 encoder (text to module matrix) and matrix decoder (module matrix to octets, all 4 rotations).
+
+import std.rt
+import barcode.bcutil
+import barcode.dmtab
+import barcode.dmrs
+import barcode.dmplace
+import barcode.dmcode
+
+export { dmtx_encode, dmtx_decode_matrix, dmtx_decode_any, DM_SHAPE_SQUARE, DM_SHAPE_ANY, DM_SHAPE_RECT }
+
+const DM_SHAPE_SQUARE: u32 = 0
+const DM_SHAPE_ANY: u32 = 1
+const DM_SHAPE_RECT: u32 = 2
+
+fn pick_size(ndata: i64, shape: u32) -> i64 {
+    var i: i64 = 0
+    while i < dmtab.dm_size_count() {
+        let sq: bool = dmtab.dm_size_rows(i) == dmtab.dm_size_cols(i)
+        var okshape: bool = true
+        if shape == DM_SHAPE_SQUARE && !sq {
+            okshape = false
+        }
+        if shape == DM_SHAPE_RECT && sq {
+            okshape = false
+        }
+        if okshape && dmtab.dm_size_data(i) >= ndata {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn module_value(cwp: u64, v: u32) -> u8 {
+    if v == dmplace.DM_UNSET {
+        return 0 as u8
+    }
+    if v == dmplace.DM_FILL_DARK {
+        return 1 as u8
+    }
+    let cwv: u32 = rt.ld8(cwp, (v / 8 as u32) as usize) as u32
+    let bit: u32 = v % 8 as u32
+    return ((cwv >> (7 as u32 - bit)) & 1 as u32) as u8
+}
+
+fn dmtx_encode(p: u64, n: usize, mode: u32, shape: u32, out: *mut rt.Buf, orows: *mut i64, ocols: *mut i64) -> BcError!bool {
+    var cw: rt.Buf = rt.buf_new()
+    dmcode.dmcode_encode(p, n, mode, &cw)
+    let ncw: i64 = rt.buf_len(&cw) as i64
+    let si: i64 = pick_size(ncw, shape)
+    if si < 0 {
+        rt.buf_free(&cw)
+        return BcError::TooLong
+    }
+    let rows: i64 = dmtab.dm_size_rows(si)
+    let cols: i64 = dmtab.dm_size_cols(si)
+    let hr: i64 = dmtab.dm_size_hregions(si)
+    let vr: i64 = dmtab.dm_size_vregions(si)
+    let nd: i64 = dmtab.dm_size_data(si)
+    let ne: i64 = dmtab.dm_size_ecc(si)
+    let nb: i64 = dmtab.dm_size_blocks(si)
+    var k: i64 = ncw
+    while k < nd {
+        if k == ncw {
+            rt.buf_push(&cw, 129 as u8)
+        } else {
+            rt.buf_push(&cw, rand253(k + 1) as u8)
+        }
+        k = k + 1
+    }
+    let total: i64 = nd + ne
+    let stream: u64 = rt.heap_alloc(total as usize + 1)
+    var b: i64 = 0
+    var blockbuf: u64 = rt.heap_alloc(300)
+    var eccbuf: u64 = rt.heap_alloc(80)
+    while b < nb {
+        var bl: i64 = 0
+        var i: i64 = b
+        while i < nd {
+            rt.st8(blockbuf, bl as usize, rt.buf_at(&cw, i as usize))
+            bl = bl + 1
+            i = i + nb
+        }
+        dmrs.dmrs_encode(blockbuf, bl as usize, eccbuf, (ne / nb) as usize)
+        i = b
+        var q: i64 = 0
+        while i < nd {
+            rt.st8(stream, i as usize, rt.ld8(blockbuf, q as usize))
+            q = q + 1
+            i = i + nb
+        }
+        q = 0
+        while q < ne / nb {
+            rt.st8(stream, (nd + q * nb + b) as usize, rt.ld8(eccbuf, q as usize))
+            q = q + 1
+        }
+        b = b + 1
+    }
+    let mr: i64 = rows - 2 * vr
+    let mc: i64 = cols - 2 * hr
+    let map: u64 = rt.heap_alloc((mr * mc * 4) as usize + 4)
+    dmplace.dm_place(map, mr, mc)
+    let rr: i64 = mr / vr
+    let rc: i64 = mc / hr
+    rt.buf_clear(out)
+    var z: i64 = 0
+    while z < rows * cols {
+        rt.buf_push(out, 0 as u8)
+        z = z + 1
+    }
+    let ob: u64 = rt.buf_ptr(out)
+    var r: i64 = 0
+    while r < rows {
+        var c: i64 = 0
+        while c < cols {
+            let ry: i64 = r % (rr + 2)
+            let rx: i64 = c % (rc + 2)
+            var dark: u8 = 0 as u8
+            if rx == 0 || ry == rr + 1 {
+                dark = 1 as u8
+            } else {
+                if ry == 0 {
+                    if rx % 2 == 0 {
+                        dark = 1 as u8
+                    }
+                } else {
+                    if rx == rc + 1 {
+                        if ry % 2 == 1 {
+                            dark = 1 as u8
+                        }
+                    } else {
+                        let mrow: i64 = (r / (rr + 2)) * rr + ry - 1
+                        let mcol: i64 = (c / (rc + 2)) * rc + rx - 1
+                        dark = module_value(stream, rt.ld32(map, (mrow * mc + mcol) as usize))
+                    }
+                }
+            }
+            rt.st8(ob, (r * cols + c) as usize, dark)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    *(orows) = rows
+    *(ocols) = cols
+    rt.heap_free(map, (mr * mc * 4) as usize + 4)
+    rt.heap_free(stream, total as usize + 1)
+    rt.heap_free(blockbuf, 300)
+    rt.heap_free(eccbuf, 80)
+    rt.buf_free(&cw)
+    return true
+}
+
+fn rand253(pos: i64) -> i64 {
+    var r: i64 = 129 + ((149 * pos) % 253) + 1
+    if r > 254 {
+        r = r - 254
+    }
+    return r
+}
+
+fn dmtx_decode_matrix(mods: u64, rows: i64, cols: i64, out: *mut rt.Buf, corrected: *mut i64) -> bool {
+    let si: i64 = dmtab.dm_size_find(rows, cols)
+    if si < 0 {
+        return false
+    }
+    let hr: i64 = dmtab.dm_size_hregions(si)
+    let vr: i64 = dmtab.dm_size_vregions(si)
+    let nd: i64 = dmtab.dm_size_data(si)
+    let ne: i64 = dmtab.dm_size_ecc(si)
+    let nb: i64 = dmtab.dm_size_blocks(si)
+    let mr: i64 = rows - 2 * vr
+    let mc: i64 = cols - 2 * hr
+    let rr: i64 = mr / vr
+    let rc: i64 = mc / hr
+    let map: u64 = rt.heap_alloc((mr * mc * 4) as usize + 4)
+    dmplace.dm_place(map, mr, mc)
+    let total: i64 = nd + ne
+    let stream: u64 = rt.heap_alloc(total as usize + 1)
+    var z: i64 = 0
+    while z < total {
+        rt.st8(stream, z as usize, 0 as u8)
+        z = z + 1
+    }
+    var y: i64 = 0
+    while y < mr {
+        var x: i64 = 0
+        while x < mc {
+            let v: u32 = rt.ld32(map, (y * mc + x) as usize)
+            if v != dmplace.DM_UNSET && v != dmplace.DM_FILL_DARK {
+                let sr: i64 = (y / rr) * (rr + 2) + (y % rr) + 1
+                let sc: i64 = (x / rc) * (rc + 2) + (x % rc) + 1
+                if rt.ld8(mods, (sr * cols + sc) as usize) != 0 as u8 {
+                    let idx: usize = (v / 8 as u32) as usize
+                    let bit: u32 = v % 8 as u32
+                    rt.st8(stream, idx, rt.ld8(stream, idx) | ((128 as u32 >> bit) as u8))
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    rt.heap_free(map, (mr * mc * 4) as usize + 4)
+    let data: u64 = rt.heap_alloc(nd as usize + 1)
+    let blockbuf: u64 = rt.heap_alloc(300)
+    var fixed: i64 = 0
+    var b: i64 = 0
+    var ok: bool = true
+    while b < nb && ok {
+        var bl: i64 = 0
+        var i: i64 = b
+        while i < nd {
+            rt.st8(blockbuf, bl as usize, rt.ld8(stream, i as usize))
+            bl = bl + 1
+            i = i + nb
+        }
+        let nsym: i64 = ne / nb
+        var q: i64 = 0
+        while q < nsym {
+            rt.st8(blockbuf, (bl + q) as usize, rt.ld8(stream, (nd + q * nb + b) as usize))
+            q = q + 1
+        }
+        let r: i64 = dmrs.dmrs_correct(blockbuf, bl + nsym, nsym)
+        if r < 0 {
+            ok = false
+        } else {
+            fixed = fixed + r
+            i = b
+            q = 0
+            while i < nd {
+                rt.st8(data, i as usize, rt.ld8(blockbuf, q as usize))
+                q = q + 1
+                i = i + nb
+            }
+        }
+        b = b + 1
+    }
+    var good: bool = false
+    if ok {
+        var text: rt.Buf = rt.buf_new()
+        if dmcode.dmcode_decode(data, nd, &text) {
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, rt.buf_ptr(&text), rt.buf_len(&text))
+            *(corrected) = fixed
+            good = true
+        }
+        rt.buf_free(&text)
+    }
+    rt.heap_free(stream, total as usize + 1)
+    rt.heap_free(data, nd as usize + 1)
+    rt.heap_free(blockbuf, 300)
+    return good
+}
+
+fn transform(src: u64, rows: i64, cols: i64, t: i64, dst: u64) -> i64 {
+    var nr: i64 = rows
+    var nc: i64 = cols
+    if t % 2 == 1 {
+        nr = cols
+        nc = rows
+    }
+    var r: i64 = 0
+    while r < nr {
+        var c: i64 = 0
+        while c < nc {
+            var sr: i64 = r
+            var sc: i64 = c
+            let q: i64 = t % 4
+            if q == 1 {
+                sr = rows - 1 - c
+                sc = r
+            }
+            if q == 2 {
+                sr = rows - 1 - r
+                sc = cols - 1 - c
+            }
+            if q == 3 {
+                sr = c
+                sc = cols - 1 - r
+            }
+            rt.st8(dst, (r * nc + c) as usize, rt.ld8(src, (sr * cols + sc) as usize))
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return nr * 1000 + nc
+}
+
+fn dmtx_decode_any(mods: u64, rows: i64, cols: i64, out: *mut rt.Buf, corrected: *mut i64) -> bool {
+    let tmp: u64 = rt.heap_alloc((rows * cols) as usize + 1)
+    var t: i64 = 0
+    var found: bool = false
+    while t < 4 && !found {
+        let dims: i64 = transform(mods, rows, cols, t, tmp)
+        let nr: i64 = dims / 1000
+        let nc: i64 = dims % 1000
+        if dmtx_decode_matrix(tmp, nr, nc, out, corrected) {
+            found = true
+        }
+        t = t + 1
+    }
+    rt.heap_free(tmp, (rows * cols) as usize + 1)
+    return found
+}

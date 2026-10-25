@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/barcode/scan.fi -- barcode.scan: finds 1D barcodes (EAN-13/8, UPC-A, Code 128, Code 39, ITF) in a gray picture by scanlines at many angles.
+
+import std.rt
+import barcode.bcutil
+import barcode.ean
+import barcode.code128
+import barcode.code39
+import barcode.itf
+
+export { Tally, bcscan_gray, bcscan_runs }
+
+struct Tally {
+    kind: u32,
+    text: rt.Buf,
+    votes: u32,
+}
+
+fn fsin(x: f64) -> f64 {
+    var t: f64 = x
+    while t > 3.14159265358979 {
+        t = t - 6.28318530717959
+    }
+    while t < 0.0 - 3.14159265358979 {
+        t = t + 6.28318530717959
+    }
+    var term: f64 = t
+    var sum: f64 = t
+    var i: i64 = 1
+    while i < 12 {
+        term = 0.0 - term * t * t / (((2 * i) * (2 * i + 1)) as f64)
+        sum = sum + term
+        i = i + 1
+    }
+    return sum
+}
+
+fn fcos(x: f64) -> f64 {
+    return fsin(x + 1.5707963267949)
+}
+
+fn sample(gray: u64, w: i64, h: i64, x: f64, y: f64) -> f64 {
+    var xi: i64 = x as i64
+    var yi: i64 = y as i64
+    if xi < 0 || yi < 0 || xi + 1 >= w || yi + 1 >= h {
+        return 0.0 - 1.0
+    }
+    let fx: f64 = x - (xi as f64)
+    let fy: f64 = y - (yi as f64)
+    let a: f64 = rt.ld8(gray, (yi * w + xi) as usize) as f64
+    let b: f64 = rt.ld8(gray, (yi * w + xi + 1) as usize) as f64
+    let c: f64 = rt.ld8(gray, ((yi + 1) * w + xi) as usize) as f64
+    let d: f64 = rt.ld8(gray, ((yi + 1) * w + xi + 1) as usize) as f64
+    return (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy
+}
+
+fn vote(t: *mut Tally, kind: u32, text: *mut rt.Buf) {
+    if (*t).kind == kind && rt.buf_len(&(*t).text) == rt.buf_len(text) && rt.mem_eq(rt.buf_ptr(&(*t).text), rt.buf_ptr(text), rt.buf_len(text)) {
+        (*t).votes = (*t).votes + 1 as u32
+        return
+    }
+    if (*t).votes <= 1 as u32 || kind == bcutil.BC_EAN13 || kind == bcutil.BC_EAN8 || kind == bcutil.BC_UPCA || kind == bcutil.BC_CODE128 {
+        if (*t).votes >= 2 as u32 && !(kind == bcutil.BC_EAN13 || kind == bcutil.BC_EAN8 || kind == bcutil.BC_UPCA || kind == bcutil.BC_CODE128) {
+            return
+        }
+        (*t).kind = kind
+        rt.buf_clear(&(*t).text)
+        rt.buf_push_bytes(&(*t).text, rt.buf_ptr(text), rt.buf_len(text))
+        (*t).votes = 1 as u32
+    }
+}
+
+fn try_runs(r: u64, n: usize, t: *mut Tally) {
+    var out: rt.Buf = rt.buf_new()
+    var kind: u32 = 0 as u32
+    if ean.ean_decode_runs(r, n, &out, &kind) {
+        vote(t, kind, &out)
+    }
+    if code128.code128_decode_runs(r, n, &out) {
+        vote(t, bcutil.BC_CODE128, &out)
+    }
+    if code39.code39_decode_runs(r, n, &out) {
+        vote(t, bcutil.BC_CODE39, &out)
+    }
+    if itf.itf_decode_runs(r, n, &out) {
+        vote(t, bcutil.BC_ITF, &out)
+    }
+    rt.buf_free(&out)
+}
+
+fn accepted(t: *mut Tally) -> bool {
+    if (*t).votes == 0 as u32 {
+        return false
+    }
+    let k: u32 = (*t).kind
+    if k == bcutil.BC_EAN13 || k == bcutil.BC_EAN8 || k == bcutil.BC_UPCA || k == bcutil.BC_CODE128 {
+        return true
+    }
+    return (*t).votes >= 2 as u32
+}
+
+fn bcscan_runs(r: u64, n: usize, t: *mut Tally) {
+    if n < 3 {
+        return
+    }
+    try_runs(r, n, t)
+    let rev: u64 = bcutil.runs_new(n)
+    var i: usize = 0
+    while i < n {
+        bcutil.runs_set(rev, i, bcutil.runs_get(r, n - 1 - i))
+        i++
+    }
+    try_runs(rev, n, t)
+    bcutil.runs_free(rev, n)
+}
+
+fn scan_line(vals: u64, len: i64, t: *mut Tally) {
+    var mn: u64 = rt.heap_alloc(((len / 16 + 2) * 2) as usize)
+    var mx: u64 = rt.heap_alloc(((len / 16 + 2) * 2) as usize)
+    var nb: i64 = len / 16 + 1
+    var b: i64 = 0
+    while b < nb {
+        var lo: i64 = 255
+        var hi: i64 = 0
+        var k: i64 = b * 16
+        while k < b * 16 + 16 && k < len {
+            let v: i64 = rt.ld8(vals, k as usize) as i64
+            if v < lo {
+                lo = v
+            }
+            if v > hi {
+                hi = v
+            }
+            k = k + 1
+        }
+        rt.st8(mn, b as usize, lo as u8)
+        rt.st8(mx, b as usize, hi as u8)
+        b = b + 1
+    }
+    let runs: u64 = bcutil.runs_new(len as usize + 2)
+    var nr: usize = 0
+    var state: bool = false
+    var have: bool = false
+    var edge: f64 = 0.0
+    var prev_v: f64 = 0.0
+    var prev_thr: f64 = 0.0
+    var win: i64 = len / 10
+    if win < 3 {
+        win = 3
+    }
+    if win > 8 {
+        win = 8
+    }
+    var i: i64 = 0
+    while i < len {
+        var lo: i64 = 255
+        var hi: i64 = 0
+        var bb: i64 = i / 16 - win
+        while bb <= i / 16 + win {
+            if bb >= 0 && bb < nb {
+                let l2: i64 = rt.ld8(mn, bb as usize) as i64
+                let h2: i64 = rt.ld8(mx, bb as usize) as i64
+                if l2 < lo {
+                    lo = l2
+                }
+                if h2 > hi {
+                    hi = h2
+                }
+            }
+            bb = bb + 1
+        }
+        let v: f64 = rt.ld8(vals, i as usize) as f64
+        let thr: f64 = ((lo + hi) as f64) / 2.0
+        var dark: bool = state
+        if hi - lo >= 40 {
+            let band: f64 = ((hi - lo) as f64) / 10.0
+            if v < thr - band {
+                dark = true
+            }
+            if v > thr + band {
+                dark = false
+            }
+        } else {
+            dark = false
+        }
+        if i == 0 {
+            state = dark
+            have = false
+        } else {
+            if dark != state {
+                var frac: f64 = 0.5
+                if bcutil.bc_fabs(v - prev_v) > 0.001 {
+                    frac = (prev_thr - prev_v) / (v - prev_v)
+                }
+                if frac < 0.0 {
+                    frac = 0.0
+                }
+                if frac > 1.0 {
+                    frac = 1.0
+                }
+                let e: f64 = ((i - 1) as f64) + frac
+                if have {
+                    let wd: f64 = (e - edge) * 16.0
+                    var wi: i64 = bcutil.bc_fround(wd)
+                    if wi < 1 {
+                        wi = 1
+                    }
+                    if nr == 0 && !state {
+                        nr = 0
+                    } else {
+                        bcutil.runs_set(runs, nr, wi)
+                        nr = nr + 1
+                    }
+                }
+                edge = e
+                have = true
+                state = dark
+            }
+        }
+        prev_v = v
+        prev_thr = thr
+        i = i + 1
+    }
+    if nr > 0 {
+        bcutil.runs_set(runs, nr, 16000)
+        nr = nr + 1
+        bcscan_runs(runs, nr, t)
+    }
+    rt.heap_free(mn, ((len / 16 + 2) * 2) as usize)
+    rt.heap_free(mx, ((len / 16 + 2) * 2) as usize)
+    bcutil.runs_free(runs, len as usize + 2)
+}
+
+fn bcscan_gray(gray: u64, w: usize, h: usize, res: *mut bcutil.BcResult) -> bool {
+    let iw: i64 = w as i64
+    let ih: i64 = h as i64
+    var diag: i64 = iw
+    if ih > diag {
+        diag = ih
+    }
+    diag = diag * 3 / 2 + 2
+    let vals: u64 = rt.heap_alloc((diag * 2 + 4) as usize)
+    var t: Tally = Tally { kind: 0 as u32, text: rt.buf_new(), votes: 0 as u32 }
+    var step: i64 = diag / 48
+    if step < 4 {
+        step = 4
+    }
+    if step > 24 {
+        step = 24
+    }
+    var pass: i64 = 0
+    var found: bool = false
+    while pass < 2 && !found {
+        var ai: i64 = 0
+        while ai < 30 && !found {
+            var deg: i64 = ai * 6
+            if pass == 0 {
+                deg = 0
+                if ai == 1 {
+                    deg = 90
+                }
+                if ai > 1 {
+                    ai = 30
+                }
+            } else {
+                if ai % 15 == 0 {
+                    ai = ai + 1
+                    continue
+                }
+            }
+            let th: f64 = (deg as f64) * 3.14159265358979 / 180.0
+            let dx: f64 = fcos(th)
+            let dy: f64 = fsin(th)
+            let nx: f64 = 0.0 - dy
+            let ny: f64 = dx
+            var off: i64 = 0 - diag / 2
+            while off <= diag / 2 && !found {
+                let cx: f64 = (iw as f64) / 2.0 + nx * (off as f64)
+                let cy: f64 = (ih as f64) / 2.0 + ny * (off as f64)
+                var len: i64 = 0
+                var s: i64 = 0 - diag
+                var started: bool = false
+                while s < diag {
+                    let v: f64 = sample(gray, iw, ih, cx + dx * (s as f64), cy + dy * (s as f64))
+                    if v >= 0.0 {
+                        started = true
+                        rt.st8(vals, len as usize, (v + 0.5) as u8)
+                        len = len + 1
+                    } else {
+                        if started {
+                            break
+                        }
+                    }
+                    s = s + 1
+                }
+                if len >= 24 {
+                    scan_line(vals, len, &t)
+                    if accepted(&t) {
+                        found = true
+                    }
+                }
+                off = off + step
+            }
+            ai = ai + 1
+        }
+        pass = pass + 1
+    }
+    rt.heap_free(vals, (diag * 2 + 4) as usize)
+    if found {
+        (*res).kind = t.kind
+        rt.buf_clear(&(*res).text)
+        rt.buf_push_bytes(&(*res).text, rt.buf_ptr(&t.text), rt.buf_len(&t.text))
+        (*res).votes = t.votes
+    }
+    rt.buf_free(&t.text)
+    return found
+}
