@@ -1523,10 +1523,15 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         }
         // SOCK_NONBLOCK (2048) is part of the type on Linux; Windows
         // says it with ioctlsocket(FIONBIO) afterwards.
-        if (a2 & 2048) != 0 {
+        let nb: i64 = a2 & 2048
+        if nb != 0 {
             __win_nonblock(s, 1)
         }
-        return __win_slot(2, s)
+        let slot: i64 = __win_slot(2, s)
+        if slot > 0 {
+            __win_nb[slot as usize] = nb
+        }
+        return slot
     }
     if nr == 42 {
         if __win_kind_of(a1) != 2 {
@@ -1665,11 +1670,17 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
             return __win_sockerrno()
         }
         // accept4(.., SOCK_NONBLOCK): a Windows socket inherits the
-        // listener's mode, so the flag is applied either way.
+        // listener's mode, so the mode is always set explicitly.
+        var nb: i64 = 0
         if nr == 288 {
-            __win_nonblock(s, a4 & 2048)
+            nb = a4 & 2048
         }
-        return __win_slot(2, s)
+        __win_nonblock(s, nb)
+        let slot: i64 = __win_slot(2, s)
+        if slot > 0 {
+            __win_nb[slot as usize] = nb
+        }
+        return slot
     }
     if nr == 32 {
         return __win_dup(a1, 0 - 1)
