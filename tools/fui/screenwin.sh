@@ -1,5 +1,5 @@
 #!/bin/bash
-# The screen apps on Windows: cross-built for x86_64-windows, run under Wine in --shot mode, and the PNG must be byte-identical to the Linux one.
+# The screen apps on Windows (fonts embedded, no fonts/ folder next to the exe): cross-built for x86_64-windows, run under Wine in --shot mode, and the PNG must be byte-identical to the Linux one.
 # FIRNC defaults to the main compiler; the temp dir is removed on exit.
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)

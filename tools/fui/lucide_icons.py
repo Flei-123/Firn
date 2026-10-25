@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/fui/lucide_icons.py -- WRITES lib/fui/lucide.fi OUT OF LUCIDE.
 #
-#   python3 tools/fui/lucide_icons.py <icon-nodes.json> > lib/fui/lucide.fi
+#   python3 tools/fui/lucide_icons.py <icon-nodes.json 1.48.0> <icon-nodes.json 0.469.0> > lib/fui/lucide.fi
 #
 # <icon-nodes.json> is the file of that name in the npm package
-# lucide-static (https://lucide.dev, ISC licence, see
+# lucide-static; the first is 1.48.0, the second 0.469.0 and only feeds PINNED_OLD
+# (icons the app already draws in their 0.469.0 shape, three of them dropped from
+# 1.x). (https://lucide.dev, ISC licence, see
 # LICENSES/Lucide-ISC.txt). Only the icons named in WANTED are taken --
 # a program pays for every string in its data segment, and 2000 icons
 # nobody draws are 700 KB of WebAssembly.
@@ -32,6 +34,11 @@ import re
 import sys
 
 VERSION = "lucide-static 1.48.0"
+
+PINNED_OLD = [
+    "clipboard-paste", "text-select", "minimize-2", "list-checks", "zap", "zap-off", "camera",
+    "sliders-horizontal", "flashlight", "volume-x",
+]
 
 WANTED = [
     # the head of a messenger
@@ -180,6 +187,9 @@ EXTRA = {
 
 def main():
     nodes = json.load(open(sys.argv[1], encoding="utf-8"))
+    old = json.load(open(sys.argv[2], encoding="utf-8"))
+    for name in PINNED_OLD:
+        nodes[name] = old[name]
     nodes.update(EXTRA)
     out = []
     w = out.append
