@@ -843,6 +843,19 @@ NEG = [
     ('type_static_10', 'static G: [i32; 2] = [1, foo()]\nfn foo() -> i32 { return 1 }\nfn main() -> i32 { return 0 }\n'),
     ('type_unknown_01', 'struct S { a: Nope }\nfn main() -> i32 { return 0 }\n'),
     ('type_unknown_02', 'fn f(x: Nope) -> i32 { return 0 }\nfn main() -> i32 { return 0 }\n'),
+    ('reg_err_01', 'fn f() -> Nope!i32 {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_01', 'gc class A extends B {\n    x: i32\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_02', 'gc class A extends B {\n    x: i32\n}\ngc class B extends A {\n    y: i32\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_03', 'struct P {\n    x: i32\n}\ngc class A {\n    p: P\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_04', 'gc class A {\n    x: i32\n}\nfn f(a: Gc[Nope]) {}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_05', 'gc class A {\n    x: i32\n}\ngc class B extends A {\n    x: i32\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_gc_06', 'gc class A {\n    x: i32\n}\nfn f(a: A) {}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_01', 'struct P {\n    x: i32\n}\nimpl Nope for P {\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_02', 'interface I {\n    fn m(*self) -> i32\n}\nstruct P {\n    x: i32\n}\nimpl I for P {\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_03', 'interface I {\n    fn m(*self) -> i32\n}\nimpl I for Q {\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_04', 'interface I {\n    fn m(*self, a: i32) -> i32\n}\nstruct P {\n    x: i32\n}\nimpl I for P {\n    fn m(*self, a: i64) -> i32 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_05', 'interface I {\n    fn m(*self) -> i32\n}\nstruct P {\n    x: i32\n}\nimpl I for P {\n    fn m(*self) -> i64 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
+    ('reg_if_06', 'interface I {\n    fn m(*self) -> i32\n}\nstruct P {\n    x: i32\n}\nimpl I for P {\n    fn m(*self, a: i32) -> i32 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
 ]
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)

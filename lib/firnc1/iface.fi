@@ -32,8 +32,9 @@ import vec
 import intern
 import ast
 import types
+import regerr
 
-export { If, if_new, if_free, if_error, if_count, if_has, if_names_self,
+export { If, if_regerr, if_new, if_free, if_error, if_count, if_has, if_names_self,
     if_add, if_method_add, if_impl_add,
     if_index, if_name, if_sidx, if_of_dyn, if_is_dyn_name,
     if_mlen, if_mname, if_slot, if_rtyp, if_plen, if_ptyp,
@@ -61,11 +62,13 @@ struct If {
     p_ty: Vec[u32], // resolved
     u_if: Vec[u32], // implementations: identifier of the interface
     u_ty: Vec[u32], // type name, as written
+    u_pos: Vec[u64],
     u_sidx: Vec[u32], // resolved (NONE = not found)
     u_pre: Vec[u32], // prefix the methods live under (`T__m`)
     u_ok: Vec[u32], // 1 = implementation complete
     u_checked: Vec[u32],
     scratch: rt.Buf,
+    re: regerr.RegErr,
     err: usize,
 }
 
@@ -77,9 +80,10 @@ fn if_new() -> If {
         m_ret: vec_new[u32](), m_rtyp: vec_new[u32](), m_on: vec_new[u32](),
         m_self: vec_new[u32](),
         p_te: vec_new[u32](), p_ty: vec_new[u32](),
-        u_if: vec_new[u32](), u_ty: vec_new[u32](), u_sidx: vec_new[u32](),
+        u_if: vec_new[u32](), u_ty: vec_new[u32](), u_pos: vec_new[u64](), u_sidx: vec_new[u32](),
         u_pre: vec_new[u32](), u_ok: vec_new[u32](), u_checked: vec_new[u32](),
         scratch: rt.buf_new(),
+        re: regerr.regerr_new(),
         err: 0,
     }
 }
@@ -101,6 +105,8 @@ fn if_free(f: *mut If) {
     vec_free[u32](&(*f).p_ty)
     vec_free[u32](&(*f).u_if)
     vec_free[u32](&(*f).u_ty)
+    vec_free[u64](&(*f).u_pos)
+    regerr.regerr_free(&(*f).re)
     vec_free[u32](&(*f).u_sidx)
     vec_free[u32](&(*f).u_pre)
     vec_free[u32](&(*f).u_ok)
@@ -109,6 +115,13 @@ fn if_free(f: *mut If) {
 }
 
 fn if_error(f: *mut If) -> usize { return (*f).err }
+
+fn if_regerr(f: *mut If) -> *mut regerr.RegErr { return &(*f).re }
+
+fn fail(f: *mut If, code: u32, pos: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) {
+    regerr.regerr_add(&(*f).re, code, pos, a0, a1, a2, a3, a4, a5)
+    (*f).err = (*f).err + 1
+}
 
 fn if_count(f: *mut If) -> usize { return vec_len[u32](&(*f).i_name) }
 
@@ -267,9 +280,10 @@ fn if_method_add(f: *mut If, i: u32, name: u32, ptypes: *mut Vec[u32],
 }
 
 // Register `impl I for T`.
-fn if_impl_add(f: *mut If, iface: u32, ty: u32) {
+fn if_impl_add(f: *mut If, iface: u32, ty: u32, pos: u64) {
     vec_push[u32](&(*f).u_if, iface)
     vec_push[u32](&(*f).u_ty, ty)
+    vec_push[u64](&(*f).u_pos, pos)
     vec_push[u32](&(*f).u_sidx, NONE)
     vec_push[u32](&(*f).u_pre, NONE)
     vec_push[u32](&(*f).u_ok, 0)
@@ -587,10 +601,10 @@ fn ends_on(it: *mut intern.Interner, name: u32, p: u64, n: usize) -> bool {
 fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
     it: *mut intern.Interner, u: usize) {
     let iname: u32 = vec_at[u32](&(*f).u_if, u)
+    let upos: u64 = vec_at[u64](&(*f).u_pos, u)
     let ii: u32 = if_index(f, iname)
     if ii == NONE {
-        // unknown interface
-        (*f).err = (*f).err + 1
+        fail(f, 301, upos, iname as u64, 0, 0, 0, 0, 0)
         return
     }
     // CARRIER OF THE IMPLEMENTATION: a struct or -- since round 50 -- a
@@ -602,6 +616,7 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
     var sidx: u32 = NONE
     var slf: u32 = 0
     var pre: u32 = 0
+    var display: u32 = raw
     let g: i32 = types.base_ty(it, raw)
     if g >= 0 {
         slf = types.new_ty(t, g as u32, 0, 0)
@@ -610,15 +625,19 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         var ambiguous: bool = false
         sidx = ty_struct(f, t, it, raw, &ambiguous)
         if sidx == NONE {
-            // unknown or ambiguous type
-            (*f).err = (*f).err + 1
+            if ambiguous {
+                fail(f, 302, upos, raw as u64, 0, 0, 0, 0, 0)
+            } else {
+                fail(f, 303, upos, raw as u64, 0, 0, 0, 0, 0)
+            }
             return
         }
         // An interface does not implement an interface.
         if if_of_dyn(f, types.st_name(t, sidx as usize)) != NONE {
-            (*f).err = (*f).err + 1
+            fail(f, 304, upos, raw as u64, 0, 0, 0, 0, 0)
             return
         }
+        display = types.st_name(t, sidx as usize)
         pre = method_prefix(f, t, it, sidx)
         slf = types.new_ty(t, types.K_STRUCT, sidx, 0)
     }
@@ -629,7 +648,7 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         if vec_at[u32](&(*f).u_if, v) == iname {
             let pv: u32 = vec_at[u32](&(*f).u_pre, v)
             if pv != NONE && pv == pre {
-                (*f).err = (*f).err + 1
+                fail(f, 305, upos, raw as u64, iname as u64, 0, 0, 0, 0)
                 return
             }
         }
@@ -643,9 +662,8 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         let full: u32 = joined(f, it, pre, if_mname(f, ii as usize, k))
         let fi: i64 = fn_search(b, full)
         if fi < 0 {
-            // the method is missing
             complete = false
-            (*f).err = (*f).err + 1
+            fail(f, 306, upos, display as u64, iname as u64, if_mname(f, ii as usize, k) as u64, 0, 0, 0)
             k = k + 1
             continue
         }
@@ -655,7 +673,7 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         let plen: u32 = ast.fn_plen(b, fi as usize)
         if plen < 1 {
             complete = false
-            (*f).err = (*f).err + 1
+            fail(f, 307, upos, display as u64, if_mname(f, ii as usize, k) as u64, iname as u64, 0, 0, 0)
             k = k + 1
             continue
         }
@@ -663,13 +681,13 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         let p0: u32 = types.param_ty_resolved(t, fi as usize, 0)
         if !types.is_ptr(t, p0) || !types.ty_equal(t, types.ty_a(t, p0), slf) {
             complete = false
-            (*f).err = (*f).err + 1
+            fail(f, 307, upos, display as u64, if_mname(f, ii as usize, k) as u64, iname as u64, 0, 0, 0)
             k = k + 1
             continue
         }
         if plen != if_plen(f, ii as usize, k) + 1 {
             complete = false
-            (*f).err = (*f).err + 1
+            fail(f, 308, upos, display as u64, if_mname(f, ii as usize, k) as u64, (plen - 1) as u64, iname as u64, if_plen(f, ii as usize, k) as u64, 0)
             k = k + 1
             continue
         }
@@ -685,13 +703,13 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
             }
             if !fits(t, actual, should) {
                 matching = false
+                fail(f, 309, upos, (j + 1) as u64, display as u64, if_mname(f, ii as usize, k) as u64, actual as u64, iname as u64, should as u64)
                 break
             }
             j = j + 1
         }
         if !matching {
             complete = false
-            (*f).err = (*f).err + 1
             k = k + 1
             continue
         }
@@ -703,7 +721,7 @@ fn check_impl(f: *mut If, t: *mut types.Types, b: *mut ast.Tree,
         }
         if !fits(t, types.ret_ty_the_func(t, fi as usize), sollr) {
             complete = false
-            (*f).err = (*f).err + 1
+            fail(f, 310, upos, display as u64, if_mname(f, ii as usize, k) as u64, types.ret_ty_the_func(t, fi as usize) as u64, iname as u64, sollr as u64, 0)
         }
         k = k + 1
     }
