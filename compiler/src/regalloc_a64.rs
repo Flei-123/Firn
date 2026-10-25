@@ -703,15 +703,9 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     let xpool_on = std::env::var_os("FIRN_A64_NO_XPOOL").is_none()
         && depth.iter().any(|&d| d > 0)
         && (leaf || !leaf_only);
-    // The caller-saved extras in a function WITH calls (crossing analysis) are OFF by default: the gate found four
-    // retention failures (tests 1003/1135/1503 js gc, 2421 gc_chunk_index: "too many objects alive after the
-    // collection"; any single one of x2-x8/x17 reproduces it, so it is no clobber but a stale conservative root --
-    // cause not found yet). `FIRN_A64_NONLEAF_CALLER=1` switches them on for the investigation.
-    // A SILENT function (only plain operations and calls of silent functions, see `compute_silent`) is never on the stack
-    // when the collector runs, so it cannot retain anything: it gets the caller-saved extras like a leaf.
     let silent_self = SILENT.with(|s| s.borrow().contains(f.name.as_str()));
     let xcaller_on = std::env::var_os("FIRN_A64_NO_XCALLER").is_none()
-        && (leaf || silent_self || std::env::var_os("FIRN_A64_NONLEAF_CALLER").is_some());
+        && (leaf || silent_self || std::env::var_os("FIRN_A64_NO_NONLEAF_CALLER").is_none());
     let mut pool: Vec<&'static str> = Vec::new();
     let mut caller: Vec<&'static str> = Vec::new();
     if xpool_on {

@@ -224,6 +224,38 @@ impl Frame {
     }
 }
 
+fn present_values(f: &Func) -> Vec<bool> {
+    let mut present = vec![std::env::var_os("FIRN_A64_FULL_SLOTS").is_some(); f.val_types.len()];
+    let mut mark = |v: Val| {
+        if let Some(p) = present.get_mut(v as usize) {
+            *p = true;
+        }
+    };
+    for p in 0..f.params.len() {
+        mark(p as Val);
+    }
+    let mut buf = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                mark(d);
+            }
+            buf.clear();
+            i.op.uses(&mut buf);
+            for v in buf.iter() {
+                mark(*v);
+            }
+        }
+        match &b.term {
+            Term::BrCond { cond, .. } => mark(*cond),
+            Term::Switch { val, .. } => mark(*val),
+            Term::Ret(Some(v)) => mark(*v),
+            Term::Br(_) | Term::Ret(None) | Term::Unset => {}
+        }
+    }
+    present
+}
+
 fn layout(f: &Func) -> Frame {
     let n = f.val_types.len();
     // ROUND BILLIG, COMPACT FRAMES. The allocation comes FIRST, so that a
@@ -242,8 +274,12 @@ fn layout(f: &Func) -> Frame {
     let ra = regalloc_a64::allocate(f);
     let mut slot = vec![NO_SLOT; n];
     let mut cursor = 0u64;
+    let present = present_values(f);
     for (idx, s) in slot.iter_mut().enumerate() {
         if ra.reg(idx as Val).is_some() || ra.imm(idx as Val).is_some() || ra.freg(idx as Val).is_some() {
+            continue;
+        }
+        if !present[idx] {
             continue;
         }
         // ROUND 91: a `v128` value needs SIXTEEN octets, and it wants them at
