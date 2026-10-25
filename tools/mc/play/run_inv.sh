@@ -262,6 +262,7 @@ MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_RUN_S=28 MCPLAY_VIEW
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player10 > "$W/ct3.out" 2>&1 &
 PP=$!
 sleep 5
+echo "kill @e[type=minecraft:item]" >&3
 echo "gamemode survival Player10" >&3; echo "give Player10 stone 20" >&3; echo "give Player10 dirt 5" >&3
 echo "execute at Player10 run setblock ~1 ~ ~ minecraft:chest" >&3
 sleep 1
@@ -296,11 +297,13 @@ ok=all(got[n]==want[n] for n in want) and got[0] is None and got[26] is None and
 sys.exit(0 if ok else 1)
 PY
 # ---- chest UI (MCPLAY_CHEST_UI): the real panel. mcplay opens the chest with a right click packet and prints the cell centres; xdotool then clicks:
-# shift click container 0 (10 stone) -> hotbar, pick up 64 stone of slot 26 and put it into slot 5, shift click the hotbar dirt -> container slot 1, Esc closes
+# shift click container 0 (10 stone) -> hotbar, pick up 64 stone of slot 26 and put it into slot 5, shift click the hotbar dirt -> container slot 1, pick the 64 up again and drag it over slots 6-8 (21 each, 1 back to slot 5), Esc closes
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_CHEST_UI=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player11 > "$W/ct4.out" 2>&1 &
 PP=$!
 sleep 5
+echo "kill @e[type=minecraft:item]" >&3
+echo "execute at Player11 run setblock ~1 ~ ~ minecraft:air" >&3
 echo "gamemode survival Player11" >&3; echo "give Player11 stone 20" >&3; echo "give Player11 dirt 5" >&3
 echo "execute at Player11 run setblock ~1 ~ ~ minecraft:chest" >&3
 sleep 1
@@ -314,6 +317,10 @@ uishift() { xdotool keydown Shift_L; sleep 0.3; uiclick "$1"; xdotool keyup Shif
 if grep -q 'chestui cell ws=55 ' "$W/ct4.out"; then
     sleep 1
     uishift 0; uiclick 26; uiclick 5; uishift 55; sleep 1
+    uiclick 5
+    xy6=$(cell 6); xy7=$(cell 7); xy8=$(cell 8)
+    xdotool mousemove $xy6; sleep 0.4; xdotool mousedown 1; sleep 0.3; xdotool mousemove $xy7; sleep 0.3; xdotool mousemove $xy8; sleep 0.3; xdotool mouseup 1; sleep 0.8
+    uiclick 5
     xdotool key Escape; sleep 1.5
     echo "execute at Player11 run data get block ~1 ~ ~ Items" >&3
     echo "data get entity Player11 Inventory" >&3
@@ -324,7 +331,7 @@ fi
 wait $PP
 C4S=$(grep 'mcplay: chestui state' "$W/ct4.out" | head -1); C4E=$(grep 'mcplay: chestui end' "$W/ct4.out" | head -1)
 echo "  $C4S"; echo "  $C4E"
-case "$C4S" in *"c0=-1"*"c1="*"x11"*"c5="*"x64"*"c26=-1"*"h0="*"x30"*"cursor=-1x0"*) ;; *) echo "  FAIL  chest ui: local state $C4S"; ERR=1;; esac
+case "$C4S" in *"c0=-1"*"c1="*"x11"*"c5="*"x1 "*"c26=-1"*"h0="*"x30"*"cursor=-1x0"*) ;; *) echo "  FAIL  chest ui: local state $C4S"; ERR=1;; esac
 case "$C4E" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;; *) echo "  FAIL  chest ui: panel did not close / mouse not captured again: $C4E"; ERR=1;; esac
 CH=$(grep 'has the following block data' "$W/server.log" | tail -1); PI=$(grep 'Player11 has the following entity data' "$W/server.log" | tail -1)
 python3 - "$CH" "$PI" <<'PY' || ERR=1
@@ -336,10 +343,10 @@ def slot(t, n):
         if c and i: return (i.group(1), int(c.group(1)))
     return None
 ch, pi = sys.argv[1], sys.argv[2]
-got={n: slot(ch, n) for n in (0,1,5,26)}
+got={n: slot(ch, n) for n in (0,1,5,6,7,8,26)}
 hot={n: slot(pi, n) for n in (0,1)}
 print("  server chest (ui): " + " ".join("%d=%s" % (n, got[n]) for n in sorted(got)) + " | hotbar: " + " ".join("%d=%s" % (n, hot[n]) for n in sorted(hot)))
-ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",64) and hot[0]==("stone",30) and hot[1] is None
+ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",1) and got[6]==("stone",21) and got[7]==("stone",21) and got[8]==("stone",21) and hot[0]==("stone",30) and hot[1] is None
 sys.exit(0 if ok else 1)
 PY
 echo stop >&3; sleep 1
