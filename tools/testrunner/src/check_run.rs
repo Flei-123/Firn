@@ -99,7 +99,8 @@ pub fn run_program(o: &Options, work: &Path, rel: &str, level: &str) -> Case {
     }
     if hdr.contains("expect_exit:") {
         let want = after(&hdr, "expect_exit: ");
-        if run.code.map(|c| c.to_string()) == Some(want.clone()) {
+        let observed = run.code.or(run.signal.map(|s| 128 + s));
+        if observed.map(|c| c.to_string()) == Some(want.clone()) {
             return case.passed(micros);
         }
         let msg = with_stderr(format!("{}, expected exit code {}", run.describe_exit(), want));
