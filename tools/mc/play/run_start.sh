@@ -78,6 +78,20 @@ wait_log "StartC joined the game" 120 || { echo "  FAIL  C: no join"; ERR=1; }
 wait $PC; [ $? -eq 0 ] || { echo "  FAIL  C: exit code"; ERR=1; }
 grep -q "^host=127.0.0.1" "$W/c.cfg" && grep -q "^name=StartC" "$W/c.cfg" && grep -q "^port=$PORT" "$W/c.cfg" || { echo "  FAIL  C: config not written"; ERR=1; }
 
+rm -f "$W/e.cfg"
+MCPLAY_CONFIG="$W/e.cfg" MCPLAY_RUN_S=20 "$W/mcplay" > "$W/E.out" 2>&1 & PE=$!
+focus || { echo "  FAIL  E: no start window"; ERR=1; }
+xdotool type --delay 80 "localhost"; sleep 0.3
+xdotool key Tab; sleep 0.3
+xdotool key BackSpace BackSpace BackSpace BackSpace BackSpace BackSpace; sleep 0.3
+xdotool type --delay 80 "$PORT"; sleep 0.3
+xdotool key Tab; sleep 0.3
+xdotool type --delay 80 "StartE"; sleep 0.5
+xdotool key Return
+wait_log "StartE joined the game" 120 || { echo "  FAIL  E: no join via hostname localhost"; ERR=1; }
+wait $PE; [ $? -eq 0 ] || { echo "  FAIL  E: exit code"; ERR=1; }
+grep -q "^host=localhost" "$W/e.cfg" && grep -q "^name=StartE" "$W/e.cfg" && grep -q "^port=$PORT" "$W/e.cfg" || { echo "  FAIL  E: hostname not written to config"; ERR=1; }
+
 MCPLAY_CONFIG="$W/d.cfg" "$W/mcplay" > "$W/D.out" 2>&1 & PD=$!
 focus || { echo "  FAIL  D: no start window"; ERR=1; }
 xdotool key Escape

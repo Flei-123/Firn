@@ -63,6 +63,11 @@ srv_cmd "fill 6 -59 6 10 -52 10 minecraft:water" "Successfully filled" || fail "
 srv_cmd "fill 6 -51 6 10 -51 10 minecraft:air" "Successfully filled" || fail "tower top"
 srv_cmd "fill -2 -60 21 2 -48 21 minecraft:stone" "Successfully filled" || fail "ladder wall"
 srv_cmd "fill 0 -60 20 0 -49 20 minecraft:ladder[facing=north]" "Successfully filled" || fail "ladders"
+srv_cmd "forceload add 16 32 48 48" "orce" || true
+sleep 4
+srv_cmd "fill 20 -60 40 40 -55 44 minecraft:stone" "Successfully filled" || fail "tunnel shell"
+srv_cmd "fill 21 -59 41 25 -56 43 minecraft:water" "Successfully filled" || fail "tunnel pool"
+srv_cmd "fill 26 -59 42 39 -59 42 minecraft:water" "Successfully filled" || fail "tunnel channel"
 sleep 2
 srv_cmd "tp $PN 8.5 -53 8.5 0 0" "Teleported $PN to" || { echo "  FAIL  tower tp not confirmed"; ERR=1; }
 wait_ticks 20 || { echo "  FAIL  no poslog ticks"; ERR=1; }
@@ -83,8 +88,15 @@ H0=$(cur_tick); wait_ticks 40; H1=$(cur_tick)
 srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/hold.pos"
 xdotool keyup shift
 D0=$(cur_tick); wait_ticks 40; D1=$(cur_tick)
+srv_cmd "tp $PN 23.5 -59 42.5 -90 0" "Teleported $PN to" || { echo "  FAIL  tunnel tp not confirmed"; ERR=1; }
+wait_ticks 30
+xdotool keydown ctrl keydown w
+T0=$(cur_tick); wait_ticks 140; T1=$(cur_tick)
+xdotool keyup w keyup ctrl
+wait_ticks 10
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/tunnel.pos"
 echo "marks sink=$S0-$S1 rise=$R0-$R1 climb=$C0-$C1 hold=$H0-$H1 down=$D0-$D1"
-python3 -I - "$W/a.out" "$W/sink.pos" "$W/hold.pos" "$S0:$S1" "$R0:$R1" "$C0:$C1" "$H0:$H1" "$D0:$D1" <<'PY' || ERR=1
+python3 -I - "$W/a.out" "$W/sink.pos" "$W/hold.pos" "$S0:$S1" "$R0:$R1" "$C0:$C1" "$H0:$H1" "$D0:$D1" "$T0:$T1" "$W/tunnel.pos" <<'PY' || ERR=1
 import re, sys
 rows = []
 for l in open(sys.argv[1], errors="replace"):
@@ -106,8 +118,8 @@ def check(ok, msg):
     if not ok:
         print("  FAIL  " + msg)
         bad += 1
-sink, rise, climb, hold, down = (span(a) for a in sys.argv[4:9])
-for n, s in (("sink", sink), ("rise", rise), ("climb", climb), ("hold", hold), ("down", down)):
+sink, rise, climb, hold, down, tunnel = (span(a) for a in sys.argv[4:10])
+for n, s in (("sink", sink), ("rise", rise), ("climb", climb), ("hold", hold), ("down", down), ("tunnel", tunnel)):
     check(len(s) >= 5, "%s: only %d poslog rows" % (n, len(s)))
 if bad:
     sys.exit(1)
@@ -148,6 +160,18 @@ print("  down: y %d -> %d (drop %d mm) vy_min=%d slide=%.0f mm/tick" % (down[0][
 check(dd >= 2500, "slide down only %d mm" % dd)
 check(dv >= -230, "slide vy min %d below -230 mm/tick" % dv)
 check(slide <= 155, "slide speed %.0f mm/tick above the 150 clamp" % slide)
+tx = tunnel[-1][2]
+ty = min(r[3] for r in tunnel)
+tmax = max(r[3] for r in tunnel[len(tunnel) // 2:])
+print("  tunnel: x %d -> %d, y %d..%d" % (tunnel[0][2], tx, ty, tmax))
+check(tx >= 38000, "tunnel: swam only to x=%d mm (needs the 0.6 high swim pose to pass the 1 high channel, expected >= 38000)" % tx)
+check(tmax <= -58300, "tunnel: y %d mm above the channel (-59000..-58000)" % tmax)
+tp = srv(sys.argv[10])
+check(tp is not None, "no server position after the tunnel")
+if tp:
+    print("  tunnel: client %d/%d/%d server %d/%d/%d" % (tunnel[-1][2], tunnel[-1][3], tunnel[-1][4], tp[0], tp[1], tp[2]))
+    check(max(abs(tx - tp[0]), abs(tunnel[-1][4] - tp[2])) <= 250 and abs(tunnel[-1][3] - tp[1]) <= 400, "tunnel: client and server positions differ")
+    check(tp[0] >= 38000, "tunnel: the server has the player at x=%d mm only" % tp[0])
 sys.exit(1 if bad else 0)
 PY
 if grep -qE "moved too quickly|moved wrongly" "$W/server.log"; then
