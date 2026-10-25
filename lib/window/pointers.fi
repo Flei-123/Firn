@@ -31,7 +31,7 @@
 // synthetic MotionEvent streams in tools/fui/pointers_main.fi.
 export {
     Pointer, Pointers, pointers_new, pointers_enable, pointers_enabled,
-    pointers_motion, pointers_single, pointers_next, pointers_down,
+    pointers_motion, pointers_motion_p, pointers_single, pointers_next, pointers_down,
     pointers_dropped, winptr_kind, winptr_coord, winptr_type,
     WMP_UPDATE, WMP_DOWN, WMP_UP, WMP_CAPTURECHANGED,
     pointers_tool_type, ptr_blank,
@@ -72,11 +72,12 @@ struct Pointer {
     x: f64, // device pixels
     y: f64,
     t: i64, // milliseconds
+    pressure: f64, // 0.0 = unknown, else 0..1
 }
 
 fn ptr_blank() -> Pointer {
     return Pointer { kind: 0 as u32, id: 0 as u32, ptype: 0 as u32,
-        primary: 0 as u32, x: 0.0, y: 0.0, t: 0 }
+        primary: 0 as u32, x: 0.0, y: 0.0, t: 0, pressure: 0.0 }
 }
 
 struct Slot {
@@ -86,11 +87,12 @@ struct Slot {
     primary: u32,
     x: f64,
     y: f64,
+    pressure: f64,
 }
 
 fn slot_blank() -> Slot {
     return Slot { used: 0 as u32, id: 0 as u32, ptype: 0 as u32,
-        primary: 0 as u32, x: 0.0, y: 0.0 }
+        primary: 0 as u32, x: 0.0, y: 0.0, pressure: 0.0 }
 }
 
 struct Pointers {
@@ -160,7 +162,7 @@ fn push(q: *mut Pointers, kind: u32, s: usize, t: i64) {
     }
     (*q).ring[(*q).head] = Pointer { kind: kind, id: (*q).st[s].id,
         ptype: (*q).st[s].ptype, primary: (*q).st[s].primary,
-        x: (*q).st[s].x, y: (*q).st[s].y, t: t }
+        x: (*q).st[s].x, y: (*q).st[s].y, t: t, pressure: (*q).st[s].pressure }
     (*q).head = n
 }
 
@@ -177,6 +179,7 @@ fn pointers_next(q: *mut Pointers, out: *mut Pointer) -> bool {
     (*out).x = (*r).x
     (*out).y = (*r).y
     (*out).t = (*r).t
+    (*out).pressure = (*r).pressure
     (*q).tail = ((*q).tail + 1) % RING
     return true
 }
@@ -230,7 +233,7 @@ fn cancel_all(q: *mut Pointers, t: i64) {
     }
 }
 
-fn put_down(q: *mut Pointers, id: u32, ptype: u32, x: f64, y: f64, t: i64) {
+fn put_down(q: *mut Pointers, id: u32, ptype: u32, x: f64, y: f64, pr: f64, t: i64) {
     let old: usize = slot_of(q, id)
     if old != NONE {
         cancel_slot(q, old, t)
@@ -244,22 +247,23 @@ fn put_down(q: *mut Pointers, id: u32, ptype: u32, x: f64, y: f64, t: i64) {
         primary = 1 as u32
     }
     (*q).st[s] = Slot { used: 1 as u32, id: id, ptype: ptype,
-        primary: primary, x: x, y: y }
+        primary: primary, x: x, y: y, pressure: pr }
     push(q, PK_DOWN, s, t)
 }
 
 // One PK_MOVE for every finger of the event (except `skip`) whose position
 // differs from the one the program last saw.
 fn moves(q: *mut Pointers, n: usize, skip: usize, ids: *mut [i32; 10],
-    xs: *mut [f64; 10], ys: *mut [f64; 10], t: i64) {
+    xs: *mut [f64; 10], ys: *mut [f64; 10], prs: *mut [f64; 10], t: i64) {
     var k: usize = 0
     while k < n && k < 10 {
         if k != skip {
             let s: usize = slot_of(q, (*ids)[k] as u32)
             if s != NONE {
-                if (*q).st[s].x != (*xs)[k] || (*q).st[s].y != (*ys)[k] {
+                if (*q).st[s].x != (*xs)[k] || (*q).st[s].y != (*ys)[k] || (*q).st[s].pressure != (*prs)[k] {
                     (*q).st[s].x = (*xs)[k]
                     (*q).st[s].y = (*ys)[k]
+                    (*q).st[s].pressure = (*prs)[k]
                     push(q, PK_MOVE, s, t)
                 }
             }
@@ -276,6 +280,14 @@ fn moves(q: *mut Pointers, n: usize, skip: usize, ids: *mut [i32; 10],
 fn pointers_motion(q: *mut Pointers, act: u32, idx: usize, n: usize,
     ids: *mut [i32; 10], xs: *mut [f64; 10], ys: *mut [f64; 10],
     types: *mut [u32; 10], t: i64) {
+    var prs: [f64; 10] = [0.0; 10]
+    pointers_motion_p(q, act, idx, n, ids, xs, ys, &prs, types, t)
+}
+
+// `pointers_motion` plus the pressure (0..1, 0.0 = unknown) of each finger.
+fn pointers_motion_p(q: *mut Pointers, act: u32, idx: usize, n: usize,
+    ids: *mut [i32; 10], xs: *mut [f64; 10], ys: *mut [f64; 10],
+    prs: *mut [f64; 10], types: *mut [u32; 10], t: i64) {
     if !(*q).on || n == 0 {
         return
     }
@@ -286,19 +298,20 @@ fn pointers_motion(q: *mut Pointers, act: u32, idx: usize, n: usize,
     if act == MA_DOWN {
         // a new sequence: whatever is still marked down lost its UP
         cancel_all(q, t)
-        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], t)
-        moves(q, n, i, ids, xs, ys, t)
+        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], (*prs)[i], t)
+        moves(q, n, i, ids, xs, ys, prs, t)
     } else if act == MA_POINTER_DOWN {
-        moves(q, n, i, ids, xs, ys, t)
-        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], t)
+        moves(q, n, i, ids, xs, ys, prs, t)
+        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], (*prs)[i], t)
     } else if act == MA_MOVE {
-        moves(q, n, NONE, ids, xs, ys, t)
+        moves(q, n, NONE, ids, xs, ys, prs, t)
     } else if act == MA_POINTER_UP || act == MA_UP {
-        moves(q, n, i, ids, xs, ys, t)
+        moves(q, n, i, ids, xs, ys, prs, t)
         let s: usize = slot_of(q, (*ids)[i] as u32)
         if s != NONE {
             (*q).st[s].x = (*xs)[i]
             (*q).st[s].y = (*ys)[i]
+            (*q).st[s].pressure = (*prs)[i]
             push(q, PK_UP, s, t)
             (*q).st[s].used = 0 as u32
         }
@@ -324,7 +337,7 @@ fn pointers_single(q: *mut Pointers, kind: u32, id: u32, ptype: u32,
         return
     }
     if kind == PK_DOWN {
-        put_down(q, id, ptype, x, y, t)
+        put_down(q, id, ptype, x, y, 0.0, t)
         return
     }
     let s: usize = slot_of(q, id)

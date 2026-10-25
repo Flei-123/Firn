@@ -601,6 +601,8 @@ echo "== 18o2. REAL POINTERS FROM THE WINDOW LAYER (r111) =="
 # fingers: tools/android/pointers_check.sh.)
 build pointers
 "$W/pointers"
+build ptrsink
+"$W/ptrsink"
 
 echo
 echo "== 18o2b. TOUCH FROM X11 AND WIN32 (r112) =="
