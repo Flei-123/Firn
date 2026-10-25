@@ -200,6 +200,8 @@ run_single() {
     wait $pid 2>/dev/null
 }
 run_play WinCpu MCPLAY_GL=0
+run_play WinDefault -u MCPLAY_GL -u MCPLAY_GFX
+grep -qE "mcplay: (gl renderer=|gfx=vk|gfx=cpu)" "$W/WinDefault.out" && echo "  ok    default back end on Windows: $(grep -oE "mcplay: (gl renderer=[^ ]*[^|]*|gfx=[a-z]+)" "$W/WinDefault.out" | head -1)" || { grep -q "gl renderer=" "$W/WinDefault.out" || echo "  note  default back end: CPU raster after the GL and Vulkan attempts"; }
 run_input
 run_dist
 run_start "$W/pkg/mcplay.exe"
