@@ -45,7 +45,8 @@ echo "  ok  sounds: $(ls "$PKG/sounds" | wc -l) files, $(du -sk "$PKG/sounds" | 
 # 3) readme
 cat > "$PKG/README.txt" <<EOF
 Voxel client $VERSION (Windows)
-  mcplay.exe <host-ipv4> <port> <name>     play (no console window; log: %LOCALAPPDATA%\\mcplay\\mcplay.log)
+  mcplay.exe                               start screen: host, port, name (saved in %LOCALAPPDATA%\\mcplay\\mcplay.cfg), Return joins, Esc quits
+  mcplay.exe <host> <port> <name>          play directly (no console window; log: %LOCALAPPDATA%\\mcplay\\mcplay.log)
   mcplay-console.exe ...                   the same with a console (log on screen)
   mcclient.exe <host> <port> <name> ...    headless join / chunk dump
 Environment: MCPLAY_GL=1 (OpenGL), MCPLAY_VIEW=<chunks> (above 8: 8 chunks full detail + LOD up to the view, MCPLAY_LOD=0 turns LOD off), MCPLAY_LOG=<file|->, MCPLAY_SOUNDS=<dir>, FIRN_AUDIO=device|null
