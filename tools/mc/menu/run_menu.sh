@@ -13,6 +13,7 @@ export FIRNLIB="$(pwd)/lib"
 export MC_VANILLA_JAR=${MC_VANILLA_JAR:-/root/.w5/jars/client-1.20.1.jar}
 export MC_VANILLA_ASSETS=${MC_VANILLA_ASSETS:-/root/.w5/menu-assets}
 export MC_VANILLA_INDEX=${MC_VANILLA_INDEX:-5}
+export MC_VANILLA=${MC_VANILLA_FORCE:-1}
 W=$(mktemp -d); SRV_PID=""; XV_PID=""
 cleanup() { [ -n "${MENU_KEEP_DIR:-}" ] && { mkdir -p "$MENU_KEEP_DIR"; cp "$W"/*.out "$W"/*.png "$W"/server.log "$MENU_KEEP_DIR"/ 2>/dev/null; }; exec 3>&- 2>/dev/null; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null && sleep 1 && kill -9 "$SRV_PID" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
@@ -74,7 +75,7 @@ if [ -n "$WB" ]; then
   xdotool type --delay 80 "127.0.0.1:$PORT"; sleep 0.5
   click "$WB" 426 356
   sleep 4
-  if shot "$WB" multi; then python3 -I tools/mc/menu/ping_check.py "$W/multi.ppm" || ERR=1; else echo "  FAIL  B: screenshot multi"; ERR=1; fi
+  if shot "$WB" multi; then python3 -I -c "from PIL import Image; Image.open('$W/multi.ppm').save('$W/multi.png')"; python3 -I tools/mc/menu/ping_check.py "$W/multi.ppm" || ERR=1; else echo "  FAIL  B: screenshot multi"; ERR=1; fi
   click "$WB" 426 92
   click "$WB" 218 396
   wait_log "MenuJ joined the game" 120 || { echo "  FAIL  B: no join via Multiplayer/Add/Join"; ERR=1; }

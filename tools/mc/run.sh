@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | swimplay | fluidplay | weatherplay | startplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom | slimeplay | snowplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | swimplay | fluidplay | weatherplay | startplay | menuplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom | slimeplay | snowplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -16,7 +16,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" weatherplay "|" startplay "|" chatplay "|" healthplay "|" combatplay "|" swimplay "|" fluidplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" slimeplay "|" snowplay "|" play ")
+    "  "|" weatherplay "|" startplay "|" menuplay "|" chatplay "|" healthplay "|" combatplay "|" swimplay "|" fluidplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" slimeplay "|" snowplay "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -146,6 +146,11 @@ if [ -z "$ONLY" ] || [ "$ONLY" = weatherplay ]; then
     echo "== mc/weatherplay =="
     bash tools/mc/play/run_weather.sh 1.20.1 || ERR=$((ERR+1))
     bash tools/mc/play/run_weather.sh 1.21.4 || ERR=$((ERR+1))
+fi
+# vanilla main menu: layout gate against widgets.png + Xvfb window flow (multiplayer, add, ping, join, quit); needs the launcher jar + asset index
+if [ -z "$ONLY" ] || [ "$ONLY" = menuplay ]; then
+    echo "== mc/menuplay =="
+    MC_VANILLA=1 bash tools/mc/menu/run_menu.sh || ERR=$((ERR+1))
 fi
 # start screen: mcplay without arguments (config file, auto start, typed form, Escape)
 if [ -z "$ONLY" ] || [ "$ONLY" = startplay ]; then
