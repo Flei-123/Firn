@@ -11,5 +11,6 @@
 
 - Stages: stage 2 == stage 3, character-identical (1302895 lines of assembly).
 - Shards 0-3 and 5 ran on f899874bb, shards 4, 6, 7 on 5d32687ac (shard 4 was rerun because its worktree was removed mid-run).
+- main 889c7f0fe re-run (single job): stages identical (1343559 lines of assembly); shards 0 and 1 done: SAME BEHAVIOUR 288, DIFFERING 0, FAULTY 0. Remaining shards still running when this was written.
 - Shards 0-7 of 8, `.firnc2` against firnc0: SAME BEHAVIOUR 1104, DIFFERING 0, FAULTY 0, NOT CORE 209, DEFER 0, COMPTIME 0, CODEGEN MISSING 0, SKIPPED 303.
 - A shard with a high SKIPPED count and few SAME BEHAVIOUR (for example 4 SAME, 186 SKIPPED) is invalid: the worktree was removed while it ran. Rerun that shard.
