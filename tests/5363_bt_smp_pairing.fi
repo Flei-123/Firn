@@ -1,0 +1,151 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.testkit
+import std.crypto.random
+import bluetooth.bt_smp
+import bluetooth.bt_smp_pair
+
+fn make(initiator: bool, auth: u32, dist: u32) -> bt_smp_pair.Pairing {
+    var ia: [u8; 6] = [1, 2, 3, 4, 5, 0xC6]
+    var ra: [u8; 6] = [9, 8, 7, 6, 5, 0xD4]
+    let f: bt_smp.Features = bt_smp.features_new(bt_smp.IO_NO_INPUT_NO_OUTPUT, auth, dist, dist)
+    if initiator {
+        return bt_smp_pair.pair_new(true, f, (&ia[0]) as u64, 1, (&ra[0]) as u64, 1, random.random_bytes)
+    }
+    return bt_smp_pair.pair_new(false, f, (&ra[0]) as u64, 1, (&ia[0]) as u64, 1, random.random_bytes)
+}
+
+fn deliver(from: *mut bt_smp_pair.Pairing, to: *mut bt_smp_pair.Pairing, tamper: usize) -> u32 {
+    var b: rt.Buf = rt.buf_new()
+    var last: u32 = bt_smp_pair.PAIR_OK
+    var count: usize = 0
+    while bt_smp_pair.pair_next_pdu(from, &b) {
+        if tamper != 0 && rt.buf_len(&b) > 0 && rt.ld8(rt.buf_ptr(&b), 0) as usize == tamper {
+            rt.st8(rt.buf_ptr(&b), rt.buf_len(&b) - 1, rt.ld8(rt.buf_ptr(&b), rt.buf_len(&b) - 1) ^ (1 as u8))
+        }
+        last = bt_smp_pair.pair_on_pdu(to, rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_clear(&b)
+        count = count + 1
+    }
+    rt.buf_free(&b)
+    if count == 0 {
+        return 99
+    }
+    return last
+}
+
+fn pump(a: *mut bt_smp_pair.Pairing, b: *mut bt_smp_pair.Pairing, tamper: usize) {
+    var rounds: u32 = 0
+    while rounds < 20 {
+        let x: u32 = deliver(a, b, tamper)
+        let y: u32 = deliver(b, a, tamper)
+        if x == 99 && y == 99 {
+            return
+        }
+        rounds = rounds + 1
+    }
+}
+
+fn keys_equal(a: *mut bt_smp_pair.Pairing, b: *mut bt_smp_pair.Pairing) -> bool {
+    var i: usize = 0
+    while i < 16 {
+        if rt.ld8(bt_smp_pair.pair_key(a), i) != rt.ld8(bt_smp_pair.pair_key(b), i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn nonzero(p: u64) -> bool {
+    var i: usize = 0
+    while i < 16 {
+        if rt.ld8(p, i) != 0 as u8 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn run_ok(sc: bool, label: str) {
+    var auth: u32 = bt_smp.AUTH_BONDING
+    if sc { auth = auth | bt_smp.AUTH_SC }
+    var i: bt_smp_pair.Pairing = make(true, auth, 7)
+    var r: bt_smp_pair.Pairing = make(false, auth, 7)
+    i.local_keys.ltk[0] = 0x11 as u8
+    i.local_keys.irk[0] = 0x12 as u8
+    i.local_keys.csrk[0] = 0x13 as u8
+    i.local_keys.ediv = 0x4321
+    r.local_keys.ltk[0] = 0x21 as u8
+    r.local_keys.irk[0] = 0x22 as u8
+    r.local_keys.csrk[0] = 0x23 as u8
+    r.local_keys.ediv = 0x1234
+    r.local_keys.addr_type = 1
+    bt_smp_pair.pair_start(&i)
+    pump(&i, &r, 0)
+    testkit.check(i.state == bt_smp_pair.ST_WAIT_ENCRYPT && r.state == bt_smp_pair.ST_WAIT_ENCRYPT, label)
+    testkit.check(keys_equal(&i, &r) && nonzero(bt_smp_pair.pair_key(&i)), label)
+    testkit.check(bt_smp_pair.pair_is_secure(&i) == sc && bt_smp_pair.pair_is_secure(&r) == sc, label)
+    if sc {
+        testkit.check(bt_smp_pair.pair_numeric(&i) == bt_smp_pair.pair_numeric(&r), label)
+        testkit.check(nonzero((&i.mac_key[0]) as u64), label)
+    }
+    bt_smp_pair.pair_on_encrypted(&i)
+    bt_smp_pair.pair_on_encrypted(&r)
+    pump(&i, &r, 0)
+    testkit.check(i.state == bt_smp_pair.ST_DONE && r.state == bt_smp_pair.ST_DONE, label)
+    var ex: u32 = 7
+    if sc { ex = 6 }
+    testkit.check(r.got == ex && i.got == ex, label)
+    testkit.check(i.peer_keys.irk[0] == 0x22 as u8 && r.peer_keys.irk[0] == 0x12 as u8, label)
+    testkit.check(i.peer_keys.csrk[0] == 0x23 as u8 && r.peer_keys.csrk[0] == 0x13 as u8, label)
+    if !sc {
+        testkit.check(i.peer_keys.ltk[0] == 0x21 as u8 && i.peer_keys.ediv == 0x1234, label)
+        testkit.check(r.peer_keys.ltk[0] == 0x11 as u8 && r.peer_keys.ediv == 0x4321, label)
+    }
+    bt_smp_pair.pair_free(&i)
+    bt_smp_pair.pair_free(&r)
+}
+
+fn run_tamper(sc: bool, code: u32, reason: u32, label: str) {
+    var auth: u32 = bt_smp.AUTH_BONDING
+    if sc { auth = auth | bt_smp.AUTH_SC }
+    var i: bt_smp_pair.Pairing = make(true, auth, 0)
+    var r: bt_smp_pair.Pairing = make(false, auth, 0)
+    bt_smp_pair.pair_start(&i)
+    pump(&i, &r, code as usize)
+    testkit.check(i.state == bt_smp_pair.ST_FAILED || r.state == bt_smp_pair.ST_FAILED, label)
+    testkit.check(i.fail_reason == reason || r.fail_reason == reason, label)
+    bt_smp_pair.pair_free(&i)
+    bt_smp_pair.pair_free(&r)
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    run_ok(false, "legacy just works with key distribution")
+    run_ok(true, "secure connections just works with key distribution")
+    run_tamper(false, bt_smp.SMP_PAIRING_RANDOM, bt_smp.FAIL_CONFIRM_VALUE, "legacy tampered random")
+    run_tamper(true, bt_smp.SMP_PAIRING_RANDOM, bt_smp.FAIL_CONFIRM_VALUE, "sc tampered random")
+    run_tamper(true, bt_smp.SMP_DHKEY_CHECK, bt_smp.FAIL_DHKEY_CHECK, "sc tampered dhkey check")
+    run_tamper(true, bt_smp.SMP_PUBLIC_KEY, bt_smp.FAIL_INVALID_PARAMETERS, "sc tampered public key")
+
+    var i: bt_smp_pair.Pairing = make(true, bt_smp.AUTH_SC, 0)
+    var r: bt_smp_pair.Pairing = make(false, 0, 0)
+    bt_smp_pair.pair_start(&i)
+    pump(&i, &r, 0)
+    testkit.check(i.state == bt_smp_pair.ST_WAIT_ENCRYPT && !bt_smp_pair.pair_is_secure(&i) && keys_equal(&i, &r), "mixed falls back to legacy")
+    bt_smp_pair.pair_free(&i)
+    bt_smp_pair.pair_free(&r)
+
+    var x: bt_smp_pair.Pairing = make(false, 0, 0)
+    var junk: [u8; 3] = [bt_smp.SMP_PAIRING_CONFIRM as u8, 1, 2]
+    testkit.check(bt_smp_pair.pair_on_pdu(&x, (&junk[0]) as u64, 3) == bt_smp_pair.PAIR_FAILED && x.fail_reason == bt_smp.FAIL_INVALID_PARAMETERS, "short pdu fails")
+    var y: bt_smp_pair.Pairing = make(false, 0, 0)
+    var unknown: [u8; 2] = [0x7F, 0]
+    testkit.check(bt_smp_pair.pair_on_pdu(&y, (&unknown[0]) as u64, 2) == bt_smp_pair.PAIR_FAILED && y.fail_reason == bt_smp.FAIL_COMMAND_NOT_SUPPORTED, "unknown pdu fails")
+    var z: bt_smp_pair.Pairing = make(false, 0, 0)
+    var early: [u8; 17] = [bt_smp.SMP_PAIRING_CONFIRM as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    testkit.check(bt_smp_pair.pair_on_pdu(&z, (&early[0]) as u64, 17) == bt_smp_pair.PAIR_FAILED && z.fail_reason == bt_smp.FAIL_UNSPECIFIED, "out of order pdu fails")
+    bt_smp_pair.pair_free(&x)
+    bt_smp_pair.pair_free(&y)
+    bt_smp_pair.pair_free(&z)
+    return testkit.finish()
+}

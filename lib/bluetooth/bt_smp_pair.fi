@@ -1,0 +1,567 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bluetooth/bt_smp_pair.fi -- bt_smp_pair: LE pairing state machine, Just Works, legacy and Secure Connections, initiator and responder
+import std.rt
+import bluetooth.bt_le
+import bluetooth.bt_aes
+import bluetooth.bt_smp
+import bluetooth.bt_smp_crypto
+import bluetooth.bt_smp_ecdh
+
+export {
+    Pairing, PairKeys,
+    PAIR_OK, PAIR_KEYS_READY, PAIR_FAILED, PAIR_DONE,
+    ST_IDLE, ST_WAIT_RESPONSE, ST_WAIT_PUBKEY, ST_WAIT_CONFIRM, ST_WAIT_RANDOM,
+    ST_WAIT_DHKEY, ST_WAIT_ENCRYPT, ST_DISTRIBUTE, ST_DONE, ST_FAILED,
+    pair_new, pair_free, pair_start, pair_on_pdu, pair_next_pdu, pair_key,
+    pair_is_secure, pair_on_encrypted, pair_numeric,
+}
+
+const PAIR_OK: u32 = 0
+const PAIR_KEYS_READY: u32 = 1
+const PAIR_FAILED: u32 = 2
+const PAIR_DONE: u32 = 3
+
+const ST_IDLE: u32 = 0
+const ST_WAIT_RESPONSE: u32 = 1
+const ST_WAIT_PUBKEY: u32 = 2
+const ST_WAIT_CONFIRM: u32 = 3
+const ST_WAIT_RANDOM: u32 = 4
+const ST_WAIT_DHKEY: u32 = 5
+const ST_WAIT_ENCRYPT: u32 = 6
+const ST_DISTRIBUTE: u32 = 7
+const ST_DONE: u32 = 8
+const ST_FAILED: u32 = 9
+
+struct PairKeys {
+    ltk: [u8; 16],
+    ediv: u32,
+    rand: [u8; 8],
+    irk: [u8; 16],
+    addr_type: u32,
+    addr: [u8; 6],
+    csrk: [u8; 16],
+    has_ltk: bool,
+    has_irk: bool,
+    has_csrk: bool,
+}
+
+struct Pairing {
+    initiator: bool,
+    state: u32,
+    sc: bool,
+    local: bt_smp.Features,
+    remote: bt_smp.Features,
+    preq: [u8; 7],
+    pres: [u8; 7],
+    ia: [u8; 7],
+    ra: [u8; 7],
+    local_rand: [u8; 16],
+    remote_rand: [u8; 16],
+    remote_confirm: [u8; 16],
+    tk: [u8; 16],
+    stk: [u8; 16],
+    ltk: [u8; 16],
+    mac_key: [u8; 16],
+    zero: [u8; 16],
+    priv_be: [u8; 32],
+    pub_x: [u8; 32],
+    pub_y: [u8; 32],
+    peer_x: [u8; 32],
+    peer_y: [u8; 32],
+    dhkey: [u8; 32],
+    numeric: u32,
+    fail_reason: u32,
+    neg_init: u32,
+    neg_resp: u32,
+    got: u32,
+    sent: bool,
+    local_keys: PairKeys,
+    peer_keys: PairKeys,
+    out: rt.Buf,
+    out_pos: usize,
+    rand_fn: fn(u64, usize) -> bool,
+}
+
+fn keys_new() -> PairKeys {
+    return PairKeys { ltk: [0; 16], ediv: 0, rand: [0; 8], irk: [0; 16], addr_type: 0,
+        addr: [0; 6], csrk: [0; 16], has_ltk: false, has_irk: false, has_csrk: false }
+}
+
+fn pair_new(initiator: bool, local: bt_smp.Features, own_addr: u64, own_type: u32, peer_addr: u64,
+    peer_type: u32, rand_fn: fn(u64, usize) -> bool) -> Pairing {
+    var p: Pairing = Pairing { initiator: initiator, state: ST_IDLE, sc: false, local: local,
+        remote: local, preq: [0; 7], pres: [0; 7], ia: [0; 7], ra: [0; 7],
+        local_rand: [0; 16], remote_rand: [0; 16], remote_confirm: [0; 16], tk: [0; 16],
+        stk: [0; 16], ltk: [0; 16], mac_key: [0; 16], zero: [0; 16], priv_be: [0; 32],
+        pub_x: [0; 32], pub_y: [0; 32], peer_x: [0; 32], peer_y: [0; 32], dhkey: [0; 32],
+        numeric: 0, fail_reason: 0, neg_init: 0, neg_resp: 0, got: 0, sent: false,
+        local_keys: keys_new(), peer_keys: keys_new(), out: rt.buf_new(), out_pos: 0,
+        rand_fn: rand_fn }
+    var ia: u64 = (&p.ia[0]) as u64
+    var ra: u64 = (&p.ra[0]) as u64
+    if initiator {
+        rt.mem_copy(ia, own_addr, 6)
+        rt.st8(ia, 6, own_type as u8)
+        rt.mem_copy(ra, peer_addr, 6)
+        rt.st8(ra, 6, peer_type as u8)
+    } else {
+        rt.mem_copy(ra, own_addr, 6)
+        rt.st8(ra, 6, own_type as u8)
+        rt.mem_copy(ia, peer_addr, 6)
+        rt.st8(ia, 6, peer_type as u8)
+    }
+    return p
+}
+
+fn pair_free(p: *mut Pairing) {
+    rt.buf_free(&(*p).out)
+}
+
+fn queue(p: *mut Pairing, pdu: *mut rt.Buf) {
+    bt_le.le_put8(&(*p).out, rt.buf_len(pdu) as u32)
+    rt.buf_push_bytes(&(*p).out, rt.buf_ptr(pdu), rt.buf_len(pdu))
+}
+
+fn pair_next_pdu(p: *mut Pairing, out: *mut rt.Buf) -> bool {
+    if (*p).out_pos >= rt.buf_len(&(*p).out) {
+        rt.buf_clear(&(*p).out)
+        (*p).out_pos = 0
+        return false
+    }
+    let base: u64 = rt.buf_ptr(&(*p).out)
+    let n: usize = rt.ld8(base, (*p).out_pos) as usize
+    rt.buf_push_bytes(out, base + ((*p).out_pos + 1) as u64, n)
+    (*p).out_pos = (*p).out_pos + 1 + n
+    return true
+}
+
+fn fail(p: *mut Pairing, reason: u32) -> u32 {
+    var b: rt.Buf = rt.buf_new()
+    bt_smp.smp_pairing_failed(&b, reason)
+    queue(p, &b)
+    rt.buf_free(&b)
+    (*p).state = ST_FAILED
+    (*p).fail_reason = reason
+    return PAIR_FAILED
+}
+
+fn pair_start(p: *mut Pairing) {
+    if !(*p).initiator || (*p).state != ST_IDLE {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    bt_smp.smp_pairing_request(&b, (*p).local)
+    rt.mem_copy((&(*p).preq[0]) as u64, rt.buf_ptr(&b), 7)
+    queue(p, &b)
+    rt.buf_free(&b)
+    (*p).state = ST_WAIT_RESPONSE
+}
+
+fn local_addr(p: *mut Pairing) -> u64 {
+    if (*p).initiator { return (&(*p).ia[0]) as u64 }
+    return (&(*p).ra[0]) as u64
+}
+
+fn gen_rand(p: *mut Pairing, dst: u64) -> bool {
+    let f: fn(u64, usize) -> bool = (*p).rand_fn
+    return f(dst, 16)
+}
+
+fn legacy_confirm(p: *mut Pairing, r: u64, out: u64) {
+    bt_smp_crypto.c1(((&(*p).tk[0]) as u64), r, (&(*p).preq[0]) as u64, (&(*p).pres[0]) as u64,
+        (*p).ia[6] as u32, (*p).ra[6] as u32, (&(*p).ia[0]) as u64, (&(*p).ra[0]) as u64, out)
+}
+
+fn negotiate(p: *mut Pairing, req: bt_smp.Features, rsp: bt_smp.Features) {
+    (*p).sc = (req.auth_req & bt_smp.AUTH_SC) != 0 && (rsp.auth_req & bt_smp.AUTH_SC) != 0
+    (*p).neg_init = rsp.init_dist
+    (*p).neg_resp = rsp.resp_dist
+    if (*p).sc {
+        (*p).neg_init = (*p).neg_init & 0xFE
+        (*p).neg_resp = (*p).neg_resp & 0xFE
+    }
+}
+
+fn send_public_key(p: *mut Pairing) -> bool {
+    if !bt_smp_ecdh.ecdh_keypair((*p).rand_fn, (&(*p).priv_be[0]) as u64, (&(*p).pub_x[0]) as u64,
+        (&(*p).pub_y[0]) as u64) {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    bt_smp.smp_public_key(&b, (&(*p).pub_x[0]) as u64, (&(*p).pub_y[0]) as u64)
+    queue(p, &b)
+    rt.buf_free(&b)
+    return true
+}
+
+fn pka(p: *mut Pairing) -> u64 {
+    if (*p).initiator { return (&(*p).pub_x[0]) as u64 }
+    return (&(*p).peer_x[0]) as u64
+}
+
+fn pkb(p: *mut Pairing) -> u64 {
+    if (*p).initiator { return (&(*p).peer_x[0]) as u64 }
+    return (&(*p).pub_x[0]) as u64
+}
+
+fn na(p: *mut Pairing) -> u64 {
+    if (*p).initiator { return ((&(*p).local_rand[0]) as u64) }
+    return ((&(*p).remote_rand[0]) as u64)
+}
+
+fn nb(p: *mut Pairing) -> u64 {
+    if (*p).initiator { return ((&(*p).remote_rand[0]) as u64) }
+    return ((&(*p).local_rand[0]) as u64)
+}
+
+fn sc_confirm(p: *mut Pairing, out: u64) {
+    bt_smp_crypto.f4(pkb(p), pka(p), nb(p), 0, out)
+}
+
+fn sc_derive(p: *mut Pairing) {
+    (*p).numeric = bt_smp_crypto.g2(pka(p), pkb(p), na(p), nb(p)) % 1000000
+    bt_smp_crypto.f5((&(*p).dhkey[0]) as u64, na(p), nb(p), (&(*p).ia[0]) as u64,
+        (&(*p).ra[0]) as u64, ((&(*p).mac_key[0]) as u64), ((&(*p).ltk[0]) as u64))
+}
+
+fn check_a(p: *mut Pairing, out: u64) {
+    bt_smp_crypto.f6(((&(*p).mac_key[0]) as u64), na(p), nb(p), ((&(*p).zero[0]) as u64),
+        (&(*p).preq[0]) as u64 + 1, (&(*p).ia[0]) as u64, (&(*p).ra[0]) as u64, out)
+}
+
+fn check_b(p: *mut Pairing, out: u64) {
+    bt_smp_crypto.f6(((&(*p).mac_key[0]) as u64), nb(p), na(p), ((&(*p).zero[0]) as u64),
+        (&(*p).pres[0]) as u64 + 1, (&(*p).ra[0]) as u64, (&(*p).ia[0]) as u64, out)
+}
+
+fn send16(p: *mut Pairing, kind: u32, v: u64) {
+    var b: rt.Buf = rt.buf_new()
+    if kind == bt_smp.SMP_PAIRING_CONFIRM {
+        bt_smp.smp_pairing_confirm(&b, v)
+    }
+    if kind == bt_smp.SMP_PAIRING_RANDOM {
+        bt_smp.smp_pairing_random(&b, v)
+    }
+    if kind == bt_smp.SMP_DHKEY_CHECK {
+        bt_smp.smp_dhkey_check(&b, v)
+    }
+    queue(p, &b)
+    rt.buf_free(&b)
+}
+
+fn on_request(p: *mut Pairing, d: u64, n: usize) -> u32 {
+    var req: bt_smp.Features = (*p).local
+    if !bt_smp.smp_parse_features(d, n, &req) {
+        return fail(p, bt_smp.FAIL_INVALID_PARAMETERS)
+    }
+    if req.max_key_size < 7 || req.max_key_size > 16 {
+        return fail(p, bt_smp.FAIL_ENCRYPTION_KEY_SIZE)
+    }
+    rt.mem_copy((&(*p).preq[0]) as u64, d, 7)
+    (*p).remote = req
+    var rsp: bt_smp.Features = (*p).local
+    rsp.init_dist = req.init_dist & (*p).local.init_dist
+    rsp.resp_dist = req.resp_dist & (*p).local.resp_dist
+    if req.max_key_size < rsp.max_key_size {
+        rsp.max_key_size = req.max_key_size
+    }
+    var b: rt.Buf = rt.buf_new()
+    bt_smp.smp_pairing_response(&b, rsp)
+    rt.mem_copy((&(*p).pres[0]) as u64, rt.buf_ptr(&b), 7)
+    queue(p, &b)
+    rt.buf_free(&b)
+    negotiate(p, req, rsp)
+    if (*p).sc {
+        (*p).state = ST_WAIT_PUBKEY
+    } else {
+        (*p).state = ST_WAIT_CONFIRM
+    }
+    return PAIR_OK
+}
+
+fn on_response(p: *mut Pairing, d: u64, n: usize) -> u32 {
+    var rsp: bt_smp.Features = (*p).local
+    if !bt_smp.smp_parse_features(d, n, &rsp) {
+        return fail(p, bt_smp.FAIL_INVALID_PARAMETERS)
+    }
+    if rsp.max_key_size < 7 || rsp.max_key_size > 16 {
+        return fail(p, bt_smp.FAIL_ENCRYPTION_KEY_SIZE)
+    }
+    rt.mem_copy((&(*p).pres[0]) as u64, d, 7)
+    (*p).remote = rsp
+    var req: bt_smp.Features = (*p).local
+    negotiate(p, req, rsp)
+    if (*p).sc {
+        if !send_public_key(p) {
+            return fail(p, bt_smp.FAIL_UNSPECIFIED)
+        }
+        (*p).state = ST_WAIT_PUBKEY
+        return PAIR_OK
+    }
+    if !gen_rand(p, ((&(*p).local_rand[0]) as u64)) {
+        return fail(p, bt_smp.FAIL_UNSPECIFIED)
+    }
+    var c: [u8; 16] = [0; 16]
+    legacy_confirm(p, ((&(*p).local_rand[0]) as u64), (&c[0]) as u64)
+    send16(p, bt_smp.SMP_PAIRING_CONFIRM, (&c[0]) as u64)
+    (*p).state = ST_WAIT_CONFIRM
+    return PAIR_OK
+}
+
+fn on_public_key(p: *mut Pairing, d: u64) -> u32 {
+    rt.mem_copy((&(*p).peer_x[0]) as u64, d + 1, 32)
+    rt.mem_copy((&(*p).peer_y[0]) as u64, d + 33, 32)
+    if !(*p).initiator {
+        if !send_public_key(p) {
+            return fail(p, bt_smp.FAIL_UNSPECIFIED)
+        }
+    }
+    if !bt_smp_ecdh.ecdh_dhkey((&(*p).priv_be[0]) as u64, (&(*p).peer_x[0]) as u64,
+        (&(*p).peer_y[0]) as u64, (&(*p).dhkey[0]) as u64) {
+        return fail(p, bt_smp.FAIL_INVALID_PARAMETERS)
+    }
+    if !gen_rand(p, ((&(*p).local_rand[0]) as u64)) {
+        return fail(p, bt_smp.FAIL_UNSPECIFIED)
+    }
+    if (*p).initiator {
+        (*p).state = ST_WAIT_CONFIRM
+        return PAIR_OK
+    }
+    var c: [u8; 16] = [0; 16]
+    sc_confirm(p, (&c[0]) as u64)
+    send16(p, bt_smp.SMP_PAIRING_CONFIRM, (&c[0]) as u64)
+    (*p).state = ST_WAIT_RANDOM
+    return PAIR_OK
+}
+
+fn on_confirm(p: *mut Pairing, d: u64) -> u32 {
+    rt.mem_copy(((&(*p).remote_confirm[0]) as u64), d + 1, 16)
+    if (*p).sc {
+        send16(p, bt_smp.SMP_PAIRING_RANDOM, ((&(*p).local_rand[0]) as u64))
+        (*p).state = ST_WAIT_RANDOM
+        return PAIR_OK
+    }
+    if (*p).initiator {
+        send16(p, bt_smp.SMP_PAIRING_RANDOM, ((&(*p).local_rand[0]) as u64))
+        (*p).state = ST_WAIT_RANDOM
+        return PAIR_OK
+    }
+    if !gen_rand(p, ((&(*p).local_rand[0]) as u64)) {
+        return fail(p, bt_smp.FAIL_UNSPECIFIED)
+    }
+    var c: [u8; 16] = [0; 16]
+    legacy_confirm(p, ((&(*p).local_rand[0]) as u64), (&c[0]) as u64)
+    send16(p, bt_smp.SMP_PAIRING_CONFIRM, (&c[0]) as u64)
+    (*p).state = ST_WAIT_RANDOM
+    return PAIR_OK
+}
+
+fn legacy_stk(p: *mut Pairing) {
+    var mrand: u64 = ((&(*p).local_rand[0]) as u64)
+    var srand: u64 = ((&(*p).remote_rand[0]) as u64)
+    if !(*p).initiator {
+        mrand = ((&(*p).remote_rand[0]) as u64)
+        srand = ((&(*p).local_rand[0]) as u64)
+    }
+    bt_smp_crypto.s1((&(*p).tk[0]) as u64, srand, mrand, (&(*p).stk[0]) as u64)
+}
+
+fn on_random(p: *mut Pairing, d: u64) -> u32 {
+    rt.mem_copy(((&(*p).remote_rand[0]) as u64), d + 1, 16)
+    var c: [u8; 16] = [0; 16]
+    let cp: u64 = (&c[0]) as u64
+    if !(*p).sc {
+        legacy_confirm(p, ((&(*p).remote_rand[0]) as u64), cp)
+        if !bt_le.le_bytes_eq(cp, ((&(*p).remote_confirm[0]) as u64), 16) {
+            return fail(p, bt_smp.FAIL_CONFIRM_VALUE)
+        }
+        if !(*p).initiator {
+            send16(p, bt_smp.SMP_PAIRING_RANDOM, ((&(*p).local_rand[0]) as u64))
+        }
+        legacy_stk(p)
+        (*p).state = ST_WAIT_ENCRYPT
+        return PAIR_KEYS_READY
+    }
+    if (*p).initiator {
+        sc_confirm(p, cp)
+        if !bt_le.le_bytes_eq(cp, ((&(*p).remote_confirm[0]) as u64), 16) {
+            return fail(p, bt_smp.FAIL_CONFIRM_VALUE)
+        }
+        sc_derive(p)
+        check_a(p, cp)
+        send16(p, bt_smp.SMP_DHKEY_CHECK, cp)
+        (*p).state = ST_WAIT_DHKEY
+        return PAIR_OK
+    }
+    send16(p, bt_smp.SMP_PAIRING_RANDOM, ((&(*p).local_rand[0]) as u64))
+    sc_derive(p)
+    (*p).state = ST_WAIT_DHKEY
+    return PAIR_OK
+}
+
+fn on_dhkey(p: *mut Pairing, d: u64) -> u32 {
+    var c: [u8; 16] = [0; 16]
+    let cp: u64 = (&c[0]) as u64
+    if (*p).initiator {
+        check_b(p, cp)
+    } else {
+        check_a(p, cp)
+    }
+    if !bt_le.le_bytes_eq(cp, d + 1, 16) {
+        return fail(p, bt_smp.FAIL_DHKEY_CHECK)
+    }
+    if !(*p).initiator {
+        check_b(p, cp)
+        send16(p, bt_smp.SMP_DHKEY_CHECK, cp)
+    }
+    (*p).state = ST_WAIT_ENCRYPT
+    return PAIR_KEYS_READY
+}
+
+fn dist_complete(p: *mut Pairing) -> bool {
+    var want: u32 = (*p).neg_resp
+    if !(*p).initiator {
+        want = (*p).neg_init
+    }
+    want = want & 7
+    return ((*p).got & want) == want
+}
+
+fn distribute(p: *mut Pairing) {
+    var mine: u32 = (*p).neg_resp
+    if (*p).initiator {
+        mine = (*p).neg_init
+    }
+    let k: *mut PairKeys = &(*p).local_keys
+    var b: rt.Buf = rt.buf_new()
+    if (mine & bt_smp.DIST_ENC_KEY) != 0 {
+        bt_smp.smp_encryption_info(&b, (&(*k).ltk[0]) as u64)
+        queue(p, &b)
+        rt.buf_clear(&b)
+        bt_smp.smp_central_ident(&b, (*k).ediv, (&(*k).rand[0]) as u64)
+        queue(p, &b)
+        rt.buf_clear(&b)
+    }
+    if (mine & bt_smp.DIST_ID_KEY) != 0 {
+        bt_smp.smp_identity_info(&b, (&(*k).irk[0]) as u64)
+        queue(p, &b)
+        rt.buf_clear(&b)
+        bt_smp.smp_identity_addr(&b, (*k).addr_type, (&(*k).addr[0]) as u64)
+        queue(p, &b)
+        rt.buf_clear(&b)
+    }
+    if (mine & bt_smp.DIST_SIGN_KEY) != 0 {
+        bt_smp.smp_signing_info(&b, (&(*k).csrk[0]) as u64)
+        queue(p, &b)
+        rt.buf_clear(&b)
+    }
+    rt.buf_free(&b)
+    (*p).sent = true
+}
+
+fn finish_distribution(p: *mut Pairing) -> u32 {
+    if (*p).state != ST_DISTRIBUTE {
+        return PAIR_OK
+    }
+    if (*p).initiator && !(*p).sent && dist_complete(p) {
+        distribute(p)
+    }
+    if (*p).sent && dist_complete(p) {
+        (*p).state = ST_DONE
+        return PAIR_DONE
+    }
+    return PAIR_OK
+}
+
+fn on_key_pdu(p: *mut Pairing, code: u32, d: u64) -> u32 {
+    let k: *mut PairKeys = &(*p).peer_keys
+    if code == bt_smp.SMP_ENCRYPTION_INFO {
+        rt.mem_copy((&(*k).ltk[0]) as u64, d + 1, 16)
+        (*k).has_ltk = true
+    }
+    if code == bt_smp.SMP_CENTRAL_IDENT {
+        (*k).ediv = bt_le.le_get16(d, 1)
+        rt.mem_copy((&(*k).rand[0]) as u64, d + 3, 8)
+        (*p).got = (*p).got | bt_smp.DIST_ENC_KEY
+    }
+    if code == bt_smp.SMP_IDENTITY_INFO {
+        rt.mem_copy((&(*k).irk[0]) as u64, d + 1, 16)
+        (*k).has_irk = true
+    }
+    if code == bt_smp.SMP_IDENTITY_ADDR {
+        (*k).addr_type = rt.ld8(d, 1) as u32
+        rt.mem_copy((&(*k).addr[0]) as u64, d + 2, 6)
+        (*p).got = (*p).got | bt_smp.DIST_ID_KEY
+    }
+    if code == bt_smp.SMP_SIGNING_INFO {
+        rt.mem_copy((&(*k).csrk[0]) as u64, d + 1, 16)
+        (*k).has_csrk = true
+        (*p).got = (*p).got | bt_smp.DIST_SIGN_KEY
+    }
+    return finish_distribution(p)
+}
+
+fn pair_on_pdu(p: *mut Pairing, data: u64, n: usize) -> u32 {
+    if n == 0 {
+        return fail(p, bt_smp.FAIL_INVALID_PARAMETERS)
+    }
+    let code: u32 = rt.ld8(data, 0) as u32
+    if bt_smp.smp_expected_len(code) == 0 {
+        return fail(p, bt_smp.FAIL_COMMAND_NOT_SUPPORTED)
+    }
+    if !bt_smp.smp_pdu_valid(data, n) {
+        return fail(p, bt_smp.FAIL_INVALID_PARAMETERS)
+    }
+    if code == bt_smp.SMP_PAIRING_FAILED {
+        (*p).state = ST_FAILED
+        (*p).fail_reason = rt.ld8(data, 1) as u32
+        return PAIR_FAILED
+    }
+    let st: u32 = (*p).state
+    if st == ST_IDLE && !(*p).initiator && code == bt_smp.SMP_PAIRING_REQUEST {
+        return on_request(p, data, n)
+    }
+    if st == ST_WAIT_RESPONSE && code == bt_smp.SMP_PAIRING_RESPONSE {
+        return on_response(p, data, n)
+    }
+    if st == ST_WAIT_PUBKEY && code == bt_smp.SMP_PUBLIC_KEY {
+        return on_public_key(p, data)
+    }
+    if st == ST_WAIT_CONFIRM && code == bt_smp.SMP_PAIRING_CONFIRM {
+        return on_confirm(p, data)
+    }
+    if st == ST_WAIT_RANDOM && code == bt_smp.SMP_PAIRING_RANDOM {
+        return on_random(p, data)
+    }
+    if st == ST_WAIT_DHKEY && code == bt_smp.SMP_DHKEY_CHECK {
+        return on_dhkey(p, data)
+    }
+    if (st == ST_DISTRIBUTE || st == ST_WAIT_ENCRYPT) && code >= bt_smp.SMP_ENCRYPTION_INFO && code <= bt_smp.SMP_SIGNING_INFO {
+        return on_key_pdu(p, code, data)
+    }
+    return fail(p, bt_smp.FAIL_UNSPECIFIED)
+}
+
+fn pair_key(p: *mut Pairing) -> u64 {
+    if (*p).sc { return ((&(*p).ltk[0]) as u64) }
+    return ((&(*p).stk[0]) as u64)
+}
+
+fn pair_is_secure(p: *mut Pairing) -> bool {
+    return (*p).sc
+}
+
+fn pair_numeric(p: *mut Pairing) -> u32 {
+    return (*p).numeric
+}
+
+fn pair_on_encrypted(p: *mut Pairing) -> u32 {
+    if (*p).state != ST_WAIT_ENCRYPT {
+        return PAIR_OK
+    }
+    (*p).state = ST_DISTRIBUTE
+    if !(*p).initiator || (*p).neg_resp & 7 == 0 {
+        distribute(p)
+    }
+    return finish_distribution(p)
+}
