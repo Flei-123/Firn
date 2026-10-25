@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_dig.sh -- block breaking checked on the SERVER: mcplay digs a stone block under the player, the vanilla 1.20.1 server must
 # report the block gone (execute if block) and, in survival, the inventory must hold +1 cobblestone. Modes: survival (iron pickaxe, held button)
-# and creative (single click). Prints `RESULT mc-play-dig: ok`.
+# and creative (single click); MCPLAY_CREATIVE is NOT set: the client must learn the game mode from the server. Prints `RESULT mc-play-dig: ok`.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -62,7 +62,7 @@ wait_ticks() { local t0 t; t0=$(prog "$1" ticks); t0=${t0:-0}; for i in $(seq 1 
 server_ask() { local mark="MARK$RANDOM$RANDOM"; echo "say $mark" >&3; for i in $(seq 1 100); do grep -q "$mark" "$W/server.log" && break; sleep 0.1; done; }
 run_mode() {
     local mode=$1 nm=$2 gm=$3 x=$4
-    MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=$([ "$mode" = creative ] && echo 1 || echo 0) MCPLAY_RUN_S=${MCPLAY_DIG_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_RUN_S=${MCPLAY_DIG_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
         MCPLAY_QUIT_FILE="$W/quit-$nm" timeout 220 $RUN 127.0.0.1 "$PORT" "$nm" > "$W/$nm.out" 2>&1 &
     PP=$!
     wj "$nm" || { ERR=1; return; }
