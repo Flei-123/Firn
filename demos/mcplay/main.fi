@@ -127,6 +127,10 @@ import mc.mc_item_icon
 import mc.mc_inv_ui
 import mc.mc_inv_drag
 import mc.mc_cont_ui
+import mc.mc_creative
+import mc.mc_creative_ui
+import mc.mc_creative_act
+import mc.mc_creative_rules
 import mc.mc_inv_tooltip
 import mc.mc_hud_debug
 import mc.mc_shot
@@ -487,6 +491,10 @@ struct Ctx {
     iui: mc_inv_ui.InvUi,
     idrag: mc_inv_drag.InvDrag,
     cui: mc_cont_ui.ContUi,
+    cr: mc_creative.Creative,
+    crui: mc_creative_ui.CrUi,
+    cr_sdrag: bool,
+    cr_logged: bool,
     shot_req: bool,
     shot_armed: bool,
     shot_n: i32,
@@ -937,7 +945,7 @@ fn on_packet(c: *mut Ctx, id: i32) {
         if !(*c).join {
             (*c).join = true
             mc_hud_play.hp_open(&(*c).hudp, (*cl).ver.protocol, env_flag("MCPLAY_VANILLA_HUD", true))
-            if env_flag("MCPLAY_ITEM_ICONS", true) && mc_item_icon.icons_open(&(*c).icons, (*cl).ver.protocol, mc_registry.reg_item_count(&(*c).reg)) { mc_inv_ui.iui_open(&(*c).iui, mc_item_icon.icons_src(&(*c).icons)); mc_cont_ui.cui_open(&(*c).cui, mc_item_icon.icons_src(&(*c).icons)) }
+            if env_flag("MCPLAY_ITEM_ICONS", true) && mc_item_icon.icons_open(&(*c).icons, (*cl).ver.protocol, mc_registry.reg_item_count(&(*c).reg)) { mc_inv_ui.iui_open(&(*c).iui, mc_item_icon.icons_src(&(*c).icons)); mc_cont_ui.cui_open(&(*c).cui, mc_item_icon.icons_src(&(*c).icons)); mc_creative_ui.crui_open(&(*c).crui, mc_item_icon.icons_src(&(*c).icons)) }
             mc_effect.fx_own_from_join(&(*c).fx, mc_client.client_body(cl))
             mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*c).dim)
             apply_hashed_seed(c, id)
@@ -1050,7 +1058,10 @@ fn pump(c: *mut Ctx) {
     var guard: i32 = 0
     while k != window.EV_NONE && guard < 20000 {
         guard = guard + 1
-        if k == window.EV_CHAR { mc_chat_ui.chat_ui_char(&(*c).chat, &(*c).chat_ui, window.ev_a((*c).wp), chat_allowed(c)) }
+        if k == window.EV_CHAR {
+            mc_chat_ui.chat_ui_char(&(*c).chat, &(*c).chat_ui, window.ev_a((*c).wp), chat_allowed(c))
+            if cr_active(c) { mc_creative.cr_query_push(&(*c).cr, &(*c).reg, window.ev_a((*c).wp)) }
+        }
         if k == window.EV_CONFIGURE {
             (*c).resized = true
         } else if k == window.EV_CLOSED {
@@ -1328,7 +1339,7 @@ fn handle_hotbar(c: *mut Ctx) {
         (*c).sent_slot = (*c).pl.slot
     }
     if mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_INVENTORY) {
-        if (*c).show_inv { ui_close(c) } else { ui_set_open(c, true) }
+        if (*c).show_inv && !(cr_active(c) && mc_creative.cr_focus(&(*c).cr)) { ui_close(c) } else if !(*c).show_inv { ui_set_open(c, true) }
     }
     ui_sync(c)
     if mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_DROP) && !(*c).show_inv {
@@ -1669,6 +1680,10 @@ fn draw_inventory_body(c: *mut Ctx, r: *mut mc_raster.Raster) {
         draw_container(c, r)
         return
     }
+    if cr_active(c) {
+        draw_creative(c, r, s)
+        return
+    }
     if mc_inv_ui.iui_ok(&(*c).iui) {
         draw_player_panel(c, r, s)
         return
@@ -1951,6 +1966,7 @@ fn ui_set_open(c: *mut Ctx, on: bool) {
 
 // E / Esc: close the panel (and a container window with a Close Window packet)
 fn ui_close(c: *mut Ctx) {
+    log_creative_state(c)
     if env_flag("MCPLAY_CHEST_UI", false) && ui_cont_open(c) {
         let v: *mut mc_inv.Inv = &(*c).inv
         say(f"mcplay: chestui state c0={mc_inv.inv_win_item(v, 0)} c1={mc_inv.inv_win_item(v, 1)}x{mc_inv.inv_win_count(v, 1)} c5={mc_inv.inv_win_item(v, 5)}x{mc_inv.inv_win_count(v, 5)} c26={mc_inv.inv_win_item(v, 26)} h0={mc_inv.inv_item(v, 36)}x{mc_inv.inv_count(v, 36)} h1={mc_inv.inv_item(v, 37)} cursor={mc_inv.inv_cursor_item(v)}x{mc_inv.inv_cursor_count(v)} clicks={(*c).inv.n_clicks}\n")
@@ -2057,6 +2073,10 @@ fn ui_inv_keys(c: *mut Ctx, slot: i32) {
 
 // Mouse in the open inventory panel: click on release, drag over slots with a carried stack (left = split evenly, right = one each), Q / number keys on the hovered slot
 fn ui_inv_click(c: *mut Ctx) {
+    if cr_active(c) {
+        ui_creative_click(c)
+        return
+    }
     let slot: i32 = ui_slot_at(c)
     let d: *mut mc_inv_drag.InvDrag = &(*c).idrag
     if mc_inv_drag.idrag_held(d) {
@@ -2087,6 +2107,178 @@ fn ui_inv_click(c: *mut Ctx) {
         return
     }
     ui_click_now(c, btn, slot)
+}
+
+fn cr_active(c: *mut Ctx) -> bool {
+    if !(*c).show_inv || ui_cont_open(c) || (*c).health.mode != 1 { return false }
+    return env_flag("MCPLAY_CREATIVE_UI", true)
+}
+
+fn cr_prepare(c: *mut Ctx) {
+    if mc_creative.cr_ready(&(*c).cr) { return }
+    mc_creative.cr_build(&(*c).cr, &(*c).reg)
+}
+
+fn cr_px(c: *mut Ctx, s: i32) -> i32 { return ((*c).w - mc_creative_ui.crui_panel_w() * s) / 2 }
+
+fn cr_py(c: *mut Ctx, s: i32) -> i32 { return ((*c).h - mc_creative_ui.crui_panel_h() * s) / 2 }
+
+fn cr_icon_item(c: *mut Ctx, name: str) -> i32 {
+    return mc_registry.reg_item_by_name(&(*c).reg, name.p as u64, name.n)
+}
+
+fn log_creative_cells(c: *mut Ctx, px: i32, py: i32, s: i32) {
+    if (*c).cr_logged || !env_flag("MCPLAY_CREATIVE_LOG", false) { return }
+    (*c).cr_logged = true
+    var x: i32 = 0
+    var y: i32 = 0
+    var t: i32 = 0
+    while t < mc_creative_rules.TAB_COUNT {
+        mc_creative_ui.crui_tab_xy(t, &x, &y)
+        say(f"mcplay: crui cell tab={t} x={px + (x + 13) * s} y={py + (y + 16) * s}\n")
+        t = t + 1
+    }
+    say(f"mcplay: crui cell pick=0 x={px + 17 * s} y={py + 26 * s}\n")
+    say(f"mcplay: crui cell pick=1 x={px + 35 * s} y={py + 26 * s}\n")
+    say(f"mcplay: crui cell ws=36 x={px + 17 * s} y={py + 120 * s}\n")
+    say(f"mcplay: crui cell ws=37 x={px + 35 * s} y={py + 120 * s}\n")
+    say(f"mcplay: crui cell delete x={px + 181 * s} y={py + 120 * s}\n")
+}
+
+fn log_creative_state(c: *mut Ctx) {
+    if !env_flag("MCPLAY_CREATIVE_LOG", false) || !cr_active(c) { return }
+    let v: *mut mc_inv.Inv = &(*c).inv
+    say(f"mcplay: crui state tab={mc_creative.cr_tab(&(*c).cr)} n={mc_creative.cr_count(&(*c).cr)} first={mc_creative.cr_item(&(*c).cr, 0)} h0={mc_inv.inv_item(v, 36)}x{mc_inv.inv_count(v, 36)} h1={mc_inv.inv_item(v, 37)}x{mc_inv.inv_count(v, 37)} cursor={mc_inv.inv_cursor_item(v)}x{mc_inv.inv_cursor_count(v)}\n")
+}
+
+fn draw_creative(c: *mut Ctx, r: *mut mc_raster.Raster, s: i32) {
+    cr_prepare(c)
+    let cr: *mut mc_creative.Creative = &(*c).cr
+    let px: i32 = cr_px(c, s)
+    let py: i32 = cr_py(c, s)
+    let mx: i32 = raw.mouse_x(&(*c).rw) as i32
+    let my: i32 = raw.mouse_y(&(*c).rw) as i32
+    let tab: i32 = mc_creative.cr_tab(cr)
+    mc_creative_ui.crui_draw(r, &(*c).crui, cr, px, py, s)
+    log_creative_cells(c, px, py, s)
+    let hit: i32 = mc_creative_ui.crui_hit(cr, px, py, s, mx, my)
+    var t: i32 = 0
+    while t < mc_creative_rules.TAB_COUNT {
+        var ix: i32 = 0
+        var iy: i32 = 0
+        mc_creative_ui.crui_tab_icon_xy(t, &ix, &iy)
+        draw_slot_label(c, r, px + (ix - 2) * s, py + (iy - 2) * s, s, cr_icon_item(c, mc_creative.cr_tab_icon(t)), 1)
+        t = t + 1
+    }
+    var k: i32 = 0
+    while k < mc_creative.CR_PAGE && tab != mc_creative_rules.TAB_INVENTORY {
+        let gx: i32 = px + (9 + 18 * (k % 9)) * s
+        let gy: i32 = py + (18 + 18 * (k / 9)) * s
+        draw_slot_label(c, r, gx - 2 * s, gy - 2 * s, s, mc_creative.cr_item(cr, k), 1)
+        if hit == mc_creative_ui.HIT_PICK0 + k { mc_hud.hud_rect(r, gx, gy, 16 * s, 16 * s, 0x80FFFFFF as u32) }
+        k = k + 1
+    }
+    var ws: i32 = 0
+    while ws < 46 {
+        var x: i32 = 0
+        var y: i32 = 0
+        if mc_creative_ui.crui_slot_xy(tab, ws, &x, &y) {
+            let gx: i32 = px + x * s
+            let gy: i32 = py + y * s
+            draw_slot_label(c, r, gx - 2 * s, gy - 2 * s, s, mc_inv.inv_item(&(*c).inv, ws), mc_inv.inv_count(&(*c).inv, ws))
+            if hit == ws { mc_hud.hud_rect(r, gx, gy, 16 * s, 16 * s, 0x80FFFFFF as u32) }
+        }
+        ws = ws + 1
+    }
+    draw_slot_label(c, r, mx - 10 * s, my - 10 * s, s, mc_inv.inv_cursor_item(&(*c).inv), mc_inv.inv_cursor_count(&(*c).inv))
+    if mc_inv.inv_cursor_item(&(*c).inv) >= 0 { return }
+    if hit >= mc_creative_ui.HIT_TAB0 && hit < mc_creative_ui.HIT_TAB0 + mc_creative_rules.TAB_COUNT {
+        let title: str = mc_creative.cr_tab_title(hit - mc_creative_ui.HIT_TAB0)
+        mc_inv_tooltip.tip_draw(r, mx, my, s, title.p as u64, title.n)
+        return
+    }
+    var item: i32 = 0 - 1
+    if hit >= mc_creative_ui.HIT_PICK0 && hit < mc_creative_ui.HIT_PICK0 + mc_creative.CR_PAGE { item = mc_creative.cr_item(cr, hit - mc_creative_ui.HIT_PICK0) }
+    if hit >= 0 && hit < 46 { item = mc_inv.inv_item(&(*c).inv, hit) }
+    if item < 0 { return }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_item_name(&(*c).reg, item, &n)
+    mc_inv_tooltip.tip_draw(r, mx, my, s, p, n)
+}
+
+fn ui_creative_keys(c: *mut Ctx, hit: i32) {
+    let cr: *mut mc_creative.Creative = &(*c).cr
+    if raw.key_pressed(&(*c).rw, 14 as u32) && mc_creative.cr_focus(cr) { mc_creative.cr_query_pop(cr, &(*c).reg) }
+    if mc_creative.cr_focus(cr) { return }
+    if hit >= mc_creative_ui.HIT_PICK0 && hit < mc_creative_ui.HIT_PICK0 + mc_creative.CR_PAGE {
+        let k: i32 = hit - mc_creative_ui.HIT_PICK0
+        let hb: i32 = mc_keybinds.kb_hotbar_pressed(&(*c).kb, &(*c).rw)
+        if hb >= 0 { mc_creative_act.cra_key_swap(&(*c).cl, cr, &(*c).reg, &(*c).inv, k, hb, true) }
+        if mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_DROP) {
+            mc_creative_act.cra_drop_pick(&(*c).cl, cr, &(*c).reg, k, raw.key_down(&(*c).rw, 29 as u32), true)
+        }
+    } else if hit >= 0 && hit < 46 && mc_creative.cr_tab(cr) == mc_creative_rules.TAB_INVENTORY {
+        ui_inv_keys(c, hit)
+    }
+}
+
+fn ui_creative_click(c: *mut Ctx) {
+    cr_prepare(c)
+    let cr: *mut mc_creative.Creative = &(*c).cr
+    let s: i32 = mc_hud.hud_scale((*c).w, (*c).h)
+    let px: i32 = cr_px(c, s)
+    let py: i32 = cr_py(c, s)
+    let mx: i32 = raw.mouse_x(&(*c).rw) as i32
+    let my: i32 = raw.mouse_y(&(*c).rw) as i32
+    let hit: i32 = mc_creative_ui.crui_hit(cr, px, py, s, mx, my)
+    let wy: i64 = raw.wheel_y(&(*c).rw)
+    if wy != 0 as i64 && mc_creative.cr_has_scrollbar(cr) {
+        var d: i32 = 1
+        if wy > 0 as i64 { d = 0 - 1 }
+        mc_creative.cr_scroll_rows(cr, d)
+    }
+    if (*c).cr_sdrag {
+        if raw.mouse_down(&(*c).rw, raw.MB_LEFT) {
+            mc_creative.cr_set_scroll_from_px(cr, (my - (py + 18 * s)) / s, 112, 15)
+        } else {
+            (*c).cr_sdrag = false
+        }
+        return
+    }
+    var btn: i32 = 0 - 1
+    if raw.mouse_pressed(&(*c).rw, raw.MB_LEFT) { btn = 0 }
+    if raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT) { btn = 1 }
+    if raw.mouse_pressed(&(*c).rw, raw.MB_MIDDLE) { btn = 2 }
+    if btn < 0 {
+        ui_creative_keys(c, hit)
+        return
+    }
+    let shift: bool = raw.key_down(&(*c).rw, 42 as u32)
+    let tab: i32 = mc_creative.cr_tab(cr)
+    if hit >= mc_creative_ui.HIT_TAB0 && hit < mc_creative_ui.HIT_TAB0 + mc_creative_rules.TAB_COUNT {
+        mc_creative.cr_select(cr, &(*c).reg, hit - mc_creative_ui.HIT_TAB0)
+    } else if hit == mc_creative_ui.HIT_SCROLL && btn == 0 {
+        (*c).cr_sdrag = true
+        mc_creative.cr_set_scroll_from_px(cr, (my - (py + 18 * s)) / s, 112, 15)
+    } else if hit == mc_creative_ui.HIT_SEARCH {
+        mc_creative.cr_set_focus(cr, true)
+    } else if hit >= mc_creative_ui.HIT_PICK0 && hit < mc_creative_ui.HIT_PICK0 + mc_creative.CR_PAGE {
+        mc_creative_act.cra_pick(cr, &(*c).reg, &(*c).inv, hit - mc_creative_ui.HIT_PICK0, btn, shift)
+    } else if hit == mc_creative_ui.HIT_DELETE {
+        mc_creative_act.cra_delete(&(*c).cl, &(*c).inv, shift, true)
+    } else if hit == mc_creative_ui.HIT_OUTSIDE {
+        if tab == mc_creative_rules.TAB_INVENTORY {
+            if btn < 2 { ui_click_now(c, btn, 0 - 999) }
+        } else {
+            mc_creative_act.cra_outside(&(*c).cl, &(*c).inv, btn, true)
+        }
+    } else if hit >= 0 && hit < 46 && btn < 2 {
+        if tab == mc_creative_rules.TAB_INVENTORY {
+            ui_click_now(c, btn, hit)
+        } else {
+            mc_creative_act.cra_slot(&(*c).cl, &(*c).reg, &(*c).inv, hit, btn, true)
+        }
+    }
 }
 
 // MCPLAY_CLICK_TEST=1 (survival, after `give <name> stone 32`): picks the stack of 32 up, puts it into slot 10, takes half, puts that
@@ -3742,7 +3934,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_biome_updates: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, end_kind: END_QUIT, end_text: rt.buf_new(), fps: 0,
-        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), chat_ui: mc_chat_ui.chatui_new(), tabl: mc_tablist.tab_new(), tab_log: env_flag("MCPLAY_TAB_LOG", false), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), icons: mc_item_icon.icons_new(), iui: mc_inv_ui.iui_new(), idrag: mc_inv_drag.idrag_new(), cui: mc_cont_ui.cui_new(), shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, tab_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, death_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), chat_ui: mc_chat_ui.chatui_new(), tabl: mc_tablist.tab_new(), tab_log: env_flag("MCPLAY_TAB_LOG", false), health: mc_health.health_new(), hudp: mc_hud_play.hp_new(), icons: mc_item_icon.icons_new(), iui: mc_inv_ui.iui_new(), idrag: mc_inv_drag.idrag_new(), cui: mc_cont_ui.cui_new(), cr: mc_creative.cr_new(), crui: mc_creative_ui.crui_new(), cr_sdrag: false, cr_logged: false, shot_req: false, shot_armed: false, shot_n: 0, kb: load_keybinds(), weather: mc_weather.weather_new(), precip: mc_precip.precip_new(), lightning: mc_lightning.lightning_new(), splash: mc_splash.splash_new(), snowfall: mc_snowfall.snowfall_new(), snow_log_s: 0 as u64, wsnd: mc_weather_snd.wsnd_new(9001 as i64), combat: mc_combat.combat_new(), cfx: mc_combat_fx.cfx_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), hud_sig: 0, cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, tab_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, death_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, sprint_sent: false, input_sent: 0 as u32, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
