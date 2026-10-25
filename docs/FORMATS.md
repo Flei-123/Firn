@@ -12,7 +12,7 @@ worktrees (`/root/certus-*`, branch names in the last column). Tempo only where 
 | WebP | lossy VP8, lossless VP8L, ALPH, animation | yes | no | - | 991 files octet-identical to libwebp via Pillow, 40 muxed animations | Firn `lib/webp/webp.fi`; Certus `lib/paint/webp.fi` |
 | GIF | 87a / 89a, animation | yes | no | - | compared with Pillow, browser rules where they differ | Firn `lib/gif/gif.fi` |
 | AVIF | HEIF container, AV1 intra frame: 4:2:0 / mono, alpha, sb128, tiles, delta_q / delta_lf, qmatrix, palette, intrabc, irot / imir, deblock, CDEF, loop restoration | yes (still pictures, intra only) | no | - | bit-exact fixtures (`avif_420`, `sb128`, ...); `image/avif` Accept is default off (`--avif=1`) | Certus `lib/paint/avif*.fi`, `av1*.fi` (`w-r1720avif`) |
-| JPEG XL | none yet | planned: `lib/jxl` (this task) | no | - | - | Firn `lib/jxl` |
+| JPEG XL | header only (jxl_bits, jxl_container, jxl_header, jxl.jxl_info) | planned: Modular lossless, VarDCT | no | - | - | Firn `lib/jxl` (entropy modules on branch staff/firn-mvo7ma20, untested) |
 | HEIC / HEIF (HEVC) | none | no | no | - | - | - |
 | BMP, ICO, TGA, TIFF | none (ICO / ICNS are only written by `pack.icons`) | no | partly | - | - | - |
 
