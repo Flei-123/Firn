@@ -75,7 +75,7 @@ pub fn classify(ty: &Type, tcx: &TypeCtx) -> ArgClass {
             if size == 0 {
                 return ArgClass::ints(0);
             }
-            if size > MAX_INTEGER_AGGREGATE {
+            if size > MAX_INTEGER_AGGREGATE || crate::layout_attrs::has_unaligned_field(ty, tcx, 0) {
                 return ArgClass::Memory;
             }
             let n = ((size + 7) / 8) as u8;

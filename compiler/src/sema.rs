@@ -554,7 +554,11 @@ impl<'a> Checker<'a> {
                 idx_of.push(self.tcx.lookup(&s.name).unwrap_or(0));
                 continue;
             }
-            idx_of.push(self.tcx.declare(&s.name));
+            let idx = self.tcx.declare(&s.name);
+            let la = crate::layout_attrs::read(s, self.dg);
+            self.tcx.structs[idx].packed = la.packed;
+            self.tcx.structs[idx].min_align = la.min_align;
+            idx_of.push(idx);
         }
 
         // 2. resolve the field types

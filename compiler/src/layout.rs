@@ -35,6 +35,16 @@ use crate::fir::{BinOp as FBin, FTy, Op, Val};
 use crate::lower::Lower;
 
 impl Lower<'_> {
+    pub(crate) fn overaligned_slot(&mut self, size: u64, align: u64) -> Val {
+        let raw = self.frame_alloca(size + align, crate::layout_attrs::FRAME_ALIGN);
+        let addr = self.push(FTy::U64, Op::Cast { src: raw, from: FTy::Ptr });
+        let zero = self.constant(FTy::U64, 0);
+        let mask = self.constant(FTy::U64, (align - 1) as i128);
+        let neg = self.push(FTy::U64, Op::Bin(FBin::Sub, zero, addr));
+        let pad = self.push(FTy::U64, Op::Bin(FBin::And, neg, mask));
+        self.push(FTy::Ptr, Op::PtrAdd { base: raw, off: pad })
+    }
+
     /// Address of field `fname` of structure `sidx`, whose value sits at
     /// `base`.
     ///

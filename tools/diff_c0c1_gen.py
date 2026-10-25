@@ -194,23 +194,54 @@ for n in range(30):
     body += "    let base: u64 = (&s.f0) as u64\n"
     for i in range(1, nf):
         body += "    putu((&s.f%d) as u64 - base)\n" % i
-    body += "    putu(size_of[S]())\n"
+    body += "    putu(size_of[S]() as u64)\n"
     body += "    var arr: [S; 2] = [s, s]\n"
     body += "    putu((&arr[1].f0) as u64 - (&arr[0].f0) as u64)\n"
     if nested:
         body += "    var w: W = W { p: 1, s: s, q: 2, }\n"
         body += "    let wb: u64 = (&w.p) as u64\n"
-        body += "    putu((&w.s.f0) as u64 - wb)\n    putu((&w.q) as u64 - wb)\n    putu(size_of[W]())\n"
+        body += "    putu((&w.s.f0) as u64 - wb)\n    putu((&w.q) as u64 - wb)\n    putu(size_of[W]() as u64)\n"
     body += "    return 0\n}\n"
     emit("layout_%02d" % n, "run", "same", body)
 
 for t in ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "bool"]:
     emit("layout_sizeof_%s" % t, "run", "same",
          "struct A { a: %s }\nstruct B { a: %s, b: %s }\nstruct C { a: u8, b: %s }\nstruct D { a: %s, b: u8 }\n"
-         "fn main() -> i32 {\n    putu(size_of[%s]())\n    putu(size_of[A]())\n    putu(size_of[B]())\n"
-         "    putu(size_of[C]())\n    putu(size_of[D]())\n    return 0\n}\n" % (t, t, t, t, t, t))
-for attr in ("packed", "align(16)"):
-    emit("layout_attr_%s" % attr.split("(")[0], "neg", "", "#[%s]\nstruct S { a: u8, b: u32 }\nfn main() -> i32 {\n    return 0\n}\n" % attr)
+         "fn main() -> i32 {\n    putu(size_of[%s]() as u64)\n    putu(size_of[A]() as u64)\n    putu(size_of[B]() as u64)\n"
+         "    putu(size_of[C]() as u64)\n    putu(size_of[D]() as u64)\n    return 0\n}\n" % (t, t, t, t, t, t))
+emit("layout_attr_packed", "run", "same",
+     "#[packed]\nstruct P {\n    a: u8,\n    b: u32,\n    c: u16,\n    d: u64,\n}\n"
+     "#[packed]\nstruct Q {\n    a: u8,\n    f: f64,\n    g: f32,\n}\n"
+     "struct W {\n    x: u8,\n    p: P,\n    y: u8,\n}\n"
+     "fn total(p: P) -> u64 {\n    return (p.a as u64) + (p.b as u64) + (p.c as u64) + p.d\n}\n"
+     "fn main() -> i32 {\n    var p: P = P { a: 1, b: 2, c: 3, d: 4 }\n    let base: u64 = (&p.a) as u64\n"
+     "    putu(size_of[P]() as u64)\n    putu(size_of[Q]() as u64)\n    putu(size_of[W]() as u64)\n"
+     "    putu((&p.b) as u64 - base)\n    putu((&p.c) as u64 - base)\n    putu((&p.d) as u64 - base)\n"
+     "    p.b = 0x01020304\n    p.d = 0x0102030405060708\n    p.c = 0xABCD\n"
+     "    putu(p.a as u64)\n    putu(p.b as u64)\n    putu(p.c as u64)\n    putu(p.d)\n"
+     "    var arr: [P; 2] = [p, p]\n    arr[1].d = 99\n"
+     "    putu((&arr[1].a) as u64 - (&arr[0].a) as u64)\n    putu(arr[0].d)\n    putu(arr[1].d)\n"
+     "    putu(total(p))\n"
+     "    var q: Q = Q { a: 7, f: 2.5, g: 4.0 }\n    q.f = 1.5\n"
+     "    putu(q.a as u64)\n    putu((q.f * 2.0) as u64)\n    putu((q.g * 2.0) as u64)\n"
+     "    var w: W = W { x: 5, p: p, y: 6 }\n    let wb: u64 = (&w.x) as u64\n"
+     "    putu((&w.p) as u64 - wb)\n    putu((&w.y) as u64 - wb)\n    putu(w.p.d)\n    return 0\n}\n")
+emit("layout_attr_align", "run", "same",
+     "#[align(16)]\nstruct A {\n    a: u8,\n}\n"
+     "#[align(64)]\nstruct B {\n    a: u8,\n    b: u32,\n}\n"
+     "#[packed]\n#[align(8)]\nstruct D {\n    a: u8,\n    b: u32,\n}\n"
+     "struct W {\n    x: u8,\n    b: B,\n    y: u8,\n}\n"
+     "fn first(b: B) -> u8 {\n    return b.a\n}\n"
+     "fn main() -> i32 {\n    putu(size_of[A]() as u64)\n    putu(size_of[B]() as u64)\n    putu(size_of[D]() as u64)\n    putu(size_of[W]() as u64)\n"
+     "    var b: B = B { a: 9, b: 8 }\n    putu((&b) as u64 % 64)\n"
+     "    var arr: [B; 3] = [b, b, b]\n    putu((&arr[0]) as u64 % 64)\n    putu((&arr[2]) as u64 % 64)\n"
+     "    putu((&arr[2]) as u64 - (&arr[0]) as u64)\n"
+     "    var w: W = W { x: 1, b: b, y: 2 }\n    putu((&w) as u64 % 64)\n    putu((&w.b) as u64 - (&w) as u64)\n"
+     "    putu((&w.y) as u64 - (&w) as u64)\n    putu(first(b) as u64)\n"
+     "    var d: D = D { a: 1, b: 2 }\n    putu((&d.b) as u64 - (&d.a) as u64)\n    putu(d.b as u64)\n    return 0\n}\n")
+for bad in ("3", "0", "8192"):
+    emit("layout_attr_align_bad_%s" % bad, "neg", "",
+         "#[align(%s)]\nstruct S { a: u8, b: u32 }\nfn main() -> i32 {\n    return 0\n}\n" % bad)
 
 # ---------------------------------------------------------------- ABI
 def abi_args(n):

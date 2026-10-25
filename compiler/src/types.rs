@@ -132,6 +132,8 @@ pub struct StructDef {
     /// `#[must_consume]` (attrs.rs): a value of this type must not be
     /// discarded silently.
     pub must_consume: bool,
+    pub packed: bool,
+    pub min_align: u64,
 }
 
 impl StructDef {
@@ -165,6 +167,8 @@ impl TypeCtx {
             size: 0,
             align: 1,
             must_consume: false,
+            packed: false,
+            min_align: 1,
         });
         self.by_name.insert(name.to_string(), idx);
         idx
@@ -172,11 +176,12 @@ impl TypeCtx {
 
     /// Computes offsets/size/alignment from (name, type) pairs.
     pub fn set_fields(&mut self, idx: usize, fields: Vec<(String, Type)>) {
+        let packed = self.structs[idx].packed;
         let mut off: u64 = 0;
-        let mut max_align: u64 = 1;
+        let mut max_align: u64 = self.structs[idx].min_align.max(1);
         let mut out = Vec::new();
         for (name, ty) in fields {
-            let a = self.align_of(&ty).max(1);
+            let a = if packed { 1 } else { self.align_of(&ty).max(1) };
             let s = self.size_of(&ty);
             if a > max_align {
                 max_align = a;

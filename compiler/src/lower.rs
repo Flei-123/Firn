@@ -326,6 +326,13 @@ impl<'a> Lower<'a> {
     /// claim the line of whatever statement happened to need a slot, and a
     /// breakpoint on that line would stop in the prologue.
     pub(crate) fn alloca(&mut self, size: u64, align: u64) -> Val {
+        if align > crate::layout_attrs::FRAME_ALIGN {
+            return self.overaligned_slot(size, align);
+        }
+        self.frame_alloca(size, align)
+    }
+
+    pub(crate) fn frame_alloca(&mut self, size: u64, align: u64) -> Val {
         let keep = self.f.loc_stamp;
         self.f.loc_stamp = crate::fir::Loc::NONE;
         let v = self.f.alloca(size, align);

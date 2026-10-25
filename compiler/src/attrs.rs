@@ -180,14 +180,14 @@ pub const ATTRS: &[AttrInfo] = &[
         name: "packed",
         target: Target::Type,
         args: 0,
-        implemented: false,
+        implemented: true,
         what: "arrange fields without padding bytes (SPEC 13)",
     },
     AttrInfo {
         name: "align",
         target: Target::Type,
         args: 1,
-        implemented: false,
+        implemented: true,
         what: "force alignment, e.g. #[align(64)] (SPEC 13)",
     },
     AttrInfo {
@@ -342,7 +342,9 @@ mod tests {
                 "no_inline",
                 "allow_escape",
                 "panic_handler",
-                "allow_fp"
+                "allow_fp",
+                "packed",
+                "align"
             ]
         );
     }
@@ -351,7 +353,7 @@ mod tests {
     fn not_implemented_attribute_report_next_a_error() {
         // Counter-check to tests/neg/attr_not_implemented.fi: the remaining
         // attributes stay rejected, nothing is silently ignored.
-        for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
+        for name in ["constant_time", "unwinds", "layout", "no_move", "hot"] {
             let a = search(name).expect(name);
             assert!(!a.implemented, "{} unexpectedly counts as implemented", name);
         }
