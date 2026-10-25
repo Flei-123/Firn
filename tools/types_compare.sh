@@ -33,6 +33,7 @@ same=0
 different=0
 noncore=0
 skipped=0
+invalid=0
 with_structs=0
 first=""
 
@@ -55,6 +56,8 @@ while IFS= read -r f; do
     grep -q '^  (struct' "$TMPD"/typv_a.txt && with_structs=$((with_structs+1))
     if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/typv_a.txt "$TMPD"/typv_b.txt; then
         same=$((same+1))
+    elif head -n 3 "$f" | grep -q '^// diff: neg'; then
+        invalid=$((invalid+1))
     else
         different=$((different+1))
         [ -z "$first" ] && first="$f (rc=$rc)"
@@ -66,6 +69,7 @@ echo "DIFFERENT:     $different"
 echo "WITH STRUCTS:  $with_structs  (a real layout is at stake there)"
 echo "NOT CORE:      $noncore"
 echo "SKIPPED:       $skipped"
+echo "INVALID:       $invalid  (declared negative and layouts differ: the layout of a rejected program is undefined)"
 if [ -n "$first" ]; then
     echo "first deviation: $first"
     ff=${first%% *}

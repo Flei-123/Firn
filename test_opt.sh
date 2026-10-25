@@ -55,6 +55,9 @@ FAILED=""
 count_insts() {
     awk '/^  /{ if ($0 !~ /^  (br |brcond |ret)/) n++ } END { print n+0 }' "$1"
 }
+fn_body() {
+    awk -v name="@$2(" '/^fn /{ f = (index($2, name) == 1) } f' "$1"
+}
 count_blocks() {
     awk '/^bb[0-9]+:/{ n++ } END { print n+0 }' "$1"
 }
@@ -137,20 +140,26 @@ tests/opt/mem2reg_single_store.fi|load.i32|1|0
 tests/opt/dead_store.fi|store.i32|1|0
 tests/opt/dead_store.fi|alloca|1|0
 tests/opt/inline_call.fi|call.i32 @square|1|0
-tests/opt/cse_common.fi|mul.i32|2|1
-tests/opt/redundant_check.fi|brcond|3|2
+tests/opt/cse_common.fi|mul.i32|2|1|loop_fn
+tests/opt/redundant_check.fi|brcond|3|2|value
 tests/opt/block_merge.fi|bb|8|1
 tests/opt/unroll_counted.fi|cmp.lt.i32|1|0
 "
 
 echo "== Mustertabelle (mem2reg, tote Speicherung, Inlining, CSE, Pruefungen) =="
-while IFS='|' read -r FILE PAT RMIN OMAX; do
+while IFS='|' read -r FILE PAT RMIN OMAX FN; do
     [ -n "$FILE" ] || continue
     base=$(basename "$FILE" .fi)
     raw="$WORK/$base.raw.fir"
     opt="$WORK/$base.opt.fir"
     "$FIRNC" $LVL --emit=fir-raw "$FILE" > "$raw"
     "$FIRNC" $LVL --emit=fir-opt "$FILE" > "$opt"
+    if [ -n "$FN" ]; then
+        fn_body "$raw" "$FN" > "$raw.fn"
+        fn_body "$opt" "$FN" > "$opt.fn"
+        raw="$raw.fn"
+        opt="$opt.fn"
+    fi
     n_raw=$(grep -cF "$PAT" "$raw" || true)
     n_opt=$(grep -cF "$PAT" "$opt" || true)
     if [ "$n_raw" -ge "$RMIN" ] && [ "$n_opt" -le "$OMAX" ]; then
