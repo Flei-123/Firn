@@ -149,8 +149,7 @@ fn t_unite(a: Taint, o: Taint) -> Taint {
 const MK: usize = 6
 
 struct Snap {
-    start: usize,
-    words: usize,
+    id: usize,
 }
 
 struct Esc {
@@ -175,7 +174,9 @@ struct Esc {
     // --- the marks: place path -> taint, insertion ordered
     pcomp: Vec[u32], // the components of every path, one after another
     marks: Vec[u64], // MK words per mark: off, len, mask, lname, ldecl, ltake
-    snaps: Vec[u64], // stack of saved `marks` copies
+    snaps: Vec[u64], // arena of saved `marks` copies
+    srec: Vec[u64], // snapshot records: start, words, owner -- a stack
+    lazy_at: usize, // records from here up are still equal to `marks`
     // scratch for the path currently being built
     pbuf: Vec[u32],
 
@@ -493,6 +494,7 @@ fn write_local(e: *mut Esc, off: u32, len: u32, t: Taint) {
 // Remove mark `i`, keeping the ORDER of the rest -- the order is part of the
 // agreement with the Rust twin.
 fn mark_remove(e: *mut Esc, i: usize) {
+    cow(e)
     let n: usize = (*e).marks.len
     let base: u64 = (*e).marks.ptr
     let from: usize = (i + 1) * MK
@@ -534,6 +536,7 @@ fn m_taint(e: *mut Esc, i: usize) -> Taint {
 }
 
 fn m_set_taint(e: *mut Esc, i: usize, t: Taint) {
+    cow(e)
     let q: u64 = (*e).marks.ptr + ((i * MK) as u64) * 8
     wr_word(q + 16, t.mask)
     wr_word(q + 24, t.lname as u64)
@@ -542,6 +545,7 @@ fn m_set_taint(e: *mut Esc, i: usize, t: Taint) {
 }
 
 fn m_push(e: *mut Esc, off: u32, len: u32, t: Taint) {
+    cow(e)
     vec_push[u64](&(*e).marks, off as u64)
     vec_push[u64](&(*e).marks, len as u64)
     vec_push[u64](&(*e).marks, t.mask)
@@ -1216,6 +1220,22 @@ fn walk_match_cases(e: *mut Esc, name: u32) {
 // ------------------------------------------------------------- snapshots
 
 fn snap_take(e: *mut Esc) -> Snap {
+    let id: usize = (*e).srec.len / 3
+    vec_push[u64](&(*e).srec, 0)
+    vec_push[u64](&(*e).srec, 0)
+    vec_push[u64](&(*e).srec, 0)
+    return Snap { id: id }
+}
+
+#[inline]
+fn cow(e: *mut Esc) {
+    if (*e).lazy_at * 3 < (*e).srec.len {
+        cow_run(e)
+    }
+}
+
+#[no_inline]
+fn cow_run(e: *mut Esc) {
     let words: usize = (*e).marks.len
     let start: usize = (*e).snaps.len
     if words > 0 {
@@ -1223,18 +1243,35 @@ fn snap_take(e: *mut Esc) -> Snap {
         rt.mem_copy((*e).snaps.ptr + (start as u64) * 8, (*e).marks.ptr, words * 8)
         (*e).snaps.len = start + words
     }
-    return Snap { start: start, words: words }
+    var r: usize = (*e).lazy_at * 3
+    var owner: u64 = 1
+    while r < (*e).srec.len {
+        vec_set[u64](&(*e).srec, r, start as u64)
+        vec_set[u64](&(*e).srec, r + 1, words as u64)
+        vec_set[u64](&(*e).srec, r + 2, owner)
+        owner = 0
+        r = r + 3
+    }
+    (*e).lazy_at = (*e).srec.len / 3
 }
 
 fn marks_clear(e: *mut Esc) {
     vec_clear[u64](&(*e).marks)
+    vec_clear[u64](&(*e).snaps)
+    vec_clear[u64](&(*e).srec)
+    (*e).lazy_at = 0
 }
 
 fn snap_put(e: *mut Esc, s: *mut Snap) {
-    let words: usize = (*s).words
+    if (*s).id >= (*e).lazy_at {
+        return
+    }
+    cow(e)
+    let words: usize = vec_at[u64](&(*e).srec, (*s).id * 3 + 1) as usize
+    let start: usize = vec_at[u64](&(*e).srec, (*s).id * 3) as usize
     if words > 0 {
         vec_reserve[u64](&(*e).marks, words)
-        rt.mem_copy((*e).marks.ptr, (*e).snaps.ptr + ((*s).start as u64) * 8, words * 8)
+        rt.mem_copy((*e).marks.ptr, (*e).snaps.ptr + (start as u64) * 8, words * 8)
     }
     (*e).marks.len = words
 }
@@ -1243,15 +1280,21 @@ fn snap_put(e: *mut Esc, s: *mut Snap) {
 // the state that was there BEFORE, so its entries come first; the Rust twin
 // merges in the same direction.
 fn snap_merge(e: *mut Esc, s: *mut Snap) {
-    let words: usize = (*s).words
-    let sb: u64 = (*e).snaps.ptr + ((*s).start as u64) * 8
+    if (*s).id >= (*e).lazy_at {
+        return
+    }
+    let words: usize = vec_at[u64](&(*e).srec, (*s).id * 3 + 1) as usize
+    let start: usize = vec_at[u64](&(*e).srec, (*s).id * 3) as usize
+    let sb: u64 = (*e).snaps.ptr + (start as u64) * 8
     if words <= (*e).marks.len && rt.mem_eq(sb, (*e).marks.ptr, words * 8) {
         return
     }
+    cow(e)
+    let sb2: u64 = (*e).snaps.ptr + (start as u64) * 8
     let count: usize = words / MK
     var i: usize = 0
     while i < count {
-        let q: u64 = sb + ((i * MK) as u64) * 8
+        let q: u64 = sb2 + ((i * MK) as u64) * 8
         let off: u32 = rd_word(q) as u32
         let len: u32 = rd_word(q + 8) as u32
         let o: Taint = Taint { mask: rd_word(q + 16),
@@ -1298,7 +1341,14 @@ fn same_path(e: *mut Esc, i: usize, off: u32, len: u32) -> bool {
 }
 
 fn snap_free(e: *mut Esc, s: *mut Snap) {
-    (*e).snaps.len = (*s).start
+    let id: usize = (*s).id
+    if id < (*e).lazy_at && vec_at[u64](&(*e).srec, id * 3 + 2) != 0 {
+        (*e).snaps.len = vec_at[u64](&(*e).srec, id * 3) as usize
+    }
+    (*e).srec.len = id * 3
+    if (*e).lazy_at > id {
+        (*e).lazy_at = id
+    }
 }
 
 // ------------------------------------------------------------ the messages
@@ -1428,7 +1478,7 @@ fn esc_empty() -> Esc {
         sum_off: vec_new[u32](), sum: vec_new[u64](),
         who: NOTHING, fend: 0, np: 0, poff: 0, found: vec_new[u64](),
         lname: vec_new[u32](), ldecl: vec_new[u64](), lidx: vec_new[u32](),
-        pcomp: vec_new[u32](), marks: vec_new[u64](), snaps: vec_new[u64](),
+        pcomp: vec_new[u32](), marks: vec_new[u64](), snaps: vec_new[u64](), srec: vec_new[u64](), lazy_at: 0,
         pbuf: vec_new[u32](),
         f_pos: vec_new[u64](), f_lname: vec_new[u32](),
         f_ldecl: vec_new[u64](), f_ltake: vec_new[u64](),
@@ -1448,6 +1498,7 @@ fn esc_free(e: *mut Esc) {
     vec_free[u32](&(*e).pcomp)
     vec_free[u64](&(*e).marks)
     vec_free[u64](&(*e).snaps)
+    vec_free[u64](&(*e).srec)
     vec_free[u32](&(*e).pbuf)
     vec_free[u64](&(*e).f_pos)
     vec_free[u32](&(*e).f_lname)
