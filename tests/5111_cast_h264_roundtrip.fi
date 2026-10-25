@@ -1,0 +1,120 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.h264enc
+import cast.h264dec
+import cast.nal
+import cast.yuv
+
+const W: usize = 100
+const H: usize = 62
+
+fn paint(pix: u64, frame: usize, box_x: usize) {
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            let o: usize = (y * W + x) * 4
+            var r: u8 = ((x * 255) / W) as u8
+            var g: u8 = ((y * 255) / H) as u8
+            var b: u8 = 40 as u8
+            if x >= box_x && x < box_x + 20 && y >= 10 && y < 30 {
+                r = 250 as u8
+                g = (frame * 20) as u8
+                b = 10 as u8
+            }
+            rt.st8(pix, o, b)
+            rt.st8(pix, o + 1, g)
+            rt.st8(pix, o + 2, r)
+            rt.st8(pix, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn planes_equal(a: *mut yuv.Yuv, b: *mut yuv.Yuv) -> bool {
+    if !rt.mem_eq((*a).y.ptr, (*b).y.ptr, (*a).w * (*a).h) { return false }
+    if !rt.mem_eq((*a).u.ptr, (*b).u.ptr, (*a).cw * (*a).ch) { return false }
+    return rt.mem_eq((*a).v.ptr, (*b).v.ptr, (*a).cw * (*a).ch)
+}
+
+fn main() -> i32 {
+    var pix: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&pix, W * H * 4)
+    rt.buf_set_len(&pix, W * H * 4)
+    var e: h264enc.Enc = h264enc.enc_new(W, H, 30 as u32)
+    var d: h264dec.Dec = h264dec.dec_new()
+    var au: rt.Buf = rt.buf_new()
+
+    paint(pix.ptr, 0, 10)
+    let idr0: bool = h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+    if !idr0 { return 1 }
+    let idr_len: usize = au.len
+    if h264dec.dec_annexb(&d, au.ptr, au.len) != h264dec.DEC_OK { return 2 }
+    if !h264dec.dec_ready(&d) { return 3 }
+    if h264dec.dec_width(&d) != W || h264dec.dec_height(&d) != H { return 4 }
+    if !planes_equal(h264dec.dec_frame(&d), &e.prev) { return 5 }
+    if h264enc.enc_last_changed(&e) != 7 * 4 { return 6 }
+
+    paint(pix.ptr, 1, 10)
+    let idr1: bool = h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+    if idr1 { return 10 }
+    if h264enc.enc_last_changed(&e) != 2 * 2 { return 11 }
+    if au.len > idr_len / 3 { return 12 }
+    if h264dec.dec_annexb(&d, au.ptr, au.len) != h264dec.DEC_OK { return 13 }
+    if !planes_equal(h264dec.dec_frame(&d), &e.prev) { return 14 }
+
+    paint(pix.ptr, 1, 10)
+    h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+    if h264enc.enc_last_changed(&e) != 0 { return 20 }
+    if h264dec.dec_annexb(&d, au.ptr, au.len) != h264dec.DEC_OK { return 21 }
+    if !planes_equal(h264dec.dec_frame(&d), &e.prev) { return 22 }
+
+    var f: usize = 2
+    while f < 9 {
+        paint(pix.ptr, f, 10 + f * 7)
+        h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+        if h264dec.dec_annexb(&d, au.ptr, au.len) != h264dec.DEC_OK { return 30 }
+        if !planes_equal(h264dec.dec_frame(&d), &e.prev) { return 31 }
+        f = f + 1
+    }
+
+    h264enc.enc_request_idr(&e)
+    if !h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au) { return 40 }
+    if h264dec.dec_annexb(&d, au.ptr, au.len) != h264dec.DEC_OK { return 41 }
+    if !planes_equal(h264dec.dec_frame(&d), &e.prev) { return 42 }
+    if h264dec.dec_pictures(&d) != 11 as u64 { return 43 }
+
+    var rgb: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&rgb, W * H * 4)
+    rt.buf_set_len(&rgb, W * H * 4)
+    h264dec.dec_to_rgb(&d, rgb.ptr, W * 4, yuv.PF_BGRA)
+    var worst: i32 = 0
+    var i: usize = 0
+    while i < W * H * 4 {
+        var df: i32 = rt.ld8(rgb.ptr, i) as i32 - rt.ld8(pix.ptr, i) as i32
+        if df < 0 { df = -df }
+        if i % 4 != 3 && df > worst { worst = df }
+        i = i + 1
+    }
+    if worst > 12 { return 50 }
+
+    var bad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&bad, au.ptr, 20)
+    h264dec.dec_annexb(&d, bad.ptr, bad.len)
+    var junk: h264dec.Dec = h264dec.dec_new()
+    var sl: rt.Buf = rt.buf_new()
+    nal.nal_write(&sl, 2 as u32, 1 as u32, pix.ptr, 30)
+    if h264dec.dec_annexb(&junk, sl.ptr, sl.len) == h264dec.DEC_OK { return 60 }
+
+    h264enc.enc_free(&e)
+    h264dec.dec_free(&d)
+    h264dec.dec_free(&junk)
+    rt.buf_free(&pix)
+    rt.buf_free(&au)
+    rt.buf_free(&rgb)
+    rt.buf_free(&bad)
+    rt.buf_free(&sl)
+    return 0
+}

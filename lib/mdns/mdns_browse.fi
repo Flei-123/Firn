@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mdns.mdns_wire
+import mdns.mdns_cache
+
+export {
+    Found, FOUND_SRV, FOUND_TXT, FOUND_A, FOUND_AAAA, found_new,
+    browse_query, browse_known, browse_ingest, browse_resolve,
+}
+
+const FOUND_SRV: u32 = 1
+const FOUND_TXT: u32 = 2
+const FOUND_A: u32 = 4
+const FOUND_AAAA: u32 = 8
+
+struct Found {
+    host: [u8; 256],
+    hlen: usize,
+    port: u32,
+    prio: u32,
+    weight: u32,
+    txt: [u8; 1024],
+    tlen: usize,
+    a4: u32,
+    a6: [u8; 16],
+}
+
+fn found_new() -> Found {
+    return Found { host: [0; 256], hlen: 0, port: 0 as u32, prio: 0 as u32, weight: 0 as u32,
+        txt: [0; 1024], tlen: 0, a4: 0 as u32, a6: [0; 16] }
+}
+
+fn browse_known(pk: *mut mdns_wire.Pk, c: *mut mdns_cache.Cache, name: u64, nlen: usize,
+    typ: u32, now: u64) {
+    var i: usize = mdns_cache.cache_find(c, name, nlen, typ, 0, now)
+    while i != mdns_cache.NONE {
+        let rem: u32 = mdns_cache.cache_remaining(c, i, now)
+        if rem * 2 as u32 > mdns_cache.cache_ttl(c, i) {
+            mdns_wire.pk_rr(pk, 1 as u32, mdns_cache.cache_name(c, i), mdns_cache.cache_nlen(c, i),
+                mdns_cache.cache_typ(c, i), false, rem, mdns_cache.cache_data(c, i),
+                mdns_cache.cache_dlen(c, i))
+        }
+        i = mdns_cache.cache_find(c, name, nlen, typ, i + 1, now)
+    }
+}
+
+fn browse_query(pk: *mut mdns_wire.Pk, name: u64, nlen: usize, typ: u32, unicast: bool,
+    c: *mut mdns_cache.Cache, now: u64) {
+    mdns_wire.pk_q(pk, name, nlen, typ, unicast)
+    browse_known(pk, c, name, nlen, typ, now)
+}
+
+fn stored_type(t: u32) -> bool {
+    return t == mdns_wire.T_PTR || t == mdns_wire.T_SRV || t == mdns_wire.T_TXT
+        || t == mdns_wire.T_A || t == mdns_wire.T_AAAA
+}
+
+fn browse_ingest(c: *mut mdns_cache.Cache, msg: u64, n: usize, now: u64) -> u32 {
+    var h: mdns_wire.Hdr = mdns_wire.hdr_new()
+    if !mdns_wire.hdr_read(msg, n, &h) || (h.flags & mdns_wire.FLAG_QR) == 0 as u32 {
+        return 0 as u32
+    }
+    var off: usize = 12
+    var q: mdns_wire.Qn = mdns_wire.qn_new()
+    var k: u32 = 0
+    while k < h.qd {
+        let nx: usize = mdns_wire.q_read(msg, n, off, &q)
+        if nx == 0 {
+            return 0 as u32
+        }
+        off = nx
+        k = k + 1 as u32
+    }
+    var rr: mdns_wire.Rr = mdns_wire.rr_new()
+    var stored: u32 = 0
+    let total: u32 = h.an + h.ns + h.ar
+    k = 0
+    while k < total {
+        let nx: usize = mdns_wire.rr_read(msg, n, off, &rr)
+        if nx == 0 {
+            return stored
+        }
+        off = nx
+        k = k + 1 as u32
+        if rr.ok && rr.class == mdns_wire.CLASS_IN && stored_type(rr.typ) {
+            let r: u32 = mdns_cache.cache_put(c, (&rr.name[0]) as u64, rr.nlen, rr.typ, rr.class, rr.ttl,
+                (&rr.data[0]) as u64, rr.dlen, rr.flush, now)
+            if r == 1 as u32 {
+                stored = stored + 1 as u32
+            }
+        }
+    }
+    return stored
+}
+
+fn browse_resolve(c: *mut mdns_cache.Cache, inst: u64, ilen: usize, now: u64, f: *mut Found) -> u32 {
+    var got: u32 = 0
+    let s: usize = mdns_cache.cache_find(c, inst, ilen, mdns_wire.T_SRV, 0, now)
+    if s != mdns_cache.NONE && mdns_cache.cache_dlen(c, s) > 6 {
+        let d: u64 = mdns_cache.cache_data(c, s)
+        (*f).prio = mdns_wire.be16(d, 0)
+        (*f).weight = mdns_wire.be16(d, 2)
+        (*f).port = mdns_wire.be16(d, 4)
+        (*f).hlen = mdns_cache.cache_dlen(c, s) - 6
+        rt.mem_copy((&(*f).host[0]) as u64, d + 6 as u64, (*f).hlen)
+        got = got | FOUND_SRV
+    }
+    let t: usize = mdns_cache.cache_find(c, inst, ilen, mdns_wire.T_TXT, 0, now)
+    if t != mdns_cache.NONE {
+        (*f).tlen = mdns_cache.cache_dlen(c, t)
+        rt.mem_copy((&(*f).txt[0]) as u64, mdns_cache.cache_data(c, t), (*f).tlen)
+        got = got | FOUND_TXT
+    }
+    if (got & FOUND_SRV) != 0 as u32 {
+        let hp: u64 = (&(*f).host[0]) as u64
+        let a: usize = mdns_cache.cache_find(c, hp, (*f).hlen, mdns_wire.T_A, 0, now)
+        if a != mdns_cache.NONE && mdns_cache.cache_dlen(c, a) == 4 {
+            (*f).a4 = mdns_wire.be32(mdns_cache.cache_data(c, a), 0)
+            got = got | FOUND_A
+        }
+        let b: usize = mdns_cache.cache_find(c, hp, (*f).hlen, mdns_wire.T_AAAA, 0, now)
+        if b != mdns_cache.NONE && mdns_cache.cache_dlen(c, b) == 16 {
+            rt.mem_copy((&(*f).a6[0]) as u64, mdns_cache.cache_data(c, b), 16)
+            got = got | FOUND_AAAA
+        }
+    }
+    return got
+}

@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import bluetooth.bt_le
+import bluetooth.bt_uuid
+import bluetooth.bt_att
+
+export {
+    GattClient, client_new, client_free, client_start, client_request,
+    client_response, client_count, client_kind, client_handle, client_aux,
+    client_props, client_uuid, client_find_char,
+    KIND_SERVICE, KIND_CHARACTERISTIC, KIND_DESCRIPTOR,
+    RESP_CONTINUE, RESP_DONE, RESP_ERROR,
+}
+
+const KIND_SERVICE: u32 = 1
+const KIND_CHARACTERISTIC: u32 = 2
+const KIND_DESCRIPTOR: u32 = 3
+
+const RESP_CONTINUE: i32 = 0
+const RESP_DONE: i32 = 1
+const RESP_ERROR: i32 = 0 - 1
+
+const STAGE_IDLE: u32 = 0
+const STAGE_SERVICES: u32 = 1
+const STAGE_CHARS: u32 = 2
+const STAGE_DESCS: u32 = 3
+const STAGE_DONE: u32 = 4
+
+const REC: usize = 32
+
+struct GattClient {
+    stage: u32,
+    cursor: u32,
+    index: usize,
+    mtu: u32,
+    recs: rt.Buf,
+    count: usize,
+}
+
+fn client_new() -> GattClient {
+    return GattClient { stage: STAGE_IDLE, cursor: 1, index: 0, mtu: bt_att.ATT_DEFAULT_MTU, recs: rt.buf_new(), count: 0 }
+}
+
+fn client_free(c: *mut GattClient) {
+    rt.buf_free(&(*c).recs)
+}
+
+fn client_start(c: *mut GattClient) {
+    rt.buf_clear(&(*c).recs)
+    (*c).count = 0
+    (*c).stage = STAGE_SERVICES
+    (*c).cursor = 1
+    (*c).index = 0
+}
+
+fn rec(c: *mut GattClient, i: usize) -> u64 {
+    return rt.buf_ptr(&(*c).recs) + (i * REC) as u64
+}
+
+fn client_count(c: *mut GattClient) -> usize {
+    return (*c).count
+}
+
+fn client_kind(c: *mut GattClient, i: usize) -> u32 {
+    return bt_le.le_get16(rec(c, i), 0)
+}
+
+fn client_handle(c: *mut GattClient, i: usize) -> u32 {
+    return bt_le.le_get16(rec(c, i), 2)
+}
+
+fn client_aux(c: *mut GattClient, i: usize) -> u32 {
+    return bt_le.le_get16(rec(c, i), 4)
+}
+
+fn client_props(c: *mut GattClient, i: usize) -> u32 {
+    return bt_le.le_get16(rec(c, i), 6)
+}
+
+fn client_uuid(c: *mut GattClient, i: usize) -> bt_uuid.Uuid {
+    return bt_uuid.Uuid { lo: bt_le.le_get64(rec(c, i), 8), hi: bt_le.le_get64(rec(c, i), 16) }
+}
+
+fn client_range_end(c: *mut GattClient, i: usize) -> u32 {
+    return bt_le.le_get16(rec(c, i), 24)
+}
+
+fn add_rec(c: *mut GattClient, kind: u32, handle: u32, aux: u32, props: u32, u: bt_uuid.Uuid, range_end: u32) {
+    bt_le.le_put16(&(*c).recs, kind)
+    bt_le.le_put16(&(*c).recs, handle)
+    bt_le.le_put16(&(*c).recs, aux)
+    bt_le.le_put16(&(*c).recs, props)
+    bt_uuid.uuid_put_full(&(*c).recs, u)
+    bt_le.le_put16(&(*c).recs, range_end)
+    bt_le.le_put_zero(&(*c).recs, 6)
+    (*c).count = (*c).count + 1
+}
+
+fn nth_of_kind(c: *mut GattClient, kind: u32, n: usize) -> usize {
+    var seen: usize = 0
+    var i: usize = 0
+    while i < (*c).count {
+        if client_kind(c, i) == kind {
+            if seen == n {
+                return i
+            }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return bt_le.NONE
+}
+
+fn client_find_char(c: *mut GattClient, u: bt_uuid.Uuid) -> usize {
+    var i: usize = 0
+    while i < (*c).count {
+        if client_kind(c, i) == KIND_CHARACTERISTIC && bt_uuid.uuid_eq(client_uuid(c, i), u) {
+            return i
+        }
+        i = i + 1
+    }
+    return bt_le.NONE
+}
+
+fn advance_stage(c: *mut GattClient) {
+    (*c).index = 0
+    if (*c).stage == STAGE_SERVICES {
+        (*c).stage = STAGE_CHARS
+        let s: usize = nth_of_kind(c, KIND_SERVICE, 0)
+        (*c).cursor = if s == bt_le.NONE { 1 } else { client_handle(c, s) }
+    } else if (*c).stage == STAGE_CHARS {
+        (*c).stage = STAGE_DESCS
+        let ch: usize = nth_of_kind(c, KIND_CHARACTERISTIC, 0)
+        (*c).cursor = if ch == bt_le.NONE { 1 } else { client_aux(c, ch) + 1 }
+    } else {
+        (*c).stage = STAGE_DONE
+    }
+}
+
+fn client_request(c: *mut GattClient, out: *mut rt.Buf) -> bool {
+    var guard: u32 = 0
+    while guard < 4096 {
+        guard = guard + 1
+        if (*c).stage == STAGE_SERVICES {
+            bt_att.att_read_by_group_type_req(out, (*c).cursor, 65535, bt_uuid.uuid16(bt_uuid.UUID_PRIMARY_SERVICE))
+            return true
+        }
+        if (*c).stage == STAGE_CHARS {
+            let s: usize = nth_of_kind(c, KIND_SERVICE, (*c).index)
+            if s == bt_le.NONE {
+                advance_stage(c)
+            } else if (*c).cursor > client_aux(c, s) {
+                (*c).index = (*c).index + 1
+                let nx: usize = nth_of_kind(c, KIND_SERVICE, (*c).index)
+                if nx != bt_le.NONE {
+                    (*c).cursor = client_handle(c, nx)
+                }
+            } else {
+                bt_att.att_read_by_type_req(out, (*c).cursor, client_aux(c, s), bt_uuid.uuid16(bt_uuid.UUID_CHARACTERISTIC))
+                return true
+            }
+        } else if (*c).stage == STAGE_DESCS {
+            let ch: usize = nth_of_kind(c, KIND_CHARACTERISTIC, (*c).index)
+            if ch == bt_le.NONE {
+                advance_stage(c)
+            } else if (*c).cursor > client_range_end(c, ch) {
+                (*c).index = (*c).index + 1
+                let nx: usize = nth_of_kind(c, KIND_CHARACTERISTIC, (*c).index)
+                if nx != bt_le.NONE {
+                    (*c).cursor = client_aux(c, nx) + 1
+                }
+            } else {
+                bt_att.att_find_info_req(out, (*c).cursor, client_range_end(c, ch))
+                return true
+            }
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
+fn fix_char_ranges(c: *mut GattClient) {
+    var i: usize = 0
+    while i < (*c).count {
+        if client_kind(c, i) == KIND_CHARACTERISTIC {
+            var end: u32 = 0
+            var k: usize = i + 1
+            if k < (*c).count && client_kind(c, k) == KIND_CHARACTERISTIC && client_range_of_service(c, k) == client_range_of_service(c, i) {
+                end = client_handle(c, k) - 1
+            } else {
+                end = client_range_of_service(c, i)
+            }
+            bt_le.le_patch16(&(*c).recs, i * REC + 24, end)
+        }
+        i = i + 1
+    }
+}
+
+fn client_range_of_service(c: *mut GattClient, ch: usize) -> u32 {
+    var s: usize = 0
+    var found: u32 = 0
+    while s < (*c).count {
+        if client_kind(c, s) == KIND_SERVICE && client_handle(c, s) <= client_handle(c, ch) && client_aux(c, s) >= client_handle(c, ch) {
+            found = client_aux(c, s)
+        }
+        s = s + 1
+    }
+    return found
+}
+
+fn is_not_found(p: u64, n: usize) -> bool {
+    return n == 5 && rt.ld8(p, 0) == bt_att.ATT_ERROR_RSP as u8 && rt.ld8(p, 4) == bt_att.E_ATTRIBUTE_NOT_FOUND as u8
+}
+
+fn response_services(c: *mut GattClient, p: u64, n: usize) -> i32 {
+    if n < 2 || rt.ld8(p, 0) != bt_att.ATT_READ_BY_GROUP_TYPE_RSP as u8 {
+        return RESP_ERROR
+    }
+    let el: usize = rt.ld8(p, 1) as usize
+    if el < 6 || (n - 2) % el != 0 {
+        return RESP_ERROR
+    }
+    var at: usize = 2
+    var last_end: u32 = 0
+    while at < n {
+        var u: bt_uuid.Uuid = bt_uuid.uuid16(0)
+        if !bt_uuid.uuid_get(p, at + 4, el - 4, &u) {
+            return RESP_ERROR
+        }
+        let sh: u32 = bt_le.le_get16(p, at)
+        let eh: u32 = bt_le.le_get16(p, at + 2)
+        if eh < sh || sh < (*c).cursor {
+            return RESP_ERROR
+        }
+        add_rec(c, KIND_SERVICE, sh, eh, 0, u, 0)
+        last_end = eh
+        at = at + el
+    }
+    if last_end >= 65535 {
+        advance_stage(c)
+    } else {
+        (*c).cursor = last_end + 1
+    }
+    return RESP_CONTINUE
+}
+
+fn response_chars(c: *mut GattClient, p: u64, n: usize) -> i32 {
+    let s: usize = nth_of_kind(c, KIND_SERVICE, (*c).index)
+    if is_not_found(p, n) {
+        (*c).cursor = client_aux(c, s) + 1
+        return RESP_CONTINUE
+    }
+    if n < 2 || rt.ld8(p, 0) != bt_att.ATT_READ_BY_TYPE_RSP as u8 {
+        return RESP_ERROR
+    }
+    let el: usize = rt.ld8(p, 1) as usize
+    if el < 7 || (n - 2) % el != 0 {
+        return RESP_ERROR
+    }
+    var at: usize = 2
+    var last: u32 = 0
+    while at < n {
+        var u: bt_uuid.Uuid = bt_uuid.uuid16(0)
+        if !bt_uuid.uuid_get(p, at + 5, el - 5, &u) {
+            return RESP_ERROR
+        }
+        let decl: u32 = bt_le.le_get16(p, at)
+        add_rec(c, KIND_CHARACTERISTIC, decl, bt_le.le_get16(p, at + 3), rt.ld8(p, at + 2) as u32, u, 0)
+        last = decl
+        at = at + el
+    }
+    (*c).cursor = last + 1
+    return RESP_CONTINUE
+}
+
+fn response_descs(c: *mut GattClient, p: u64, n: usize) -> i32 {
+    let ch: usize = nth_of_kind(c, KIND_CHARACTERISTIC, (*c).index)
+    if is_not_found(p, n) {
+        (*c).cursor = client_range_end(c, ch) + 1
+        return RESP_CONTINUE
+    }
+    if n < 2 || rt.ld8(p, 0) != bt_att.ATT_FIND_INFO_RSP as u8 {
+        return RESP_ERROR
+    }
+    let fmt: u32 = rt.ld8(p, 1) as u32
+    let ul: usize = if fmt == 1 { 2 } else { 16 }
+    if (fmt != 1 && fmt != 2) || (n - 2) % (2 + ul) != 0 {
+        return RESP_ERROR
+    }
+    var at: usize = 2
+    var last: u32 = 0
+    while at < n {
+        var u: bt_uuid.Uuid = bt_uuid.uuid16(0)
+        bt_uuid.uuid_get(p, at + 2, ul, &u)
+        let h: u32 = bt_le.le_get16(p, at)
+        if h > client_aux(c, ch) {
+            add_rec(c, KIND_DESCRIPTOR, h, client_handle(c, ch), 0, u, 0)
+        }
+        last = h
+        at = at + 2 + ul
+    }
+    (*c).cursor = last + 1
+    return RESP_CONTINUE
+}
+
+fn client_response(c: *mut GattClient, p: u64, n: usize) -> i32 {
+    var r: i32 = RESP_ERROR
+    if (*c).stage == STAGE_SERVICES {
+        if is_not_found(p, n) {
+            advance_stage(c)
+            r = RESP_CONTINUE
+        } else {
+            r = response_services(c, p, n)
+        }
+        if (*c).stage == STAGE_CHARS && r == RESP_CONTINUE {
+            return RESP_CONTINUE
+        }
+        return r
+    }
+    if (*c).stage == STAGE_CHARS {
+        r = response_chars(c, p, n)
+        if r == RESP_CONTINUE {
+            fix_char_ranges(c)
+        }
+        return r
+    }
+    if (*c).stage == STAGE_DESCS {
+        return response_descs(c, p, n)
+    }
+    return RESP_ERROR
+}

@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/webdav/wd_client.fi -- webdav.wd_client: a WebDAV client on net.http: PROPFIND, GET (range, stream), PUT, MKCOL, DELETE, MOVE, COPY, Basic/Digest, same-origin redirects only.
+import std.rt
+import std.str
+import net.http
+import net.url
+import webdav.wd_path
+import webdav.wd_xml
+import webdav.wd_auth
+
+export {
+    Dav, dav_new, dav_init, dav_free, dav_set_credentials, dav_set_allow_plain_basic,
+    dav_set_timeout, dav_http, dav_status, dav_error, dav_net_error, dav_error_name,
+    dav_list, dav_stat, dav_get, dav_get_range, dav_get_stream, dav_put, dav_mkcol,
+    dav_delete, dav_move, dav_copy, dav_exists, dav_options, dav_resp_header,
+    DEPTH_SELF, DEPTH_CHILDREN, DEPTH_INFINITY,
+    E_NONE, E_URL, E_PATH, E_NET, E_AUTH, E_AUTH_PLAIN, E_STATUS, E_XML, E_REDIRECT,
+}
+
+const DEPTH_SELF: u32 = 0
+const DEPTH_CHILDREN: u32 = 1
+const DEPTH_INFINITY: u32 = 2
+
+const E_NONE: u32 = 0
+const E_URL: u32 = 1
+const E_PATH: u32 = 2
+const E_NET: u32 = 3
+const E_AUTH: u32 = 4
+const E_AUTH_PLAIN: u32 = 5
+const E_STATUS: u32 = 6
+const E_XML: u32 = 7
+const E_REDIRECT: u32 = 8
+
+const MAX_HOPS: u32 = 5
+
+struct Dav {
+    http: http.Client,
+    resp: http.Response,
+    origin: rt.Buf,
+    root: rt.Buf,
+    root_enc: rt.Buf,
+    auth: wd_auth.Auth,
+    secure: bool,
+    plain_basic: bool,
+    probed: bool,
+    ready: bool,
+    status: u32,
+    err: u32,
+    neterr: rt.Buf,
+}
+
+fn dav_new() -> Dav {
+    return Dav {
+        http: http.client_new(), resp: http.resp_new(), origin: rt.buf_new(),
+        root: rt.buf_new(), root_enc: rt.buf_new(), auth: wd_auth.auth_new(),
+        secure: false, plain_basic: false, probed: false, ready: false,
+        status: 0 as u32, err: 0 as u32, neterr: rt.buf_new(),
+    }
+}
+
+fn dav_init(d: *mut Dav, base: str) -> bool {
+    var u: url.Url = url.url_new()
+    if !url.url_parse(base.p as u64, base.n, &u) {
+        return false
+    }
+    if !url.url_is_http(&u) && !url.url_is_https(&u) {
+        return false
+    }
+    if !http.client_init(&(*d).http) {
+        return false
+    }
+    http.client_set_max_redirects(&(*d).http, 0 as u32)
+    http.client_set_cache(&(*d).http, false)
+    http.client_set_gzip(&(*d).http, false)
+    (*d).secure = url.url_is_https(&u)
+    rt.buf_clear(&(*d).origin)
+    rt.buf_push_bytes(&(*d).origin, url.url_scheme_ptr(&u), url.url_scheme_len(&u))
+    rt.buf_push_bytes(&(*d).origin, "://".p as u64, 3)
+    rt.buf_push_bytes(&(*d).origin, url.url_host_ptr(&u), url.url_host_len(&u))
+    if url.url_port(&u) != url.url_default_port(&u) {
+        rt.buf_push(&(*d).origin, 58 as u8)
+        rt.buf_push_dec_u64(&(*d).origin, url.url_port(&u) as u64)
+    }
+    var pl: usize = url.url_path_len(&u)
+    let pp: u64 = url.url_path_ptr(&u)
+    var q: usize = 0
+    while q < pl {
+        if rt.ld8(pp, q) == 63 as u8 {
+            pl = q
+            break
+        }
+        q = q + 1
+    }
+    while pl > 0 && rt.ld8(pp, pl - 1) == 47 as u8 {
+        pl = pl - 1
+    }
+    rt.buf_clear(&(*d).root_enc)
+    rt.buf_push_bytes(&(*d).root_enc, pp, pl)
+    rt.buf_clear(&(*d).root)
+    if !wd_path.pct_decode(pp, pl, &(*d).root) {
+        return false
+    }
+    (*d).ready = true
+    return true
+}
+
+fn dav_free(d: *mut Dav) {
+    http.client_free(&(*d).http)
+    http.resp_free(&(*d).resp)
+    rt.buf_free(&(*d).origin)
+    rt.buf_free(&(*d).root)
+    rt.buf_free(&(*d).root_enc)
+    rt.buf_free(&(*d).neterr)
+    wd_auth.auth_free(&(*d).auth)
+}
+
+fn dav_set_credentials(d: *mut Dav, user: str, pass: str) {
+    wd_auth.auth_set_user(&(*d).auth, user, pass)
+}
+
+fn dav_set_allow_plain_basic(d: *mut Dav, on: bool) { (*d).plain_basic = on }
+fn dav_set_timeout(d: *mut Dav, ms: u64) { http.client_set_timeout(&(*d).http, ms) }
+fn dav_http(d: *mut Dav) -> *mut http.Client { return &(*d).http }
+fn dav_status(d: *mut Dav) -> u32 { return (*d).status }
+fn dav_error(d: *mut Dav) -> u32 { return (*d).err }
+
+fn dav_net_error(d: *mut Dav) -> str {
+    return rt.buf_str(&(*d).neterr)
+}
+
+fn dav_error_name(code: u32) -> str {
+    if code == E_NONE { return "none" }
+    if code == E_URL { return "bad base url" }
+    if code == E_PATH { return "bad path" }
+    if code == E_NET { return "network error" }
+    if code == E_AUTH { return "authentication failed" }
+    if code == E_AUTH_PLAIN { return "basic authentication refused on plain http" }
+    if code == E_STATUS { return "unexpected status" }
+    if code == E_XML { return "bad multistatus body" }
+    if code == E_REDIRECT { return "redirect refused" }
+    return "unknown"
+}
+
+fn dav_resp_header(d: *mut Dav, name: str, at: *mut u64) -> usize {
+    return http.resp_header(&(*d).resp, name.p as u64, name.n, at)
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn hdr(b: *mut rt.Buf, name: str, val: str) {
+    push_str(b, name)
+    push_str(b, ": ")
+    push_str(b, val)
+    push_str(b, "\r\n")
+}
+
+fn target_of(d: *mut Dav, path: str, out: *mut rt.Buf) -> bool {
+    var norm: rt.Buf = rt.buf_new()
+    if !wd_path.path_normalize(path.p as u64, path.n, &norm) {
+        rt.buf_free(&norm)
+        return false
+    }
+    rt.buf_push_bytes(out, (*d).root_enc.ptr, (*d).root_enc.len)
+    wd_path.pct_encode_path(norm.ptr, norm.len, out)
+    if (*out).len == 0 {
+        rt.buf_push(out, 47 as u8)
+    }
+    rt.buf_free(&norm)
+    return true
+}
+
+fn is_redirect(s: u32) -> bool {
+    return s == 301 as u32 || s == 302 as u32 || s == 307 as u32 || s == 308 as u32
+}
+
+fn same_origin_target(d: *mut Dav, p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if n > 0 && rt.ld8(p, 0) == 47 as u8 {
+        rt.buf_push_bytes(out, p, n)
+        return true
+    }
+    let on: usize = (*d).origin.len
+    if n >= on && wd_path.starts_with_ci(p, n, rt.buf_str(&(*d).origin)) {
+        if n == on {
+            rt.buf_push(out, 47 as u8)
+            return true
+        }
+        if rt.ld8(p, on) == 47 as u8 {
+            rt.buf_push_bytes(out, p + on as u64, n - on)
+            return true
+        }
+    }
+    return false
+}
+
+fn fail(d: *mut Dav, code: u32) -> bool {
+    (*d).err = code
+    return false
+}
+
+fn request(d: *mut Dav, method: str, target_p: u64, target_n: usize,
+    extra_p: u64, extra_n: usize, body_p: u64, body_n: usize, ctype: str) -> bool {
+    (*d).err = E_NONE
+    (*d).status = 0 as u32
+    if body_n > 0 && wd_auth.auth_has_user(&(*d).auth) && !wd_auth.auth_ready(&(*d).auth) && !(*d).probed {
+        (*d).probed = true
+        var rp: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&rp, (*d).root_enc.ptr, (*d).root_enc.len)
+        rt.buf_push(&rp, 47 as u8)
+        let pr: bool = request(d, "OPTIONS", rp.ptr, rp.len, 0 as u64, 0, 0 as u64, 0, "")
+        rt.buf_free(&rp)
+        (*d).err = E_NONE
+    }
+    var tgt: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&tgt, target_p, target_n)
+    var hops: u32 = 0 as u32
+    var tries: u32 = 0 as u32
+    var result: bool = false
+    var running: bool = true
+    while running {
+        var hb: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&hb, extra_p, extra_n)
+        if body_n == 0 && (method.n == 3 && wd_path.starts_with_ci(method.p as u64, 3, "put")) {
+            hdr(&hb, "Content-Length", "0")
+        }
+        if wd_auth.auth_ready(&(*d).auth) {
+            var av: rt.Buf = rt.buf_new()
+            if wd_auth.auth_header(&(*d).auth, method, tgt.ptr, tgt.len, &av) {
+                push_str(&hb, "Authorization: ")
+                rt.buf_push_bytes(&hb, av.ptr, av.len)
+                push_str(&hb, "\r\n")
+            }
+            rt.buf_free(&av)
+        }
+        http.client_set_headers(&(*d).http, hb.ptr, hb.len)
+        rt.buf_free(&hb)
+        var full: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&full, (*d).origin.ptr, (*d).origin.len)
+        rt.buf_push_bytes(&full, tgt.ptr, tgt.len)
+        rt.buf_clear(&(*d).neterr)
+        let got: bool = http.http_fetch(&(*d).http, method.p as u64, method.n,
+            full.ptr, full.len, body_p, body_n, ctype.p as u64, ctype.n,
+            &(*d).resp) catch | e | http.fail_into(&(*d).neterr, e)
+        rt.buf_free(&full)
+        let st: u32 = http.resp_status(&(*d).resp)
+        if (*d).neterr.len > 0 && !is_redirect(st) {
+            (*d).status = 0 as u32
+            result = fail(d, E_NET)
+            running = false
+            break
+        }
+        (*d).status = st
+        if is_redirect(st) {
+            var at: u64 = 0
+            let ln: usize = http.resp_header(&(*d).resp, "Location".p as u64, 8, &at)
+            hops = hops + 1 as u32
+            var nt: rt.Buf = rt.buf_new()
+            if ln == 0 || hops > MAX_HOPS || !same_origin_target(d, at, ln, &nt) {
+                rt.buf_free(&nt)
+                result = fail(d, E_REDIRECT)
+                running = false
+                break
+            }
+            rt.buf_clear(&tgt)
+            wd_path.href_to_path(nt.ptr, nt.len, &tgt)
+            rt.buf_free(&nt)
+            continue
+        }
+        if st == 401 as u32 && wd_auth.auth_has_user(&(*d).auth) && tries < 2 as u32 {
+            var at2: u64 = 0
+            let ln2: usize = http.resp_header(&(*d).resp, "WWW-Authenticate".p as u64, 16, &at2)
+            let sch: u32 = wd_auth.auth_challenge(&(*d).auth, at2, ln2)
+            if sch == 0 as u32 {
+                result = fail(d, E_AUTH)
+                running = false
+                break
+            }
+            if sch == wd_auth.SCHEME_BASIC && !(*d).secure && !(*d).plain_basic {
+                wd_auth.auth_forget(&(*d).auth)
+                result = fail(d, E_AUTH_PLAIN)
+                running = false
+                break
+            }
+            tries = tries + 1 as u32
+            continue
+        }
+        if st == 401 as u32 {
+            result = fail(d, E_AUTH)
+            running = false
+            break
+        }
+        result = true
+        running = false
+    }
+    rt.buf_free(&tgt)
+    return result
+}
+
+fn simple(d: *mut Dav, method: str, path: str, extra: str, body_p: u64, body_n: usize,
+    ctype: str, ok1: u32, ok2: u32, ok3: u32) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    if !target_of(d, path, &t) {
+        rt.buf_free(&t)
+        return fail(d, E_PATH)
+    }
+    let ok: bool = request(d, method, t.ptr, t.len, extra.p as u64, extra.n, body_p, body_n, ctype)
+    rt.buf_free(&t)
+    if !ok {
+        return false
+    }
+    let s: u32 = (*d).status
+    if s == ok1 || s == ok2 || s == ok3 {
+        return true
+    }
+    return fail(d, E_STATUS)
+}
+
+fn depth_text(depth: u32) -> str {
+    if depth == DEPTH_SELF {
+        return "Depth: 0\r\n"
+    }
+    if depth == DEPTH_CHILDREN {
+        return "Depth: 1\r\n"
+    }
+    return "Depth: infinity\r\n"
+}
+
+fn dav_list(d: *mut Dav, path: str, depth: u32, out: *mut wd_xml.Listing) -> bool {
+    var body: rt.Buf = rt.buf_new()
+    wd_xml.propfind_body(&body)
+    var ex: rt.Buf = rt.buf_new()
+    push_str(&ex, depth_text(depth))
+    var t: rt.Buf = rt.buf_new()
+    if !target_of(d, path, &t) {
+        rt.buf_free(&body)
+        rt.buf_free(&ex)
+        rt.buf_free(&t)
+        return fail(d, E_PATH)
+    }
+    let ok: bool = request(d, "PROPFIND", t.ptr, t.len, ex.ptr, ex.len, body.ptr, body.len,
+        "application/xml; charset=utf-8")
+    rt.buf_free(&body)
+    rt.buf_free(&ex)
+    rt.buf_free(&t)
+    if !ok {
+        return false
+    }
+    if (*d).status != 207 as u32 {
+        return fail(d, E_STATUS)
+    }
+    wd_xml.listing_clear(out)
+    if !wd_xml.parse_multistatus(out, rt.buf_str(&(*d).root), http.resp_body_ptr(&(*d).resp),
+        http.resp_body_len(&(*d).resp)) {
+        return fail(d, E_XML)
+    }
+    return true
+}
+
+fn dav_stat(d: *mut Dav, path: str, out: *mut wd_xml.Listing) -> bool {
+    if !dav_list(d, path, DEPTH_SELF, out) {
+        return false
+    }
+    if wd_xml.list_count(out) < 1 {
+        return fail(d, E_XML)
+    }
+    return true
+}
+
+fn dav_exists(d: *mut Dav, path: str) -> bool {
+    var l: wd_xml.Listing = wd_xml.listing_new()
+    let ok: bool = dav_list(d, path, DEPTH_SELF, &l)
+    wd_xml.listing_free(&l)
+    return ok
+}
+
+fn dav_options(d: *mut Dav, path: str) -> bool {
+    return simple(d, "OPTIONS", path, "", 0 as u64, 0, "", 200 as u32, 204 as u32, 200 as u32)
+}
+
+fn dav_get(d: *mut Dav, path: str, out: *mut rt.Buf) -> bool {
+    if !simple(d, "GET", path, "", 0 as u64, 0, "", 200 as u32, 200 as u32, 200 as u32) {
+        return false
+    }
+    rt.buf_push_bytes(out, http.resp_body_ptr(&(*d).resp), http.resp_body_len(&(*d).resp))
+    return true
+}
+
+fn dav_get_range(d: *mut Dav, path: str, from: u64, count: u64, out: *mut rt.Buf) -> bool {
+    var ex: rt.Buf = rt.buf_new()
+    push_str(&ex, "Range: bytes=")
+    rt.buf_push_dec_u64(&ex, from)
+    rt.buf_push(&ex, 45 as u8)
+    rt.buf_push_dec_u64(&ex, from + count - 1 as u64)
+    push_str(&ex, "\r\n")
+    var t: rt.Buf = rt.buf_new()
+    if count == 0 as u64 || !target_of(d, path, &t) {
+        rt.buf_free(&ex)
+        rt.buf_free(&t)
+        return fail(d, E_PATH)
+    }
+    let ok: bool = request(d, "GET", t.ptr, t.len, ex.ptr, ex.len, 0 as u64, 0, "")
+    rt.buf_free(&ex)
+    rt.buf_free(&t)
+    if !ok {
+        return false
+    }
+    if (*d).status != 206 as u32 {
+        return fail(d, E_STATUS)
+    }
+    rt.buf_push_bytes(out, http.resp_body_ptr(&(*d).resp), http.resp_body_len(&(*d).resp))
+    return true
+}
+
+fn dav_get_stream(d: *mut Dav, path: str, sink: fn(u64, u64, usize) -> bool, ud: u64) -> bool {
+    http.client_set_sink(&(*d).http, sink, ud)
+    let ok: bool = simple(d, "GET", path, "", 0 as u64, 0, "", 200 as u32, 200 as u32, 200 as u32)
+    http.client_clear_sink(&(*d).http)
+    return ok
+}
+
+fn dav_put(d: *mut Dav, path: str, p: u64, n: usize, ctype: str) -> bool {
+    return simple(d, "PUT", path, "", p, n, ctype, 200 as u32, 201 as u32, 204 as u32)
+}
+
+fn dav_mkcol(d: *mut Dav, path: str) -> bool {
+    return simple(d, "MKCOL", path, "", 0 as u64, 0, "", 201 as u32, 201 as u32, 201 as u32)
+}
+
+fn dav_delete(d: *mut Dav, path: str) -> bool {
+    return simple(d, "DELETE", path, "", 0 as u64, 0, "", 200 as u32, 204 as u32, 204 as u32)
+}
+
+fn transfer(d: *mut Dav, method: str, from: str, to: str, overwrite: bool) -> bool {
+    var dest: rt.Buf = rt.buf_new()
+    var tt: rt.Buf = rt.buf_new()
+    if !target_of(d, to, &tt) {
+        rt.buf_free(&dest)
+        rt.buf_free(&tt)
+        return fail(d, E_PATH)
+    }
+    var ex: rt.Buf = rt.buf_new()
+    push_str(&ex, "Destination: ")
+    rt.buf_push_bytes(&ex, (*d).origin.ptr, (*d).origin.len)
+    rt.buf_push_bytes(&ex, tt.ptr, tt.len)
+    push_str(&ex, "\r\n")
+    if overwrite {
+        push_str(&ex, "Overwrite: T\r\n")
+    } else {
+        push_str(&ex, "Overwrite: F\r\n")
+    }
+    let ok: bool = simple(d, method, from, rt.buf_str(&ex), 0 as u64, 0, "", 201 as u32, 204 as u32, 204 as u32)
+    rt.buf_free(&dest)
+    rt.buf_free(&tt)
+    rt.buf_free(&ex)
+    return ok
+}
+
+fn dav_move(d: *mut Dav, from: str, to: str, overwrite: bool) -> bool {
+    return transfer(d, "MOVE", from, to, overwrite)
+}
+
+fn dav_copy(d: *mut Dav, from: str, to: str, overwrite: bool) -> bool {
+    return transfer(d, "COPY", from, to, overwrite)
+}

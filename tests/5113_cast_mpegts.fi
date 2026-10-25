@@ -1,0 +1,106 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import cast.h264enc
+import cast.h264dec
+import cast.mpegts
+import cast.pktlist
+import cast.rtp
+import cast.yuv
+
+const W: usize = 80
+const H: usize = 48
+
+fn paint(pix: u64, frame: usize) {
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            let o: usize = (y * W + x) * 4
+            var v: usize = (x * 2 + y * 3 + frame * 17) % 250
+            if x > frame * 8 && x < frame * 8 + 24 && y > 8 && y < 30 { v = 255 - v }
+            rt.st8(pix, o, v as u8)
+            rt.st8(pix, o + 1, ((v + 5) % 256) as u8)
+            rt.st8(pix, o + 2, (255 - v) as u8)
+            rt.st8(pix, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn same_frame(a: *mut yuv.Yuv, b: *mut yuv.Yuv) -> bool {
+    return rt.mem_eq((*a).y.ptr, (*b).y.ptr, (*a).w * (*a).h) && rt.mem_eq((*a).u.ptr, (*b).u.ptr, (*a).cw * (*a).ch) && rt.mem_eq((*a).v.ptr, (*b).v.ptr, (*a).cw * (*a).ch)
+}
+
+fn main() -> i32 {
+    var digits: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 9 {
+        rt.buf_push(&digits, (49 + i) as u8)
+        i = i + 1
+    }
+    if mpegts.mpeg_crc32(digits.ptr, digits.len) != 58124007 as u32 { return 1 }
+    rt.buf_free(&digits)
+
+    var pix: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&pix, W * H * 4)
+    rt.buf_set_len(&pix, W * H * 4)
+    var e: h264enc.Enc = h264enc.enc_new(W, H, 30 as u32)
+    var d: h264dec.Dec = h264dec.dec_new()
+    var mux: mpegts.TsMux = mpegts.tsmux_new()
+    var dm: mpegts.TsDemux = mpegts.tsdemux_new()
+    var au: rt.Buf = rt.buf_new()
+    var ts: rt.Buf = rt.buf_new()
+    var es: rt.Buf = rt.buf_new()
+    var packer: mpegts.Mp2tPack = mpegts.mp2tpack_new(7 as u32, 65534 as u32)
+    var list: pktlist.PktList = pktlist.pl_new()
+    var f: usize = 0
+    var decoded: usize = 0
+    while f < 7 {
+        paint(pix.ptr, f)
+        h264enc.enc_encode(&e, pix.ptr, W * 4, yuv.PF_BGRA, &au)
+        rt.buf_clear(&ts)
+        mpegts.tsmux_psi(&mux, &ts)
+        mpegts.tsmux_video(&mux, au.ptr, au.len, (900000 + f * 3000) as u64, f == 0, &ts)
+        if ts.len % 188 != 0 { return 2 }
+        mpegts.mp2tpack_push(&packer, ts.ptr, ts.len, (f * 3000) as u32, &list, true)
+        var pos: usize = 0
+        var pp: u64 = 0
+        var pn: usize = 0
+        while pktlist.pl_next(&list, &pos, &pp, &pn) {
+            var h: rtp.RtpPacket = rtp.RtpPacket { pt: 0 as u32, marker: false, seq: 0 as u32, ts: 0 as u32, ssrc: 0 as u32, off: 0, len: 0 }
+            if !rtp.rtp_parse(pp, pn, &h) { return 3 }
+            if h.pt != 33 as u32 || h.len % 188 != 0 || h.len > 1316 { return 4 }
+            mpegts.tsdemux_push(&dm, pp + h.off as u64, h.len)
+        }
+        pktlist.pl_clear(&list)
+        mpegts.tsdemux_flush(&dm)
+        var pts: u64 = 0
+        if !mpegts.tsdemux_take(&dm, &es, &pts) { return 5 }
+        if pts != (900000 + f * 3000) as u64 { return 6 }
+        if es.len != au.len { return 7 }
+        if !rt.mem_eq(es.ptr, au.ptr, au.len) { return 8 }
+        if h264dec.dec_annexb(&d, es.ptr, es.len) != h264dec.DEC_OK { return 9 }
+        if !same_frame(h264dec.dec_frame(&d), &e.prev) { return 10 }
+        decoded = decoded + 1
+        f = f + 1
+    }
+    if decoded != 7 { return 11 }
+    if mpegts.tsdemux_video_pid(&dm) != mpegts.TS_VIDEO_PID { return 12 }
+    if mpegts.tsdemux_errors(&dm) != 0 as u32 { return 13 }
+
+    var bad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&bad, ts.ptr, ts.len)
+    rt.st8(bad.ptr, 188 + 3, 0 as u8)
+    var dm2: mpegts.TsDemux = mpegts.tsdemux_new()
+    mpegts.tsdemux_push(&dm2, bad.ptr, bad.len)
+    mpegts.tsdemux_flush(&dm2)
+    rt.buf_free(&bad)
+    mpegts.tsdemux_free(&dm2)
+    mpegts.tsdemux_free(&dm)
+    h264enc.enc_free(&e)
+    h264dec.dec_free(&d)
+    pktlist.pl_free(&list)
+    return 0
+}

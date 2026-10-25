@@ -1,0 +1,184 @@
+import std.rt
+import std.str
+import webdav.wd_client
+import webdav.wd_xml
+
+static mut failures: i32 = 0
+static mut checks: i32 = 0
+static mut sink_bytes: u64 = 0
+static mut sink_sum: u64 = 0
+static mut sink_begin: i32 = 0
+
+fn check(name: str, ok: bool) {
+    checks += 1
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let a: u64 = rt.arg_ptr(start, i)
+    return str { p: a as *mut u8, n: rt.c_length(a) }
+}
+
+fn same(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+fn pattern(b: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, ((i * 31 + 7) % 251) as u8)
+        i = i + 1
+    }
+}
+
+fn eq_buf(a: *mut rt.Buf, b: *mut rt.Buf) -> bool {
+    return rt.buf_len(a) == rt.buf_len(b) && rt.mem_eq(rt.buf_ptr(a), rt.buf_ptr(b), rt.buf_len(a))
+}
+
+fn sink(ud: u64, p: u64, n: usize) -> bool {
+    if n == 0 {
+        sink_begin += 1
+        return true
+    }
+    sink_bytes = sink_bytes + n as u64
+    var i: usize = 0
+    while i < n {
+        sink_sum = sink_sum + rt.ld8(p, i) as u64
+        i = i + 1
+    }
+    return true
+}
+
+fn find(l: *mut wd_xml.Listing, name: str) -> i64 {
+    var i: usize = 0
+    while i < wd_xml.list_count(l) {
+        if same(wd_xml.list_name(l, i), name) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn scenario_full(d: *mut wd_client.Dav) {
+    check("mkcol t", wd_client.dav_mkcol(d, "/t"))
+    check("mkcol again 405", !wd_client.dav_mkcol(d, "/t") && wd_client.dav_status(d) == 405 as u32 && wd_client.dav_error(d) == wd_client.E_STATUS)
+    check("mkcol no parent 409", !wd_client.dav_mkcol(d, "/nope/x") && wd_client.dav_status(d) == 409 as u32)
+    check("put hello", wd_client.dav_put(d, "/t/a.txt", "hello".p as u64, 5, "text/plain"))
+    var got: rt.Buf = rt.buf_new()
+    check("get hello", wd_client.dav_get(d, "/t/a.txt", &got) && rt.buf_len(&got) == 5 && rt.mem_eq(rt.buf_ptr(&got), "hello".p as u64, 5))
+    check("get missing 404", !wd_client.dav_get(d, "/t/none", &got) && wd_client.dav_status(d) == 404 as u32)
+    check("put empty", wd_client.dav_put(d, "/t/empty", 0 as u64, 0, ""))
+    rt.buf_clear(&got)
+    check("get empty", wd_client.dav_get(d, "/t/empty", &got) && rt.buf_len(&got) == 0)
+    check("put overwrite", wd_client.dav_put(d, "/t/a.txt", "HELLO!".p as u64, 6, "text/plain") && wd_client.dav_status(d) == 204 as u32)
+    check("put space name", wd_client.dav_put(d, "/t/my file #1.txt", "sp".p as u64, 2, "text/plain"))
+    check("put unicode name", wd_client.dav_put(d, "/t/gr\u{fc}n\u{e4}.txt", "u".p as u64, 1, "text/plain"))
+    var big: rt.Buf = rt.buf_new()
+    pattern(&big, 3145728)
+    check("put 3MiB", wd_client.dav_put(d, "/t/big.bin", rt.buf_ptr(&big), rt.buf_len(&big), "application/octet-stream"))
+    rt.buf_clear(&got)
+    check("get 3MiB identical", wd_client.dav_get(d, "/t/big.bin", &got) && eq_buf(&got, &big))
+    rt.buf_clear(&got)
+    check("range", wd_client.dav_get_range(d, "/t/big.bin", 1000 as u64, 50 as u64, &got) && rt.buf_len(&got) == 50 && rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&big) + 1000 as u64, 50))
+
+    var l: wd_xml.Listing = wd_xml.listing_new()
+    check("list t", wd_client.dav_list(d, "/t", wd_client.DEPTH_CHILDREN, &l))
+    check("list count", wd_xml.list_count(&l) == 6)
+    check("list self is dir", wd_xml.list_is_dir(&l, 0) && same(wd_xml.list_path(&l, 0), "/t"))
+    let ia: i64 = find(&l, "a.txt")
+    check("list a.txt", ia >= 0 && wd_xml.list_size(&l, ia as usize) == 6 as u64 && !wd_xml.list_is_dir(&l, ia as usize))
+    check("list a.txt path", ia >= 0 && same(wd_xml.list_path(&l, ia as usize), "/t/a.txt"))
+    check("list mtime", ia >= 0 && wd_xml.list_mtime(&l, ia as usize) > 1700000000 as u64)
+    check("list etag", ia >= 0 && wd_xml.list_etag(&l, ia as usize).n > 2)
+    check("list ctype", ia >= 0 && same(wd_xml.list_ctype(&l, ia as usize), "application/octet-stream"))
+    let isp: i64 = find(&l, "my file #1.txt")
+    check("list space name", isp >= 0 && wd_xml.list_size(&l, isp as usize) == 2 as u64 && same(wd_xml.list_path(&l, isp as usize), "/t/my file #1.txt"))
+    check("list unicode name", find(&l, "gr\u{fc}n\u{e4}.txt") >= 0)
+    let ib: i64 = find(&l, "big.bin")
+    check("list big size", ib >= 0 && wd_xml.list_size(&l, ib as usize) == 3145728 as u64)
+    check("stat file", wd_client.dav_stat(d, "/t/a.txt", &l) && wd_xml.list_count(&l) == 1 && wd_xml.list_size(&l, 0) == 6 as u64)
+    check("stat dir", wd_client.dav_stat(d, "/t", &l) && wd_xml.list_is_dir(&l, 0))
+    check("stat missing", !wd_client.dav_stat(d, "/t/zzz", &l) && wd_client.dav_status(d) == 404 as u32)
+    check("stat root", wd_client.dav_stat(d, "/", &l) && wd_xml.list_is_dir(&l, 0) && same(wd_xml.list_path(&l, 0), "/"))
+
+    check("mkcol sub", wd_client.dav_mkcol(d, "/t/sub"))
+    check("copy", wd_client.dav_copy(d, "/t/a.txt", "/t/sub/b.txt", true))
+    check("copy no overwrite 412", !wd_client.dav_copy(d, "/t/a.txt", "/t/sub/b.txt", false) && wd_client.dav_status(d) == 412 as u32)
+    check("copy overwrite 204", wd_client.dav_copy(d, "/t/a.txt", "/t/sub/b.txt", true) && wd_client.dav_status(d) == 204 as u32)
+    rt.buf_clear(&got)
+    check("copy content", wd_client.dav_get(d, "/t/sub/b.txt", &got) && rt.buf_len(&got) == 6)
+    check("move", wd_client.dav_move(d, "/t/sub/b.txt", "/t/sub/c.txt", true))
+    check("move source gone", !wd_client.dav_exists(d, "/t/sub/b.txt") && wd_client.dav_status(d) == 404 as u32)
+    check("move target there", wd_client.dav_exists(d, "/t/sub/c.txt"))
+    check("move dir", wd_client.dav_move(d, "/t/sub", "/t/sub2", true) && wd_client.dav_exists(d, "/t/sub2/c.txt"))
+    check("list depth infinity", wd_client.dav_list(d, "/t", wd_client.DEPTH_INFINITY, &l) && find(&l, "c.txt") >= 0)
+
+    sink_bytes = 0 as u64
+    sink_sum = 0 as u64
+    sink_begin = 0
+    check("stream get", wd_client.dav_get_stream(d, "/t/big.bin", sink, 0 as u64))
+    var want: u64 = 0 as u64
+    var i: usize = 0
+    while i < rt.buf_len(&big) {
+        want = want + rt.ld8(rt.buf_ptr(&big), i) as u64
+        i = i + 1
+    }
+    check("stream bytes", sink_bytes == 3145728 as u64 && sink_sum == want)
+    check("stream begin once", sink_begin == 1)
+    rt.buf_clear(&got)
+    check("get after stream", wd_client.dav_get(d, "/t/a.txt", &got) && rt.buf_len(&got) == 6)
+
+    check("path traversal refused", !wd_client.dav_get(d, "/t/../../etc/passwd", &got) && wd_client.dav_error(d) == wd_client.E_PATH)
+    check("options", wd_client.dav_options(d, "/"))
+    check("delete file", wd_client.dav_delete(d, "/t/a.txt") && !wd_client.dav_exists(d, "/t/a.txt"))
+    check("delete missing 404", !wd_client.dav_delete(d, "/t/a.txt") && wd_client.dav_status(d) == 404 as u32)
+    check("delete tree", wd_client.dav_delete(d, "/t") && !wd_client.dav_exists(d, "/t"))
+    wd_xml.listing_free(&l)
+    rt.buf_free(&got)
+    rt.buf_free(&big)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 5 {
+        return 2
+    }
+    let url: str = arg(start, 1)
+    let user: str = arg(start, 2)
+    let pass: str = arg(start, 3)
+    let mode: str = arg(start, 4)
+    var d: wd_client.Dav = wd_client.dav_new()
+    check("init", wd_client.dav_init(&d, url))
+    if user.n > 0 {
+        wd_client.dav_set_credentials(&d, user, pass)
+    }
+    wd_client.dav_set_timeout(&d, 20000 as u64)
+    var l: wd_xml.Listing = wd_xml.listing_new()
+    if same(mode, "full") {
+        wd_client.dav_set_allow_plain_basic(&d, true)
+        scenario_full(&d)
+    } else if same(mode, "badauth") {
+        wd_client.dav_set_allow_plain_basic(&d, true)
+        check("bad credentials", !wd_client.dav_list(&d, "/", wd_client.DEPTH_CHILDREN, &l) && wd_client.dav_error(&d) == wd_client.E_AUTH && wd_client.dav_status(&d) == 401 as u32)
+    } else if same(mode, "noauth") {
+        check("no credentials 401", !wd_client.dav_list(&d, "/", wd_client.DEPTH_CHILDREN, &l) && wd_client.dav_error(&d) == wd_client.E_AUTH)
+    } else if same(mode, "plainrefused") {
+        check("basic refused on http", !wd_client.dav_list(&d, "/", wd_client.DEPTH_CHILDREN, &l) && wd_client.dav_error(&d) == wd_client.E_AUTH_PLAIN)
+    } else if same(mode, "redirects") {
+        check("cross origin redirect refused", !wd_client.dav_list(&d, "/evil", wd_client.DEPTH_SELF, &l) && wd_client.dav_error(&d) == wd_client.E_REDIRECT && wd_client.dav_status(&d) == 302 as u32)
+    } else if same(mode, "dead") {
+        check("connection refused", !wd_client.dav_list(&d, "/", wd_client.DEPTH_SELF, &l) && wd_client.dav_error(&d) == wd_client.E_NET)
+    }
+    wd_xml.listing_free(&l)
+    wd_client.dav_free(&d)
+    if failures != 0 {
+        return 1
+    }
+    rt.write_everything(1, "e2e ok\n".p as u64, 7)
+    return 0
+}
