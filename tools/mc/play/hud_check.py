@@ -153,6 +153,34 @@ def region_diff(a, b, x0, y0, x1, y1):
     return sum(1 for x in range(x0, x1) for y in range(y0, y1) if a.getpixel((x, y)) != b.getpixel((x, y)))
 
 
+SPRITES = "assets/minecraft/textures/gui/sprites/container/"
+SPR_CHECKS = {
+    "enchant": [("enchanting_table/enchantment_slot", 60, 14), ("enchanting_table/enchantment_slot", 60, 33),
+                ("enchanting_table/enchantment_slot", 60, 52), ("enchanting_table/level_1", 61, 15),
+                ("enchanting_table/level_2", 61, 34), ("enchanting_table/level_3", 61, 53)],
+    "brewing": [("brewing_stand/fuel_length", 60, 44), ("brewing_stand/brew_progress", 97, 16, 14)],
+    "anvil": [("anvil/text_field", 59, 20)],
+    "horse": [("slot", 7, 17), ("slot", 7, 35), ("horse/chest_slots", 79, 17)],
+}
+CREATIVE_TABS = SPRITES + "creative_inventory/"
+
+
+def check_sprites(img, jar, kind, errors, s=2):
+    for item in SPR_CHECKS[kind]:
+        tex = load(jar, SPRITES + item[0] + ".png")
+        h = item[3] if len(item) > 3 else tex.size[1]
+        good, total = match_px(img, tex, s, item[1] * s, item[2] * s, 0, 0, tex.size[0], h)
+        expect(f"{kind} sprite {item[0]}", good, total, errors, 0.6)
+
+
+def check_creative_sprites(img, jar, errors, s=2, px=40, py=60):
+    cases = [("tab_bottom_unselected_4", 27 * 3, 136, 4, 28), ("tab_top_unselected_2", 27, 0 - 28, 0, 28)]
+    for name, x, y, v, h in cases:
+        tex = load(jar, CREATIVE_TABS + name + ".png")
+        good, total = match_px(img, tex, s, px + x * s, py + y * s, 0, v, tex.size[0], h)
+        expect(f"creative sprite {name}", good, total, errors, 0.95)
+
+
 def main():
     mode, ppm, jar = sys.argv[1], sys.argv[2], sys.argv[3]
     img = read(ppm)
@@ -184,6 +212,11 @@ def main():
         check_bars(img, jar, errors)
     elif mode == "inv":
         check_inventory(img, jar, errors)
+    elif mode == "spr":
+        if sys.argv[4] == "creative":
+            check_creative_sprites(img, jar, errors)
+        else:
+            check_sprites(img, jar, sys.argv[4], errors)
     elif mode == "cont":
         check_container(img, jar, sys.argv[4], int(sys.argv[5]) if len(sys.argv) > 5 else 3, errors)
     elif mode == "hidden":
