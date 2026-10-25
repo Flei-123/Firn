@@ -9,8 +9,10 @@ import av1.av1tab2
 import av1.av1lt
 import av1.av1recon
 import av1.av1lr
+import av1.av1qm
+import av1.av1txfm
 
-export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_err }
+export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_set_quant_ext, tile_err }
 
 const S_SYM: i64 = 0
 const S_MCDF: i64 = 1
@@ -85,6 +87,13 @@ const S_HASC: i64 = 74
 const S_AVUC: i64 = 75
 const S_AVLC: i64 = 76
 const S_NPL: i64 = 77
+const S_BDI: i64 = 78
+const S_DQD: i64 = 79
+const S_QML: i64 = 84
+const S_DQPRES: i64 = 87
+const S_DQRES: i64 = 88
+const S_CURQ: i64 = 89
+const S_RDELTAS: i64 = 90
 
 static NUM4W: [i16; 22] = [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16]
 static NUM4H: [i16; 22] = [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4]
@@ -384,6 +393,26 @@ fn qclip(v: i64) -> i64 {
     return imax(0, imin(255, v))
 }
 
+fn set_quant(c: u64, qidx: i64) {
+    let bdi: i64 = sg(c, S_BDI)
+    ss(c, S_DCQ + 0, av1lt.dc_q(bdi, qclip(qidx + sg(c, S_DQD + 0) - 128)))
+    ss(c, S_DCQ + 1, av1lt.ac_q(bdi, qclip(qidx)))
+    ss(c, S_DCQ + 2, av1lt.dc_q(bdi, qclip(qidx + sg(c, S_DQD + 1) - 128)))
+    ss(c, S_DCQ + 3, av1lt.ac_q(bdi, qclip(qidx + sg(c, S_DQD + 2) - 128)))
+    ss(c, S_DCQ + 4, av1lt.dc_q(bdi, qclip(qidx + sg(c, S_DQD + 3) - 128)))
+    ss(c, S_DCQ + 5, av1lt.ac_q(bdi, qclip(qidx + sg(c, S_DQD + 4) - 128)))
+}
+
+fn tile_set_quant_ext(c: u64, qm_present: i64, qm_y: i64, qm_u: i64, qm_v: i64, dq_present: i64, dq_res: i64) {
+    if qm_present != 0 {
+        ss(c, S_QML + 0, qm_y)
+        ss(c, S_QML + 1, qm_u)
+        ss(c, S_QML + 2, qm_v)
+    }
+    ss(c, S_DQPRES, dq_present)
+    ss(c, S_DQRES, dq_res)
+}
+
 fn tile_set_frame(c: u64, qidx: i64, tx_mode: i64, reduced_tx: i64, sct: i64, lossless: i64, dq_ydc: i64, dq_udc: i64, dq_uac: i64,
                   dq_vdc: i64, dq_vac: i64, bit_depth: i64, subx: i64, suby: i64, cdef_bits: i64, enable_cdef: i64, unsupported: i64) -> i64 {
     ss(c, S_QIDX, qidx)
@@ -410,12 +439,17 @@ fn tile_set_frame(c: u64, qidx: i64, tx_mode: i64, reduced_tx: i64, sct: i64, lo
     if bit_depth < 8 || bit_depth > 12 {
         bdi = 0
     }
-    ss(c, S_DCQ + 0, av1lt.dc_q(bdi, qclip(qidx + dq_ydc - 128)))
-    ss(c, S_DCQ + 1, av1lt.ac_q(bdi, qclip(qidx)))
-    ss(c, S_DCQ + 2, av1lt.dc_q(bdi, qclip(qidx + dq_udc - 128)))
-    ss(c, S_DCQ + 3, av1lt.ac_q(bdi, qclip(qidx + dq_uac - 128)))
-    ss(c, S_DCQ + 4, av1lt.dc_q(bdi, qclip(qidx + dq_vdc - 128)))
-    ss(c, S_DCQ + 5, av1lt.ac_q(bdi, qclip(qidx + dq_vac - 128)))
+    ss(c, S_BDI, bdi)
+    ss(c, S_DQD + 0, dq_ydc)
+    ss(c, S_DQD + 1, dq_udc)
+    ss(c, S_DQD + 2, dq_uac)
+    ss(c, S_DQD + 3, dq_vdc)
+    ss(c, S_DQD + 4, dq_vac)
+    ss(c, S_QML + 0, av1qm.NONE_LEVEL)
+    ss(c, S_QML + 1, av1qm.NONE_LEVEL)
+    ss(c, S_QML + 2, av1qm.NONE_LEVEL)
+    ss(c, S_CURQ, qidx)
+    set_quant(c, qidx)
     var bad: i64 = unsupported
     if subx != suby || subx > 1 || bit_depth != 8 {
         bad = 1
@@ -1436,8 +1470,17 @@ fn reconstruct(c: u64, plane: i64, sx: i64, sy: i64, txsz: i64) {
         reconstruct_wht(c, plane, sx, sy)
         return
     }
+    var qm: u64 = 0
+    let level: i64 = sg(c, S_QML + plane)
+    if level < av1qm.NONE_LEVEL && sg(c, S_TXTYPE) < 9 {
+        var chroma: i64 = 0
+        if plane > 0 {
+            chroma = 1
+        }
+        qm = av1qm.level_base(level, chroma) + (av1qm.tx_offset(av1txfm.tx_log2w(txsz), av1txfm.tx_log2h(txsz)) as u64)
+    }
     av1recon.recon_block(sg(c, S_WORK) as u64, sg(c, S_QUANT) as u64, plane_ptr(c, plane), tile_stride(c), sx, sy, plane_w(c, plane), plane_h(c, plane),
-                         txsz, sg(c, S_TXTYPE), sg(c, S_DCQ + plane * 2), sg(c, S_DCQ + plane * 2 + 1), sg(c, S_BD))
+                         txsz, sg(c, S_TXTYPE), sg(c, S_DCQ + plane * 2), sg(c, S_DCQ + plane * 2 + 1), sg(c, S_BD), qm)
 }
 
 fn transform_block(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i64) {
@@ -1549,6 +1592,29 @@ fn read_cfl(c: u64) {
     }
 }
 
+fn read_delta_qindex(c: u64, size: i64, skip: i64) {
+    if sg(c, S_RDELTAS) == 0 || (size == 12 && skip != 0) {
+        ss(c, S_RDELTAS, 0)
+        return
+    }
+    var mag: i64 = rs(c, mcell(c, avif_cdf.M_DELTA_Q as i64), 4)
+    if mag == 3 {
+        let rem: i64 = av1sym.sym_literal(symp(c), 3) + 1
+        let low: i64 = av1sym.sym_literal(symp(c), rem)
+        mag = low + (1 << rem) + 1
+    }
+    if mag != 0 {
+        var step: i64 = mag
+        if av1sym.sym_literal(symp(c), 1) != 0 {
+            step = 0 - mag
+        }
+        let cur: i64 = imax(1, imin(255, sg(c, S_CURQ) + step * (1 << sg(c, S_DQRES))))
+        ss(c, S_CURQ, cur)
+        set_quant(c, cur)
+    }
+    ss(c, S_RDELTAS, 0)
+}
+
 fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
     if sg(c, S_ERR) != 0 {
         return
@@ -1613,6 +1679,7 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
         stb(sg(c, S_CDEFIDX) as u64, (r >> 4) * sg(c, S_SBCOLS) + (cc >> 4), ci + 1)
         ss(c, S_CDEFDONE, 1)
     }
+    read_delta_qindex(c, size, skip)
     var am: i64 = 0
     var lm: i64 = 0
     if avu != 0 {
@@ -1974,6 +2041,7 @@ fn tile_run(c: u64) {
         while cc < mc {
             clear_block_decoded(c, r, cc)
             ss(c, S_CDEFDONE, 0)
+            ss(c, S_RDELTAS, sg(c, S_DQPRES))
             if sg(c, S_LR) != 0 {
                 av1lr.lr_read_sb(sg(c, S_LR) as u64, symp(c), r, cc)
             }

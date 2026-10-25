@@ -316,6 +316,23 @@ const firnTag = document.currentScript;
             n.onclose = () => { delete notes[id]; ev(x.firn_web_dialog(...give('notify-close'), 0, 0, 1, id)); };
             return id;
         },
+        firn_web_download(np, nn, mp, mn, p, n) {
+            try {
+                const name = str(np, nn), mime = str(mp, mn) || 'application/octet-stream';
+                const blob = new Blob([bytes(p, n).slice()], { type: mime });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = name;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 30000);
+                (window.firnDownloads = window.firnDownloads || []).push({ name, mime, size: blob.size });
+                return 1;
+            } catch (e) { return 0; }
+        },
         firn_web_notify_close(id) {
             const n = notes[id];
             if (!n) return 0;
@@ -537,7 +554,9 @@ const firnTag = document.currentScript;
     // pointer and not a second mouse; an older module gets the one pointer.
     const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
     const PTYPE = { mouse: 1, touch: 2, pen: 3 };
-    const ptr = (kind, e) => x.firn_web_pointer_ex
+    const ptr = (kind, e) => x.firn_web_pointer_px
+        ? x.firn_web_pointer_px(kind, ...at(e), e.pointerId, PTYPE[e.pointerType] || 1, e.isPrimary ? 1 : 0, e.timeStamp, e.pressure)
+        : x.firn_web_pointer_ex
         ? x.firn_web_pointer_ex(kind, ...at(e), e.pointerId, PTYPE[e.pointerType] || 1, e.isPrimary ? 1 : 0, e.timeStamp)
         : x.firn_web_pointer(kind === 4 ? 2 : kind, ...at(e));
     // A page that handles touch itself (the module says so) must not be

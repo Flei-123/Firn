@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/barcode/code128.fi -- barcode.code128: Code 128 (sets A, B, C, FNC1, FNC4, shifts) encoder and run-length decoder.
+
+import std.rt
+import barcode.bcutil
+import barcode.bctab
+
+export { code128_encode, code128_decode_runs, CODE128_AUTO, CODE128_A, CODE128_B, CODE128_C }
+
+const CODE128_AUTO: u32 = 0
+const CODE128_A: u32 = 1
+const CODE128_B: u32 = 2
+const CODE128_C: u32 = 3
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn digit_run(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = 0
+    while i + k < n && is_digit(rt.ld8(p, i + k)) {
+        k++
+    }
+    return k
+}
+
+fn push_symbol(m: *mut rt.Buf, v: i64) {
+    var dark: bool = true
+    var j: i64 = 0
+    while j < 6 {
+        bcutil.mods_push_run(m, dark, (rt.ld8(bctab.CODE128_WIDTHS.p as u64, (v * 6 + j) as usize) as i64) - 48)
+        dark = !dark
+        j = j + 1
+    }
+}
+
+fn push_code(codes: *mut rt.Buf, v: i64) {
+    rt.buf_push(codes, v as u8)
+}
+
+fn code128_encode(p: u64, n: usize, set: u32, m: *mut rt.Buf) -> BcError!bool {
+    if n == 0 {
+        return BcError::BadArg
+    }
+    var codes: rt.Buf = rt.buf_new()
+    var cur: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c > 127 as u8 {
+            rt.buf_free(&codes)
+            return BcError::BadArg
+        }
+        i++
+    }
+    i = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        let run: usize = digit_run(p, n, i)
+        var want: i64 = 2
+        if set == CODE128_A {
+            want = 1
+        }
+        if set == CODE128_B {
+            want = 2
+        }
+        if set == CODE128_C {
+            want = 3
+        }
+        if set == CODE128_AUTO {
+            if run >= 4 || (run >= 2 && i + run == n && i == 0) || (run >= 2 && i + run == n && cur == 3) {
+                want = 3
+            } else {
+                if cur == 3 {
+                    want = 2
+                } else {
+                    want = cur
+                }
+                if c < 32 as u8 {
+                    want = 1
+                }
+                if want == 0 {
+                    want = 2
+                }
+                if cur == 1 && c >= 96 as u8 {
+                    want = 2
+                }
+                if cur == 2 && c < 32 as u8 {
+                    want = 1
+                }
+            }
+            if want == 3 && cur != 3 && (run % 2) == 1 && run < 4 {
+                want = 2
+            }
+        }
+        if want == 3 {
+            if run < 2 {
+                rt.buf_free(&codes)
+                return BcError::BadArg
+            }
+        }
+        if want == 1 && c >= 96 as u8 {
+            rt.buf_free(&codes)
+            return BcError::BadArg
+        }
+        if want == 2 && c < 32 as u8 {
+            rt.buf_free(&codes)
+            return BcError::BadArg
+        }
+        if want != cur {
+            if cur == 0 {
+                push_code(&codes, 102 + want)
+            } else {
+                if want == 1 {
+                    push_code(&codes, 101)
+                }
+                if want == 2 {
+                    push_code(&codes, 100)
+                }
+                if want == 3 {
+                    push_code(&codes, 99)
+                }
+            }
+            cur = want
+        }
+        if cur == 3 {
+            let a: i64 = (rt.ld8(p, i) as i64) - 48
+            let b: i64 = (rt.ld8(p, i + 1) as i64) - 48
+            push_code(&codes, a * 10 + b)
+            i = i + 2
+        } else {
+            if cur == 1 {
+                if c < 32 as u8 {
+                    push_code(&codes, (c as i64) + 64)
+                } else {
+                    push_code(&codes, (c as i64) - 32)
+                }
+            } else {
+                push_code(&codes, (c as i64) - 32)
+            }
+            i++
+        }
+    }
+    var sum: i64 = rt.buf_at(&codes, 0) as i64
+    var k: usize = 1
+    while k < rt.buf_len(&codes) {
+        sum = sum + (k as i64) * (rt.buf_at(&codes, k) as i64)
+        k++
+    }
+    push_code(&codes, sum % 103)
+    rt.buf_clear(m)
+    k = 0
+    while k < rt.buf_len(&codes) {
+        push_symbol(m, rt.buf_at(&codes, k) as i64)
+        k++
+    }
+    var dark: bool = true
+    var j: i64 = 0
+    while j < 7 {
+        bcutil.mods_push_run(m, dark, (rt.ld8(bctab.CODE128_STOP.p as u64, j as usize) as i64) - 48)
+        dark = !dark
+        j = j + 1
+    }
+    rt.buf_free(&codes)
+    return true
+}
+
+fn match_symbol(r: u64, i: i64) -> i64 {
+    var total: f64 = 0.0
+    var j: i64 = 0
+    while j < 6 {
+        total = total + bcutil.runs_w(r, i + j)
+        j = j + 1
+    }
+    let mw: f64 = total / 11.0
+    var best: f64 = 1000000.0
+    var best_v: i64 = 0 - 1
+    var second: f64 = 1000000.0
+    var v: i64 = 0
+    while v < 106 {
+        var err: f64 = 0.0
+        j = 0
+        while j < 6 {
+            let tw: f64 = ((rt.ld8(bctab.CODE128_WIDTHS.p as u64, (v * 6 + j) as usize) as i64) - 48) as f64
+            err = err + bcutil.bc_fabs(bcutil.runs_w(r, i + j) / mw - tw)
+            j = j + 1
+        }
+        if err < best {
+            second = best
+            best = err
+            best_v = v
+        } else {
+            if err < second {
+                second = err
+            }
+        }
+        v = v + 1
+    }
+    if best > 2.2 {
+        return 0 - 1
+    }
+    return best_v
+}
+
+fn emit(out: *mut rt.Buf, set: i64, v: i64, high: bool) {
+    var c: i64 = v + 32
+    if set == 1 && v >= 64 {
+        c = v - 64
+    }
+    if high {
+        c = c + 128
+    }
+    rt.buf_push(out, c as u8)
+}
+
+fn decode_at(r: u64, nr: i64, s: i64, out: *mut rt.Buf) -> bool {
+    if s + 6 > nr {
+        return false
+    }
+    let st: i64 = match_symbol(r, s)
+    if st < 103 || st > 105 {
+        return false
+    }
+    var mw0: f64 = 0.0
+    var q0: i64 = 0
+    while q0 < 6 {
+        mw0 = mw0 + bcutil.runs_w(r, s + q0)
+        q0 = q0 + 1
+    }
+    mw0 = mw0 / 11.0
+    if s > 0 && bcutil.runs_w(r, s - 1) < mw0 * 4.0 {
+        return false
+    }
+    var set: i64 = st - 102
+    var sum: i64 = st
+    var pos: i64 = s + 6
+    var idx: i64 = 1
+    var shift: bool = false
+    var high: bool = false
+    var high_once: bool = false
+    var text: rt.Buf = rt.buf_new()
+    var done: bool = false
+    var ok: bool = false
+    while !done {
+        if pos + 6 > nr {
+            break
+        }
+        let v: i64 = match_symbol(r, pos)
+        if v < 0 {
+            break
+        }
+        if pos + 13 <= nr && v == 106 {
+            break
+        }
+        var check_pos: i64 = pos + 6
+        if check_pos + 7 <= nr {
+            let ck: i64 = match_symbol(r, check_pos)
+            if ck >= 0 && ck < 103 && ck == (sum + idx * v) % 103 {
+                var stop: f64 = 0.0
+                var j: i64 = 0
+                var sw: f64 = 0.0
+                while j < 7 {
+                    sw = sw + bcutil.runs_w(r, check_pos + 6 + j)
+                    j = j + 1
+                }
+                var mw: f64 = 0.0
+                j = 0
+                while j < 6 {
+                    mw = mw + bcutil.runs_w(r, check_pos + j)
+                    j = j + 1
+                }
+                mw = mw / 11.0
+                var good: bool = true
+                if bcutil.bc_fabs(sw / mw - 13.0) > 3.0 {
+                    good = false
+                }
+                if good && check_pos + 13 < nr && bcutil.runs_w(r, check_pos + 13) < mw * 4.0 {
+                    good = false
+                }
+                if good {
+                    var ccode: i64 = v
+                    var dummy: i64 = ccode
+                    if set == 3 {
+                        if v < 100 {
+                            rt.buf_push(&text, (48 + v / 10) as u8)
+                            rt.buf_push(&text, (48 + v % 10) as u8)
+                        }
+                    } else {
+                        if v < 96 {
+                            emit(&text, set, v, high || high_once)
+                        }
+                    }
+                    ok = true
+                    done = true
+                    continue
+                }
+            }
+        }
+        sum = sum + idx * v
+        idx = idx + 1
+        pos = pos + 6
+        var cur: i64 = set
+        if shift {
+            if cur == 1 {
+                cur = 2
+            } else {
+                cur = 1
+            }
+            shift = false
+        }
+        if v >= 103 {
+            ok = false
+            break
+        }
+        if cur == 3 {
+            if v < 100 {
+                rt.buf_push(&text, (48 + v / 10) as u8)
+                rt.buf_push(&text, (48 + v % 10) as u8)
+            }
+            if v == 100 {
+                set = 2
+            }
+            if v == 101 {
+                set = 1
+            }
+        } else {
+            if v < 96 {
+                emit(&text, cur, v, high || high_once)
+                high_once = false
+            }
+            if v == 98 {
+                shift = true
+            }
+            if v == 99 {
+                set = 3
+            }
+            if v == 100 && cur == 1 {
+                set = 2
+            }
+            if v == 101 && cur == 2 {
+                set = 1
+            }
+            if v == 100 && cur == 2 {
+                high_once = true
+            }
+            if v == 101 && cur == 1 {
+                high_once = true
+            }
+        }
+    }
+    if ok && rt.buf_len(&text) > 0 {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&text), rt.buf_len(&text))
+    } else {
+        ok = false
+    }
+    rt.buf_free(&text)
+    return ok
+}
+
+fn code128_decode_runs(r: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var s: i64 = 0
+    let nr: i64 = n as i64
+    while s + 6 + 6 + 6 + 7 <= nr {
+        if decode_at(r, nr, s, out) {
+            return true
+        }
+        s = s + 2
+    }
+    return false
+}
