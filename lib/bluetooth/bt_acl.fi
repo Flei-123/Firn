@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import bluetooth.bt_le
+import bluetooth.bt_hci
+
+export {
+    PB_START_HOST, PB_CONTINUE, PB_START_CONTROLLER,
+    CID_ATT, CID_LE_SIGNALING, CID_SMP, CID_SIGNALING,
+    L2Asm, l2asm_new, l2asm_free, l2asm_reset, l2asm_feed, l2asm_cid,
+    l2asm_payload, l2asm_payload_len,
+    acl_frame_l2cap, acl_parse_header,
+    FEED_MORE, FEED_DONE, FEED_ERROR,
+}
+
+const PB_START_HOST: u32 = 0
+const PB_CONTINUE: u32 = 1
+const PB_START_CONTROLLER: u32 = 2
+
+const CID_SIGNALING: u32 = 1
+const CID_ATT: u32 = 4
+const CID_LE_SIGNALING: u32 = 5
+const CID_SMP: u32 = 6
+
+const FEED_MORE: i32 = 0
+const FEED_DONE: i32 = 1
+const FEED_ERROR: i32 = 0 - 1
+
+struct L2Asm {
+    buf: rt.Buf,
+    handle: u32,
+    want: usize,
+    active: bool,
+}
+
+fn l2asm_new() -> L2Asm {
+    return L2Asm { buf: rt.buf_new(), handle: 0, want: 0, active: false }
+}
+
+fn l2asm_free(a: *mut L2Asm) {
+    rt.buf_free(&(*a).buf)
+}
+
+fn l2asm_reset(a: *mut L2Asm) {
+    rt.buf_clear(&(*a).buf)
+    (*a).want = 0
+    (*a).active = false
+}
+
+fn acl_parse_header(p: u64, n: usize, handle: *mut u32, pb: *mut u32, dlen: *mut usize) -> bool {
+    if n < 5 || rt.ld8(p, 0) != bt_hci.H4_ACL as u8 {
+        return false
+    }
+    let w: u32 = bt_le.le_get16(p, 1)
+    *handle = w & 4095
+    *pb = (w >> 12) & 3
+    *dlen = bt_le.le_get16(p, 3) as usize
+    return n == 5 + *dlen
+}
+
+fn l2asm_feed(a: *mut L2Asm, p: u64, n: usize) -> i32 {
+    var handle: u32 = 0
+    var pb: u32 = 0
+    var dlen: usize = 0
+    if !acl_parse_header(p, n, &handle, &pb, &dlen) {
+        return FEED_ERROR
+    }
+    if pb == PB_START_HOST || pb == PB_START_CONTROLLER {
+        l2asm_reset(a)
+        if dlen < 4 {
+            return FEED_ERROR
+        }
+        (*a).handle = handle
+        (*a).want = bt_le.le_get16(p, 5) as usize + 4
+        (*a).active = true
+    } else if pb == PB_CONTINUE {
+        if !(*a).active || handle != (*a).handle {
+            return FEED_ERROR
+        }
+    } else {
+        return FEED_ERROR
+    }
+    rt.buf_push_bytes(&(*a).buf, p + 5 as u64, dlen)
+    let have: usize = rt.buf_len(&(*a).buf)
+    if have > (*a).want {
+        l2asm_reset(a)
+        return FEED_ERROR
+    }
+    if have == (*a).want {
+        return FEED_DONE
+    }
+    return FEED_MORE
+}
+
+fn l2asm_cid(a: *mut L2Asm) -> u32 {
+    return bt_le.le_get16(rt.buf_ptr(&(*a).buf), 2)
+}
+
+fn l2asm_payload(a: *mut L2Asm) -> u64 {
+    return rt.buf_ptr(&(*a).buf) + 4 as u64
+}
+
+fn l2asm_payload_len(a: *mut L2Asm) -> usize {
+    return rt.buf_len(&(*a).buf) - 4
+}
+
+fn acl_frame_l2cap(out: *mut rt.Buf, handle: u32, cid: u32, payload: u64, n: usize, max_data: usize) -> u32 {
+    var frame: rt.Buf = rt.buf_new()
+    bt_le.le_put16(&frame, n as u32)
+    bt_le.le_put16(&frame, cid)
+    bt_le.le_put_raw(&frame, payload, n)
+    let total: usize = rt.buf_len(&frame)
+    let fp: u64 = rt.buf_ptr(&frame)
+    var off: usize = 0
+    var count: u32 = 0
+    while off < total {
+        var take: usize = total - off
+        if take > max_data {
+            take = max_data
+        }
+        let pb: u32 = if off == 0 { PB_START_HOST } else { PB_CONTINUE }
+        bt_le.le_put8(out, bt_hci.H4_ACL)
+        bt_le.le_put16(out, handle | (pb << 12))
+        bt_le.le_put16(out, take as u32)
+        bt_le.le_put_raw(out, fp + off as u64, take)
+        off = off + take
+        count = count + 1
+    }
+    rt.buf_free(&frame)
+    return count
+}
