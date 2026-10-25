@@ -10,7 +10,7 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 export SPR_DUMP_DIR=$W
 ERR=0
-for t in tests/5370_mc_cont_spr.fi tests/5371_mc_creative_spr.fi; do
+for t in tests/5370_mc_cont_spr.fi tests/5371_mc_creative_spr.fi tests/5431_mc_trade_strike.fi; do
   $FIRNC -o "$W/t" "$t" && "$W/t" || { echo "  FAIL  $t"; ERR=1; }
 done
 for k in enchant brewing anvil horse; do
