@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_huff.fi -- jxl_huff: JPEG XL prefix codes (simple and normal Brotli-style codes) as canonical decoders
+import std.rt
+import jxl.jxl_bits
+
+export {
+    huff_block_bytes, huff_read_code, huff_decode, huff_single_code, huff_var_len_u8, huff_var_len_u16,
+}
+
+const HUFF_COUNTS: usize = 16
+const HUFF_SINGLE: usize = 16
+const HUFF_SYMS: usize = 17
+
+static CL_ORDER: [u8; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+static CL_BITS: [u8; 16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+static CL_VAL: [u8; 16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+
+fn huff_block_bytes(alphabet: usize) -> usize {
+    return (HUFF_SYMS + alphabet) * 2
+}
+
+fn huff_var_len_u8(b: *mut jxl_bits.JxlBits) -> u32 {
+    if jxl_bits.jb_bit(b) {
+        let nbits: u32 = jxl_bits.jb_read(b, 3)
+        if nbits == 0 {
+            return 1
+        }
+        return jxl_bits.jb_read(b, nbits) + ((1 as u32) << nbits)
+    }
+    return 0
+}
+
+fn huff_var_len_u16(b: *mut jxl_bits.JxlBits) -> u32 {
+    if jxl_bits.jb_bit(b) {
+        let nbits: u32 = jxl_bits.jb_read(b, 4)
+        if nbits == 0 {
+            return 1
+        }
+        return jxl_bits.jb_read(b, nbits) + ((1 as u32) << nbits)
+    }
+    return 0
+}
+
+fn huff_single_code(blk: u64, symbol: u32) {
+    var i: usize = 0
+    while i < HUFF_SYMS {
+        rt.st16(blk, i, 0 as u16)
+        i = i + 1
+    }
+    rt.st16(blk, HUFF_SINGLE, (symbol + 1) as u16)
+}
+
+fn huff_build(lens: u64, n: usize, blk: u64) -> bool {
+    var counts: [i32; 16] = [0; 16]
+    var i: usize = 0
+    var used: usize = 0
+    var last: usize = 0
+    while i < n {
+        let l: usize = rt.ld8(lens, i) as usize
+        counts[l] = counts[l] + 1
+        if l != 0 {
+            used = used + 1
+            last = i
+        }
+        i = i + 1
+    }
+    if used == 0 {
+        return false
+    }
+    if used == 1 {
+        huff_single_code(blk, last as u32)
+        return true
+    }
+    var left: i32 = 1
+    var len: usize = 1
+    while len < 16 {
+        left = left * 2 - counts[len]
+        if left < 0 {
+            return false
+        }
+        len = len + 1
+    }
+    if left != 0 {
+        return false
+    }
+    var offs: [i32; 17] = [0; 17]
+    len = 1
+    while len < 16 {
+        offs[len + 1] = offs[len] + counts[len]
+        len = len + 1
+    }
+    len = 0
+    while len < 16 {
+        rt.st16(blk, len, (if_zero(len, counts[len])) as u16)
+        len = len + 1
+    }
+    rt.st16(blk, HUFF_SINGLE, 0 as u16)
+    i = 0
+    while i < n {
+        let l: usize = rt.ld8(lens, i) as usize
+        if l != 0 {
+            rt.st16(blk, HUFF_SYMS + offs[l] as usize, i as u16)
+            offs[l] = offs[l] + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn if_zero(len: usize, c: i32) -> i32 {
+    if len == 0 {
+        return 0
+    }
+    return c
+}
+
+fn huff_decode(b: *mut jxl_bits.JxlBits, blk: u64) -> u32 {
+    let single: u32 = rt.ld16(blk, HUFF_SINGLE) as u32
+    if single != 0 {
+        return single - 1
+    }
+    var code: i32 = 0
+    var first: i32 = 0
+    var index: i32 = 0
+    var len: usize = 1
+    while len < 16 {
+        code = code | (jxl_bits.jb_read(b, 1) as i32)
+        let count: i32 = rt.ld16(blk, len) as i32
+        if code - count < first {
+            return rt.ld16(blk, HUFF_SYMS + (index + (code - first)) as usize) as u32
+        }
+        index = index + count
+        first = (first + count) << 1
+        code = code << 1
+        len = len + 1
+    }
+    (*b).over = true
+    return 0
+}
+
+fn read_simple(b: *mut jxl_bits.JxlBits, alphabet: usize, blk: u64) -> bool {
+    var max_bits: u32 = 0
+    if alphabet > 1 {
+        var v: usize = alphabet - 1
+        while v > 0 {
+            max_bits = max_bits + 1
+            v = v >> 1
+        }
+    }
+    var num: u32 = jxl_bits.jb_read(b, 2) + 1
+    var syms: [u32; 4] = [0; 4]
+    var i: u32 = 0
+    while i < num {
+        let s: u32 = jxl_bits.jb_read(b, max_bits)
+        if s as usize >= alphabet {
+            return false
+        }
+        syms[i as usize] = s
+        i = i + 1
+    }
+    i = 0
+    while i + 1 < num {
+        var j: u32 = i + 1
+        while j < num {
+            if syms[i as usize] == syms[j as usize] {
+                return false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var tree_select: bool = false
+    if num == 4 {
+        tree_select = jxl_bits.jb_bit(b)
+    }
+    var lens: u64 = rt.heap_alloc(alphabet + 8)
+    if lens == 0 {
+        return false
+    }
+    var ok: bool = true
+    var order: [u32; 4] = [0; 4]
+    var k: u32 = 0
+    while k < num {
+        order[k as usize] = syms[k as usize]
+        k = k + 1
+    }
+    if num == 1 {
+        rt.st8(lens, order[0] as usize, 1 as u8)
+        huff_single_code(blk, order[0])
+    } else {
+        if num == 2 {
+            sort_range(&order, 0, 2)
+            rt.st8(lens, order[0] as usize, 1 as u8)
+            rt.st8(lens, order[1] as usize, 1 as u8)
+        } else if num == 3 {
+            sort_range(&order, 1, 3)
+            rt.st8(lens, order[0] as usize, 1 as u8)
+            rt.st8(lens, order[1] as usize, 2 as u8)
+            rt.st8(lens, order[2] as usize, 2 as u8)
+        } else if !tree_select {
+            sort_range(&order, 0, 4)
+            rt.st8(lens, order[0] as usize, 2 as u8)
+            rt.st8(lens, order[1] as usize, 2 as u8)
+            rt.st8(lens, order[2] as usize, 2 as u8)
+            rt.st8(lens, order[3] as usize, 2 as u8)
+        } else {
+            sort_range(&order, 2, 4)
+            rt.st8(lens, order[0] as usize, 1 as u8)
+            rt.st8(lens, order[1] as usize, 2 as u8)
+            rt.st8(lens, order[2] as usize, 3 as u8)
+            rt.st8(lens, order[3] as usize, 3 as u8)
+        }
+        ok = huff_build(lens, alphabet, blk)
+    }
+    rt.heap_free(lens, alphabet + 8)
+    return ok
+}
+
+fn sort_range(a: *mut [u32; 4], lo: usize, hi: usize) {
+    var i: usize = lo
+    while i < hi {
+        var j: usize = i + 1
+        while j < hi {
+            if (*a)[i] > (*a)[j] {
+                let t: u32 = (*a)[i]
+                (*a)[i] = (*a)[j]
+                (*a)[j] = t
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn read_lengths(b: *mut jxl_bits.JxlBits, cl_blk: u64, n: usize, lens: u64) -> bool {
+    var symbol: usize = 0
+    var prev_len: u32 = 8
+    var repeat: i32 = 0
+    var repeat_len: u32 = 0
+    var space: i32 = 32768
+    while symbol < n && space > 0 {
+        let code_len: u32 = huff_decode(b, cl_blk)
+        if code_len < 16 {
+            repeat = 0
+            rt.st8(lens, symbol, code_len as u8)
+            symbol = symbol + 1
+            if code_len != 0 {
+                prev_len = code_len
+                space = space - ((32768 as i32) >> (code_len as i32))
+            }
+        } else {
+            let extra: u32 = code_len - 14
+            var new_len: u32 = 0
+            if code_len == 16 {
+                new_len = prev_len
+            }
+            if repeat_len != new_len {
+                repeat = 0
+                repeat_len = new_len
+            }
+            let old_repeat: i32 = repeat
+            if repeat > 0 {
+                repeat = (repeat - 2) << (extra as i32)
+            }
+            repeat = repeat + (jxl_bits.jb_read(b, extra) as i32) + 3
+            let delta: i32 = repeat - old_repeat
+            if symbol + (delta as usize) > n {
+                return false
+            }
+            var k: i32 = 0
+            while k < delta {
+                rt.st8(lens, symbol + (k as usize), repeat_len as u8)
+                k = k + 1
+            }
+            symbol = symbol + (delta as usize)
+            if repeat_len != 0 {
+                space = space - (delta << (15 - (repeat_len as i32)))
+            }
+        }
+        if jxl_bits.jb_over(b) {
+            return false
+        }
+    }
+    return space == 0
+}
+
+fn huff_read_code(b: *mut jxl_bits.JxlBits, alphabet: usize, blk: u64) -> bool {
+    if alphabet > 32768 || alphabet == 0 {
+        return false
+    }
+    if alphabet == 1 {
+        huff_single_code(blk, 0)
+        return true
+    }
+    let skip: u32 = jxl_bits.jb_read(b, 2)
+    if skip == 1 {
+        return read_simple(b, alphabet, blk)
+    }
+    var cll: u64 = rt.heap_alloc(32)
+    var cl_blk: u64 = rt.heap_alloc(huff_block_bytes(18))
+    var lens: u64 = rt.heap_alloc(alphabet + 8)
+    if cll == 0 || cl_blk == 0 || lens == 0 {
+        return false
+    }
+    var space: i32 = 32
+    var num_codes: i32 = 0
+    var i: usize = skip as usize
+    while i < 18 && space > 0 {
+        let idx: usize = jxl_bits.jb_peek(b, 4) as usize
+        jxl_bits.jb_consume(b, CL_BITS[idx] as u32)
+        let v: u32 = CL_VAL[idx] as u32
+        rt.st8(cll, CL_ORDER[i] as usize, v as u8)
+        if v != 0 {
+            space = space - ((32 as i32) >> (v as i32))
+            num_codes = num_codes + 1
+        }
+        i = i + 1
+    }
+    var ok: bool = (num_codes == 1 || space == 0) && huff_build(cll, 18, cl_blk)
+    if ok {
+        ok = read_lengths(b, cl_blk, alphabet, lens)
+    }
+    if ok {
+        ok = huff_build(lens, alphabet, blk)
+    }
+    rt.heap_free(cll, 32)
+    rt.heap_free(cl_blk, huff_block_bytes(18))
+    rt.heap_free(lens, alphabet + 8)
+    return ok
+}

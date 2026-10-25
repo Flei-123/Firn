@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_code.fi -- jxl_code: JPEG XL entropy codes (histograms, context map, hybrid uint, LZ77) and the symbol reader
+import std.rt
+import jxl.jxl_bits
+import jxl.jxl_err
+import jxl.jxl_huff
+import jxl.jxl_ans
+
+export {
+    JxlCode, JxlReader, code_new, code_free, code_read, reader_new, reader_free, reader_init,
+    reader_read, reader_read_hist, reader_final_ok, code_hist,
+}
+
+const WINDOW: usize = 1048576
+const WINDOW_MASK: u64 = 1048575
+const NUM_SPECIAL: usize = 120
+
+static SPECIAL: [i8; 240] = [
+    0, 1, 1, 0, 1, 1, -1, 1, 0, 2, 2, 0, 1, 2, -1, 2, 2, 1, -2, 1, 2, 2, -2, 2, 0, 3, 3, 0, 1, 3, -1, 3,
+    3, 1, -3, 1, 2, 3, -2, 3, 3, 2, -3, 2, 0, 4, 4, 0, 1, 4, -1, 4, 4, 1, -4, 1, 3, 3, -3, 3, 2, 4, -2, 4,
+    4, 2, -4, 2, 0, 5, 3, 4, -3, 4, 4, 3, -4, 3, 5, 0, 1, 5, -1, 5, 5, 1, -5, 1, 2, 5, -2, 5, 5, 2, -5, 2,
+    4, 4, -4, 4, 3, 5, -3, 5, 5, 3, -5, 3, 0, 6, 6, 0, 1, 6, -1, 6, 6, 1, -6, 1, 2, 6, -2, 6, 6, 2, -6, 2,
+    4, 5, -4, 5, 5, 4, -5, 4, 3, 6, -3, 6, 6, 3, -6, 3, 0, 7, 7, 0, 1, 7, -1, 7, 5, 5, -5, 5, 7, 1, -7, 1,
+    4, 6, -4, 6, 6, 4, -6, 4, 2, 7, -2, 7, 7, 2, -7, 2, 3, 7, -3, 7, 7, 3, -7, 3, 5, 6, -5, 6, 6, 5, -6, 5,
+    8, 0, 4, 7, -4, 7, 7, 4, -7, 4, 8, 1, 8, 2, 6, 6, -6, 6, 8, 3, 5, 7, -5, 7, 7, 5, -7, 5, 8, 4, 6, 7,
+    -6, 7, 7, 6, -7, 6, 8, 5, 7, 7, -7, 7, 8, 6, 8, 7]
+
+struct JxlCode {
+    use_prefix: bool,
+    log_alpha: u32,
+    nhist: u32,
+    nctx: u32,
+    ctxmap: u64,
+    ucfg: u64,
+    alias: u64,
+    huff: u64,
+    huff_off: u64,
+    huff_size: usize,
+    lz77: bool,
+    lz_min_symbol: u32,
+    lz_min_length: u32,
+    lz_split: u32,
+    lz_msb: u32,
+    lz_lsb: u32,
+    dist_ctx: u32,
+}
+
+struct JxlReader {
+    code: *mut JxlCode,
+    state: u32,
+    window: u64,
+    num_decoded: u64,
+    num_to_copy: u32,
+    copy_pos: u64,
+    special: [u32; 120],
+    nspecial: usize,
+}
+
+fn code_new() -> JxlCode {
+    return JxlCode { use_prefix: false, log_alpha: 0, nhist: 0, nctx: 0, ctxmap: 0, ucfg: 0, alias: 0,
+        huff: 0, huff_off: 0, huff_size: 0, lz77: false, lz_min_symbol: 0, lz_min_length: 0,
+        lz_split: 0, lz_msb: 0, lz_lsb: 0, dist_ctx: 0 }
+}
+
+fn code_free(c: *mut JxlCode) {
+    rt.heap_free((*c).ctxmap, (*c).nctx as usize)
+    rt.heap_free((*c).ucfg, (*c).nhist as usize * 12)
+    if (*c).alias != 0 {
+        rt.heap_free((*c).alias, (*c).nhist as usize * (((1 as usize) << ((*c).log_alpha as usize)) * 20))
+    }
+    rt.heap_free((*c).huff, (*c).huff_size)
+    rt.heap_free((*c).huff_off, (*c).nhist as usize * 4)
+    *c = code_new()
+}
+
+fn ceil_log2(x: u32) -> u32 {
+    if x <= 1 {
+        return 0
+    }
+    var v: u32 = x - 1
+    var r: u32 = 0
+    while v > 0 {
+        r = r + 1
+        v = v >> 1
+    }
+    return r
+}
+
+fn read_uint_config(b: *mut jxl_bits.JxlBits, log_alpha: u32, split: *mut u32, msb: *mut u32, lsb: *mut u32) -> bool {
+    let se: u32 = jxl_bits.jb_read(b, ceil_log2(log_alpha + 1))
+    var m: u32 = 0
+    var l: u32 = 0
+    if se != log_alpha {
+        m = jxl_bits.jb_read(b, ceil_log2(se + 1))
+        if m > se {
+            return false
+        }
+        l = jxl_bits.jb_read(b, ceil_log2(se - m + 1))
+    }
+    if l + m > se {
+        return false
+    }
+    *split = se
+    *msb = m
+    *lsb = l
+    return true
+}
+
+fn code_hist(c: *mut JxlCode, ctx: u32) -> u32 {
+    return rt.ld8((*c).ctxmap, ctx as usize) as u32
+}
+
+fn read_context_map(b: *mut jxl_bits.JxlBits, map: u64, n: usize, nhist: *mut u32) -> bool {
+    if jxl_bits.jb_bit(b) {
+        let bits: u32 = jxl_bits.jb_read(b, 2)
+        var i: usize = 0
+        while i < n {
+            var v: u32 = 0
+            if bits != 0 {
+                v = jxl_bits.jb_read(b, bits)
+            }
+            rt.st8(map, i, v as u8)
+            i = i + 1
+        }
+    } else {
+        let use_mtf: bool = jxl_bits.jb_bit(b)
+        var inner: JxlCode = code_new()
+        let r: i32 = code_read(b, 1, n <= 2, &inner)
+        if r != jxl_err.JX_OK {
+            code_free(&inner)
+            return false
+        }
+        var rd: JxlReader = reader_new()
+        if reader_init(&rd, &inner, b, 0) != jxl_err.JX_OK {
+            reader_free(&rd)
+            code_free(&inner)
+            return false
+        }
+        var i: usize = 0
+        var ok: bool = true
+        while i < n {
+            let sym: u32 = reader_read(&rd, b, 0)
+            if sym >= 256 {
+                ok = false
+                break
+            }
+            rt.st8(map, i, sym as u8)
+            i = i + 1
+        }
+        if ok && !reader_final_ok(&rd) {
+            ok = false
+        }
+        reader_free(&rd)
+        code_free(&inner)
+        if !ok || jxl_bits.jb_over(b) {
+            return false
+        }
+        if use_mtf {
+            var mtf: [u8; 256] = [0 as u8; 256]
+            var k: usize = 0
+            while k < 256 {
+                mtf[k] = k as u8
+                k = k + 1
+            }
+            k = 0
+            while k < n {
+                let idx: usize = rt.ld8(map, k) as usize
+                let v: u8 = mtf[idx]
+                rt.st8(map, k, v)
+                if idx != 0 {
+                    var j: usize = idx
+                    while j > 0 {
+                        mtf[j] = mtf[j - 1]
+                        j = j - 1
+                    }
+                    mtf[0] = v
+                }
+                k = k + 1
+            }
+        }
+    }
+    var mx: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let v: u32 = rt.ld8(map, i) as u32
+        if v > mx {
+            mx = v
+        }
+        i = i + 1
+    }
+    *nhist = mx + 1
+    var seen: [u8; 256] = [0 as u8; 256]
+    i = 0
+    while i < n {
+        seen[rt.ld8(map, i) as usize] = 1 as u8
+        i = i + 1
+    }
+    var h: u32 = 0
+    while h <= mx {
+        if seen[h as usize] == 0 {
+            return false
+        }
+        h = h + 1
+    }
+    return true
+}
+
+fn code_read(b: *mut jxl_bits.JxlBits, num_contexts: usize, disallow_lz77: bool, c: *mut JxlCode) -> i32 {
+    *c = code_new()
+    var nctx: usize = num_contexts
+    (*c).lz77 = jxl_bits.jb_bit(b)
+    if (*c).lz77 {
+        (*c).lz_min_symbol = jxl_bits.jb_u32(b, jxl_bits.jd_val(224), jxl_bits.jd_val(512), jxl_bits.jd_val(4096), jxl_bits.jd_off(15, 8))
+        (*c).lz_min_length = jxl_bits.jb_u32(b, jxl_bits.jd_val(3), jxl_bits.jd_val(4), jxl_bits.jd_off(2, 5), jxl_bits.jd_off(8, 9))
+        if !read_uint_config(b, 8, &(*c).lz_split, &(*c).lz_msb, &(*c).lz_lsb) {
+            return jxl_err.JX_BAD
+        }
+        if disallow_lz77 {
+            return jxl_err.JX_BAD
+        }
+        nctx = nctx + 1
+    }
+    (*c).nctx = nctx as u32
+    (*c).ctxmap = rt.heap_alloc(nctx)
+    if (*c).ctxmap == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var nhist: u32 = 1
+    if nctx > 1 {
+        if !read_context_map(b, (*c).ctxmap, nctx, &nhist) {
+            return jxl_err.JX_BAD
+        }
+    }
+    (*c).dist_ctx = rt.ld8((*c).ctxmap, nctx - 1) as u32
+    (*c).nhist = nhist
+    (*c).use_prefix = jxl_bits.jb_bit(b)
+    if (*c).use_prefix {
+        (*c).log_alpha = 15
+    } else {
+        (*c).log_alpha = jxl_bits.jb_read(b, 2) + 5
+    }
+    (*c).ucfg = rt.heap_alloc(nhist as usize * 12)
+    if (*c).ucfg == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var h: u32 = 0
+    while h < nhist {
+        var sp: u32 = 0
+        var m: u32 = 0
+        var l: u32 = 0
+        if !read_uint_config(b, (*c).log_alpha, &sp, &m, &l) {
+            return jxl_err.JX_BAD
+        }
+        rt.st32((*c).ucfg, h as usize * 3, sp)
+        rt.st32((*c).ucfg, h as usize * 3 + 1, m)
+        rt.st32((*c).ucfg, h as usize * 3 + 2, l)
+        h = h + 1
+    }
+    let max_alpha: usize = (1 as usize) << ((*c).log_alpha as usize)
+    if (*c).use_prefix {
+        var sizes: u64 = rt.heap_alloc(nhist as usize * 4)
+        (*c).huff_off = rt.heap_alloc(nhist as usize * 4)
+        if sizes == 0 || (*c).huff_off == 0 {
+            return jxl_err.JX_MEMORY
+        }
+        var total: usize = 0
+        h = 0
+        while h < nhist {
+            let sz: u32 = jxl_huff.huff_var_len_u16(b) + 1
+            if sz as usize > max_alpha {
+                rt.heap_free(sizes, nhist as usize * 4)
+                return jxl_err.JX_BAD
+            }
+            rt.st32(sizes, h as usize, sz)
+            rt.st32((*c).huff_off, h as usize, total as u32)
+            total = total + jxl_huff.huff_block_bytes(sz as usize)
+            h = h + 1
+        }
+        (*c).huff_size = total
+        (*c).huff = rt.heap_alloc(total)
+        if (*c).huff == 0 {
+            rt.heap_free(sizes, nhist as usize * 4)
+            return jxl_err.JX_MEMORY
+        }
+        h = 0
+        var ok: bool = true
+        while h < nhist && ok {
+            let sz: u32 = rt.ld32(sizes, h as usize)
+            let blk: u64 = (*c).huff + rt.ld32((*c).huff_off, h as usize) as u64
+            if sz > 1 {
+                ok = jxl_huff.huff_read_code(b, sz as usize, blk)
+            } else {
+                jxl_huff.huff_single_code(blk, 0)
+            }
+            h = h + 1
+        }
+        rt.heap_free(sizes, nhist as usize * 4)
+        if !ok || jxl_bits.jb_over(b) {
+            return jxl_err.JX_BAD
+        }
+        return jxl_err.JX_OK
+    }
+    let table: usize = (1 as usize) << ((*c).log_alpha as usize)
+    (*c).alias = rt.heap_alloc(nhist as usize * table * 20)
+    var counts: u64 = rt.heap_alloc(jxl_ans.ANS_MAX_ALPHA * 4)
+    if (*c).alias == 0 || counts == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    h = 0
+    var ok2: bool = true
+    while h < nhist && ok2 {
+        var n: usize = 0
+        ok2 = jxl_ans.ans_read_histogram(b, counts, &n)
+        if ok2 && n > max_alpha {
+            ok2 = false
+        }
+        if ok2 {
+            ok2 = jxl_ans.ans_build_alias(counts, n, (*c).log_alpha, (*c).alias + (h as u64 * table as u64 * 20))
+        }
+        h = h + 1
+    }
+    rt.heap_free(counts, jxl_ans.ANS_MAX_ALPHA * 4)
+    if !ok2 || jxl_bits.jb_over(b) {
+        return jxl_err.JX_BAD
+    }
+    return jxl_err.JX_OK
+}
+
+fn reader_new() -> JxlReader {
+    return JxlReader { code: 0 as *mut JxlCode, state: 0, window: 0, num_decoded: 0, num_to_copy: 0,
+        copy_pos: 0, special: [0 as u32; 120], nspecial: 0 }
+}
+
+fn reader_free(r: *mut JxlReader) {
+    if (*r).window != 0 {
+        rt.heap_free((*r).window, WINDOW * 4)
+        (*r).window = 0
+    }
+}
+
+fn reader_init(r: *mut JxlReader, c: *mut JxlCode, b: *mut jxl_bits.JxlBits, dist_mul: u32) -> i32 {
+    (*r).code = c
+    (*r).num_decoded = 0
+    (*r).num_to_copy = 0
+    (*r).copy_pos = 0
+    (*r).nspecial = 0
+    if (*c).use_prefix {
+        (*r).state = 19 << 16
+    } else {
+        (*r).state = jxl_bits.jb_read(b, 32)
+    }
+    if (*c).lz77 {
+        (*r).window = rt.heap_alloc(WINDOW * 4)
+        if (*r).window == 0 {
+            return jxl_err.JX_MEMORY
+        }
+        if dist_mul != 0 {
+            (*r).nspecial = NUM_SPECIAL
+            var i: usize = 0
+            while i < NUM_SPECIAL {
+                var d: i64 = (SPECIAL[i * 2] as i64) + (dist_mul as i64) * (SPECIAL[i * 2 + 1] as i64)
+                if d < 1 {
+                    d = 1
+                }
+                (*r).special[i] = d as u32
+                i = i + 1
+            }
+        }
+    }
+    return jxl_err.JX_OK
+}
+
+fn reader_final_ok(r: *mut JxlReader) -> bool {
+    if (*(*r).code).use_prefix {
+        return true
+    }
+    return (*r).state == (19 << 16)
+}
+
+fn read_symbol(r: *mut JxlReader, b: *mut jxl_bits.JxlBits, hist: u32) -> u32 {
+    let c: *mut JxlCode = (*r).code
+    if (*c).use_prefix {
+        return jxl_huff.huff_decode(b, (*c).huff + rt.ld32((*c).huff_off, hist as usize) as u64)
+    }
+    let log_entry: u32 = jxl_ans.ANS_LOG_TAB - (*c).log_alpha
+    let res: u32 = (*r).state & 4095
+    let i: u32 = res >> log_entry
+    let pos: u32 = res & (((1 as u32) << log_entry) - 1)
+    let table: u64 = (*c).alias + ((hist as u64) << ((*c).log_alpha as u64)) * 20
+    let e: usize = (i as usize) * 5
+    let cutoff: u32 = rt.ld32(table, e)
+    var sym: u32 = i
+    var offset: u32 = pos
+    var freq: u32 = rt.ld32(table, e + 3)
+    if pos >= cutoff {
+        sym = rt.ld32(table, e + 1)
+        offset = rt.ld32(table, e + 2) + pos
+        freq = rt.ld32(table, e + 4)
+    }
+    var st: u64 = (freq as u64) * (((*r).state >> 12) as u64) + (offset as u64)
+    if st < 65536 {
+        st = (st << 16) | (jxl_bits.jb_peek(b, 16) as u64)
+        jxl_bits.jb_consume(b, 16)
+    }
+    (*r).state = (st & 4294967295) as u32
+    return sym
+}
+
+fn hybrid_value(r: *mut JxlReader, b: *mut jxl_bits.JxlBits, split_e: u32, msb: u32, lsb: u32, token_in: u32) -> u32 {
+    let split_token: u32 = (1 as u32) << split_e
+    if token_in < split_token {
+        return token_in
+    }
+    var nbits: u32 = split_e - (msb + lsb) + ((token_in - split_token) >> (msb + lsb))
+    nbits = nbits & 31
+    let low: u32 = token_in & (((1 as u32) << lsb) - 1)
+    let token: u32 = token_in >> lsb
+    let bits: u32 = jxl_bits.jb_read(b, nbits)
+    let hi: u64 = (((1 as u64) << (msb as u64)) | ((token & (((1 as u32) << msb) - 1)) as u64))
+    let ret: u64 = ((((hi << (nbits as u64)) | (bits as u64)) << (lsb as u64)) | (low as u64))
+    return (ret & 4294967295) as u32
+}
+
+fn reader_read_hist(r: *mut JxlReader, b: *mut jxl_bits.JxlBits, hist: u32) -> u32 {
+    let c: *mut JxlCode = (*r).code
+    if (*r).num_to_copy > 0 {
+        let v: u32 = rt.ld32((*r).window, ((*r).copy_pos & WINDOW_MASK) as usize)
+        (*r).copy_pos = (*r).copy_pos + 1
+        (*r).num_to_copy = (*r).num_to_copy - 1
+        rt.st32((*r).window, ((*r).num_decoded & WINDOW_MASK) as usize, v)
+        (*r).num_decoded = (*r).num_decoded + 1
+        return v
+    }
+    let token: u32 = read_symbol(r, b, hist)
+    if (*c).lz77 && token >= (*c).lz_min_symbol {
+        let len: u32 = hybrid_value(r, b, (*c).lz_split, (*c).lz_msb, (*c).lz_lsb, token - (*c).lz_min_symbol)
+        (*r).num_to_copy = len + (*c).lz_min_length
+        let dtok: u32 = read_symbol(r, b, (*c).dist_ctx)
+        let dh: usize = (*c).dist_ctx as usize * 3
+        var dist: u64 = hybrid_value(r, b, rt.ld32((*c).ucfg, dh), rt.ld32((*c).ucfg, dh + 1), rt.ld32((*c).ucfg, dh + 2), dtok) as u64
+        if dist < (*r).nspecial as u64 {
+            dist = (*r).special[dist as usize] as u64
+        } else {
+            dist = dist + 1 - (*r).nspecial as u64
+        }
+        if dist > (*r).num_decoded {
+            dist = (*r).num_decoded
+        }
+        if dist > WINDOW as u64 {
+            dist = WINDOW as u64
+        }
+        (*r).copy_pos = (*r).num_decoded - dist
+        if dist == 0 {
+            var fill: usize = (*r).num_to_copy as usize
+            if fill > WINDOW {
+                fill = WINDOW
+            }
+            var z: usize = 0
+            while z < fill {
+                rt.st32((*r).window, z, 0 as u32)
+                z = z + 1
+            }
+        }
+        return reader_read_hist(r, b, hist)
+    }
+    let h: usize = hist as usize * 3
+    let v: u32 = hybrid_value(r, b, rt.ld32((*c).ucfg, h), rt.ld32((*c).ucfg, h + 1), rt.ld32((*c).ucfg, h + 2), token)
+    if (*c).lz77 {
+        rt.st32((*r).window, ((*r).num_decoded & WINDOW_MASK) as usize, v)
+        (*r).num_decoded = (*r).num_decoded + 1
+    }
+    return v
+}
+
+fn reader_read(r: *mut JxlReader, b: *mut jxl_bits.JxlBits, ctx: u32) -> u32 {
+    return reader_read_hist(r, b, code_hist((*r).code, ctx))
+}
