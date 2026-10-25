@@ -1,0 +1,237 @@
+import std.rt
+import jxl.jxl_bits
+import jxl.jxl_code
+import jxl.jxl_err
+import jxl.jxl_img
+import jxl.jxl_mem
+import jxl.jxl_tree
+import jxl.jxl_wp
+
+export { chan_decode, clamped_gradient, predict_one }
+
+const PROPS: usize = 256
+const FIRST_REF: usize = 16
+
+fn clamped_gradient(n: i64, w: i64, l: i64) -> i64 {
+    let m: i64 = jxl_mem.min64(n, w)
+    let mx: i64 = jxl_mem.max64(n, w)
+    let grad: i64 = n + w - l
+    if l > mx {
+        return m
+    }
+    if l < m {
+        return mx
+    }
+    return grad
+}
+
+fn select(a: i64, b: i64, c: i64) -> i64 {
+    let p: i64 = a + b - c
+    if jxl_mem.abs64(p - a) < jxl_mem.abs64(p - b) {
+        return a
+    }
+    return b
+}
+
+fn predict_one(p: u32, left: i64, top: i64, toptop: i64, topleft: i64, topright: i64, leftleft: i64, toprightright: i64, wp: i64) -> i64 {
+    if p == 1 {
+        return left
+    }
+    if p == 2 {
+        return top
+    }
+    if p == 3 {
+        return (left + top) / 2
+    }
+    if p == 4 {
+        return select(left, top, topleft)
+    }
+    if p == 5 {
+        return clamped_gradient(left, top, topleft)
+    }
+    if p == 6 {
+        return wp
+    }
+    if p == 7 {
+        return topright
+    }
+    if p == 8 {
+        return topleft
+    }
+    if p == 9 {
+        return leftleft
+    }
+    if p == 10 {
+        return (left + topleft) / 2
+    }
+    if p == 11 {
+        return (topleft + top) / 2
+    }
+    if p == 12 {
+        return (top + topright) / 2
+    }
+    if p == 13 {
+        return (6 * top - 2 * toptop + 7 * left + leftleft + toprightright + 3 * topright + 8) / 16
+    }
+    return 0
+}
+
+fn fill_refs(img: *mut jxl_img.JxlImage, c: usize, y: usize, nrefs: usize, refs: u64) {
+    rt.mem_set(refs, 0 as u8, nrefs * jxl_img.img_w(img, c) * 4)
+    let w: usize = jxl_img.img_w(img, c)
+    var offset: usize = 0
+    var j: usize = c
+    while j > 0 && offset < nrefs {
+        j = j - 1
+        if jxl_img.img_w(img, j) != w || jxl_img.img_h(img, j) != jxl_img.img_h(img, c) {
+            continue
+        }
+        if jxl_img.img_hs(img, j) != jxl_img.img_hs(img, c) || jxl_img.img_vs(img, j) != jxl_img.img_vs(img, c) {
+            continue
+        }
+        var x: usize = 0
+        while x < w {
+            let v: i64 = jxl_img.img_get(img, j, x, y) as i64
+            var vleft: i64 = 0
+            if x > 0 {
+                vleft = jxl_img.img_get(img, j, x - 1, y) as i64
+            }
+            var vtop: i64 = vleft
+            if y > 0 {
+                vtop = jxl_img.img_get(img, j, x, y - 1) as i64
+            }
+            var vtl: i64 = vleft
+            if x > 0 && y > 0 {
+                vtl = jxl_img.img_get(img, j, x - 1, y - 1) as i64
+            }
+            let vp: i64 = clamped_gradient(vleft, vtop, vtl)
+            jxl_mem.sti(refs, x * nrefs + offset, jxl_mem.abs64(v) as i32)
+            jxl_mem.sti(refs, x * nrefs + offset + 1, v as i32)
+            jxl_mem.sti(refs, x * nrefs + offset + 2, jxl_mem.abs64(v - vp) as i32)
+            jxl_mem.sti(refs, x * nrefs + offset + 3, (v - vp) as i32)
+            x = x + 1
+        }
+        offset = offset + 4
+    }
+}
+
+fn chan_decode(b: *mut jxl_bits.JxlBits, rd: *mut jxl_code.JxlReader, tree: *mut jxl_tree.JxlTree, wph: *mut jxl_wp.JxlWpHeader,
+        img: *mut jxl_img.JxlImage, c: usize, stream_id: u32) -> i32 {
+    let w: usize = jxl_img.img_w(img, c)
+    let h: usize = jxl_img.img_h(img, c)
+    if w == 0 || h == 0 {
+        return jxl_err.JX_OK
+    }
+    let data: u64 = jxl_img.img_data(img, c)
+    let props: u64 = rt.heap_alloc(PROPS * 4)
+    if props == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    rt.mem_set(props, 0 as u8, PROPS * 4)
+    jxl_mem.sti(props, 0, c as i32)
+    jxl_mem.sti(props, 1, stream_id as i32)
+    let max_prop: i32 = jxl_tree.tree_max_property(tree)
+    var nrefs: usize = 0
+    if max_prop >= (FIRST_REF as i32) {
+        nrefs = (((max_prop as usize) + 1 - FIRST_REF + 3) / 4) * 4
+    }
+    var refs: u64 = 0
+    if nrefs > 0 {
+        refs = rt.heap_alloc(nrefs * w * 4)
+    }
+    let use_wp: bool = jxl_tree.tree_uses_wp(tree)
+    var wp: jxl_wp.JxlWp = jxl_wp.wp_new(wph, w)
+    var wprops: u64 = 0
+    if jxl_tree.tree_max_property(tree) >= jxl_tree.WP_PROPERTY {
+        wprops = props
+    }
+    var y: usize = 0
+    var status: i32 = jxl_err.JX_OK
+    while y < h && status == jxl_err.JX_OK {
+        if nrefs > 0 {
+            fill_refs(img, c, y, nrefs, refs)
+        }
+        jxl_mem.sti(props, 2, y as i32)
+        jxl_mem.sti(props, 9, 0)
+        var x: usize = 0
+        while x < w {
+            var left: i64 = 0
+            if x > 0 {
+                left = jxl_mem.ldi(data, y * w + x - 1) as i64
+            } else if y > 0 {
+                left = jxl_mem.ldi(data, (y - 1) * w + x) as i64
+            }
+            var top: i64 = left
+            if y > 0 {
+                top = jxl_mem.ldi(data, (y - 1) * w + x) as i64
+            }
+            var topleft: i64 = left
+            if x > 0 && y > 0 {
+                topleft = jxl_mem.ldi(data, (y - 1) * w + x - 1) as i64
+            }
+            var topright: i64 = top
+            if x + 1 < w && y > 0 {
+                topright = jxl_mem.ldi(data, (y - 1) * w + x + 1) as i64
+            }
+            var leftleft: i64 = left
+            if x > 1 {
+                leftleft = jxl_mem.ldi(data, y * w + x - 2) as i64
+            }
+            var toptop: i64 = top
+            if y > 1 {
+                toptop = jxl_mem.ldi(data, (y - 2) * w + x) as i64
+            }
+            var trr: i64 = topright
+            if x + 2 < w && y > 0 {
+                trr = jxl_mem.ldi(data, (y - 1) * w + x + 2) as i64
+            }
+            jxl_mem.sti(props, 3, x as i32)
+            jxl_mem.sti(props, 4, jxl_mem.abs64(top) as i32)
+            jxl_mem.sti(props, 5, jxl_mem.abs64(left) as i32)
+            jxl_mem.sti(props, 6, top as i32)
+            jxl_mem.sti(props, 7, left as i32)
+            jxl_mem.sti(props, 8, (left - (jxl_mem.ldi(props, 9) as i64)) as i32)
+            jxl_mem.sti(props, 9, (left + top - topleft) as i32)
+            jxl_mem.sti(props, 10, (left - topleft) as i32)
+            jxl_mem.sti(props, 11, (topleft - top) as i32)
+            jxl_mem.sti(props, 12, (top - topright) as i32)
+            jxl_mem.sti(props, 13, (top - toptop) as i32)
+            jxl_mem.sti(props, 14, (left - leftleft) as i32)
+            var wpv: i64 = 0
+            if use_wp {
+                wpv = jxl_wp.wp_predict(&wp, x, y, top, left, topright, topleft, toptop, wprops)
+            }
+            if nrefs > 0 {
+                var k: usize = 0
+                while k < nrefs {
+                    jxl_mem.sti(props, FIRST_REF + k, jxl_mem.ldi(refs, x * nrefs + k))
+                    k = k + 1
+                }
+            }
+            let leaf: usize = jxl_tree.tree_lookup(tree, props)
+            let ctx: u32 = jxl_tree.tree_leaf_id(tree, leaf)
+            let guess: i64 = jxl_tree.tree_offset(tree, leaf) + predict_one(jxl_tree.tree_predictor(tree, leaf), left, top, toptop, topleft, topright, leftleft, trr, wpv)
+            let sym: u32 = jxl_code.reader_read(rd, b, ctx)
+            var sv: i64 = (sym >> 1) as i64
+            if (sym & 1) != 0 {
+                sv = 0 - sv - 1
+            }
+            let val: i64 = sv * jxl_tree.tree_multiplier(tree, leaf) + guess
+            jxl_mem.sti(data, y * w + x, val as i32)
+            if use_wp {
+                jxl_wp.wp_update(&wp, val, x, y)
+            }
+            x = x + 1
+        }
+        if jxl_bits.jb_over(b) {
+            status = jxl_err.JX_TRUNCATED
+        }
+        y = y + 1
+    }
+    jxl_wp.wp_free(&wp)
+    rt.heap_free(props, PROPS * 4)
+    if nrefs > 0 {
+        rt.heap_free(refs, nrefs * w * 4)
+    }
+    return status
+}
