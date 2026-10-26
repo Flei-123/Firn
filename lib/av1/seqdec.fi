@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/av1/seqdec.fi -- av1.seqdec: AV1 OBU stream decoder (key/intra-only frames, hidden frames, show_existing_frame, reference slots).
+import rt.rt
+import av1.av1mem
+import av1.avif
+import av1.av1pic
+import av1.still
+
+export { seq_open, seq_next, seq_free, SEQ_FRAME, SEQ_HIDDEN, SEQ_END, SEQ_UNSUPPORTED, SEQ_BAD }
+
+const SEQ_FRAME: i32 = 0
+const SEQ_HIDDEN: i32 = 1
+const SEQ_END: i32 = 2
+const SEQ_UNSUPPORTED: i32 = 3
+const SEQ_BAD: i32 = 4
+
+const ST_INFO: usize = 0
+const ST_SRC: usize = 1
+const ST_LEN: usize = 2
+const ST_AT: usize = 3
+const ST_SLOTS: usize = 4
+const ST_CELLS: usize = 12
+const NUM_SLOTS: usize = 8
+
+fn sg(h: u64, i: usize) -> i64 {
+    return *((h + ((i * 8) as u64)) as *mut i64)
+}
+
+fn ss(h: u64, i: usize, v: i64) {
+    *((h + ((i * 8) as u64)) as *mut i64) = v
+}
+
+fn seq_open(src: u64, n: usize) -> u64 {
+    let info: u64 = avif.avif_obu_open(src, n)
+    if info == 0 {
+        return 0
+    }
+    let h: u64 = av1mem.heap_alloc(ST_CELLS * 8) as u64
+    if h == 0 {
+        avif.avif_info_free(info)
+        return 0
+    }
+    ss(h, ST_INFO, info as i64)
+    ss(h, ST_SRC, src as i64)
+    ss(h, ST_LEN, n as i64)
+    return h
+}
+
+fn seq_free(h: u64) {
+    if h == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < NUM_SLOTS {
+        av1pic.pic_release(sg(h, ST_SLOTS + i) as u64)
+        i = i + 1
+    }
+    avif.avif_info_free(sg(h, ST_INFO) as u64)
+    av1mem.heap_free(h as *mut u8, ST_CELLS * 8)
+}
+
+fn set_slot(h: u64, i: usize, pic: u64) {
+    av1pic.pic_retain(pic)
+    av1pic.pic_release(sg(h, ST_SLOTS + i) as u64)
+    ss(h, ST_SLOTS + i, pic as i64)
+}
+
+fn refresh_slots(h: u64, pic: u64, mask: i64) {
+    var i: usize = 0
+    while i < NUM_SLOTS {
+        if ((mask >> (i as i64)) & 1) != 0 {
+            set_slot(h, i, pic)
+        }
+        i = i + 1
+    }
+}
+
+fn show_existing(h: u64, info: u64, f: *mut still.Frame) -> i32 {
+    let idx: usize = avif.avif_cell(info, avif.FH_BASE + avif.FH_SHOW_IDX) as usize
+    let pic: u64 = sg(h, ST_SLOTS + idx) as u64
+    if pic == 0 || av1pic.pic_get(pic, av1pic.PIC_SHOWABLE) == 0 {
+        return SEQ_BAD
+    }
+    let rc: i32 = still.output_pic(info, pic, f)
+    if rc != 0 {
+        return SEQ_BAD
+    }
+    if av1pic.pic_get(pic, av1pic.PIC_FTYPE) == 0 {
+        refresh_slots(h, pic, 255)
+    }
+    return SEQ_FRAME
+}
+
+fn decode_new(h: u64, info: u64, f: *mut still.Frame) -> i32 {
+    let fb: usize = avif.FH_BASE
+    let show: bool = avif.avif_cell(info, fb + avif.FH_SHOW) != 0
+    avif.avif_set_cell(info, avif.AI_WIDTH, avif.avif_cell(info, fb + avif.FH_UP_W))
+    avif.avif_set_cell(info, avif.AI_HEIGHT, avif.avif_cell(info, fb + avif.FH_FRAME_H))
+    var pic: u64 = 0
+    let rc: i32 = still.decode_frame(sg(h, ST_SRC) as u64, info, f, &pic, true, show)
+    if rc != 0 {
+        av1pic.pic_release(pic)
+        return SEQ_UNSUPPORTED
+    }
+    if pic == 0 {
+        return SEQ_BAD
+    }
+    refresh_slots(h, pic, avif.avif_cell(info, fb + avif.FH_REFRESH))
+    av1pic.pic_release(pic)
+    if show {
+        return SEQ_FRAME
+    }
+    return SEQ_HIDDEN
+}
+
+fn seq_next(h: u64, f: *mut still.Frame) -> i32 {
+    let info: u64 = sg(h, ST_INFO) as u64
+    let src: u64 = sg(h, ST_SRC) as u64
+    let n: usize = sg(h, ST_LEN) as usize
+    while true {
+        let at: usize = sg(h, ST_AT) as usize
+        if at >= n {
+            return SEQ_END
+        }
+        let nx: i64 = avif.avif_obu_next(src, n, info, at)
+        if nx < 0 {
+            return SEQ_BAD
+        }
+        ss(h, ST_AT, nx)
+        if avif.avif_cell(info, avif.FH_BASE + avif.FH_NEW_FRAME) == 0 {
+            continue
+        }
+        if avif.avif_cell(info, avif.FH_BASE + avif.FH_OK) == 0 {
+            return SEQ_UNSUPPORTED
+        }
+        if avif.avif_cell(info, avif.FH_BASE + avif.FH_SHOW_EXISTING) != 0 {
+            return show_existing(h, info, f)
+        }
+        if avif.avif_cell(info, avif.FH_BASE + avif.FH_TYPE) != 6 {
+            return SEQ_UNSUPPORTED
+        }
+        return decode_new(h, info, f)
+    }
+    return SEQ_END
+}

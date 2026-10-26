@@ -9,8 +9,9 @@ import av1.av1cdef
 import av1.av1lr
 import av1.av1fg
 import av1.av1sr
+import av1.av1pic
 
-export { Frame, frame_new, frame_free, still_decode, still_decode_limited, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR, STILL_TOO_LARGE, STILL_MAX_PIXELS }
+export { Frame, frame_new, frame_free, decode_frame, output_pic, still_decode, still_decode_limited, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR, STILL_TOO_LARGE, STILL_MAX_PIXELS }
 
 const STILL_OK: i32 = 0
 const STILL_NOT_AVIF: i32 = 1
@@ -151,6 +152,15 @@ fn set_tile_grid(t: u64, info: u64) {
 
 fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     let fb: usize = avif.FH_BASE
+    if cell(info, fb + avif.FH_SHOW_EXISTING) != 0 || cell(info, fb + avif.FH_FRAME_TYPE) != 0 || cell(info, fb + avif.FH_SHOW) == 0 {
+        return STILL_UNSUPPORTED
+    }
+    var keep: u64 = 0
+    return decode_frame(src, info, f, &keep, false, true)
+}
+
+fn decode_frame(src: u64, info: u64, f: *mut Frame, pic_out: *mut u64, keep: bool, show: bool) -> i32 {
+    let fb: usize = avif.FH_BASE
     if cell(info, fb + avif.FH_OK) == 0 {
         return STILL_UNSUPPORTED
     }
@@ -215,8 +225,47 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     var pl: Planes = Planes { p0: av1tile.tile_plane(t, 0), p1: av1tile.tile_plane(t, 1), p2: av1tile.tile_plane(t, 2), stride: av1tile.tile_stride(t), bytes: 0 }
     post_filters(t, info, lrctx, np, mc, mr, bit_depth, lossless, &pl)
     let st: i64 = pl.stride
+    if keep {
+        let pic: u64 = av1pic.pic_new(pl.p0, pl.p1, pl.p2, st, mr * 4, np, w, h, bit_depth, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY))
+        if pic != 0 {
+            av1pic.pic_set(pic, av1pic.PIC_FTYPE, cell(info, fb + avif.FH_FRAME_TYPE))
+            av1pic.pic_set(pic, av1pic.PIC_SHOWABLE, cell(info, fb + avif.FH_SHOWABLE))
+            av1pic.pic_set(pic, av1pic.PIC_ORDER, cell(info, fb + avif.FH_ORDER_HINT))
+            av1pic.pic_store_grain(pic, info)
+        }
+        *pic_out = pic
+    }
+    if !show {
+        free_planes(&pl, np)
+        av1tile.tile_free(t)
+        av1lr.lr_free(lrctx)
+        return STILL_OK
+    }
+    emit_planes(info, &pl, np, w, h, bit_depth, f)
+    free_planes(&pl, np)
+    av1tile.tile_free(t)
+    av1lr.lr_free(lrctx)
+    return STILL_OK
+}
+
+fn output_pic(info: u64, pic: u64, f: *mut Frame) -> i32 {
+    let np: i64 = av1pic.pic_get(pic, av1pic.PIC_NP)
+    var pl: Planes = Planes { p0: av1pic.pic_clone_plane(pic, 0), p1: 0, p2: 0, stride: av1pic.pic_get(pic, av1pic.PIC_STRIDE), bytes: 1 }
+    if np == 3 {
+        pl.p1 = av1pic.pic_clone_plane(pic, 1)
+        pl.p2 = av1pic.pic_clone_plane(pic, 2)
+    }
+    pl.bytes = (pl.stride * av1pic.pic_get(pic, av1pic.PIC_ROWS) * 2) as usize
+    av1pic.pic_load_grain(pic, info)
+    emit_planes(info, &pl, np, av1pic.pic_get(pic, av1pic.PIC_W), av1pic.pic_get(pic, av1pic.PIC_H), av1pic.pic_get(pic, av1pic.PIC_DEPTH), f)
+    free_planes(&pl, np)
+    return STILL_OK
+}
+
+fn emit_planes(info: u64, pl: *mut Planes, np: i64, w: i64, h: i64, bit_depth: i64, f: *mut Frame) {
+    let st: i64 = (*pl).stride
     if cell(info, avif.GR_BASE + avif.GR_APPLY) != 0 {
-        av1fg.fg_apply(info, pl.p0, pl.p1, pl.p2, st, w, h,
+        av1fg.fg_apply(info, (*pl).p0, (*pl).p1, (*pl).p2, st, w, h,
                        cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np, bit_depth, cell(info, avif.AI_MC) == 0)
     }
     (*f).width = w
@@ -225,17 +274,13 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     (*f).sub_x = cell(info, avif.AI_SUBX)
     (*f).sub_y = cell(info, avif.AI_SUBY)
     (*f).depth = bit_depth
-    (*f).y = crop_plane(pl.p0, st, w, h, bit_depth, &(*f).y_bytes)
+    (*f).y = crop_plane((*pl).p0, st, w, h, bit_depth, &(*f).y_bytes)
     if np == 3 {
         let cw: i64 = (w + (*f).sub_x) >> (*f).sub_x
         let ch: i64 = (h + (*f).sub_y) >> (*f).sub_y
-        (*f).u = crop_plane(pl.p1, st, cw, ch, bit_depth, &(*f).u_bytes)
-        (*f).v = crop_plane(pl.p2, st, cw, ch, bit_depth, &(*f).v_bytes)
+        (*f).u = crop_plane((*pl).p1, st, cw, ch, bit_depth, &(*f).u_bytes)
+        (*f).v = crop_plane((*pl).p2, st, cw, ch, bit_depth, &(*f).v_bytes)
     }
-    free_planes(&pl, np)
-    av1tile.tile_free(t)
-    av1lr.lr_free(lrctx)
-    return STILL_OK
 }
 
 fn setup_restoration(t: u64, info: u64, np: i64, up_w: i64) -> u64 {
