@@ -200,6 +200,8 @@ struct Parser {
     // `modules.rs`, only after parsing rather than during it.
     alias: u32,
     own: Vec[u32], // top level names declared by this file
+    ren: Vec[u32],
+    wcls: Vec[u32],
     foreign: u64, // shared tree (0 = we use our own)
     multi: bool, // several files are compiled (`module__x`); an interpolation copy keeps it, `foreign` alone cannot tell
     module: Vec[u32], // intern numbers of the module aliases (for `module.x`)
@@ -377,7 +379,7 @@ fn par_new(lx: u64) -> Parser {
     var p: Parser = Parser {
         lx: lx, pos: 0, n: 0,
         tree: ast.tree_new(),
-        alias: NONE, own: vec_new[u32](), foreign: 0, multi: false,
+        alias: NONE, own: vec_new[u32](), ren: vec_new[u32](), wcls: vec_new[u32](), foreign: 0, multi: false,
         module: vec_new[u32](),
         module_at: vec_new[u32](),
         module_to: vec_new[u32](),
@@ -502,6 +504,8 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).module_to)
     vec_free[u32](&(*p).module_at)
     vec_free[u32](&(*p).own)
+    vec_free[u32](&(*p).ren)
+    vec_free[u32](&(*p).wcls)
     rt.buf_free(&(*p).scratch)
     report.pend_free(&(*p).pend)
     rt.buf_free(&(*p).dmsg)
@@ -1018,11 +1022,24 @@ fn renamed(p: *mut Parser, nr: u32) -> u32 {
     if (*p).alias == NONE {
         return nr
     }
-    if !is_own(p, nr) {
-        return nr
+    if (nr as usize) < (*p).ren.len {
+        let raw: u32 = *(((*p).ren.ptr +% nr as u64 *% 4) as *mut u32)
+        if raw != 0 {
+            return raw - 1
+        }
     }
-    var tr: [u8; 2] = "__"
-    return join(p, (*p).alias, (&tr[0]) as u64, 2, nr)
+    return renamed_fill(p, nr)
+}
+
+#[no_inline]
+fn renamed_fill(p: *mut Parser, nr: u32) -> u32 {
+    var out: u32 = nr
+    if is_own(p, nr) {
+        var tr: [u8; 2] = "__"
+        out = join(p, (*p).alias, (&tr[0]) as u64, 2, nr)
+    }
+    nameidx.nameidx_put(&(*p).ren, nr, out)
+    return out
 }
 
 // Builds `module.x` and interns it.
@@ -1235,21 +1252,27 @@ fn lex_has_alias(lxp: u64) -> bool {
     let n: usize = lexer.lex_count(l)
     let it: *mut intern.Interner = lexer.lex_names(l)
     var tw: [u8; 4] = "type"
+    let nr_type: i64 = intern.intern_find(it, (&tw[0]) as u64, 4)
+    if nr_type < 0 {
+        return false
+    }
+    let nr_type32: u32 = nr_type as u32
+    let kinds: u64 = (*l).kind.ptr
+    let nrs: u64 = (*l).nr.ptr
     var depth: i64 = 0
     var i: usize = 0
     while i + 2 < n {
-        let k: u32 = lexer.lex_kind(l, i)
-        if k == A_LBRACE {
-            depth = depth + 1
-        }
-        if k == A_RBRACE {
-            depth = depth - 1
-        }
-        if depth == 0 && k == A_IDENT && lexer.lex_kind(l, i + 1) == A_IDENT
-        && lexer.lex_kind(l, i + 2) == A_ASSIGN {
-            if intern.intern_equal(it, lexer.lex_nr(l, i), (&tw[0]) as u64, 4) {
+        let k: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
+        if k == A_IDENT {
+            if depth == 0 && *((nrs +% i as u64 *% 4) as *mut u32) == nr_type32
+            && *((kinds +% (i + 1) as u64 *% 4) as *mut u32) == A_IDENT
+            && *((kinds +% (i + 2) as u64 *% 4) as *mut u32) == A_ASSIGN {
                 return true
             }
+        } else if k == A_LBRACE {
+            depth = depth + 1
+        } else if k == A_RBRACE {
+            depth = depth - 1
         }
         i = i + 1
     }
@@ -1326,6 +1349,17 @@ fn alias_lookup(p: *mut Parser, q: u32) -> u32 {
     return NONE
 }
 
+#[no_inline]
+fn alias_declare(p: *mut Parser, i: usize) {
+    vec_push[u32](&(*p).al_name, renamed(p, nr_at(p, i + 1)))
+    vec_push[u32](&(*p).al_head, i as u32)
+    vec_push[u32](&(*p).al_pos, (i + 3) as u32)
+    vec_push[u32](&(*p).al_end, (i + 3) as u32)
+    vec_push[u32](&(*p).al_state, 0)
+    vec_push[u32](&(*p).al_node, ast.NOTHING)
+    vec_push[u32](&(*p).al_bad, 0)
+}
+
 // Finds the declarations of this file (top level only) and reads all of
 // them. Before the item loop: the order of the declarations is free.
 fn alias_search(p: *mut Parser) {
@@ -1334,30 +1368,25 @@ fn alias_search(p: *mut Parser) {
     let itn: *mut intern.Interner = lexer.lex_names(lxr)
     var w_type: [u8; 4] = "type"
     let nr_type: i64 = intern.intern_find(itn, (&w_type[0]) as u64, 4)
+    if nr_type < 0 {
+        return
+    }
+    let nr_type32: u32 = nr_type as u32
     let kinds: u64 = (*lxr).kind.ptr
     let nrs: u64 = (*lxr).nr.ptr
+    let total: usize = (*p).n
     var i: usize = 0
-    while i < (*p).n {
+    while i < total {
         let k: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
-        if k == A_LBRACE {
-            depth = depth + 1
-        }
-        if k == A_RBRACE {
-            depth = depth - 1
-        }
-        var word: i64 = 0 - 1
         if k == A_IDENT {
             let wn: u32 = *((nrs +% i as u64 *% 4) as *mut u32)
-            word = wn as i64
-        }
-        if depth == 0 && word >= 0 && word == nr_type && alias_head_at(p, i) == 1 {
-            vec_push[u32](&(*p).al_name, renamed(p, nr_at(p, i + 1)))
-            vec_push[u32](&(*p).al_head, i as u32)
-            vec_push[u32](&(*p).al_pos, (i + 3) as u32)
-            vec_push[u32](&(*p).al_end, (i + 3) as u32)
-            vec_push[u32](&(*p).al_state, 0)
-            vec_push[u32](&(*p).al_node, ast.NOTHING)
-            vec_push[u32](&(*p).al_bad, 0)
+            if wn == nr_type32 && depth == 0 && alias_head_at(p, i) == 1 {
+                alias_declare(p, i)
+            }
+        } else if k == A_LBRACE {
+            depth = depth + 1
+        } else if k == A_RBRACE {
+            depth = depth - 1
         }
         i = i + 1
     }
@@ -7263,6 +7292,20 @@ fn type_intrinsic_word(p: *mut Parser, nr: u32) -> bool {
     intern.intern_equal(itn, nr, (&gu[0]) as u64, 10)
 }
 
+#[no_inline]
+fn word_class(p: *mut Parser, nr: u32, gc_nr: i64, ct1_nr: i64, ct2_nr: i64, ct3_nr: i64) -> u32 {
+    var cls: u32 = 0
+    let w: i64 = nr as i64
+    if simd_word(p, nr) || type_intrinsic_word(p, nr) {
+        cls = 1
+    }
+    if (gc_nr >= 0 && w == gc_nr) || (ct1_nr >= 0 && w == ct1_nr) || (ct2_nr >= 0 && w == ct2_nr) || (ct3_nr >= 0 && w == ct3_nr) {
+        cls = 1
+    }
+    nameidx.nameidx_put(&(*p).wcls, nr, cls)
+    return cls
+}
+
 fn kind_bit(k: u32, base: u32) -> u64 {
     if k < base || k >= base + 64 {
         return 0
@@ -7286,6 +7329,7 @@ fn kind_bit(k: u32, base: u32) -> u64 {
 //   IDENT '!'                                              error union `E!T`
 //   the identifier `gc`                                    `gc class`, `gc C{}`
 fn extensions_search(p: *mut Parser) {
+    vec_clear[u32](&(*p).wcls)
     // Intern number of the identifier "gc" -- if it appears in the text at all.
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
     var gc_word: [u8; 2] = "gc"
@@ -7310,11 +7354,36 @@ fn extensions_search(p: *mut Parser) {
         | kind_bit(A_KWCOMPTIME, 64) | kind_bit(A_HASH, 64) | kind_bit(A_QUESTION, 64)
         | kind_bit(A_COLON, 64)
     let kinds: u64 = (*lx(p)).kind.ptr
+    let total: usize = (*p).n
+    var wcn: usize = (*p).wcls.len
+    var wcp: u64 = (*p).wcls.ptr
     var i: usize = 0
-    while i < (*p).n {
+    while i < total {
         let a: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
         if a == A_IDENT {
             let nr: i64 = nr_at(p, i) as i64
+            var wc: u32 = 4294967295
+            if (nr as usize) < wcn {
+                let raw: u32 = *((wcp +% nr as u64 *% 4) as *mut u32)
+                if raw != 0 {
+                    wc = raw - 1
+                }
+            }
+            if wc == 4294967295 {
+                wc = word_class(p, nr as u32, gc_nr, ct1_nr, ct2_nr, ct3_nr)
+                wcn = (*p).wcls.len
+                wcp = (*p).wcls.ptr
+            }
+            if wc == 0 {
+                var nk: u32 = 0
+                if i + 1 < total {
+                    nk = *((kinds +% (i + 1) as u64 *% 4) as *mut u32)
+                }
+                if nk != A_NOT && nk != A_LBRACKET {
+                    i = i + 1
+                    continue
+                }
+            }
             // ROUND 82: the vector and crypto instructions
             // (compiler/src/simd.rs). This parser knows neither the type
             // `v128` nor the 42 `__v128_*` / `__aes*` / `__sha256*` /
@@ -7552,6 +7621,7 @@ fn own_search(p: *mut Parser) {
     if (*p).alias == NONE {
         return
     }
+    vec_clear[u32](&(*p).ren)
     let lxr: *mut lexer.Lexer = lx(p)
     let itn: *mut intern.Interner = lexer.lex_names(lxr)
     var w_iface: [u8; 9] = "interface"
@@ -7562,10 +7632,18 @@ fn own_search(p: *mut Parser) {
     let nr_type: i64 = intern.intern_find(itn, (&w_type[0]) as u64, 4)
     let kinds: u64 = (*lxr).kind.ptr
     let nrs: u64 = (*lxr).nr.ptr
+    let own_lo: u64 = kind_bit(A_IDENT, 0) | kind_bit(A_KWFN, 0) | kind_bit(A_KWSTRUCT, 0)
+        | kind_bit(A_KWCONST, 0)
+    let total: usize = (*p).n
     var i: usize = 0
-    while i + 1 < (*p).n {
+    while i + 1 < total {
         let a: u32 = *((kinds +% i as u64 *% 4) as *mut u32)
-        if a != A_IDENT && a != A_KWFN && a != A_KWSTRUCT && a != A_KWCONST && a != A_KWSTATIC {
+        if a < 64 {
+            if ((own_lo >> a as u64) & 1) == 0 {
+                i = i + 1
+                continue
+            }
+        } else if a != A_KWSTATIC {
             i = i + 1
             continue
         }
