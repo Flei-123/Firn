@@ -83,7 +83,6 @@ impl<'a> Parser<'a> {
                 None => rel_path.to_path_buf(),
             }
         };
-        crate::buildcache::taint();
         let bytes = match std::fs::read(&full) {
             Ok(b) => b,
             Err(e) => {
@@ -94,6 +93,7 @@ impl<'a> Parser<'a> {
                 return self.broken_expr(sp);
             }
         };
+        crate::buildcache::note_file(&full, &bytes);
         if bytes.len() > MAX_OCTETS {
             self.dg.error_note(
                 args[0].span,

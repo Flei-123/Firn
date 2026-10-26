@@ -56,7 +56,7 @@ fn module_path(base: &Path, parts: &[String]) -> PathBuf {
     if crate::target::windows() {
         let mut alt = p.clone();
         alt.set_extension(format!("windows.{}", config::FILE_EXT));
-        if alt.is_file() {
+        if crate::cachemanifest::is_file(&alt) {
             return alt;
         }
     }
@@ -113,7 +113,7 @@ fn sysroot_lib_in(dir: &Path) -> Option<PathBuf> {
     for _ in 0..3 {
         up.push("..");
         let cand = up.join("lib");
-        if cand.join(SYSROOT_MARKER).is_file() {
+        if crate::cachemanifest::is_file(&cand.join(SYSROOT_MARKER)) {
             return Some(cand);
         }
         if first.is_none() {
@@ -208,6 +208,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                 }));
             }
         };
+        crate::cachemanifest::read_source(&path, &src);
         let id = out.len() as u32;
         let abs_file = package_world::absolute(&path.display().to_string(), &work_dir);
         // ROUND 93: from here on the file is known under the spelling that
@@ -259,14 +260,14 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         let extras = extra_search_paths();
         for (parts, ispan) in scan_imports(&src, id) {
             let mut p = module_path(&own, &parts);
-            if !p.exists() {
+            if !crate::cachemanifest::exists(&p) {
                 let q = module_path(&base, &parts);
-                if q.exists() {
+                if crate::cachemanifest::exists(&q) {
                     p = q;
                 }
             }
             // (3) and (4): the view of the package to which this file belongs.
-            if !p.exists() {
+            if !crate::cachemanifest::exists(&p) {
                 if let Some(pi) = my_package {
                     if let Some(q) = package_candidate(world, pi, &parts) {
                         p = q;
@@ -276,19 +277,19 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
             // (5a) the platform directory of the target inside every
             // library directory (`lib/@web/`, `lib/@linux/`, ...), before
             // the directory itself -- see `target::platform_dir`.
-            if !p.exists() {
+            if !crate::cachemanifest::exists(&p) {
                 for z in &extras {
                     let q = module_path(&z.join(crate::target::platform_dir()), &parts);
-                    if q.exists() {
+                    if crate::cachemanifest::exists(&q) {
                         p = q;
                         break;
                     }
                 }
             }
-            if !p.exists() {
+            if !crate::cachemanifest::exists(&p) {
                 for z in &extras {
                     let q = module_path(z, &parts);
-                    if q.exists() {
+                    if crate::cachemanifest::exists(&q) {
                         p = q;
                         break;
                     }
@@ -343,7 +344,7 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
     for q in &p.manifest.sources {
         let base = package::join(&p.root, q);
         let cand = module_path(Path::new(&base), parts);
-        if cand.exists() {
+        if crate::cachemanifest::exists(&cand) {
             return Some(cand);
         }
     }
@@ -359,7 +360,7 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
     for q in &dp.manifest.sources {
         let base = package::join(&dp.root, q);
         let cand = module_path(Path::new(&base), &rest);
-        if cand.exists() {
+        if crate::cachemanifest::exists(&cand) {
             return Some(cand);
         }
     }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::lock::Sha256;
+use crate::keyhash::{digest_hex, KeyHasher};
 use crate::modules::SourceFile;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 const MAGIC: &str = "FIRNCACHE1";
@@ -12,6 +13,90 @@ const STALE_TMP: Duration = Duration::from_secs(3600);
 const EXCLUDED_ENV: [&str; 4] = ["FIRN_CACHE_DIR", "FIRN_CACHE_MAX_MB", "FIRN_NO_CACHE", "FIRN_CACHE_LOG"];
 
 static TAINT: AtomicBool = AtomicBool::new(false);
+static INPUTS: Mutex<Vec<Input>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    File { path: String, sha: String },
+    Env { name: String, value: Option<Vec<u8>> },
+    EnvHas { name: String, set: bool },
+}
+
+fn record(input: Input) {
+    if !crate::target::active().is_wasm() {
+        taint();
+    }
+    if let Ok(mut v) = INPUTS.lock() {
+        v.push(input);
+    }
+}
+
+pub fn note_file(path: &Path, bytes: &[u8]) {
+    record(Input::File {
+        path: path.display().to_string(),
+        sha: digest_hex(bytes),
+    });
+}
+
+pub fn note_env(name: &str, value: &[u8], from_env: bool) {
+    record(Input::Env {
+        name: name.to_string(),
+        value: if from_env { Some(value.to_vec()) } else { None },
+    });
+}
+
+pub fn note_env_has(name: &str, set: bool) {
+    record(Input::EnvHas { name: name.to_string(), set });
+}
+
+pub fn inputs() -> Vec<Input> {
+    INPUTS.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()).collect()
+}
+
+fn input_line(i: &Input) -> String {
+    match i {
+        Input::File { path, sha } => format!("dep=file {} {}", hex(path.as_bytes()), sha),
+        Input::Env { name, value: Some(v) } => format!("dep=env {} 1 {}", hex(name.as_bytes()), hex(v)),
+        Input::Env { name, value: None } => format!("dep=env {} 0 -", hex(name.as_bytes())),
+        Input::EnvHas { name, set } => format!("dep=has {} {} -", hex(name.as_bytes()), *set as u8),
+    }
+}
+
+fn parse_input(v: &str) -> Option<Input> {
+    let f: Vec<&str> = v.split(' ').collect();
+    match f.as_slice() {
+        ["file", path, sha] => Some(Input::File { path: String::from_utf8(unhex(path)?).ok()?, sha: sha.to_string() }),
+        ["env", name, "1", val] => Some(Input::Env { name: String::from_utf8(unhex(name)?).ok()?, value: Some(unhex(val)?) }),
+        ["env", name, "0", _] => Some(Input::Env { name: String::from_utf8(unhex(name)?).ok()?, value: None }),
+        ["has", name, flag, _] => Some(Input::EnvHas { name: String::from_utf8(unhex(name)?).ok()?, set: *flag == "1" }),
+        _ => None,
+    }
+}
+
+fn input_holds(i: &Input) -> bool {
+    match i {
+        Input::File { path, sha } => match std::fs::read(path) {
+            Ok(b) => digest_hex(&b) == *sha,
+            Err(_) => false,
+        },
+        Input::Env { name, value } => {
+            let now = std::env::var_os(name).map(|v| v.into_encoded_bytes());
+            now == *value
+        }
+        Input::EnvHas { name, set } => std::env::var_os(name).is_some() == *set,
+    }
+}
 
 pub fn taint() {
     TAINT.store(true, Ordering::SeqCst);
@@ -93,7 +178,7 @@ fn max_bytes() -> u64 {
     mb.saturating_mul(1024 * 1024)
 }
 
-fn push_field(h: &mut Sha256, tag: &str, data: &[u8]) {
+fn push_field(h: &mut KeyHasher, tag: &str, data: &[u8]) {
     h.push(tag.as_bytes());
     h.push(b"\n");
     h.push(format!("{}", data.len()).as_bytes());
@@ -121,11 +206,11 @@ fn key_args(args: &[String]) -> Vec<&str> {
     out
 }
 
-pub fn key(args: &[String], files: &[SourceFile], manifests: &[String]) -> Option<String> {
+fn base_hasher(args: &[String]) -> Option<KeyHasher> {
     let exe = std::env::current_exe().ok()?;
     let exe_bytes = std::fs::read(exe).ok()?;
-    let mut h = Sha256::new();
-    push_field(&mut h, "compiler", crate::lock::sha256_hex(&exe_bytes).as_bytes());
+    let mut h = KeyHasher::new();
+    push_field(&mut h, "compiler", digest_hex(&exe_bytes).as_bytes());
     push_field(&mut h, "cwd", crate::package_world::cwd().as_bytes());
     for a in key_args(args) {
         push_field(&mut h, "arg", a.as_bytes());
@@ -145,19 +230,35 @@ pub fn key(args: &[String], files: &[SourceFile], manifests: &[String]) -> Optio
         push_field(&mut h, "env", k.as_bytes());
         push_field(&mut h, "val", v);
     }
+    Some(h)
+}
+
+fn push_manifests(h: &mut KeyHasher, manifests: &[String]) {
+    for m in manifests {
+        push_field(h, "manifest", m.as_bytes());
+        let body = std::fs::read(m).unwrap_or_default();
+        push_field(h, "manifest-body", &body);
+    }
+}
+
+pub fn key(args: &[String], files: &[SourceFile], manifests: &[String]) -> Option<String> {
+    let mut h = base_hasher(args)?;
     for f in files {
         push_field(&mut h, "path", f.path.display().to_string().as_bytes());
         push_field(&mut h, "src", f.src.as_bytes());
     }
-    for m in manifests {
-        push_field(&mut h, "manifest", m.as_bytes());
-        let body = std::fs::read(m).unwrap_or_default();
-        push_field(&mut h, "manifest-body", &body);
-    }
+    push_manifests(&mut h, manifests);
     Some(h.hex())
 }
 
-fn objects_dir(dir: &Path) -> PathBuf {
+pub fn resolve_key(args: &[String], manifests: &[String]) -> Option<String> {
+    let mut h = base_hasher(args)?;
+    push_field(&mut h, "resolve", b"1");
+    push_manifests(&mut h, manifests);
+    Some(h.hex())
+}
+
+pub(crate) fn objects_dir(dir: &Path) -> PathBuf {
     dir.join("objects")
 }
 
@@ -236,7 +337,7 @@ fn decode(mut bytes: Vec<u8>) -> Option<Entry> {
     Some(Entry { link, asm })
 }
 
-fn touch(path: &Path) {
+pub(crate) fn touch(path: &Path) {
     if let Ok(f) = std::fs::File::options().append(true).open(path) {
         let _ = f.set_modified(SystemTime::now());
     }
@@ -284,23 +385,25 @@ fn object_path(dir: &Path, key: &str, id: &str) -> PathBuf {
 }
 
 fn encode_object(obj: &[u8]) -> Vec<u8> {
-    let mut v = format!(
-        "{}\nlen={}\nsum={:016x}\n---\n",
-        OBJECT_MAGIC,
-        obj.len(),
-        fast_sum(obj)
-    )
-    .into_bytes();
+    encode_blob(OBJECT_MAGIC, obj)
+}
+
+fn encode_blob(magic: &str, obj: &[u8]) -> Vec<u8> {
+    let mut v = format!("{}\nlen={}\nsum={:016x}\n---\n", magic, obj.len(), fast_sum(obj)).into_bytes();
     v.extend_from_slice(obj);
     v
 }
 
-fn decode_object(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+fn decode_object(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    decode_blob(bytes, OBJECT_MAGIC)
+}
+
+fn decode_blob(mut bytes: Vec<u8>, magic: &str) -> Option<Vec<u8>> {
     let marker = b"\n---\n";
     let at = bytes.windows(marker.len()).take(256).position(|w| w == marker)?;
     let head = std::str::from_utf8(&bytes[..at]).ok()?;
     let mut lines = head.lines();
-    if lines.next()? != OBJECT_MAGIC {
+    if lines.next()? != magic {
         return None;
     }
     let len: usize = lines.next()?.strip_prefix("len=")?.parse().ok()?;
@@ -313,7 +416,7 @@ fn decode_object(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 pub fn object_id(assembler: &str) -> String {
-    let mut h = Sha256::new();
+    let mut h = KeyHasher::new();
     push_field(&mut h, "assembler", assembler.as_bytes());
     h.hex()[..16].to_string()
 }
@@ -332,7 +435,7 @@ pub fn store_object(slot: &Slot, id: &str, obj: &[u8]) -> bool {
     write_atomic(&slot.dir, &object_path(&slot.dir, &slot.key, id), &encode_object(obj))
 }
 
-fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
+pub(crate) fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
     use std::io::Write;
     let objs = objects_dir(dir);
     if std::fs::create_dir_all(&objs).is_err() {
@@ -350,6 +453,65 @@ fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
     }
     prune(dir, max_bytes());
     true
+}
+
+const WASM_MAGIC: &str = "FIRNWASM2";
+
+fn wasm_path(dir: &Path, key: &str) -> PathBuf {
+    objects_dir(dir).join(format!("{}.wasm", key))
+}
+
+fn encode_wasm(deps: &[Input], binary: &[u8]) -> Vec<u8> {
+    let mut v = format!("{}\n", WASM_MAGIC);
+    for d in deps {
+        v.push_str(&input_line(d));
+        v.push('\n');
+    }
+    v.push_str(&format!("len={}\nsum={:016x}\n---\n", binary.len(), fast_sum(binary)));
+    let mut out = v.into_bytes();
+    out.extend_from_slice(binary);
+    out
+}
+
+fn decode_wasm(mut bytes: Vec<u8>) -> Option<(Vec<Input>, Vec<u8>)> {
+    let marker = b"\n---\n";
+    let at = bytes.windows(marker.len()).take(1 << 20).position(|w| w == marker)?;
+    let head = std::str::from_utf8(&bytes[..at]).ok()?;
+    let mut lines = head.lines();
+    if lines.next()? != WASM_MAGIC {
+        return None;
+    }
+    let mut deps = Vec::new();
+    let mut len: Option<usize> = None;
+    let mut sum: Option<String> = None;
+    for l in lines {
+        let (k, v) = l.split_once('=')?;
+        match k {
+            "dep" => deps.push(parse_input(v)?),
+            "len" => len = v.parse().ok(),
+            "sum" => sum = Some(v.to_string()),
+            _ => return None,
+        }
+    }
+    bytes.drain(..at + marker.len());
+    if bytes.len() != len? || format!("{:016x}", fast_sum(&bytes)) != sum? {
+        return None;
+    }
+    Some((deps, bytes))
+}
+
+pub fn lookup_wasm(dir: &Path, key: &str) -> Option<Vec<u8>> {
+    let path = wasm_path(dir, key);
+    let (deps, body) = decode_wasm(std::fs::read(&path).ok()?)?;
+    if !deps.iter().all(input_holds) {
+        return None;
+    }
+    touch(&path);
+    Some(body)
+}
+
+pub fn store_wasm(dir: &Path, key: &str, deps: &[Input], binary: &[u8]) -> bool {
+    write_atomic(dir, &wasm_path(dir, key), &encode_wasm(deps, binary))
 }
 
 pub fn store(dir: &Path, key: &str, link: &LinkInfo, asm: &str) -> bool {
@@ -528,6 +690,39 @@ mod tests {
         b[n - 1] ^= 1;
         std::fs::write(&p, &b).unwrap();
         assert!(lookup_object(&slot, "aa").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn wasm_roundtrip_and_corruption() {
+        let d = tmpdir("wasm");
+        let bin = vec![0u8, b'a', b's', b'm', 1, 0, 0, 0, 255, 254];
+        assert!(lookup_wasm(&d, "k1").is_none());
+        assert!(store_wasm(&d, "k1", &[], &bin));
+        assert_eq!(lookup_wasm(&d, "k1").unwrap(), bin);
+        let p = wasm_path(&d, "k1");
+        let mut b = std::fs::read(&p).unwrap();
+        let n = b.len();
+        b[n - 1] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        assert!(lookup_wasm(&d, "k1").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn wasm_inputs_are_verified_on_lookup() {
+        let d = tmpdir("wasmdep");
+        let f = d.join("inc.txt");
+        std::fs::write(&f, b"one").unwrap();
+        let deps = vec![
+            Input::File { path: f.display().to_string(), sha: digest_hex(b"one") },
+            Input::Env { name: "FIRN_TEST_DEP_UNSET".to_string(), value: None },
+            Input::EnvHas { name: "FIRN_TEST_DEP_UNSET".to_string(), set: false },
+        ];
+        assert!(store_wasm(&d, "k1", &deps, b"bin"));
+        assert_eq!(lookup_wasm(&d, "k1").unwrap(), b"bin");
+        std::fs::write(&f, b"two").unwrap();
+        assert!(lookup_wasm(&d, "k1").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

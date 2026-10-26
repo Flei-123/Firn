@@ -121,6 +121,8 @@ mod rotate;
 mod bitsel;
 mod bswapload;
 mod buildcache;
+mod cachemanifest;
+mod keyhash;
 mod objcache;
 mod chainsink;
 mod usecount;
@@ -766,6 +768,20 @@ fn run(opts: &Options) -> i32 {
         }
     };
     let path = &input;
+    let cache_dir = cache_dir_for(opts);
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let manifest_paths: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
+    let resolve_key = match &cache_dir {
+        Some(_) if !opts.lock && !opts.locked => buildcache::resolve_key(&cli_args, &manifest_paths),
+        _ => None,
+    };
+    if let (Some(dir), Some(rkey)) = (&cache_dir, &resolve_key) {
+        if let Some(key) = cachemanifest::lookup(dir, rkey) {
+            if let Some(code) = cache_hit(opts, path, &target_out_manifest, dir, &key) {
+                return code;
+            }
+        }
+    }
     // --- Resolve modules (root file + all 'import' modules) ---
     let files = match modules::resolve(path, &world) {
         Ok(f) => f,
@@ -836,35 +852,19 @@ fn run(opts: &Options) -> i32 {
             return 2;
         }
     };
-    let cache_dir = cache_dir_for(opts);
     if cache_dir.is_none() {
         buildcache::log("off");
     }
     let cache_key = match &cache_dir {
-        Some(_) => {
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            let manifests: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
-            buildcache::key(&args, &files, &manifests)
-        }
+        Some(_) => buildcache::key(&cli_args, &files, &manifest_paths),
         None => None,
     };
     if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
-        let slot = buildcache::Slot { dir: dir.clone(), key: key.clone() };
-        if let Some(head) = buildcache::lookup_head(dir, key) {
-            let object = if opts.emit == Emit::Exe && !opts.keep_asm {
-                objcache::load(&slot)
-            } else {
-                None
-            };
-            let asm = if object.is_some() { None } else { head.read_asm() };
-            if object.is_some() || asm.is_some() {
-                buildcache::log("hit");
-                if object.is_some() {
-                    buildcache::log("objload");
-                }
-                let mut tm = Timings::new(false);
-                return finish(opts, path, target_out_manifest, asm.as_deref(), object, &head.link, Some(&slot), &mut tm);
+        if let Some(code) = cache_hit(opts, path, &target_out_manifest, dir, key) {
+            if let Some(rkey) = &resolve_key {
+                cachemanifest::store(dir, rkey, key);
             }
+            return code;
         }
         buildcache::log("miss");
     }
@@ -1295,7 +1295,19 @@ fn run(opts: &Options) -> i32 {
     // ROUND WASM: the third target writes no assembler text. Its module is
     // finished in memory, so it leaves the pipeline here, before `as`/`ld`.
     if target::active().is_wasm() {
-        return emit_wasm(opts, &module, path, target_out_manifest, &mut tm);
+        let store = match (&cache_dir, &cache_key) {
+            (Some(dir), Some(key)) if !buildcache::tainted() && prog.comptime_blocks.is_empty() => Some((dir.clone(), key.clone())),
+            (Some(_), Some(_)) => {
+                buildcache::log("skip");
+                None
+            }
+            _ => None,
+        };
+        let manifest = match (&store, &resolve_key) {
+            (Some((dir, key)), Some(rkey)) => Some((dir.clone(), rkey.clone(), key.clone())),
+            _ => None,
+        };
+        return emit_wasm(opts, &module, path, target_out_manifest, &mut tm, store, manifest);
     }
     let emitted = match target::active() {
         target::Target::X86_64 => {
@@ -1321,6 +1333,9 @@ fn run(opts: &Options) -> i32 {
             if buildcache::store(dir, key, &link, &asm) {
                 buildcache::log("store");
                 slot = Some(buildcache::Slot { dir: dir.clone(), key: key.clone() });
+                if let Some(rkey) = &resolve_key {
+                    cachemanifest::store(dir, rkey, key);
+                }
             }
         } else {
             buildcache::log("skip");
@@ -1328,6 +1343,33 @@ fn run(opts: &Options) -> i32 {
     }
     let link = buildcache::LinkInfo::capture();
     finish(opts, path, target_out_manifest, Some(&asm), None, &link, slot.as_ref(), &mut tm)
+}
+
+fn cache_hit(opts: &Options, path: &Path, target_out_manifest: &Option<PathBuf>, dir: &PathBuf, key: &str) -> Option<i32> {
+    if target::active().is_wasm() {
+        let binary = buildcache::lookup_wasm(dir, key)?;
+        let out = wasm_output(opts, path, target_out_manifest.clone());
+        std::fs::write(&out, &binary).ok()?;
+        buildcache::log("hit");
+        return Some(0);
+    }
+    let slot = buildcache::Slot { dir: dir.clone(), key: key.to_string() };
+    let head = buildcache::lookup_head(dir, key)?;
+    let object = if opts.emit == Emit::Exe && !opts.keep_asm {
+        objcache::load(&slot)
+    } else {
+        None
+    };
+    let asm = if object.is_some() { None } else { head.read_asm() };
+    if object.is_none() && asm.is_none() {
+        return None;
+    }
+    buildcache::log("hit");
+    if object.is_some() {
+        buildcache::log("objload");
+    }
+    let mut tm = Timings::new(false);
+    Some(finish(opts, path, target_out_manifest.clone(), asm.as_deref(), object, &head.link, Some(&slot), &mut tm))
 }
 
 fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
@@ -1340,7 +1382,7 @@ fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
         && opts.header.is_none()
         && opts.def_file.is_none()
         && opts.deps_out.is_none()
-        && !target::active().is_wasm();
+        && (!target::active().is_wasm() || (opts.emit == Emit::Exe && !opts.test_mode && !opts.only_object));
     if !cacheable {
         return None;
     }
@@ -1526,6 +1568,8 @@ fn emit_wasm(
     path: &Path,
     target_out_manifest: Option<PathBuf>,
     tm: &mut Timings,
+    store: Option<(PathBuf, String)>,
+    manifest: Option<(PathBuf, String, String)>,
 ) -> i32 {
     if opts.test_mode {
         eprintln!("error: --test builds and runs a native test binary; with --target=wasm32-browser build the module and run it under a host (tools/wasm/run.mjs)");
@@ -1551,22 +1595,34 @@ fn emit_wasm(
             out.binary.len()
         );
     }
-    let target = opts.output.clone().or(target_out_manifest).unwrap_or_else(|| {
-        let d = default_output(path);
-        if opts.emit == Emit::Asm {
-            d.with_extension("wat")
-        } else {
-            d.with_extension("wasm")
-        }
-    });
+    let target = wasm_output(opts, path, target_out_manifest);
     let bytes: &[u8] = if opts.emit == Emit::Asm { out.text.as_bytes() } else { &out.binary };
     if let Err(e) = std::fs::write(&target, bytes) {
         eprintln!("error: cannot write '{}': {}", target.display(), e);
         return 2;
     }
     tm.mark("write .wasm");
+    if let (Some((dir, key)), Emit::Exe) = (&store, opts.emit) {
+        if buildcache::store_wasm(dir, key, &buildcache::inputs(), &out.binary) {
+            buildcache::log("store");
+            if let Some((mdir, rkey, mkey)) = &manifest {
+                cachemanifest::store(mdir, rkey, mkey);
+            }
+        }
+    }
     tm.print();
     0
+}
+
+fn wasm_output(opts: &Options, path: &Path, target_out_manifest: Option<PathBuf>) -> PathBuf {
+    opts.output.clone().or(target_out_manifest).unwrap_or_else(|| {
+        let d = default_output(path);
+        if opts.emit == Emit::Asm {
+            d.with_extension("wat")
+        } else {
+            d.with_extension("wasm")
+        }
+    })
 }
 
 /// Prints all collected errors and yields the exit code.
