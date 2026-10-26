@@ -1,7 +1,9 @@
+import os
 import re
-import struct
-import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from jxlbits import BitWriter, encode_toc, to_bits, to_bytes
 
 KIND_MODE = [0, 1, 2, 3, 0, 0, 0, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0]
 KIND_BANDS = [6, 0, 0, 4, 7, 8, 7, 8, 8, 4, 0, 8, 8, 8, 8, 8, 8]
@@ -13,18 +15,6 @@ def load_tables(root):
     params = [float(v) for v in re.search(r"static PARAMS: \[f64; \d+\] = \[(.*?)\]", text, re.S).group(1).split(",")]
     offsets = [int(v) for v in re.search(r"static OFFSETS: \[usize; \d+\] = \[(.*?)\]", text, re.S).group(1).split(",")]
     return params, offsets
-
-
-class BitWriter:
-    def __init__(self):
-        self.bits = []
-
-    def put(self, value, count):
-        for i in range(count):
-            self.bits.append((value >> i) & 1)
-
-    def put_f16(self, value):
-        self.put(struct.unpack("<H", struct.pack("<e", value))[0], 16)
 
 
 def put_dct_params(bw, values, nb, first_scale, delta):
@@ -92,36 +82,6 @@ def variant_bits(name, params, offsets):
             custom = True
         emit_kind(bw, kind, custom, params, offsets, 1.3, 0.1)
     return bw.bits
-
-
-def to_bytes(bits):
-    out = bytearray((len(bits) + 7) // 8)
-    for i, b in enumerate(bits):
-        if b:
-            out[i >> 3] |= 1 << (i & 7)
-    return bytes(out)
-
-
-def to_bits(data):
-    return [(data[i >> 3] >> (i & 7)) & 1 for i in range(len(data) * 8)]
-
-
-def encode_toc(sizes):
-    bw = BitWriter()
-    for s in sizes:
-        if s < 1024:
-            bw.put(0, 2)
-            bw.put(s, 10)
-        elif s < 17408:
-            bw.put(1, 2)
-            bw.put(s - 1024, 14)
-        elif s < 4211712:
-            bw.put(2, 2)
-            bw.put(s - 17408, 22)
-        else:
-            bw.put(3, 2)
-            bw.put(s - 4211712, 30)
-    return to_bytes(bw.bits)
 
 
 def rebuild(data, probe, new_bits, strip):

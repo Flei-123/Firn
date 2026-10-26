@@ -1,0 +1,510 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_splines.fi -- jxl_splines: spline parser, dequantizer and Gaussian stroke renderer
+import std.math
+import std.mathx
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_code
+import jxl.jxl_err
+
+export { JxlSplines, splines_new, splines_free, splines_read, splines_count, splines_apply }
+
+const CTX_QUANT_ADJ: u32 = 0
+const CTX_START_POS: u32 = 1
+const CTX_NUM_SPLINES: u32 = 2
+const CTX_NUM_CTRL: u32 = 3
+const CTX_CTRL: u32 = 4
+const CTX_DCT: u32 = 5
+const NUM_CTX: usize = 6
+
+const POS_LIMIT: i64 = 8388608
+const DELTA_LIMIT: i64 = 1073741824
+const MAX_CTRL: usize = 1048576
+const COEFS: usize = 128
+const SQRT2: f64 = 1.41421356237
+const SQRT0_5: f64 = 0.70710678118
+const PI32: f64 = 0.09817477042468103
+
+struct JxlSplines {
+    count: usize,
+    quant_adj: i32,
+    start: vec.Vec[i64],
+    ncp: vec.Vec[usize],
+    ctrl_off: vec.Vec[usize],
+    ctrl: vec.Vec[i64],
+    dct: vec.Vec[i32],
+}
+
+fn splines_new() -> JxlSplines {
+    return JxlSplines { count: 0, quant_adj: 0, start: vec.vec_new[i64](), ncp: vec.vec_new[usize](), ctrl_off: vec.vec_new[usize](),
+        ctrl: vec.vec_new[i64](), dct: vec.vec_new[i32]() }
+}
+
+fn splines_free(s: *mut JxlSplines) {
+    vec.vec_free[i64](&(*s).start)
+    vec.vec_free[usize](&(*s).ncp)
+    vec.vec_free[usize](&(*s).ctrl_off)
+    vec.vec_free[i64](&(*s).ctrl)
+    vec.vec_free[i32](&(*s).dct)
+}
+
+fn splines_count(s: *mut JxlSplines) -> usize {
+    return (*s).count
+}
+
+fn in_pos_range(v: i64) -> bool {
+    return v < POS_LIMIT && v > (0 - POS_LIMIT)
+}
+
+fn read_spline(rd: *mut jxl_code.JxlReader, b: *mut jxl_bits.JxlBits, s: *mut JxlSplines, total: *mut usize, max_ctrl: usize) -> i32 {
+    let n: usize = jxl_code.reader_read(rd, b, CTX_NUM_CTRL) as usize
+    *total = *total + n
+    if *total > max_ctrl {
+        return jxl_err.JX_BAD
+    }
+    vec.vec_push[usize](&(*s).ncp, n)
+    vec.vec_push[usize](&(*s).ctrl_off, vec.vec_len[i64](&(*s).ctrl) / 2)
+    var i: usize = 0
+    while i < n * 2 {
+        let v: i64 = jxl_code.unpack_signed(jxl_code.reader_read(rd, b, CTX_CTRL))
+        if v >= DELTA_LIMIT || v <= (0 - DELTA_LIMIT) {
+            return jxl_err.JX_BAD
+        }
+        vec.vec_push[i64](&(*s).ctrl, v)
+        i = i + 1
+    }
+    i = 0
+    while i < COEFS {
+        let v: i64 = jxl_code.unpack_signed(jxl_code.reader_read(rd, b, CTX_DCT))
+        vec.vec_push[i32](&(*s).dct, v as i32)
+        i = i + 1
+    }
+    return jxl_err.JX_OK
+}
+
+fn splines_read(b: *mut jxl_bits.JxlBits, num_pixels: usize, s: *mut JxlSplines) -> i32 {
+    var code: jxl_code.JxlCode = jxl_code.code_new()
+    var rd: jxl_code.JxlReader = jxl_code.reader_new()
+    var r: i32 = jxl_code.code_read(b, NUM_CTX, false, &code)
+    if r == jxl_err.JX_OK {
+        r = jxl_code.reader_init(&rd, &code, b, 0)
+    }
+    if r != jxl_err.JX_OK {
+        jxl_code.code_free(&code)
+        return r
+    }
+    var max_ctrl: usize = num_pixels / 2
+    if max_ctrl > MAX_CTRL {
+        max_ctrl = MAX_CTRL
+    }
+    let n: usize = (jxl_code.reader_read(&rd, b, CTX_NUM_SPLINES) as usize) + 1
+    if n > max_ctrl {
+        r = jxl_err.JX_BAD
+    }
+    var lx: i64 = 0
+    var ly: i64 = 0
+    var i: usize = 0
+    while r == jxl_err.JX_OK && i < n {
+        var x: i64 = jxl_code.reader_read(&rd, b, CTX_START_POS) as i64
+        var y: i64 = jxl_code.reader_read(&rd, b, CTX_START_POS) as i64
+        if i != 0 {
+            x = jxl_code.unpack_signed(x as u32) + lx
+            y = jxl_code.unpack_signed(y as u32) + ly
+        }
+        if !in_pos_range(x) || !in_pos_range(y) {
+            r = jxl_err.JX_BAD
+            break
+        }
+        vec.vec_push[i64](&(*s).start, x)
+        vec.vec_push[i64](&(*s).start, y)
+        lx = x
+        ly = y
+        i = i + 1
+    }
+    if r == jxl_err.JX_OK {
+        (*s).quant_adj = jxl_code.unpack_signed(jxl_code.reader_read(&rd, b, CTX_QUANT_ADJ)) as i32
+        var total: usize = n
+        i = 0
+        while r == jxl_err.JX_OK && i < n {
+            r = read_spline(&rd, b, s, &total, max_ctrl)
+            i = i + 1
+        }
+    }
+    if r == jxl_err.JX_OK && (!jxl_code.reader_final_ok(&rd) || jxl_bits.jb_over(b)) {
+        r = jxl_err.JX_BAD
+    }
+    if r == jxl_err.JX_OK {
+        (*s).count = n
+    }
+    jxl_code.reader_free(&rd)
+    jxl_code.code_free(&code)
+    return r
+}
+
+fn vf(v: *mut vec.Vec[f64], i: usize) -> f64 {
+    return *vec.vec_elem_ptr[f64](v, i)
+}
+
+fn finite(v: f64) -> bool {
+    return v - v == 0.0
+}
+
+fn inv_adjusted_quant(adj: i32) -> f64 {
+    if adj >= 0 {
+        return 1.0 / (1.0 + 0.125 * (adj as f64))
+    }
+    return 1.0 - 0.125 * (adj as f64)
+}
+
+fn channel_weight(c: usize) -> f64 {
+    if c == 0 {
+        return 0.0042
+    }
+    if c == 1 {
+        return 0.075
+    }
+    if c == 2 {
+        return 0.07
+    }
+    return 0.3333
+}
+
+fn dequantize(s: *mut JxlSplines, si: usize, ytox: f64, ytob: f64, coef: *mut [f64; 128]) {
+    let inv_quant: f64 = inv_adjusted_quant((*s).quant_adj)
+    var c: usize = 0
+    while c < 4 {
+        var i: usize = 0
+        while i < 32 {
+            var f: f64 = 1.0
+            if i == 0 {
+                f = SQRT0_5
+            }
+            let q: i32 = vec.vec_at[i32](&(*s).dct, si * COEFS + c * 32 + i)
+            (*coef)[c * 32 + i] = (q as f64) * f * channel_weight(c) * inv_quant
+            i = i + 1
+        }
+        c = c + 1
+    }
+    var i: usize = 0
+    while i < 32 {
+        (*coef)[i] = (*coef)[i] + ytox * (*coef)[32 + i]
+        (*coef)[64 + i] = (*coef)[64 + i] + ytob * (*coef)[32 + i]
+        i = i + 1
+    }
+}
+
+fn control_points(s: *mut JxlSplines, si: usize, out: *mut vec.Vec[f64]) -> bool {
+    var cx: i64 = vec.vec_at[i64](&(*s).start, si * 2)
+    var cy: i64 = vec.vec_at[i64](&(*s).start, si * 2 + 1)
+    vec.vec_push[f64](out, cx as f64)
+    vec.vec_push[f64](out, cy as f64)
+    let n: usize = vec.vec_at[usize](&(*s).ncp, si)
+    let off: usize = vec.vec_at[usize](&(*s).ctrl_off, si)
+    var dx: i64 = 0
+    var dy: i64 = 0
+    var i: usize = 0
+    while i < n {
+        dx = dx + vec.vec_at[i64](&(*s).ctrl, (off + i) * 2)
+        dy = dy + vec.vec_at[i64](&(*s).ctrl, (off + i) * 2 + 1)
+        if !in_pos_range(dx) || !in_pos_range(dy) {
+            return false
+        }
+        cx = cx + dx
+        cy = cy + dy
+        if !in_pos_range(cx) || !in_pos_range(cy) {
+            return false
+        }
+        if cx == (vf(out, i * 2) as i64) && cy == (vf(out, i * 2 + 1) as i64) {
+            return false
+        }
+        vec.vec_push[f64](out, cx as f64)
+        vec.vec_push[f64](out, cy as f64)
+        i = i + 1
+    }
+    return true
+}
+
+fn catmull_rom(pts: *mut vec.Vec[f64], out: *mut vec.Vec[f64]) {
+    let n: usize = vec.vec_len[f64](pts) / 2
+    if n == 1 {
+        vec.vec_push[f64](out, vf(pts, 0))
+        vec.vec_push[f64](out, vf(pts, 1))
+        return
+    }
+    var ext: vec.Vec[f64] = vec.vec_new[f64]()
+    vec.vec_push[f64](&ext, 2.0 * vf(pts, 0) - vf(pts, 2))
+    vec.vec_push[f64](&ext, 2.0 * vf(pts, 1) - vf(pts, 3))
+    var i: usize = 0
+    while i < n * 2 {
+        vec.vec_push[f64](&ext, vf(pts, i))
+        i = i + 1
+    }
+    vec.vec_push[f64](&ext, 2.0 * vf(pts, n * 2 - 2) - vf(pts, n * 2 - 4))
+    vec.vec_push[f64](&ext, 2.0 * vf(pts, n * 2 - 1) - vf(pts, n * 2 - 3))
+    let m: usize = n + 2
+    var start: usize = 0
+    while start + 3 < m {
+        var px: [f64; 4] = [0.0; 4]
+        var py: [f64; 4] = [0.0; 4]
+        var k: usize = 0
+        while k < 4 {
+            px[k] = vf(&ext, (start + k) * 2)
+            py[k] = vf(&ext, (start + k) * 2 + 1)
+            k = k + 1
+        }
+        vec.vec_push[f64](out, px[1])
+        vec.vec_push[f64](out, py[1])
+        var d: [f64; 3] = [0.0; 3]
+        var t: [f64; 4] = [0.0; 4]
+        k = 0
+        while k < 3 {
+            d[k] = math.sqrt(math.hypot(px[k + 1] - px[k], py[k + 1] - py[k]))
+            t[k + 1] = t[k] + d[k]
+            k = k + 1
+        }
+        var j: usize = 1
+        while j < 16 {
+            let tt: f64 = d[0] + ((j as f64) / 16.0) * d[1]
+            var ax: [f64; 3] = [0.0; 3]
+            var ay: [f64; 3] = [0.0; 3]
+            k = 0
+            while k < 3 {
+                let f: f64 = (tt - t[k]) / d[k]
+                ax[k] = px[k] + f * (px[k + 1] - px[k])
+                ay[k] = py[k] + f * (py[k + 1] - py[k])
+                k = k + 1
+            }
+            var bx: [f64; 2] = [0.0; 2]
+            var by: [f64; 2] = [0.0; 2]
+            k = 0
+            while k < 2 {
+                let f: f64 = (tt - t[k]) / (d[k] + d[k + 1])
+                bx[k] = ax[k] + f * (ax[k + 1] - ax[k])
+                by[k] = ay[k] + f * (ay[k + 1] - ay[k])
+                k = k + 1
+            }
+            let g: f64 = (tt - t[1]) / d[1]
+            vec.vec_push[f64](out, bx[0] + g * (bx[1] - bx[0]))
+            vec.vec_push[f64](out, by[0] + g * (by[1] - by[0]))
+            j = j + 1
+        }
+        start = start + 1
+    }
+    vec.vec_push[f64](out, vf(&ext, (m - 2) * 2))
+    vec.vec_push[f64](out, vf(&ext, (m - 2) * 2 + 1))
+    vec.vec_free[f64](&ext)
+}
+
+fn emit(out: *mut vec.Vec[f64], x: f64, y: f64, mult: f64, limit: usize) -> bool {
+    vec.vec_push[f64](out, x)
+    vec.vec_push[f64](out, y)
+    vec.vec_push[f64](out, mult)
+    return vec.vec_len[f64](out) / 3 <= limit
+}
+
+fn spaced_points(pts: *mut vec.Vec[f64], out: *mut vec.Vec[f64], limit: usize) -> bool {
+    let n: usize = vec.vec_len[f64](pts) / 2
+    var cx: f64 = vf(pts, 0)
+    var cy: f64 = vf(pts, 1)
+    if !emit(out, cx, cy, 1.0, limit) {
+        return false
+    }
+    var next: usize = 0
+    while next < n {
+        var px: f64 = cx
+        var py: f64 = cy
+        var acc: f64 = 0.0
+        var done: bool = false
+        while !done {
+            if next == n {
+                return emit(out, px, py, acc, limit)
+            }
+            let nx: f64 = vf(pts, next * 2)
+            let ny: f64 = vf(pts, next * 2 + 1)
+            let dx: f64 = nx - px
+            let dy: f64 = ny - py
+            let seg: f64 = math.sqrt(dx * dx + dy * dy)
+            if acc + seg >= 1.0 {
+                let k: f64 = (1.0 - acc) / seg
+                cx = px + k * dx
+                cy = py + k * dy
+                if !emit(out, cx, cy, 1.0, limit) {
+                    return false
+                }
+                done = true
+            } else {
+                acc = acc + seg
+                px = nx
+                py = ny
+                next = next + 1
+            }
+        }
+    }
+    return true
+}
+
+fn idct(coef: *mut [f64; 128], base: usize, t: f64) -> f64 {
+    var sum: f64 = 0.0
+    var i: usize = 0
+    while i < 32 {
+        sum = sum + SQRT2 * (*coef)[base + i] * math.cos(PI32 * (i as f64) * (t + 0.5))
+        i = i + 1
+    }
+    return sum
+}
+
+fn add_segment(segs: *mut vec.Vec[f64], limit: *mut usize, cx: f64, cy: f64, col: *mut [f64; 3], sigma: f64, intensity: f64) {
+    if !(finite(sigma) && sigma != 0.0 && finite(1.0 / sigma) && finite(intensity)) {
+        if *limit < 4 {
+            *limit = 0
+        } else {
+            *limit = *limit - 4
+        }
+        return
+    }
+    var max_color: f64 = 0.01
+    var c: usize = 0
+    while c < 3 {
+        let a: f64 = math.fabs((*col)[c] * intensity)
+        if a > max_color {
+            max_color = a
+        }
+        c = c + 1
+    }
+    let max_dist: f64 = math.sqrt(0.0 - 2.0 * sigma * sigma * (math.ln(0.1) * 5.0 - math.ln(max_color)))
+    let cost: f64 = 2.0 * max_dist + 2.0
+    if cost >= 32768.0 {
+        *limit = 0
+        return
+    }
+    let area: usize = (cost * cost) as usize
+    if area > *limit {
+        *limit = 0
+        return
+    }
+    *limit = *limit - area
+    vec.vec_push[f64](segs, cx)
+    vec.vec_push[f64](segs, cy)
+    vec.vec_push[f64](segs, (*col)[0])
+    vec.vec_push[f64](segs, (*col)[1])
+    vec.vec_push[f64](segs, (*col)[2])
+    vec.vec_push[f64](segs, 1.0 / sigma)
+    vec.vec_push[f64](segs, 0.25 * sigma * intensity)
+    vec.vec_push[f64](segs, max_dist)
+}
+
+fn spline_segments(s: *mut JxlSplines, si: usize, ytox: f64, ytob: f64, segs: *mut vec.Vec[f64], limit: *mut usize) -> i32 {
+    var coef: [f64; 128] = [0.0; 128]
+    dequantize(s, si, ytox, ytob, &coef)
+    var ctl: vec.Vec[f64] = vec.vec_new[f64]()
+    var cr: vec.Vec[f64] = vec.vec_new[f64]()
+    var td: vec.Vec[f64] = vec.vec_new[f64]()
+    var r: i32 = jxl_err.JX_OK
+    if !control_points(s, si, &ctl) {
+        r = jxl_err.JX_BAD
+    }
+    if r == jxl_err.JX_OK {
+        catmull_rom(&ctl, &cr)
+        if !spaced_points(&cr, &td, *limit) {
+            r = jxl_err.JX_BAD
+        }
+    }
+    let n: usize = vec.vec_len[f64](&td) / 3
+    if r == jxl_err.JX_OK && n >= 2 {
+        let arc: f64 = ((n - 2) as f64) + vf(&td, (n - 1) * 3 + 2)
+        if arc > 0.0 {
+            let inv_arc: f64 = 1.0 / arc
+            var k: usize = 0
+            while r == jxl_err.JX_OK && k < n {
+                var progress: f64 = (k as f64) * inv_arc
+                if progress > 1.0 {
+                    progress = 1.0
+                }
+                let t: f64 = 31.0 * progress
+                var col: [f64; 3] = [idct(&coef, 0, t), idct(&coef, 32, t), idct(&coef, 64, t)]
+                add_segment(segs, limit, vf(&td, k * 3), vf(&td, k * 3 + 1), &col, idct(&coef, 96, t), vf(&td, k * 3 + 2))
+                if *limit == 0 {
+                    r = jxl_err.JX_BAD
+                }
+                k = k + 1
+            }
+        }
+    }
+    vec.vec_free[f64](&ctl)
+    vec.vec_free[f64](&cr)
+    vec.vec_free[f64](&td)
+    return r
+}
+
+fn fadd(p: u64, i: usize, v: f64) {
+    let q: *mut f64 = (p +% ((i * 8) as u64)) as *mut f64
+    *q = *q + v
+}
+
+fn draw_segment(sg: *mut vec.Vec[f64], si: usize, planes: u64, stride: usize, plane_len: usize, w: usize, h: usize) {
+    let o: usize = si * 8
+    let cx: f64 = vf(sg, o)
+    let cy: f64 = vf(sg, o + 1)
+    let inv_sigma: f64 = vf(sg, o + 5)
+    let s4i: f64 = vf(sg, o + 6)
+    let md: f64 = vf(sg, o + 7)
+    var y0: i64 = (cy - md + 0.5) as i64
+    var y1: i64 = (cy + md + 1.5) as i64
+    var x0: i64 = (cx - md + 0.5) as i64
+    var x1: i64 = (cx + md + 1.5) as i64
+    if y0 < 0 {
+        y0 = 0
+    }
+    if x0 < 0 {
+        x0 = 0
+    }
+    if y1 > (h as i64) {
+        y1 = h as i64
+    }
+    if x1 > (w as i64) {
+        x1 = w as i64
+    }
+    var y: i64 = y0
+    while y < y1 {
+        let dy: f64 = (y as f64) - cy
+        var x: i64 = x0
+        while x < x1 {
+            let dx: f64 = (x as f64) - cx
+            let dist: f64 = math.sqrt(dx * dx + dy * dy)
+            let one: f64 = mathx.erf((dist * 0.5 + 0.353553391) * inv_sigma) - mathx.erf((dist * 0.5 - 0.353553391) * inv_sigma)
+            let li: f64 = s4i * one * one
+            var c: usize = 0
+            while c < 3 {
+                fadd(planes, c * plane_len + (y as usize) * stride + (x as usize), vf(sg, o + 2 + c) * li)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn splines_apply(s: *mut JxlSplines, ytox: f64, ytob: f64, planes: u64, stride: usize, plane_len: usize, w: usize, h: usize) -> i32 {
+    var segs: vec.Vec[f64] = vec.vec_new[f64]()
+    var limit: usize = 1073741824
+    let budget: f64 = 16.0 * (w as f64) * (h as f64) + 65536.0
+    if budget < 1073741824.0 {
+        limit = budget as usize
+    }
+    var r: i32 = jxl_err.JX_OK
+    var si: usize = 0
+    while r == jxl_err.JX_OK && si < (*s).count {
+        r = spline_segments(s, si, ytox, ytob, &segs, &limit)
+        si = si + 1
+    }
+    if r == jxl_err.JX_OK {
+        let n: usize = vec.vec_len[f64](&segs) / 8
+        var i: usize = 0
+        while i < n {
+            draw_segment(&segs, i, planes, stride, plane_len, w, h)
+            i = i + 1
+        }
+    }
+    vec.vec_free[f64](&segs)
+    return r
+}
