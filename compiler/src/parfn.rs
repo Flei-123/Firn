@@ -17,7 +17,7 @@
 //! plain sums, (c) TOUCHED is only ever asked about the function being
 //! processed, and the batch is serial when two tasks share a name.
 //!
-//! `FIRN_OPT_THREADS=n` picks the thread count (default: min(4, cores),
+//! `FIRN_OPT_THREADS=n` picks the thread count (default: min(8, cores),
 //! `1` = serial).
 
 use crate::fir::Func;
@@ -36,7 +36,50 @@ pub(crate) fn threads() -> usize {
     if let Some(n) = std::env::var("FIRN_OPT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.clamp(1, 64);
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
+}
+
+pub(crate) fn map_slice<T, R, F>(items: &[T], work: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let nthreads = threads().min(items.len() / 64);
+    if nthreads <= 1 {
+        return items.iter().map(&work).collect();
+    }
+    let chunk = (items.len() + nthreads * 4 - 1) / (nthreads * 4);
+    let nchunks = (items.len() + chunk - 1) / chunk;
+    let next = AtomicUsize::new(0);
+    let mut parts: Vec<(usize, Vec<R>)> = Vec::with_capacity(nchunks);
+    std::thread::scope(|sc| {
+        let mut hs = Vec::new();
+        for _ in 0..nthreads {
+            let (next, work) = (&next, &work);
+            hs.push(sc.spawn(move || {
+                let mut got: Vec<(usize, Vec<R>)> = Vec::new();
+                loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= nchunks {
+                        break;
+                    }
+                    let lo = k * chunk;
+                    let hi = (lo + chunk).min(items.len());
+                    got.push((k, items[lo..hi].iter().map(work).collect()));
+                }
+                got
+            }));
+        }
+        for h in hs {
+            match h.join() {
+                Ok(g) => parts.extend(g),
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+    });
+    parts.sort_by_key(|(k, _)| *k);
+    parts.into_iter().flat_map(|(_, v)| v).collect()
 }
 
 /// The state a worker needs from the compiling thread.

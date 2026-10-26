@@ -539,9 +539,12 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
     // r761: which functions are pure length getters (`vec_len`): the range
     // analysis reads a call of one as a load of the word it returns.
     crate::rangecheck::note_len_getters(m);
+    let mut stage = StageClock::new();
     // Clean up per function first, so that the size heuristic of the inliner
     // works on bodies that are already simplified.
     optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
+    let mut settled = settled_after_full(&m.funcs);
+    stage.mark("first batch");
     // Round EINBETTEN -- the explicit will first. It holds on every level;
     // the size rule below only on `release-*`. If both run, the second pass
     // finds the requested sites already done.
@@ -553,6 +556,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             phi_check(f, "inline-requested");
         }
         optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
+        settled = settled_after_full(&m.funcs);
     }
     // r591 -- the leaf inliner of the debug-preserving levels. Two rounds: a
     // thin wrapper (`fn chars(self, i) { return chars(self, i) }`) is a leaf
@@ -576,6 +580,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
                 phi_check(&m.funcs[ci], "inline-leaf");
             }
             optimize_batch(&mut m.funcs, Some(&changed), &mut st, &cheap, &mut clk);
+            unsettle(&mut settled, &changed);
             if k == 0 {
                 break;
             }
@@ -589,17 +594,23 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             phi_check(&m.funcs[ci], "guardsplit");
         }
         optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
+        unsettle(&mut settled, &changed);
     }
     if cfg.runs("inline") {
         let t = std::time::Instant::now();
-        st.inlined += crate::inline::inline_module(m);
+        let (inlined, inline_changed) = crate::inline::inline_module_tracked(m);
+        st.inlined += inlined;
         clk.add("inline", t);
+        stage.mark("inline");
         for f in m.funcs.iter() {
             phi_check(f, "inline");
         }
-        optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
-        // ROUND TK2 (r136): the recursive callers kept for the frame budget go
-        // through the same passes as the module.
+        let redo = redo_after_inline(&settled, &inline_changed, m.funcs.len());
+        if stage.on {
+            eprintln!("  redo {} of {} functions ({} inline-changed)", redo.as_ref().map(|r| r.len()).unwrap_or(m.funcs.len()), m.funcs.len(), inline_changed.len());
+        }
+        optimize_batch(&mut m.funcs, redo.as_deref(), &mut st, cfg, &mut clk);
+        stage.mark("batch after inline");
         let mut kept = crate::inline::rec_originals_take();
         optimize_map(&mut kept, &mut st, cfg, &mut clk);
         crate::inline::rec_originals_put(kept);
@@ -619,6 +630,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             }
             optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
         }
+        stage.mark("inline again + batch");
         let t = std::time::Instant::now();
         let changed = crate::inline_once::run(m);
         clk.add("inline", t);
@@ -629,6 +641,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
         }
     }
+    stage.mark("inline once + batch");
     if cfg.runs("promote") && std::env::var_os("FIRN_NO_PROMOTE").is_none() {
         let t = std::time::Instant::now();
         let nounmap = crate::promote::nounmap_functions(m);
@@ -728,6 +741,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             eprintln!("promote: pre-check {:.1} ms, {} functions passed it, all {:.1} ms", t_check, n_check, t.elapsed().as_secs_f64() * 1000.0);
         }
         clk.add("promote", t);
+        stage.mark("promote");
     }
     // r837: 32-bit rotate recognition. After the fixpoint and the inliner (the shift counts are
     // constants by now), before `fuse-checks`; the five operations of the old expression die in `dce`.
@@ -796,6 +810,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         clk.add2("fuse-checks", t, n > 0);
     }
+    stage.mark("late passes");
     clk.print();
     st
 }
@@ -876,7 +891,65 @@ fn phi_check(f: &Func, pass: &str) {
     }
 }
 
+fn settled_after_full(funcs: &[Func]) -> Vec<bool> {
+    let un = unsettled_take();
+    funcs.iter().map(|f| !un.contains(&f.name)).collect()
+}
+
+fn unsettle(settled: &mut [bool], changed: &[usize]) {
+    drop(unsettled_take());
+    for &ci in changed {
+        if let Some(s) = settled.get_mut(ci) {
+            *s = false;
+        }
+    }
+}
+
+fn redo_after_inline(settled: &[bool], changed: &[usize], nfuncs: usize) -> Option<Vec<usize>> {
+    if settled.len() != nfuncs || std::env::var_os("FIRN_OPT_REDO_ALL").is_some() {
+        return None;
+    }
+    let mut redo: Vec<bool> = settled.iter().map(|s| !*s).collect();
+    for &ci in changed {
+        redo[ci] = true;
+    }
+    Some(redo.iter().enumerate().filter(|(_, r)| **r).map(|(i, _)| i).collect())
+}
+
+struct StageClock {
+    on: bool,
+    last: std::time::Instant,
+}
+
+impl StageClock {
+    fn new() -> StageClock {
+        StageClock { on: std::env::var_os("FIRN_STAGE_TIMINGS").is_some(), last: std::time::Instant::now() }
+    }
+
+    fn mark(&mut self, name: &str) {
+        if self.on {
+            eprintln!("  stage {:<24} {:8.1} ms", name, self.last.elapsed().as_secs_f64() * 1000.0);
+            self.last = std::time::Instant::now();
+        }
+    }
+}
+
+static UNSETTLED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn unsettled_take() -> HashSet<String> {
+    let mut g = UNSETTLED.lock().unwrap();
+    std::mem::take(&mut *g).into_iter().collect()
+}
+
 fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
+    let mut unsettled = false;
+    optimize_func_inner(f, st, cfg, clk, &mut unsettled);
+    if unsettled {
+        UNSETTLED.lock().unwrap().push(f.name.clone());
+    }
+}
+
+fn optimize_func_inner(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock, unsettled: &mut bool) {
     let mut round = 0;
     let mut tailrec_done = false;
     let mut fx = Fix::new();
@@ -1059,6 +1132,9 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         clk.rounds += 1;
         if !fx.changed || round >= MAX_ROUNDS {
+            if fx.changed {
+                *unsettled = true;
+            }
             // Self tail recursion becomes a loop: once, at the end of the
             // first fixpoint, then the cheap passes get another round on the
             // new loop (`tailrec.rs`).
@@ -1070,6 +1146,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
                     clk.add2("tailrec", t, c);
                     phi_check(f, "tailrec");
                     if c {
+                        *unsettled = true;
                         fx.version += 1;
                         continue;
                     }

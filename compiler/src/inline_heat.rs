@@ -9,7 +9,7 @@
 
 use crate::fir::{FTy, Func, Module, Op};
 use crate::fx::HashMap;
-use crate::inline::{inline_one, inlinable, loop_blocks, CallGraph};
+use crate::inline::{forward_only, hot_after_embed, inline_one, inlinable, loop_blocks, CallGraph};
 
 const LOOP_WEIGHT: f64 = 8.0;
 const HEAT_ROUNDS: usize = 6;
@@ -121,18 +121,15 @@ fn score_threshold(m: &Module, idx: &HashMap<String, usize>, hot: &[Vec<bool>], 
 
 pub(crate) fn run(m: &mut Module, ctx: &mut HeatContext, changed: &mut Vec<usize>) -> HeatResult {
     let nf = m.funcs.len();
-    let mut hot: Vec<Vec<bool>> = m
-        .funcs
-        .iter()
-        .map(|f| {
-            let has_call = f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Call { .. })));
-            if has_call && f.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i) {
-                loop_blocks(f)
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
+    let verify = std::env::var_os("FIRN_HEAT_VERIFY").is_some();
+    let mut hot: Vec<Vec<bool>> = crate::parfn::map_slice(&m.funcs, |f| {
+        let has_call = f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Call { .. })));
+        if has_call && f.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i) {
+            loop_blocks(f)
+        } else {
+            Vec::new()
+        }
+    });
     let heat = function_heat(m, ctx.idx, &hot);
     let threshold = score_threshold(m, ctx.idx, &hot, &heat, ctx.max_copied);
     let mut sites = 0usize;
@@ -201,11 +198,21 @@ pub(crate) fn run(m: &mut Module, ctx: &mut HeatContext, changed: &mut Vec<usize
             if caller_rec && !ctx.kept.contains_key(&m.funcs[ci].name) {
                 ctx.kept.insert(m.funcs[ci].name.clone(), m.funcs[ci].clone());
             }
+            let callee_blocks = m.funcs[gi].blocks.len();
+            let incremental = forward_only(&m.funcs[gi]) && hot[ci].len() == m.funcs[ci].blocks.len();
+            let before = m.funcs[ci].blocks.len();
             inline_one(m, ci, bi, ii, gi);
             changed.push(ci);
             sites += 1;
             start_b = bi;
-            hot[ci] = loop_blocks(&m.funcs[ci]);
+            if incremental && m.funcs[ci].blocks.len() == before + callee_blocks + 1 {
+                hot[ci] = hot_after_embed(&hot[ci], bi, callee_blocks + 1);
+                if verify {
+                    assert!(hot[ci] == loop_blocks(&m.funcs[ci]), "incremental hot mismatch in {}", m.funcs[ci].name);
+                }
+            } else {
+                hot[ci] = loop_blocks(&m.funcs[ci]);
+            }
         }
     }
     HeatResult { sites, copied, threshold }

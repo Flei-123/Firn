@@ -216,6 +216,18 @@ pub(crate) fn inlinable(callee: &Func) -> bool {
 /// embeddings — only the caller is mutated).
 /// Blocks of `f` that lie on a loop (inside the natural loop of some back
 /// edge).
+pub(crate) fn forward_only(f: &Func) -> bool {
+    f.blocks.iter().all(|b| b.term.successors().iter().all(|s| *s > b.id))
+}
+
+pub(crate) fn hot_after_embed(hot: &[bool], bi: usize, new_blocks: usize) -> Vec<bool> {
+    let mut v = Vec::with_capacity(hot.len() + new_blocks);
+    v.extend_from_slice(&hot[..=bi]);
+    v.extend(std::iter::repeat(hot[bi]).take(new_blocks));
+    v.extend_from_slice(&hot[bi + 1..]);
+    v
+}
+
 pub(crate) fn loop_blocks(f: &Func) -> Vec<bool> {
     let n = f.blocks.len();
     let mut on = vec![false; n];
@@ -368,12 +380,27 @@ fn inline_one_pooled(
     m: &mut Module,
     ci: usize,
     bi: usize,
-    mut ii: usize,
+    ii: usize,
     gi: usize,
-    mut pool: Option<&mut SlotPool>,
+    pool: Option<&mut SlotPool>,
 ) {
-    let callee = m.funcs[gi].clone();
-    let (args, dst, ret_ty, call_loc) = match &m.funcs[ci].blocks[bi].insts[ii] {
+    if gi == ci {
+        let callee = m.funcs[gi].clone();
+        embed_body(&mut m.funcs[ci], &callee, bi, ii, pool);
+        return;
+    }
+    let (caller, callee) = if ci < gi {
+        let (lo, hi) = m.funcs.split_at_mut(gi);
+        (&mut lo[ci], &hi[0])
+    } else {
+        let (lo, hi) = m.funcs.split_at_mut(ci);
+        (&mut hi[0], &lo[gi])
+    };
+    embed_body(caller, callee, bi, ii, pool);
+}
+
+fn embed_body(caller: &mut Func, callee: &Func, bi: usize, mut ii: usize, mut pool: Option<&mut SlotPool>) {
+    let (args, dst, ret_ty, call_loc) = match &caller.blocks[bi].insts[ii] {
         // ROUND 94: the position of the CALL. Everything that belongs to the
         // call itself (the result travelling back) keeps it; everything that
         // belongs to the callee's body keeps the callee's own position.
@@ -387,7 +414,7 @@ fn inline_one_pooled(
     let mut shift = 0usize;
     let result_slot = if dst.is_some() {
         shift += 1;
-        Some(m.funcs[ci].alloca(ret_ty.bytes().max(1), ret_ty.bytes().max(1)))
+        Some(caller.alloca(ret_ty.bytes().max(1), ret_ty.bytes().max(1)))
     } else {
         None
     };
@@ -409,13 +436,13 @@ fn inline_one_pooled(
                         continue;
                     }
                     *k += 1;
-                    let nv = m.funcs[ci].alloca(*size, *align);
+                    let nv = caller.alloca(*size, *align);
                     slots.push(nv);
                     valmap.insert(d, nv);
                     shift += 1;
                     continue;
                 }
-                let nv = m.funcs[ci].alloca(*size, *align);
+                let nv = caller.alloca(*size, *align);
                 valmap.insert(d, nv);
                 shift += 1;
             }
@@ -426,7 +453,7 @@ fn inline_one_pooled(
     }
 
     // 2. Map the remaining values of the body onto new ids.
-    let f = &mut m.funcs[ci];
+    let f = caller;
     for b in &callee.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -753,7 +780,8 @@ pub(crate) fn apply_block_order(f: &mut Func, order: &[u32]) {
             Term::Ret(v) => Term::Ret(*v),
             Term::Unset => Term::Unset,
         };
-        for i in b.insts.iter_mut() {
+        let np = b.phi_count();
+        for i in b.insts[..np].iter_mut() {
             if let Op::Phi { incoming } = &mut i.op {
                 for e in incoming.iter_mut() {
                     e.0 = map[e.0 as usize];
@@ -867,7 +895,7 @@ pub fn inline_module_dev_leaves(m: &mut Module) -> (usize, Vec<usize>) {
 /// the budget. Returns the number of embeddings; the callers that received
 /// one are appended to `changed`.
 fn inline_trivial_leaves(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) -> usize {
-    let triv: Vec<bool> = m.funcs.iter().map(trivial_leaf).collect();
+    let triv: Vec<bool> = crate::parfn::map_slice(&m.funcs, trivial_leaf);
     inline_flagged_leaves(m, &triv, dbg, changed)
 }
 
@@ -892,6 +920,11 @@ fn inline_flagged_leaves_x(
     }
     let idx: HashMap<String, usize> =
         m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
+    if !loops_only && !dbg && crate::parfn::threads() > 1 {
+        if let Some(n) = inline_flagged_leaves_par(m, triv, &idx, changed) {
+            return n;
+        }
+    }
     let mut n = 0usize;
     for ci in 0..m.funcs.len() {
         {
@@ -953,6 +986,108 @@ fn inline_flagged_leaves_x(
     n
 }
 
+fn flagged_leaf_site(
+    f: &Func,
+    start_b: usize,
+    idx: &HashMap<String, usize>,
+    bodies: &[Option<Func>],
+) -> Option<(usize, usize, usize)> {
+    for bi in start_b..f.blocks.len() {
+        for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
+            if let Op::Call { name, args } = &inst.op {
+                if let Some(&gi) = idx.get(name) {
+                    if let Some(body) = &bodies[gi] {
+                        if body.params.len() == args.len() && !(inst.dst.is_some() && body.ret == FTy::Void) {
+                            return Some((bi, ii, gi));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn embed_flagged_leaves(f: &mut Func, idx: &HashMap<String, usize>, bodies: &[Option<Func>]) -> usize {
+    if f.constant_time || !f.secret.is_empty() {
+        return 0;
+    }
+    let mut pool: SlotPool = HashMap::default();
+    let mut start_b = 0usize;
+    let mut n = 0usize;
+    loop {
+        if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+            break;
+        }
+        match flagged_leaf_site(f, start_b, idx, bodies) {
+            Some((bi, ii, gi)) => {
+                let body = bodies[gi].as_ref().expect("flagged leaf body");
+                embed_body(f, body, bi, ii, Some(&mut pool));
+                n += 1;
+                start_b = bi;
+            }
+            None => break,
+        }
+    }
+    n
+}
+
+fn count_flagged_leaf_sites(f: &Func, idx: &HashMap<String, usize>, bodies: &[Option<Func>]) -> usize {
+    if f.constant_time || !f.secret.is_empty() || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    let mut n = 0usize;
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Op::Call { name, args } = &inst.op {
+                if let Some(&gi) = idx.get(name) {
+                    if let Some(body) = &bodies[gi] {
+                        if body.params.len() == args.len() && !(inst.dst.is_some() && body.ret == FTy::Void) {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+fn inline_flagged_leaves_par(
+    m: &mut Module,
+    triv: &[bool],
+    idx: &HashMap<String, usize>,
+    changed: &mut Vec<usize>,
+) -> Option<usize> {
+    let bodies: Vec<Option<Func>> = m
+        .funcs
+        .iter()
+        .zip(triv)
+        .map(|(f, t)| if *t { Some(f.clone()) } else { None })
+        .collect();
+    let counts: Vec<usize> = crate::parfn::map_slice(&m.funcs, |f| count_flagged_leaf_sites(f, idx, &bodies));
+    let total: usize = counts.iter().sum();
+    if total >= MAX_TRIVIAL_INLINES {
+        return None;
+    }
+    let tasks: Vec<(&mut Func, usize)> = m
+        .funcs
+        .iter_mut()
+        .zip(&counts)
+        .filter(|(_, c)| **c > 0)
+        .map(|(f, _)| (f, 1usize))
+        .collect();
+    let stats = crate::parfn::run(tasks, |f, s| {
+        s.inlined += embed_flagged_leaves(f, idx, &bodies);
+    });
+    for (ci, c) in counts.iter().enumerate() {
+        for _ in 0..*c {
+            changed.push(ci);
+        }
+    }
+    Some(stats.inlined)
+}
+
 /// Call graph on function indices, taken once before the size-ordered phase.
 /// Embedding only ever REMOVES reachability (the edge f->g becomes
 /// f->callees(g), which f reached through g anyway), so a graph taken before
@@ -963,7 +1098,10 @@ pub(crate) struct CallGraph {
     memo: HashMap<(usize, usize), bool>,
     mark: Vec<u32>,
     epoch: u32,
+    sets: Vec<Option<Vec<u64>>>,
 }
+
+const REACH_SET_MAX_FUNCS: usize = 16384;
 
 impl CallGraph {
     pub(crate) fn new(m: &Module, idx: &HashMap<String, usize>) -> CallGraph {
@@ -986,13 +1124,22 @@ impl CallGraph {
                 v
             })
             .collect();
-        CallGraph { succ, memo: HashMap::default(), mark: vec![0; m.funcs.len()], epoch: 0 }
+        let sets = if m.funcs.len() <= REACH_SET_MAX_FUNCS { vec![None; m.funcs.len()] } else { Vec::new() };
+        CallGraph { succ, memo: HashMap::default(), mark: vec![0; m.funcs.len()], epoch: 0, sets }
     }
 
     /// Can `from` reach `to` through calls (`from == to` counts)?
     pub(crate) fn reaches(&mut self, from: usize, to: usize) -> bool {
         if from == to {
             return true;
+        }
+        if !self.sets.is_empty() {
+            if self.sets[from].is_none() {
+                let set = self.reach_set(from);
+                self.sets[from] = Some(set);
+            }
+            let set = self.sets[from].as_ref().expect("reach set");
+            return set[to >> 6] >> (to & 63) & 1 == 1;
         }
         if let Some(&r) = self.memo.get(&(from, to)) {
             return r;
@@ -1014,6 +1161,20 @@ impl CallGraph {
         }
         self.memo.insert((from, to), found);
         found
+    }
+
+    fn reach_set(&self, from: usize) -> Vec<u64> {
+        let mut set = vec![0u64; (self.succ.len() + 63) >> 6];
+        let mut stack = vec![from];
+        while let Some(cur) = stack.pop() {
+            let (w, b) = (cur >> 6, cur & 63);
+            if set[w] >> b & 1 == 1 {
+                continue;
+            }
+            set[w] |= 1 << b;
+            stack.extend(self.succ[cur].iter().copied());
+        }
+        set
     }
 
     /// Can `g` reach itself through at least one call?
@@ -1266,6 +1427,14 @@ fn inline_by_size_with(
 /// calls.
 pub fn inline_module(m: &mut Module) -> usize {
     inline_module_inner(m, false)
+}
+
+pub fn inline_module_tracked(m: &mut Module) -> (usize, Vec<usize>) {
+    let mut changed = Vec::new();
+    let n = inline_module_track(m, false, &mut changed);
+    changed.sort();
+    changed.dedup();
+    (n, changed)
 }
 
 /// TEMPO 15 -- the SECOND round, after every function has been optimized
