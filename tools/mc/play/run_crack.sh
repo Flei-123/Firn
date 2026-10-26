@@ -56,6 +56,8 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 if [ "${CRACK_WINE:-0}" = 1 ]; then export WINEPREFIX="$W/wp" WINEDEBUG=-all WINEARCH=win64; wine wineboot -i >/dev/null 2>&1; fi
+export MC_VANILLA_JAR=${MC_VANILLA_JAR:-/root/.w5/jars/client-$MCV.jar}
+[ -f "$MC_VANILLA_JAR" ] || fail "missing $MC_VANILLA_JAR (tools/mcclient/fetch_client.sh)"
 ERR=0
 BOT_PID=""
 BDN=$(bash tools/mc/pick_display.sh 200 100)
@@ -112,6 +114,7 @@ sleep 4
 shot other_after; keep other_after
 echo "  other player overlay:"
 python3 -I tools/mc/play/crack_check.py other "$W/other_before.ppm" "$W/other1.ppm" "$W/other2.ppm" "$W/other_after.ppm" || ERR=1
+grep -q "crack textures unavailable" "$W/CrackV.out" && { echo "  FAIL  crack textures did not load"; ERR=1; }
 grep -E "dig=" "$W/CrackV.out" | tail -1 | cut -c1-260 | sed "s/^/  viewer: /"
 grep "dig_bot" "$W/CrackB.out" | tr "\n" " " | sed "s/^/  bot: /"; echo
 touch "$W/quit-V" "$W/quit-B"; wait $PP 2>/dev/null; PP=""
