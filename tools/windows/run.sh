@@ -122,9 +122,11 @@ one_case() {
             >"$WORK/$base.lin.err" 2>&1; then
         echo "LINUXBAD $file :: linux compilation failed"; return
     fi
-    local lout lrc try
+    local lout lrc try llimit
+    llimit=$(awk -v n="$base" '$1 == n && NF >= 3 { print $3; exit }' "$ROOT/tools/aarch64/timeouts.txt" 2>/dev/null)
+    llimit=${llimit:-60}
     for try in 1 2; do
-        lout=$(timeout 60 "$WORK/$base.lin" </dev/null 2>/dev/null); lrc=$?
+        lout=$(timeout "$llimit" "$WORK/$base.lin" </dev/null 2>/dev/null); lrc=$?
         [ "$testkit" = 1 ] && lout=""
         if [ "$kind" = out ]; then
             if [ "$lrc" -eq 0 ] && [ "$lout" = "$exp" ]; then break; fi
