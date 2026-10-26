@@ -53,7 +53,7 @@ def start_portald(*args):
     line = p.stdout.readline().strip()
     return p, line
 
-pd, line = start_portald()
+pd, line = start_portald("--product", "TestOS")
 check("portald starts and says READY", line == "READY", (line, pd.poll()))
 
 bus = dbus.bus.BusConnection(address)
@@ -69,7 +69,7 @@ time.sleep(0.3)
 nobj = bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
 ni = dbus.Interface(nobj, "org.freedesktop.Notifications")
 check("GetCapabilities", [str(c) for c in ni.GetCapabilities()] == ["body", "actions", "persistence"], ni.GetCapabilities())
-check("GetServerInformation", [str(x) for x in ni.GetServerInformation()] == ["OrientOS toast", "Fleitec", "1", "1.2"], ni.GetServerInformation())
+check("GetServerInformation", [str(x) for x in ni.GetServerInformation()] == ["TestOS toast", "Fleitec", "1", "1.2"], ni.GetServerInformation())
 i1 = int(ni.Notify("Firefox", 0, "icon", "Summary äö 日本", "Body\nline two\ttab", ["default", "Open"],  # english: ok
                    {"urgency": dbus.Byte(2), "category": "x", "n": dbus.Int32(5), "arr": dbus.Array([1, 2], signature="i")}, 5000,
                    signature="susssasa{sv}i"))
@@ -99,7 +99,7 @@ else:
     print("  SKIP  gdbus not installed")
 r = subprocess.run(["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                     "org.freedesktop.Notifications.GetServerInformation"], env=env, capture_output=True, text=True, timeout=20)
-check("dbus-send: GetServerInformation", r.returncode == 0 and "OrientOS toast" in r.stdout, (r.stdout, r.stderr))
+check("dbus-send: GetServerInformation", r.returncode == 0 and "TestOS toast" in r.stdout, (r.stdout, r.stderr))
 r = subprocess.run(["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                     "org.freedesktop.Notifications.NoSuchMethod"], env=env, capture_output=True, text=True, timeout=20)
 check("an unknown method is an error, not a hang", r.returncode != 0 and "UnknownMethod" in r.stderr, (r.stdout, r.stderr))

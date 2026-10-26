@@ -236,6 +236,12 @@ entries are staged locally by `tools/android/jarvis_release.sh` (never uploaded)
   appkit's own pages come in English and German
   (`lib/appkit/locale/*.opmsg`); the system language comes from
   `plat_locale`.
+* `brand`: the product brand of the system the program runs on:
+  `product_name()`, `product_slug()`, `vendor_name()`, `product_web()`
+  (empty when the platform has no image brand). The platform file answers
+  `plat_brand(key, out)`; on Osum `brand_osum` reads the `key: value` lines of
+  `/proc/brand` and, for `product`/`slug` only, the product in front of
+  ` (Firn) version ` in `/proc/version`. No product name is written in Firn.
 
 ## 6. The template
 
