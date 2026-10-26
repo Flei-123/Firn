@@ -24,3 +24,6 @@ enc ibc_mos_nopal "$(MOSAIC 64x64 3x3 yuv420p)" yuv420p 25 3 "$S:enable-palette=
 enc ibc_grid_256 "testsrc2=s=128x128:r=25,tile=2x2,drawgrid=w=16:h=16:t=1:c=white@0.5,format=yuv420p" yuv420p 30 2 "$S"
 enc ibc_cells_300 "cellauto=s=300x300:rule=110:full=1:scroll=0,format=yuv420p" yuv420p 25 3 "$S"
 enc ibc_rgbtest_200 "rgbtestsrc=s=200x200,tile=1x1,format=yuv420p" yuv420p 25 3 "$S"
+enc ibc_mos_lossless "$(MOSAIC 64x64 3x3 yuv420p)" yuv420p 0 3 "lossless=1:sb-size=64:tune-content=screen"
+enc ibc_mos_lossless_444 "$(MOSAIC 64x64 3x3 yuv444p)" yuv444p 0 3 "lossless=1:sb-size=64:tune-content=screen"
+enc ibc_mos_lossless_10b "$(MOSAIC 64x64 3x3 yuv420p10le)" yuv420p10le 0 3 "lossless=1:sb-size=64:tune-content=screen"
