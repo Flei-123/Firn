@@ -34,5 +34,5 @@ kill "$APID" 2>/dev/null; wait "$APID" 2>/dev/null; sleep 1
 DISPLAY=":$(cat "$D/disp")" FUI_DATA_DIR="$PWD/examples/fui_apps/data" FUI_ATSPI="unix:path=$D/bus" "$D/notes" --theme dark >"$D/napp.log" 2>&1 &
 APID=$!
 sleep 3
-python3 -I tools/fui/screenax_test.py "unix:path=$D/bus" "$D/ntree.json" Notes --editor
+FOCUS_DISPLAY=":$(cat "$D/disp")" python3 -I tools/fui/screenax_test.py "unix:path=$D/bus" "$D/ntree.json" Notes --editor
 exit $?

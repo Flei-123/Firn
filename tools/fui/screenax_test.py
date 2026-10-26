@@ -9,6 +9,7 @@ import dbus
 from atspi_test import ACC, COMP, ACT, FRAME, ROLE, STATE, Client, bits
 
 addr, jpath, title = sys.argv[1], sys.argv[2], sys.argv[3]
+display = os.environ.get("FOCUS_DISPLAY", "")
 with open(jpath) as f:
     tree = json.load(f)
 c = Client(addr)
@@ -114,6 +115,53 @@ def editor_checks():
         print("  WRONG preview accepted a caret")
         errs += 1
     print("%s editor node: name, Text/EditableText, SetTextContents, caret, selection" % ("  ok   " if errs == 0 else "  WRONG"))
+    errs += focus_checks(ed, pv, until)
+    return errs
+
+
+def focus_checks(ed, pv, until):
+    import subprocess
+    TEXT = "org.a11y.atspi.Text"
+    errs = 0
+
+    def has_focus(p):
+        return 12 in bits(c.call(p, ACC, "GetState"))
+
+    def keys(*args):
+        env = dict(os.environ, DISPLAY=display)
+        subprocess.run(["xdotool", "search", "--name", "Notes", "windowfocus"] + list(args), env=env, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if has_focus(ed):
+        print("  WRONG editor starts focused")
+        errs += 1
+    if not bool(c.call(ed, COMP, "GrabFocus")) or not until(lambda: has_focus(ed)):
+        print("  WRONG GrabFocus did not focus the editor")
+        errs += 1
+    if has_focus(pv):
+        print("  WRONG preview focused together with the editor")
+        errs += 1
+    if display:
+        before = str(c.call(ed, TEXT, "GetText", 0, -1))
+        keys("type", "--delay", "40", "Q")
+        if not until(lambda: str(c.call(ed, TEXT, "GetText", 0, -1)).count("Q") == before.count("Q") + 1):
+            print("  WRONG typing after GrabFocus did not reach the editor")
+            errs += 1
+        keys("key", "Tab")
+        if not until(lambda: not has_focus(ed)):
+            print("  WRONG Tab did not take the focus from the editor")
+            errs += 1
+        elif not until(lambda: has_focus(pv)):
+            print("  WRONG Tab did not move the focus to the preview")
+            errs += 1
+        keys("key", "shift+Tab")
+        if not until(lambda: has_focus(ed) and not has_focus(pv)):
+            print("  WRONG Shift+Tab did not bring the focus back to the editor")
+            errs += 1
+    if not bool(c.call(pv, COMP, "GrabFocus")) or not until(lambda: has_focus(pv) and not has_focus(ed)):
+        print("  WRONG GrabFocus on the preview did not take the focus from the editor")
+        errs += 1
+    print("%s editor focus: GrabFocus, typing, Tab, Shift+Tab" % ("  ok   " if errs == 0 else "  WRONG"))
     return errs
 
 
