@@ -1644,7 +1644,7 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         }
         var sab: [i64; 16] = [0; 16]
         let sa: u64 = __win_sa_out(a5 as u64, a6, (&sab[0]) as u64)
-        let r: i64 = sendto(__win_handle(a1), a2 as u64, a3, a4, sa, a6) as i64
+        let r: i64 = sendto(__win_handle(a1), a2 as u64, a3, a4 & 3, sa, a6) as i64
         if r < 0 {
             return __win_ioerrno()
         }
@@ -1658,7 +1658,7 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        let r: i64 = recvfrom(__win_handle(a1), a2 as u64, a3, a4,
+        let r: i64 = recvfrom(__win_handle(a1), a2 as u64, a3, a4 & 3,
             a5 as u64, a6 as u64) as i64
         if r < 0 {
             return __win_ioerrno()
