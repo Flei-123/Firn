@@ -12,8 +12,10 @@ import av1.av1lr
 import av1.av1qm
 import av1.av1txfm
 import av1.av1pal
+import av1.av1ibc
+import av1.av1intertx
 
-export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_set_quant_ext, tile_set_sct, tile_set_bit_depth, tile_err, tile_set_grid, tile_set_col_start, tile_set_row_start }
+export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_set_quant_ext, tile_set_sct, tile_set_bit_depth, tile_err, tile_set_grid, tile_set_col_start, tile_set_row_start, tile_set_intrabc }
 
 const S_SYM: i64 = 0
 const S_MCDF: i64 = 1
@@ -104,6 +106,10 @@ const S_TINFO: i64 = 96
 const S_DATA: i64 = 97
 const S_DLEN: i64 = 98
 const S_UPD: i64 = 99
+const S_IBC: i64 = 500
+const S_ALLOWIBC: i64 = 501
+const S_ISINTER: i64 = 502
+const S_TXTYPES: i64 = 503
 const G_COLS: i64 = 0
 const G_ROWS: i64 = 1
 const G_SIZE_BYTES: i64 = 2
@@ -328,6 +334,20 @@ fn tile_set_col_start(c: u64, i: i64, sb_start: i64) {
 
 fn tile_set_row_start(c: u64, i: i64, sb_start: i64) {
     ss(sg(c, S_TINFO) as u64, G_ROW_START + i, imin(sb_start * 16, sg(c, S_MR)))
+}
+
+fn tile_set_intrabc(c: u64, allow: i64) {
+    ss(c, S_ALLOWIBC, allow)
+    if allow == 0 {
+        return
+    }
+    let mc: i64 = sg(c, S_MC)
+    let mr: i64 = sg(c, S_MR)
+    let mn: i64 = mc * mr + 64
+    let ps: u64 = zalloc_c(c, av1ibc.IBC_CELLS * 8)
+    av1ibc.ibc_bind(ps, zalloc_c(c, mn), zalloc_c(c, mn * 4), sg(c, S_MIS) as u64, zalloc_c(c, 256), mc, mr)
+    ss(c, S_IBC, ps as i64)
+    ss(c, S_TXTYPES, zalloc_c(c, mn) as i64)
 }
 
 fn tile_set_lr(c: u64, lr: u64) {
@@ -1137,7 +1157,52 @@ fn eob_cdf(c: u64, ms: i64, ptype: i64, cls: i64) -> u64 {
     return kcell(c, base + (ptype * 2 + k) * (ms + 6))
 }
 
+fn read_inter_tx_type(c: u64, txsz: i64) {
+    let set: i64 = av1intertx.inter_set(av1tab2.t_sqr(txsz), av1tab2.t_sqrup(txsz), sg(c, S_REDTX))
+    var t: i64 = 0
+    if set > 0 && sg(c, S_QIDX) > 0 {
+        let cdf: u64 = mcell(c, avif_cdf.M_INTER_EXT_TX as i64 + ((set - 1) * 4 + av1tab2.t_sqr(txsz)) * 17)
+        t = av1intertx.inter_inv(set, rs(c, cdf, av1intertx.inter_nsym(set)))
+    }
+    ss(c, S_TXTYPE, t)
+}
+
+fn chroma_inter_tx_type(c: u64, txsz: i64, x4: i64, y4: i64) -> i64 {
+    let set: i64 = av1intertx.inter_set(av1tab2.t_sqr(txsz), av1tab2.t_sqrup(txsz), sg(c, S_REDTX))
+    let lx: i64 = imax(sg(c, S_COL), x4 << sg(c, S_SUBX))
+    let ly: i64 = imax(sg(c, S_ROW), y4 << sg(c, S_SUBY))
+    let t: i64 = ldb(sg(c, S_TXTYPES) as u64, ly * sg(c, S_MC) + lx)
+    if av1intertx.in_set_inter(set, t) != 0 {
+        return t
+    }
+    return 0
+}
+
+fn store_tx_types(c: u64, x4: i64, y4: i64, w4: i64, h4: i64, t: i64) {
+    if sg(c, S_ISINTER) == 0 {
+        return
+    }
+    let map: u64 = sg(c, S_TXTYPES) as u64
+    let mc: i64 = sg(c, S_MC)
+    let mr: i64 = sg(c, S_MR)
+    var i: i64 = 0
+    while i < h4 {
+        var j: i64 = 0
+        while j < w4 {
+            if y4 + i < mr && x4 + j < mc {
+                stb(map, (y4 + i) * mc + x4 + j, t)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
 fn read_tx_type(c: u64, txsz: i64) {
+    if sg(c, S_ISINTER) != 0 {
+        read_inter_tx_type(c, txsz)
+        return
+    }
     let set: i64 = tx_set(c, txsz)
     var t: i64 = 0
     if set > 0 && sg(c, S_QIDX) > 0 {
@@ -1241,12 +1306,17 @@ fn coeffs(c: u64, plane: i64, sx: i64, sy: i64, txsz: i64) -> i64 {
     var cul: i64 = 0
     var dccat: i64 = 0
     let az: i64 = rs(c, kcell(c, avif_cdf.K_TXB_SKIP as i64 + (txc * 13 + ctx) * 3), 2)
+    if az != 0 && plane == 0 {
+        store_tx_types(c, x4, y4, w4, h4, 0)
+    }
     if az == 0 {
         var tt: i64 = 0
         if sg(c, S_LOSSLESS) == 0 && av1tab2.t_sqrup(txsz) <= 3 {
             if plane == 0 {
                 read_tx_type(c, txsz)
                 tt = sg(c, S_TXTYPE)
+            } else if sg(c, S_ISINTER) != 0 {
+                tt = chroma_inter_tx_type(c, txsz, x4, y4)
             } else {
                 let cand: i64 = av1tab2.t_mode2tx(sg(c, S_UVMODE))
                 if av1tab2.t_inset(tx_set(c, txsz) * 16 + cand) != 0 {
@@ -1255,6 +1325,9 @@ fn coeffs(c: u64, plane: i64, sx: i64, sy: i64, txsz: i64) -> i64 {
             }
         }
         ss(c, S_TXTYPE, tt)
+        if plane == 0 {
+            store_tx_types(c, x4, y4, w4, h4, tt)
+        }
         let cls: i64 = tx_class(tt)
         var skind: i64 = 0
         if cls == 2 {
@@ -1611,12 +1684,14 @@ fn transform_block(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i
     let har: i64 = ldb(bd, (plane * 18 + bdr) * 18 + bdc + stepx + 1)
     let hbl: i64 = ldb(bd, (plane * 18 + bdr + stepy + 1) * 18 + bdc)
     let pps: u64 = sg(c, S_PAL) as u64
-    if (plane == 0 && av1pal.pal_size_y(pps) > 0) || (plane > 0 && av1pal.pal_size_uv(pps) > 0) {
-        predict_palette(c, plane, sx, sy, x, y, txsz)
-    } else {
-        predict_intra(c, plane, sx, sy, hl, ha, har, hbl, mode, txsz)
-        if isc != 0 {
-            predict_cfl(c, plane, sx, sy, txsz)
+    if sg(c, S_ISINTER) == 0 {
+        if (plane == 0 && av1pal.pal_size_y(pps) > 0) || (plane > 0 && av1pal.pal_size_uv(pps) > 0) {
+            predict_palette(c, plane, sx, sy, x, y, txsz)
+        } else {
+            predict_intra(c, plane, sx, sy, hl, ha, har, hbl, mode, txsz)
+            if isc != 0 {
+                predict_cfl(c, plane, sx, sy, txsz)
+            }
         }
     }
     if plane == 0 {
@@ -1643,6 +1718,155 @@ fn transform_block(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i
             j = j + 1
         }
         i = i + 1
+    }
+}
+
+fn find_tx_size(w: i64, h: i64) -> i64 {
+    var t: i64 = 0
+    while t < 19 {
+        if av1tab2.t_txw(t) == w && av1tab2.t_txh(t) == h {
+            return t
+        }
+        t = t + 1
+    }
+    return 0
+}
+
+fn transform_tree(c: u64, sx: i64, sy: i64, w: i64, h: i64) {
+    if sx >= sg(c, S_MC) * 4 || sy >= sg(c, S_MR) * 4 {
+        return
+    }
+    let lt: i64 = ldb(sg(c, S_TXS) as u64, (sy >> 2) * sg(c, S_MC) + (sx >> 2))
+    if w <= av1tab2.t_txw(lt) && h <= av1tab2.t_txh(lt) {
+        transform_block(c, 0, sx, sy, 0, 0, find_tx_size(w, h))
+    } else if w > h {
+        transform_tree(c, sx, sy, w / 2, h)
+        transform_tree(c, sx + w / 2, sy, w / 2, h)
+    } else if w < h {
+        transform_tree(c, sx, sy, w, h / 2)
+        transform_tree(c, sx, sy + h / 2, w, h / 2)
+    } else {
+        transform_tree(c, sx, sy, w / 2, h / 2)
+        transform_tree(c, sx + w / 2, sy, w / 2, h / 2)
+        transform_tree(c, sx, sy + h / 2, w / 2, h / 2)
+        transform_tree(c, sx + w / 2, sy + h / 2, w / 2, h / 2)
+    }
+}
+
+fn is_ibc_at(c: u64, r: i64, cc: i64) -> bool {
+    if sg(c, S_IBC) == 0 {
+        return false
+    }
+    return av1ibc.ibc_kind(sg(c, S_IBC) as u64, r, cc) == 2
+}
+
+fn above_tx_width(c: u64, row: i64, col: i64) -> i64 {
+    let mc: i64 = sg(c, S_MC)
+    if row == sg(c, S_ROW) {
+        if sg(c, S_AVU) == 0 {
+            return 64
+        }
+        if ldb(sg(c, S_SKP) as u64, (row - 1) * mc + col) != 0 && is_ibc_at(c, row - 1, col) {
+            return n4w(ldb(sg(c, S_MIS) as u64, (row - 1) * mc + col)) * 4
+        }
+    }
+    return av1tab2.t_txw(ldb(sg(c, S_TXS) as u64, (row - 1) * mc + col))
+}
+
+fn left_tx_height(c: u64, row: i64, col: i64) -> i64 {
+    let mc: i64 = sg(c, S_MC)
+    if col == sg(c, S_COL) {
+        if sg(c, S_AVL) == 0 {
+            return 64
+        }
+        if ldb(sg(c, S_SKP) as u64, row * mc + col - 1) != 0 && is_ibc_at(c, row, col - 1) {
+            return n4h(ldb(sg(c, S_MIS) as u64, row * mc + col - 1)) * 4
+        }
+    }
+    return av1tab2.t_txh(ldb(sg(c, S_TXS) as u64, row * mc + col - 1))
+}
+
+fn read_var_tx_size(c: u64, row: i64, col: i64, txsz: i64, depth: i64) {
+    let mc: i64 = sg(c, S_MC)
+    let mr: i64 = sg(c, S_MR)
+    if row >= mr || col >= mc {
+        return
+    }
+    var split: i64 = 0
+    if txsz != 0 && depth != 2 {
+        let size: i64 = sg(c, S_SIZE)
+        let side: i64 = imin(64, imax(n4w(size), n4h(size)) * 4)
+        let max_tx: i64 = find_tx_size(side, side)
+        var ctx: i64 = (4 - max_tx) * 6
+        if av1tab2.t_sqrup(txsz) != max_tx {
+            ctx = ctx + 3
+        }
+        if above_tx_width(c, row, col) < av1tab2.t_txw(txsz) {
+            ctx = ctx + 1
+        }
+        if left_tx_height(c, row, col) < av1tab2.t_txh(txsz) {
+            ctx = ctx + 1
+        }
+        split = rs(c, mcell(c, avif_cdf.M_TXFM_PARTITION as i64 + ctx * 3), 2)
+    }
+    let w4: i64 = av1tab2.t_txw(txsz) >> 2
+    let h4: i64 = av1tab2.t_txh(txsz) >> 2
+    if split != 0 {
+        let sub: i64 = av1tab2.t_split(txsz)
+        let step_w: i64 = av1tab2.t_txw(sub) >> 2
+        let step_h: i64 = av1tab2.t_txh(sub) >> 2
+        var i: i64 = 0
+        while i < h4 {
+            var j: i64 = 0
+            while j < w4 {
+                read_var_tx_size(c, row + i, col + j, sub, depth + 1)
+                j = j + step_w
+            }
+            i = i + step_h
+        }
+    } else {
+        let txs: u64 = sg(c, S_TXS) as u64
+        var i: i64 = 0
+        while i < h4 {
+            var j: i64 = 0
+            while j < w4 {
+                if row + i < mr && col + j < mc {
+                    stb(txs, (row + i) * mc + col + j, txsz)
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        ss(c, S_TXSZ, txsz)
+    }
+}
+
+fn read_block_var_tx(c: u64, r: i64, cc: i64, size: i64) {
+    let mx: i64 = av1tab2.t_maxrect(size)
+    let step_w: i64 = av1tab2.t_txw(mx) >> 2
+    let step_h: i64 = av1tab2.t_txh(mx) >> 2
+    var row: i64 = r
+    while row < r + n4h(size) {
+        var col: i64 = cc
+        while col < cc + n4w(size) {
+            read_var_tx_size(c, row, col, mx, 0)
+            col = col + step_w
+        }
+        row = row + step_h
+    }
+}
+
+fn predict_ibc_block(c: u64, r: i64, cc: i64, size: i64, hasc: i64) {
+    let ps: u64 = sg(c, S_IBC) as u64
+    let mvr: i64 = av1ibc.ibc_mv_row(ps)
+    let mvc: i64 = av1ibc.ibc_mv_col(ps)
+    var plane: i64 = 0
+    while plane < 1 + 2 * hasc {
+        let qx: i64 = psub_x(c, plane)
+        let qy: i64 = psub_y(c, plane)
+        av1ibc.ibc_predict(ps, plane_ptr(c, plane), tile_stride(c), (cc >> qx) * 4, (r >> qy) * 4, imax(4, (n4w(size) * 4) >> qx),
+                           imax(4, (n4h(size) * 4) >> qy), mvr, mvc, qx, qy, sg(c, S_BD))
+        plane = plane + 1
     }
 }
 
@@ -1766,12 +1990,17 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
     }
     let skip: i64 = rs(c, mcell(c, avif_cdf.M_SKIP_TXFM as i64 + sctx * 3), 2)
     ss(c, S_SKIP, skip)
-    if skip == 0 && sg(c, S_ENCDEF) != 0 && sg(c, S_LOSSLESS) == 0 && sg(c, S_CDEFDONE) == 0 {
+    if skip == 0 && sg(c, S_ENCDEF) != 0 && sg(c, S_ALLOWIBC) == 0 && sg(c, S_LOSSLESS) == 0 && sg(c, S_CDEFDONE) == 0 {
         let ci: i64 = av1sym.sym_literal(symp(c), sg(c, S_CDEFBITS))
         stb(sg(c, S_CDEFIDX) as u64, (r >> 4) * sg(c, S_SBCOLS) + (cc >> 4), ci + 1)
         ss(c, S_CDEFDONE, 1)
     }
     read_delta_qindex(c, size, skip)
+    var ibc: i64 = 0
+    if sg(c, S_ALLOWIBC) != 0 {
+        ibc = rs(c, mcell(c, avif_cdf.M_INTRABC as i64), 2)
+    }
+    ss(c, S_ISINTER, ibc)
     var am: i64 = 0
     var lm: i64 = 0
     if avu != 0 {
@@ -1780,69 +2009,93 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
     if avl != 0 {
         lm = IMC[ldb(ym, r * mc + cc - 1) as usize] as i64
     }
-    let ymode: i64 = rs(c, mcell(c, avif_cdf.M_KF_Y_MODE as i64 + (am * 5 + lm) * 14), 13)
-    ss(c, S_YMODE, ymode)
+    var ymode: i64 = 0
     var angy: i64 = 0
-    if size >= 3 && is_dir(ymode) != 0 {
-        angy = rs(c, mcell(c, avif_cdf.M_ANGLE_DELTA as i64 + (ymode - 1) * 8), 7) - 3
-    }
-    ss(c, S_ANGY, angy)
     var uvmode: i64 = 0
     var anguv: i64 = 0
-    if hasc != 0 {
-        var cfl_ok: i64 = 0
-        if sg(c, S_LOSSLESS) != 0 {
-            if plane_size(size, subx, suby) == 0 {
+    let ps: u64 = sg(c, S_PAL) as u64
+    ss(c, S_UFI, 0)
+    if ibc != 0 {
+        ss(c, S_YMODE, 0)
+        ss(c, S_ANGY, 0)
+        ss(c, S_UVMODE, 0)
+        ss(c, S_ANGUV, 0)
+        av1pal.pal_clear(ps)
+        if av1ibc.ibc_decode_mv(sg(c, S_IBC) as u64, symp(c), r, cc, size, hasc, subx, suby) == 0 {
+            ss(c, S_ERR, 5)
+            return
+        }
+    } else {
+        ymode = rs(c, mcell(c, avif_cdf.M_KF_Y_MODE as i64 + (am * 5 + lm) * 14), 13)
+        ss(c, S_YMODE, ymode)
+        if size >= 3 && is_dir(ymode) != 0 {
+            angy = rs(c, mcell(c, avif_cdf.M_ANGLE_DELTA as i64 + (ymode - 1) * 8), 7) - 3
+        }
+        ss(c, S_ANGY, angy)
+        if hasc != 0 {
+            var cfl_ok: i64 = 0
+            if sg(c, S_LOSSLESS) != 0 {
+                if plane_size(size, subx, suby) == 0 {
+                    cfl_ok = 1
+                }
+            } else if imax(bw4, bh4) <= 8 {
                 cfl_ok = 1
             }
-        } else if imax(bw4, bh4) <= 8 {
-            cfl_ok = 1
-        }
-        if cfl_ok != 0 {
-            uvmode = rs(c, mcell(c, avif_cdf.M_UV_MODE as i64 + (13 + ymode) * 15), 14)
+            if cfl_ok != 0 {
+                uvmode = rs(c, mcell(c, avif_cdf.M_UV_MODE as i64 + (13 + ymode) * 15), 14)
+            } else {
+                uvmode = rs(c, mcell(c, avif_cdf.M_UV_MODE as i64 + ymode * 15), 13)
+            }
+            ss(c, S_UVMODE, uvmode)
+            if uvmode == 13 {
+                read_cfl(c)
+            }
+            if size >= 3 && is_dir(uvmode) != 0 {
+                anguv = rs(c, mcell(c, avif_cdf.M_ANGLE_DELTA as i64 + (uvmode - 1) * 8), 7) - 3
+            }
         } else {
-            uvmode = rs(c, mcell(c, avif_cdf.M_UV_MODE as i64 + ymode * 15), 13)
+            ss(c, S_UVMODE, 0)
         }
-        ss(c, S_UVMODE, uvmode)
-        if uvmode == 13 {
-            read_cfl(c)
+        ss(c, S_ANGUV, anguv)
+        if size >= 3 && sg(c, S_SCT) != 0 {
+            let bctx: i64 = (MIWL[size as usize] as i64) + (MIHL[size as usize] as i64) - 2
+            av1pal.pal_mode_info(ps, symp(c), sg(c, S_MCDF) as u64, r, cc, mc, avu, avl, bctx, hasc, ymode, uvmode, sg(c, S_BD))
+        } else {
+            av1pal.pal_clear(ps)
         }
-        if size >= 3 && is_dir(uvmode) != 0 {
-            anguv = rs(c, mcell(c, avif_cdf.M_ANGLE_DELTA as i64 + (uvmode - 1) * 8), 7) - 3
-        }
-    } else {
-        ss(c, S_UVMODE, 0)
-    }
-    ss(c, S_ANGUV, anguv)
-    let ps: u64 = sg(c, S_PAL) as u64
-    if size >= 3 && sg(c, S_SCT) != 0 {
-        let bctx: i64 = (MIWL[size as usize] as i64) + (MIHL[size as usize] as i64) - 2
-        av1pal.pal_mode_info(ps, symp(c), sg(c, S_MCDF) as u64, r, cc, mc, avu, avl, bctx, hasc, ymode, uvmode, sg(c, S_BD))
-    } else {
-        av1pal.pal_clear(ps)
-    }
-    ss(c, S_UFI, 0)
-    if sg(c, S_EFI) != 0 && ymode == 0 && av1pal.pal_size_y(ps) == 0 && imax(bw4, bh4) <= 8 {
-        let u: i64 = rs(c, mcell(c, avif_cdf.M_FILTER_INTRA as i64 + size * 3), 2)
-        ss(c, S_UFI, u)
-        if u != 0 {
-            ss(c, S_FIM, rs(c, mcell(c, avif_cdf.M_FILTER_INTRA_MODE as i64), 5))
+        if sg(c, S_EFI) != 0 && ymode == 0 && av1pal.pal_size_y(ps) == 0 && imax(bw4, bh4) <= 8 {
+            let u: i64 = rs(c, mcell(c, avif_cdf.M_FILTER_INTRA as i64 + size * 3), 2)
+            ss(c, S_UFI, u)
+            if u != 0 {
+                ss(c, S_FIM, rs(c, mcell(c, avif_cdf.M_FILTER_INTRA_MODE as i64), 5))
+            }
         }
     }
     av1pal.pal_tokens(ps, symp(c), sg(c, S_MCDF) as u64, bw4 * 4, bh4 * 4, r, cc, mr, mc, subx, suby)
     var txsz: i64 = 0
+    var vartx: i64 = 0
     if sg(c, S_LOSSLESS) == 0 {
         let mx: i64 = av1tab2.t_maxrect(size)
         txsz = mx
-        if size > 0 && sg(c, S_TXMODE) == 2 {
+        if ibc != 0 && skip == 0 && size > 0 && sg(c, S_TXMODE) == 2 {
+            vartx = 1
+            read_block_var_tx(c, r, cc, size)
+            txsz = sg(c, S_TXSZ)
+        } else if size > 0 && sg(c, S_TXMODE) == 2 && (ibc == 0 || skip == 0) {
             let txs: u64 = sg(c, S_TXS) as u64
             var aw: i64 = 0
             var lh: i64 = 0
             if avu != 0 {
                 aw = av1tab2.t_txw(ldb(txs, (r - 1) * mc + cc))
+                if is_ibc_at(c, r - 1, cc) {
+                    aw = n4w(ldb(sg(c, S_MIS) as u64, (r - 1) * mc + cc)) * 4
+                }
             }
             if avl != 0 {
                 lh = av1tab2.t_txh(ldb(txs, r * mc + cc - 1))
+                if is_ibc_at(c, r, cc - 1) {
+                    lh = n4h(ldb(sg(c, S_MIS) as u64, r * mc + cc - 1)) * 4
+                }
             }
             var tctx: i64 = 0
             if aw >= av1tab2.t_txw(mx) {
@@ -1887,13 +2140,26 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
                 }
                 stb(mis, at, size)
                 stb(skp, at, skip)
-                stb(sg(c, S_TXS) as u64, at, txsz)
+                if vartx == 0 {
+                    stb(sg(c, S_TXS) as u64, at, txsz)
+                }
             }
             x = x + 1
         }
         y = y + 1
     }
     av1pal.pal_store(ps, r, cc, bw4, bh4, mr, mc)
+    if sg(c, S_IBC) != 0 {
+        var kind: i64 = 1
+        var mvr: i64 = 0
+        var mvc: i64 = 0
+        if ibc != 0 {
+            kind = 2
+            mvr = av1ibc.ibc_mv_row(sg(c, S_IBC) as u64)
+            mvc = av1ibc.ibc_mv_col(sg(c, S_IBC) as u64)
+        }
+        av1ibc.ibc_store(sg(c, S_IBC) as u64, r, cc, bw4, bh4, kind, mvr, mvc)
+    }
     let cn: i64 = sg(c, S_CN)
     if skip != 0 {
         var pl: i64 = 0
@@ -1915,10 +2181,18 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
             pl = pl + 1
         }
     }
+    if ibc != 0 {
+        predict_ibc_block(c, r, cc, size, hasc)
+    }
     var plane: i64 = 0
     while plane < 1 + 2 * hasc {
         let qx: i64 = psub_x(c, plane)
         let qy: i64 = psub_y(c, plane)
+        if ibc != 0 && plane == 0 && sg(c, S_LOSSLESS) == 0 {
+            transform_tree(c, cc * 4, r * 4, bw4 * 4, bh4 * 4)
+            plane = plane + 1
+            continue
+        }
         var tsz: i64 = 0
         if sg(c, S_LOSSLESS) == 0 {
             tsz = txsz
@@ -2144,6 +2418,10 @@ fn run_tile(c: u64, r0: i64, r1: i64, c0: i64, c1: i64, data: u64, len: i64) {
     ss(c, S_C1, c1)
     av1sym.sym_init(symp(c), data, len, sg(c, S_UPD))
     reset_cdfs(c)
+    if sg(c, S_IBC) != 0 {
+        av1ibc.ibc_set_tile(sg(c, S_IBC) as u64, r0, r1, c0, c1)
+        av1ibc.ibc_reset_cdfs(sg(c, S_IBC) as u64)
+    }
     clear_above_context(c)
     if sg(c, S_DQPRES) != 0 {
         ss(c, S_CURQ, sg(c, S_QIDX))
