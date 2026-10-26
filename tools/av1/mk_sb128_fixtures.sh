@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -eu
+cd "$(dirname "$0")/../.."
+O="${1:-tests/data/av1}"
+mkdir -p "$O"
+enc() {
+  name="$1"; src="$2"; fmt="$3"; crf="$4"; cpu="$5"; params="$6"
+  ffmpeg -v error -y -f lavfi -i "$src" -frames:v 1 -pix_fmt "$fmt" -c:v libaom-av1 -crf "$crf" -cpu-used "$cpu" -still-picture 1 -aom-params "$params" "$O/$name.avif"
+}
+B="enable-palette=0:sb-size=128"
+S="enable-cdef=1:enable-restoration=1:sb-size=128:tune-content=screen"
+G() { echo "gradients=s=$1:d=1:seed=$2,noise=alls=${3:-14}:allf=t:all_seed=$2"; }
+MOSAIC() { echo "testsrc2=s=$1:r=25,tile=$2,format=$3"; }
+enc sb128_16 "$(G 16x16 91)" yuv420p 30 4 "enable-cdef=1:enable-restoration=0:$B"
+enc sb128_129 "$(G 129x129 92)" yuv420p 25 3 "enable-cdef=1:enable-restoration=0:$B"
+enc sb128_300 "$(G 300x300 93 8)" yuv420p 35 3 "enable-cdef=1:enable-restoration=0:$B"
+enc sb128_300_lr "$(G 300x300 94 10)" yuv420p 35 3 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_300_nocdef_lr "$(G 300x300 95 10)" yuv420p 35 3 "enable-cdef=0:enable-restoration=1:$B"
+enc sb128_300_smooth "gradients=s=300x300:d=1:seed=96" yuv420p 40 2 "enable-cdef=1:enable-restoration=0:$B"
+enc sb128_131x77 "$(G 131x77 97 20)" yuv420p 45 2 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_lowq "$(G 256x256 98 6)" yuv420p 10 3 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_hiq "$(G 256x256 99 30)" yuv420p 55 3 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_444 "$(G 200x200 100)" yuv444p 30 4 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_422 "$(G 200x200 101)" yuv422p 30 4 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_400 "$(G 200x200 102)" gray 30 4 "enable-cdef=1:enable-restoration=0:$B"
+enc sb128_10b "$(G 300x300 103)" yuv420p10le 30 4 "enable-cdef=1:enable-restoration=1:$B"
+enc sb128_pal "testsrc2=s=300x300,format=yuv420p" yuv420p 30 3 "enable-cdef=1:enable-restoration=0:sb-size=128:tune-content=screen"
+enc sb128_lossless "$(G 200x200 104)" yuv420p 0 4 "lossless=1:$B"
+enc sb128_tiles "$(G 400x400 105)" yuv420p 30 4 "enable-cdef=1:enable-restoration=0:$B:tile-columns=1:tile-rows=1"
+enc sb128_dq "$(G 300x300 106)" yuv420p 30 4 "enable-cdef=1:enable-restoration=0:$B:deltaq-mode=1"
+enc sb128_qm "$(G 300x300 107)" yuv420p 30 4 "enable-cdef=1:enable-restoration=0:$B:enable-qm=1"
+enc sb128_ibc "$(MOSAIC 100x100 3x3 yuv420p)" yuv420p 25 3 "$S"
+enc sb128_ibc_444 "$(MOSAIC 100x100 3x3 yuv444p)" yuv444p 25 3 "$S"
+enc sb128_ibc_422 "$(MOSAIC 100x100 3x3 yuv422p)" yuv422p 25 3 "$S"
+enc sb128_ibc_10b "$(MOSAIC 100x100 3x3 yuv420p10le)" yuv420p10le 25 3 "$S"
+enc sb128_ibc_lossless "$(MOSAIC 100x100 3x3 yuv420p)" yuv420p 0 3 "lossless=1:sb-size=128:tune-content=screen"
+enc sb128_ibc_big "$(MOSAIC 128x128 3x3 yuv420p)" yuv420p 25 3 "$S"
+enc sb128_rgbtest "rgbtestsrc=s=300x200,format=yuv420p" yuv420p 25 3 "$S"
