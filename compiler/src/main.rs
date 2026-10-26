@@ -138,6 +138,7 @@ mod types;
 mod wasm_cfg;
 mod wasm_enc;
 mod wasm_locals;
+mod wasm_outline;
 mod wasm_rt;
 mod so_thunk;
 mod win;
@@ -1595,6 +1596,8 @@ fn emit_wasm(
         eprintln!("error: --target=wasm32-browser has no object files: one program is one module (leave out -c)");
         return 2;
     }
+    let outlined = wasm_outline::run(module);
+    let module = outlined.as_ref().unwrap_or(module);
     let out = match codegen_wasm::emit(module) {
         Ok(o) => o,
         Err(e) => {
