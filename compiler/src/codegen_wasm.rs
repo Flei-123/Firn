@@ -1730,6 +1730,21 @@ impl<'a> Fx<'a> {
     }
 
     fn num(&mut self, n: w::Num) {
+        if n == w::I32_WRAP_I64 {
+            if let Some(Ins::I64Const(c)) = self.out.last() {
+                let c = *c as i32;
+                self.out.pop();
+                self.out.push(Ins::I32Const(c));
+                return;
+            }
+        }
+        if n == w::I32_EQ {
+            if let Some(Ins::I32Const(0)) = self.out.last() {
+                self.out.pop();
+                self.out.push(Ins::Num(w::I32_EQZ));
+                return;
+            }
+        }
         self.out.push(Ins::Num(n));
     }
 
@@ -2631,8 +2646,7 @@ impl<'a> Fx<'a> {
                 self.ins(Ins::I64Const(0));
                 self.put(i, VT::I64);
             }
-            // `memcpy_idiom.rs` only runs for x86-64; this can never be reached.
-            Op::MemCopy { .. } => unreachable!("memcopy on a non-x86 target"),
+            Op::MemCopy { dst, src, n, esz } => self.mem_copy(*dst, *src, *n, *esz),
             Op::CopyMem { dst, src, size } => {
                 if *size > 0 {
                     self.addr(*dst);
@@ -3013,6 +3027,81 @@ impl<'a> Fx<'a> {
     }
 
     /// Address and length of a panic message, as two `i32`.
+    fn mem_copy(&mut self, dst: Val, src: Val, n: Val, esz: u8) {
+        let (load, store) = match esz {
+            1 => (w::I32_LOAD8_U, w::I32_STORE8),
+            4 => (w::I32_LOAD, w::I32_STORE),
+            _ => (w::I64_LOAD, w::I64_STORE),
+        };
+        let d = self.tmp(VT::I32);
+        let s = self.tmp(VT::I32);
+        let c = self.tmp(VT::I64);
+        self.addr(dst);
+        self.ins(Ins::LocalSet(d));
+        self.addr(src);
+        self.ins(Ins::LocalSet(s));
+        self.get(n, VT::I64);
+        self.ins(Ins::LocalSet(c));
+        self.ins(Ins::LocalGet(c));
+        self.ins(Ins::I64Const(1));
+        self.num(w::I64_SUB);
+        self.ins(Ins::I64Const((u32::MAX / esz as u32) as i64));
+        self.num(w::I64_LT_U);
+        self.ins(Ins::LocalGet(d));
+        self.num(w::I64_EXTEND_I32_U);
+        self.ins(Ins::LocalGet(s));
+        self.num(w::I64_EXTEND_I32_U);
+        self.num(w::I64_LE_U);
+        self.ins(Ins::LocalGet(d));
+        self.num(w::I64_EXTEND_I32_U);
+        self.ins(Ins::LocalGet(s));
+        self.num(w::I64_EXTEND_I32_U);
+        self.ins(Ins::LocalGet(c));
+        self.ins(Ins::I64Const(esz as i64));
+        self.num(w::I64_MUL);
+        self.num(w::I64_ADD);
+        self.num(w::I64_GE_U);
+        self.num(w::I32_OR);
+        self.num(w::I32_AND);
+        self.ins(Ins::If);
+        self.ins(Ins::LocalGet(d));
+        self.ins(Ins::LocalGet(s));
+        self.ins(Ins::LocalGet(c));
+        self.ins(Ins::I64Const(esz as i64));
+        self.num(w::I64_MUL);
+        self.num(w::I32_WRAP_I64);
+        self.ins(Ins::MemoryCopy);
+        self.ins(Ins::Else);
+        self.ins(Ins::Block);
+        self.ins(Ins::Loop);
+        self.ins(Ins::LocalGet(c));
+        self.num(w::I64_EQZ);
+        self.ins(Ins::BrIf(1));
+        self.ins(Ins::LocalGet(d));
+        self.ins(Ins::LocalGet(s));
+        self.ins(Ins::Load(load, 0));
+        self.ins(Ins::Store(store, 0));
+        self.ins(Ins::LocalGet(d));
+        self.ins(Ins::I32Const(esz as i32));
+        self.num(w::I32_ADD);
+        self.ins(Ins::LocalSet(d));
+        self.ins(Ins::LocalGet(s));
+        self.ins(Ins::I32Const(esz as i32));
+        self.num(w::I32_ADD);
+        self.ins(Ins::LocalSet(s));
+        self.ins(Ins::LocalGet(c));
+        self.ins(Ins::I64Const(1));
+        self.num(w::I64_SUB);
+        self.ins(Ins::LocalSet(c));
+        self.ins(Ins::Br(0));
+        self.ins(Ins::End);
+        self.ins(Ins::End);
+        self.ins(Ins::End);
+        self.release(VT::I32, d);
+        self.release(VT::I32, s);
+        self.release(VT::I64, c);
+    }
+
     fn msg(&mut self, msg: &str) -> Result<(), String> {
         let a = *self.g.msg_addr.get(msg).ok_or("internal error: panic message without data")?;
         self.ins(Ins::I32Const(a as i32));

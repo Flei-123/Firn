@@ -976,6 +976,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             && match crate::target::active() {
                 crate::target::Target::X86_64 => true,
                 crate::target::Target::Aarch64 => std::env::var_os("FIRN_A64_NO_MEMCPY").is_none(),
+                crate::target::Target::Wasm32Browser => std::env::var_os("FIRN_WASM_NO_MEMCPY").is_none(),
                 _ => false,
             };
         if (cfg.runs("memset") || memcpy_on) && fx.due(11) {

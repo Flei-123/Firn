@@ -73,6 +73,7 @@ mod lower_match;
 mod modules;
 mod mono;
 mod mem2reg;
+mod heapstat;
 mod memcpy_idiom;
 mod memset;
 mod divnonneg;
@@ -227,17 +228,24 @@ struct Options {
 ///
 /// The output goes to stderr, sorted by cost, so that
 /// `tools/bench82/run.sh` can grep it and a regression limit can hang on it.
+#[global_allocator]
+static HEAP: heapstat::Counting = heapstat::Counting;
+
 struct Timings {
     on: bool,
     start: Instant,
     last: Instant,
     rows: Vec<(&'static str, f64)>,
+    heap: Vec<(&'static str, usize, usize)>,
 }
 
 impl Timings {
     fn new(on: bool) -> Timings {
         let now = Instant::now();
-        Timings { on, start: now, last: now, rows: Vec::new() }
+        if on {
+            heapstat::enable();
+        }
+        Timings { on, start: now, last: now, rows: Vec::new(), heap: Vec::new() }
     }
     /// Closes the phase that has just run. Several passes through the same
     /// name add up — that is what makes `as`/`ld` comparable with the rest.
@@ -248,6 +256,7 @@ impl Timings {
         let now = Instant::now();
         let ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
         self.last = now;
+        self.heap.push((what, heapstat::live(), heapstat::take_peak()));
         match self.rows.iter_mut().find(|r| r.0 == what) {
             Some(r) => r.1 += ms,
             None => self.rows.push((what, ms)),
@@ -265,6 +274,10 @@ impl Timings {
             eprintln!("  {:<18} {:9.1} ms  {:5.1} %", name, ms, ms / total * 100.0);
         }
         eprintln!("total {:.1} ms", total);
+        eprintln!("heap after each phase (MB live / MB peak inside the phase)");
+        for (name, live, peak) in &self.heap {
+            eprintln!("  {:<18} {:8.1} {:8.1}", name, *live as f64 / 1048576.0, *peak as f64 / 1048576.0);
+        }
     }
 }
 
@@ -1179,6 +1192,9 @@ fn run(opts: &Options) -> i32 {
         return report(&dg);
     }
 
+    let has_comptime = !prog.comptime_blocks.is_empty();
+    drop(info);
+    drop(prog);
     tm.mark("lower");
     if opts.stats {
         eprintln!(
@@ -1296,7 +1312,7 @@ fn run(opts: &Options) -> i32 {
     // finished in memory, so it leaves the pipeline here, before `as`/`ld`.
     if target::active().is_wasm() {
         let store = match (&cache_dir, &cache_key) {
-            (Some(dir), Some(key)) if !buildcache::tainted() && prog.comptime_blocks.is_empty() => Some((dir.clone(), key.clone())),
+            (Some(dir), Some(key)) if !buildcache::tainted() && !has_comptime => Some((dir.clone(), key.clone())),
             (Some(_), Some(_)) => {
                 buildcache::log("skip");
                 None
@@ -1328,7 +1344,7 @@ fn run(opts: &Options) -> i32 {
     tm.mark("codegen");
     let mut slot = None;
     if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
-        if !buildcache::tainted() && prog.comptime_blocks.is_empty() {
+        if !buildcache::tainted() && !has_comptime {
             let link = buildcache::LinkInfo::capture();
             if buildcache::store(dir, key, &link, &asm) {
                 buildcache::log("store");
