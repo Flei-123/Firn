@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_vdrecon.fi -- jxl_vdrecon: JPEG XL VarDCT reconstruction (dequantization, inverse DCT, XYB to sRGB)
+import jxl.jxl_cmap
+import jxl.jxl_dcsmooth
+import jxl.jxl_dct
+import jxl.jxl_err
+import jxl.jxl_lfdata
+import jxl.jxl_qweights
+import jxl.jxl_quant
+import jxl.jxl_vardct
+import jxl.jxl_xyb
+import std.rt
+import std.vec
+
+export { vr_reconstruct }
+
+const FLAG_SKIP_ADAPTIVE_DC: u64 = 128
+const FLAG_USE_DC_FRAME: u64 = 32
+
+fn fld(p: u64, i: usize) -> f64 {
+    return *((p +% ((i * 8) as u64)) as *mut f64)
+}
+
+fn fst(p: u64, i: usize, v: f64) {
+    *((p +% ((i * 8) as u64)) as *mut f64) = v
+}
+
+fn qmul(scale: u32) -> f64 {
+    var m: f64 = 1.0
+    var i: u32 = 2
+    while i < scale {
+        m = m / 1.25
+        i = i + 1
+    }
+    i = scale
+    while i < 2 {
+        m = m * 1.25
+        i = i + 1
+    }
+    return m
+}
+
+fn dequant_dct8(v: *mut jxl_vardct.JxlVardct, table: u64, bx: usize, by: usize, coef: u64) {
+    let d: *mut jxl_lfdata.JxlLfData = &(*v).data
+    let idx: usize = jxl_lfdata.lfd_idx(d, bx, by)
+    let qf: f64 = vec.vec_at[i32](&(*d).qf, idx) as f64
+    let scale: f64 = jxl_quant.quant_inv_global_scale(&(*v).lfg.quant) / qf
+    var mulc: [f64; 3] = [scale * qmul((*v).doc.frame.x_qm_scale), scale, scale * qmul((*v).doc.frame.b_qm_scale)]
+    let tile: usize = jxl_lfdata.lfd_tile_idx(d, bx / 8, by / 8)
+    let rx: f64 = jxl_cmap.cmap_ratio_x(&(*v).lfg.cmap, vec.vec_at[i32](&(*d).ytox, tile))
+    let rb: f64 = jxl_cmap.cmap_ratio_b(&(*v).lfg.cmap, vec.vec_at[i32](&(*d).ytob, tile))
+    let qo: usize = vec.vec_at[u32](&(*d).qoff, idx) as usize
+    var k: usize = 0
+    while k < 64 {
+        var c: usize = 0
+        while c < 3 {
+            let q: i32 = vec.vec_at[i32](&(*d).coefs, c * (*d).coef_stride + qo + k)
+            fst(coef, c * 64 + k, jxl_qweights.qw_bias_adjust(q, c) * fld(table, c * 64 + k) * mulc[c])
+            c = c + 1
+        }
+        let yv: f64 = fld(coef, 64 + k)
+        fst(coef, k, fld(coef, k) + rx * yv)
+        fst(coef, 128 + k, fld(coef, 128 + k) + rb * yv)
+        k = k + 1
+    }
+    var c2: usize = 0
+    while c2 < 3 {
+        fst(coef, c2 * 64, jxl_lfdata.lfd_dc_get(d, c2, bx, by))
+        c2 = c2 + 1
+    }
+}
+
+fn vr_reconstruct(v: *mut jxl_vardct.JxlVardct, out: u64) -> i32 {
+    let d: *mut jxl_lfdata.JxlLfData = &(*v).data
+    let flags: u64 = (*v).doc.frame.flags
+    if (flags & (FLAG_SKIP_ADAPTIVE_DC | FLAG_USE_DC_FRAME)) == 0 {
+        if !jxl_dcsmooth.dcs_apply(d, &(*v).lfg.quant) {
+            return jxl_err.JX_MEMORY
+        }
+    }
+    let stride: usize = (*d).bw * 8
+    let rows: usize = (*d).bh * 8
+    let plane_len: usize = stride * rows
+    let planes: u64 = rt.heap_alloc(plane_len * 3 * 8)
+    let table: u64 = rt.heap_alloc(3 * 64 * 8)
+    let coef: u64 = rt.heap_alloc(3 * 64 * 8)
+    let pix: u64 = rt.heap_alloc(64 * 8)
+    var r: i32 = jxl_err.JX_OK
+    if planes == 0 || table == 0 || coef == 0 || pix == 0 {
+        r = jxl_err.JX_MEMORY
+    }
+    if r == jxl_err.JX_OK {
+        jxl_qweights.qw_dct8_table(table)
+        var by: usize = 0
+        while by < (*d).bh && r == jxl_err.JX_OK {
+            var bx: usize = 0
+            while bx < (*d).bw && r == jxl_err.JX_OK {
+                if jxl_lfdata.lfd_acs_is_first(d, bx, by) {
+                    if jxl_lfdata.lfd_acs_type(d, bx, by) != 0 {
+                        r = jxl_err.JX_UNSUPPORTED
+                    } else {
+                        dequant_dct8(v, table, bx, by, coef)
+                        var c: usize = 0
+                        while c < 3 {
+                            jxl_dct.idct_2d(8, 8, coef +% ((c * 64 * 8) as u64), pix)
+                            var y: usize = 0
+                            while y < 8 {
+                                var x: usize = 0
+                                while x < 8 {
+                                    fst(planes, c * plane_len + (by * 8 + y) * stride + bx * 8 + x, fld(pix, x * 8 + y))
+                                    x = x + 1
+                                }
+                                y = y + 1
+                            }
+                            c = c + 1
+                        }
+                    }
+                }
+                bx = bx + 1
+            }
+            by = by + 1
+        }
+    }
+    if r == jxl_err.JX_OK {
+        jxl_xyb.xyb_to_rgb8(planes, (*v).doc.frame.width as usize, (*v).doc.frame.height as usize, stride, plane_len, (*v).doc.meta.intensity_target, out)
+    }
+    if planes != 0 {
+        rt.heap_free(planes, plane_len * 3 * 8)
+    }
+    if table != 0 {
+        rt.heap_free(table, 3 * 64 * 8)
+    }
+    if coef != 0 {
+        rt.heap_free(coef, 3 * 64 * 8)
+    }
+    if pix != 0 {
+        rt.heap_free(pix, 64 * 8)
+    }
+    return r
+}
