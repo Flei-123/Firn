@@ -1,0 +1,202 @@
+import std.rt
+import jxl.jxl_bits
+import jxl.jxl_code
+import jxl.jxl_err
+import jxl.jxl_mem
+
+export {
+    JxlTree, tree_new, tree_free, tree_read, tree_lookup, tree_is_leaf, tree_leaf_id, tree_predictor,
+    tree_multiplier, tree_offset, tree_uses_wp, tree_max_property, tree_count, WP_PROPERTY, PRED_WEIGHTED,
+}
+
+const CTX_SPLIT: u32 = 0
+const CTX_PROPERTY: u32 = 1
+const CTX_PREDICTOR: u32 = 2
+const CTX_OFFSET: u32 = 3
+const CTX_MUL_LOG: u32 = 4
+const CTX_MUL_BITS: u32 = 5
+const NODE_WORDS: usize = 8
+const WP_PROPERTY: i32 = 15
+const PRED_WEIGHTED: u32 = 6
+
+struct JxlTree {
+    nodes: u64,
+    count: usize,
+    cap: usize,
+}
+
+fn tree_new() -> JxlTree {
+    return JxlTree { nodes: 0, count: 0, cap: 0 }
+}
+
+fn tree_free(t: *mut JxlTree) {
+    if (*t).nodes != 0 {
+        rt.heap_free((*t).nodes, (*t).cap * NODE_WORDS * 4)
+    }
+    *t = tree_new()
+}
+
+fn tree_count(t: *mut JxlTree) -> usize {
+    return (*t).count
+}
+
+fn push_node(t: *mut JxlTree) -> bool {
+    if (*t).count == (*t).cap {
+        var ncap: usize = (*t).cap * 2
+        if ncap < 16 {
+            ncap = 16
+        }
+        let np: u64 = rt.heap_alloc(ncap * NODE_WORDS * 4)
+        if np == 0 {
+            return false
+        }
+        if (*t).nodes != 0 {
+            rt.mem_copy(np, (*t).nodes, (*t).count * NODE_WORDS * 4)
+            rt.heap_free((*t).nodes, (*t).cap * NODE_WORDS * 4)
+        }
+        (*t).nodes = np
+        (*t).cap = ncap
+    }
+    (*t).count = (*t).count + 1
+    return true
+}
+
+fn tree_is_leaf(t: *mut JxlTree, n: usize) -> bool {
+    return jxl_mem.ldi((*t).nodes, n * NODE_WORDS) < 0
+}
+
+fn tree_leaf_id(t: *mut JxlTree, n: usize) -> u32 {
+    return rt.ld32((*t).nodes, n * NODE_WORDS + 2)
+}
+
+fn tree_predictor(t: *mut JxlTree, n: usize) -> u32 {
+    return rt.ld32((*t).nodes, n * NODE_WORDS + 4)
+}
+
+fn tree_multiplier(t: *mut JxlTree, n: usize) -> i64 {
+    return rt.ld32((*t).nodes, n * NODE_WORDS + 5) as i64
+}
+
+fn tree_offset(t: *mut JxlTree, n: usize) -> i64 {
+    return jxl_mem.ldq((*t).nodes, n * 4 + 3)
+}
+
+fn tree_uses_wp(t: *mut JxlTree) -> bool {
+    var i: usize = 0
+    while i < (*t).count {
+        if tree_is_leaf(t, i) {
+            if tree_predictor(t, i) == PRED_WEIGHTED {
+                return true
+            }
+        } else if jxl_mem.ldi((*t).nodes, i * NODE_WORDS) == WP_PROPERTY {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn tree_max_property(t: *mut JxlTree) -> i32 {
+    var m: i32 = 0 - 1
+    var i: usize = 0
+    while i < (*t).count {
+        if !tree_is_leaf(t, i) {
+            let p: i32 = jxl_mem.ldi((*t).nodes, i * NODE_WORDS)
+            if p > m {
+                m = p
+            }
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn tree_lookup(t: *mut JxlTree, props: u64) -> usize {
+    var pos: usize = 0
+    while !tree_is_leaf(t, pos) {
+        let prop: usize = jxl_mem.ldi((*t).nodes, pos * NODE_WORDS) as usize
+        let split: i32 = jxl_mem.ldi((*t).nodes, pos * NODE_WORDS + 1)
+        if jxl_mem.ldi(props, prop) > split {
+            pos = rt.ld32((*t).nodes, pos * NODE_WORDS + 2) as usize
+        } else {
+            pos = rt.ld32((*t).nodes, pos * NODE_WORDS + 3) as usize
+        }
+    }
+    return pos
+}
+
+fn read_tree_nodes(b: *mut jxl_bits.JxlBits, rd: *mut jxl_code.JxlReader, limit: usize, t: *mut JxlTree) -> i32 {
+    var leaf_id: u32 = 0
+    var to_decode: usize = 1
+    while to_decode > 0 {
+        if jxl_bits.jb_over(b) {
+            return jxl_err.JX_TRUNCATED
+        }
+        if (*t).count > limit {
+            return jxl_err.JX_TOO_LARGE
+        }
+        to_decode = to_decode - 1
+        let prop1: u32 = jxl_code.reader_read(rd, b, CTX_PROPERTY)
+        if prop1 > 256 {
+            return jxl_err.JX_BAD
+        }
+        let idx: usize = (*t).count
+        if !push_node(t) {
+            return jxl_err.JX_MEMORY
+        }
+        let base: usize = idx * NODE_WORDS
+        if prop1 == 0 {
+            let predictor: u32 = jxl_code.reader_read(rd, b, CTX_PREDICTOR)
+            if predictor >= 14 {
+                return jxl_err.JX_BAD
+            }
+            let offset: i64 = jxl_bits.jb_signed(jxl_code.reader_read(rd, b, CTX_OFFSET)) as i64
+            let mul_log: u32 = jxl_code.reader_read(rd, b, CTX_MUL_LOG)
+            if mul_log >= 31 {
+                return jxl_err.JX_BAD
+            }
+            let mul_bits: u32 = jxl_code.reader_read(rd, b, CTX_MUL_BITS)
+            if (mul_bits as u64) + 1 >= ((1 as u64) << (31 - mul_log) as u64) {
+                return jxl_err.JX_BAD
+            }
+            jxl_mem.sti((*t).nodes, base, 0 - 1)
+            jxl_mem.sti((*t).nodes, base + 1, 0)
+            rt.st32((*t).nodes, base + 2, leaf_id)
+            rt.st32((*t).nodes, base + 3, 0 as u32)
+            rt.st32((*t).nodes, base + 4, predictor)
+            rt.st32((*t).nodes, base + 5, (((mul_bits as u64) + 1) << (mul_log as u64)) as u32)
+            jxl_mem.stq((*t).nodes, idx * 4 + 3, offset)
+            leaf_id = leaf_id + 1
+        } else {
+            let split: i32 = jxl_bits.jb_signed(jxl_code.reader_read(rd, b, CTX_SPLIT))
+            jxl_mem.sti((*t).nodes, base, (prop1 - 1) as i32)
+            jxl_mem.sti((*t).nodes, base + 1, split)
+            rt.st32((*t).nodes, base + 2, (idx + to_decode + 1) as u32)
+            rt.st32((*t).nodes, base + 3, (idx + to_decode + 2) as u32)
+            rt.st32((*t).nodes, base + 4, 0 as u32)
+            rt.st32((*t).nodes, base + 5, 1 as u32)
+            jxl_mem.stq((*t).nodes, idx * 4 + 3, 0)
+            to_decode = to_decode + 2
+        }
+    }
+    return jxl_err.JX_OK
+}
+
+fn tree_read(b: *mut jxl_bits.JxlBits, limit: usize, t: *mut JxlTree) -> i32 {
+    var c: jxl_code.JxlCode = jxl_code.code_new()
+    var r: i32 = jxl_code.code_read(b, 6, false, &c)
+    if r != jxl_err.JX_OK {
+        return r
+    }
+    var rd: jxl_code.JxlReader = jxl_code.reader_new()
+    r = jxl_code.reader_init(&rd, &c, b, 0)
+    if r == jxl_err.JX_OK {
+        r = read_tree_nodes(b, &rd, limit, t)
+    }
+    if r == jxl_err.JX_OK && !jxl_code.reader_final_ok(&rd) {
+        r = jxl_err.JX_BAD
+    }
+    jxl_code.reader_free(&rd)
+    jxl_code.code_free(&c)
+    return r
+}

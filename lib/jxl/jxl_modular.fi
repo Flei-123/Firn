@@ -1,0 +1,166 @@
+import std.rt
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_chan
+import jxl.jxl_code
+import jxl.jxl_container
+import jxl.jxl_err
+import jxl.jxl_frame
+import jxl.jxl_header
+import jxl.jxl_img
+import jxl.jxl_tree
+import jxl.jxl_wp
+import jxl.jxl_xform
+
+export { modular_decode }
+
+fn read_group_header(b: *mut jxl_bits.JxlBits, use_global: *mut bool, wph: *mut jxl_wp.JxlWpHeader, xfs: *mut vec.Vec[jxl_xform.JxlXform]) -> i32 {
+    *use_global = jxl_bits.jb_bit(b)
+    jxl_wp.wp_header_read(b, wph)
+    let n: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_off(4, 2), jxl_bits.jd_off(8, 18))
+    var i: u32 = 0
+    while i < n {
+        var x: jxl_xform.JxlXform = jxl_xform.xf_new()
+        let r: i32 = jxl_xform.xf_read(b, &x)
+        if r != jxl_err.JX_OK {
+            return r
+        }
+        if !vec.vec_push[jxl_xform.JxlXform](xfs, x) {
+            return jxl_err.JX_MEMORY
+        }
+        i = i + 1
+    }
+    return jxl_err.JX_OK
+}
+
+fn decode_channels(b: *mut jxl_bits.JxlBits, img: *mut jxl_img.JxlImage, tree: *mut jxl_tree.JxlTree, code: *mut jxl_code.JxlCode, wph: *mut jxl_wp.JxlWpHeader, max_size: usize, stream_id: u32) -> i32 {
+    var dist_mul: usize = 0
+    var c: usize = 0
+    while c < jxl_img.img_count(img) {
+        let w: usize = jxl_img.img_w(img, c)
+        let h: usize = jxl_img.img_h(img, c)
+        if w != 0 && h != 0 {
+            if c >= (*img).nb_meta && (w > max_size || h > max_size) {
+                return jxl_err.JX_UNSUPPORTED
+            }
+            if w > dist_mul {
+                dist_mul = w
+            }
+        }
+        c = c + 1
+    }
+    var rd: jxl_code.JxlReader = jxl_code.reader_new()
+    var r: i32 = jxl_code.reader_init(&rd, code, b, dist_mul as u32)
+    c = 0
+    while r == jxl_err.JX_OK && c < jxl_img.img_count(img) {
+        r = jxl_chan.chan_decode(b, &rd, tree, wph, img, c, stream_id)
+        c = c + 1
+    }
+    if r == jxl_err.JX_OK && !jxl_code.reader_final_ok(&rd) {
+        r = jxl_err.JX_BAD
+    }
+    jxl_code.reader_free(&rd)
+    return r
+}
+
+fn decode_global(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut jxl_frame.JxlFrame, img: *mut jxl_img.JxlImage) -> i32 {
+    let nchan: usize = jxl_header.jm_color_channels(m) as usize
+    let nextra: usize = vec.vec_len[jxl_header.JxlExtra](&(*m).extra)
+    var c: usize = 0
+    while c < nchan + nextra {
+        jxl_img.img_add(img, (*f).width as usize, (*f).height as usize, 0, 0)
+        c = c + 1
+    }
+    var tree: jxl_tree.JxlTree = jxl_tree.tree_new()
+    var code: jxl_code.JxlCode = jxl_code.code_new()
+    var wph: jxl_wp.JxlWpHeader = jxl_wp.wp_header_default()
+    var xfs: vec.Vec[jxl_xform.JxlXform] = vec.vec_new[jxl_xform.JxlXform]()
+    var use_global: bool = false
+    var r: i32 = jxl_err.JX_OK
+    let has_tree: bool = jxl_bits.jb_bit(b)
+    if has_tree {
+        var limit: usize = 1024 + ((*f).width as usize) * ((*f).height as usize) * (nchan + nextra) / 16
+        if limit > 4194304 {
+            limit = 4194304
+        }
+        r = jxl_tree.tree_read(b, limit, &tree)
+        if r == jxl_err.JX_OK {
+            r = jxl_code.code_read(b, (jxl_tree.tree_count(&tree) + 1) / 2, false, &code)
+        }
+    }
+    if r == jxl_err.JX_OK {
+        r = read_group_header(b, &use_global, &wph, &xfs)
+    }
+    var i: usize = 0
+    while r == jxl_err.JX_OK && i < vec.vec_len[jxl_xform.JxlXform](&xfs) {
+        r = jxl_xform.xf_meta(vec.vec_elem_ptr[jxl_xform.JxlXform](&xfs, i), img)
+        i = i + 1
+    }
+    if r == jxl_err.JX_OK && !use_global {
+        r = jxl_err.JX_UNSUPPORTED
+    }
+    if r == jxl_err.JX_OK && !has_tree {
+        r = jxl_err.JX_BAD
+    }
+    if r == jxl_err.JX_OK {
+        r = decode_channels(b, img, &tree, &code, &wph, (*f).group_dim as usize, 0)
+    }
+    i = vec.vec_len[jxl_xform.JxlXform](&xfs)
+    while r == jxl_err.JX_OK && i > 0 {
+        i = i - 1
+        r = jxl_xform.xf_inverse(vec.vec_elem_ptr[jxl_xform.JxlXform](&xfs, i), img, &wph, (*m).depth.bits as i64)
+    }
+    jxl_tree.tree_free(&tree)
+    jxl_code.code_free(&code)
+    vec.vec_free[jxl_xform.JxlXform](&xfs)
+    return r
+}
+
+fn modular_decode(p: u64, n: usize, img: *mut jxl_img.JxlImage) -> i32 {
+    var cs: rt.Buf = rt.buf_new()
+    var r: i32 = jxl_container.jc_extract(p, n, &cs)
+    if r != jxl_err.JX_OK {
+        rt.buf_free(&cs)
+        return r
+    }
+    var b: jxl_bits.JxlBits = jxl_bits.jb_new(rt.buf_ptr(&cs), rt.buf_len(&cs))
+    jxl_bits.jb_skip_bits(&b, 16)
+    var m: jxl_header.JxlMeta = jxl_header.jm_new()
+    r = jxl_header.jm_read(&b, &m)
+    if r == jxl_err.JX_OK {
+        r = jxl_header.jm_read_custom_transform(&b, &m)
+    }
+    if r == jxl_err.JX_OK && (m.color.want_icc || m.have_preview || m.xyb_encoded || m.have_animation) {
+        r = jxl_err.JX_UNSUPPORTED
+    }
+    if r == jxl_err.JX_OK && !jxl_bits.jb_zero_pad(&b) {
+        r = jxl_err.JX_BAD
+    }
+    var f: jxl_frame.JxlFrame = jxl_frame.jf_new()
+    if r == jxl_err.JX_OK {
+        r = jxl_frame.jf_read(&b, &m, &f)
+    }
+    if r == jxl_err.JX_OK {
+        r = jxl_frame.jf_read_toc(&b, &f)
+    }
+    if r == jxl_err.JX_OK && (f.encoding != jxl_frame.JF_MODULAR || f.do_ycbcr || f.upsampling != 1 || (f.flags & 19) != 0 || f.toc_count != 1) {
+        r = jxl_err.JX_UNSUPPORTED
+    }
+    if r == jxl_err.JX_OK {
+        var sb: jxl_bits.JxlBits = jxl_bits.jb_new(rt.buf_ptr(&cs) + (f.body_start as u64), jxl_frame.jf_section_size(&f, 0))
+        if jxl_bits.jb_bit(&sb) {
+            r = jxl_err.JX_OK
+        } else {
+            var k: u32 = 0
+            while k < 3 {
+                jxl_bits.jb_f16(&sb)
+                k = k + 1
+            }
+        }
+        r = decode_global(&sb, &m, &f, img)
+    }
+    jxl_frame.jf_free(&f)
+    jxl_header.jm_free(&m)
+    rt.buf_free(&cs)
+    return r
+}

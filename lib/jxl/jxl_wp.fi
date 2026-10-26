@@ -1,0 +1,193 @@
+import std.rt
+import jxl.jxl_bits
+import jxl.jxl_mem
+
+export {
+    JxlWpHeader, JxlWp, wp_header_default, wp_header_read, wp_new, wp_free, wp_predict, wp_update, WP_PRED_ROUND,
+}
+
+const WP_PRED_ROUND: i64 = 3
+
+struct JxlWpHeader {
+    p1c: i64,
+    p2c: i64,
+    p3ca: i64,
+    p3cb: i64,
+    p3cc: i64,
+    p3cd: i64,
+    p3ce: i64,
+    w: [i64; 4],
+}
+
+struct JxlWp {
+    xsize: usize,
+    perr: u64,
+    err: u64,
+    hdr: JxlWpHeader,
+    prediction: [i64; 4],
+    pred: i64,
+    div: [i64; 64],
+}
+
+fn wp_header_default() -> JxlWpHeader {
+    return JxlWpHeader { p1c: 16, p2c: 10, p3ca: 7, p3cb: 7, p3cc: 7, p3cd: 0, p3ce: 0, w: [13, 12, 12, 12] }
+}
+
+fn wp_header_read(b: *mut jxl_bits.JxlBits, h: *mut JxlWpHeader) {
+    *h = wp_header_default()
+    if jxl_bits.jb_bit(b) {
+        return
+    }
+    (*h).p1c = jxl_bits.jb_read(b, 5) as i64
+    (*h).p2c = jxl_bits.jb_read(b, 5) as i64
+    (*h).p3ca = jxl_bits.jb_read(b, 5) as i64
+    (*h).p3cb = jxl_bits.jb_read(b, 5) as i64
+    (*h).p3cc = jxl_bits.jb_read(b, 5) as i64
+    (*h).p3cd = jxl_bits.jb_read(b, 5) as i64
+    (*h).p3ce = jxl_bits.jb_read(b, 5) as i64
+    var i: usize = 0
+    while i < 4 {
+        (*h).w[i] = jxl_bits.jb_read(b, 4) as i64
+        i = i + 1
+    }
+}
+
+fn wp_new(hdr: *mut JxlWpHeader, xsize: usize) -> JxlWp {
+    let row: usize = (xsize + 2) * 2
+    var s: JxlWp = JxlWp { xsize: xsize, perr: rt.heap_alloc(row * 4 * 4), err: rt.heap_alloc(row * 4), hdr: *hdr,
+        prediction: [0; 4], pred: 0, div: [0; 64] }
+    rt.mem_set(s.perr, 0 as u8, row * 16)
+    rt.mem_set(s.err, 0 as u8, row * 4)
+    var i: usize = 0
+    while i < 64 {
+        s.div[i] = 16777216 / ((i + 1) as i64)
+        i = i + 1
+    }
+    return s
+}
+
+fn wp_free(s: *mut JxlWp) {
+    let row: usize = ((*s).xsize + 2) * 2
+    rt.heap_free((*s).perr, row * 16)
+    rt.heap_free((*s).err, row * 4)
+    (*s).perr = 0
+    (*s).err = 0
+}
+
+fn error_weight(s: *mut JxlWp, x: u64, maxweight: i64) -> i64 {
+    var shift: i64 = (jxl_mem.floor_log2(x + 1) as i64) - 5
+    if shift < 0 {
+        shift = 0
+    }
+    return 4 + ((maxweight * (*s).div[(x >> (shift as u64)) as usize]) >> shift)
+}
+
+fn perr_at(s: *mut JxlWp, i: usize, pos: usize) -> u64 {
+    return rt.ld32((*s).perr, i * ((*s).xsize + 2) * 2 + pos) as u64
+}
+
+fn wp_predict(s: *mut JxlWp, x: usize, y: usize, n_in: i64, w_in: i64, ne_in: i64, nw_in: i64, nn_in: i64, props: u64) -> i64 {
+    let xsize: usize = (*s).xsize
+    var cur_row: usize = xsize + 2
+    var prev_row: usize = 0
+    if (y & 1) != 0 {
+        cur_row = 0
+        prev_row = xsize + 2
+    }
+    let pos_n: usize = prev_row + x
+    var pos_ne: usize = pos_n
+    if x + 1 < xsize {
+        pos_ne = pos_n + 1
+    }
+    var pos_nw: usize = pos_n
+    if x > 0 {
+        pos_nw = pos_n - 1
+    }
+    var weights: [i64; 4] = [0; 4]
+    var i: usize = 0
+    while i < 4 {
+        let sum: u64 = (perr_at(s, i, pos_n) + perr_at(s, i, pos_ne) + perr_at(s, i, pos_nw)) & 4294967295
+        weights[i] = error_weight(s, sum, (*s).hdr.w[i])
+        i = i + 1
+    }
+    let n: i64 = n_in * 8
+    let w: i64 = w_in * 8
+    let ne: i64 = ne_in * 8
+    let nw: i64 = nw_in * 8
+    let nn: i64 = nn_in * 8
+    var te_w: i64 = 0
+    if x > 0 {
+        te_w = jxl_mem.ldi((*s).err, cur_row + x - 1) as i64
+    }
+    let te_n: i64 = jxl_mem.ldi((*s).err, pos_n) as i64
+    let te_nw: i64 = jxl_mem.ldi((*s).err, pos_nw) as i64
+    let te_ne: i64 = jxl_mem.ldi((*s).err, pos_ne) as i64
+    let sum_wn: i64 = te_n + te_w
+    if props != 0 {
+        var p: i64 = te_w
+        if jxl_mem.abs64(te_n) > jxl_mem.abs64(p) {
+            p = te_n
+        }
+        if jxl_mem.abs64(te_nw) > jxl_mem.abs64(p) {
+            p = te_nw
+        }
+        if jxl_mem.abs64(te_ne) > jxl_mem.abs64(p) {
+            p = te_ne
+        }
+        jxl_mem.sti(props, 15, p as i32)
+    }
+    let h: *mut JxlWpHeader = &(*s).hdr
+    (*s).prediction[0] = w + ne - n
+    (*s).prediction[1] = n - (((sum_wn + te_ne) * (*h).p1c) >> 5)
+    (*s).prediction[2] = w - (((sum_wn + te_nw) * (*h).p2c) >> 5)
+    (*s).prediction[3] = n - ((te_nw * (*h).p3ca + te_n * (*h).p3cb + te_ne * (*h).p3cc + (nn - n) * (*h).p3cd + (nw - w) * (*h).p3ce) >> 5)
+    var weight_sum: i64 = 0
+    i = 0
+    while i < 4 {
+        weight_sum = weight_sum + weights[i]
+        i = i + 1
+    }
+    let log_weight: i64 = jxl_mem.floor_log2(weight_sum as u64) as i64
+    weight_sum = 0
+    i = 0
+    while i < 4 {
+        weights[i] = weights[i] >> (log_weight - 4)
+        weight_sum = weight_sum + weights[i]
+        i = i + 1
+    }
+    var sum: i64 = (weight_sum >> 1) - 1
+    i = 0
+    while i < 4 {
+        sum = sum + (*s).prediction[i] * weights[i]
+        i = i + 1
+    }
+    (*s).pred = (sum * (*s).div[(weight_sum - 1) as usize]) >> 24
+    if (((te_n ^ te_w) | (te_n ^ te_nw)) > 0) {
+        return ((*s).pred + WP_PRED_ROUND) >> 3
+    }
+    let mx: i64 = jxl_mem.max64(w, jxl_mem.max64(ne, n))
+    let mn: i64 = jxl_mem.min64(w, jxl_mem.min64(ne, n))
+    (*s).pred = jxl_mem.max64(mn, jxl_mem.min64(mx, (*s).pred))
+    return ((*s).pred + WP_PRED_ROUND) >> 3
+}
+
+fn wp_update(s: *mut JxlWp, val_in: i64, x: usize, y: usize) {
+    let xsize: usize = (*s).xsize
+    var cur_row: usize = xsize + 2
+    var prev_row: usize = 0
+    if (y & 1) != 0 {
+        cur_row = 0
+        prev_row = xsize + 2
+    }
+    let val: i64 = val_in * 8
+    jxl_mem.sti((*s).err, cur_row + x, ((*s).pred - val) as i32)
+    var i: usize = 0
+    while i < 4 {
+        let e: i64 = (jxl_mem.abs64((*s).prediction[i] - val) + WP_PRED_ROUND) >> 3
+        let base: usize = i * (xsize + 2) * 2
+        rt.st32((*s).perr, base + cur_row + x, (e & 4294967295) as u32)
+        let old: u64 = rt.ld32((*s).perr, base + prev_row + x + 1) as u64
+        rt.st32((*s).perr, base + prev_row + x + 1, ((old + (e as u64)) & 4294967295) as u32)
+        i = i + 1
+    }
+}
