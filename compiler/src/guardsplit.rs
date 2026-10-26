@@ -141,6 +141,7 @@ fn expand_site(f: &mut Func, g: &Guard, bi: usize, ii: usize) -> Val {
     let join = f.add_block();
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
     f.blocks[bi].insts.pop();
+    f.blocks[bi].insts.shrink_to_fit();
     let old_term = std::mem::replace(&mut f.blocks[bi].term, Term::Unset);
     if let Some(p) = copies.iter().position(|i| i.dst == Some(cond)) {
         let c = copies.remove(p);

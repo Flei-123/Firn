@@ -2728,6 +2728,7 @@ fn fuse_checks(f: &mut Func) -> usize {
             let tail_id = f.add_block();
             let slow_id = f.add_block();
             let mut rest = f.blocks[cur].insts.split_off(split_at);
+            f.blocks[cur].insts.shrink_to_fit();
             // rest[0] is the instruction at split_at (the cast, or the mul itself)
             let mut tail_insts: Vec<crate::fir::Inst> = Vec::new();
             let mut slow_insts: Vec<crate::fir::Inst> = Vec::new();
