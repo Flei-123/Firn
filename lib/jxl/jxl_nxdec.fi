@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_nxdec.fi -- jxl_nxdec: non-XYB Modular frames with patches and noise (scaled float planes)
+import std.rt
+import jxl.jxl_err
+import jxl.jxl_features
+import jxl.jxl_frame
+import jxl.jxl_header
+import jxl.jxl_img
+import jxl.jxl_lfglobal
+import jxl.jxl_mdec
+import jxl.jxl_mem
+import jxl.jxl_open
+import jxl.jxl_refdec
+import jxl.jxl_refs
+
+export { nx_wants, nx_decode }
+
+const NX_FEATURE_FLAGS: u64 = 3
+const NX_MAX_BITS: u32 = 16
+
+fn fst(p: u64, i: usize, v: f64) {
+    *((p +% ((i * 8) as u64)) as *mut f64) = v
+}
+
+fn fld(p: u64, i: usize) -> f64 {
+    return *((p +% ((i * 8) as u64)) as *mut f64)
+}
+
+fn nx_wants(p: u64, n: usize) -> bool {
+    var d: jxl_open.JxlDoc = jxl_open.doc_new()
+    let r: i32 = jxl_open.doc_open(p, n, &d)
+    var wanted: bool = false
+    if r == jxl_err.JX_OK {
+        wanted = d.frame.frame_type != jxl_frame.JF_REGULAR || (d.frame.flags & NX_FEATURE_FLAGS) != 0
+    }
+    jxl_open.doc_free(&d)
+    return wanted
+}
+
+fn nx_check(d: *mut jxl_open.JxlDoc) -> i32 {
+    let f: *mut jxl_frame.JxlFrame = &(*d).frame
+    let m: *mut jxl_header.JxlMeta = &(*d).meta
+    if (*f).encoding != jxl_frame.JF_MODULAR || (*m).xyb_encoded || (*f).do_ycbcr || (*f).upsampling != 1 || (*f).ec_upsampled {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if ((*f).flags & NX_FEATURE_FLAGS) != (*f).flags || (*m).have_animation || (*m).depth.is_float {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if (*m).depth.bits == 0 || (*m).depth.bits > NX_MAX_BITS || jxl_header.jm_color_channels(m) != 3 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if (*f).width == 0 || (*f).height == 0 || ((*f).width as u64) * ((*f).height as u64) > jxl_mdec.MDEC_MAX_PIXELS {
+        return jxl_err.JX_TOO_LARGE
+    }
+    return jxl_err.JX_OK
+}
+
+fn nx_max_value(bits: u32) -> f64 {
+    return (((1 as u64) << (bits as u64)) - 1) as f64
+}
+
+fn nx_planes(d: *mut jxl_open.JxlDoc, g: *mut jxl_lfglobal.JxlLfGlobal) -> u64 {
+    let f: *mut jxl_frame.JxlFrame = &(*d).frame
+    let n: usize = ((*f).width as usize) * ((*f).height as usize)
+    let planes: u64 = rt.heap_alloc(n * 3 * 8)
+    if planes == 0 {
+        return 0
+    }
+    let scale: f64 = 1.0 / nx_max_value((*d).meta.depth.bits)
+    var c: usize = 0
+    while c < 3 {
+        let src: u64 = jxl_img.img_data(&(*g).img, c)
+        var i: usize = 0
+        while i < n {
+            fst(planes, c * n + i, (jxl_mem.ldi(src, i) as f64) * scale)
+            i = i + 1
+        }
+        c = c + 1
+    }
+    return planes
+}
+
+fn nx_store(d: *mut jxl_open.JxlDoc, g: *mut jxl_lfglobal.JxlLfGlobal, planes: u64) {
+    let f: *mut jxl_frame.JxlFrame = &(*d).frame
+    let n: usize = ((*f).width as usize) * ((*f).height as usize)
+    let maxv: f64 = nx_max_value((*d).meta.depth.bits)
+    var c: usize = 0
+    while c < 3 {
+        let dst: u64 = jxl_img.img_data(&(*g).img, c)
+        var i: usize = 0
+        while i < n {
+            var v: f64 = fld(planes, c * n + i) * maxv + 0.5
+            if v < 0.0 {
+                v = 0.0
+            }
+            if v > maxv {
+                v = maxv
+            }
+            jxl_mem.sti(dst, i, v as i32)
+            i = i + 1
+        }
+        c = c + 1
+    }
+}
+
+fn nx_reference(d: *mut jxl_open.JxlDoc, refs: *mut jxl_refs.JxlRefs) -> i32 {
+    let f: *mut jxl_frame.JxlFrame = &(*d).frame
+    if (*f).frame_type != 2 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    var r: i32 = nx_check(d)
+    if r != jxl_err.JX_OK {
+        return r
+    }
+    var g: jxl_lfglobal.JxlLfGlobal = jxl_lfglobal.lfg_new()
+    r = jxl_mdec.mdec_read(d, &g)
+    if r == jxl_err.JX_OK {
+        let planes: u64 = nx_planes(d, &g)
+        if planes == 0 {
+            r = jxl_err.JX_MEMORY
+        } else {
+            let w: usize = (*f).width as usize
+            let h: usize = (*f).height as usize
+            r = jxl_features.feat_apply(&g, f, refs, planes, w, w * h)
+            if r == jxl_err.JX_OK {
+                jxl_refs.refs_store(refs, (*f).save_slot as usize, planes, w, w * h, w, h)
+            } else {
+                rt.heap_free(planes, w * h * 3 * 8)
+            }
+        }
+    }
+    jxl_lfglobal.lfg_free(&g)
+    return r
+}
+
+fn nx_main(d: *mut jxl_open.JxlDoc, refs: *mut jxl_refs.JxlRefs, img: *mut jxl_img.JxlImage) -> i32 {
+    var r: i32 = nx_check(d)
+    if r != jxl_err.JX_OK {
+        return r
+    }
+    var g: jxl_lfglobal.JxlLfGlobal = jxl_lfglobal.lfg_new()
+    r = jxl_mdec.mdec_read(d, &g)
+    if r == jxl_err.JX_OK {
+        jxl_refdec.refdec_note_frame(refs, true)
+        let f: *mut jxl_frame.JxlFrame = &(*d).frame
+        let planes: u64 = nx_planes(d, &g)
+        if planes == 0 {
+            r = jxl_err.JX_MEMORY
+        } else {
+            let stride: usize = (*f).width as usize
+            let plane_len: usize = stride * ((*f).height as usize)
+            r = jxl_features.feat_apply(&g, f, refs, planes, stride, plane_len)
+            if r == jxl_err.JX_OK {
+                nx_store(d, &g, planes)
+                *img = g.img
+                g.img = jxl_img.img_new()
+            }
+            rt.heap_free(planes, plane_len * 3 * 8)
+        }
+    }
+    jxl_lfglobal.lfg_free(&g)
+    return r
+}
+
+fn nx_decode(p: u64, n: usize, img: *mut jxl_img.JxlImage) -> i32 {
+    var d: jxl_open.JxlDoc = jxl_open.doc_new()
+    var refs: jxl_refs.JxlRefs = jxl_refs.refs_new()
+    var r: i32 = jxl_open.doc_open(p, n, &d)
+    while r == jxl_err.JX_OK && d.frame.frame_type != jxl_frame.JF_REGULAR {
+        jxl_refdec.refdec_note_frame(&refs, false)
+        r = nx_reference(&d, &refs)
+        if r == jxl_err.JX_OK {
+            r = jxl_open.doc_next_frame(&d)
+        }
+    }
+    if r == jxl_err.JX_OK {
+        r = nx_main(&d, &refs, img)
+    }
+    jxl_refs.refs_free(&refs)
+    jxl_open.doc_free(&d)
+    return r
+}
