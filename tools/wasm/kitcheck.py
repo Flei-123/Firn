@@ -199,7 +199,7 @@ try:
     verdict(ok, "the module starts and paints a first picture")
     if not ok:
         raise SystemExit("kitcheck: no picture")
-    BASE, SURF, RAISED, ACCENT = rgb(0x1C1B22), rgb(0x2B2A33), rgb(0x37373F), rgb(0x1BD96A)
+    BASE, SURF, RAISED, ACCENT = rgb(0x202020), rgb(0x282828), rgb(0x303030), rgb(0x1BD96A)
     s1 = b.shot("web-kit-1-home")
     verdict(near(s1[600, 600], BASE), "the page has the base colour: %s" % (s1[600, 600],))
     verdict(near(s1[600, 100], SURF), "the sidebar has the surface colour: %s" % (s1[600, 100],))
