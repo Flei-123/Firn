@@ -482,6 +482,7 @@ fn embed_body(caller: &mut Func, callee: &Func, bi: usize, mut ii: usize, mut po
     // 4. Split the calling block.
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
     f.blocks[bi].insts.pop(); // the `call` itself falls away
+    f.blocks[bi].insts.shrink_to_fit();
     let old_term = std::mem::replace(&mut f.blocks[bi].term, Term::Br(blockmap[&callee.entry()]));
     f.blocks[cont as usize].insts = tail;
     f.blocks[cont as usize].term = old_term.clone();
