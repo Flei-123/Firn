@@ -9,7 +9,7 @@ $base = Join-Path $env:TEMP 'mcvan'
 $srv = Join-Path $base 'srv'
 $out = Join-Path $base 'out'
 New-Item -ItemType Directory -Force $out | Out-Null
-$port = 25599
+$port = if ($env:MCVAN_PORT) { [int]$env:MCVAN_PORT } else { 25599 }
 $rconPort = 25575
 $java17 = 'C:\Program Files\Java\jdk-17\bin\javaw.exe'
 $logSuffix = if ($Target -eq 'mcplay') { "_$Gfx" } else { '' }
