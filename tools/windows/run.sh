@@ -88,7 +88,7 @@ cause_of() { # $1 = "<file> <why>" -- the file name is part of the match,
              #      because some causes are known by the case and some by
              #      the message.
     local why="$1" pat rest
-    while read -r pat rest; do
+    while IFS=$'\t' read -r pat rest; do
         case "$pat" in ''|'#'*) continue ;; esac
         # shellcheck disable=SC2254
         case "$why" in $pat) echo "$rest"; return ;; esac
