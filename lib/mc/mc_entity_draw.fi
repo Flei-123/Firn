@@ -21,9 +21,12 @@ import mc.mc_backend
 import mc.mc_registry
 import mc.mc_hurt_tint
 import mc.mc_bolt_shape
+import mc.mc_emodel
+import mc.mc_emodel_pose
+import mc.mc_entity_skins
 
 export {
-    EntList, entlist_new, entlist_free, entlist_clear, entlist_add_model, entlist_add_sized, entlist_build, entlist_build_reg, entlist_draw, entlist_boxes, entlist_set_hurt, entlist_set_bolt_type, entlist_add_bolt, entlist_add_box, entlist_add_part,
+    EntList, entlist_new, entlist_free, entlist_clear, entlist_add_model, entlist_add_sized, entlist_build, entlist_build_reg, entlist_draw, entlist_boxes, entlist_set_hurt, entlist_set_bolt_type, entlist_add_bolt, entlist_set_skins, entlist_open_skins, entlist_set_backend, entlist_set_death, entlist_skinned, entlist_add_box, entlist_add_part,
 }
 
 struct EntList {
@@ -38,10 +41,78 @@ struct EntList {
     bolt_type: i32,
     n_bolts: u32,
     n_bolt_boxes: u32,
+    sk: rt.Buf,
+    models: mc_emodel.EModels,
+    skins: mc_entity_skins.EntitySkins,
+    skin_px: u64,
+    skin_dirty: bool,
+    skin_ok: bool,
+    death: u64,
+    n_skinned: u32,
 }
 
 fn entlist_new() -> EntList {
-    return EntList { buf: rt.buf_new(), n_in: 0 as u32, n_culled: 0 as u32, n_lod: 0 as u32, hurt: 0 as u64, now_ms: 0 as u64, tint_k: 0, n_tinted: 0 as u32, bolt_type: 0 - 1, n_bolts: 0 as u32, n_bolt_boxes: 0 as u32 }
+    return EntList { buf: rt.buf_new(), n_in: 0 as u32, n_culled: 0 as u32, n_lod: 0 as u32, hurt: 0 as u64, now_ms: 0 as u64, tint_k: 0, n_tinted: 0 as u32, bolt_type: 0 - 1, n_bolts: 0 as u32, n_bolt_boxes: 0 as u32,
+        sk: rt.buf_new(), models: mc_emodel.emodels_build(), skins: mc_entity_skins.skins_new(), skin_px: 0 as u64, skin_dirty: false, skin_ok: false, death: 0 as u64, n_skinned: 0 as u32 }
+}
+
+fn entlist_open_skins(l: *mut EntList, protocol: i32) -> bool {
+    if !mc_entity_skins.skins_open(&(*l).skins, protocol) { return false }
+    entlist_set_skins(l, (*l).skins.px)
+    return true
+}
+
+fn entlist_set_backend(l: *mut EntList, b: *mut mc_backend.Backend) {
+    (*l).skin_ok = (*b).kind == mc_backend.KIND_CPU
+}
+
+fn entlist_set_skins(l: *mut EntList, px: u64) {
+    if (*l).skin_px != px { (*l).skin_dirty = true }
+    (*l).skin_px = px
+}
+
+fn entlist_set_death(l: *mut EntList, t: *mut mc_hurt_tint.HurtTable) {
+    (*l).death = t as u64
+}
+
+fn entlist_skinned(l: *mut EntList) -> usize {
+    return rt.buf_len(&(*l).sk) / mc_emodel_pose.SK_BYTES
+}
+
+fn skin_pose(l: *mut EntList, e: *mut mc_entity.Entity, eyaw: f64, epitch: f64) -> mc_emodel_pose.Pose {
+    var p: mc_emodel_pose.Pose = mc_emodel_pose.pose_new()
+    p.swing = (*e).swing
+    p.amount = (*e).swing_amount
+    p.age = ((*l).now_ms as f64) * 0.02
+    p.head_pitch = epitch
+    if (*l).tint_k > 0 {
+        let k: f64 = ((*l).tint_k as f64) * 0.001
+        p.tg = 255.0 * (1.0 - 0.6 * k)
+        p.tb = p.tg
+    }
+    if (*l).death != 0 as u64 {
+        let age: i64 = mc_hurt_tint.hurt_since((*l).death as *mut mc_hurt_tint.HurtTable, (*e).id, (*l).now_ms)
+        if age >= 0 as i64 {
+            var d: f64 = (age as f64) / 800.0
+            if d > 1.0 { d = 1.0 }
+            p.death = d
+        }
+    }
+    return p
+}
+
+fn try_skinned(l: *mut EntList, e: *mut mc_entity.Entity, reg: *mut mc_registry.Registry, ex: f64, ey: f64, ez: f64, eyaw: f64, epitch: f64) -> bool {
+    if !(*l).skin_ok || (*l).skin_px == 0 as u64 || (reg as u64) == 0 as u64 || (*e).kind == mc_entity.KIND_PLAYER || (*e).type_id < 0 { return false }
+    let ri: i32 = mc_registry.reg_entity_find(reg, (*e).type_id)
+    if ri < 0 { return false }
+    var nl: usize = 0
+    let np: u64 = mc_registry.reg_entity_name(reg, ri, &nl)
+    let mob: i32 = mc_emodel.emodel_find(&(*l).models, np, nl)
+    if mob < 0 { return false }
+    var pose: mc_emodel_pose.Pose = skin_pose(l, e, eyaw, epitch)
+    mc_emodel_pose.emodel_emit(&(*l).models, mob, &pose, ex, ey, ez, eyaw, &(*l).sk)
+    (*l).n_skinned = (*l).n_skinned + 1 as u32
+    return true
 }
 
 fn entlist_set_hurt(l: *mut EntList, t: *mut mc_hurt_tint.HurtTable, now: u64) {
@@ -51,10 +122,15 @@ fn entlist_set_hurt(l: *mut EntList, t: *mut mc_hurt_tint.HurtTable, now: u64) {
 
 fn entlist_free(l: *mut EntList) {
     rt.buf_free(&(*l).buf)
+    rt.buf_free(&(*l).sk)
+    mc_entity_skins.skins_free(&(*l).skins)
+    mc_emodel.emodels_free(&(*l).models)
 }
 
 fn entlist_clear(l: *mut EntList) {
     rt.buf_clear(&(*l).buf)
+    rt.buf_clear(&(*l).sk)
+    (*l).n_skinned = 0 as u32
     (*l).n_in = 0 as u32
     (*l).n_culled = 0 as u32
     (*l).n_lod = 0 as u32
@@ -275,7 +351,8 @@ fn build_inner(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Cam
         (*l).tint_k = 0
         if (*l).hurt != 0 as u64 { (*l).tint_k = mc_hurt_tint.hurt_strength_permille((*l).hurt as *mut mc_hurt_tint.HurtTable, (*e).id, (*l).now_ms) }
         if (*l).tint_k > 0 { (*l).n_tinted = (*l).n_tinted + 1 as u32 }
-        if bw > 0.0 && bh > 0.0 {
+        if !lod && try_skinned(l, e, reg, ex, ey, ez, eyaw, (*e).rpitch) {
+        } else if bw > 0.0 && bh > 0.0 {
             entlist_add_sized(l, ex, ey, ez, eyaw, ((*e).id as u64) + 1 as u64, bw, bh)
         } else {
             entlist_add_model(l, ex, ey, ez, eyaw, ((*e).id as u64) + 1 as u64, (*e).kind != mc_entity.KIND_OBJECT, lod)
@@ -286,6 +363,12 @@ fn build_inner(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Cam
 
 // Hands the list to the back end (b.draw_entities); returns the boxes drawn (0 on a back end without entity support).
 fn entlist_draw(l: *mut EntList, b: *mut mc_backend.Backend) -> u64 {
+    if (*l).skin_dirty {
+        (*b).upload_skin((*b).ent_obj, (*l).skin_px, 10)
+        (*l).skin_dirty = false
+    }
+    let ns: usize = entlist_skinned(l)
+    if ns > 0 { (*b).draw_skinned((*b).ent_obj, rt.buf_ptr(&(*l).sk), ns) }
     let n: usize = entlist_boxes(l)
     if n == 0 { return 0 as u64 }
     return (*b).draw_entities((*b).ent_obj, rt.buf_ptr(&(*l).buf), n)
