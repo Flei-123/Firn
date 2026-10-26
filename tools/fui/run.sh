@@ -1007,6 +1007,10 @@ build tablex
 build uiatab
 "$W/uiatab" | tail -n 3 | grep -q "UIATAB PASSED"
 
+# uitext: UIA text units, range moves, endpoints, find over UTF-8 bytes
+build uitext
+"$W/uitext" | tail -n 3 | grep -q "UITEXT PASSED"
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
@@ -1052,6 +1056,9 @@ if [ -x /usr/lib/wine/wine64 ]; then
     FIRNC="$FIRNC" sh tools/fui/uiacom.sh >"$W/uiacom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiacom.log"
     if [ "$rc" != 0 ]; then echo "uiacom FAILED ($rc)"; exit 1; fi
+    FIRNC="$FIRNC" sh tools/fui/uiatextcom.sh >"$W/uiatextcom.log" 2>&1 || rc=$?
+    tail -n 2 "$W/uiatextcom.log"
+    if [ "$rc" != 0 ]; then echo "uiatextcom FAILED ($rc)"; exit 1; fi
 else
     echo "  uiacom: wine missing, skipped"
 fi

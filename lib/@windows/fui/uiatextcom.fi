@@ -1,0 +1,518 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.uia
+import fui.uitext
+import fui.uiacom
+import gpu.wgl
+
+export { install, range_count }
+
+const NRNG: usize = 64
+const RW: usize = 6
+const RCAP: usize = 65536
+const VT_UNKNOWN: u64 = 13
+const VT_R8: u64 = 5
+
+static mut G_RNG: u64 = 0
+static mut G_RMETA: u64 = 0
+static mut G_RVT: u64 = 0
+static mut G_RGUID: u64 = 0
+static mut G_BUF: u64 = 0
+static mut G_NEEDLE: u64 = 0
+static mut F_NOTSUP: u64 = 0
+static mut G_READY: bool = false
+
+fn word(p: u64, i: usize) -> u64 { return rt.ld64(p, i) }
+
+fn put_word(p: u64, i: usize, v: u64) { rt.st64(p, i, v) }
+
+fn rmeta(r: usize, k: usize) -> u64 { return word(G_RMETA, r * RW + k) }
+
+fn set_rmeta(r: usize, k: usize, v: u64) { put_word(G_RMETA, r * RW + k, v) }
+
+fn rslot(r: usize) -> u64 { return G_RNG + ((r * 16) as u64) }
+
+fn put_i32(p: u64, v: i32) {
+    if p == 0 { return }
+    var w: i64 = v as i64
+    if w < 0 { w = w + 4294967296 }
+    rt.st32(p, 0, w as u32)
+}
+
+fn arg_i64(v: u64) -> i64 {
+    let lo: i64 = (v & 4294967295) as i64
+    if lo >= 2147483648 { return lo - 4294967296 }
+    return lo
+}
+
+fn arg_u32(v: u64) -> u32 { return (v & 4294967295) as u32 }
+
+fn range_count() -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while G_RMETA != 0 && i < NRNG {
+        if rmeta(i, 0) != 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn new_range(node: usize, s: usize, e: usize) -> u64 {
+    var i: usize = 0
+    while i < NRNG {
+        if rmeta(i, 0) == 0 {
+            set_rmeta(i, 0, 1)
+            set_rmeta(i, 1, 1)
+            set_rmeta(i, 2, node as u64)
+            set_rmeta(i, 3, s as u64)
+            set_rmeta(i, 4, e as u64)
+            return rslot(i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn range_of(this: u64) -> usize {
+    if this == 0 || G_RNG == 0 { return uitext.NONE }
+    if this < G_RNG || this >= G_RNG + ((NRNG * 16) as u64) { return uitext.NONE }
+    let r: usize = word(this, 1) as usize
+    if r >= NRNG || rmeta(r, 0) == 0 { return uitext.NONE }
+    return r
+}
+
+fn load_text(node: usize) -> usize {
+    let el: uia.El = uia.el_from_node(uiacom.provider(), node)
+    if uia.el_is_none(el) { return uitext.NONE }
+    return uia.el_value(uiacom.provider(), el, G_BUF, RCAP)
+}
+
+fn range_ctx(this: u64, n: *mut usize) -> usize {
+    let r: usize = range_of(this)
+    if r == uitext.NONE { return uitext.NONE }
+    let len: usize = load_text(rmeta(r, 2) as usize)
+    if len == uitext.NONE { return uitext.NONE }
+    var s: usize = uitext.clamp(rmeta(r, 3) as usize, len)
+    var e: usize = uitext.clamp(rmeta(r, 4) as usize, len)
+    if e < s { e = s }
+    set_rmeta(r, 3, s as u64)
+    set_rmeta(r, 4, e as u64)
+    *n = len
+    return r
+}
+
+fn guid_eq(p: u64, k: usize) -> bool {
+    return word(p, 0) == word(G_RGUID, k * 2) && word(p, 1) == word(G_RGUID, k * 2 + 1)
+}
+
+#[win_callback]
+fn r_qi(this: u64, riid: u64, ppv: u64, d: u64) -> u64 {
+    if ppv == 0 || riid == 0 { return uiacom.E_POINTER }
+    put_word(ppv, 0, 0)
+    let r: usize = range_of(this)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    if !guid_eq(riid, 0) && !guid_eq(riid, 1) { return 0x80004002 }
+    set_rmeta(r, 1, rmeta(r, 1) + 1)
+    put_word(ppv, 0, this)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_addref(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let r: usize = range_of(this)
+    if r == uitext.NONE { return 0 }
+    set_rmeta(r, 1, rmeta(r, 1) + 1)
+    return rmeta(r, 1)
+}
+
+#[win_callback]
+fn r_release(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let r: usize = range_of(this)
+    if r == uitext.NONE { return 0 }
+    var n: u64 = rmeta(r, 1)
+    if n > 0 { n = n - 1 }
+    set_rmeta(r, 1, n)
+    if n == 0 { set_rmeta(r, 0, 0) }
+    return n
+}
+
+fn give_range(node: usize, s: usize, e: usize, out: u64) -> u64 {
+    let rp: u64 = new_range(node, s, e)
+    if rp == 0 { return uiacom.E_FAIL }
+    put_word(out, 0, rp)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_clone(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    return give_range(rmeta(r, 2) as usize, rmeta(r, 3) as usize, rmeta(r, 4) as usize, out)
+}
+
+#[win_callback]
+fn r_compare(this: u64, other: u64, out: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    var n: usize = 0
+    let a: usize = range_ctx(this, &n)
+    let b: usize = range_ctx(other, &n)
+    if a == uitext.NONE || b == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let same: bool = rmeta(a, 2) == rmeta(b, 2) && rmeta(a, 3) == rmeta(b, 3) && rmeta(a, 4) == rmeta(b, 4)
+    return uiacom.bool_out(out, same)
+}
+
+#[win_callback]
+fn r_compare_endpoints(this: u64, ep: u64, other: u64, other_ep: u64, out: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    var n: usize = 0
+    let a: usize = range_ctx(this, &n)
+    let b: usize = range_ctx(other, &n)
+    if a == uitext.NONE || b == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    put_i32(out, uitext.compare_endpoints(rmeta(a, 3) as usize, rmeta(a, 4) as usize, arg_u32(ep), rmeta(b, 3) as usize, rmeta(b, 4) as usize, arg_u32(other_ep)))
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_expand(this: u64, unit: u64, c: u64, d: u64) -> u64 {
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var s: usize = rmeta(r, 3) as usize
+    var e: usize = rmeta(r, 4) as usize
+    uitext.expand(arg_u32(unit), G_BUF, n, &s, &e)
+    set_rmeta(r, 3, s as u64)
+    set_rmeta(r, 4, e as u64)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_find_attribute(this: u64, attr: u64, val: u64, backward: u64, out: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_find_text(this: u64, text: u64, backward: u64, fold: u64, out: u64) -> u64 {
+    if out == 0 || text == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let m: usize = uiacom.utf8_of_bstr(text, G_NEEDLE, 4096)
+    var at: usize = 0
+    if !uitext.find_text(G_BUF, rmeta(r, 3) as usize, rmeta(r, 4) as usize, G_NEEDLE, m, arg_u32(backward) != 0 as u32, arg_u32(fold) != 0 as u32, &at) {
+        return uiacom.S_OK
+    }
+    return give_range(rmeta(r, 2) as usize, at, at + m, out)
+}
+
+#[win_callback]
+fn r_attribute_value(this: u64, attr: u64, out: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    put_word(out, 1, 0)
+    put_word(out, 2, 0)
+    if F_NOTSUP == 0 { return uiacom.UIA_E_NOTSUPPORTED }
+    var unk: [u64; 1] = [0; 1]
+    let hr: u64 = wgl.call1(F_NOTSUP, (&unk[0]) as u64)
+    if hr != 0 || unk[0] == 0 { return uiacom.UIA_E_NOTSUPPORTED }
+    rt.st16(out, 0, VT_UNKNOWN as u16)
+    put_word(out, 1, unk[0])
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_bounding(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let el: uia.El = uia.el_from_node(uiacom.provider(), rmeta(r, 2) as usize)
+    if uia.el_is_none(el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let sa: u64 = uiacom.sa_vector(VT_R8, 4)
+    if sa == 0 { return uiacom.E_FAIL }
+    var q: [f64; 4] = [0.0; 4]
+    uiacom.element_rect(el, (&q[0]) as u64)
+    var k: usize = 0
+    while k < 4 {
+        let ok: bool = uiacom.sa_put(sa, k, ((&q[0]) as u64) + ((k * 8) as u64))
+        k = k + 1
+    }
+    put_word(out, 0, sa)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_enclosing(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    let r: usize = range_of(this)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let el: uia.El = uia.el_from_node(uiacom.provider(), rmeta(r, 2) as usize)
+    if uia.el_is_none(el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    put_word(out, 0, uiacom.give(el, uiacom.S_SIMPLE))
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_get_text(this: u64, max: u64, out: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let s: usize = rmeta(r, 3) as usize
+    var e: usize = rmeta(r, 4) as usize
+    let lim: i64 = arg_i64(max)
+    if lim >= 0 {
+        var moved: i64 = 0
+        let cut: usize = uitext.step_position(uitext.U_CHAR, G_BUF, n, s, lim, &moved)
+        if cut < e { e = cut }
+    }
+    put_word(out, 0, uiacom.bstr_big(G_BUF + (s as u64), e - s))
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_move(this: u64, unit: u64, count: u64, out: u64) -> u64 {
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var s: usize = rmeta(r, 3) as usize
+    var e: usize = rmeta(r, 4) as usize
+    let moved: i64 = uitext.move_range(arg_u32(unit), G_BUF, n, &s, &e, arg_i64(count))
+    set_rmeta(r, 3, s as u64)
+    set_rmeta(r, 4, e as u64)
+    put_i32(out, moved as i32)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_move_endpoint_unit(this: u64, ep: u64, unit: u64, count: u64, out: u64) -> u64 {
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var s: usize = rmeta(r, 3) as usize
+    var e: usize = rmeta(r, 4) as usize
+    let moved: i64 = uitext.move_endpoint(arg_u32(unit), G_BUF, n, &s, &e, arg_u32(ep), arg_i64(count))
+    set_rmeta(r, 3, s as u64)
+    set_rmeta(r, 4, e as u64)
+    put_i32(out, moved as i32)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_move_endpoint_range(this: u64, ep: u64, other: u64, other_ep: u64) -> u64 {
+    var n: usize = 0
+    let a: usize = range_ctx(this, &n)
+    let b: usize = range_ctx(other, &n)
+    if a == uitext.NONE || b == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var target: usize = rmeta(b, 4) as usize
+    if arg_u32(other_ep) == uitext.EP_START { target = rmeta(b, 3) as usize }
+    var s: usize = rmeta(a, 3) as usize
+    var e: usize = rmeta(a, 4) as usize
+    if arg_u32(ep) == uitext.EP_START {
+        s = target
+        if e < s { e = s }
+    } else {
+        e = target
+        if s > e { s = e }
+    }
+    set_rmeta(a, 3, s as u64)
+    set_rmeta(a, 4, e as u64)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_select(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    var n: usize = 0
+    let r: usize = range_ctx(this, &n)
+    if r == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    if !uiacom.text_set_caret(rmeta(r, 2) as usize, rmeta(r, 3) as usize, rmeta(r, 4) as usize) { return uiacom.E_FAIL }
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn r_notsup(this: u64, b: u64, c: u64, d: u64) -> u64 { return uiacom.UIA_E_NOTSUPPORTED }
+
+#[win_callback]
+fn r_scroll(this: u64, b: u64, c: u64, d: u64) -> u64 { return uiacom.S_OK }
+
+#[win_callback]
+fn r_children(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    let sa: u64 = uiacom.sa_vector(VT_UNKNOWN, 0)
+    if sa == 0 { return uiacom.E_FAIL }
+    put_word(out, 0, sa)
+    return uiacom.S_OK
+}
+
+fn node_of_this(this: u64, el: *mut uia.El) -> bool {
+    let e: usize = uiacom.entry_of(this)
+    if e == uitext.NONE { return false }
+    *el = uiacom.el_of(e)
+    return true
+}
+
+fn doc_range(el: uia.El, out: u64) -> u64 {
+    let n: usize = load_text(el.node)
+    if n == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    return give_range(el.node, 0, n, out)
+}
+
+fn array_of_one(el: uia.El, s: usize, e: usize, out: u64) -> u64 {
+    let sa: u64 = uiacom.sa_vector(VT_UNKNOWN, 1)
+    if sa == 0 { return uiacom.E_FAIL }
+    let rp: u64 = new_range(el.node, s, e)
+    if rp == 0 { return uiacom.E_FAIL }
+    let ok: bool = uiacom.sa_put(sa, 0, rp)
+    let ignored: u64 = r_release(rp, 0, 0, 0)
+    put_word(out, 0, sa)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn t_get_selection(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var el: uia.El = uia.el_none()
+    if !node_of_this(this, &el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var caret: usize = 0
+    var anchor: usize = 0
+    if !uiacom.text_caret(el.node, &caret, &anchor) { return uiacom.UIA_E_NOTSUPPORTED }
+    var s: usize = anchor
+    var e: usize = caret
+    if e < s {
+        s = caret
+        e = anchor
+    }
+    return array_of_one(el, s, e, out)
+}
+
+#[win_callback]
+fn t_visible(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var el: uia.El = uia.el_none()
+    if !node_of_this(this, &el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    let n: usize = load_text(el.node)
+    if n == uitext.NONE { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    return array_of_one(el, 0, n, out)
+}
+
+#[win_callback]
+fn t_from_child(this: u64, child: u64, out: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var el: uia.El = uia.el_none()
+    if !node_of_this(this, &el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    return doc_range(el, out)
+}
+
+#[win_callback]
+fn t_from_point(this: u64, pt: u64, out: u64, d: u64) -> u64 {
+    if out != 0 { put_word(out, 0, 0) }
+    return uiacom.UIA_E_NOTSUPPORTED
+}
+
+#[win_callback]
+fn t_document(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var el: uia.El = uia.el_none()
+    if !node_of_this(this, &el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    return doc_range(el, out)
+}
+
+#[win_callback]
+fn t_supported(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 { return uiacom.E_POINTER }
+    put_i32(out, 1)
+    return uiacom.S_OK
+}
+
+#[win_callback]
+fn t_from_annotation(this: u64, annotation: u64, out: u64, d: u64) -> u64 {
+    if out != 0 { put_word(out, 0, 0) }
+    return uiacom.UIA_E_NOTSUPPORTED
+}
+
+#[win_callback]
+fn t_caret_range(this: u64, active: u64, out: u64, d: u64) -> u64 {
+    if out == 0 || active == 0 { return uiacom.E_POINTER }
+    put_word(out, 0, 0)
+    var el: uia.El = uia.el_none()
+    if !node_of_this(this, &el) { return uiacom.UIA_E_ELEMENTNOTAVAILABLE }
+    var caret: usize = 0
+    var anchor: usize = 0
+    if !uiacom.text_caret(el.node, &caret, &anchor) { return uiacom.UIA_E_NOTSUPPORTED }
+    let has: u64 = uiacom.bool_out(active, uia.el_has_focus(uiacom.provider(), el))
+    return give_range(el.node, caret, caret, out)
+}
+
+fn build_tables() {
+    put_word(G_RGUID, 0, 0x0)
+    put_word(G_RGUID, 1, 0x46000000000000c0)
+    put_word(G_RGUID, 2, 0x46f8c3555347ad7b)
+    put_word(G_RGUID, 3, 0x632f58339090f5af)
+    put_word(G_RVT, 0, uiacom.code_of4(r_qi))
+    put_word(G_RVT, 1, uiacom.code_of4(r_addref))
+    put_word(G_RVT, 2, uiacom.code_of4(r_release))
+    put_word(G_RVT, 3, uiacom.code_of4(r_clone))
+    put_word(G_RVT, 4, uiacom.code_of4(r_compare))
+    put_word(G_RVT, 5, uiacom.code_of5(r_compare_endpoints))
+    put_word(G_RVT, 6, uiacom.code_of4(r_expand))
+    put_word(G_RVT, 7, uiacom.code_of5(r_find_attribute))
+    put_word(G_RVT, 8, uiacom.code_of5(r_find_text))
+    put_word(G_RVT, 9, uiacom.code_of4(r_attribute_value))
+    put_word(G_RVT, 10, uiacom.code_of4(r_bounding))
+    put_word(G_RVT, 11, uiacom.code_of4(r_enclosing))
+    put_word(G_RVT, 12, uiacom.code_of4(r_get_text))
+    put_word(G_RVT, 13, uiacom.code_of4(r_move))
+    put_word(G_RVT, 14, uiacom.code_of5(r_move_endpoint_unit))
+    put_word(G_RVT, 15, uiacom.code_of4(r_move_endpoint_range))
+    put_word(G_RVT, 16, uiacom.code_of4(r_select))
+    put_word(G_RVT, 17, uiacom.code_of4(r_notsup))
+    put_word(G_RVT, 18, uiacom.code_of4(r_notsup))
+    put_word(G_RVT, 19, uiacom.code_of4(r_scroll))
+    put_word(G_RVT, 20, uiacom.code_of4(r_children))
+    var r: usize = 0
+    while r < NRNG {
+        put_word(rslot(r), 0, G_RVT)
+        put_word(rslot(r), 1, r as u64)
+        r = r + 1
+    }
+    var k: usize = uiacom.S_TEXT
+    while k <= uiacom.S_TEXT2 {
+        uiacom.vt_set(k, 3, t_get_selection)
+        uiacom.vt_set(k, 4, t_visible)
+        uiacom.vt_set(k, 5, t_from_child)
+        uiacom.vt_set(k, 6, t_from_point)
+        uiacom.vt_set(k, 7, t_document)
+        uiacom.vt_set(k, 8, t_supported)
+        k = k + 1
+    }
+    uiacom.vt_set(uiacom.S_TEXT2, 9, t_from_annotation)
+    uiacom.vt_set(uiacom.S_TEXT2, 10, t_caret_range)
+}
+
+fn install() -> bool {
+    if G_READY { return true }
+    G_RNG = rt.heap_alloc(NRNG * 16)
+    G_RMETA = rt.heap_alloc(NRNG * RW * 8)
+    G_RVT = rt.heap_alloc(24 * 8)
+    G_RGUID = rt.heap_alloc(4 * 8)
+    G_BUF = rt.heap_alloc(RCAP + 16)
+    G_NEEDLE = rt.heap_alloc(4112)
+    if G_RNG == 0 || G_RMETA == 0 || G_RVT == 0 || G_RGUID == 0 || G_BUF == 0 || G_NEEDLE == 0 { return false }
+    F_NOTSUP = wgl.dll_sym("uiautomationcore.dll", "UiaGetReservedNotSupportedValue")
+    build_tables()
+    G_READY = true
+    return true
+}
