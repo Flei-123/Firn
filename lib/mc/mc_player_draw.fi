@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.math
+import mc.mc_entity
+import mc.mc_entity_draw
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_pskin
+import mc.mc_player_parts
+import mc.mc_player_model
+import mc.mc_held_item
+import mc.mc_item_icon
+import mc.mc_registry
+import mc.mc_hurt_tint
+import mc.mc_hand
+import mc.mc_use_bar
+
+export { PlayerDraw, pd_new, pd_free, pd_swing, pd_self, pd_remote, pd_set_self_skin, pd_set_use, pd_sync_use, pd_hand }
+
+const SWING_MS: u64 = 300 as u64
+const CACHE: usize = 8
+const DEG_STEP: f64 = 50.0
+
+struct SelfState {
+    inited: bool,
+    lx: f64, lz: f64,
+    last_ms: u64,
+    phase: f64,
+    amount: f64,
+    body_yaw: f64,
+    swing_start: u64,
+    use_kind: i32,
+    use_start: u64,
+    equip_start: u64,
+    last_item: i32,
+}
+
+struct PlayerDraw {
+    me: mc_player_parts.PlayerCubes,
+    me_custom: bool,
+    cache: [mc_player_parts.PlayerCubes; 8],
+    keys_hi: [u64; 8],
+    keys_lo: [u64; 8],
+    used: [u64; 8],
+    n_cached: usize,
+    held: mc_held_item.Held,
+    none: mc_held_item.Held,
+    st: SelfState,
+    n_remote: u32,
+}
+
+fn pd_new() -> PlayerDraw {
+    return PlayerDraw {
+        me: mc_player_parts.pc_new(), me_custom: false,
+        cache: [mc_player_parts.pc_new(); 8], keys_hi: [0 as u64; 8], keys_lo: [0 as u64; 8], used: [0 as u64; 8], n_cached: 0,
+        held: mc_held_item.held_new(), none: mc_held_item.held_new(),
+        st: SelfState { inited: false, lx: 0.0, lz: 0.0, last_ms: 0 as u64, phase: 0.0, amount: 0.0, body_yaw: 0.0, swing_start: 0 as u64, use_kind: 0, use_start: 0 as u64, equip_start: 0 as u64, last_item: 0 - 2 },
+        n_remote: 0 as u32,
+    }
+}
+
+fn pd_free(pd: *mut PlayerDraw) {
+    mc_player_parts.pc_free(&(*pd).me)
+    var i: usize = 0
+    while i < CACHE {
+        mc_player_parts.pc_free(&(*pd).cache[i])
+        i = i + 1
+    }
+    mc_held_item.held_free(&(*pd).held)
+    mc_held_item.held_free(&(*pd).none)
+}
+
+fn pd_swing(pd: *mut PlayerDraw, now: u64) {
+    (*pd).st.swing_start = now
+}
+
+fn pd_set_use(pd: *mut PlayerDraw, kind: i32, start: u64) {
+    (*pd).st.use_kind = kind
+    (*pd).st.use_start = start
+}
+
+fn pd_set_self_skin(pd: *mut PlayerDraw, s: *mut mc_pskin.Skin) {
+    mc_player_parts.pc_build(&(*pd).me, s)
+    (*pd).me_custom = true
+}
+
+fn wrap(a: f64) -> f64 {
+    var r: f64 = a
+    while r > 180.0 { r = r - 360.0 }
+    while r < 0.0 - 180.0 { r = r + 360.0 }
+    return r
+}
+
+fn follow_body(body: f64, head: f64, moving: bool) -> f64 {
+    if moving { return head }
+    let d: f64 = wrap(head - body)
+    if d > DEG_STEP { return head - DEG_STEP }
+    if d < 0.0 - DEG_STEP { return head + DEG_STEP }
+    return body
+}
+
+fn swing_progress(start: u64, now: u64) -> f64 {
+    if start == 0 as u64 || now < start { return 0.0 - 1.0 }
+    let dt: u64 = now - start
+    if dt >= SWING_MS { return 0.0 - 1.0 }
+    return (dt as f64) / (SWING_MS as f64)
+}
+
+fn ensure_default(pc: *mut mc_player_parts.PlayerCubes, hi: u64, lo: u64) {
+    var s: mc_pskin.Skin = mc_pskin.skin_new()
+    mc_pskin.skin_default_for(&s, hi, lo)
+    mc_player_parts.pc_build(pc, &s)
+    mc_pskin.skin_free(&s)
+}
+
+fn pd_self(pd: *mut PlayerDraw, l: *mut mc_entity_draw.EntList, ic: *mut mc_item_icon.IconCache, reg: *mut mc_registry.Registry, item: i32,
+    x: f64, y: f64, z: f64, yaw: f64, pitch: f64, sneak: bool, prone: bool, now: u64, uuid_hi: u64, uuid_lo: u64) {
+    if !mc_player_parts.pc_built(&(*pd).me) { ensure_default(&(*pd).me, uuid_hi, uuid_lo) }
+    let st: *mut SelfState = &(*pd).st
+    var moving: bool = false
+    if !(*st).inited {
+        (*st).inited = true
+        (*st).lx = x
+        (*st).lz = z
+        (*st).last_ms = now
+        (*st).body_yaw = yaw
+    } else if now > (*st).last_ms {
+        let dt: f64 = ((now - (*st).last_ms) as f64) * 0.001
+        let dx: f64 = x - (*st).lx
+        let dz: f64 = z - (*st).lz
+        var tick_speed: f64 = math.sqrt(dx * dx + dz * dz) / (dt * 20.0)
+        if dt > 0.25 { tick_speed = 0.0 }
+        var target: f64 = tick_speed * 4.0
+        if target > 1.0 { target = 1.0 }
+        (*st).amount = (*st).amount + (target - (*st).amount) * (1.0 - math.exp(0.0 - dt * 12.0))
+        (*st).phase = (*st).phase + (*st).amount * dt * 20.0 * 0.5
+        (*st).lx = x
+        (*st).lz = z
+        (*st).last_ms = now
+        moving = tick_speed > 0.02
+    }
+    (*st).body_yaw = follow_body((*st).body_yaw, yaw, moving)
+    mc_held_item.held_update(&(*pd).held, ic, reg, item)
+    var p: mc_player_model.Pose = mc_player_model.pose_new()
+    p.x = x
+    p.y = y
+    p.z = z
+    p.body_yaw = (*st).body_yaw
+    p.head_yaw = yaw
+    p.pitch = pitch
+    p.phase = (*st).phase
+    p.amount = (*st).amount
+    p.sneak = sneak
+    p.prone = prone
+    p.swing = swing_progress((*st).swing_start, now)
+    p.time_s = (now as f64) * 0.001
+    p.arm_mode = (*st).use_kind
+    mc_player_model.pm_draw(l, &(*pd).me, &p, &(*pd).held)
+}
+
+fn slot_for(pd: *mut PlayerDraw, hi: u64, lo: u64, now: u64) -> usize {
+    var i: usize = 0
+    var oldest: usize = 0
+    while i < (*pd).n_cached {
+        if (*pd).keys_hi[i] == hi && (*pd).keys_lo[i] == lo {
+            (*pd).used[i] = now
+            return i
+        }
+        if (*pd).used[i] < (*pd).used[oldest] { oldest = i }
+        i = i + 1
+    }
+    var s: usize = oldest
+    if (*pd).n_cached < CACHE {
+        s = (*pd).n_cached
+        (*pd).n_cached = (*pd).n_cached + 1
+    }
+    (*pd).keys_hi[s] = hi
+    (*pd).keys_lo[s] = lo
+    (*pd).used[s] = now
+    ensure_default(&(*pd).cache[s], hi, lo)
+    return s
+}
+
+fn pd_remote(pd: *mut PlayerDraw, l: *mut mc_entity_draw.EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Camera, max_dist: f64, far_lod: f64, now: u64) {
+    (*pd).n_remote = 0 as u32
+    let cap: usize = mc_entity.store_slot_cap(s)
+    var i: usize = 0
+    while i < cap {
+        let e: *mut mc_entity.Entity = mc_entity.store_at(s, i)
+        i = i + 1
+        if e as u64 == 0 { continue }
+        if (*e).kind != mc_entity.KIND_PLAYER { continue }
+        var ex: f64 = (*e).x
+        var ey: f64 = (*e).y
+        var ez: f64 = (*e).z
+        var eyaw: f64 = (*e).yaw
+        var epitch: f64 = (*e).pitch
+        if (*e).rinit {
+            ex = (*e).rx
+            ey = (*e).ry
+            ez = (*e).rz
+            eyaw = (*e).ryaw
+            epitch = (*e).rpitch
+        }
+        let dx: f64 = ex - (*cam).x
+        let dy: f64 = ey - (*cam).y
+        let dz: f64 = ez - (*cam).z
+        let d2: f64 = dx * dx + dy * dy + dz * dz
+        if max_dist > 0.0 && d2 > max_dist * max_dist { continue }
+        if mc_math.frustum_test_box(&(*cam).frustum, ex - 0.8, ey, ez - 0.8, ex + 0.8, ey + 2.0, ez + 0.8) == 0 { continue }
+        let slot: usize = slot_for(pd, (*e).uuid_hi, (*e).uuid_lo, now)
+        var p: mc_player_model.Pose = mc_player_model.pose_new()
+        p.x = ex
+        p.y = ey
+        p.z = ez
+        p.body_yaw = eyaw
+        p.head_yaw = eyaw
+        p.pitch = epitch
+        p.phase = (*e).swing * 0.5
+        p.amount = (*e).swing_amount
+        if p.amount > 1.0 { p.amount = 1.0 }
+        p.time_s = (now as f64) * 0.001
+        if (*l).hurt != 0 as u64 { p.tint_k = mc_hurt_tint.hurt_strength_permille((*l).hurt as *mut mc_hurt_tint.HurtTable, (*e).id, (*l).now_ms) }
+        (*pd).n_remote = (*pd).n_remote + 1 as u32
+        if far_lod > 0.0 && d2 > far_lod * far_lod {
+            mc_player_model.pm_draw_far(l, &(*pd).cache[slot], &p)
+        } else {
+            mc_player_model.pm_draw(l, &(*pd).cache[slot], &p, &(*pd).none)
+        }
+    }
+}
+
+fn pd_hand(pd: *mut PlayerDraw, l: *mut mc_entity_draw.EntList, ic: *mut mc_item_icon.IconCache, reg: *mut mc_registry.Registry, item: i32,
+    cam: *mut mc_camera.Camera, yaw: f64, now: u64, uuid_hi: u64, uuid_lo: u64) {
+    if !mc_player_parts.pc_built(&(*pd).me) { ensure_default(&(*pd).me, uuid_hi, uuid_lo) }
+    let st: *mut SelfState = &(*pd).st
+    if item != (*st).last_item {
+        (*st).last_item = item
+        (*st).equip_start = now
+    }
+    mc_held_item.held_update(&(*pd).held, ic, reg, item)
+    var equip: f64 = 1.0
+    if now >= (*st).equip_start && now - (*st).equip_start < mc_hand.EQUIP_MS { equip = ((now - (*st).equip_start) as f64) / (mc_hand.EQUIP_MS as f64) }
+    mc_hand.hand_draw(l, &(*pd).me, &(*pd).held, cam, yaw, swing_progress((*st).swing_start, now), equip, (*st).use_kind, (now as f64) * 0.001)
+}
+
+fn pd_sync_use(pd: *mut PlayerDraw, using: bool, use_kind: i32, now: u64) {
+    var k: i32 = mc_player_model.ARM_NONE
+    if using {
+        if use_kind == mc_use_bar.USE_EAT { k = mc_player_model.ARM_EAT }
+        else if use_kind == mc_use_bar.USE_BOW || use_kind == mc_use_bar.USE_CROSSBOW { k = mc_player_model.ARM_BOW }
+        else if mc_held_item.held_kind(&(*pd).held) == mc_held_item.HELD_SHIELD { k = mc_player_model.ARM_BLOCK }
+    }
+    if k != (*pd).st.use_kind { (*pd).st.use_start = now }
+    (*pd).st.use_kind = k
+}
