@@ -3,8 +3,10 @@
 import jxl.jxl_err
 import jxl.jxl_features
 import jxl.jxl_frame
+import jxl.jxl_header
 import jxl.jxl_img
 import jxl.jxl_mdec
+import jxl.jxl_upsample
 import jxl.jxl_open
 import jxl.jxl_refdec
 import jxl.jxl_refs
@@ -98,9 +100,35 @@ fn copy_extras(img: *mut jxl_img.JxlImage, src: *mut jxl_img.JxlImage, first: us
     return r
 }
 
-fn pack_samples(planes: u64, stride: usize, plane_len: usize, v: *mut jxl_vardct.JxlVardct, bits: u32, img: *mut jxl_img.JxlImage) -> i32 {
-    let w: usize = (*v).doc.frame.width as usize
-    let h: usize = (*v).doc.frame.height as usize
+fn upsample_frame(v: *mut jxl_vardct.JxlVardct, planes: *mut u64, stride: *mut usize, plane_len: *mut usize, w: *mut usize, h: *mut usize) -> i32 {
+    let f: *mut jxl_frame.JxlFrame = &(*v).doc.frame
+    *w = (*f).width as usize
+    *h = (*f).height as usize
+    if (*f).upsampling == 1 {
+        return jxl_err.JX_OK
+    }
+    if jxl_header.jm_extra_count(&(*v).doc.meta) != 0 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    let ow: usize = (*f).full_w as usize
+    let oh: usize = (*f).full_h as usize
+    if ow == 0 || oh == 0 || (ow as u64) * (oh as u64) > jxl_mdec.MDEC_MAX_PIXELS {
+        return jxl_err.JX_TOO_LARGE
+    }
+    let np: u64 = jxl_upsample.ups_planes(&(*v).doc.meta, *planes, *stride, *plane_len, *w, *h, (*f).upsampling, ow, oh)
+    if np == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    rt.heap_free(*planes, *plane_len * 3 * 8)
+    *planes = np
+    *stride = ow
+    *plane_len = ow * oh
+    *w = ow
+    *h = oh
+    return jxl_err.JX_OK
+}
+
+fn pack_samples(planes: u64, stride: usize, plane_len: usize, w: usize, h: usize, v: *mut jxl_vardct.JxlVardct, bits: u32, img: *mut jxl_img.JxlImage) -> i32 {
     let bytes: usize = w * h * 3 * 4
     let out: u64 = rt.heap_alloc(bytes)
     if out == 0 {
@@ -119,7 +147,7 @@ fn pack_samples(planes: u64, stride: usize, plane_len: usize, v: *mut jxl_vardct
 
 fn decode_modular_main(v: *mut jxl_vardct.JxlVardct, refs: *mut jxl_refs.JxlRefs, bits: u32, img: *mut jxl_img.JxlImage) -> i32 {
     let f: *mut jxl_frame.JxlFrame = &(*v).doc.frame
-    if (*f).frame_type != jxl_frame.JF_REGULAR || (*f).upsampling != 1 || bits == 0 || bits > 16 || (*v).doc.meta.have_animation {
+    if (*f).frame_type != jxl_frame.JF_REGULAR || bits == 0 || bits > 16 || (*v).doc.meta.have_animation {
         return jxl_err.JX_UNSUPPORTED
     }
     var r: i32 = jxl_mdec.mdec_check(&(*v).doc)
@@ -130,19 +158,25 @@ fn decode_modular_main(v: *mut jxl_vardct.JxlVardct, refs: *mut jxl_refs.JxlRefs
         return r
     }
     jxl_refdec.refdec_note_frame(refs, true)
-    let planes: u64 = jxl_mdec.mdec_planes(&(*v).doc, &(*v).lfg)
+    var planes: u64 = jxl_mdec.mdec_planes(&(*v).doc, &(*v).lfg)
     if planes == 0 {
         return jxl_err.JX_MEMORY
     }
-    let w: usize = (*f).width as usize
-    r = jxl_features.feat_apply(&(*v).lfg, f, refs, planes, w, w * (*f).height as usize)
+    var stride: usize = (*f).width as usize
+    var plane_len: usize = stride * ((*f).height as usize)
+    var w: usize = 0
+    var h: usize = 0
+    r = jxl_features.feat_apply(&(*v).lfg, f, refs, planes, stride, plane_len)
     if r == jxl_err.JX_OK {
-        r = pack_samples(planes, w, w * (*f).height as usize, v, bits, img)
+        r = upsample_frame(v, &planes, &stride, &plane_len, &w, &h)
+    }
+    if r == jxl_err.JX_OK {
+        r = pack_samples(planes, stride, plane_len, w, h, v, bits, img)
     }
     if r == jxl_err.JX_OK {
         r = copy_extras(img, &(*v).lfg.img, 3)
     }
-    rt.heap_free(planes, w * (*f).height as usize * 3 * 8)
+    rt.heap_free(planes, plane_len * 3 * 8)
     return r
 }
 
@@ -150,7 +184,7 @@ fn decode_vardct_main(v: *mut jxl_vardct.JxlVardct, refs: *mut jxl_refs.JxlRefs,
     var r: i32 = jxl_vardct.vd_begin(v)
     if r == jxl_err.JX_OK {
         let f: *mut jxl_frame.JxlFrame = &(*v).doc.frame
-        if (*f).frame_type != jxl_frame.JF_REGULAR || (*f).do_ycbcr || (*f).upsampling != 1 || (*f).ec_upsampled || bits == 0 || bits > 16 {
+        if (*f).frame_type != jxl_frame.JF_REGULAR || (*f).do_ycbcr || (*f).ec_upsampled || bits == 0 || bits > 16 {
             r = jxl_err.JX_UNSUPPORTED
         } else if ((*f).width as u64) * ((*f).height as u64) > jxl_mdec.MDEC_MAX_PIXELS {
             r = jxl_err.JX_TOO_LARGE
@@ -165,8 +199,13 @@ fn decode_vardct_main(v: *mut jxl_vardct.JxlVardct, refs: *mut jxl_refs.JxlRefs,
         var stride: usize = 0
         var plane_len: usize = 0
         r = jxl_vdrecon.vr_xyb(v, refs, &planes, &stride, &plane_len)
+        var w: usize = 0
+        var h: usize = 0
         if r == jxl_err.JX_OK {
-            r = pack_samples(planes, stride, plane_len, v, bits, img)
+            r = upsample_frame(v, &planes, &stride, &plane_len, &w, &h)
+        }
+        if r == jxl_err.JX_OK {
+            r = pack_samples(planes, stride, plane_len, w, h, v, bits, img)
             rt.heap_free(planes, plane_len * 3 * 8)
         }
     }

@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_upsample.fi -- jxl_upsample: JPEG XL 2x/4x/8x non-separable 5x5 upsampling of float planes
+import std.rt
+import jxl.jxl_header
+import jxl.jxl_upweights
+
+export { ups_planes, ups_plane, ups_factor_start }
+
+fn ups_factor_start(factor: u32) -> usize {
+    if factor == 2 {
+        return jxl_upweights.UPW_2
+    }
+    if factor == 4 {
+        return jxl_upweights.UPW_4
+    }
+    return jxl_upweights.UPW_8
+}
+
+fn fld(p: u64, i: usize) -> f64 {
+    return *((p +% ((i * 8) as u64)) as *mut f64)
+}
+
+fn fst(p: u64, i: usize, v: f64) {
+    *((p +% ((i * 8) as u64)) as *mut f64) = v
+}
+
+fn weight_index(side: usize, i: usize, j: usize) -> usize {
+    var y: usize = i
+    var x: usize = j
+    if j < i {
+        y = j
+        x = i
+    }
+    var tri: usize = 0
+    if y > 0 {
+        tri = y * (y - 1) / 2
+    }
+    return side * y - tri + x - y
+}
+
+fn fold_index(o: usize, half: usize, k: usize) -> usize {
+    var base: usize = 0
+    var kk: usize = k
+    if o < half {
+        base = o % half
+    } else {
+        base = half - 1 - (o % half)
+        kk = 4 - k
+    }
+    return base * 5 + kk
+}
+
+fn build_kernel(m: *mut jxl_header.JxlMeta, n: usize, kern: u64) {
+    let half: usize = n / 2
+    let side: usize = 5 * half
+    let start: usize = ups_factor_start(n as u32)
+    var oy: usize = 0
+    while oy < n {
+        var ox: usize = 0
+        while ox < n {
+            var iy: usize = 0
+            while iy < 5 {
+                var ix: usize = 0
+                while ix < 5 {
+                    let j: usize = fold_index(oy, half, iy)
+                    let i: usize = fold_index(ox, half, ix)
+                    fst(kern, ((oy * n + ox) * 25) + iy * 5 + ix, (*m).up_w[start + weight_index(side, i, j)])
+                    ix = ix + 1
+                }
+                iy = iy + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+fn mirror(c: i64, size: i64) -> usize {
+    var v: i64 = c
+    while v < 0 || v >= size {
+        if v < 0 {
+            v = 0 - v - 1
+        }
+        if v >= size {
+            v = 2 * size - 1 - v
+        }
+    }
+    return v as usize
+}
+
+fn ups_plane(kern: u64, n: usize, src: u64, w: usize, h: usize, src_stride: usize, dst: u64, out_w: usize, out_h: usize) {
+    var nb: [f64; 25] = [0.0; 25]
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            var lo: f64 = fld(src, y * src_stride + x)
+            var hi: f64 = lo
+            var iy: usize = 0
+            while iy < 5 {
+                let sy: usize = mirror((y as i64) + (iy as i64) - 2, h as i64)
+                var ix: usize = 0
+                while ix < 5 {
+                    let sx: usize = mirror((x as i64) + (ix as i64) - 2, w as i64)
+                    let v: f64 = fld(src, sy * src_stride + sx)
+                    nb[iy * 5 + ix] = v
+                    if v < lo {
+                        lo = v
+                    }
+                    if v > hi {
+                        hi = v
+                    }
+                    ix = ix + 1
+                }
+                iy = iy + 1
+            }
+            var oy: usize = 0
+            while oy < n {
+                var ox: usize = 0
+                while ox < n {
+                    let ty: usize = y * n + oy
+                    let tx: usize = x * n + ox
+                    if ty < out_h && tx < out_w {
+                        var sum: f64 = 0.0
+                        var k: usize = 0
+                        while k < 25 {
+                            sum = sum + fld(kern, (oy * n + ox) * 25 + k) * nb[k]
+                            k = k + 1
+                        }
+                        if sum < lo {
+                            sum = lo
+                        }
+                        if sum > hi {
+                            sum = hi
+                        }
+                        fst(dst, ty * out_w + tx, sum)
+                    }
+                    ox = ox + 1
+                }
+                oy = oy + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn ups_planes(m: *mut jxl_header.JxlMeta, planes: u64, stride: usize, plane_len: usize, w: usize, h: usize, factor: u32, out_w: usize, out_h: usize) -> u64 {
+    let n: usize = factor as usize
+    let kern: u64 = rt.heap_alloc(n * n * 25 * 8)
+    let out_len: usize = out_w * out_h
+    let dst: u64 = rt.heap_alloc(out_len * 3 * 8)
+    if kern == 0 || dst == 0 {
+        if kern != 0 {
+            rt.heap_free(kern, n * n * 25 * 8)
+        }
+        if dst != 0 {
+            rt.heap_free(dst, out_len * 3 * 8)
+        }
+        return 0
+    }
+    build_kernel(m, n, kern)
+    var c: usize = 0
+    while c < 3 {
+        ups_plane(kern, n, planes +% ((c * plane_len * 8) as u64), w, h, stride, dst +% ((c * out_len * 8) as u64), out_w, out_h)
+        c = c + 1
+    }
+    rt.heap_free(kern, n * n * 25 * 8)
+    return dst
+}
