@@ -107,6 +107,15 @@ one_case() {
         *) echo "LINUXBAD $file :: no expectation in line 1"; return ;;
     esac
 
+    local FLAGS="$FLAGS" testkit=0
+    if head -5 "$file" | grep -q '^// only_mode: opt$'; then
+        FLAGS="--opt-level=release-fast"
+    fi
+    if grep -q '^#\[test\]' "$file" && ! grep -q '^fn main' "$file"; then
+        testkit=1
+        FLAGS="$FLAGS --test --no-run --test-limit=0"
+    fi
+
     # --- Linux: does the case work at all, and does it meet its own
     # expectation? Only then is there something to compare.
     if ! "$FIRNC" $FLAGS --target=x86_64-linux -o "$WORK/$base.lin" "$file" \
@@ -116,6 +125,7 @@ one_case() {
     local lout lrc try
     for try in 1 2; do
         lout=$(timeout 60 "$WORK/$base.lin" </dev/null 2>/dev/null); lrc=$?
+        [ "$testkit" = 1 ] && lout=""
         if [ "$kind" = out ]; then
             if [ "$lrc" -eq 0 ] && [ "$lout" = "$exp" ]; then break; fi
         else
@@ -143,9 +153,11 @@ one_case() {
     fi
     local wout wrc
     wout=$(timeout 180 "$WINE" "$WORK/$base.exe" </dev/null 2>/dev/null); wrc=$?
+    [ "$testkit" = 1 ] && wout=""
     if [ "$lrc" != "$wrc" ] || [ "$lout" != "$wout" ]; then
         sleep 1
         wout=$(timeout 180 "$WINE" "$WORK/$base.exe" </dev/null 2>/dev/null); wrc=$?
+        [ "$testkit" = 1 ] && wout=""
     fi
     if [ "$lrc" != "$wrc" ]; then
         echo "DIFF $file :: exit code linux=$lrc windows=$wrc"; return

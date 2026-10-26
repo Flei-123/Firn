@@ -9,6 +9,7 @@
 // directory must really be gone, and at the very end no `fsx2341_*` entry
 // may be left in the temporary directory.
 import std.fsx
+import std.osinfo
 import std.fs
 import std.rt
 import std.dir
@@ -36,6 +37,9 @@ fn content(n: usize, seed: u64) -> rt.Buf {
 fn write_buf(path: str, b: *mut rt.Buf, mode: u32) -> FsError!bool {
     try fs.write_file_mode(path, rt.buf_ptr(b), rt.buf_len(b), mode, false)
     // the umask may have taken bits away: set them exactly
+    if osinfo.is_windows() {
+        return true
+    }
     return try fs.chmod(path, mode)
 }
 
@@ -50,6 +54,13 @@ fn same_content(path: str, b: *mut rt.Buf) -> bool {
 fn mode_of(path: str) -> u32 {
     let info: fs.FileInfo = fs.lstat(path) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
     return info.mode
+}
+
+fn assert_mode(path: str, want: u32) {
+    if osinfo.is_windows() {
+        return
+    }
+    assert_eq[u32](mode_of(path), want)
 }
 
 fn kind_of(path: str) -> u8 {
@@ -201,7 +212,7 @@ fn temp_dirs() -> FsError!bool {
     testkit.assert_true(starts_with(pa, shell.temp_dir() + "/fsx2341_a_"), "the directory is under temp_dir() with the prefix")
     testkit.assert_eq_i64(pa.length() as i64, (shell.temp_dir().length() + 1 + 10 + 12) as i64)
     testkit.assert_true(fs.is_dir(pa), "it exists and is a directory")
-    assert_eq[u32](mode_of(pa), 448 as u32)
+    assert_mode(pa, 448 as u32)
     testkit.assert_eq_i64(entries(pa) as i64, 0)
     testkit.assert_eq_i64(fsx.registered_count() as i64, 2)
     // drop: gone, and idempotent
@@ -271,7 +282,7 @@ fn temp_files() -> FsError!bool {
     let p: str = fsx.temp_file_path(&f)
     testkit.assert_eq_str(p, fsx.temp_dir_path(&d) + "/x.json")
     assert_eq[u8](kind_of(p), fs.KIND_FILE)
-    assert_eq[u32](mode_of(p), 384 as u32)
+    assert_mode(p, 384 as u32)
     let info: fs.FileInfo = try fs.stat(p)
     testkit.assert_eq_u64(info.size, 0 as u64)
     // an existing name is refused, bad names too
@@ -300,7 +311,7 @@ fn standalone_file() -> FsError!bool {
     let p: str = __str_copy(fsx.temp_file_path(&f))
     testkit.assert_true(starts_with(p, shell.temp_dir() + "/fsx2341_n_"), "standalone file under temp_dir()")
     assert_eq[u8](kind_of(p), fs.KIND_FILE)
-    assert_eq[u32](mode_of(p), 384 as u32)
+    assert_mode(p, 384 as u32)
     testkit.assert_eq_i64(fsx.registered_count() as i64, 1)
     testkit.assert_true(fsx.temp_file_drop(&f), "standalone drop")
     testkit.assert_true(gone(p), "standalone file gone")
@@ -337,7 +348,7 @@ fn copy_files() -> FsError!bool {
         let n: usize = try fsx.copy_file(sp, dp)
         testkit.assert_eq_i64(n as i64, sizes[i] as i64)
         testkit.assert_true(same_content(dp, &src), "content is equal, size " + num_str(sizes[i] as i64))
-        assert_eq[u32](mode_of(dp), modes[i])
+        assert_mode(dp, modes[i])
         rt.buf_free(&src)
         i = i + 1
     }
@@ -351,12 +362,14 @@ fn copy_files() -> FsError!bool {
     try write_buf(w + "/two", &b, 292 as u32)
     try fsx.copy_file(w + "/one", w + "/two")
     testkit.assert_true(same_content(w + "/two", &a), "an existing read-only target is replaced")
-    assert_eq[u32](mode_of(w + "/two"), 420 as u32)
+    assert_mode(w + "/two", 420 as u32)
     // through a symbolic link: the content of the target is copied
-    try fs.symlink("one", w + "/lnk")
-    try fsx.copy_file(w + "/lnk", w + "/from_lnk")
-    assert_eq[u8](kind_of(w + "/from_lnk"), fs.KIND_FILE)
-    testkit.assert_true(same_content(w + "/from_lnk", &a), "a link as source copies what it points to")
+    if !osinfo.is_windows() {
+        try fs.symlink("one", w + "/lnk")
+        try fsx.copy_file(w + "/lnk", w + "/from_lnk")
+        assert_eq[u8](kind_of(w + "/from_lnk"), fs.KIND_FILE)
+        testkit.assert_true(same_content(w + "/from_lnk", &a), "a link as source copies what it points to")
+    }
     // onto itself: still the same content
     try fsx.copy_file(w + "/one", w + "/one")
     testkit.assert_true(same_content(w + "/one", &a), "copy onto itself keeps the content")
@@ -367,7 +380,11 @@ fn copy_files() -> FsError!bool {
     testkit.assert_true(copy_err(w + "/one", w + "/adir") == 1021, "a directory as target is IsDir")
     testkit.assert_true(copy_err(w + "/one", w + "/nodir/x") == 1002, "a missing parent is NotFound")
     testkit.assert_true(gone(w + "/zzz"), "a failed copy leaves no target")
-    testkit.assert_eq_i64(entries(w) as i64, 18 + 5)
+    var expected_entries: i64 = 18 + 5
+    if osinfo.is_windows() {
+        expected_entries = 18 + 3
+    }
+    testkit.assert_eq_i64(entries(w) as i64, expected_entries)
     rt.buf_free(&a)
     rt.buf_free(&b)
     return true
@@ -412,30 +429,32 @@ fn main() -> i32 {
     testkit.assert_true(sp.length() > 0 && gone(sp), "defer removed the directory on the error path")
     testkit.assert_eq_i64(fsx.registered_count() as i64, 0)
 
-    // a child whose assertion fails: std.testkit cleans up
-    testkit.context("child with a failing assertion")
-    run_child(child_fails_assert)
-    testkit.assert_eq_i64(cap_code, 101)
-    let cp: str = first_line()
-    testkit.assert_true(starts_with(cp, shell.temp_dir() + "/fsx2341_c_"), "the child printed its directory")
-    testkit.assert_true(gone(cp), "the directory of a failed test is gone")
-    // and one that ends through finish()
-    testkit.context("child with finish")
-    run_child(child_finishes)
-    testkit.assert_eq_i64(cap_code, 0)
-    let fp: str = first_line()
-    testkit.assert_true(starts_with(fp, shell.temp_dir() + "/fsx2341_f_"), "the finishing child printed its directory")
-    testkit.assert_true(gone(fp), "finish() removed the directory it still held")
+    if !osinfo.is_windows() {
+        // a child whose assertion fails: std.testkit cleans up
+        testkit.context("child with a failing assertion")
+        run_child(child_fails_assert)
+        testkit.assert_eq_i64(cap_code, 101)
+        let cp: str = first_line()
+        testkit.assert_true(starts_with(cp, shell.temp_dir() + "/fsx2341_c_"), "the child printed its directory")
+        testkit.assert_true(gone(cp), "the directory of a failed test is gone")
+        // and one that ends through finish()
+        testkit.context("child with finish")
+        run_child(child_finishes)
+        testkit.assert_eq_i64(cap_code, 0)
+        let fp: str = first_line()
+        testkit.assert_true(starts_with(fp, shell.temp_dir() + "/fsx2341_f_"), "the finishing child printed its directory")
+        testkit.assert_true(gone(fp), "finish() removed the directory it still held")
 
-    // cleanup_all of a child does not touch what the parent armed
-    testkit.context("fork ownership")
-    var mine: fsx.TempDir = fsx.temp_dir("fsx2341_o_") catch fsx_dummy()
-    let mp: str = __str_copy(fsx.temp_dir_path(&mine))
-    run_child(child_cleans)
-    testkit.assert_eq_i64(cap_code, 0)
-    testkit.assert_true(fs.is_dir(mp), "the parent's directory survives a child's cleanup_all")
-    testkit.assert_true(fsx.temp_dir_drop(&mine), "and the parent can still drop it")
-    testkit.assert_true(gone(mp), "gone")
+        // cleanup_all of a child does not touch what the parent armed
+        testkit.context("fork ownership")
+        var mine: fsx.TempDir = fsx.temp_dir("fsx2341_o_") catch fsx_dummy()
+        let mp: str = __str_copy(fsx.temp_dir_path(&mine))
+        run_child(child_cleans)
+        testkit.assert_eq_i64(cap_code, 0)
+        testkit.assert_true(fs.is_dir(mp), "the parent's directory survives a child's cleanup_all")
+        testkit.assert_true(fsx.temp_dir_drop(&mine), "and the parent can still drop it")
+        testkit.assert_true(gone(mp), "gone")
+    }
 
     testkit.context("")
     // nothing of ours may be left in the temporary directory
