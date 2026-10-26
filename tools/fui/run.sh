@@ -661,6 +661,11 @@ build glide
 "$W/glide"
 
 echo
+echo "== W7b. RUBBER BAND: iOS formula (1 - 1/(0.55 x/d + 1)) d, both axes and ends, release returns to 0 =="
+build rubber
+"$W/rubber"
+
+echo
 echo "== W1. SCREEN MOTION: hover fade, lift, focus ring, caret blink + wake-up, page fade-up =="
 build screenanim
 "$W/screenanim"

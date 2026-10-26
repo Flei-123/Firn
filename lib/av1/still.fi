@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/av1/still.fi -- AV1 still picture (AVIF) decoder API: bytes in, planar 8 bit YUV out.
+// lib/av1/still.fi -- AV1 still picture (AVIF) decoder API: bytes in, planar YUV out (8 bit u8, 10 bit u16 LE).
 import rt.rt
 import av1.av1mem
 import av1.avif
@@ -65,8 +65,12 @@ fn fits(info: u64, max_pixels: i64) -> bool {
     return w * h <= max_pixels && mw * mh <= max_pixels + max_pixels / 4 + 8192
 }
 
-fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bytes: *mut usize) -> u64 {
-    let n: usize = (w * h) as usize
+fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bd: i64, bytes: *mut usize) -> u64 {
+    var unit: i64 = 1
+    if bd > 8 {
+        unit = 2
+    }
+    let n: usize = (w * h * unit) as usize
     let dst: u64 = av1mem.heap_alloc(n) as u64
     *bytes = n
     if dst == 0 {
@@ -74,7 +78,17 @@ fn crop_plane(src: u64, stride: i64, w: i64, h: i64, bytes: *mut usize) -> u64 {
     }
     var row: i64 = 0
     while row < h {
-        av1mem.mem_copy((dst + ((row * w) as u64)) as *mut u8, (src + ((row * stride) as u64)) as *mut u8, w as usize)
+        let drow: u64 = dst + ((row * w * unit) as u64)
+        let srow: u64 = src + ((row * stride * 2) as u64)
+        if bd > 8 {
+            av1mem.mem_copy(drow as *mut u8, srow as *mut u8, (w * 2) as usize)
+        } else {
+            var col: i64 = 0
+            while col < w {
+                *((drow + (col as u64)) as *mut u8) = (*((srow + ((col * 2) as u64)) as *mut u16)) as u8
+                col = col + 1
+            }
+        }
         row = row + 1
     }
     return dst
@@ -95,6 +109,26 @@ fn still_decode_limited(src: u64, n: usize, max_pixels: i64, f: *mut Frame) -> i
     }
     avif.avif_info_free(info)
     return rc
+}
+
+fn set_tile_grid(t: u64, info: u64) {
+    let fb: usize = avif.FH_BASE
+    let tcols: i64 = cell(info, fb + avif.FH_TCOLS)
+    let trows: i64 = cell(info, fb + avif.FH_TROWS)
+    if tcols * trows <= 1 {
+        return
+    }
+    av1tile.tile_set_grid(t, tcols, trows, cell(info, fb + avif.FH_TSIZE_BYTES))
+    var i: i64 = 0
+    while i <= tcols {
+        av1tile.tile_set_col_start(t, i, cell(info, fb + avif.FH_TCSTART + (i as usize)))
+        i = i + 1
+    }
+    i = 0
+    while i <= trows {
+        av1tile.tile_set_row_start(t, i, cell(info, fb + avif.FH_TRSTART + (i as usize)))
+        i = i + 1
+    }
 }
 
 fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
@@ -118,16 +152,20 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     }
     let lossless: bool = cell(info, fb + avif.FH_LOSSLESS) != 0
     let t: u64 = av1tile.tile_new(src + (off as u64), tlen, mc, mr, cell(info, avif.AI_FILTER_INTRA), cell(info, avif.AI_EDGE_FILTER), upd)
+    set_tile_grid(t, info)
     av1tile.tile_set_chroma(t, np, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY))
+    let bit_depth: i64 = cell(info, avif.AI_BITDEPTH)
+    if bit_depth != 8 && bit_depth != 10 {
+        av1tile.tile_free(t)
+        return STILL_UNSUPPORTED
+    }
+    av1tile.tile_set_bit_depth(t, bit_depth)
     var lrctx: u64 = 0
     var rc: i32 = STILL_OK
     av1tile.tile_set_sct(t, cell(info, fb + avif.FH_SCT))
     if !lossless {
         var unsup: i64 = cell(info, fb + avif.FH_SEG_EN) | cell(info, fb + avif.FH_DLF_PRES) | cell(info, fb + avif.FH_INTRABC)
         unsup = unsup | cell(info, avif.AI_SB128)
-        if cell(info, fb + avif.FH_TCOLS) * cell(info, fb + avif.FH_TROWS) > 1 {
-            unsup = unsup | 1
-        }
         let lrt0: i64 = cell(info, fb + avif.FH_LR_TYPE)
         let lrt1: i64 = cell(info, fb + avif.FH_LR_TYPE + 1)
         let lrt2: i64 = cell(info, fb + avif.FH_LR_TYPE + 2)
@@ -161,7 +199,7 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
         return rc
     }
     if !lossless {
-        post_filters(t, info, lrctx, np, mc, mr)
+        post_filters(t, info, lrctx, np, mc, mr, bit_depth)
     }
     let st: i64 = av1tile.tile_stride(t)
     (*f).width = w
@@ -169,20 +207,20 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     (*f).planes = np
     (*f).sub_x = cell(info, avif.AI_SUBX)
     (*f).sub_y = cell(info, avif.AI_SUBY)
-    (*f).depth = cell(info, avif.AI_BITDEPTH)
-    (*f).y = crop_plane(av1tile.tile_plane(t, 0), st, w, h, &(*f).y_bytes)
+    (*f).depth = bit_depth
+    (*f).y = crop_plane(av1tile.tile_plane(t, 0), st, w, h, bit_depth, &(*f).y_bytes)
     if np == 3 {
         let cw: i64 = (w + (*f).sub_x) >> (*f).sub_x
         let ch: i64 = (h + (*f).sub_y) >> (*f).sub_y
-        (*f).u = crop_plane(av1tile.tile_plane(t, 1), st, cw, ch, &(*f).u_bytes)
-        (*f).v = crop_plane(av1tile.tile_plane(t, 2), st, cw, ch, &(*f).v_bytes)
+        (*f).u = crop_plane(av1tile.tile_plane(t, 1), st, cw, ch, bit_depth, &(*f).u_bytes)
+        (*f).v = crop_plane(av1tile.tile_plane(t, 2), st, cw, ch, bit_depth, &(*f).v_bytes)
     }
     av1tile.tile_free(t)
     av1lr.lr_free(lrctx)
     return STILL_OK
 }
 
-fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64) {
+fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64, bd: i64) {
     let fb: usize = avif.FH_BASE
     let st: i64 = av1tile.tile_stride(t)
     let lv: u64 = av1mem.heap_alloc(64) as u64
@@ -197,7 +235,7 @@ fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64) {
                    cell(info, fb + avif.FH_FRAME_W), cell(info, fb + avif.FH_FRAME_H),
                    cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np, lv,
                    cell(info, fb + avif.FH_LF_SHARP), cell(info, fb + avif.FH_LF_DELTA_EN),
-                   cell(info, fb + avif.FH_LF_RD0) - 128, scr)
+                   cell(info, fb + avif.FH_LF_RD0) - 128, scr, bd)
     av1mem.heap_free(lv as *mut u8, 64)
     av1mem.heap_free(scr as *mut u8, 512)
     var s0: u64 = 0
@@ -223,12 +261,12 @@ fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64) {
         av1cdef.cdef_frame(av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), st,
                            av1tile.tile_skp(t), av1tile.tile_cdefidx(t), av1tile.tile_sbcols(t), mc, mr,
                            cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np,
-                           cell(info, fb + avif.FH_CDEF_DAMP), par, csc)
+                           cell(info, fb + avif.FH_CDEF_DAMP), bd, par, csc)
         av1mem.heap_free(par as *mut u8, av1cdef.CDEF_PAR_BYTES as usize)
         av1mem.heap_free(csc as *mut u8, av1cdef.CDEF_SCRATCH_BYTES as usize)
     }
     if lrctx != 0 {
-        av1lr.lr_frame(lrctx, av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), s0, s1, s2, st)
+        av1lr.lr_frame(lrctx, av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), s0, s1, s2, st, bd)
         if cdef_on {
             av1lr.lr_snapshot_free(s0, st, mr * 4)
             av1lr.lr_snapshot_free(s1, st, mr * 4)

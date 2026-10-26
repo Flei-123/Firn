@@ -6,10 +6,15 @@ import jxl.jxl_bits
 import jxl.jxl_container
 import jxl.jxl_err
 import jxl.jxl_header
+import jxl.jxl_icc
+import jxl.jxl_float
 import jxl.jxl_frame
+import jxl.jxl_img
+import jxl.jxl_modular
+import jxl.jxl_mem
 
 export {
-    JxlInfo, JxlFrameInfo, JxlError, jxl_info, jxl_frame_info, jxl_sniff,
+    JxlInfo, JxlFrameInfo, JxlError, JxlPicture, JxlIcc, jxl_icc_new, jxl_icc_profile, jxl_icc_free, jxl_info_new, jxl_picture_new, jxl_info, jxl_frame_info, jxl_sniff, jxl_decode, jxl_picture_free,
 }
 
 struct JxlInfo {
@@ -19,12 +24,19 @@ struct JxlInfo {
     extra_channels: u32,
     has_alpha: bool,
     bits: u32,
+    exp_bits: u32,
     is_float: bool,
     xyb: bool,
     want_icc: bool,
     animated: bool,
     orientation: u32,
     boxed: bool,
+    alpha_index: i32,
+}
+
+fn jxl_info_new() -> JxlInfo {
+    return JxlInfo { width: 0, height: 0, color_channels: 0, extra_channels: 0, has_alpha: false, bits: 0, exp_bits: 0,
+        is_float: false, xyb: false, want_icc: false, animated: false, orientation: 1, boxed: false, alpha_index: 0 - 1 }
 }
 
 fn jxl_sniff(p: u64, n: usize) -> bool {
@@ -55,8 +67,10 @@ fn info_status(p: u64, n: usize, info: *mut JxlInfo) -> i32 {
         (*info).height = m.height
         (*info).color_channels = jxl_header.jm_color_channels(&m)
         (*info).extra_channels = vec.vec_len[jxl_header.JxlExtra](&m.extra) as u32
-        (*info).has_alpha = jxl_header.jm_alpha_index(&m) >= 0
+        (*info).alpha_index = jxl_header.jm_alpha_index(&m)
+        (*info).has_alpha = (*info).alpha_index >= 0
         (*info).bits = m.depth.bits
+        (*info).exp_bits = m.depth.exp_bits
         (*info).is_float = m.depth.is_float
         (*info).xyb = m.xyb_encoded
         (*info).want_icc = m.color.want_icc
@@ -110,7 +124,7 @@ fn frame_status(p: u64, n: usize, fi: *mut JxlFrameInfo) -> i32 {
         r = jxl_header.jm_read_custom_transform(&b, &m)
     }
     if r == jxl_err.JX_OK && m.color.want_icc {
-        r = jxl_err.JX_UNSUPPORTED
+        r = jxl_icc.icc_discard(&b)
     }
     if r == jxl_err.JX_OK && m.have_preview {
         r = jxl_err.JX_UNSUPPORTED
@@ -155,6 +169,198 @@ fn frame_status(p: u64, n: usize, fi: *mut JxlFrameInfo) -> i32 {
 
 fn jxl_frame_info(p: u64, n: usize, fi: *mut JxlFrameInfo) -> JxlError!bool {
     let r: i32 = frame_status(p, n, fi)
+    if r != jxl_err.JX_OK {
+        return jxl_err.jx_fail(r)
+    }
+    return true
+}
+
+struct JxlPicture {
+    width: u32,
+    height: u32,
+    channels: u32,
+    bytes_per_sample: u32,
+    bits: u32,
+    is_float: bool,
+    data: u64,
+    size: usize,
+}
+
+fn jxl_picture_new() -> JxlPicture {
+    return JxlPicture { width: 0, height: 0, channels: 0, bytes_per_sample: 0, bits: 0, is_float: false, data: 0, size: 0 }
+}
+
+fn jxl_picture_free(pic: *mut JxlPicture) {
+    rt.heap_free((*pic).data, (*pic).size)
+    (*pic).data = 0
+    (*pic).size = 0
+}
+
+fn clamp_sample(v: i32, bits: u32) -> i64 {
+    var x: i64 = v as i64
+    let in_max: i64 = ((1 as i64) << bits) - 1
+    if x < 0 {
+        x = 0
+    }
+    if x > in_max {
+        x = in_max
+    }
+    return x
+}
+
+fn sample_value(v: i32, info: *mut JxlInfo) -> u64 {
+    if (*info).is_float {
+        return jxl_float.int_to_float_bits(v as i64, (*info).bits, (*info).exp_bits)
+    }
+    return clamp_sample(v, (*info).bits) as u64
+}
+
+fn pack_picture(img: *mut jxl_img.JxlImage, info: *mut JxlInfo, pic: *mut JxlPicture) -> i32 {
+    let w: usize = (*info).width as usize
+    let h: usize = (*info).height as usize
+    var nch: usize = (*info).color_channels as usize
+    var alpha_chan: usize = 0
+    if (*info).has_alpha {
+        alpha_chan = nch + ((*info).alpha_index as usize)
+        nch = nch + 1
+    }
+    if jxl_img.img_count(img) < nch || (*info).bits == 0 || (*info).bits > 32 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if (*info).is_float && ((*info).bits < 16 || ((*info).bits == 32 && (*info).exp_bits != 8)) {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    if !(*info).is_float && (*info).bits > 16 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    var bps: usize = 1
+    if (*info).is_float {
+        bps = 4
+    } else if (*info).bits > 8 {
+        bps = 2
+    }
+    let size: usize = w * h * nch * bps
+    let data: u64 = rt.heap_alloc(size)
+    if data == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var c: usize = 0
+    while c < nch {
+        var src: usize = c
+        if (*info).has_alpha && c + 1 == nch {
+            src = alpha_chan
+        }
+        if jxl_img.img_w(img, src) != w || jxl_img.img_h(img, src) != h {
+            rt.heap_free(data, size)
+            return jxl_err.JX_UNSUPPORTED
+        }
+        var i: usize = 0
+        while i < w * h {
+            let v: u64 = sample_value(jxl_mem.ldi(jxl_img.img_data(img, src), i), info)
+            let at: usize = (i * nch + c) * bps
+            var k: usize = 0
+            while k < bps {
+                *((data +% (at + k) as u64) as *mut u8) = ((v >> ((k * 8) as u64)) & 255) as u8
+                k = k + 1
+            }
+            i = i + 1
+        }
+        c = c + 1
+    }
+    (*pic).width = (*info).width
+    (*pic).height = (*info).height
+    (*pic).channels = nch as u32
+    (*pic).bytes_per_sample = bps as u32
+    (*pic).bits = (*info).bits
+    (*pic).is_float = (*info).is_float
+    (*pic).data = data
+    (*pic).size = size
+    return jxl_err.JX_OK
+}
+
+fn decode_status(p: u64, n: usize, pic: *mut JxlPicture) -> i32 {
+    var info: JxlInfo = jxl_info_new()
+    var r: i32 = info_status(p, n, &info)
+    if r != jxl_err.JX_OK {
+        return r
+    }
+    var img: jxl_img.JxlImage = jxl_img.img_new()
+    r = jxl_modular.modular_decode(p, n, &img)
+    if r == jxl_err.JX_OK {
+        r = pack_picture(&img, &info, pic)
+    }
+    jxl_img.img_free(&img)
+    return r
+}
+
+fn jxl_decode(p: u64, n: usize, pic: *mut JxlPicture) -> JxlError!bool {
+    (*pic).data = 0
+    (*pic).size = 0
+    let r: i32 = decode_status(p, n, pic)
+    if r != jxl_err.JX_OK {
+        return jxl_err.jx_fail(r)
+    }
+    return true
+}
+
+struct JxlIcc {
+    data: u64,
+    size: usize,
+}
+
+fn jxl_icc_new() -> JxlIcc {
+    return JxlIcc { data: 0, size: 0 }
+}
+
+fn jxl_icc_free(icc: *mut JxlIcc) {
+    rt.heap_free((*icc).data, (*icc).size)
+    (*icc).data = 0
+    (*icc).size = 0
+}
+
+fn icc_status(p: u64, n: usize, icc: *mut JxlIcc) -> i32 {
+    var cs: rt.Buf = rt.buf_new()
+    var r: i32 = jxl_container.jc_extract(p, n, &cs)
+    if r != jxl_err.JX_OK {
+        rt.buf_free(&cs)
+        return r
+    }
+    if rt.buf_len(&cs) < 2 || rt.buf_at(&cs, 0) != 255 as u8 || rt.buf_at(&cs, 1) != 10 as u8 {
+        rt.buf_free(&cs)
+        return jxl_err.JX_NOT_JXL
+    }
+    var b: jxl_bits.JxlBits = jxl_bits.jb_new(rt.buf_ptr(&cs), rt.buf_len(&cs))
+    jxl_bits.jb_skip_bits(&b, 16)
+    var m: jxl_header.JxlMeta = jxl_header.jm_new()
+    r = jxl_header.jm_read(&b, &m)
+    if r == jxl_err.JX_OK {
+        r = jxl_header.jm_read_custom_transform(&b, &m)
+    }
+    var out: rt.Buf = rt.buf_new()
+    if r == jxl_err.JX_OK && m.color.want_icc {
+        r = jxl_icc.icc_read(&b, &out)
+    }
+    if r == jxl_err.JX_OK && rt.buf_len(&out) > 0 {
+        let size: usize = rt.buf_len(&out)
+        let data: u64 = rt.heap_alloc(size)
+        if data == 0 {
+            r = jxl_err.JX_MEMORY
+        } else {
+            rt.mem_copy(data, rt.buf_ptr(&out), size)
+            (*icc).data = data
+            (*icc).size = size
+        }
+    }
+    rt.buf_free(&out)
+    jxl_header.jm_free(&m)
+    rt.buf_free(&cs)
+    return r
+}
+
+fn jxl_icc_profile(p: u64, n: usize, icc: *mut JxlIcc) -> JxlError!bool {
+    (*icc).data = 0
+    (*icc).size = 0
+    let r: i32 = icc_status(p, n, icc)
     if r != jxl_err.JX_OK {
         return jxl_err.jx_fail(r)
     }

@@ -212,7 +212,7 @@ const firnTag = document.currentScript;
         firn_web_tz(lo, hi) { return -new Date(((hi >>> 0) * 4294967296 + (lo >>> 0)) * 1000).getTimezoneOffset() | 0; },
         firn_web_store_get(kp, kn, p, cap) { try { return put(localStorage.getItem(str(kp, kn)), p, cap); } catch (e) { return 0; } },
         firn_web_store_set(kp, kn, p, n) { try { localStorage.setItem(str(kp, kn), str(p, n)); } catch (e) { /* private mode */ } },
-        firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text', 'grab', 'grabbing', 'zoom-in'][k] || 'default'; },
+        firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text', 'grab', 'grabbing', 'zoom-in', 'crosshair', 'wait', 'ew-resize', 'ns-resize', 'move'][k] || 'default'; },
         // THE FIELD THE KEYBOARD REALLY EDITS (lib/plat/web.fi web_edit_mode):
         // the text field holds the page's whole line and lies over its field
         firn_web_edit_mode(on, font, line, left, top, right) { editMode(on, font, line, left, top, right); },
