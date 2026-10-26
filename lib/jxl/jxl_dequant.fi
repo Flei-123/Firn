@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_dequant.fi -- jxl_dequant: JPEG XL custom dequantization matrix records (library, params, raw)
+import std.rt
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_err
+import jxl.jxl_img
+import jxl.jxl_qwtab
+import jxl.jxl_stream
+import jxl.jxl_wp
+import jxl.jxl_xform
+
+export { dq_read, dq_free, dq_rec }
+
+const ALMOST_ZERO: f64 = 0.00000001
+const NO_LIMIT: usize = 16777215
+const MULT_AT: usize = 48
+const AFV_BANDS_AT: usize = 27
+const AFV_4X4_AT: usize = 75
+const RAW_BIT_DEPTH: i64 = 8
+
+fn dq_rec(recs: u64, kind: usize) -> u64 {
+    return recs +% ((kind * jxl_qwtab.QW_REC_WORDS * 8) as u64)
+}
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn read_dct_params(b: *mut jxl_bits.JxlBits, rec: u64, off: usize, nb_word: usize) -> bool {
+    let nb: usize = (jxl_bits.jb_read(b, 4) as usize) + 1
+    rt.st64(rec, nb_word, nb as u64)
+    var c: usize = 0
+    while c < 3 {
+        var i: usize = 0
+        while i < nb {
+            jxl_qwtab.qw_rec_set_f(rec, off + c * nb + i, jxl_bits.jb_f16(b))
+            i = i + 1
+        }
+        let first: f64 = jxl_qwtab.qw_rec_f(rec, off + c * nb)
+        if first < ALMOST_ZERO {
+            return false
+        }
+        jxl_qwtab.qw_rec_set_f(rec, off + c * nb, first * 64.0)
+        c = c + 1
+    }
+    return true
+}
+
+fn read_scaled(b: *mut jxl_bits.JxlBits, rec: u64, n: usize, stride: usize) -> bool {
+    var c: usize = 0
+    while c < 3 {
+        var i: usize = 0
+        while i < n {
+            let v: f64 = jxl_bits.jb_f16(b)
+            if fabs(v) < ALMOST_ZERO {
+                return false
+            }
+            jxl_qwtab.qw_rec_set_f(rec, c * stride + i, v * 64.0)
+            i = i + 1
+        }
+        c = c + 1
+    }
+    return true
+}
+
+fn read_mults(b: *mut jxl_bits.JxlBits, rec: u64, per_channel: usize) -> bool {
+    var c: usize = 0
+    while c < 3 {
+        var i: usize = 0
+        while i < per_channel {
+            let v: f64 = jxl_bits.jb_f16(b)
+            if fabs(v) < ALMOST_ZERO {
+                return false
+            }
+            jxl_qwtab.qw_rec_set_f(rec, MULT_AT + c * per_channel + i, v)
+            i = i + 1
+        }
+        c = c + 1
+    }
+    return true
+}
+
+fn read_afv(b: *mut jxl_bits.JxlBits, rec: u64) -> bool {
+    var c: usize = 0
+    while c < 3 {
+        var i: usize = 0
+        while i < 9 {
+            var v: f64 = jxl_bits.jb_f16(b)
+            if i < 6 {
+                v = v * 64.0
+            }
+            jxl_qwtab.qw_rec_set_f(rec, c * 9 + i, v)
+            i = i + 1
+        }
+        c = c + 1
+    }
+    if !read_dct_params(b, rec, AFV_BANDS_AT, 1) {
+        return false
+    }
+    return read_dct_params(b, rec, AFV_4X4_AT, 2)
+}
+
+fn read_raw(b: *mut jxl_bits.JxlBits, kind: usize, rec: u64, ms: *mut jxl_stream.JxlModState, stream_id: u32) -> i32 {
+    let den: f64 = jxl_bits.jb_f16(b)
+    if den < ALMOST_ZERO {
+        return jxl_err.JX_BAD
+    }
+    let w: usize = jxl_qwtab.qw_kind_rows(kind)
+    let h: usize = jxl_qwtab.qw_kind_cols(kind)
+    var img: jxl_img.JxlImage = jxl_img.img_new()
+    var c: usize = 0
+    while c < 3 {
+        jxl_img.img_add(&img, w, h, 0, 0)
+        c = c + 1
+    }
+    var wph: jxl_wp.JxlWpHeader = jxl_wp.wp_header_default()
+    var xfs: vec.Vec[jxl_xform.JxlXform] = vec.vec_new[jxl_xform.JxlXform]()
+    var r: i32 = jxl_stream.stream_decode(b, &img, ms, stream_id, NO_LIMIT, &wph, &xfs)
+    if r == jxl_err.JX_OK {
+        r = jxl_stream.xfs_inverse(&xfs, &img, &wph, RAW_BIT_DEPTH)
+    }
+    jxl_stream.xfs_free(&xfs)
+    if r == jxl_err.JX_OK {
+        let bytes: usize = 3 * w * h * 8
+        let p: u64 = rt.heap_alloc(bytes)
+        if p == 0 {
+            r = jxl_err.JX_MEMORY
+        } else {
+            c = 0
+            while c < 3 && r == jxl_err.JX_OK {
+                var y: usize = 0
+                while y < h && r == jxl_err.JX_OK {
+                    var x: usize = 0
+                    while x < w {
+                        let v: i32 = jxl_img.img_get(&img, c, x, y)
+                        if v <= 0 {
+                            r = jxl_err.JX_BAD
+                        } else {
+                            *((p +% (((c * w * h + y * w + x) * 8) as u64)) as *mut f64) = 1.0 / (den * (v as f64))
+                        }
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+                c = c + 1
+            }
+            if r == jxl_err.JX_OK {
+                rt.st64(rec, 3, p)
+            } else {
+                rt.heap_free(p, bytes)
+            }
+        }
+    }
+    jxl_img.img_free(&img)
+    return r
+}
+
+fn read_kind(b: *mut jxl_bits.JxlBits, kind: usize, rec: u64, ms: *mut jxl_stream.JxlModState, stream_id: u32) -> i32 {
+    let mode: u64 = jxl_bits.jb_read(b, 3) as u64
+    if mode == 0 {
+        jxl_qwtab.qw_default_rec(kind, rec)
+        return jxl_err.JX_OK
+    }
+    let single: bool = jxl_qwtab.qw_kind_rows(kind) == 8 && jxl_qwtab.qw_kind_cols(kind) == 8
+    if mode >= 1 && mode <= 5 && !single {
+        return jxl_err.JX_BAD
+    }
+    rt.st64(rec, 0, mode)
+    if mode == 7 {
+        return read_raw(b, kind, rec, ms, stream_id)
+    }
+    var ok: bool = false
+    if mode == 1 {
+        ok = read_scaled(b, rec, 3, 3)
+    }
+    if mode == 2 {
+        ok = read_scaled(b, rec, 6, 6)
+    }
+    if mode == 3 {
+        ok = read_mults(b, rec, 2) && read_dct_params(b, rec, 0, 1)
+    }
+    if mode == 4 {
+        ok = read_mults(b, rec, 1) && read_dct_params(b, rec, 0, 1)
+    }
+    if mode == 5 {
+        ok = read_afv(b, rec)
+    }
+    if mode == 6 {
+        ok = read_dct_params(b, rec, 0, 1)
+    }
+    if !ok {
+        return jxl_err.JX_BAD
+    }
+    return jxl_err.JX_OK
+}
+
+fn dq_free(recs: u64) {
+    if recs == 0 {
+        return
+    }
+    var kind: usize = 0
+    while kind < jxl_qwtab.QW_KIND_COUNT {
+        let rec: u64 = dq_rec(recs, kind)
+        if rt.ld64(rec, 0) == jxl_qwtab.QW_MODE_RAW && rt.ld64(rec, 3) != 0 {
+            rt.heap_free(rt.ld64(rec, 3), 3 * jxl_qwtab.qw_kind_rows(kind) * jxl_qwtab.qw_kind_cols(kind) * 8)
+        }
+        kind = kind + 1
+    }
+    rt.heap_free(recs, jxl_qwtab.QW_KIND_COUNT * jxl_qwtab.QW_REC_WORDS * 8)
+}
+
+fn dq_read(b: *mut jxl_bits.JxlBits, nlf: usize, ms: *mut jxl_stream.JxlModState, out: *mut u64) -> i32 {
+    *out = 0
+    if jxl_bits.jb_bit(b) {
+        return jxl_err.JX_OK
+    }
+    let total: usize = jxl_qwtab.QW_KIND_COUNT * jxl_qwtab.QW_REC_WORDS * 8
+    let recs: u64 = rt.heap_alloc(total)
+    if recs == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    rt.mem_set(recs, 0 as u8, total)
+    var r: i32 = jxl_err.JX_OK
+    var kind: usize = 0
+    while r == jxl_err.JX_OK && kind < jxl_qwtab.QW_KIND_COUNT {
+        r = read_kind(b, kind, dq_rec(recs, kind), ms, (1 + 3 * nlf + kind) as u32)
+        kind = kind + 1
+    }
+    if r != jxl_err.JX_OK {
+        dq_free(recs)
+        return r
+    }
+    *out = recs
+    return jxl_err.JX_OK
+}
