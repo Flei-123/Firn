@@ -17,7 +17,7 @@ Vanilla column = algorithm of ModelBlockRenderer / LightTexture / LevelRenderer 
 | 4 | Smooth Lighting Off / Minimum / Maximum | enum OFF/MIN/MAX (lang keys exist in 1.20.1) | no option, always smooth + AO | FIXED: `F_FLAT_LIGHT` mesher flag (front-cell light). Off = flat + no AO, Minimum = flat + AO (our reading, MIN semantics not verified), Maximum = smooth + AO. Button in Video Settings, remesh on change |
 | 5 | Biome tint grass / foliage / water | per-biome colormap, blend radius 5x5 default | mc_biome_tint / zoom / update, model tint | OK (r240 open: per-position tint of models) |
 | 6 | Fog / underwater | per-biome fog, water fog colour blend 5 s, vision 0.25..1 | mc_biome_fog, mc_water_fog | OK |
-| 7 | Mipmaps / anisotropy | mipmap level 4 default, aniso 1 | GL `glbe_set_filter` exists, NOT called by mcplay (nearest only) | GAP: needs option + laptop perf measurement (u_filter=1 uses textureGrad) |
+| 7 | Mipmaps / anisotropy | mipmap level 4 default, aniso 1 | GL `glbe_set_filter` exists, NOT called by mcplay (nearest only) | PARTLY: env `MCPLAY_FILTER=0|1|2` (nearest / mipmaps / mip+aniso8) wired in mcplay GL init; laptop cost NOT measured yet; menu option open |
 | 8a | Sun / moon | textured quads, 8 moon phases | discs, no phases | GAP |
 | 8b | Stars | ~1500 stars at night | none | GAP (sky is python-mirrored; needs GL + VK + CPU pass) |
 | 8c | Clouds | 2 layers, 12 block cells, height 192 | none | GAP (biggest remaining visual item) |
