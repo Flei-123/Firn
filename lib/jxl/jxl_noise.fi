@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_noise.fi -- jxl_noise: JPEG XL noise synthesis (per-group xorshift128+ fields, 5x5 convolution, XYB strength model)
+import jxl.jxl_fplane
+import jxl.jxl_gaborish
+import std.rt
+
+export { noise_apply }
+
+const GOLDEN: u64 = 0x9E3779B97F4A7C15 as u64
+
+struct NoiseRng {
+    s0: [u64; 8],
+    s1: [u64; 8],
+    batch: [u64; 8],
+}
+
+fn splitmix(z_in: u64) -> u64 {
+    var z: u64 = z_in
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9 as u64
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB as u64
+    return z ^ (z >> 31)
+}
+
+fn rng_new(seed1: u64, seed2: u64, seed3: u64, seed4: u64) -> NoiseRng {
+    var r: NoiseRng = NoiseRng { s0: [0 as u64; 8], s1: [0 as u64; 8], batch: [0 as u64; 8] }
+    r.s0[0] = splitmix((((seed1 << 32) +% seed2) +% GOLDEN))
+    r.s1[0] = splitmix((((seed3 << 32) +% seed4) +% GOLDEN))
+    var i: usize = 1
+    while i < 8 {
+        r.s0[i] = splitmix(r.s0[i - 1])
+        r.s1[i] = splitmix(r.s1[i - 1])
+        i = i + 1
+    }
+    return r
+}
+
+fn rng_fill(r: *mut NoiseRng) {
+    var i: usize = 0
+    while i < 8 {
+        var s1: u64 = (*r).s0[i]
+        let s0: u64 = (*r).s1[i]
+        (*r).batch[i] = s1 +% s0
+        (*r).s0[i] = s0
+        s1 = s1 ^ (s1 << 23)
+        s1 = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5)
+        (*r).s1[i] = s1
+        i = i + 1
+    }
+}
+
+fn batch_float(r: *mut NoiseRng, j: usize) -> f64 {
+    let word: u64 = ((*r).batch[j / 2] >> (((j % 2) * 32) as u64)) & 0xFFFFFFFF
+    return 1.0 + ((word >> 9) as f64) / 8388608.0
+}
+
+fn fill_rect(r: *mut NoiseRng, plane: u64, stride: usize, x0: usize, y0: usize, xs: usize, ys: usize) {
+    var y: usize = 0
+    while y < ys {
+        var x: usize = 0
+        while x + 16 < xs {
+            rng_fill(r)
+            var j: usize = 0
+            while j < 16 {
+                jxl_fplane.fp_st(plane, (y0 + y) * stride + x0 + x + j, batch_float(r, j))
+                j = j + 1
+            }
+            x = x + 16
+        }
+        rng_fill(r)
+        var j: usize = 0
+        while x + j < xs {
+            jxl_fplane.fp_st(plane, (y0 + y) * stride + x0 + x + j, batch_float(r, j))
+            j = j + 1
+        }
+        y = y + 1
+    }
+}
+
+fn generate(w: usize, h: usize, group_dim: usize, visible: u64, nonvisible: u64, planes: u64) {
+    var gy: usize = 0
+    while gy * group_dim < h {
+        var gx: usize = 0
+        while gx * group_dim < w {
+            let x0: usize = gx * group_dim
+            let y0: usize = gy * group_dim
+            var xs: usize = group_dim
+            if x0 + xs > w {
+                xs = w - x0
+            }
+            var ys: usize = group_dim
+            if y0 + ys > h {
+                ys = h - y0
+            }
+            var rng: NoiseRng = rng_new(visible, nonvisible, x0 as u64, y0 as u64)
+            var c: usize = 0
+            while c < 3 {
+                fill_rect(&rng, planes +% ((c * w * h * 8) as u64), w, x0, y0, xs, ys)
+                c = c + 1
+            }
+            gx = gx + 1
+        }
+        gy = gy + 1
+    }
+}
+
+fn convolve(src: u64, dst: u64, w: usize, h: usize) {
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            var others: f64 = 0.0
+            var dy: i64 = -2
+            while dy <= 2 {
+                let yy: usize = jxl_gaborish.mirror_index((y as i64) + dy, h as i64)
+                var dx: i64 = -2
+                while dx <= 2 {
+                    if dx != 0 || dy != 0 {
+                        let xx: usize = jxl_gaborish.mirror_index((x as i64) + dx, w as i64)
+                        others = others + jxl_fplane.fp_ld(src, yy * w + xx)
+                    }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            jxl_fplane.fp_st(dst, y * w + x, others * 0.16 + jxl_fplane.fp_ld(src, y * w + x) * (-3.84))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn strength(lut: *mut [f64; 8], v: f64) -> f64 {
+    var scaled: f64 = v * 6.0
+    if scaled < 0.0 {
+        scaled = 0.0
+    }
+    var fl: f64 = 0.0
+    while fl + 1.0 <= scaled {
+        fl = fl + 1.0
+    }
+    var frac: f64 = scaled - fl
+    if scaled >= 7.0 {
+        fl = 6.0
+        frac = 1.0
+    }
+    let idx: usize = fl as usize
+    var s: f64 = (*lut)[idx] + ((*lut)[idx + 1] - (*lut)[idx]) * frac
+    if s > 1.0 {
+        s = 1.0
+    }
+    if s < 0.0 {
+        s = 0.0
+    }
+    return s
+}
+
+fn noise_apply(planes: u64, stride: usize, plane_len: usize, w: usize, h: usize, group_dim: usize, lut: *mut [f64; 8], ytox: f64, ytob: f64, visible: u64, nonvisible: u64) -> bool {
+    let raw: u64 = rt.heap_alloc(3 * w * h * 8)
+    let conv: u64 = rt.heap_alloc(3 * w * h * 8)
+    if raw == 0 || conv == 0 {
+        rt.heap_free(raw, 3 * w * h * 8)
+        rt.heap_free(conv, 3 * w * h * 8)
+        return false
+    }
+    generate(w, h, group_dim, visible, nonvisible, raw)
+    var c: usize = 0
+    while c < 3 {
+        convolve(raw +% ((c * w * h * 8) as u64), conv +% ((c * w * h * 8) as u64), w, h)
+        c = c + 1
+    }
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            let i: usize = y * stride + x
+            let n: usize = y * w + x
+            let vx: f64 = jxl_fplane.fp_ld(planes, i)
+            let vy: f64 = jxl_fplane.fp_ld(planes, plane_len + i)
+            let vb: f64 = jxl_fplane.fp_ld(planes, 2 * plane_len + i)
+            let sg: f64 = strength(lut, (vy - vx) * 0.5)
+            let sr: f64 = strength(lut, (vy + vx) * 0.5)
+            let rr: f64 = jxl_fplane.fp_ld(conv, n) * 0.22
+            let rg: f64 = jxl_fplane.fp_ld(conv, w * h + n) * 0.22
+            let rc: f64 = jxl_fplane.fp_ld(conv, 2 * w * h + n) * 0.22
+            let red: f64 = sr * (0.0078125 * rr + 0.9921875 * rc)
+            let green: f64 = sg * (0.0078125 * rg + 0.9921875 * rc)
+            let rgn: f64 = red + green
+            jxl_fplane.fp_st(planes, i, (ytox * rgn + (red - green)) + vx)
+            jxl_fplane.fp_st(planes, plane_len + i, vy + rgn)
+            jxl_fplane.fp_st(planes, 2 * plane_len + i, ytob * rgn + vb)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    rt.heap_free(raw, 3 * w * h * 8)
+    rt.heap_free(conv, 3 * w * h * 8)
+    return true
+}
