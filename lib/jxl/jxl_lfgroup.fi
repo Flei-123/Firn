@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.vec
+import jxl.jxl_acs
+import jxl.jxl_bctx
+import jxl.jxl_bits
+import jxl.jxl_cmap
+import jxl.jxl_err
+import jxl.jxl_frame
+import jxl.jxl_header
+import jxl.jxl_img
+import jxl.jxl_lfdata
+import jxl.jxl_quant
+import jxl.jxl_stream
+import jxl.jxl_wp
+import jxl.jxl_xform
+
+export { lfgroup_decode }
+
+const NO_LIMIT: usize = 16777215
+const EPF_ENTRIES: i32 = 8
+const QUANT_MAX: i32 = 256
+const BLOCKS_PER_AC_GROUP: usize = 32
+
+struct LfRect {
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+}
+
+fn ceil_log2_nonzero(n: usize) -> u32 {
+    var v: usize = n - 1
+    var r: u32 = 0
+    while v > 0 {
+        r = r + 1
+        v = v >> 1
+    }
+    return r
+}
+
+fn decode_stream(b: *mut jxl_bits.JxlBits, img: *mut jxl_img.JxlImage, ms: *mut jxl_stream.JxlModState, stream_id: u32, bit_depth: i64) -> i32 {
+    var wph: jxl_wp.JxlWpHeader = jxl_wp.wp_header_default()
+    var xfs: vec.Vec[jxl_xform.JxlXform] = vec.vec_new[jxl_xform.JxlXform]()
+    var r: i32 = jxl_stream.stream_decode(b, img, ms, stream_id, NO_LIMIT, &wph, &xfs)
+    if r == jxl_err.JX_OK {
+        r = jxl_stream.xfs_inverse(&xfs, img, &wph, bit_depth)
+    }
+    jxl_stream.xfs_free(&xfs)
+    return r
+}
+
+fn dc_bucket(bc: *mut jxl_bctx.JxlBlockCtx, c: usize, q: i32) -> usize {
+    var n: usize = 0
+    var t: usize = 0
+    while t < ((*bc).dc_counts[c] as usize) {
+        if q > (*bc).dc_thresholds[c * 16 + t] {
+            n = n + 1
+        }
+        t = t + 1
+    }
+    return n
+}
+
+fn dequant_dc(img: *mut jxl_img.JxlImage, q: *mut jxl_quant.JxlQuant, cm: *mut jxl_cmap.JxlCmap, bc: *mut jxl_bctx.JxlBlockCtx, mul: f64, d: *mut jxl_lfdata.JxlLfData, r: *mut LfRect) {
+    let fx: f64 = jxl_quant.quant_dc_step(q, 0) * mul
+    let fy: f64 = jxl_quant.quant_dc_step(q, 1) * mul
+    let fb: f64 = jxl_quant.quant_dc_step(q, 2) * mul
+    let rx: f64 = jxl_cmap.cmap_ratio_x(cm, (*cm).ytox_dc)
+    let rb: f64 = jxl_cmap.cmap_ratio_b(cm, (*cm).ytob_dc)
+    var y: usize = 0
+    while y < (*r).h {
+        var x: usize = 0
+        while x < (*r).w {
+            let qy: i32 = jxl_img.img_get(img, 0, x, y)
+            let qx: i32 = jxl_img.img_get(img, 1, x, y)
+            let qb: i32 = jxl_img.img_get(img, 2, x, y)
+            let iy: f64 = (qy as f64) * fy
+            jxl_lfdata.lfd_dc_set(d, 1, (*r).x0 + x, (*r).y0 + y, iy)
+            jxl_lfdata.lfd_dc_set(d, 0, (*r).x0 + x, (*r).y0 + y, iy * rx + (qx as f64) * fx)
+            jxl_lfdata.lfd_dc_set(d, 2, (*r).x0 + x, (*r).y0 + y, iy * rb + (qb as f64) * fb)
+            var bucket: usize = 0
+            if (*bc).num_dc_ctxs > 1 {
+                bucket = dc_bucket(bc, 0, qx)
+                bucket = bucket * (((*bc).dc_counts[2] as usize) + 1) + dc_bucket(bc, 2, qb)
+                bucket = bucket * (((*bc).dc_counts[1] as usize) + 1) + dc_bucket(bc, 1, qy)
+            }
+            vec.vec_set[u8](&(*d).qdc, jxl_lfdata.lfd_idx(d, (*r).x0 + x, (*r).y0 + y), bucket as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn decode_dc(b: *mut jxl_bits.JxlBits, ms: *mut jxl_stream.JxlModState, q: *mut jxl_quant.JxlQuant, cm: *mut jxl_cmap.JxlCmap, bc: *mut jxl_bctx.JxlBlockCtx, bit_depth: i64, g: usize, d: *mut jxl_lfdata.JxlLfData, r: *mut LfRect) -> i32 {
+    let extra_precision: u32 = jxl_bits.jb_read(b, 2)
+    let mul: f64 = 1.0 / ((1 << extra_precision) as f64)
+    var img: jxl_img.JxlImage = jxl_img.img_new()
+    var c: usize = 0
+    while c < 3 {
+        jxl_img.img_add(&img, (*r).w, (*r).h, 0, 0)
+        c = c + 1
+    }
+    var res: i32 = decode_stream(b, &img, ms, (1 + g) as u32, bit_depth)
+    if res == jxl_err.JX_OK {
+        dequant_dc(&img, q, cm, bc, mul, d, r)
+    }
+    jxl_img.img_free(&img)
+    return res
+}
+
+fn store_tiles(img: *mut jxl_img.JxlImage, d: *mut jxl_lfdata.JxlLfData, r: *mut LfRect, tw: usize, th: usize) {
+    var ty: usize = 0
+    while ty < th {
+        var tx: usize = 0
+        while tx < tw {
+            let at: usize = jxl_lfdata.lfd_tile_idx(d, (*r).x0 / 8 + tx, (*r).y0 / 8 + ty)
+            vec.vec_set[i32](&(*d).ytox, at, clamp_i8(jxl_img.img_get(img, 0, tx, ty)))
+            vec.vec_set[i32](&(*d).ytob, at, clamp_i8(jxl_img.img_get(img, 1, tx, ty)))
+            tx = tx + 1
+        }
+        ty = ty + 1
+    }
+}
+
+fn clamp_i8(v: i32) -> i32 {
+    if v < -128 {
+        return -128
+    }
+    if v > 127 {
+        return 127
+    }
+    return v
+}
+
+fn assign_blocks(img: *mut jxl_img.JxlImage, d: *mut jxl_lfdata.JxlLfData, r: *mut LfRect, count: usize) -> i32 {
+    let xlim: usize = (*r).x0 + (*r).w
+    let ylim: usize = (*r).y0 + (*r).h
+    var num: usize = 0
+    var iy: usize = 0
+    while iy < (*r).h {
+        var ix: usize = 0
+        while ix < (*r).w {
+            let x: usize = (*r).x0 + ix
+            let y: usize = (*r).y0 + iy
+            let sharp: i32 = jxl_img.img_get(img, 3, ix, iy)
+            if sharp < 0 || sharp >= EPF_ENTRIES {
+                return jxl_err.JX_BAD
+            }
+            vec.vec_set[u8](&(*d).epf, jxl_lfdata.lfd_idx(d, x, y), sharp as u8)
+            if !jxl_lfdata.lfd_acs_valid(d, x, y) {
+                if num >= count {
+                    return jxl_err.JX_BAD
+                }
+                let t: i32 = jxl_img.img_get(img, 2, num, 0)
+                if !jxl_acs.acs_valid_type(t) {
+                    return jxl_err.JX_BAD
+                }
+                let cx: usize = jxl_acs.acs_cover_x(t as u32)
+                let cy: usize = jxl_acs.acs_cover_y(t as u32)
+                if x + cx > (x / BLOCKS_PER_AC_GROUP + 1) * BLOCKS_PER_AC_GROUP || x + cx > xlim {
+                    return jxl_err.JX_BAD
+                }
+                if y + cy > (y / BLOCKS_PER_AC_GROUP + 1) * BLOCKS_PER_AC_GROUP || y + cy > ylim {
+                    return jxl_err.JX_BAD
+                }
+                jxl_lfdata.lfd_acs_set(d, x, y, t as u32)
+                var qf: i32 = jxl_img.img_get(img, 2, num, 1)
+                if qf < 0 {
+                    qf = 0
+                }
+                if qf > QUANT_MAX - 1 {
+                    qf = QUANT_MAX - 1
+                }
+                vec.vec_set[i32](&(*d).qf, jxl_lfdata.lfd_idx(d, x, y), 1 + qf)
+                num = num + 1
+            }
+            ix = ix + 1
+        }
+        iy = iy + 1
+    }
+    return jxl_err.JX_OK
+}
+
+fn decode_ac_meta(b: *mut jxl_bits.JxlBits, ms: *mut jxl_stream.JxlModState, nlf: usize, bit_depth: i64, g: usize, d: *mut jxl_lfdata.JxlLfData, r: *mut LfRect) -> i32 {
+    let count: usize = (jxl_bits.jb_read(b, ceil_log2_nonzero((*r).w * (*r).h)) as usize) + 1
+    let tw: usize = ((*r).w + 7) / 8
+    let th: usize = ((*r).h + 7) / 8
+    var img: jxl_img.JxlImage = jxl_img.img_new()
+    jxl_img.img_add(&img, tw, th, 3, 3)
+    jxl_img.img_add(&img, tw, th, 3, 3)
+    jxl_img.img_add(&img, count, 2, 0, 0)
+    jxl_img.img_add(&img, (*r).w, (*r).h, 0, 0)
+    var res: i32 = decode_stream(b, &img, ms, (1 + 2 * nlf + g) as u32, bit_depth)
+    if res == jxl_err.JX_OK {
+        store_tiles(&img, d, r, tw, th)
+        res = assign_blocks(&img, d, r, count)
+    }
+    jxl_img.img_free(&img)
+    return res
+}
+
+fn lfgroup_decode(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut jxl_frame.JxlFrame, ms: *mut jxl_stream.JxlModState, q: *mut jxl_quant.JxlQuant, cm: *mut jxl_cmap.JxlCmap, bc: *mut jxl_bctx.JxlBlockCtx, g: usize, d: *mut jxl_lfdata.JxlLfData) -> i32 {
+    if vec.vec_len[jxl_header.JxlExtra](&(*m).extra) != 0 || ((*f).flags & jxl_frame.JF_FLAG_USE_LF) != 0 || (*f).upsampling != 1 {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    let gd: usize = (*f).group_dim as usize
+    let gx: usize = g % ((*f).lf_groups_x as usize)
+    let gy: usize = g / ((*f).lf_groups_x as usize)
+    var rect: LfRect = LfRect { x0: gx * gd, y0: gy * gd, w: gd, h: gd }
+    if rect.x0 + rect.w > (*d).bw {
+        rect.w = (*d).bw - rect.x0
+    }
+    if rect.y0 + rect.h > (*d).bh {
+        rect.h = (*d).bh - rect.y0
+    }
+    let bit_depth: i64 = (*m).depth.bits as i64
+    var r: i32 = decode_dc(b, ms, q, cm, bc, bit_depth, g, d, &rect)
+    if r == jxl_err.JX_OK {
+        r = decode_ac_meta(b, ms, (*f).num_lf_groups as usize, bit_depth, g, d, &rect)
+    }
+    if r == jxl_err.JX_OK && jxl_bits.jb_over(b) {
+        r = jxl_err.JX_TRUNCATED
+    }
+    return r
+}
