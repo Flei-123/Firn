@@ -187,13 +187,10 @@ files came from.
   reference can still be copied into a raw pointer, and `drop` does not apply
   to `gc class` / `Rc[T]` yet. The self-hosted compiler `firnc1` does not know
   `drop` (it reports such files as not ported).
-* Windows: no threads and no child processes yet (they report `ENOSYS`); no
-  debug information in `.exe` files. Creating symbolic links needs Windows
-  developer mode or administrator rights.
+* Windows: no debug information in `.exe` files. Creating symbolic links needs
+  Windows developer mode or administrator rights.
 * WebAssembly: programs that use files, sockets, threads, SIMD or inline
   assembly are refused at compile time, with the reason.
-* `net.http` (the HTTP client) does not speak `https://` yet; TLS is
-  available directly through `tls.tls`.
 * WebP images are decoded only on Android (through the system); Firn has its
   own JPEG and PNG decoders.
 * `input.type_text` assumes a US keyboard layout. Linux needs write access to
@@ -202,3 +199,10 @@ files came from.
 * No conditional compilation: platform code is chosen by module files
   (`backend.fi` / `backend.windows.fi`, or a `window/backend.fi` next to the
   program).
+
+## What is coming
+
+* A stable language and library interface (1.0); until then see
+  [ROADMAP.md](ROADMAP.md).
+* Stricter ownership checking (see Known limits).
+* WebAssembly threads, and a Windows and Android host for `fui.app`.
