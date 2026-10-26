@@ -6,8 +6,9 @@ import av1.avif
 import av1.av1pic
 import av1.av1fhx
 import av1.still
+import av1.av1cdfio
 
-export { seq_info, seq_open, seq_next, seq_free, SEQ_FRAME, SEQ_HIDDEN, SEQ_END, SEQ_UNSUPPORTED, SEQ_BAD }
+export { seq_cdfs, seq_info, seq_open, seq_next, seq_free, SEQ_FRAME, SEQ_HIDDEN, SEQ_END, SEQ_UNSUPPORTED, SEQ_BAD }
 
 const SEQ_FRAME: i32 = 0
 const SEQ_HIDDEN: i32 = 1
@@ -20,8 +21,20 @@ const ST_SRC: usize = 1
 const ST_LEN: usize = 2
 const ST_AT: usize = 3
 const ST_SLOTS: usize = 4
-const ST_CELLS: usize = 12
+const ST_STORE: usize = 12
+const ST_IO: usize = 13
+const ST_CELLS: usize = 16
 const NUM_SLOTS: usize = 8
+const IO_LOAD_M: usize = 5
+const IO_LOAD_K: usize = 6
+
+fn io_get(io: u64, i: usize) -> i64 {
+    return *((io + ((i * 8) as u64)) as *mut i64)
+}
+
+fn io_set(io: u64, i: usize, v: i64) {
+    *((io + ((i * 8) as u64)) as *mut i64) = v
+}
 
 fn sg(h: u64, i: usize) -> i64 {
     return *((h + ((i * 8) as u64)) as *mut i64)
@@ -41,6 +54,18 @@ fn seq_open(src: u64, n: usize) -> u64 {
         avif.avif_info_free(info)
         return 0
     }
+    let io: u64 = av1mem.heap_alloc(still.CDFIO_CELLS * 8) as u64
+    let store: u64 = av1cdfio.store_new()
+    if io == 0 || store == 0 {
+        avif.avif_info_free(info)
+        return 0
+    }
+    io_set(io, still.CDFIO_OUT_M, av1cdfio.buf_new(av1cdfio.MODE_CELLS) as i64)
+    io_set(io, still.CDFIO_OUT_K, av1cdfio.buf_new(av1cdfio.COEF_CELLS) as i64)
+    io_set(io, IO_LOAD_M, av1cdfio.buf_new(av1cdfio.MODE_CELLS) as i64)
+    io_set(io, IO_LOAD_K, av1cdfio.buf_new(av1cdfio.COEF_CELLS) as i64)
+    ss(h, ST_STORE, store as i64)
+    ss(h, ST_IO, io as i64)
     ss(h, ST_INFO, info as i64)
     ss(h, ST_SRC, src as i64)
     ss(h, ST_LEN, n as i64)
@@ -60,8 +85,51 @@ fn seq_free(h: u64) {
         av1pic.pic_release(sg(h, ST_SLOTS + i) as u64)
         i = i + 1
     }
+    let io: u64 = sg(h, ST_IO) as u64
+    av1cdfio.buf_free(io_get(io, still.CDFIO_OUT_M) as u64, av1cdfio.MODE_CELLS)
+    av1cdfio.buf_free(io_get(io, still.CDFIO_OUT_K) as u64, av1cdfio.COEF_CELLS)
+    av1cdfio.buf_free(io_get(io, IO_LOAD_M) as u64, av1cdfio.MODE_CELLS)
+    av1cdfio.buf_free(io_get(io, IO_LOAD_K) as u64, av1cdfio.COEF_CELLS)
+    av1mem.heap_free(io as *mut u8, still.CDFIO_CELLS * 8)
+    av1cdfio.store_free(sg(h, ST_STORE) as u64)
     avif.avif_info_free(sg(h, ST_INFO) as u64)
     av1mem.heap_free(h as *mut u8, ST_CELLS * 8)
+}
+
+fn seq_cdfs(h: u64, slot: i64, mode_dst: u64, coef_dst: u64) -> bool {
+    return av1cdfio.store_load(sg(h, ST_STORE) as u64, slot, mode_dst, coef_dst)
+}
+
+fn prepare_cdf_init(h: u64, info: u64) -> bool {
+    let io: u64 = sg(h, ST_IO) as u64
+    io_set(io, still.CDFIO_INIT_M, 0)
+    io_set(io, still.CDFIO_INIT_K, 0)
+    let primary: i64 = avif.avif_cell(info, avif.FH_BASE + av1fhx.FH_PRIMARY_REF)
+    if primary == av1fhx.PRIMARY_NONE {
+        return true
+    }
+    let slot: i64 = avif.avif_cell(info, avif.FH_BASE + av1fhx.FH_REF_IDX + (primary as usize))
+    if !av1cdfio.store_load(sg(h, ST_STORE) as u64, slot, io_get(io, IO_LOAD_M) as u64, io_get(io, IO_LOAD_K) as u64) {
+        return false
+    }
+    io_set(io, still.CDFIO_INIT_M, io_get(io, IO_LOAD_M))
+    io_set(io, still.CDFIO_INIT_K, io_get(io, IO_LOAD_K))
+    return true
+}
+
+fn save_slot_cdfs(h: u64, mask: i64, ok: bool) {
+    let io: u64 = sg(h, ST_IO) as u64
+    var i: i64 = 0
+    while i < 8 {
+        if ((mask >> i) & 1) != 0 {
+            if ok {
+                av1cdfio.store_save(sg(h, ST_STORE) as u64, i, io_get(io, still.CDFIO_OUT_M) as u64, io_get(io, still.CDFIO_OUT_K) as u64)
+            } else {
+                av1cdfio.store_invalidate(sg(h, ST_STORE) as u64, i)
+            }
+        }
+        i = i + 1
+    }
 }
 
 fn set_slot(h: u64, i: usize, pic: u64) {
@@ -92,6 +160,7 @@ fn show_existing(h: u64, info: u64, f: *mut still.Frame) -> i32 {
     }
     if av1pic.pic_get(pic, av1pic.PIC_FTYPE) == 0 {
         refresh_slots(h, pic, 255)
+        av1cdfio.store_copy_all(sg(h, ST_STORE) as u64, idx as i64)
     }
     avif.avif_ref_show_existing(info, idx as i64)
     return SEQ_FRAME
@@ -103,7 +172,10 @@ fn decode_new(h: u64, info: u64, f: *mut still.Frame) -> i32 {
     avif.avif_set_cell(info, avif.AI_WIDTH, avif.avif_cell(info, fb + avif.FH_UP_W))
     avif.avif_set_cell(info, avif.AI_HEIGHT, avif.avif_cell(info, fb + avif.FH_FRAME_H))
     var pic: u64 = 0
-    let rc: i32 = still.decode_frame(sg(h, ST_SRC) as u64, info, f, &pic, true, show)
+    if !prepare_cdf_init(h, info) {
+        return SEQ_BAD
+    }
+    let rc: i32 = still.decode_frame_cdf(sg(h, ST_SRC) as u64, info, f, &pic, true, show, sg(h, ST_IO) as u64)
     if rc != 0 {
         av1pic.pic_release(pic)
         return SEQ_UNSUPPORTED
@@ -112,6 +184,7 @@ fn decode_new(h: u64, info: u64, f: *mut still.Frame) -> i32 {
         return SEQ_BAD
     }
     refresh_slots(h, pic, avif.avif_cell(info, fb + avif.FH_REFRESH))
+    save_slot_cdfs(h, avif.avif_cell(info, fb + avif.FH_REFRESH), io_get(sg(h, ST_IO) as u64, still.CDFIO_OUT_OK) != 0)
     avif.avif_ref_update(info, avif.avif_cell(info, fb + avif.FH_REFRESH))
     av1pic.pic_release(pic)
     if show {
@@ -168,6 +241,7 @@ fn seq_next(h: u64, f: *mut still.Frame) -> i32 {
             return show_existing(h, info, f)
         }
         if avif.avif_cell(info, avif.FH_BASE + avif.FH_FRAME_TYPE) == 1 {
+            save_slot_cdfs(h, avif.avif_cell(info, avif.FH_BASE + avif.FH_REFRESH), false)
             avif.avif_ref_update(info, avif.avif_cell(info, avif.FH_BASE + avif.FH_REFRESH))
             return SEQ_UNSUPPORTED
         }
