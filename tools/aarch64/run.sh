@@ -215,8 +215,10 @@ one_case() {
     # expectation on the second, quieter attempt was never a difference
     # between the machines; one that fails twice is reported and not
     # compared.
+    xlimit=$(awk -v n="$base" '$1 == n && NF >= 3 { print $3; exit }' "$ROOT/tools/aarch64/timeouts.txt" 2>/dev/null)
+    xlimit=${xlimit:-60}
     for try in 1 2; do
-        xout=$(timeout 60 "$WORK/$base.x86" </dev/null 2>/dev/null); xrc=$?
+        xout=$(timeout "$xlimit" "$WORK/$base.x86" </dev/null 2>/dev/null); xrc=$?
         [ "$testkit" = 1 ] && xout=""   # the runner report carries timings: the exit code is the verdict
         if [ "$kind" = out ]; then
             [ "$xrc" -eq 0 ] && [ "$xout" = "$exp" ] && break
