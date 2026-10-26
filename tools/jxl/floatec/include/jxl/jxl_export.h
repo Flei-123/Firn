@@ -1,0 +1,6 @@
+#ifndef JXL_EXPORT_STUB_H_
+#define JXL_EXPORT_STUB_H_
+#define JXL_EXPORT
+#define JXL_DEPRECATED
+#define JXL_THREADS_EXPORT
+#endif
