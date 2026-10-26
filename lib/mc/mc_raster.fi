@@ -35,6 +35,7 @@ import paint.canvas
 import paint.png
 import mc.mc_camera
 import mc.mc_texture
+import mc.mc_lightmap
 
 export {
     Raster, Stats, raster_new, raster_free, raster_clear, raster_set_camera, raster_set_atlas,
@@ -85,6 +86,7 @@ struct Raster {
     // light (raster_set_light)
     day: i64, // sky light multiplier 0..256
     tint_r: i64, tint_g: i64, tint_b: i64, // block light tint per channel 0..256
+    lm_on: bool, lm_sky: i32, lm_gamma: i32,
     lod_pass: bool, // PASS_LOD: opaque pass with the wider LOD edge expansion (LOD_EXP_DIV)
     trans: bool, // translucent pass: alpha blend over the colour buffer, depth test but NO depth write, alpha 0 = no write
     flat_on: bool, // flat colour mode (entity boxes): no texel fetch, colour flat_rgb (R | G << 8 | B << 16)
@@ -126,7 +128,7 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, edge_exp: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, lod_pass: false, flat_on: false, flat_rgb: 0 as u32, flat_em: false, fade_a: 64, fade_inv: false, mesh_cls: 0, qt: 0 as u32,
+        cull: true, edge_exp: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, lm_on: false, lm_sky: 256, lm_gamma: 128, trans: false, lod_pass: false, flat_on: false, flat_rgb: 0 as u32, flat_em: false, fade_a: 64, fade_inv: false, mesh_cls: 0, qt: 0 as u32,
         vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0, slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
@@ -212,10 +214,23 @@ fn raster_set_fog(r: *mut Raster, on: bool, start: f64, end: f64, rgb_r: u32, rg
 // Light uniforms: day = sky light multiplier 0..256 (256 = full day, e.g. mc_sky.sky_light_day), tint = block
 // light colour multipliers per channel 0..256 (warm: 256 224 176).
 fn raster_set_light(r: *mut Raster, day: i32, tint_r: i32, tint_g: i32, tint_b: i32) {
+    if mc_lightmap.lm_is_packed(day) {
+        (*r).lm_on = true
+        (*r).lm_sky = mc_lightmap.lm_unpack_sky(day)
+        (*r).lm_gamma = tint_r
+        return
+    }
+    (*r).lm_on = false
     (*r).day = clamp256(day as i64)
     (*r).tint_r = clamp256(tint_r as i64)
     (*r).tint_g = clamp256(tint_g as i64)
     (*r).tint_b = clamp256(tint_b as i64)
+}
+
+fn vanilla_face_k(fk: i64) -> i64 {
+    if fk == 204 as i64 { return 153 as i64 }
+    if fk == 153 as i64 { return 204 as i64 }
+    return fk
 }
 
 fn clamp256(v: i64) -> i64 {
@@ -517,14 +532,26 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                         var fq: i64 = math.floor(100.0 + 52.0 * ao) as i64
                         if fq < 0 as i64 { fq = 0 }
                         if fq > 256 as i64 { fq = 256 }
-                        let total: i64 = (fq * (fk as i64)) / 256 as i64
-                        var s256: i64 = math.floor(sk * dayf / 15.0 + 0.5) as i64
-                        var b256: i64 = math.floor(bk * 256.0 / 15.0 + 0.5) as i64
-                        s256 = clamp256(s256)
-                        b256 = clamp256(b256)
-                        let tr: i64 = (total * light_factor(s256, b256, (*r).tint_r)) / 256 as i64
-                        let tg: i64 = (total * light_factor(s256, b256, (*r).tint_g)) / 256 as i64
-                        let tb: i64 = (total * light_factor(s256, b256, (*r).tint_b)) / 256 as i64
+                        var fkv: i64 = fk as i64
+                        if (*r).lm_on { fkv = vanilla_face_k(fkv) }
+                        let total: i64 = (fq * fkv) / 256 as i64
+                        var tr: i64 = 0 as i64
+                        var tg: i64 = 0 as i64
+                        var tb: i64 = 0 as i64
+                        if (*r).lm_on {
+                            let lc: mc_lightmap.LmRgb = mc_lightmap.lm_eval(sk, bk, (*r).lm_sky, (*r).lm_gamma)
+                            tr = (total * lc.r) / 256 as i64
+                            tg = (total * lc.g) / 256 as i64
+                            tb = (total * lc.b) / 256 as i64
+                        } else {
+                            var s256: i64 = math.floor(sk * dayf / 15.0 + 0.5) as i64
+                            var b256: i64 = math.floor(bk * 256.0 / 15.0 + 0.5) as i64
+                            s256 = clamp256(s256)
+                            b256 = clamp256(b256)
+                            tr = (total * light_factor(s256, b256, (*r).tint_r)) / 256 as i64
+                            tg = (total * light_factor(s256, b256, (*r).tint_g)) / 256 as i64
+                            tb = (total * light_factor(s256, b256, (*r).tint_b)) / 256 as i64
+                        }
                         var t0r: i64 = (tp & 255 as u32) as i64
                         var t0g: i64 = ((tp >> 8 as u32) & 255 as u32) as i64
                         var t0b: i64 = ((tp >> 16 as u32) & 255 as u32) as i64
