@@ -178,6 +178,9 @@ import mc.mc_audio
 import mc.mc_snd_events
 import mc.mc_entity
 import mc.mc_entity_draw
+import mc.mc_player_draw
+import mc.mc_skin_fetch
+import mc.mc_pskin
 import mc.v763.mc_snd_v763
 import audio.engine
 import audio.bank
@@ -477,6 +480,9 @@ struct Ctx {
     cam3: mc_camera3p.Cam3p,
     ents_on: bool, // MCPLAY_ENTITIES=0 switches the entity boxes off (packets are still tracked)
     entl: mc_entity_draw.EntList,
+    pdraw: mc_player_draw.PlayerDraw,
+    pdraw_on: bool,
+    hand_on: bool,
     ent_t: u64, // ns of the last interpolation step
     ent_peak: usize, // most entities tracked at once
     ent_vis_max: u32, // most entities that passed culling in one frame
@@ -3350,7 +3356,7 @@ fn handle_mouse(c: *mut Ctx) {
     if lp && !(*c).tgt_hit && (*c).hit && may_break(c) {
         let face: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
-        mc_play.send_swing(cl, (*c).seq)
+        mc_player_draw.pd_swing(&(*c).pdraw, now_ms()); mc_play.send_swing(cl, (*c).seq)
         mc_play.send_dig(cl, mc_play.DIG_START, (*c).pk.x, (*c).pk.y, (*c).pk.z, face, (*c).seq)
         if instant_break(c) {
             break_local(c, (*c).pk.x, (*c).pk.y, (*c).pk.z)
@@ -3405,7 +3411,7 @@ fn handle_mouse(c: *mut Ctx) {
         let face3: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
         mc_play.send_place(cl, (*c).pk.x, (*c).pk.y, (*c).pk.z, face3, (*c).seq)
-        mc_play.send_swing(cl, (*c).seq)
+        mc_player_draw.pd_swing(&(*c).pdraw, now_ms()); mc_play.send_swing(cl, (*c).seq)
         (*c).n_place = (*c).n_place + 1 as u64
         if env_flag("MCPLAY_DEBUG", false) { say(f"mcplay: dbg place sent at {(*c).pk.x},{(*c).pk.y},{(*c).pk.z} face={face3} player_mm={((*c).pl.x * 1000.0) as i64},{((*c).pl.y * 1000.0) as i64},{((*c).pl.z * 1000.0) as i64} slot={(*c).pl.slot} aud={(*c).aud}\n") }
         (*c).pend_place = true
@@ -3725,12 +3731,23 @@ fn ents_step(c: *mut Ctx) {
 fn ents_draw(c: *mut Ctx, b: *mut mc_backend.Backend) {
     if !(*c).ents_on || !(*c).have_pos { return }
     mc_entity_draw.entlist_set_hurt(&(*c).entl, &(*c).cfx.tint, now_ms())
+    (*c).entl.skip_players = (*c).pdraw_on
+    mc_player_draw.pd_sync_use(&(*c).pdraw, (*c).combat.using_item, (*c).cfx.use_kind, now_ms())
     mc_entity_draw.entlist_build_reg(&(*c).entl, &(*c).ents, &(*c).cam, ENT_MAX_DIST, ENT_FAR_LOD, &(*c).reg)
+    if (*c).pdraw_on { mc_player_draw.pd_remote(&(*c).pdraw, &(*c).entl, &(*c).ents, &(*c).cam, ENT_MAX_DIST, ENT_FAR_LOD, now_ms()) }
     mc_splash_draw.entlist_add_splashes(&(*c).entl, &(*c).splash, &(*c).cam, now_ms())
     mc_snowfall_draw.entlist_add_snowfall(&(*c).entl, &(*c).snowfall, &(*c).cam, now_ms())
     if mc_camera3p.mode_is_third((*c).cam3_mode) {
         let pose: i32 = mc_self_model.pose_of((*c).pl.swimming, (*c).pl.low_pose, (*c).pl.crouched, (*c).pl.sneaking)
-        mc_self_model.self_add(&(*c).entl, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, pose)
+        if (*c).pdraw_on {
+            mc_player_draw.pd_self(&(*c).pdraw, &(*c).entl, &(*c).icons, &(*c).reg, mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot), (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, (*c).pl.pitch,
+                pose == mc_self_model.POSE_SNEAK, pose == mc_self_model.POSE_PRONE, now_ms(), 0 as u64, 0 as u64)
+        } else {
+            mc_self_model.self_add(&(*c).entl, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, pose)
+        }
+    }
+    if (*c).pdraw_on && !mc_camera3p.mode_is_third((*c).cam3_mode) && (*c).hand_on {
+        mc_player_draw.pd_hand(&(*c).pdraw, &(*c).entl, &(*c).icons, &(*c).reg, mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot), &(*c).cam, (*c).pl.yaw, now_ms(), 0 as u64, 0 as u64)
     }
     let vis: u32 = (*c).entl.n_in - (*c).entl.n_culled
     if vis > (*c).ent_vis_max { (*c).ent_vis_max = vis }
@@ -4334,6 +4351,7 @@ fn session_free(c: *mut Ctx) {
     mc_model_mesh.ms_free(&(*c).ms)
     if (*c).wp != (0 as *mut window.Window) { window.close_window((*c).wp) }
     mc_entity_draw.entlist_free(&(*c).entl)
+    mc_player_draw.pd_free(&(*c).pdraw)
     mc_entity.store_free(&(*c).ents)
     mc_world.world_free(&(*c).world)
     mc_chunk.scratch_free(&(*c).sc)
@@ -4462,7 +4480,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
         eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
         cam3_mode: env_int("MCPLAY_CAM3P", 0), cam3: mc_camera3p.cam3p_new(),
-        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
+        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), pdraw: mc_player_draw.pd_new(), pdraw_on: env_flag("MCPLAY_PLAYER_MODEL", true), hand_on: env_flag("MCPLAY_HAND", true), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
         ent_frames: 0 as u64, ent_moving: 0 as u64, ent_resets: 0 as u64,
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, sev: mc_snd_events.sev_new(), n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
@@ -4547,6 +4565,22 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         return frc
     }
     mc_codec.wire_timeout(&c.cl.w, 2) // the frame loop must not block on the socket
+    if rt.buf_len(&(*ln).uuid) > 0 && env_flag("MCPLAY_SKIN", true) {
+        var raw_uuid: [u8; 16] = [0; 16]
+        if mc_auth.uuid_from_text(rt.buf_ptr(&(*ln).uuid), rt.buf_len(&(*ln).uuid), (&raw_uuid[0]) as u64) {
+            var hex: rt.Buf = rt.buf_new()
+            mc_auth.uuid_to_text((&raw_uuid[0]) as u64, false, &hex)
+            var own_skin: mc_pskin.Skin = mc_pskin.skin_new()
+            if mc_skin_fetch.skin_fetch(rt.buf_str(&hex), &own_skin) {
+                mc_player_draw.pd_set_self_skin(&c.pdraw, &own_skin)
+                say(f"mcplay: own skin loaded\n")
+            } else {
+                say(f"mcplay: own skin download failed, default skin\n")
+            }
+            mc_pskin.skin_free(&own_skin)
+            rt.buf_free(&hex)
+        }
+    }
     // r277: SO_RCVTIMEO(2 ms) is rounded up to the 15.6 ms Windows timer tick -> every idle frame waited a whole tick (all
     // mcplay frames sat at 15.6 ms with world_draw 1.4 ms). poll(0) before each read never waits; MCPLAY_NETPOLL=0 = old behaviour.
     if env_flag("MCPLAY_NETPOLL", true) { mc_codec.wire_poll_gate(&c.cl.w, true) }

@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.str
+import std.json
+import std.base64
+import net.http
+import mc.mc_pskin
+
+export { skin_fetch, skin_url_from_profile }
+
+const PROFILE_BASE: str = "https://sessionserver.mojang.com/session/minecraft/profile/"
+const BODY_MAX: usize = 262144
+
+fn span_is(sp: str.Span, lit: str) -> bool {
+    if sp.n != lit.length() { return false }
+    var i: usize = 0
+    while i < sp.n {
+        if sp.chars(i) != lit.chars(i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn get_body(c: *mut http.Client, url: str, out: *mut rt.Buf) -> bool {
+    var r: http.Response = http.resp_new()
+    let ne: u32 = http.http_get_num(c, url.p as u64, url.length(), &r)
+    if ne != 0 as u32 {
+        http.client_close(c)
+        http.resp_free(&r)
+        return false
+    }
+    let ok: bool = http.resp_status(&r) == 200 as u32 && http.resp_body_len(&r) <= BODY_MAX
+    if ok { rt.buf_push_bytes(out, http.resp_body_ptr(&r), http.resp_body_len(&r)) }
+    http.resp_free(&r)
+    return ok
+}
+
+fn find_textures_value(d: *mut json.Json, root: u32, out: *mut rt.Buf) -> bool {
+    let props: u32 = json.json_get(d, root, "properties".p as u64, 10)
+    if props == json.JSON_NONE { return false }
+    var it: u32 = json.json_child(d, props)
+    while it != json.JSON_NONE {
+        let nm: u32 = json.json_get(d, it, "name".p as u64, 4)
+        if nm != json.JSON_NONE {
+            let sp: str.Span = json.json_string(d, nm)
+            if sp.n == 8 && span_is(sp, "textures") {
+                let v: u32 = json.json_get(d, it, "value".p as u64, 5)
+                if v == json.JSON_NONE { return false }
+                let vs: str.Span = json.json_string(d, v)
+                return base64.decode(vs.p as u64, vs.n, out)
+            }
+        }
+        it = json.json_next(d, it)
+    }
+    return false
+}
+
+fn skin_url_from_profile(prof: u64, n: usize, url: *mut rt.Buf, slim: *mut bool) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, prof, n) catch false
+    if !ok { json.json_free(&d); return false }
+    var tex: rt.Buf = rt.buf_new()
+    var found: bool = false
+    if find_textures_value(&d, json.json_root(&d), &tex) {
+        var d2: json.Json = json.json_new()
+        let ok2: bool = json.json_parse(&d2, rt.buf_ptr(&tex), rt.buf_len(&tex)) catch false
+        if ok2 {
+            let t: u32 = json.json_get(&d2, json.json_root(&d2), "textures".p as u64, 8)
+            let sk: u32 = json.json_get(&d2, t, "SKIN".p as u64, 4)
+            let u: u32 = json.json_get(&d2, sk, "url".p as u64, 3)
+            if t != json.JSON_NONE && sk != json.JSON_NONE && u != json.JSON_NONE {
+                let us: str.Span = json.json_string(&d2, u)
+                rt.buf_push_bytes(url, us.p as u64, us.n)
+                *slim = false
+                let md: u32 = json.json_get(&d2, sk, "metadata".p as u64, 8)
+                if md != json.JSON_NONE {
+                    let m: u32 = json.json_get(&d2, md, "model".p as u64, 5)
+                    if m != json.JSON_NONE {
+                        let ms: str.Span = json.json_string(&d2, m)
+                        if ms.n == 4 && span_is(ms, "slim") { *slim = true }
+                    }
+                }
+                found = true
+            }
+        }
+        json.json_free(&d2)
+    }
+    rt.buf_free(&tex)
+    json.json_free(&d)
+    return found
+}
+
+fn skin_fetch(uuid_hex: str, out: *mut mc_pskin.Skin) -> bool {
+    var c: http.Client = http.client_new()
+    if !http.client_init(&c) { return false }
+    http.client_set_system_trust(&c, true)
+    http.client_set_timeout(&c, 8000)
+    var body: rt.Buf = rt.buf_new()
+    var url: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    var slim: bool = false
+    let purl: str = PROFILE_BASE + uuid_hex
+    if get_body(&c, purl, &body) && skin_url_from_profile(rt.buf_ptr(&body), rt.buf_len(&body), &url, &slim) {
+        rt.buf_clear(&body)
+        let us: str = str { p: rt.buf_data(&url), n: url.len }
+        if get_body(&c, us, &body) {
+            mc_pskin.skin_set_slim(out, slim)
+            ok = mc_pskin.skin_from_png(out, rt.buf_ptr(&body), rt.buf_len(&body))
+            if ok { mc_pskin.skin_set_slim(out, slim) }
+        }
+    }
+    rt.buf_free(&body)
+    rt.buf_free(&url)
+    http.client_free(&c)
+    return ok
+}
