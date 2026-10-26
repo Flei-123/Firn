@@ -2,7 +2,7 @@
 use crate::keyhash::{digest_hex, KeyHasher};
 use crate::modules::SourceFile;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -435,6 +435,8 @@ pub fn store_object(slot: &Slot, id: &str, obj: &[u8]) -> bool {
     write_atomic(&slot.dir, &object_path(&slot.dir, &slot.key, id), &encode_object(obj))
 }
 
+static TMP_SERIAL: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
     use std::io::Write;
     let objs = objects_dir(dir);
@@ -445,7 +447,8 @@ pub(crate) fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = objs.join(format!(".tmp-{}-{}", std::process::id(), nonce));
+    let serial = TMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let tmp = objs.join(format!(".tmp-{}-{}-{}", std::process::id(), nonce, serial));
     let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(data).and_then(|_| f.flush()));
     if written.is_err() || std::fs::rename(&tmp, target).is_err() {
         let _ = std::fs::remove_file(&tmp);

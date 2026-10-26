@@ -52,10 +52,10 @@ fn unhex(s: &str) -> Option<String> {
     String::from_utf8(bytes?).ok()
 }
 
-fn encode(key: &str) -> Vec<u8> {
+fn encode(key: &str, seen: Vec<Seen>) -> Vec<u8> {
     let mut body = String::new();
     body.push_str(&format!("key={}\n", key));
-    for s in recorded() {
+    for s in seen {
         match s {
             Seen::File { path, sha } => body.push_str(&format!("file {} {}\n", hex(&path), sha)),
             Seen::Probe { path, exists } => body.push_str(&format!("probe {} {}\n", hex(&path), exists as u8)),
@@ -117,7 +117,11 @@ pub fn lookup(dir: &Path, mkey: &str) -> Option<String> {
 }
 
 pub fn store(dir: &Path, mkey: &str, key: &str) -> bool {
-    buildcache::write_atomic(dir, &manifest_path(dir, mkey), &encode(key))
+    store_seen(dir, mkey, key, recorded())
+}
+
+fn store_seen(dir: &Path, mkey: &str, key: &str, seen: Vec<Seen>) -> bool {
+    buildcache::write_atomic(dir, &manifest_path(dir, mkey), &encode(key, seen))
 }
 
 #[cfg(test)]
@@ -140,9 +144,11 @@ mod tests {
         let f = d.join("a.fi");
         let ghost = d.join("ghost.fi");
         std::fs::write(&f, "one").unwrap();
-        read_source(&f, "one");
-        assert!(!exists(&ghost));
-        assert!(store(&d, "m1", "keyA"));
+        let seen = vec![
+            Seen::File { path: f.display().to_string(), sha: digest_hex(b"one") },
+            Seen::Probe { path: ghost.display().to_string(), exists: false },
+        ];
+        assert!(store_seen(&d, "m1", "keyA", seen));
         assert_eq!(lookup(&d, "m1").as_deref(), Some("keyA"));
         std::fs::write(&ghost, "x").unwrap();
         assert!(lookup(&d, "m1").is_none());
@@ -158,8 +164,8 @@ mod tests {
         let d = tmpdir();
         let f = d.join("b.fi");
         std::fs::write(&f, "q").unwrap();
-        read_source(&f, "q");
-        assert!(store(&d, "m2", "keyB"));
+        let seen = vec![Seen::File { path: f.display().to_string(), sha: digest_hex(b"q") }];
+        assert!(store_seen(&d, "m2", "keyB", seen));
         let p = manifest_path(&d, "m2");
         let mut b = std::fs::read(&p).unwrap();
         let n = b.len();
