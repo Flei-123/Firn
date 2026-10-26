@@ -90,6 +90,27 @@ session() {
 session PEdS 1 w 7
 session PEdD 1 wd 8
 session PEdC 0 w 5
+dim_session() {
+    local PN=PEdN NL
+    env FIRN_AUDIO=null MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_POS_LOG=1 MCPLAY_RUN_S=${EDGE_DIM_RUN_S:-24} MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_VIEW=3 \
+        "$W/mcplay" 127.0.0.1 "$PORT" "$PN" > "$W/$PN.out" 2>&1 &
+    local PP=$!
+    if wait_log "$PN joined the game" 90; then
+        sleep 4
+        NL=$(wc -l < "$W/server.log")
+        echo "execute in minecraft:the_nether run tp $PN 0.5 100 0.5 0 0" >&3
+        wait_log "Teleported $PN to" 10 "$NL" || { echo "  FAIL  $PN: nether tp not confirmed"; ERR=1; }
+    else
+        echo "  FAIL  $PN: no join"; ERR=1
+    fi
+    wait $PP; local RC=$?
+    [ $RC -eq 0 ] || { echo "  FAIL  $PN: exit code $RC"; ERR=1; }
+}
+case "$PROTO" in 769|77*|78*) dim_session
+    LD=$(grep -o "loaded=[0-9]*" "$W/PEdN.out" | tail -1 | cut -d= -f2)
+    echo "  N (dimension change): Player Loaded sent ${LD:-none}x"
+    [ "${LD:-0}" -ge 2 ] || { echo "  FAIL  N: Player Loaded not sent again after the dimension change (sent ${LD:-none}x)"; ERR=1; } ;;
+esac
 # verdict: poslog rows on the platform level (y within 100 mm of -55000) give the extremes; min_y over ALL rows after the tp shows a fall
 verdict() {
 python3 -I - "$W/$1.out" "$W/$1.pos" <<'PY'

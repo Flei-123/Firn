@@ -1,0 +1,116 @@
+// expect_exit: 0
+// OpenGL back end: a changed atlas uploads only the changed tiles; the image equals a full upload. SKIP (exit 0) without a GL context.
+import std.rt
+import std.io
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import gpu.gl_mc
+
+const W: i32 = 160
+const H: i32 = 90
+
+fn scene_mesh(b: *mut mc_backend.Backend) -> usize {
+    let v: u64 = rt.heap_alloc(4 * 8)
+    let ix: u64 = rt.heap_alloc(6 * 4)
+    let xs: [u32; 4] = [12 as u32, 4 as u32, 4 as u32, 12 as u32]
+    let ys: [u32; 4] = [2 as u32, 2 as u32, 14 as u32, 14 as u32]
+    let idx: [u32; 6] = [0 as u32, 1 as u32, 2 as u32, 0 as u32, 2 as u32, 3 as u32]
+    var k: usize = 0
+    while k < 4 {
+        rt.st32(v, k * 2, xs[k] | (ys[k] << 8 as u32) | (10 as u32 << 16 as u32) | (3 as u32 << 24 as u32))
+        rt.st32(v, k * 2 + 1, 1 as u32)
+        k = k + 1
+    }
+    k = 0
+    while k < 6 {
+        rt.st32(ix, k, idx[k])
+        k = k + 1
+    }
+    return (*b).mesh_upload((*b).obj, 1, v, 4, ix, 6)
+}
+
+fn render_copy(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, h: usize) -> u64 {
+    (*b).begin((*b).obj, cam as u64, 0xFFE6BE96 as u32)
+    (*b).draw((*b).obj, h, 0.0, 0.0, 0.0)
+    (*b).end((*b).obj)
+    let px: u64 = (*b).present((*b).obj)
+    let n: usize = (W as usize) * (H as usize) * 4
+    let out: u64 = rt.heap_alloc(n)
+    rt.mem_copy(out, px, n)
+    return out
+}
+
+fn paint_tile(a: *mut mc_texture.Atlas, t: u32, color: u32) {
+    let n: usize = ((*a).tile as usize) * ((*a).tile as usize)
+    let buf: u64 = rt.heap_alloc(n * 4)
+    var i: usize = 0
+    while i < n {
+        rt.st32(buf, i, color)
+        i = i + 1
+    }
+    mc_texture.atlas_set_tile(a, t, buf)
+    rt.heap_free(buf, n * 4)
+}
+
+fn diff_count(a: u64, b: u64) -> u64 {
+    var n: u64 = 0
+    var i: usize = 0
+    while i < (W as usize) * (H as usize) {
+        if rt.ld32(a, i) != rt.ld32(b, i) { n = n + 1 as u64 }
+        i = i + 1
+    }
+    return n
+}
+
+fn main(start: u64) -> i32 {
+    var va: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    if !va.ok {
+        io.fmt_print(f"SKIP glbe_open\n")
+        return 0
+    }
+    var vb: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    var ba: mc_backend.Backend = gl_mc.glbe_backend(&va)
+    var bb: mc_backend.Backend = gl_mc.glbe_backend(&vb)
+    var atlas: mc_texture.Atlas = mc_texture.atlas_default()
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    var fails: i32 = 0
+    ba.upload_atlas(ba.obj, (&atlas) as u64)
+    let ha: usize = scene_mesh(&ba)
+    let before: u64 = render_copy(&ba, &cam, ha)
+    ba.upload_atlas(ba.obj, (&atlas) as u64)
+    if gl_mc.glbe_atlas_tiles_sent(&va) != 0 as u64 { fails = fails + 1 }
+    paint_tile(&atlas, 1 as u32, 0xFF2040E0 as u32)
+    paint_tile(&atlas, 7 as u32, 0xFF40E020 as u32)
+    ba.upload_atlas(ba.obj, (&atlas) as u64)
+    let sent: u64 = gl_mc.glbe_atlas_tiles_sent(&va)
+    io.fmt_print(f"tiles sent after two changed tiles: {sent}\n")
+    if sent != 2 as u64 { fails = fails + 1 }
+    let partial: u64 = render_copy(&ba, &cam, ha)
+    bb.upload_atlas(bb.obj, (&atlas) as u64)
+    let hb: usize = scene_mesh(&bb)
+    let full: u64 = render_copy(&bb, &cam, hb)
+    let d_full: u64 = diff_count(partial, full)
+    let d_old: u64 = diff_count(partial, before)
+    io.fmt_print(f"partial vs full upload: {d_full} px differ, partial vs old atlas: {d_old} px differ\n")
+    if d_full != 0 as u64 || d_old < 1000 as u64 { fails = fails + 1 }
+    ba.upload_atlas(ba.obj, (&atlas) as u64)
+    if gl_mc.glbe_atlas_tiles_sent(&va) != 2 as u64 { fails = fails + 1 }
+    var t: u32 = 1
+    while t <= 200 as u32 {
+        paint_tile(&atlas, t, 0xFF0000FF as u32 | (t << 8 as u32))
+        t = t + 1 as u32
+    }
+    ba.upload_atlas(ba.obj, (&atlas) as u64)
+    bb.upload_atlas(bb.obj, (&atlas) as u64)
+    let big_a: u64 = render_copy(&ba, &cam, ha)
+    let big_b: u64 = render_copy(&bb, &cam, hb)
+    if diff_count(big_a, big_b) != 0 as u64 { fails = fails + 1 }
+    gl_mc.glbe_close(&va)
+    gl_mc.glbe_close(&vb)
+    io.fmt_print(f"gl atlas partial: {fails} failed\n")
+    return fails
+}
