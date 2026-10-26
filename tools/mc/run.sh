@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | hudplay | combatplay | swimplay | fluidplay | weatherplay | startplay | menuplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom | slimeplay | snowplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | hudplay | combatplay | swimplay | fluidplay | weatherplay | startplay | menuplay | sessplay | edge | slowplay | modelplay | vanillaplay | lodseam | biomezoom | slimeplay | snowplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -181,6 +181,12 @@ if [ -z "$ONLY" ] || [ "$ONLY" = edge ]; then
     bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
     MC_VERSION=1.21.4 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
     MC_VERSION=1.21.8 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
+fi
+# movement effect blocks (soul sand, honey, cobweb slowdown; bamboo / pointed dripstone XZ offset collision) against the real server: ~4 min per version.
+if [ -z "$ONLY" ] || [ "$ONLY" = slowplay ]; then
+    echo "== mc/slowplay =="
+    bash tools/mc/play/run_slow.sh || ERR=$((ERR+1))
+    MC_VERSION=1.21.4 bash tools/mc/play/run_slow.sh || ERR=$((ERR+1))
 fi
 if [ -z "$ONLY" ] || [ "$ONLY" = swimplay ]; then
     echo "== mc/swimplay =="
