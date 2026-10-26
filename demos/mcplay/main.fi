@@ -160,6 +160,10 @@ import mc.mc_effect
 import mc.mc_dig
 import mc.mc_game_mode
 import mc.mc_dig_sel
+import mc.mc_crack
+import mc.mc_crack_anim
+import mc.mc_crack_view
+import mc.mc_dig_bot
 import mc.mc_craft
 import mc.mc_craft_sel
 import gpu.glctx
@@ -263,6 +267,11 @@ fn env_flag(name: str, fallback: bool) -> bool {
         return fallback
     }
     return v.chars(0) == 49 as u8
+}
+
+fn env_str(name: str, fallback: str) -> str {
+    if !env.has(name) { return fallback }
+    return env.get(name)
 }
 
 fn env_int(name: str, fallback: i32) -> i32 {
@@ -426,6 +435,14 @@ struct Ctx {
     dig_z: i32,
     dig_t0: u64,
     dig_ms: u64,
+    crk: mc_crack.CrackTex,
+    crk_tried: bool,
+    crk_on: bool,
+    cra: mc_crack_anim.CrackAnims,
+    crk_own: u64,
+    bot: mc_dig_bot.DigBot,
+    bot_go: str,
+    crk_other: u64,
     seq: i32,
     place_id: i32,
     ticks_day: i32,
@@ -986,6 +1003,8 @@ fn on_packet(c: *mut Ctx, id: i32) {
         on_block_change(c)
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MULTI_BLOCK_CHANGE) {
         on_multi_change(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_BLOCK_BREAK_ANIMATION) {
+        mc_crack_anim.crack_anims_on_packet(&(*c).cra, mc_client.client_body(cl), now_ms())
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UPDATE_TIME) {
         on_time(c)
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
@@ -1332,6 +1351,18 @@ fn test_flags() -> i32 {
     return f
 }
 
+fn dig_bot_tick(c: *mut Ctx) {
+    if !(*c).bot.on || !(*c).have_pos { return }
+    let go: bool = (*c).bot_go.length() == 0 || fs.exists((*c).bot_go)
+    let act: i32 = mc_dig_bot.digbot_step(&(*c).bot, now_ms(), go)
+    if act == mc_dig_bot.DIGBOT_NONE { return }
+    var status: i32 = mc_play.DIG_START
+    if act == mc_dig_bot.DIGBOT_CANCEL { status = mc_play.DIG_CANCEL }
+    (*c).seq = (*c).seq + 1
+    let ok: bool = mc_play.send_dig(&(*c).cl, status, (*c).bot.x, (*c).bot.y, (*c).bot.z, 1, (*c).seq)
+    say(f"mcplay: dig_bot action={act} sent={ok}\n")
+}
+
 fn run_tests(c: *mut Ctx, tf: i32) {
     if (tf & 1) != 0 { click_test(c) }
     if (tf & 2) != 0 { click_test2(c) }
@@ -1640,6 +1671,28 @@ fn hud_base(c: *mut Ctx, r: *mut mc_raster.Raster, d: *mut mc_hud.HudDebug) {
         di.state = (*d).id
         mc_hud_debug.dbg_draw(r, s, &di, &(*c).world, &(*c).reg)
     }
+}
+
+fn draw_cracks(c: *mut Ctx, r: *mut mc_raster.Raster) {
+    if !(*c).crk_on || !(*c).have_pos { return }
+    if !(*c).crk_tried {
+        (*c).crk_tried = true
+        if !mc_crack.crack_tex_open(&(*c).crk, (*c).protocol) { say(f"mcplay: crack textures unavailable\n") }
+    }
+    if !mc_crack.crack_tex_ok(&(*c).crk) { return }
+    let now: u64 = now_ms()
+    if (*c).digging {
+        let st: i32 = mc_crack.crack_stage(now - (*c).dig_t0, (*c).dig_ms)
+        var b: mc_crack.CrackBox = mc_crack_view.crackv_unit_box((*c).dig_x, (*c).dig_y, (*c).dig_z)
+        if (*c).hit && (*c).pk.x == (*c).dig_x && (*c).pk.y == (*c).dig_y && (*c).pk.z == (*c).dig_z && (*c).models_on {
+            var mb: mc_model_pick.MpBox = sel_box(c)
+            b = mc_crack.CrackBox { x0: mb.x0, y0: mb.y0, z0: mb.z0, x1: mb.x1, y1: mb.y1, z1: mb.z1 }
+        }
+        mc_crack_view.crackv_draw_block(r, &(*c).cam, &(*c).crk, &(*c).world, (*c).dim.min_y, &(*c).itb, (*c).dig_x, (*c).dig_y, (*c).dig_z, st, &b)
+        (*c).crk_own = (*c).crk_own + 1 as u64
+    }
+    let n: i32 = mc_crack_view.crackv_draw_anims(r, &(*c).cam, &(*c).crk, &(*c).cra, &(*c).world, (*c).dim.min_y, &(*c).itb, now)
+    (*c).crk_other = (*c).crk_other + (n as u64)
 }
 
 fn draw_inventory(c: *mut Ctx, r: *mut mc_raster.Raster) {
@@ -3719,6 +3772,7 @@ fn draw_frame_gl(c: *mut Ctx) {
     var rec: rt.Buf = rt.buf_new()
     mc_hud.hud_record(&rec)
     mc_weather_fx.weather_fx_draw(&(*c).g.r, mc_hud.hud_scale((*c).w, (*c).h), &(*c).weather, now_ms())
+    draw_cracks(c, &(*c).g.r)
     hud_base(c, &(*c).g.r, &d)
     draw_inventory(c, &(*c).g.r)
     mc_hud.hud_record(0 as *mut rt.Buf)
@@ -3891,6 +3945,7 @@ fn draw_frame_vk(c: *mut Ctx) {
     var rec: rt.Buf = rt.buf_new()
     mc_hud.hud_record(&rec)
     mc_weather_fx.weather_fx_draw(&(*c).g.r, mc_hud.hud_scale((*c).w, (*c).h), &(*c).weather, now_ms())
+    draw_cracks(c, &(*c).g.r)
     hud_base(c, &(*c).g.r, &d)
     draw_inventory(c, &(*c).g.r)
     mc_hud.hud_record(0 as *mut rt.Buf)
@@ -3963,6 +4018,7 @@ fn draw_frame(c: *mut Ctx) {
         d.nz = (*c).pk.nz
     }
     mc_weather_fx.weather_fx_draw(r, mc_hud.hud_scale((*c).w, (*c).h), &(*c).weather, now_ms())
+    draw_cracks(c, r)
     hud_base(c, r, &d)
     draw_inventory(c, r)
 }
@@ -4330,7 +4386,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         join: false, have_pos: false, last_tp: 0, tp_quiet_until: 0 as u64, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
         creative: env_flag("MCPLAY_CREATIVE", true), creative_fixed: env.has("MCPLAY_CREATIVE"),
         acc_dx: 0.0, acc_dy: 0.0, tot_dx: 0.0, tot_dy: 0.0, n_f11: 0, want_fly: false, want_noclip: false, sent_slot: 0 - 1,
-        digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, seq: 0,
+        digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, crk: mc_crack.crack_tex_new(), crk_tried: false, crk_on: env_flag("MCPLAY_CRACK", true), cra: mc_crack_anim.crack_anims_new(), crk_own: 0 as u64, bot: mc_dig_bot.digbot_new(env.has("MCPLAY_BOT_DIG_Y"), env_int("MCPLAY_BOT_DIG_X", 0), env_int("MCPLAY_BOT_DIG_Y", 0), env_int("MCPLAY_BOT_DIG_Z", 0), env_int("MCPLAY_BOT_DIG_MS", 3000) as u64), bot_go: env_str("MCPLAY_BOT_GO_FILE", ""), crk_other: 0 as u64, seq: 0,
         place_id: env_int("MCPLAY_PLACE_ID", 0), ticks_day: env_int("MCPLAY_TICKS", 2000),
         light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, n_region_moves: 0 as u64, day_time: 0, day_fixed: false, n_time: 0,
         aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
@@ -4542,6 +4598,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
             say(f"mcplay: progress ticks={c.n_ticks} pos={c.have_pos} chunks={c.n_chunks} ground={c.pl.on_ground} y_mm={(c.pl.y * 1000.0) as i64} walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps}\n")
         }
         if quit_file.length() > 0 && c.n_frames % 5 as u64 == 0 as u64 && fs.exists(quit_file) { c.closed = true }
+        dig_bot_tick(&c)
         if spin_step != 0.0 { c.pl.yaw = c.pl.yaw + spin_step }
         if c.have_pos {
             mc_input.player_set_camera(&c.pl, &c.cam)
@@ -4633,7 +4690,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     say(f"mcplay: walk walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps} ticks_dropped={tick_dropped}\n")
     say(f"mcplay: gamemode mode={c.health.mode} creative={c.creative} fixed={c.creative_fixed}\n")
     say(f"mcplay: input grab={c.grab} fullscreen={window.is_fullscreen(c.wp)} f11={c.n_f11} raw_dx={c.tot_dx} raw_dy={c.tot_dy} yaw={c.pl.yaw} pitch={c.pl.pitch} win={window.width(c.wp)}x{window.height(c.wp)} dpi={window.dpi(c.wp)}\n")
-    say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms} dig_total={c.dig_total} dig_table={c.dg.nblocks}\n")
+    say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms} crack_own={c.crk_own} crack_other={c.crk_other} crack_updates={c.cra.updates} dig_total={c.dig_total} dig_table={c.dg.nblocks}\n")
     say(f"mcplay: fx haste={mc_effect.fx_haste(&c.fx)} fatigue={mc_effect.fx_fatigue(&c.fx)} eff={mc_inv.inv_held_eff(&c.inv, c.pl.slot)} eff0={mc_inv.inv_held_eff(&c.inv, 0)} fx_ticks={c.fx_ticks} plain_ticks={c.fx_plain} clicks={c.inv.n_clicks} cursor={mc_inv.inv_cursor_item(&c.inv)}x{mc_inv.inv_cursor_count(&c.inv)} slot10={mc_inv.inv_count(&c.inv, 10)} slot11={mc_inv.inv_count(&c.inv, 11)}\n")
     if env_int("MCPLAY_CONT_UI", 0) > 0 {
         say(f"mcplay: contui end show_inv={c.show_inv} cont_ui={c.cont_ui} win={mc_inv.inv_window(&c.inv)} grab={c.grab} bad={c.inv.bad}\n")

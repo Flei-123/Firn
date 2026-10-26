@@ -29,6 +29,7 @@ import std.time
 import mc.mc_backend
 import mc.mc_camera
 import mc.mc_texture
+import mc.mc_atlas_shadow
 import mc.mc_math
 import mc.mc_sky
 import gpu.vk
@@ -42,7 +43,7 @@ export {
     VkBackend, vkbe_open, vkbe_open_cache, vkbe_on_rebuild, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
     vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_open_win_v, vkbe_wait, vkbe_mem_stats,
     vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky, vkbe_tint, vkbe_hud, vkbe_blank, vkbe_open_into, vkbe_lost, vkbe_inject_lost,
-    vkbe_open_win, vkbe_sc_on, vkbe_window_pixels, vkbe_sc_stat, SC_PRESENTS, SC_SKIPS, SC_REBUILDS, SC_OUT_OF_DATE, SC_SUBOPTIMAL, SC_FORMAT,
+    vkbe_atlas_tiles_sent, vkbe_open_win, vkbe_sc_on, vkbe_window_pixels, vkbe_sc_stat, SC_PRESENTS, SC_SKIPS, SC_REBUILDS, SC_OUT_OF_DATE, SC_SUBOPTIMAL, SC_FORMAT,
 }
 
 const SC_PRESENTS: i32 = 0 // vkbe_sc_stat selectors
@@ -136,6 +137,9 @@ struct VkBackend {
     bound: u64, // pipeline currently bound in the recording command buffer (0 = none)
     fs: [FSlot; 2],
     atlas: vk_mem.Img,
+    ash: mc_atlas_shadow.AtlasShadow,
+    alayers: usize,
+    atlas_tiles_sent: u64,
     tile: i32,
     layers_lost: i32,
     meshes: u64, // mcap * MW words
@@ -199,7 +203,7 @@ fn blank() -> VkBackend {
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
         gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_ent: vk_desc.vpipe_none(), pipe_mod_op: vk_desc.vpipe_none(), pipe_mod_tr: vk_desc.vpipe_none(), mcls: 0, rv3: 0.0, rv7: 0.0, rv11: 0.0, cube: vk_mem.buf_none(), ents_drawn: 0, pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
-        fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
+        fs: [fslot_none(); 2], atlas: vk_mem.img_none(), ash: mc_atlas_shadow.shadow_new(), alayers: 0, atlas_tiles_sent: 0 as u64, tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, lost: false, inject_lost: false, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
         fog_start: 20.0, fog_end: 90.0, fog_r: 150.0, fog_g: 190.0, fog_b: 230.0, draws: 0, tris: 0,
@@ -663,15 +667,87 @@ fn defer_add(b: *mut VkBackend, kind: u64, buf: u64, blk: usize, off: u64, size:
 }
 
 // ---- atlas -----------------------------------------------------------------------------------------------------------------
+fn atlas_barrier_layers(b: *mut VkBackend) -> u64 {
+    if (*b).alayers < 2 { return 2 as u64 }
+    return (*b).alayers as u64
+}
+
+fn vkbe_atlas_tiles_sent(b: *mut VkBackend) -> u64 {
+    return (*b).atlas_tiles_sent
+}
+
+fn atlas_update_tiles(b: *mut VkBackend, at: *mut mc_texture.Atlas) -> bool {
+    if !(*b).atlas.ok || (*b).tile != (*at).tile { return false }
+    if !mc_atlas_shadow.shadow_matches(&(*b).ash, at) { return false }
+    let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    var layers: usize = total
+    if (layers as u64) > (*b).x.max_layers { layers = (*b).x.max_layers as usize }
+    if layers != (*b).alayers { return false }
+    let list: u64 = rt.heap_alloc(layers * 4)
+    if list == 0 { return false }
+    let n: usize = mc_atlas_shadow.shadow_changed_list(&(*b).ash, at, layers, list)
+    if n == 0 {
+        rt.heap_free(list, layers * 4)
+        return true
+    }
+    if n * 2 > layers {
+        rt.heap_free(list, layers * 4)
+        return false
+    }
+    let t: usize = (*at).tile as usize
+    let lbytes: usize = t * t * 4
+    let rgs: u64 = rt.heap_alloc(n * 56)
+    var st: vk_mem.Buf = vk_mem.buf_make(&(*b).x, (n * lbytes) as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    if rgs == 0 || !st.ok {
+        if rgs != 0 { rt.heap_free(rgs, n * 56) }
+        if st.ok { vk_mem.buf_free(&(*b).x, &st) }
+        rt.heap_free(list, layers * 4)
+        return false
+    }
+    rt.mem_set(rgs, 0 as u8, n * 56)
+    vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+    var k: usize = 0
+    while k < n {
+        let g: usize = rt.ld32(list, k) as usize
+        mc_atlas_shadow.shadow_tile_gather(&(*b).ash, at, g, st.ptr + (k * lbytes) as u64)
+        let rg: u64 = rgs + (k * 56) as u64
+        vk_mem.w64(rg, 0, (k * lbytes) as u64)
+        vk_mem.w32(rg, 16, 1)
+        vk_mem.w32(rg, 24, g as u64)
+        vk_mem.w32(rg, 28, 1)
+        vk_mem.w32(rg, 44, t as u64)
+        vk_mem.w32(rg, 48, t as u64)
+        vk_mem.w32(rg, 52, 1)
+        k = k + 1
+    }
+    let cmd: u64 = vk_frame.imm_begin(&(*b).x, &(*b).fr)
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, atlas_barrier_layers(b), vk_frame.LAYOUT_SHADER_READ, vk_frame.LAYOUT_TRANSFER_DST,
+        vk_frame.ST_FRAGMENT, vk_frame.ST_TRANSFER, vk_frame.AC_SHADER_READ, vk_frame.AC_TRANSFER_WRITE)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_B2I, cmd, st.buf, (*b).atlas.img, vk_frame.LAYOUT_TRANSFER_DST, n as u64, rgs, 0, 0, 0, 0)
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, atlas_barrier_layers(b), vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_SHADER_READ,
+        vk_frame.ST_TRANSFER, vk_frame.ST_FRAGMENT, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_SHADER_READ)
+    vk_frame.imm_submit(&(*b).x, &(*b).fr)
+    vk_mem.buf_free(&(*b).x, &st)
+    rt.heap_free(rgs, n * 56)
+    rt.heap_free(list, layers * 4)
+    (*b).atlas_tiles_sent = (*b).atlas_tiles_sent + n as u64
+    return true
+}
+
 fn be_atlas(o: u64, a: u64) {
     let b: *mut VkBackend = o as *mut VkBackend
     let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
     if !(*b).ok || (*at).px == 0 {
         return
     }
+    if atlas_update_tiles(b, at) {
+        return
+    }
     vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
     reap(b)
     vk_mem.img_free(&(*b).x, &(*b).atlas)
+    mc_atlas_shadow.shadow_free(&(*b).ash)
+    (*b).alayers = 0
     let t: usize = (*at).tile as usize
     var layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
     (*b).layers_lost = 0
@@ -724,6 +800,8 @@ fn be_atlas(o: u64, a: u64) {
     vk_frame.imm_submit(&(*b).x, &(*b).fr)
     vk_mem.buf_free(&(*b).x, &st)
     (*b).tile = (*at).tile
+    (*b).alayers = layers
+    mc_atlas_shadow.shadow_store(&(*b).ash, at)
     var i: usize = 0
     while i < NFR {
         vk_desc.desc_write_atlas(&(*b).x, &(*b).d, i, (*b).atlas.view)
@@ -1563,6 +1641,7 @@ fn vkbe_close(b: *mut VkBackend) {
         }
         targets_free(b)
         vk_mem.img_free(&(*b).x, &(*b).atlas)
+        mc_atlas_shadow.shadow_free(&(*b).ash)
         vk_desc.bview_free(&(*b).x, (*b).gran_view)
         vk_desc.bview_free(&(*b).x, (*b).org_view)
         vk_mem.buf_free(&(*b).x, &(*b).gran)

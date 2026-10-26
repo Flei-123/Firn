@@ -36,6 +36,7 @@ import mc.mc_backend
 import mc.mc_prof
 import mc.mc_camera
 import mc.mc_texture
+import mc.mc_atlas_shadow
 import mc.mc_math
 import gpu.glctx
 import gpu.gl33
@@ -48,7 +49,7 @@ export {
     glbe_gl, glbe_renderer, glbe_draws, glbe_tris, glbe_resize, glbe_fbo_texture,
     MODE_LEGACY, MODE_POOL, MODE_MULTI, MODE_INDIRECT,
     glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
-    glbe_max_layers, glbe_layers_lost, glbe_set_layer_limit, glbe_atlas_pages, glbe_calls, glbe_tris_submitted, glbe_set_facecull, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
+    glbe_max_layers, glbe_layers_lost, glbe_set_layer_limit, glbe_atlas_pages, glbe_atlas_tiles_sent, glbe_calls, glbe_tris_submitted, glbe_set_facecull, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
     // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
     glbe_x, glbe_near, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
@@ -208,11 +209,8 @@ struct GlBackend {
     org_max: usize,
     pend: u64, // slot index per collected draw
     pend_n: usize,
-    ashadow: u64,
-    ashadow_bytes: usize,
-    sh_tile: i32,
-    sh_cols: i32,
-    sh_rows: i32,
+    ash: mc_atlas_shadow.AtlasShadow,
+    atlas_tiles_sent: u64,
     mpend: u64,
     mpend_n: usize,
     mpend_cap: usize,
@@ -250,7 +248,7 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true,
         slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
         mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
-        org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0, ashadow: 0, ashadow_bytes: 0, sh_tile: 0, sh_cols: 0, sh_rows: 0, mpend: 0, mpend_n: 0, mpend_cap: 0,
+        org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0, ash: mc_atlas_shadow.shadow_new(), atlas_tiles_sent: 0 as u64, mpend: 0, mpend_n: 0, mpend_cap: 0,
         sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, facecull: false, up_keep: false, tris_sub: 0 as u64, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
         up_bytes: 0, frame_up: 0, x: gl_ext.glx_new(), xok: false, msaa: 0,
         mt: gl_fbo.Target { ok: false, w: w, h: h, n_color: 1, depth_mode: gl_fbo.DEPTH_RENDERBUFFER, samples: 0, fbo: 0 as u32,
@@ -1046,63 +1044,12 @@ fn be_atlas(o: u64, a: u64) {
     }
     (*gb).atile = (*at).tile
     (*gb).acols = (*at).cols
-    atlas_shadow_store(gb, at)
-}
-
-fn atlas_shadow_store(gb: *mut GlBackend, at: *mut mc_texture.Atlas) {
-    let bytes: usize = ((*at).w as usize) * ((*at).h as usize) * 4
-    if (*gb).ashadow != 0 && (*gb).ashadow_bytes != bytes {
-        rt.heap_free((*gb).ashadow, (*gb).ashadow_bytes)
-        (*gb).ashadow = 0
-    }
-    if (*gb).ashadow == 0 {
-        (*gb).ashadow = rt.heap_alloc(bytes)
-        (*gb).ashadow_bytes = bytes
-    }
-    if (*gb).ashadow == 0 {
-        (*gb).ashadow_bytes = 0
-        return
-    }
-    rt.mem_copy((*gb).ashadow, (*at).px, bytes)
-    (*gb).sh_tile = (*at).tile
-    (*gb).sh_cols = (*at).cols
-    (*gb).sh_rows = (*at).rows
-}
-
-fn atlas_tile_changed(gb: *mut GlBackend, at: *mut mc_texture.Atlas, g: usize) -> bool {
-    let t: usize = (*at).tile as usize
-    let row: usize = t * 4
-    let stride: usize = ((*at).w as usize) * 4
-    let col: usize = g % ((*at).cols as usize)
-    let rw: usize = g / ((*at).cols as usize)
-    var y: usize = 0
-    while y < t {
-        let off: usize = (rw * t + y) * stride + col * row
-        if !rt.mem_eq((*gb).ashadow + off as u64, (*at).px + off as u64, row) { return true }
-        y = y + 1
-    }
-    return false
-}
-
-fn atlas_tile_gather(gb: *mut GlBackend, at: *mut mc_texture.Atlas, g: usize, out: u64) {
-    let t: usize = (*at).tile as usize
-    let row: usize = t * 4
-    let stride: usize = ((*at).w as usize) * 4
-    let col: usize = g % ((*at).cols as usize)
-    let rw: usize = g / ((*at).cols as usize)
-    var y: usize = 0
-    while y < t {
-        let off: usize = (rw * t + y) * stride + col * row
-        rt.mem_copy(out + (y * row) as u64, (*at).px + off as u64, row)
-        rt.mem_copy((*gb).ashadow + off as u64, (*at).px + off as u64, row)
-        y = y + 1
-    }
+    mc_atlas_shadow.shadow_store(&(*gb).ash, at)
 }
 
 fn atlas_update_tiles(gb: *mut GlBackend, at: *mut mc_texture.Atlas) -> bool {
-    if (*gb).mip || (*gb).atlas_tex == 0 as u32 || (*gb).ashadow == 0 { return false }
-    if (*gb).sh_tile != (*at).tile || (*gb).sh_cols != (*at).cols || (*gb).sh_rows != (*at).rows { return false }
-    if (*gb).ashadow_bytes != ((*at).w as usize) * ((*at).h as usize) * 4 { return false }
+    if (*gb).mip || (*gb).atlas_tex == 0 as u32 { return false }
+    if !mc_atlas_shadow.shadow_matches(&(*gb).ash, at) { return false }
     let t: usize = (*at).tile as usize
     let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
     let buf: u64 = rt.heap_alloc(t * t * 4)
@@ -1110,8 +1057,9 @@ fn atlas_update_tiles(gb: *mut GlBackend, at: *mut mc_texture.Atlas) -> bool {
     let pl: usize = (*gb).page_layers as usize
     var g: usize = 0
     while g < total {
-        if atlas_tile_changed(gb, at, g) {
-            atlas_tile_gather(gb, at, g, buf)
+        if mc_atlas_shadow.shadow_tile_changed(&(*gb).ash, at, g) {
+            mc_atlas_shadow.shadow_tile_gather(&(*gb).ash, at, g, buf)
+            (*gb).atlas_tiles_sent = (*gb).atlas_tiles_sent + 1 as u64
             let pg: usize = g / pl
             var tex: u32 = (*gb).atlas_tex
             if pg > 0 && pg <= 3 { tex = (*gb).atlas_x[pg - 1] }
@@ -1145,6 +1093,10 @@ fn free_atlas_pages(gb: *mut GlBackend) {
 // thousands of layers. Takes effect on the next upload_atlas.
 fn glbe_set_layer_limit(gb: *mut GlBackend, n: i32) {
     (*gb).limit_set = n
+}
+
+fn glbe_atlas_tiles_sent(gb: *mut GlBackend) -> u64 {
+    return (*gb).atlas_tiles_sent
 }
 
 fn glbe_atlas_pages(gb: *mut GlBackend) -> i32 {
