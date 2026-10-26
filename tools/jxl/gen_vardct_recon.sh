@@ -15,3 +15,8 @@ done
 for f in t64 t37x29 s300x200 s600x300; do
     $J/djxl "$V/${f}_e7.jxl" "$V/${f}_e7.ppm"
 done
+python3 -I tools/jxl/gen_vardct_acs_corpus.py "$D"
+for f in acsmix acsedges acsnoise; do
+    $J/cjxl "$D/$f.png" "$V/${f}_e8.jxl" -d 1.5 -e 8 --epf=1
+    $J/djxl "$V/${f}_e8.jxl" "$V/${f}_e8.ppm"
+done

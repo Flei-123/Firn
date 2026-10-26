@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/jxl/jxl_vdrecon.fi -- jxl_vdrecon: JPEG XL VarDCT reconstruction (dequantization, inverse DCT, XYB to sRGB)
+import jxl.jxl_acs
+import jxl.jxl_acstrans
 import jxl.jxl_cmap
 import jxl.jxl_dcsmooth
-import jxl.jxl_dct
 import jxl.jxl_epf
 import jxl.jxl_err
 import jxl.jxl_gaborish
 import jxl.jxl_lfdata
 import jxl.jxl_qweights
+import jxl.jxl_qwtab
 import jxl.jxl_quant
 import jxl.jxl_vardct
 import jxl.jxl_xyb
@@ -42,9 +44,10 @@ fn qmul(scale: u32) -> f64 {
     return m
 }
 
-fn dequant_dct8(v: *mut jxl_vardct.JxlVardct, table: u64, bx: usize, by: usize, coef: u64) {
+fn dequant_block(v: *mut jxl_vardct.JxlVardct, t: u32, table: u64, bx: usize, by: usize, coef: u64) {
     let d: *mut jxl_lfdata.JxlLfData = &(*v).data
     let idx: usize = jxl_lfdata.lfd_idx(d, bx, by)
+    let n: usize = jxl_acs.acs_cover_x(t) * jxl_acs.acs_cover_y(t) * 64
     let qf: f64 = vec.vec_at[i32](&(*d).qf, idx) as f64
     let scale: f64 = jxl_quant.quant_inv_global_scale(&(*v).lfg.quant) / qf
     var mulc: [f64; 3] = [scale * qmul((*v).doc.frame.x_qm_scale), scale, scale * qmul((*v).doc.frame.b_qm_scale)]
@@ -53,23 +56,86 @@ fn dequant_dct8(v: *mut jxl_vardct.JxlVardct, table: u64, bx: usize, by: usize, 
     let rb: f64 = jxl_cmap.cmap_ratio_b(&(*v).lfg.cmap, vec.vec_at[i32](&(*d).ytob, tile))
     let qo: usize = vec.vec_at[u32](&(*d).qoff, idx) as usize
     var k: usize = 0
-    while k < 64 {
+    while k < n {
         var c: usize = 0
         while c < 3 {
             let q: i32 = vec.vec_at[i32](&(*d).coefs, c * (*d).coef_stride + qo + k)
-            fst(coef, c * 64 + k, jxl_qweights.qw_bias_adjust(q, c) * fld(table, c * 64 + k) * mulc[c])
+            fst(coef, c * n + k, jxl_qweights.qw_bias_adjust(q, c) * fld(table, c * n + k) * mulc[c])
             c = c + 1
         }
-        let yv: f64 = fld(coef, 64 + k)
+        let yv: f64 = fld(coef, n + k)
         fst(coef, k, fld(coef, k) + rx * yv)
-        fst(coef, 128 + k, fld(coef, 128 + k) + rb * yv)
+        fst(coef, 2 * n + k, fld(coef, 2 * n + k) + rb * yv)
         k = k + 1
     }
-    var c2: usize = 0
-    while c2 < 3 {
-        fst(coef, c2 * 64, jxl_lfdata.lfd_dc_get(d, c2, bx, by))
-        c2 = c2 + 1
+}
+
+fn kind_table(tabs: u64, kind: usize) -> u64 {
+    var p: u64 = *((tabs +% ((kind * 8) as u64)) as *mut u64)
+    if p != 0 {
+        return p
     }
+    let bytes: usize = 3 * jxl_qwtab.qw_kind_rows(kind) * jxl_qwtab.qw_kind_cols(kind) * 8
+    p = rt.heap_alloc(bytes)
+    if p == 0 {
+        return 0
+    }
+    if !jxl_qwtab.qw_table(kind, p) {
+        rt.heap_free(p, bytes)
+        return 0
+    }
+    *((tabs +% ((kind * 8) as u64)) as *mut u64) = p
+    return p
+}
+
+fn free_tables(tabs: u64) {
+    var kind: usize = 0
+    while kind < jxl_qwtab.QW_KIND_COUNT {
+        let p: u64 = *((tabs +% ((kind * 8) as u64)) as *mut u64)
+        if p != 0 {
+            rt.heap_free(p, 3 * jxl_qwtab.qw_kind_rows(kind) * jxl_qwtab.qw_kind_cols(kind) * 8)
+        }
+        kind = kind + 1
+    }
+    rt.heap_free(tabs, jxl_qwtab.QW_KIND_COUNT * 8)
+}
+
+fn reconstruct_block(v: *mut jxl_vardct.JxlVardct, tabs: u64, bx: usize, by: usize, coef: u64, pix: u64, scratch: u64, planes: u64, plane_len: usize, stride: usize) -> i32 {
+    let d: *mut jxl_lfdata.JxlLfData = &(*v).data
+    let t: u32 = jxl_lfdata.lfd_acs_type(d, bx, by)
+    let cx: usize = jxl_acs.acs_cover_x(t)
+    let cy: usize = jxl_acs.acs_cover_y(t)
+    if bx + cx > (*d).bw || by + cy > (*d).bh {
+        return jxl_err.JX_BAD
+    }
+    let table: u64 = kind_table(tabs, jxl_qwtab.qw_kind_of(t))
+    if table == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    dequant_block(v, t, table, bx, by, coef)
+    let n: usize = cx * cy * 64
+    let pc: usize = cx * 8
+    var c: usize = 0
+    while c < 3 {
+        let cc: u64 = coef +% ((c * n * 8) as u64)
+        if !jxl_acstrans.ats_llf(t, d, c, bx, by, cc, scratch) {
+            return jxl_err.JX_MEMORY
+        }
+        if !jxl_acstrans.ats_pixels(t, cc, pix, scratch) {
+            return jxl_err.JX_MEMORY
+        }
+        var y: usize = 0
+        while y < cy * 8 {
+            var x: usize = 0
+            while x < pc {
+                fst(planes, c * plane_len + (by * 8 + y) * stride + bx * 8 + x, fld(pix, y * pc + x))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return jxl_err.JX_OK
 }
 
 fn vr_reconstruct(v: *mut jxl_vardct.JxlVardct, out: u64) -> i32 {
@@ -83,40 +149,29 @@ fn vr_reconstruct(v: *mut jxl_vardct.JxlVardct, out: u64) -> i32 {
     let stride: usize = (*d).bw * 8
     let rows: usize = (*d).bh * 8
     let plane_len: usize = stride * rows
+    let max_coefs: usize = jxl_acstrans.ats_max_coefs()
+    let scratch_bytes: usize = jxl_acstrans.ats_scratch_bytes()
     let planes: u64 = rt.heap_alloc(plane_len * 3 * 8)
-    let table: u64 = rt.heap_alloc(3 * 64 * 8)
-    let coef: u64 = rt.heap_alloc(3 * 64 * 8)
-    let pix: u64 = rt.heap_alloc(64 * 8)
+    let tabs: u64 = rt.heap_alloc(jxl_qwtab.QW_KIND_COUNT * 8)
+    let coef: u64 = rt.heap_alloc(3 * max_coefs * 8)
+    let pix: u64 = rt.heap_alloc(max_coefs * 8)
+    let scratch: u64 = rt.heap_alloc(scratch_bytes)
     var r: i32 = jxl_err.JX_OK
-    if planes == 0 || table == 0 || coef == 0 || pix == 0 {
+    if planes == 0 || tabs == 0 || coef == 0 || pix == 0 || scratch == 0 {
         r = jxl_err.JX_MEMORY
     }
     if r == jxl_err.JX_OK {
-        jxl_qweights.qw_dct8_table(table)
+        var kind: usize = 0
+        while kind < jxl_qwtab.QW_KIND_COUNT {
+            *((tabs +% ((kind * 8) as u64)) as *mut u64) = 0
+            kind = kind + 1
+        }
         var by: usize = 0
         while by < (*d).bh && r == jxl_err.JX_OK {
             var bx: usize = 0
             while bx < (*d).bw && r == jxl_err.JX_OK {
                 if jxl_lfdata.lfd_acs_is_first(d, bx, by) {
-                    if jxl_lfdata.lfd_acs_type(d, bx, by) != 0 {
-                        r = jxl_err.JX_UNSUPPORTED
-                    } else {
-                        dequant_dct8(v, table, bx, by, coef)
-                        var c: usize = 0
-                        while c < 3 {
-                            jxl_dct.idct_2d(8, 8, coef +% ((c * 64 * 8) as u64), pix)
-                            var y: usize = 0
-                            while y < 8 {
-                                var x: usize = 0
-                                while x < 8 {
-                                    fst(planes, c * plane_len + (by * 8 + y) * stride + bx * 8 + x, fld(pix, x * 8 + y))
-                                    x = x + 1
-                                }
-                                y = y + 1
-                            }
-                            c = c + 1
-                        }
-                    }
+                    r = reconstruct_block(v, tabs, bx, by, coef, pix, scratch, planes, plane_len, stride)
                 }
                 bx = bx + 1
             }
@@ -139,14 +194,17 @@ fn vr_reconstruct(v: *mut jxl_vardct.JxlVardct, out: u64) -> i32 {
     if planes != 0 {
         rt.heap_free(planes, plane_len * 3 * 8)
     }
-    if table != 0 {
-        rt.heap_free(table, 3 * 64 * 8)
+    if tabs != 0 {
+        free_tables(tabs)
     }
     if coef != 0 {
-        rt.heap_free(coef, 3 * 64 * 8)
+        rt.heap_free(coef, 3 * max_coefs * 8)
     }
     if pix != 0 {
-        rt.heap_free(pix, 64 * 8)
+        rt.heap_free(pix, max_coefs * 8)
+    }
+    if scratch != 0 {
+        rt.heap_free(scratch, scratch_bytes)
     }
     return r
 }
