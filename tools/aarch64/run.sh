@@ -258,15 +258,17 @@ one_case() {
         esac
         return
     fi
-    local aout arc
-    aout=$(timeout "${A64_TIMEOUT:-240}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+    local aout arc limit
+    limit=$(awk -v n="$base" '$1 == n { print $2; exit }' "$ROOT/tools/aarch64/timeouts.txt" 2>/dev/null)
+    limit=${limit:-${A64_TIMEOUT:-240}}
+    aout=$(timeout "$limit" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
     [ "$testkit" = 1 ] && aout=""
     # The same second attempt on this side, for the same reason -- and only
     # when the two really disagree, so a run that already agrees costs
     # nothing.
     if [ "$xrc" != "$arc" ] || [ "$xout" != "$aout" ]; then
         sleep 2
-        aout=$(timeout "${A64_TIMEOUT:-240}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+        aout=$(timeout "$limit" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
         [ "$testkit" = 1 ] && aout=""
     fi
     if [ "$xrc" != "$arc" ]; then
