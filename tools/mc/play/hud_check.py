@@ -16,8 +16,19 @@ CONTAINER_TEX = {
     "generic": "generic_54",
     "furnace": "furnace",
     "craft": "crafting_table",
+    "dispenser": "dispenser",
+    "hopper": "hopper",
+    "blast_furnace": "blast_furnace",
+    "smoker": "smoker",
+    "brewing": "brewing_stand",
+    "grindstone": "grindstone",
+    "stonecutter": "stonecutter",
+    "loom": "loom",
+    "smithing": "smithing",
+    "cartography": "cartography_table",
 }
-CONTAINER_H = {"furnace": 166, "craft": 166}
+CONTAINER_H = {"furnace": 166, "craft": 166, "dispenser": 166, "hopper": 133, "blast_furnace": 166, "smoker": 166, "brewing": 166,
+               "grindstone": 166, "stonecutter": 166, "loom": 166, "smithing": 166, "cartography": 166}
 
 
 def load(jar, name):
@@ -139,6 +150,31 @@ def check_container(img, jar, kind, rows, errors):
         expect(f"{kind} player part", g2, t2, errors, 0.85)
 
 
+def sprite_or_sheet(jar, sprite, sheet_u, sheet_v, w, h):
+    with zipfile.ZipFile(jar) as z:
+        names = set(z.namelist())
+    path = "assets/minecraft/textures/gui/sprites/container/" + sprite + ".png"
+    if path in names:
+        return load(jar, path), 0, 0
+    return load(jar, "assets/minecraft/textures/gui/container/furnace.png"), sheet_u, sheet_v
+
+
+def check_furnace_lit(img, jar, errors):
+    w, h = img.size
+    s = lc.scale_for(w, h)
+    if not os.path.isfile(jar):
+        print("  skip  furnace lit needs the vanilla jar")
+        return
+    ox = (w - 176 * s) // 2
+    oy = (h - 166 * s) // 2
+    flame, fu, fv = sprite_or_sheet(jar, "furnace/lit_progress", 176, 0, 14, 14)
+    g, t = match_px(img, flame, s, ox + 56 * s, oy + 36 * s, fu, fv, 14, 14)
+    expect("furnace flame lit", g, t, errors, 0.6)
+    arrow, au, av = sprite_or_sheet(jar, "furnace/burn_progress", 176, 14, 24, 16)
+    g, t = match_px(img, arrow, s, ox + 79 * s, oy + 34 * s, au, av, 4, 16)
+    expect("furnace arrow started", g, t, errors, 0.6)
+
+
 def has_hotbar(img, jar):
     widgets = load(jar, WIDGETS)
     w, h = img.size
@@ -219,6 +255,8 @@ def main():
             check_sprites(img, jar, sys.argv[4], errors)
     elif mode == "cont":
         check_container(img, jar, sys.argv[4], int(sys.argv[5]) if len(sys.argv) > 5 else 3, errors)
+    elif mode == "furnace_lit":
+        check_furnace_lit(img, jar, errors)
     elif mode == "hidden":
         ok = not has_hotbar(img, jar)
         print(f"  {'ok  ' if ok else 'FAIL'}  hud hidden with F1")
