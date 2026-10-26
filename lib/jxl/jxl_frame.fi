@@ -3,11 +3,14 @@
 import std.rt
 import std.vec
 import jxl.jxl_bits
+import jxl.jxl_code
+import jxl.jxl_mem
+import jxl.jxl_perm
 import jxl.jxl_err
 import jxl.jxl_header
 
 export {
-    JxlFrame, jf_new, jf_free, jf_read, jf_read_toc, jf_section_offset, jf_section_size,
+    JxlFrame, jf_new, jf_free, jf_read, jf_read_toc, jf_section_offset, jf_section_size, jf_pass_min_shift, jf_pass_max_shift,
     JF_FLAG_NOISE, JF_FLAG_PATCHES, JF_FLAG_SPLINES, JF_FLAG_USE_LF, JF_REGULAR, JF_MODULAR, JF_VARDCT,
 }
 
@@ -45,18 +48,32 @@ struct JxlFrame {
     toc: u64,
     permuted: bool,
     body_start: usize,
+    perm: u64,
+    brk: u64,
+    ec_upsampled: bool,
+    dl: u64,
+    nds: u32,
+    offs: u64,
 }
 
 fn jf_new() -> JxlFrame {
     return JxlFrame { frame_type: 0, encoding: 0, flags: 0, do_ycbcr: false, upsampling: 1, group_shift: 1,
         num_passes: 1, x0: 0, y0: 0, width: 0, height: 0, is_last: true, group_dim: 256, groups_x: 0, groups_y: 0,
         num_groups: 0, lf_groups_x: 0, lf_groups_y: 0, num_lf_groups: 0, blend_mode: 0, duration: 0, toc_count: 0,
-        toc: 0, permuted: false, body_start: 0 }
+        toc: 0, permuted: false, body_start: 0, perm: 0, brk: 0, ec_upsampled: false, dl: 0, nds: 0, offs: 0 }
 }
 
 fn jf_free(f: *mut JxlFrame) {
     rt.heap_free((*f).toc, (*f).toc_count * 4)
+    rt.heap_free((*f).offs, ((*f).toc_count + 1) * 8)
+    (*f).offs = 0
+    rt.heap_free((*f).perm, (*f).toc_count * 4)
+    rt.heap_free((*f).brk, ((*f).num_passes as usize) * 8)
+    rt.heap_free((*f).dl, 32)
+    (*f).dl = 0
     (*f).toc = 0
+    (*f).perm = 0
+    (*f).brk = 0
     (*f).toc_count = 0
 }
 
@@ -148,6 +165,63 @@ fn skip_extensions(b: *mut jxl_bits.JxlBits) {
     }
 }
 
+fn jf_pass_min_shift(f: *mut JxlFrame, pass: u32) -> i32 {
+    return jxl_mem.ldi((*f).brk, (pass as usize) * 2)
+}
+
+fn jf_pass_max_shift(f: *mut JxlFrame, pass: u32) -> i32 {
+    return jxl_mem.ldi((*f).brk, (pass as usize) * 2 + 1)
+}
+
+fn fill_brackets(f: *mut JxlFrame, nds: u32) -> bool {
+    let np: u32 = (*f).num_passes
+    (*f).brk = rt.heap_alloc((np as usize) * 8)
+    if (*f).brk == 0 {
+        return false
+    }
+    var pass: u32 = 0
+    while pass < np {
+        var max_shift: i32 = 2
+        var min_shift: i32 = 3
+        var i: u32 = 0
+        var done: bool = false
+        while !done {
+            var j: u32 = 0
+            while j < nds {
+                if i == rt.ld32((*f).dl, 4 + j as usize) {
+                    let d: u32 = rt.ld32((*f).dl, j as usize)
+                    if d == 8 {
+                        min_shift = 3
+                    }
+                    if d == 4 {
+                        min_shift = 2
+                    }
+                    if d == 2 {
+                        min_shift = 1
+                    }
+                    if d == 1 {
+                        min_shift = 0
+                    }
+                }
+                j = j + 1
+            }
+            if i + 1 == np {
+                min_shift = 0
+            }
+            if i == pass {
+                done = true
+            } else {
+                max_shift = min_shift - 1
+                i = i + 1
+            }
+        }
+        jxl_mem.sti((*f).brk, (pass as usize) * 2, min_shift)
+        jxl_mem.sti((*f).brk, (pass as usize) * 2 + 1, max_shift)
+        pass = pass + 1
+    }
+    return true
+}
+
 fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFrame) -> i32 {
     *f = jf_new()
     let num_extra: usize = vec.vec_len[jxl_header.JxlExtra](&(*m).extra)
@@ -170,7 +244,9 @@ fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFram
             (*f).upsampling = jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
             var e: usize = 0
             while e < num_extra {
-                jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
+                if jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8)) != 1 {
+                    (*f).ec_upsampled = true
+                }
                 e = e + 1
             }
         }
@@ -179,8 +255,20 @@ fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFram
         }
         if (*f).frame_type != 2 {
             (*f).num_passes = jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(3), jxl_bits.jd_off(3, 4))
+            if (*f).num_passes > 11 {
+                return jxl_err.JX_BAD
+            }
+            (*f).dl = rt.heap_alloc(32)
+            if (*f).dl == 0 {
+                return jxl_err.JX_MEMORY
+            }
+            rt.mem_set((*f).dl, 0 as u8, 32)
             if (*f).num_passes != 1 {
                 let nds: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_off(1, 3))
+                if nds > 4 || nds > (*f).num_passes {
+                    return jxl_err.JX_BAD
+                }
+                (*f).nds = nds
                 var i: u32 = 0
                 while i + 1 < (*f).num_passes {
                     jxl_bits.jb_read(b, 2)
@@ -188,8 +276,20 @@ fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFram
                 }
                 i = 0
                 while i < nds {
-                    jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
-                    jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_bits(3))
+                    let v: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_val(4), jxl_bits.jd_val(8))
+                    if i > 0 && v >= rt.ld32((*f).dl, (i - 1) as usize) {
+                        return jxl_err.JX_BAD
+                    }
+                    rt.st32((*f).dl, i as usize, v)
+                    i = i + 1
+                }
+                i = 0
+                while i < nds {
+                    let v: u32 = jxl_bits.jb_u32(b, jxl_bits.jd_val(0), jxl_bits.jd_val(1), jxl_bits.jd_val(2), jxl_bits.jd_bits(3))
+                    if (i > 0 && v <= rt.ld32((*f).dl, 4 + (i - 1) as usize)) || v >= (*f).num_passes {
+                        return jxl_err.JX_BAD
+                    }
+                    rt.st32((*f).dl, 4 + i as usize, v)
                     i = i + 1
                 }
             }
@@ -243,6 +343,9 @@ fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFram
     if jxl_bits.jb_over(b) {
         return jxl_err.JX_TRUNCATED
     }
+    if !fill_brackets(f, (*f).nds) {
+        return jxl_err.JX_MEMORY
+    }
     if (*f).upsampling != 1 {
         (*f).width = div_ceil((*f).width, (*f).upsampling)
         (*f).height = div_ceil((*f).height, (*f).upsampling)
@@ -250,6 +353,9 @@ fn jf_read(b: *mut jxl_bits.JxlBits, m: *mut jxl_header.JxlMeta, f: *mut JxlFram
     (*f).group_dim = (128 as u32) << (*f).group_shift
     (*f).groups_x = div_ceil((*f).width, (*f).group_dim)
     (*f).groups_y = div_ceil((*f).height, (*f).group_dim)
+    if ((*f).groups_x as u64) * ((*f).groups_y as u64) > 65536 {
+        return jxl_err.JX_TOO_LARGE
+    }
     (*f).num_groups = (*f).groups_x * (*f).groups_y
     (*f).lf_groups_x = div_ceil((*f).width, (*f).group_dim * 8)
     (*f).lf_groups_y = div_ceil((*f).height, (*f).group_dim * 8)
@@ -262,17 +368,24 @@ fn jf_read_toc(b: *mut jxl_bits.JxlBits, f: *mut JxlFrame) -> i32 {
     if (*f).num_groups != 1 || (*f).num_passes != 1 {
         count = 2 + (*f).num_lf_groups as usize + ((*f).num_passes as usize) * ((*f).num_groups as usize)
     }
-    if count > 1048576 {
+    if count > 65536 {
         return jxl_err.JX_TOO_LARGE
     }
     (*f).permuted = jxl_bits.jb_bit(b)
+    (*f).toc_count = count
     if (*f).permuted {
-        return jxl_err.JX_UNSUPPORTED
+        (*f).perm = rt.heap_alloc(count * 4)
+        if (*f).perm == 0 {
+            return jxl_err.JX_MEMORY
+        }
+        let pr: i32 = jxl_perm.perm_read(b, count, (*f).perm)
+        if pr != jxl_err.JX_OK {
+            return pr
+        }
     }
     if !jxl_bits.jb_zero_pad(b) {
         return jxl_err.JX_BAD
     }
-    (*f).toc_count = count
     (*f).toc = rt.heap_alloc(count * 4)
     if (*f).toc == 0 {
         return jxl_err.JX_MEMORY
@@ -286,20 +399,33 @@ fn jf_read_toc(b: *mut jxl_bits.JxlBits, f: *mut JxlFrame) -> i32 {
     if !jxl_bits.jb_zero_pad(b) || jxl_bits.jb_over(b) {
         return jxl_err.JX_BAD
     }
+    (*f).offs = rt.heap_alloc((count + 1) * 8)
+    if (*f).offs == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var acc: u64 = 0
+    i = 0
+    while i < count {
+        rt.st64((*f).offs, i, acc)
+        acc = acc + (rt.ld32((*f).toc, i) as u64)
+        i = i + 1
+    }
+    rt.st64((*f).offs, count, acc)
     (*f).body_start = jxl_bits.jb_byte_pos(b)
     return jxl_err.JX_OK
 }
 
+fn phys_index(f: *mut JxlFrame, i: usize) -> usize {
+    if (*f).perm == 0 {
+        return i
+    }
+    return rt.ld32((*f).perm, i) as usize
+}
+
 fn jf_section_size(f: *mut JxlFrame, i: usize) -> usize {
-    return rt.ld32((*f).toc, i) as usize
+    return rt.ld32((*f).toc, phys_index(f, i)) as usize
 }
 
 fn jf_section_offset(f: *mut JxlFrame, i: usize) -> usize {
-    var off: usize = (*f).body_start
-    var k: usize = 0
-    while k < i {
-        off = off + rt.ld32((*f).toc, k) as usize
-        k = k + 1
-    }
-    return off
+    return (*f).body_start + (rt.ld64((*f).offs, phys_index(f, i)) as usize)
 }

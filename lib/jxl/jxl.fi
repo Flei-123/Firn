@@ -7,9 +7,12 @@ import jxl.jxl_container
 import jxl.jxl_err
 import jxl.jxl_header
 import jxl.jxl_frame
+import jxl.jxl_img
+import jxl.jxl_modular
+import jxl.jxl_mem
 
 export {
-    JxlInfo, JxlFrameInfo, JxlError, jxl_info, jxl_frame_info, jxl_sniff,
+    JxlInfo, JxlFrameInfo, JxlError, JxlPicture, jxl_info, jxl_frame_info, jxl_sniff, jxl_decode, jxl_picture_free,
 }
 
 struct JxlInfo {
@@ -25,6 +28,7 @@ struct JxlInfo {
     animated: bool,
     orientation: u32,
     boxed: bool,
+    alpha_index: i32,
 }
 
 fn jxl_sniff(p: u64, n: usize) -> bool {
@@ -55,7 +59,8 @@ fn info_status(p: u64, n: usize, info: *mut JxlInfo) -> i32 {
         (*info).height = m.height
         (*info).color_channels = jxl_header.jm_color_channels(&m)
         (*info).extra_channels = vec.vec_len[jxl_header.JxlExtra](&m.extra) as u32
-        (*info).has_alpha = jxl_header.jm_alpha_index(&m) >= 0
+        (*info).alpha_index = jxl_header.jm_alpha_index(&m)
+        (*info).has_alpha = (*info).alpha_index >= 0
         (*info).bits = m.depth.bits
         (*info).is_float = m.depth.is_float
         (*info).xyb = m.xyb_encoded
@@ -155,6 +160,118 @@ fn frame_status(p: u64, n: usize, fi: *mut JxlFrameInfo) -> i32 {
 
 fn jxl_frame_info(p: u64, n: usize, fi: *mut JxlFrameInfo) -> JxlError!bool {
     let r: i32 = frame_status(p, n, fi)
+    if r != jxl_err.JX_OK {
+        return jxl_err.jx_fail(r)
+    }
+    return true
+}
+
+struct JxlPicture {
+    width: u32,
+    height: u32,
+    channels: u32,
+    bytes_per_sample: u32,
+    bits: u32,
+    data: u64,
+    size: usize,
+}
+
+fn jxl_picture_free(pic: *mut JxlPicture) {
+    rt.heap_free((*pic).data, (*pic).size)
+    (*pic).data = 0
+    (*pic).size = 0
+}
+
+fn scale_sample(v: i32, bits: u32, out_max: i64) -> i64 {
+    var x: i64 = v as i64
+    let in_max: i64 = ((1 as i64) << bits) - 1
+    if x < 0 {
+        x = 0
+    }
+    if x > in_max {
+        x = in_max
+    }
+    if in_max == out_max {
+        return x
+    }
+    return (x * out_max + in_max / 2) / in_max
+}
+
+fn pack_picture(img: *mut jxl_img.JxlImage, info: *mut JxlInfo, pic: *mut JxlPicture) -> i32 {
+    let w: usize = (*info).width as usize
+    let h: usize = (*info).height as usize
+    var nch: usize = (*info).color_channels as usize
+    var alpha_chan: usize = 0
+    if (*info).has_alpha {
+        alpha_chan = nch + ((*info).alpha_index as usize)
+        nch = nch + 1
+    }
+    if jxl_img.img_count(img) < nch || (*info).bits == 0 || (*info).bits > 16 || (*info).is_float {
+        return jxl_err.JX_UNSUPPORTED
+    }
+    var bps: usize = 1
+    var out_max: i64 = 255
+    if (*info).bits > 8 {
+        bps = 2
+        out_max = 65535
+    }
+    let size: usize = w * h * nch * bps
+    let data: u64 = rt.heap_alloc(size)
+    if data == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var c: usize = 0
+    while c < nch {
+        var src: usize = c
+        if (*info).has_alpha && c + 1 == nch {
+            src = alpha_chan
+        }
+        if jxl_img.img_w(img, src) != w || jxl_img.img_h(img, src) != h {
+            rt.heap_free(data, size)
+            return jxl_err.JX_UNSUPPORTED
+        }
+        var i: usize = 0
+        while i < w * h {
+            let v: i64 = scale_sample(jxl_mem.ldi(jxl_img.img_data(img, src), i), (*info).bits, out_max)
+            let at: usize = (i * nch + c) * bps
+            *((data +% at as u64) as *mut u8) = (v & 255) as u8
+            if bps == 2 {
+                *((data +% (at + 1) as u64) as *mut u8) = ((v >> 8) & 255) as u8
+            }
+            i = i + 1
+        }
+        c = c + 1
+    }
+    (*pic).width = (*info).width
+    (*pic).height = (*info).height
+    (*pic).channels = nch as u32
+    (*pic).bytes_per_sample = bps as u32
+    (*pic).bits = (*info).bits
+    (*pic).data = data
+    (*pic).size = size
+    return jxl_err.JX_OK
+}
+
+fn decode_status(p: u64, n: usize, pic: *mut JxlPicture) -> i32 {
+    var info: JxlInfo = JxlInfo { width: 0, height: 0, color_channels: 0, extra_channels: 0, has_alpha: false, bits: 0,
+        is_float: false, xyb: false, want_icc: false, animated: false, orientation: 1, boxed: false, alpha_index: 0 - 1 }
+    var r: i32 = info_status(p, n, &info)
+    if r != jxl_err.JX_OK {
+        return r
+    }
+    var img: jxl_img.JxlImage = jxl_img.img_new()
+    r = jxl_modular.modular_decode(p, n, &img)
+    if r == jxl_err.JX_OK {
+        r = pack_picture(&img, &info, pic)
+    }
+    jxl_img.img_free(&img)
+    return r
+}
+
+fn jxl_decode(p: u64, n: usize, pic: *mut JxlPicture) -> JxlError!bool {
+    (*pic).data = 0
+    (*pic).size = 0
+    let r: i32 = decode_status(p, n, pic)
     if r != jxl_err.JX_OK {
         return jxl_err.jx_fail(r)
     }

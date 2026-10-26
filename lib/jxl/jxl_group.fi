@@ -1,0 +1,111 @@
+import std.rt
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_err
+import jxl.jxl_img
+import jxl.jxl_stream
+import jxl.jxl_wp
+import jxl.jxl_xform
+
+export { group_decode }
+
+const NO_LIMIT: usize = 2147483647
+const MAX_SHIFT: u32 = 31
+
+fn clamp_extent(pos: usize, want: usize, full: usize) -> usize {
+    if pos >= full {
+        return 0
+    }
+    if want > full - pos {
+        return full - pos
+    }
+    return want
+}
+
+fn first_group_channel(full: *mut jxl_img.JxlImage, group_dim: usize) -> usize {
+    var c: usize = (*full).nb_meta
+    while c < jxl_img.img_count(full) {
+        if jxl_img.img_w(full, c) > group_dim || jxl_img.img_h(full, c) > group_dim {
+            return c
+        }
+        c = c + 1
+    }
+    return c
+}
+
+fn copy_back(full: *mut jxl_img.JxlImage, gi: *mut jxl_img.JxlImage, rec: u64, n: usize) -> i32 {
+    var k: usize = 0
+    while k < n {
+        let c: usize = rt.ld64(rec, k * 3) as usize
+        let rx: usize = rt.ld64(rec, k * 3 + 1) as usize
+        let ry: usize = rt.ld64(rec, k * 3 + 2) as usize
+        let gw: usize = jxl_img.img_w(gi, k)
+        let gh: usize = jxl_img.img_h(gi, k)
+        let fw: usize = jxl_img.img_w(full, c)
+        if rx + gw > fw || ry + gh > jxl_img.img_h(full, c) {
+            return jxl_err.JX_BAD
+        }
+        var y: usize = 0
+        while y < gh {
+            rt.mem_copy(jxl_img.img_data(full, c) + (((ry + y) * fw + rx) * 4) as u64, jxl_img.img_data(gi, k) + ((y * gw) * 4) as u64, gw * 4)
+            y = y + 1
+        }
+        k = k + 1
+    }
+    return jxl_err.JX_OK
+}
+
+fn group_decode(b: *mut jxl_bits.JxlBits, full: *mut jxl_img.JxlImage, ms: *mut jxl_stream.JxlModState, bit_depth: i64, group_dim: usize, x0: usize, y0: usize, rw: usize, rh: usize, min_shift: i32, max_shift: i32, stream_id: u32) -> i32 {
+    let n: usize = jxl_img.img_count(full)
+    let beginc: usize = first_group_channel(full, group_dim)
+    var gi: jxl_img.JxlImage = jxl_img.img_new()
+    let rec: u64 = rt.heap_alloc((n + 1) * 24)
+    if rec == 0 {
+        return jxl_err.JX_MEMORY
+    }
+    var cnt: usize = 0
+    var c: usize = beginc
+    while c < n {
+        let hs: u32 = jxl_img.img_hs(full, c)
+        let vs: u32 = jxl_img.img_vs(full, c)
+        if hs < MAX_SHIFT && vs < MAX_SHIFT {
+            var shift: i32 = hs as i32
+            if (vs as i32) < shift {
+                shift = vs as i32
+            }
+            if shift <= max_shift && shift >= min_shift {
+                let rx: usize = x0 >> hs
+                let ry: usize = y0 >> vs
+                let sw: usize = clamp_extent(rx, rw >> hs, jxl_img.img_w(full, c))
+                let sh: usize = clamp_extent(ry, rh >> vs, jxl_img.img_h(full, c))
+                if sw != 0 && sh != 0 {
+                    jxl_img.img_add(&gi, sw, sh, hs, vs)
+                    rt.st64(rec, cnt * 3, c as u64)
+                    rt.st64(rec, cnt * 3 + 1, rx as u64)
+                    rt.st64(rec, cnt * 3 + 2, ry as u64)
+                    cnt = cnt + 1
+                }
+            }
+        }
+        c = c + 1
+    }
+    var r: i32 = jxl_err.JX_OK
+    if cnt > 0 {
+        var wph: jxl_wp.JxlWpHeader = jxl_wp.wp_header_default()
+        var xfs: vec.Vec[jxl_xform.JxlXform] = vec.vec_new[jxl_xform.JxlXform]()
+        r = jxl_stream.stream_decode(b, &gi, ms, stream_id, NO_LIMIT, &wph, &xfs)
+        if r == jxl_err.JX_OK {
+            r = jxl_stream.xfs_inverse(&xfs, &gi, &wph, bit_depth)
+        }
+        if r == jxl_err.JX_OK && jxl_img.img_count(&gi) != cnt {
+            r = jxl_err.JX_BAD
+        }
+        if r == jxl_err.JX_OK {
+            r = copy_back(full, &gi, rec, cnt)
+        }
+        jxl_stream.xfs_free(&xfs)
+    }
+    rt.heap_free(rec, (n + 1) * 24)
+    jxl_img.img_free(&gi)
+    return r
+}
