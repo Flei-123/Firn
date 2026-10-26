@@ -7,6 +7,8 @@ import av1.av1tile
 import av1.av1lf
 import av1.av1cdef
 import av1.av1lr
+import av1.av1fg
+import av1.av1sr
 
 export { Frame, frame_new, frame_free, still_decode, still_decode_limited, STILL_OK, STILL_NOT_AVIF, STILL_UNSUPPORTED, STILL_TILE_ERROR, STILL_TOO_LARGE, STILL_MAX_PIXELS }
 
@@ -30,6 +32,14 @@ struct Frame {
     y_bytes: usize,
     u_bytes: usize,
     v_bytes: usize,
+}
+
+struct Planes {
+    p0: u64,
+    p1: u64,
+    p2: u64,
+    stride: i64,
+    bytes: usize,
 }
 
 fn frame_new() -> Frame {
@@ -59,7 +69,15 @@ fn fits(info: u64, max_pixels: i64) -> bool {
     if w > 65536 || h > 65536 || mw > 65536 + 64 || mh > 65536 + 64 {
         return false
     }
-    if w > mw || h > mh {
+    var lim: i64 = mw
+    let up_w: i64 = cell(info, fb + avif.FH_UP_W)
+    if up_w > cell(info, fb + avif.FH_FRAME_W) {
+        lim = up_w
+        if up_w > 65536 || up_w * mh > max_pixels + max_pixels / 4 + 8192 {
+            return false
+        }
+    }
+    if w > lim || h > mh {
         return false
     }
     return w * h <= max_pixels && mw * mh <= max_pixels + max_pixels / 4 + 8192
@@ -151,6 +169,11 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
         np = 1
     }
     let lossless: bool = cell(info, fb + avif.FH_LOSSLESS) != 0
+    let up_w: i64 = cell(info, fb + avif.FH_UP_W)
+    let superres: bool = up_w != cell(info, fb + avif.FH_FRAME_W)
+    if lossless && superres {
+        return STILL_UNSUPPORTED
+    }
     let t: u64 = av1tile.tile_new(src + (off as u64), tlen, mc, mr, cell(info, avif.AI_FILTER_INTRA), cell(info, avif.AI_EDGE_FILTER), upd)
     av1tile.tile_set_sb128(t, cell(info, avif.AI_SB128))
     set_tile_grid(t, info)
@@ -169,14 +192,11 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
     }
     setup_segmentation(t, info)
     if !lossless {
-        var unsup: i64 = 0
+        let unsup: i64 = 0
         let lrt0: i64 = cell(info, fb + avif.FH_LR_TYPE)
         let lrt1: i64 = cell(info, fb + avif.FH_LR_TYPE + 1)
         let lrt2: i64 = cell(info, fb + avif.FH_LR_TYPE + 2)
         let uses_lr: bool = (lrt0 | lrt1 | lrt2) != 0
-        if uses_lr {
-            unsup = unsup | cell(info, avif.AI_SUPERRES)
-        }
         let bad: i64 = av1tile.tile_set_frame(t, cell(info, fb + avif.FH_BASE_Q), cell(info, fb + avif.FH_TX_MODE), cell(info, fb + avif.FH_REDUCED_TX),
                                               cell(info, fb + avif.FH_SCT), 0, cell(info, fb + avif.FH_DQ_YDC), cell(info, fb + avif.FH_DQ_UDC),
                                               cell(info, fb + avif.FH_DQ_UAC), cell(info, fb + avif.FH_DQ_VDC), cell(info, fb + avif.FH_DQ_VAC),
@@ -189,9 +209,10 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
             return STILL_UNSUPPORTED
         }
         if uses_lr {
-            lrctx = av1lr.lr_new(np, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), cell(info, fb + avif.FH_FRAME_W),
+            lrctx = av1lr.lr_new(np, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), up_w,
                                  cell(info, fb + avif.FH_FRAME_H), lrt0, lrt1, lrt2, cell(info, fb + avif.FH_LR_UNIT_SHIFT),
                                  cell(info, fb + avif.FH_LR_UV_SHIFT))
+            av1lr.lr_set_superres(lrctx, cell(info, fb + avif.FH_SR_DENOM))
             av1tile.tile_set_lr(t, lrctx)
         }
     }
@@ -202,23 +223,29 @@ fn decode_info(src: u64, info: u64, f: *mut Frame) -> i32 {
         av1lr.lr_free(lrctx)
         return rc
     }
+    var pl: Planes = Planes { p0: av1tile.tile_plane(t, 0), p1: av1tile.tile_plane(t, 1), p2: av1tile.tile_plane(t, 2), stride: av1tile.tile_stride(t), bytes: 0 }
     if !lossless {
-        post_filters(t, info, lrctx, np, mc, mr, bit_depth)
+        post_filters(t, info, lrctx, np, mc, mr, bit_depth, &pl)
     }
-    let st: i64 = av1tile.tile_stride(t)
+    let st: i64 = pl.stride
+    if cell(info, avif.GR_BASE + avif.GR_APPLY) != 0 {
+        av1fg.fg_apply(info, pl.p0, pl.p1, pl.p2, st, w, h,
+                       cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), np, bit_depth, cell(info, avif.AI_MC) == 0)
+    }
     (*f).width = w
     (*f).height = h
     (*f).planes = np
     (*f).sub_x = cell(info, avif.AI_SUBX)
     (*f).sub_y = cell(info, avif.AI_SUBY)
     (*f).depth = bit_depth
-    (*f).y = crop_plane(av1tile.tile_plane(t, 0), st, w, h, bit_depth, &(*f).y_bytes)
+    (*f).y = crop_plane(pl.p0, st, w, h, bit_depth, &(*f).y_bytes)
     if np == 3 {
         let cw: i64 = (w + (*f).sub_x) >> (*f).sub_x
         let ch: i64 = (h + (*f).sub_y) >> (*f).sub_y
-        (*f).u = crop_plane(av1tile.tile_plane(t, 1), st, cw, ch, bit_depth, &(*f).u_bytes)
-        (*f).v = crop_plane(av1tile.tile_plane(t, 2), st, cw, ch, bit_depth, &(*f).v_bytes)
+        (*f).u = crop_plane(pl.p1, st, cw, ch, bit_depth, &(*f).u_bytes)
+        (*f).v = crop_plane(pl.p2, st, cw, ch, bit_depth, &(*f).v_bytes)
     }
+    free_planes(&pl, np)
     av1tile.tile_free(t)
     av1lr.lr_free(lrctx)
     return STILL_OK
@@ -251,7 +278,56 @@ fn setup_segmentation(t: u64, info: u64) {
                         cell(info, fb + avif.FH_LF0), cell(info, fb + avif.FH_LF0 + 1), cell(info, fb + avif.FH_LF0 + 2), cell(info, fb + avif.FH_LF0 + 3))
 }
 
-fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64, bd: i64) {
+fn free_planes(pl: *mut Planes, np: i64) {
+    if (*pl).bytes == 0 {
+        return
+    }
+    av1mem.heap_free((*pl).p0 as *mut u8, (*pl).bytes)
+    if np == 3 {
+        av1mem.heap_free((*pl).p1 as *mut u8, (*pl).bytes)
+        av1mem.heap_free((*pl).p2 as *mut u8, (*pl).bytes)
+    }
+}
+
+fn upscale_one(info: u64, src: u64, st: i64, plane: i64, mc: i64, mr: i64, bd: i64) -> u64 {
+    let fb: usize = avif.FH_BASE
+    return av1sr.sr_upscale_alloc(src, st, plane, cell(info, avif.AI_SUBX), cell(info, avif.AI_SUBY), cell(info, fb + avif.FH_FRAME_W),
+                                  cell(info, fb + avif.FH_UP_W), cell(info, fb + avif.FH_FRAME_H), mc, mr, bd)
+}
+
+fn upscale_frame(info: u64, pl: *mut Planes, np: i64, mc: i64, mr: i64, bd: i64, s0: *mut u64, s1: *mut u64, s2: *mut u64) {
+    let st: i64 = (*pl).stride
+    let ust: i64 = av1sr.sr_stride(cell(info, avif.FH_BASE + avif.FH_UP_W))
+    let n0: u64 = upscale_one(info, (*pl).p0, st, 0, mc, mr, bd)
+    var n1: u64 = 0
+    var n2: u64 = 0
+    if np == 3 {
+        n1 = upscale_one(info, (*pl).p1, st, 1, mc, mr, bd)
+        n2 = upscale_one(info, (*pl).p2, st, 2, mc, mr, bd)
+    }
+    if *s0 != 0 {
+        let t0: u64 = upscale_one(info, *s0, st, 0, mc, mr, bd)
+        av1lr.lr_snapshot_free(*s0, st, mr * 4)
+        *s0 = t0
+    }
+    if *s1 != 0 {
+        let t1: u64 = upscale_one(info, *s1, st, 1, mc, mr, bd)
+        av1lr.lr_snapshot_free(*s1, st, mr * 4)
+        *s1 = t1
+    }
+    if *s2 != 0 {
+        let t2: u64 = upscale_one(info, *s2, st, 2, mc, mr, bd)
+        av1lr.lr_snapshot_free(*s2, st, mr * 4)
+        *s2 = t2
+    }
+    (*pl).p0 = n0
+    (*pl).p1 = n1
+    (*pl).p2 = n2
+    (*pl).stride = ust
+    (*pl).bytes = av1sr.sr_bytes(ust, mr * 4)
+}
+
+fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64, bd: i64, pl: *mut Planes) {
     let fb: usize = avif.FH_BASE
     let st: i64 = av1tile.tile_stride(t)
     let lv: u64 = av1mem.heap_alloc(64) as u64
@@ -295,12 +371,15 @@ fn post_filters(t: u64, info: u64, lrctx: u64, np: i64, mc: i64, mr: i64, bd: i6
         av1mem.heap_free(par as *mut u8, av1cdef.CDEF_PAR_BYTES as usize)
         av1mem.heap_free(csc as *mut u8, av1cdef.CDEF_SCRATCH_BYTES as usize)
     }
+    if cell(info, fb + avif.FH_UP_W) != cell(info, fb + avif.FH_FRAME_W) {
+        upscale_frame(info, pl, np, mc, mr, bd, &s0, &s1, &s2)
+    }
     if lrctx != 0 {
-        av1lr.lr_frame(lrctx, av1tile.tile_plane(t, 0), av1tile.tile_plane(t, 1), av1tile.tile_plane(t, 2), s0, s1, s2, st, bd)
+        av1lr.lr_frame(lrctx, (*pl).p0, (*pl).p1, (*pl).p2, s0, s1, s2, (*pl).stride, bd)
         if cdef_on {
-            av1lr.lr_snapshot_free(s0, st, mr * 4)
-            av1lr.lr_snapshot_free(s1, st, mr * 4)
-            av1lr.lr_snapshot_free(s2, st, mr * 4)
+            av1lr.lr_snapshot_free(s0, (*pl).stride, mr * 4)
+            av1lr.lr_snapshot_free(s1, (*pl).stride, mr * 4)
+            av1lr.lr_snapshot_free(s2, (*pl).stride, mr * 4)
         }
     }
 }
