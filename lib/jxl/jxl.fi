@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/jxl/jxl.fi -- jxl: JPEG XL decoder entry points (header info; Modular lossless pixels as the stages land)
+import std.core
 import std.rt
 import std.vec
 import jxl.jxl_bits
 import jxl.jxl_container
+import jxl.jxl_ecup
 import jxl.jxl_err
 import jxl.jxl_header
 import jxl.jxl_icc
@@ -35,11 +37,14 @@ struct JxlInfo {
     orientation: u32,
     boxed: bool,
     alpha_index: i32,
+    alpha_float: bool,
+    alpha_bits: u32,
+    alpha_exp_bits: u32,
 }
 
 fn jxl_info_new() -> JxlInfo {
     return JxlInfo { width: 0, height: 0, color_channels: 0, extra_channels: 0, has_alpha: false, bits: 0, exp_bits: 0,
-        is_float: false, xyb: false, want_icc: false, animated: false, orientation: 1, boxed: false, alpha_index: 0 - 1 }
+        is_float: false, xyb: false, want_icc: false, animated: false, orientation: 1, boxed: false, alpha_index: 0 - 1, alpha_float: false, alpha_bits: 0, alpha_exp_bits: 0 }
 }
 
 fn jxl_sniff(p: u64, n: usize) -> bool {
@@ -72,6 +77,12 @@ fn info_status(p: u64, n: usize, info: *mut JxlInfo) -> i32 {
         (*info).extra_channels = vec.vec_len[jxl_header.JxlExtra](&m.extra) as u32
         (*info).alpha_index = jxl_header.jm_alpha_index(&m)
         (*info).has_alpha = (*info).alpha_index >= 0
+        if (*info).has_alpha {
+            let ae: *mut jxl_header.JxlExtra = jxl_header.jm_extra(&m, (*info).alpha_index as usize)
+            (*info).alpha_float = (*ae).depth.is_float
+            (*info).alpha_bits = (*ae).depth.bits
+            (*info).alpha_exp_bits = (*ae).depth.exp_bits
+        }
         (*info).bits = m.depth.bits
         (*info).exp_bits = m.depth.exp_bits
         (*info).is_float = m.depth.is_float
@@ -218,6 +229,22 @@ fn sample_value(v: i32, info: *mut JxlInfo) -> u64 {
     return clamp_sample(v, (*info).bits) as u64
 }
 
+fn alpha_float_value(raw: i32, info: *mut JxlInfo) -> u64 {
+    let bits: u64 = (raw as i64 & 4294967295) as u64
+    if (*info).is_float {
+        return bits
+    }
+    let f: f64 = core.bits_f32(bits as u32) as f64
+    if !(f > 0.0) {
+        return 0
+    }
+    let top: f64 = (((1 as u64) << ((*info).bits as u64)) - 1) as f64
+    if f >= 1.0 {
+        return top as u64
+    }
+    return (f * top + 0.5) as u64
+}
+
 fn pack_picture(img: *mut jxl_img.JxlImage, info: *mut JxlInfo, pic: *mut JxlPicture) -> i32 {
     let w: usize = (*info).width as usize
     let h: usize = (*info).height as usize
@@ -259,7 +286,12 @@ fn pack_picture(img: *mut jxl_img.JxlImage, info: *mut JxlInfo, pic: *mut JxlPic
         }
         var i: usize = 0
         while i < w * h {
-            let v: u64 = sample_value(jxl_mem.ldi(jxl_img.img_data(img, src), i), info)
+            var v: u64 = 0
+            if (*info).has_alpha && c + 1 == nch && (*info).alpha_float {
+                v = alpha_float_value(jxl_mem.ldi(jxl_img.img_data(img, src), i), info)
+            } else {
+                v = sample_value(jxl_mem.ldi(jxl_img.img_data(img, src), i), info)
+            }
             let at: usize = (i * nch + c) * bps
             var k: usize = 0
             while k < bps {
@@ -315,6 +347,9 @@ fn decode_status(p: u64, n: usize, pic: *mut JxlPicture) -> i32 {
             r = jxl_nxdec.nx_decode(p, n, &img)
         } else {
             r = jxl_modular.modular_decode(p, n, &img)
+        }
+        if r == jxl_err.JX_OK && info.has_alpha && info.alpha_float && jxl_img.img_count(&img) > (info.color_channels as usize) + (info.alpha_index as usize) {
+            jxl_ecup.ecup_normalize_float(&img, (info.color_channels as usize) + (info.alpha_index as usize), jxl_header.JxlBitDepth { is_float: true, bits: info.alpha_bits, exp_bits: info.alpha_exp_bits })
         }
     }
     if r == jxl_err.JX_OK {
