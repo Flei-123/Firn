@@ -175,6 +175,8 @@ extern fn RemoveDirectoryW(p: u64) -> i32;
 extern fn CreateSymbolicLinkW(link: u64, target: u64, flags: i64) -> i32;
 extern fn CreateDirectoryW(p: u64, sa: i64) -> i32;
 extern fn MoveFileExW(a: u64, b: u64, fl: i64) -> i32;
+extern fn SetFileAttributesW(p: u64, attrs: i64) -> i32;
+extern fn SetFileTime(h: i64, created: u64, accessed: u64, written: u64) -> i32;
 extern fn SystemFunction036(buf: u64, n: i64) -> i32;
 // ROUND WIN-THREADS: the thread runtime's futex and thread block pointer.
 extern fn TlsAlloc() -> i32;
@@ -1045,8 +1047,7 @@ fn __win_poll(fds: u64, nfds: i64, ms: i64) -> i64 {
         var tvp: u64 = 0
         if ms >= 0 {
             let tv: u64 = (&tvb[0]) as u64
-            __win_st64(tv, 0, ms / 1000)
-            __win_st64(tv, 1, (ms % 1000) * 1000)
+            __win_st64(tv, 0, ms / 1000 + (ms % 1000) * 1000 * 4294967296)
             tvp = tv
         }
         let r: i32 = __win_ws_select(0, rd, wr, ex, tvp)
@@ -1283,16 +1284,92 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
 }
 
 // The calls that use `__win_path` / `__win_tmp`: open, openat, getdents64,
-// statx, unlinkat, symlinkat, access, unlink, getcwd, mkdir, rename, dup,
+// statx, unlinkat, symlinkat, chmod, utimensat, access, unlink, getcwd, mkdir, rename, dup,
 // dup2.
 fn __win_scratch_call(nr: i64) -> bool {
-    if nr == 2 || nr == 257 || nr == 217 || nr == 332 || nr == 263 || nr == 266 {
+    if nr == 2 || nr == 257 || nr == 217 || nr == 332 || nr == 263 || nr == 266 || nr == 90 || nr == 280 {
         return true
     }
     if nr == 21 || nr == 87 || nr == 79 || nr == 83 || nr == 82 || nr == 32 || nr == 33 {
         return true
     }
     return false
+}
+
+fn __win_chmod(mode: i64) -> i64 {
+    let at: i64 = GetFileAttributesW(__win_path) as i64
+    if at == 0 - 1 {
+        return __win_errno()
+    }
+    if (at & 16) != 0 {
+        return 0
+    }
+    var na: i64 = at & 4294967294
+    if (mode & 146) == 0 {
+        na = na | 1
+    }
+    if na == 0 {
+        na = 128
+    }
+    if na == at {
+        return 0
+    }
+    if SetFileAttributesW(__win_path, na) == 0 {
+        return __win_errno()
+    }
+    return 0
+}
+
+fn __win_unix_to_ft(secs: i64, nsec: i64, dst: u64) {
+    let ft: i64 = secs * 10000000 + nsec / 100 + 116444736000000000
+    __win_st64(dst, 0, ft)
+}
+
+fn __win_utimens(path: u64, ts: u64, flags: i64) -> i64 {
+    if __win_u8_to_u16(path, __win_path, 16384) < 0 {
+        return 0 - 36
+    }
+    var fl: i64 = 33554432
+    if (flags & 256) != 0 {
+        fl = fl | 2097152
+    }
+    var now: [i64; 2] = [0; 2]
+    var times: [i64; 2] = [0; 2]
+    var ap: u64 = 0
+    var mp: u64 = 0
+    if ts == 0 {
+        GetSystemTimeAsFileTime((&now[0]) as u64)
+        ap = (&now[0]) as u64
+        mp = (&now[0]) as u64
+    } else {
+        let ans: i64 = __win_ld32u(ts, 8)
+        let mns: i64 = __win_ld32u(ts, 24)
+        if ans == 1073741823 || mns == 1073741823 {
+            GetSystemTimeAsFileTime((&now[0]) as u64)
+        }
+        if ans == 1073741823 {
+            ap = (&now[0]) as u64
+        } else if ans != 1073741822 {
+            __win_unix_to_ft(__win_ld64(ts, 0), ans, (&times[0]) as u64)
+            ap = (&times[0]) as u64
+        }
+        if mns == 1073741823 {
+            mp = (&now[0]) as u64
+        } else if mns != 1073741822 {
+            __win_unix_to_ft(__win_ld64(ts, 2), mns, ((&times[0]) as u64) + 8)
+            mp = ((&times[0]) as u64) + 8
+        }
+    }
+    let h: i64 = CreateFileW(__win_path, 256, 7, 0, 3, fl, 0)
+    if h == 0 - 1 {
+        return __win_errno()
+    }
+    let ok: i32 = SetFileTime(h, 0, ap, mp)
+    CloseHandle(h)
+    if ok == 0 {
+        return __win_errno()
+    }
+    return 0
 }
 
 fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
@@ -1373,6 +1450,15 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
             return __win_errno()
         }
         return 0
+    }
+    if nr == 90 {
+        if __win_u8_to_u16(a1 as u64, __win_path, 16384) < 0 {
+            return 0 - 36
+        }
+        return __win_chmod(a2)
+    }
+    if nr == 280 {
+        return __win_utimens(a2 as u64, a3 as u64, a4)
     }
     if nr == 266 {
         // symlinkat(target, AT_FDCWD, linkpath). Flag 2 =

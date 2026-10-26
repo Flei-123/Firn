@@ -185,6 +185,8 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("RemoveDirectoryW", "KERNEL32.dll", 1),
     ("CreateSymbolicLinkW", "KERNEL32.dll", 3),
     ("MoveFileExW", "KERNEL32.dll", 3),
+    ("SetFileAttributesW", "KERNEL32.dll", 2),
+    ("SetFileTime", "KERNEL32.dll", 4),
     ("GetModuleHandleW", "KERNEL32.dll", 1),
     ("GetProcAddress", "KERNEL32.dll", 2),
     // --- std.dynlib (docs/FFI.md): load ANY dll at run time ---------------
