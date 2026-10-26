@@ -118,6 +118,7 @@ Radius 32 (v1, PERF_FRAMES=30, 3 Laeufe, reports/perf_20261014-085359_cpu_r32.ts
 * Scaling CPU p50: r8 336 -> r16 1040 (3.1x) -> r32 3453 ms (3.3x); GL p50: 86 -> 347 (4.0x) -> 1235 ms (3.6x). Tris/frame 0.46M -> 2.0M -> 7.4M, sections 485 -> 2185 -> 8088: time ~ linear in tris, no culling/LOD gain visible.
 * GL r32 Streuung gross (p50 max 1552, p99 max 2695): Server-Load lief 16-24 (r8/r16: 13-17) -> r32 GL-Zahl pessimistisch/verrauscht. CPU r32 stabiler (+-3%).
 * Weltaufbau r32: load_e2e CPU 144 s, GL 118 s (5329 Chunks, 76670 Sektionen), RSS-Peak 1.6-1.7 GB (r16: 0.46-0.63 GB, r8: 0.15-0.3 GB).
+* Wiederholung 26.10. (r148, GL llvmpipe r32, 3 Laeufe, reports/perf_20261026-035402_gl_r32.tsv): p50 1167 ms (1081-1239), p95 1445, p99 1542 (vorher 1235/p99 bis 2695). Load 11 vor, 27 waehrend/nach dem Lauf (andere Worker) -> NICHT <15, als verrauscht gekennzeichnet; Streuung der 3 Laeufe aber klein (+-7%). Weiter ~linear in Tris (7.43M), keine GPU.
 * Classification: llvmpipe/CPU, NOT a real GPU, vanilla NOT measured. No statement about vanilla/a real GPU is possible.
 
 ## g1 (14.10.): CPU path -- mesher, snapshot + submit, worker scaling
