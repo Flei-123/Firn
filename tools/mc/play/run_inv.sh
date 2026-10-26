@@ -366,7 +366,8 @@ if [ "${RUN_INV_ONLY:-}" != trader ]; then
 env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player16 > "$W/an.out" 2>&1 &
 PP=$!
-sleep 5
+for i in $(seq 1 90); do grep -q "Player16 joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
+sleep 2
 echo "kill @e[type=minecraft:item]" >&3
 echo "execute at Player16 run setblock ~1 ~ ~ minecraft:air" >&3
 echo "gamemode survival Player16" >&3; echo "give Player16 iron_pickaxe 1" >&3; echo "give Player16 stone 4" >&3
@@ -399,7 +400,8 @@ case "$ANE" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;
 env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=2 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player17 > "$W/en.out" 2>&1 &
 PP=$!
-sleep 5
+for i in $(seq 1 90); do grep -q "Player17 joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
+sleep 2
 echo "kill @e[type=minecraft:item]" >&3
 echo "execute at Player17 run setblock ~1 ~ ~ minecraft:air" >&3
 echo "gamemode survival Player17" >&3; echo "xp set Player17 30 levels" >&3; echo "give Player17 iron_pickaxe 1" >&3; echo "give Player17 lapis_lazuli 3" >&3
