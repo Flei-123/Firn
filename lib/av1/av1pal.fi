@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: MPL-2.0
+import av1.av1sym
+import av1.avif_cdf
+
+export { pal_clear, PS_CELLS, MAP_STRIDE, pal_bind, pal_mode_info, pal_tokens, pal_store, pal_color, pal_size_y, pal_size_uv }
+
+const PS_CELLS: i64 = 72
+const MAP_STRIDE: i64 = 64
+const C_SIZE_Y: i64 = 0
+const C_SIZE_UV: i64 = 1
+const C_COL_Y: i64 = 2
+const C_COL_U: i64 = 10
+const C_COL_V: i64 = 18
+const C_CACHE: i64 = 26
+const C_SIZES_Y: i64 = 44
+const C_SIZES_U: i64 = 45
+const C_COLS_Y: i64 = 46
+const C_COLS_U: i64 = 47
+const C_MAP_Y: i64 = 48
+const C_MAP_UV: i64 = 49
+const C_ORDER: i64 = 52
+const C_SCORE: i64 = 60
+
+static HASH_CTX: [i16; 9] = [-1, -1, 0, -1, -1, 4, 3, 2, 1]
+
+#[no_gc]
+fn pget(ps: u64, i: i64) -> i64 {
+    return *((ps + ((i * 8) as u64)) as *mut i64)
+}
+
+#[no_gc]
+fn pset(ps: u64, i: i64, v: i64) {
+    *((ps + ((i * 8) as u64)) as *mut i64) = v
+}
+
+#[no_gc]
+fn ldb(p: u64, i: i64) -> i64 {
+    return (*((p + (i as u64)) as *mut u8)) as i64
+}
+
+#[no_gc]
+fn stb(p: u64, i: i64, v: i64) {
+    *((p + (i as u64)) as *mut u8) = (v & 255) as u8
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn pal_size_y(ps: u64) -> i64 {
+    return pget(ps, C_SIZE_Y)
+}
+
+fn pal_size_uv(ps: u64) -> i64 {
+    return pget(ps, C_SIZE_UV)
+}
+
+fn pal_clear(ps: u64) {
+    pset(ps, C_SIZE_Y, 0)
+    pset(ps, C_SIZE_UV, 0)
+}
+
+fn pal_bind(ps: u64, sizes_y: u64, sizes_u: u64, cols_y: u64, cols_u: u64, map_y: u64, map_uv: u64) {
+    pset(ps, C_SIZES_Y, sizes_y as i64)
+    pset(ps, C_SIZES_U, sizes_u as i64)
+    pset(ps, C_COLS_Y, cols_y as i64)
+    pset(ps, C_COLS_U, cols_u as i64)
+    pset(ps, C_MAP_Y, map_y as i64)
+    pset(ps, C_MAP_UV, map_uv as i64)
+}
+
+fn rs(sp: *mut av1sym.Sym, mcdf: u64, idx: i64, n: i64) -> i64 {
+    return av1sym.sym_read(sp, mcdf + ((idx * 2) as u64), n)
+}
+
+fn lit(sp: *mut av1sym.Sym, n: i64) -> i64 {
+    return av1sym.sym_literal(sp, n)
+}
+
+fn ceil_log2(x: i64) -> i64 {
+    if x < 2 {
+        return 0
+    }
+    var i: i64 = 1
+    var p: i64 = 2
+    while p < x {
+        i = i + 1
+        p = p << 1
+    }
+    return i
+}
+
+fn floor_log2(x: i64) -> i64 {
+    var s: i64 = 0
+    var v: i64 = x
+    while v > 1 {
+        v = v >> 1
+        s = s + 1
+    }
+    return s
+}
+
+fn read_ns(sp: *mut av1sym.Sym, n: i64) -> i64 {
+    let w: i64 = floor_log2(n) + 1
+    let m: i64 = (1 << w) - n
+    let v: i64 = lit(sp, w - 1)
+    if v < m {
+        return v
+    }
+    let extra: i64 = lit(sp, 1)
+    return (v << 1) - m + extra
+}
+
+fn sort_cells(ps: u64, base: i64, n: i64) {
+    var i: i64 = 1
+    while i < n {
+        let v: i64 = pget(ps, base + i)
+        var j: i64 = i - 1
+        while j >= 0 && pget(ps, base + j) > v {
+            pset(ps, base + j + 1, pget(ps, base + j))
+            j = j - 1
+        }
+        pset(ps, base + j + 1, v)
+        i = i + 1
+    }
+}
+
+fn cache_push(ps: u64, n: i64, v: i64) -> i64 {
+    if n == 0 || v != pget(ps, C_CACHE + n - 1) {
+        pset(ps, C_CACHE + n, v)
+        return n + 1
+    }
+    return n
+}
+
+fn build_cache(ps: u64, plane: i64, r: i64, cc: i64, mc: i64, avu: i64, avl: i64) -> i64 {
+    var sizes: u64 = pget(ps, C_SIZES_Y) as u64
+    var cols: u64 = pget(ps, C_COLS_Y) as u64
+    if plane == 1 {
+        sizes = pget(ps, C_SIZES_U) as u64
+        cols = pget(ps, C_COLS_U) as u64
+    }
+    var above_n: i64 = 0
+    var above_at: i64 = 0
+    if avu != 0 && ((r * 4) & 63) != 0 {
+        above_at = (r - 1) * mc + cc
+        above_n = ldb(sizes, above_at)
+    }
+    var left_n: i64 = 0
+    var left_at: i64 = 0
+    if avl != 0 {
+        left_at = r * mc + cc - 1
+        left_n = ldb(sizes, left_at)
+    }
+    var ai: i64 = 0
+    var li: i64 = 0
+    var n: i64 = 0
+    while ai < above_n && li < left_n {
+        let ac: i64 = ldb(cols, above_at * 8 + ai)
+        let lc: i64 = ldb(cols, left_at * 8 + li)
+        if lc < ac {
+            n = cache_push(ps, n, lc)
+            li = li + 1
+        } else {
+            n = cache_push(ps, n, ac)
+            ai = ai + 1
+            if lc == ac {
+                li = li + 1
+            }
+        }
+    }
+    while ai < above_n {
+        n = cache_push(ps, n, ldb(cols, above_at * 8 + ai))
+        ai = ai + 1
+    }
+    while li < left_n {
+        n = cache_push(ps, n, ldb(cols, left_at * 8 + li))
+        li = li + 1
+    }
+    return n
+}
+
+fn read_cached_colors(ps: u64, sp: *mut av1sym.Sym, base: i64, n: i64, cache_n: i64, bd: i64, extra_range: i64, plus_one: i64) {
+    var idx: i64 = 0
+    var i: i64 = 0
+    while i < cache_n && idx < n {
+        if lit(sp, 1) != 0 {
+            pset(ps, base + idx, pget(ps, C_CACHE + i))
+            idx = idx + 1
+        }
+        i = i + 1
+    }
+    if idx < n {
+        pset(ps, base + idx, lit(sp, bd))
+        idx = idx + 1
+    }
+    var bits: i64 = 0
+    if idx < n {
+        bits = bd - 3 + lit(sp, 2)
+    }
+    let maxv: i64 = (1 << bd) - 1
+    while idx < n {
+        let delta: i64 = lit(sp, bits) + plus_one
+        let v: i64 = imin(maxv, pget(ps, base + idx - 1) + delta)
+        pset(ps, base + idx, v)
+        bits = imin(bits, ceil_log2((1 << bd) - v - extra_range))
+        idx = idx + 1
+    }
+    sort_cells(ps, base, n)
+}
+
+fn read_v_colors(ps: u64, sp: *mut av1sym.Sym, n: i64, bd: i64) {
+    let maxval: i64 = 1 << bd
+    var idx: i64 = 0
+    if lit(sp, 1) != 0 {
+        let bits: i64 = bd - 4 + lit(sp, 2)
+        pset(ps, C_COL_V, lit(sp, bd))
+        idx = 1
+        while idx < n {
+            var d: i64 = lit(sp, bits)
+            if d != 0 {
+                if lit(sp, 1) != 0 {
+                    d = 0 - d
+                }
+            }
+            var val: i64 = pget(ps, C_COL_V + idx - 1) + d
+            if val < 0 {
+                val = val + maxval
+            }
+            if val >= maxval {
+                val = val - maxval
+            }
+            pset(ps, C_COL_V + idx, imin(maxval - 1, imax(0, val)))
+            idx = idx + 1
+        }
+    } else {
+        while idx < n {
+            pset(ps, C_COL_V + idx, lit(sp, bd))
+            idx = idx + 1
+        }
+    }
+}
+
+fn pal_mode_info(ps: u64, sp: *mut av1sym.Sym, mcdf: u64, r: i64, cc: i64, mc: i64, avu: i64, avl: i64, bctx: i64,
+                 hasc: i64, ymode: i64, uvmode: i64, bd: i64) {
+    pset(ps, C_SIZE_Y, 0)
+    pset(ps, C_SIZE_UV, 0)
+    if ymode == 0 {
+        let sizes: u64 = pget(ps, C_SIZES_Y) as u64
+        var ctx: i64 = 0
+        if avu != 0 && ldb(sizes, (r - 1) * mc + cc) > 0 {
+            ctx = ctx + 1
+        }
+        if avl != 0 && ldb(sizes, r * mc + cc - 1) > 0 {
+            ctx = ctx + 1
+        }
+        if rs(sp, mcdf, avif_cdf.M_PALETTE_Y_MODE as i64 + (bctx * 3 + ctx) * 3, 2) != 0 {
+            let n: i64 = rs(sp, mcdf, avif_cdf.M_PALETTE_Y_SIZE as i64 + bctx * 8, 7) + 2
+            pset(ps, C_SIZE_Y, n)
+            let cache_n: i64 = build_cache(ps, 0, r, cc, mc, avu, avl)
+            read_cached_colors(ps, sp, C_COL_Y, n, cache_n, bd, 1, 1)
+        }
+    }
+    if hasc != 0 && uvmode == 0 {
+        var ctx: i64 = 0
+        if pget(ps, C_SIZE_Y) > 0 {
+            ctx = 1
+        }
+        if rs(sp, mcdf, avif_cdf.M_PALETTE_UV_MODE as i64 + ctx * 3, 2) != 0 {
+            let n: i64 = rs(sp, mcdf, avif_cdf.M_PALETTE_UV_SIZE as i64 + bctx * 8, 7) + 2
+            pset(ps, C_SIZE_UV, n)
+            let cache_n: i64 = build_cache(ps, 1, r, cc, mc, avu, avl)
+            read_cached_colors(ps, sp, C_COL_U, n, cache_n, bd, 0, 0)
+            read_v_colors(ps, sp, n, bd)
+        }
+    }
+}
+
+fn color_context(ps: u64, map: u64, r: i64, c: i64, n: i64) -> i64 {
+    var i: i64 = 0
+    while i < 8 {
+        pset(ps, C_ORDER + i, i)
+        pset(ps, C_SCORE + i, 0)
+        i = i + 1
+    }
+    if c > 0 {
+        let k: i64 = ldb(map, r * MAP_STRIDE + c - 1)
+        pset(ps, C_SCORE + k, pget(ps, C_SCORE + k) + 2)
+    }
+    if r > 0 && c > 0 {
+        let k: i64 = ldb(map, (r - 1) * MAP_STRIDE + c - 1)
+        pset(ps, C_SCORE + k, pget(ps, C_SCORE + k) + 1)
+    }
+    if r > 0 {
+        let k: i64 = ldb(map, (r - 1) * MAP_STRIDE + c)
+        pset(ps, C_SCORE + k, pget(ps, C_SCORE + k) + 2)
+    }
+    i = 0
+    while i < 3 {
+        var max_score: i64 = pget(ps, C_SCORE + i)
+        var max_idx: i64 = i
+        var j: i64 = i + 1
+        while j < n {
+            if pget(ps, C_SCORE + j) > max_score {
+                max_score = pget(ps, C_SCORE + j)
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != i {
+            let max_order: i64 = pget(ps, C_ORDER + max_idx)
+            var k: i64 = max_idx
+            while k > i {
+                pset(ps, C_SCORE + k, pget(ps, C_SCORE + k - 1))
+                pset(ps, C_ORDER + k, pget(ps, C_ORDER + k - 1))
+                k = k - 1
+            }
+            pset(ps, C_SCORE + i, max_score)
+            pset(ps, C_ORDER + i, max_order)
+        }
+        i = i + 1
+    }
+    let hash: i64 = pget(ps, C_SCORE) + pget(ps, C_SCORE + 1) * 2 + pget(ps, C_SCORE + 2) * 2
+    return HASH_CTX[hash as usize] as i64
+}
+
+fn read_map(ps: u64, sp: *mut av1sym.Sym, mcdf: u64, cdf_base: i64, map: u64, n: i64, onw: i64, onh: i64, bw: i64, bh: i64) {
+    stb(map, 0, read_ns(sp, n))
+    var i: i64 = 1
+    while i < onh + onw - 1 {
+        var j: i64 = imin(i, onw - 1)
+        let jmin: i64 = imax(0, i - onh + 1)
+        while j >= jmin {
+            let r: i64 = i - j
+            var ctx: i64 = color_context(ps, map, r, j, n)
+            if ctx < 0 {
+                ctx = 0
+            }
+            let sym: i64 = rs(sp, mcdf, cdf_base + ((n - 2) * 5 + ctx) * 9, n)
+            stb(map, r * MAP_STRIDE + j, pget(ps, C_ORDER + sym))
+            j = j - 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < onh {
+        var j: i64 = onw
+        while j < bw {
+            stb(map, i * MAP_STRIDE + j, ldb(map, i * MAP_STRIDE + onw - 1))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = onh
+    while i < bh {
+        var j: i64 = 0
+        while j < bw {
+            stb(map, i * MAP_STRIDE + j, ldb(map, (onh - 1) * MAP_STRIDE + j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn pal_tokens(ps: u64, sp: *mut av1sym.Sym, mcdf: u64, bw: i64, bh: i64, r: i64, cc: i64, mr: i64, mc: i64, subx: i64, suby: i64) {
+    let onw: i64 = imin(bw, (mc - cc) * 4)
+    let onh: i64 = imin(bh, (mr - r) * 4)
+    let ny: i64 = pget(ps, C_SIZE_Y)
+    if ny > 0 {
+        read_map(ps, sp, mcdf, avif_cdf.M_PALETTE_Y_COLOR_INDEX as i64, pget(ps, C_MAP_Y) as u64, ny, onw, onh, bw, bh)
+    }
+    let nuv: i64 = pget(ps, C_SIZE_UV)
+    if nuv > 0 {
+        var cbw: i64 = bw >> subx
+        var cbh: i64 = bh >> suby
+        var conw: i64 = onw >> subx
+        var conh: i64 = onh >> suby
+        if cbw < 4 {
+            cbw = cbw + 2
+            conw = conw + 2
+        }
+        if cbh < 4 {
+            cbh = cbh + 2
+            conh = conh + 2
+        }
+        read_map(ps, sp, mcdf, avif_cdf.M_PALETTE_UV_COLOR_INDEX as i64, pget(ps, C_MAP_UV) as u64, nuv, conw, conh, cbw, cbh)
+    }
+}
+
+fn pal_store(ps: u64, r: i64, cc: i64, bw4: i64, bh4: i64, mr: i64, mc: i64) {
+    let ny: i64 = pget(ps, C_SIZE_Y)
+    let nuv: i64 = pget(ps, C_SIZE_UV)
+    if ny == 0 && nuv == 0 {
+        return
+    }
+    let sizes_y: u64 = pget(ps, C_SIZES_Y) as u64
+    let sizes_u: u64 = pget(ps, C_SIZES_U) as u64
+    let cols_y: u64 = pget(ps, C_COLS_Y) as u64
+    let cols_u: u64 = pget(ps, C_COLS_U) as u64
+    var y: i64 = 0
+    while y < bh4 {
+        var x: i64 = 0
+        while x < bw4 {
+            if r + y < mr && cc + x < mc {
+                let at: i64 = (r + y) * mc + cc + x
+                stb(sizes_y, at, ny)
+                stb(sizes_u, at, nuv)
+                var k: i64 = 0
+                while k < ny {
+                    stb(cols_y, at * 8 + k, pget(ps, C_COL_Y + k))
+                    k = k + 1
+                }
+                k = 0
+                while k < nuv {
+                    stb(cols_u, at * 8 + k, pget(ps, C_COL_U + k))
+                    k = k + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn pal_color(ps: u64, plane: i64, mx: i64, my: i64) -> i64 {
+    if plane == 0 {
+        return pget(ps, C_COL_Y + ldb(pget(ps, C_MAP_Y) as u64, my * MAP_STRIDE + mx))
+    }
+    let k: i64 = ldb(pget(ps, C_MAP_UV) as u64, my * MAP_STRIDE + mx)
+    if plane == 1 {
+        return pget(ps, C_COL_U + k)
+    }
+    return pget(ps, C_COL_V + k)
+}

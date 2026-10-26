@@ -11,8 +11,9 @@ import av1.av1recon
 import av1.av1lr
 import av1.av1qm
 import av1.av1txfm
+import av1.av1pal
 
-export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_set_quant_ext, tile_err }
+export { tile_set_chroma, tile_set_lr, tile_skp, tile_cdefidx, tile_sbcols, tile_lftx, tile_new, tile_run, tile_plane, tile_stride, tile_bits_left, tile_free, tile_set_frame, tile_set_quant_ext, tile_set_sct, tile_err }
 
 const S_SYM: i64 = 0
 const S_MCDF: i64 = 1
@@ -94,6 +95,7 @@ const S_DQPRES: i64 = 87
 const S_DQRES: i64 = 88
 const S_CURQ: i64 = 89
 const S_RDELTAS: i64 = 90
+const S_PAL: i64 = 91
 
 static NUM4W: [i16; 22] = [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16]
 static NUM4H: [i16; 22] = [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4]
@@ -381,6 +383,9 @@ fn tile_new(data: u64, len: i64, mi_cols: i64, mi_rows: i64, enable_fi: i64, ena
     ss(c, S_CDEFIDX, zalloc_c(c, ((mi_cols + 15) >> 4) * ((mi_rows + 15) >> 4) + 8) as i64)
     ss(c, S_LOSSLESS, 1)
     ss(c, S_BD, 8)
+    let ps: u64 = zalloc_c(c, av1pal.PS_CELLS * 8)
+    av1pal.pal_bind(ps, zalloc_c(c, mn), zalloc_c(c, mn), zalloc_c(c, mn * 8), zalloc_c(c, mn * 8), zalloc_c(c, 4096), zalloc_c(c, 4096))
+    ss(c, S_PAL, ps as i64)
     ss(c, S_TCDF, zalloc_c(c, 64) as i64)
     ss(c, S_EFI, enable_fi)
     ss(c, S_EEF, enable_ef)
@@ -409,6 +414,10 @@ fn set_quant(c: u64, qidx: i64) {
     ss(c, S_DCQ + 3, av1lt.ac_q(bdi, qclip(qidx + sg(c, S_DQD + 2) - 128)))
     ss(c, S_DCQ + 4, av1lt.dc_q(bdi, qclip(qidx + sg(c, S_DQD + 3) - 128)))
     ss(c, S_DCQ + 5, av1lt.ac_q(bdi, qclip(qidx + sg(c, S_DQD + 4) - 128)))
+}
+
+fn tile_set_sct(c: u64, sct: i64) {
+    ss(c, S_SCT, sct)
 }
 
 fn tile_set_quant_ext(c: u64, qm_present: i64, qm_y: i64, qm_u: i64, qm_v: i64, dq_present: i64, dq_res: i64) {
@@ -1491,6 +1500,21 @@ fn reconstruct(c: u64, plane: i64, sx: i64, sy: i64, txsz: i64) {
                          txsz, sg(c, S_TXTYPE), sg(c, S_DCQ + plane * 2), sg(c, S_DCQ + plane * 2 + 1), sg(c, S_BD), qm)
 }
 
+fn predict_palette(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i64) {
+    let ps: u64 = sg(c, S_PAL) as u64
+    let w: i64 = av1tab2.t_txw(txsz)
+    let h: i64 = av1tab2.t_txh(txsz)
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        while j < w {
+            setpx(c, plane, sx + j, sy + i, av1pal.pal_color(ps, plane, x * 4 + j, y * 4 + i))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
 fn transform_block(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i64) {
     if sx >= plane_w(c, plane) || sy >= plane_h(c, plane) {
         return
@@ -1531,9 +1555,14 @@ fn transform_block(c: u64, plane: i64, sx: i64, sy: i64, x: i64, y: i64, txsz: i
     }
     let har: i64 = ldb(bd, (plane * 18 + bdr) * 18 + bdc + stepx + 1)
     let hbl: i64 = ldb(bd, (plane * 18 + bdr + stepy + 1) * 18 + bdc)
-    predict_intra(c, plane, sx, sy, hl, ha, har, hbl, mode, txsz)
-    if isc != 0 {
-        predict_cfl(c, plane, sx, sy, txsz)
+    let pps: u64 = sg(c, S_PAL) as u64
+    if (plane == 0 && av1pal.pal_size_y(pps) > 0) || (plane > 0 && av1pal.pal_size_uv(pps) > 0) {
+        predict_palette(c, plane, sx, sy, x, y, txsz)
+    } else {
+        predict_intra(c, plane, sx, sy, hl, ha, har, hbl, mode, txsz)
+        if isc != 0 {
+            predict_cfl(c, plane, sx, sy, txsz)
+        }
     }
     if plane == 0 {
         ss(c, S_MAXLW, sx + stepx * 4)
@@ -1730,29 +1759,22 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
         ss(c, S_UVMODE, 0)
     }
     ss(c, S_ANGUV, anguv)
+    let ps: u64 = sg(c, S_PAL) as u64
     if size >= 3 && sg(c, S_SCT) != 0 {
         let bctx: i64 = (MIWL[size as usize] as i64) + (MIHL[size as usize] as i64) - 2
-        if ymode == 0 {
-            if rs(c, mcell(c, avif_cdf.M_PALETTE_Y_MODE as i64 + (bctx * 3) * 3), 2) != 0 {
-                ss(c, S_ERR, 2)
-                return
-            }
-        }
-        if hasc != 0 && uvmode == 0 {
-            if rs(c, mcell(c, avif_cdf.M_PALETTE_UV_MODE as i64), 2) != 0 {
-                ss(c, S_ERR, 3)
-                return
-            }
-        }
+        av1pal.pal_mode_info(ps, symp(c), sg(c, S_MCDF) as u64, r, cc, mc, avu, avl, bctx, hasc, ymode, uvmode, sg(c, S_BD))
+    } else {
+        av1pal.pal_clear(ps)
     }
     ss(c, S_UFI, 0)
-    if sg(c, S_EFI) != 0 && ymode == 0 && imax(bw4, bh4) <= 8 {
+    if sg(c, S_EFI) != 0 && ymode == 0 && av1pal.pal_size_y(ps) == 0 && imax(bw4, bh4) <= 8 {
         let u: i64 = rs(c, mcell(c, avif_cdf.M_FILTER_INTRA as i64 + size * 3), 2)
         ss(c, S_UFI, u)
         if u != 0 {
             ss(c, S_FIM, rs(c, mcell(c, avif_cdf.M_FILTER_INTRA_MODE as i64), 5))
         }
     }
+    av1pal.pal_tokens(ps, symp(c), sg(c, S_MCDF) as u64, bw4 * 4, bh4 * 4, r, cc, mr, mc, subx, suby)
     var txsz: i64 = 0
     if sg(c, S_LOSSLESS) == 0 {
         let mx: i64 = av1tab2.t_maxrect(size)
@@ -1816,6 +1838,7 @@ fn decode_block(c: u64, r: i64, cc: i64, size: i64) {
         }
         y = y + 1
     }
+    av1pal.pal_store(ps, r, cc, bw4, bh4, mr, mc)
     let cn: i64 = sg(c, S_CN)
     if skip != 0 {
         var pl: i64 = 0
