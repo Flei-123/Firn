@@ -2,7 +2,7 @@
 # tools/mc/play/run_inv.sh [mc_version=1.21.4] -- mcplay inventory + survival dig against an official server of ANY version
 # (data components from 1.20.5: mc_inv reads Window Items / Set Slot through the packet schema, mc_dig uses the version's tool table).
 # One server, Xvfb, mcplay (CPU raster): /give an iron pickaxe + stone, look down, hold the left button.
-# Prints `RESULT mc-play-inv: ok|FAIL`. Env: RUN_INV_CMDS (extra server commands in the survival stage), MCPLAY_RAW_INV=1 (rawinv lines = real packet bodies for test fixtures), FIRNC, JAVA (1.21+ needs Java 21+; default /root/tools/jdk25/bin/java when present), MC_VIEW (3), MCPLAY_KEEP_DIR, RUN_INV_ONLY=cont (only the anvil/enchanting stages, needs RUN_INV_CONT=1).
+# Prints `RESULT mc-play-inv: ok|FAIL`. Env: RUN_INV_CMDS (extra server commands in the survival stage), MCPLAY_RAW_INV=1 (rawinv lines = real packet bodies for test fixtures), FIRNC, JAVA (1.21+ needs Java 21+; default /root/tools/jdk25/bin/java when present), MC_VIEW (3), MCPLAY_KEEP_DIR, RUN_INV_ONLY=cont (only the anvil/enchanting stages, needs RUN_INV_CONT=1), RUN_INV_TRADER=1 or RUN_INV_ONLY=trader (villager trade stage; RUN_INV_CONT=1 required; TRADER_SHOT=<ppm> keeps the trade screen).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-/root/firn/compiler/target/release/firnc}
@@ -20,6 +20,7 @@ for t in Xvfb xdotool; do command -v $t >/dev/null || fail "missing tool: $t"; d
 $FIRNC --opt-level=dev-fast -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
 SND=${MCPLAY_SOUNDS:-${XDG_CACHE_HOME:-$HOME/.cache}/mcplay/sounds}
 export MCPLAY_SOUNDS="$SND"
+NPCS=false; { [ "${RUN_INV_TRADER:-0}" = 1 ] || [ "${RUN_INV_ONLY:-}" = trader ]; } && NPCS=true
 mkdir -p "$W/srv"
 MCCLIENT_JAR_CACHE=${MCCLIENT_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
@@ -37,7 +38,7 @@ spawn-protection=0
 difficulty=peaceful
 spawn-monsters=false
 spawn-animals=false
-spawn-npcs=false
+spawn-npcs=$NPCS
 enable-rcon=false
 enable-query=false
 PROPS
@@ -54,7 +55,7 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
-if [ "${RUN_INV_ONLY:-}" != cont ]; then
+if [ -z "${RUN_INV_ONLY:-}" ]; then
 # ---- creative: Set Creative Slot (MCPLAY_GIVE) and the server's Window Items / Set Slot
 MCPLAY_AUDIO=0 MCPLAY_GIVE="iron_pickaxe:1,stone:64" MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player > "$W/creative.out" 2>&1
@@ -361,6 +362,7 @@ CJENV=(MC_VANILLA=1 "MC_VANILLA_JAR=$CJAR" "MC_VANILLA_ASSETS=${MC_VANILLA_ASSET
 [ -n "$CJAR" ] || { echo "  FAIL  cont ui: no client jar for $MCV"; ERR=1; }
 ccell() { grep "contui cell $2 " "$W/$1.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
 cclick() { local xy; xy=$(ccell "$1" "$2"); [ -n "$xy" ] || { echo "  FAIL  cont ui: no cell $2"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.8; }
+if [ "${RUN_INV_ONLY:-}" != trader ]; then
 env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player16 > "$W/an.out" 2>&1 &
 PP=$!
@@ -432,7 +434,9 @@ PY
 . tools/mc/play/inv_panel_stage.sh
 [ -n "$CJAR" ] && run_panel_stage
 fi
-if [ "${RUN_INV_ONLY:-}" != cont ]; then
+if { [ "${RUN_INV_TRADER:-0}" = 1 ] || [ "${RUN_INV_ONLY:-}" = trader ]; } && [ -n "$CJAR" ]; then . tools/mc/play/inv_trader_stage.sh; run_trader_stage; fi
+fi
+if [ -z "${RUN_INV_ONLY:-}" ]; then
 # ---- creative screen (MCPLAY_CREATIVE_LOG): E opens the tabbed item list, xdotool switches tabs, takes stacks from the list and puts them into the hotbar (Set Creative Slot)
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=1 MCPLAY_CREATIVE_LOG=1 MCPLAY_RUN_S=40 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player15 > "$W/cr.out" 2>&1 &
