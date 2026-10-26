@@ -552,7 +552,8 @@ const firnTag = document.currentScript;
     // A module that has firn_web_pointer_ex gets what a PointerEvent has --
     // pointerId, type, isPrimary, timeStamp -- so a second finger is a second
     // pointer and not a second mouse; an older module gets the one pointer.
-    const at = (e) => [e.offsetX, e.offsetY, e.buttons | (e.pointerType === 'mouse' ? 0 : 256)];
+    const middle = (e) => e.pointerType === 'mouse' && e.button === 1 && (e.type === 'pointerdown' || e.type === 'pointerup');
+    const at = (e) => [e.offsetX, e.offsetY, (e.buttons & 3) | (e.pointerType === 'mouse' ? 0 : 256) | (middle(e) ? 512 : 0)];
     const PTYPE = { mouse: 1, touch: 2, pen: 3 };
     const ptr = (kind, e) => x.firn_web_pointer_px
         ? x.firn_web_pointer_px(kind, ...at(e), e.pointerId, PTYPE[e.pointerType] || 1, e.isPrimary ? 1 : 0, e.timeStamp, e.pressure)
@@ -566,11 +567,14 @@ const firnTag = document.currentScript;
     canvas.addEventListener('pointermove', (e) => ev(ptr(0, e)));
     canvas.addEventListener('pointerdown', (e) => {
         if (!document.hasFocus || document.hasFocus()) said('focus', '1');
+        if (e.button === 1) e.preventDefault();
         canvas.setPointerCapture(e.pointerId);
         if (document.activeElement !== ta) canvas.focus({ preventScroll: true });
         ev(ptr(1, e));
     });
     canvas.addEventListener('pointerup', (e) => ev(ptr(2, e)));
+    canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+    canvas.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
     canvas.addEventListener('pointercancel', (e) => ev(ptr(4, e)));
     canvas.addEventListener('pointerleave', (e) => ev(ptr(3, e)));
     const mods = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
