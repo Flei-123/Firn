@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from jxlbits import BitWriter, encode_toc, to_bits, to_bytes
+import rawdq
 
 KIND_MODE = [0, 1, 2, 3, 0, 0, 0, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0]
 KIND_BANDS = [6, 0, 0, 4, 7, 8, 7, 8, 8, 4, 0, 8, 8, 8, 8, 8, 8]
@@ -68,6 +69,8 @@ def emit_kind(bw, kind, custom, params, offsets, first_scale, delta):
 
 
 def variant_bits(name, params, offsets):
+    if name in rawdq.VARIANTS:
+        return rawdq.variant_bits(name)
     bw = BitWriter()
     bw.put(0, 1)
     for kind in range(17):
@@ -118,4 +121,5 @@ def main():
     open(dst, "wb").write(rebuild(data, probe, variant_bits(variant, params, offsets), strip))
 
 
-main()
+if __name__ == "__main__":
+    main()

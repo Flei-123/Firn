@@ -9,7 +9,7 @@ FIRNLIB=$R/lib /root/firn/compiler/target/release/firnc tools/jxl/toc_probe.fi -
 for src in "$@"; do
     cp $V/$src.jxl $D/p.jxl
     P=$(cd $D && ./probe | tr '\n' ' ')
-    for variant in lib dct small all; do
+    for variant in ${VARIANTS:-lib dct small all}; do
         for strip in 0 1; do
             python3 -I tools/jxl/gen_dequant.py $R $V/$src.jxl $D/t.jxl $variant $strip $P
             if $J/djxl $D/t.jxl $D/t.ppm >/dev/null 2>&1; then
