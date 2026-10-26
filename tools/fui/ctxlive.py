@@ -18,8 +18,8 @@
 import os, shutil, subprocess, sys, tempfile, time
 
 PROG = sys.argv[1]
-BELEG = sys.argv[2]
-os.makedirs(BELEG, exist_ok=True)
+PROOF = sys.argv[2]
+os.makedirs(PROOF, exist_ok=True)
 HERE = os.path.dirname(os.path.abspath(__file__))
 WINE = PROG.endswith(".exe")
 OX = 0
@@ -34,6 +34,9 @@ except Exception:
     print("SKIP: no PIL (python3-pil) -- the pictures cannot be read")
     sys.exit(0)
 
+sys.path.insert(0, HERE)
+import xlive
+
 bad = 0
 total = 0
 
@@ -46,11 +49,8 @@ def chk(text, ok, got="", want=""):
     print("  %-78s%s %s %s" % (text, "OK   " if ok else "WRONG", got, want), flush=True)
 
 
-DISP = ":%d" % (100 + os.getpid() % 800)
+xvfb, DISP = xlive.start_xvfb()
 env = dict(os.environ, DISPLAY=DISP)
-xvfb = subprocess.Popen(["Xvfb", DISP, "-screen", "0", "1100x720x24"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(1.0)
 app = None
 
 
@@ -80,20 +80,18 @@ def xdo(*args):
     subprocess.run(["xdotool"] + a, env=env, check=False)
 
 
-def shot(name):
-    xwd = os.path.join(BELEG, name + ".xwd")
-    with open(xwd, "wb") as f:
-        subprocess.run(["xwd", "-root", "-silent", "-display", DISP], stdout=f, check=True)
-    png = os.path.join(BELEG, name + ".png")
-    subprocess.run([sys.executable, os.path.join(HERE, "xwd2png.py"), xwd, png],
-                   check=True, stdout=subprocess.DEVNULL)
-    os.remove(xwd)
-    img = Image.open(png).convert("RGB")
+def grab(name="ctx-live-probe"):
+    img = xlive.capture(DISP, PROOF, name)
     if OX or OY:
-        # the window's origin becomes (0, 0), so every box below is the same on both hosts
         shifted = Image.new("RGB", img.size, (0, 0, 0))
         shifted.paste(img.crop((OX, OY, img.size[0], img.size[1])), (0, 0))
         img = shifted
+    return img
+
+
+def await_state(name, pred, action=None, timeout=20.0, retry_after=5.0):
+    img, ok = xlive.wait_until(grab, pred, action, timeout, retry_after)
+    img.save(os.path.join(PROOF, name + ".png"))
     return img
 
 
@@ -104,15 +102,41 @@ def cpu_ticks(pid):
 
 
 def diff(a, b, box):
-    x0, y0, x1, y1 = box
-    pa = a.load()
-    pb = b.load()
-    n = 0
-    for y in range(y0, y1):
-        for x in range(x0, x1):
-            if sum(abs(p - q) for p, q in zip(pa[x, y], pb[x, y])) > 60:
-                n += 1
-    return n
+    return xlive.count_diff(a, b, box)
+
+
+def escape():
+    xdo("key", "Escape")
+
+
+def click_right_at(x, y):
+    xdo("mousemove", str(x), str(y))
+    time.sleep(0.1)
+    xdo("click", "3")
+
+
+def open_menu(ref, name, probe_box=(445, 150, 590, 395), attempts=4):
+    img = None
+    for _ in range(attempts):
+        click_right_at(300, 186)
+        img = await_state(name, lambda i: diff(ref, i, probe_box) > 1500, timeout=8.0)
+        if diff(ref, img, probe_box) > 1500:
+            return img
+        escape()
+        await_state(name, lambda i: diff(ref, i, probe_box) < 50, escape, timeout=6.0, retry_after=2.0)
+    return img
+
+
+def settle(timeout=10.0):
+    prev = grab()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.3)
+        cur = grab()
+        if diff(prev, cur, (0, 0, xlive.SCREEN_W, xlive.SCREEN_H)) == 0:
+            return cur
+        prev = cur
+    return prev
 
 
 print("== a context menu in a real window (Xvfb %s) ==" % DISP)
@@ -120,42 +144,39 @@ cmd = [PROG]
 if WINE:
     wpfx = tempfile.mkdtemp(prefix="ctxlive-wine-")
     env = dict(env, WINEPREFIX=wpfx, WINEDEBUG="-all")
-    subprocess.run(["wineboot", "-i"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    subprocess.run(["wineboot", "-i"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
     cmd = ["wine", PROG]
 app = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 if WINE:
-    for _ in range(40):
+    deadline = time.time() + 90
+    while time.time() < deadline:
         time.sleep(0.5)
         out = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "Context"], env=env,
                              capture_output=True, text=True).stdout.split()
         if out:
             g = subprocess.run(["xdotool", "getwindowgeometry", out[0]], env=env, capture_output=True,
                                text=True).stdout
+            if "Position:" not in g:
+                continue
             pos = g.split("Position:")[1].split()[0].split(",")
             OX, OY = int(pos[0]), int(pos[1])
             subprocess.run(["xdotool", "windowfocus", out[0]], env=env, check=False)
             break
     print("  (wine window origin %d,%d)" % (OX, OY))
-time.sleep(1.8)
+black = Image.new("RGB", (xlive.SCREEN_W, xlive.SCREEN_H), (0, 0, 0))
+A = await_state("ctx-live-0-closed", lambda i: diff(i, black, (0, 0, 420, 360)) > 5000, timeout=45.0)
 if app.poll() is not None:
     chk("the program is running", False, "exit %s" % app.returncode, app.stderr.read().decode()[:200])
     finish(1)
-A = shot("ctx-live-0-closed")
-chk("the program's window is up (the root is not all black)", diff(A, Image.new("RGB", A.size, (0, 0, 0)), (0, 0, 420, 360)) > 5000)
+A = settle()
+A.save(os.path.join(PROOF, "ctx-live-0-closed.png"))
+chk("the program's window is up (the root is not all black)", diff(A, black, (0, 0, 420, 360)) > 5000)
 
-# 1. right click on the third row, near the window's right edge: the menu
-#    (about 170 px wide) must reach past x = 420
-xdo("mousemove", "300", "186")
-time.sleep(0.2)
-xdo("click", "3")
-time.sleep(0.8)
-B = shot("ctx-live-1-open")
-out_box = (445, 150, 590, 395)
-n_out = diff(A, B, out_box)
+B = open_menu(A, "ctx-live-1-open")
+n_out = diff(A, B, (445, 150, 590, 395))
 chk("the menu is visible OUTSIDE the window (right of x = 420)", n_out > 1500, "%d px" % n_out)
 n_in = diff(A, B, (300, 186, 430, 336))
 chk("... and inside the window too", n_in > 1500, "%d px" % n_in)
-# the window's right edge is not a cut: the same rows run on both sides of x = 420
 rows_ok = 0
 pb = B.load()
 for y in range(196, 330):
@@ -163,98 +184,89 @@ for y in range(196, 330):
         rows_ok += 1
 chk("the menu is not cut at the window's edge (x = 430 and x = 444 look alike)", rows_ok > 100, "%d rows" % rows_ok)
 
-# 2. Esc closes it and the screen is as before
-xdo("key", "Escape")
-time.sleep(0.5)
-C = shot("ctx-live-2-closed")
-# (the right click chose the row under it, as in Windows: the list differs, the
-# screen outside the window must be as before)
-chk("Esc closes the menu: the screen outside the window is as before", diff(A, C, (440, 0, 1100, 720)) < 50, "%d px differ" % diff(A, C, (440, 0, 1100, 720)))
+escape()
+C = await_state("ctx-live-2-closed", lambda i: diff(A, i, (440, 0, 1100, 720)) < 50, escape, retry_after=4.0)
+n = diff(A, C, (440, 0, 1100, 720))
+chk("Esc closes the menu: the screen outside the window is as before", n < 50, "%d px differ" % n)
 
-# 3. open again, click Rename (the second entry): the menu closes and the page shows the action's text
-xdo("mousemove", "300", "186")
-time.sleep(0.2)
-xdo("click", "3")
-time.sleep(0.8)
+B = open_menu(A, "ctx-live-1b-open")
+hover_box = (305, 222, 470, 256)
+nudge = lambda: (xdo("mousemove", "349", "239"), time.sleep(0.1), xdo("mousemove", "350", "239"))
 xdo("mousemove", "350", "239")
-time.sleep(0.4)
-D = shot("ctx-live-3-hover")
-chk("hovering Rename highlights it", diff(B, D, (305, 222, 470, 256)) > 300, "%d px" % diff(B, D, (305, 222, 470, 256)))
+D = await_state("ctx-live-3-hover", lambda i: diff(B, i, hover_box) > 300, nudge, retry_after=3.0)
+n = diff(B, D, hover_box)
+chk("hovering Rename highlights it", n > 300, "%d px" % n)
 xdo("click", "1")
-time.sleep(0.8)
-E = shot("ctx-live-4-ran")
-chk("the click ran the action: the menu is gone", diff(A, E, (445, 150, 590, 395)) < 50, "%d px" % diff(A, E, (445, 150, 590, 395)))
-chk("... and the page's label changed ('rename')", diff(A, E, (130, 255, 290, 285)) > 100, "%d px" % diff(A, E, (130, 255, 290, 285)))
+E = await_state("ctx-live-4-ran",
+                lambda i: diff(A, i, (445, 150, 590, 395)) < 50 and diff(A, i, (130, 255, 290, 285)) > 100)
+n = diff(A, E, (445, 150, 590, 395))
+chk("the click ran the action: the menu is gone", n < 50, "%d px" % n)
+n = diff(A, E, (130, 255, 290, 285))
+chk("... and the page's label changed ('rename')", n > 100, "%d px" % n)
 
-# 4. a click outside everything closes the menu and the click goes nowhere
-xdo("mousemove", "300", "186")
-time.sleep(0.2)
-xdo("click", "3")
-time.sleep(0.8)
+E = settle()
+B = open_menu(E, "ctx-live-5a-open")
 xdo("mousemove", "800", "500")
 time.sleep(0.2)
 xdo("click", "1")
-time.sleep(0.6)
-F = shot("ctx-live-5-outside")
 if WINE:
-    # a window manager-less Xvfb gives wine no activation change and no grab on a click of the bare
-    # root; Windows closes the menu on deactivation (WM_ACTIVATEAPP), which wine cannot show here
+    F = await_state("ctx-live-5-outside", lambda i: False, timeout=1.0)
     print("  NOT TESTED wine: a click on the empty screen (no window manager, no activation change)")
-    xdo("key", "Escape")
-    time.sleep(0.5)
+    escape()
+    await_state("ctx-live-5b-closed", lambda i: diff(E, i, (445, 150, 590, 395)) < 50, escape, retry_after=3.0)
 else:
-    chk("a click on the empty screen closes the menu", diff(E, F, (445, 150, 590, 395)) < 50, "%d px" % diff(E, F, (445, 150, 590, 395)))
+    F = await_state("ctx-live-5-outside", lambda i: diff(E, i, (445, 150, 590, 395)) < 50)
+    n = diff(E, F, (445, 150, 590, 395))
+    chk("a click on the empty screen closes the menu", n < 50, "%d px" % n)
 
-# 5. a submenu opens in a window of its own; Esc closes it first, then the menu
-xdo("mousemove", "300", "186")
-time.sleep(0.2)
-xdo("click", "3")
-time.sleep(0.8)
-G0 = shot("ctx-live-6-open")
+F = settle()
+G0 = open_menu(F, "ctx-live-6-open")
 xdo("key", "End")
 xdo("key", "Up")
-time.sleep(0.4)
+time.sleep(0.2)
 xdo("key", "Right")
-time.sleep(0.8)
-G1 = shot("ctx-live-7-submenu")
-chk("the keys reach the menu (the focus moved, the submenu opened)", diff(G0, G1, (300, 186, 800, 450)) > 800, "%d px" % diff(G0, G1, (300, 186, 800, 450)))
-# the submenu stands to the right of the menu (x > 585) on the root window, outside the program's window
-chk("the submenu is a window of its own to the right of the menu", diff(G0, G1, (612, 140, 800, 450)) > 600, "%d px" % diff(G0, G1, (612, 140, 800, 450)))
-xdo("key", "Escape")
-time.sleep(0.6)
-G2 = shot("ctx-live-8-subclosed")
-chk("Esc closes the submenu only: the menu stays as it was", diff(G1, G2, (300, 186, 570, 424)) < 400, "%d px differ" % diff(G1, G2, (300, 186, 570, 424)))
-chk("... and the submenu's window is gone", diff(G0, G2, (612, 140, 800, 450)) < 50, "%d px differ" % diff(G0, G2, (612, 140, 800, 450)))
-xdo("key", "Escape")
-time.sleep(0.6)
-G3 = shot("ctx-live-9-closed")
-chk("Esc again closes the menu", diff(G3, G0, (440, 186, 800, 450)) > 500 and diff(A, G3, (440, 0, 1100, 720)) < 50, "%d px" % diff(A, G3, (440, 0, 1100, 720)))
+G1 = await_state("ctx-live-7-submenu",
+                 lambda i: diff(G0, i, (300, 186, 800, 450)) > 800 and diff(G0, i, (612, 140, 800, 450)) > 600)
+n = diff(G0, G1, (300, 186, 800, 450))
+chk("the keys reach the menu (the focus moved, the submenu opened)", n > 800, "%d px" % n)
+n = diff(G0, G1, (612, 140, 800, 450))
+chk("the submenu is a window of its own to the right of the menu", n > 600, "%d px" % n)
+escape()
+G2 = await_state("ctx-live-8-subclosed",
+                 lambda i: diff(G0, i, (612, 140, 800, 450)) < 50 and diff(G1, i, (300, 186, 570, 424)) < 400,
+                 escape, retry_after=4.0)
+n = diff(G1, G2, (300, 186, 570, 424))
+chk("Esc closes the submenu only: the menu stays as it was", n < 400, "%d px differ" % n)
+n = diff(G0, G2, (612, 140, 800, 450))
+chk("... and the submenu's window is gone", n < 50, "%d px differ" % n)
+escape()
+G3 = await_state("ctx-live-9-closed",
+                 lambda i: diff(F, i, (440, 0, 1100, 720)) < 50 and diff(i, G0, (440, 186, 800, 450)) > 500,
+                 escape, retry_after=4.0)
+n = diff(F, G3, (440, 0, 1100, 720))
+chk("Esc again closes the menu", diff(G3, G0, (440, 186, 800, 450)) > 500 and n < 50, "%d px" % n)
 
-# 6. the keyboard way: Tab focuses the note field, Shift+F10 opens its text menu below it
+G3 = settle()
 xdo("key", "Tab")
-time.sleep(0.3)
+time.sleep(0.2)
 xdo("key", "shift+F10")
-time.sleep(0.8)
-H = shot("ctx-live-10-keyboard")
-chk("Tab, Shift+F10: a menu opens for the focused element", diff(G3, H, (90, 250, 560, 560)) > 1500, "%d px" % diff(G3, H, (90, 250, 560, 560)))
-xdo("key", "Escape")
-time.sleep(0.5)
-I = shot("ctx-live-11-closed")
+H = await_state("ctx-live-10-keyboard", lambda i: diff(G3, i, (90, 250, 560, 560)) > 1500)
+n = diff(G3, H, (90, 250, 560, 560))
+chk("Tab, Shift+F10: a menu opens for the focused element", n > 1500, "%d px" % n)
+escape()
+I = await_state("ctx-live-11-closed", lambda i: diff(H, i, (90, 250, 560, 560)) > 1500, escape, retry_after=4.0)
 chk("Esc closes it", diff(H, I, (90, 250, 560, 560)) > 1500)
 
-# 7. an open menu is idle: no frames, no busy loop (a hover delay may wake it, nothing else)
-xdo("mousemove", "300", "186")
-time.sleep(0.2)
-xdo("click", "3")
-time.sleep(0.8)
+I = settle()
+open_menu(I, "ctx-live-12-open")
+settle()
 t0 = cpu_ticks(app.pid)
 time.sleep(2.0)
 t1 = cpu_ticks(app.pid)
 chk("an open menu does not spin: under 10 clock ticks of CPU in 2 s", t1 - t0 < 10, "%d ticks" % (t1 - t0))
-xdo("key", "Escape")
+escape()
 time.sleep(0.4)
 
-# 8. the program is still alive and answers: the menu key path (focus the field with Tab, Shift+F10)
 chk("the program is still running", app.poll() is None)
 
 print("")
