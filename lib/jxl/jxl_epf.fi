@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/jxl/jxl_epf.fi -- jxl_epf: JPEG XL edge-preserving filter (3 passes) on XYB planes
 import jxl.jxl_acs
-import jxl.jxl_gaborish
 import jxl.jxl_lfdata
 import jxl.jxl_loopf
+import jxl.jxl_pad
 import jxl.jxl_quant
 import std.math
 import std.rt
@@ -17,7 +17,6 @@ const SIGMA_FLOOR: f64 = -0.0001
 
 static OFF12: [i32; 24] = [-2, 0, -1, -1, -1, 0, -1, 1, 0, -2, 0, -1, 0, 1, 0, 2, 1, -1, 1, 0, 1, 1, 2, 0]
 static OFF4: [i32; 8] = [-1, 0, 0, -1, 0, 1, 1, 0]
-static PLUS: [i32; 10] = [0, 0, -1, 0, 0, -1, 1, 0, 0, 1]
 
 struct EpfCtx {
     width: usize,
@@ -26,6 +25,9 @@ struct EpfCtx {
     plane_len: usize,
     bw: usize,
     sigma: u64,
+    padded: u64,
+    pw: usize,
+    pad_plane: usize,
 }
 
 fn fld(p: u64, i: usize) -> f64 {
@@ -36,41 +38,26 @@ fn fst(p: u64, i: usize, v: f64) {
     *((p +% ((i * 8) as u64)) as *mut f64) = v
 }
 
-fn px(e: *mut EpfCtx, src: u64, c: usize, x: i64, y: i64) -> f64 {
-    let xi: usize = jxl_gaborish.mirror_index(x, (*e).width as i64)
-    let yi: usize = jxl_gaborish.mirror_index(y, (*e).height as i64)
-    return fld(src, c * (*e).plane_len + yi * (*e).stride + xi)
+fn plus_sad(p: u64, i: usize, k: usize, pw: usize) -> f64 {
+    var s: f64 = 0.0
+    s = s + math.fabs(fld(p, i) - fld(p, k))
+    s = s + math.fabs(fld(p, i - pw) - fld(p, k - pw))
+    s = s + math.fabs(fld(p, i - 1) - fld(p, k - 1))
+    s = s + math.fabs(fld(p, i + pw) - fld(p, k + pw))
+    s = s + math.fabs(fld(p, i + 1) - fld(p, k + 1))
+    return s
 }
 
-fn sad_plus(e: *mut EpfCtx, src: u64, lf: *mut jxl_loopf.JxlLoopFilter, x: i64, y: i64, dx: i32, dy: i32) -> f64 {
-    var total: f64 = 0.0
+fn load_padded(e: *mut EpfCtx, planes: u64) {
     var c: usize = 0
     while c < 3 {
-        var s: f64 = 0.0
-        var j: usize = 0
-        while j < 5 {
-            let ox: i64 = PLUS[j * 2 + 1] as i64
-            let oy: i64 = PLUS[j * 2] as i64
-            s = s + math.fabs(px(e, src, c, x + ox, y + oy) - px(e, src, c, x + (dx as i64) + ox, y + (dy as i64) + oy))
-            j = j + 1
-        }
-        total = total + s * (*lf).epf_channel_scale[c]
+        jxl_pad.pad_fill(planes +% ((c * (*e).plane_len * 8) as u64), (*e).width, (*e).height, (*e).stride, 3, (*e).padded +% ((c * (*e).pad_plane * 8) as u64))
         c = c + 1
     }
-    return total
 }
 
-fn sad_single(e: *mut EpfCtx, src: u64, lf: *mut jxl_loopf.JxlLoopFilter, x: i64, y: i64, dx: i32, dy: i32) -> f64 {
-    var total: f64 = 0.0
-    var c: usize = 0
-    while c < 3 {
-        total = total + math.fabs(px(e, src, c, x, y) - px(e, src, c, x + (dx as i64), y + (dy as i64))) * (*lf).epf_channel_scale[c]
-        c = c + 1
-    }
-    return total
-}
-
-fn epf_pass(e: *mut EpfCtx, src: u64, dst: u64, lf: *mut jxl_loopf.JxlLoopFilter, kind: u32) {
+fn epf_pass(e: *mut EpfCtx, planes: u64, lf: *mut jxl_loopf.JxlLoopFilter, kind: u32) {
+    load_padded(e, planes)
     var count: usize = 4
     var sm: f64 = 1.65
     if kind == 0 {
@@ -81,79 +68,78 @@ fn epf_pass(e: *mut EpfCtx, src: u64, dst: u64, lf: *mut jxl_loopf.JxlLoopFilter
         sm = (*lf).epf_pass2_sigma_scale * 1.65
     }
     let bsm: f64 = sm * (*lf).epf_border_sad_mul
+    let pw: usize = (*e).pw
+    let pwi: i64 = pw as i64
+    var doff: [i64; 12] = [0; 12]
+    var i0: usize = 0
+    while i0 < count {
+        if kind == 0 {
+            doff[i0] = (OFF12[i0 * 2] as i64) * pwi + (OFF12[i0 * 2 + 1] as i64)
+        } else {
+            doff[i0] = (OFF4[i0 * 2] as i64) * pwi + (OFF4[i0 * 2 + 1] as i64)
+        }
+        i0 = i0 + 1
+    }
+    let p0: u64 = (*e).padded
+    let p1: u64 = p0 +% (((*e).pad_plane * 8) as u64)
+    let p2: u64 = p1 +% (((*e).pad_plane * 8) as u64)
+    let sc0: f64 = (*lf).epf_channel_scale[0]
+    let sc1: f64 = (*lf).epf_channel_scale[1]
+    let sc2: f64 = (*lf).epf_channel_scale[2]
+    let o0: u64 = planes
+    let o1: u64 = planes +% (((*e).plane_len * 8) as u64)
+    let o2: u64 = o1 +% (((*e).plane_len * 8) as u64)
     var y: usize = 0
     while y < (*e).height {
+        let ym: usize = y % 8
         var x: usize = 0
         while x < (*e).width {
             let sg: f64 = fld((*e).sigma, (y / 8) * (*e).bw + x / 8)
-            var c: usize = 0
-            if sg < MIN_SIGMA {
-                while c < 3 {
-                    fst(dst, c * (*e).plane_len + y * (*e).stride + x, px(e, src, c, x as i64, y as i64))
-                    c = c + 1
-                }
-            } else {
+            if sg >= MIN_SIGMA {
+                let xm: usize = x % 8
                 var mul: f64 = sm
-                if y % 8 == 0 || y % 8 == 7 || x % 8 == 0 || x % 8 == 7 {
+                if ym == 0 || ym == 7 || xm == 0 || xm == 7 {
                     mul = bsm
                 }
                 let inv_sigma: f64 = sg * mul
-                var acc: [f64; 3] = [px(e, src, 0, x as i64, y as i64), px(e, src, 1, x as i64, y as i64), px(e, src, 2, x as i64, y as i64)]
+                let o: usize = (y + 3) * pw + x + 3
+                var a0: f64 = fld(p0, o)
+                var a1: f64 = fld(p1, o)
+                var a2: f64 = fld(p2, o)
                 var wsum: f64 = 1.0
                 var i: usize = 0
                 while i < count {
-                    var dy: i32 = 0
-                    var dx: i32 = 0
-                    if kind == 0 {
-                        dy = OFF12[i * 2]
-                        dx = OFF12[i * 2 + 1]
-                    } else {
-                        dy = OFF4[i * 2]
-                        dx = OFF4[i * 2 + 1]
-                    }
+                    let k: usize = ((o as i64) + doff[i]) as usize
                     var sad: f64 = 0.0
                     if kind == 2 {
-                        sad = sad_single(e, src, lf, x as i64, y as i64, dx, dy)
+                        sad = sad + math.fabs(fld(p0, o) - fld(p0, k)) * sc0
+                        sad = sad + math.fabs(fld(p1, o) - fld(p1, k)) * sc1
+                        sad = sad + math.fabs(fld(p2, o) - fld(p2, k)) * sc2
                     } else {
-                        sad = sad_plus(e, src, lf, x as i64, y as i64, dx, dy)
+                        sad = sad + plus_sad(p0, o, k, pw) * sc0
+                        sad = sad + plus_sad(p1, o, k, pw) * sc1
+                        sad = sad + plus_sad(p2, o, k, pw) * sc2
                     }
                     var w: f64 = sad * inv_sigma + 1.0
                     if w < 0.0 {
                         w = 0.0
                     }
                     if w != 0.0 {
-                        var cc: usize = 0
-                        while cc < 3 {
-                            acc[cc] = acc[cc] + w * px(e, src, cc, (x as i64) + (dx as i64), (y as i64) + (dy as i64))
-                            cc = cc + 1
-                        }
+                        a0 = a0 + w * fld(p0, k)
+                        a1 = a1 + w * fld(p1, k)
+                        a2 = a2 + w * fld(p2, k)
                     }
                     wsum = wsum + w
                     i = i + 1
                 }
-                c = 0
-                while c < 3 {
-                    fst(dst, c * (*e).plane_len + y * (*e).stride + x, acc[c] / wsum)
-                    c = c + 1
-                }
+                let oo: usize = y * (*e).stride + x
+                fst(o0, oo, a0 / wsum)
+                fst(o1, oo, a1 / wsum)
+                fst(o2, oo, a2 / wsum)
             }
             x = x + 1
         }
         y = y + 1
-    }
-    var c2: usize = 0
-    while c2 < 3 {
-        var yy: usize = 0
-        while yy < (*e).height {
-            var xx: usize = 0
-            while xx < (*e).width {
-                let o: usize = c2 * (*e).plane_len + yy * (*e).stride + xx
-                fst(src, o, fld(dst, o))
-                xx = xx + 1
-            }
-            yy = yy + 1
-        }
-        c2 = c2 + 1
     }
 }
 
@@ -194,20 +180,21 @@ fn epf_apply(planes: u64, width: usize, height: usize, stride: usize, plane_len:
     }
     let nb: usize = (*d).bw * (*d).bh
     let sigma: u64 = rt.heap_alloc(nb * 8)
-    let dst: u64 = rt.heap_alloc(plane_len * 3 * 8)
-    if sigma == 0 || dst == 0 {
+    let pad_plane: usize = jxl_pad.pad_len(width, height, 3)
+    let padded: u64 = rt.heap_alloc(pad_plane * 3 * 8)
+    if sigma == 0 || padded == 0 {
         return false
     }
-    var e: EpfCtx = EpfCtx { width: width, height: height, stride: stride, plane_len: plane_len, bw: (*d).bw, sigma: sigma }
+    var e: EpfCtx = EpfCtx { width: width, height: height, stride: stride, plane_len: plane_len, bw: (*d).bw, sigma: sigma, padded: padded, pw: jxl_pad.pad_stride(width, 3), pad_plane: pad_plane }
     fill_sigma(&e, d, q, lf)
     if (*lf).epf_iters >= 3 {
-        epf_pass(&e, planes, dst, lf, 0)
+        epf_pass(&e, planes, lf, 0)
     }
-    epf_pass(&e, planes, dst, lf, 1)
+    epf_pass(&e, planes, lf, 1)
     if (*lf).epf_iters >= 2 {
-        epf_pass(&e, planes, dst, lf, 2)
+        epf_pass(&e, planes, lf, 2)
     }
     rt.heap_free(sigma, nb * 8)
-    rt.heap_free(dst, plane_len * 3 * 8)
+    rt.heap_free(padded, pad_plane * 3 * 8)
     return true
 }
