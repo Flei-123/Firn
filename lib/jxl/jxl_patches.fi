@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jxl/jxl_patches.fi -- jxl_patches: patch dictionary parser and compositing from reference frames
+import std.vec
+import jxl.jxl_bits
+import jxl.jxl_code
+import jxl.jxl_err
+import jxl.jxl_refs
+
+export { JxlPatches, patches_new, patches_free, patches_read, patches_count, patches_apply }
+
+const CTX_NUM_REF: u32 = 0
+const CTX_REF_FRAME: u32 = 1
+const CTX_SIZE: u32 = 2
+const CTX_REF_POS: u32 = 3
+const CTX_POS: u32 = 4
+const CTX_BLEND: u32 = 5
+const CTX_OFFSET: u32 = 6
+const CTX_COUNT: u32 = 7
+const CTX_ALPHA: u32 = 8
+const CTX_CLAMP: u32 = 9
+const NUM_CTX: usize = 10
+
+const BLEND_NONE: u32 = 0
+const BLEND_REPLACE: u32 = 1
+const BLEND_ADD: u32 = 2
+const BLEND_MUL: u32 = 3
+
+struct JxlPatchRef {
+    slot: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+}
+
+struct JxlPatchPos {
+    ref_idx: u32,
+    x: u32,
+    y: u32,
+    mode: u32,
+    clamp: bool,
+}
+
+struct JxlPatches {
+    refs: vec.Vec[JxlPatchRef],
+    pos: vec.Vec[JxlPatchPos],
+}
+
+fn patches_new() -> JxlPatches {
+    return JxlPatches { refs: vec.vec_new[JxlPatchRef](), pos: vec.vec_new[JxlPatchPos]() }
+}
+
+fn patches_free(p: *mut JxlPatches) {
+    vec.vec_free[JxlPatchRef](&(*p).refs)
+    vec.vec_free[JxlPatchPos](&(*p).pos)
+}
+
+fn patches_count(p: *mut JxlPatches) -> usize {
+    return vec.vec_len[JxlPatchPos](&(*p).pos)
+}
+
+fn unpack_signed(v: u32) -> i64 {
+    if (v & 1) == 0 {
+        return (v >> 1) as i64
+    }
+    return 0 - (((v + 1) >> 1) as i64)
+}
+
+fn read_blendings(b: *mut jxl_bits.JxlBits, rd: *mut jxl_code.JxlReader, num_ec: usize, mode_out: *mut u32, clamp_out: *mut bool) -> i32 {
+    var j: usize = 0
+    while j <= num_ec {
+        let mode: u32 = jxl_code.reader_read(rd, b, CTX_BLEND)
+        if mode > 7 {
+            return jxl_err.JX_BAD
+        }
+        if mode >= 4 {
+            return jxl_err.JX_UNSUPPORTED
+        }
+        var clamp: bool = false
+        if mode == BLEND_MUL {
+            clamp = jxl_code.reader_read(rd, b, CTX_CLAMP) != 0
+        }
+        if j == 0 {
+            *mode_out = mode
+            *clamp_out = clamp
+        } else if mode != BLEND_NONE {
+            return jxl_err.JX_UNSUPPORTED
+        }
+        j = j + 1
+    }
+    return jxl_err.JX_OK
+}
+
+fn patches_read(b: *mut jxl_bits.JxlBits, width: usize, height: usize, num_ec: usize, p: *mut JxlPatches) -> i32 {
+    var code: jxl_code.JxlCode = jxl_code.code_new()
+    var rd: jxl_code.JxlReader = jxl_code.reader_new()
+    var r: i32 = jxl_code.code_read(b, NUM_CTX, false, &code)
+    if r == jxl_err.JX_OK {
+        r = jxl_code.reader_init(&rd, &code, b, 0)
+    }
+    if r != jxl_err.JX_OK {
+        jxl_code.code_free(&code)
+        return r
+    }
+    let max_refs: usize = 1024 + width * height / 4
+    let max_patches: usize = max_refs * 4
+    let num_refs: usize = jxl_code.reader_read(&rd, b, CTX_NUM_REF) as usize
+    if num_refs > max_refs {
+        r = jxl_err.JX_BAD
+    }
+    var total: usize = 0
+    var id: usize = 0
+    while r == jxl_err.JX_OK && id < num_refs {
+        let slot: u32 = jxl_code.reader_read(&rd, b, CTX_REF_FRAME)
+        if slot >= 4 {
+            r = jxl_err.JX_BAD
+            break
+        }
+        let x0: u32 = jxl_code.reader_read(&rd, b, CTX_REF_POS)
+        let y0: u32 = jxl_code.reader_read(&rd, b, CTX_REF_POS)
+        let w: u32 = jxl_code.reader_read(&rd, b, CTX_SIZE) + 1
+        let h: u32 = jxl_code.reader_read(&rd, b, CTX_SIZE) + 1
+        let count: usize = (jxl_code.reader_read(&rd, b, CTX_COUNT) as usize) + 1
+        total = total + count
+        if total > max_patches {
+            r = jxl_err.JX_BAD
+            break
+        }
+        vec.vec_push[JxlPatchRef](&(*p).refs, JxlPatchRef { slot: slot, x0: x0, y0: y0, w: w, h: h })
+        let ref_idx: u32 = (vec.vec_len[JxlPatchRef](&(*p).refs) - 1) as u32
+        var px: i64 = 0
+        var py: i64 = 0
+        var i: usize = 0
+        while r == jxl_err.JX_OK && i < count {
+            if i == 0 {
+                px = jxl_code.reader_read(&rd, b, CTX_POS) as i64
+                py = jxl_code.reader_read(&rd, b, CTX_POS) as i64
+            } else {
+                px = px + unpack_signed(jxl_code.reader_read(&rd, b, CTX_OFFSET))
+                py = py + unpack_signed(jxl_code.reader_read(&rd, b, CTX_OFFSET))
+            }
+            if px < 0 || py < 0 || px + (w as i64) > (width as i64) || py + (h as i64) > (height as i64) {
+                r = jxl_err.JX_BAD
+                break
+            }
+            var mode: u32 = BLEND_NONE
+            var clamp: bool = false
+            r = read_blendings(b, &rd, num_ec, &mode, &clamp)
+            if r == jxl_err.JX_OK {
+                vec.vec_push[JxlPatchPos](&(*p).pos, JxlPatchPos { ref_idx: ref_idx, x: px as u32, y: py as u32, mode: mode, clamp: clamp })
+            }
+            i = i + 1
+        }
+        id = id + 1
+    }
+    if r == jxl_err.JX_OK && (!jxl_code.reader_final_ok(&rd) || jxl_bits.jb_over(b)) {
+        r = jxl_err.JX_BAD
+    }
+    jxl_code.reader_free(&rd)
+    jxl_code.code_free(&code)
+    return r
+}
+
+fn fld(p: u64, i: usize) -> f64 {
+    return *((p +% ((i * 8) as u64)) as *mut f64)
+}
+
+fn fst(p: u64, i: usize, v: f64) {
+    *((p +% ((i * 8) as u64)) as *mut f64) = v
+}
+
+fn clamp01(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+fn blend(mode: u32, clamp: bool, bg: f64, fg: f64) -> f64 {
+    if mode == BLEND_REPLACE {
+        return fg
+    }
+    if mode == BLEND_ADD {
+        return bg + fg
+    }
+    if mode == BLEND_MUL {
+        if clamp {
+            return bg * clamp01(fg)
+        }
+        return bg * fg
+    }
+    return bg
+}
+
+fn patches_apply(p: *mut JxlPatches, refs: *mut jxl_refs.JxlRefs, planes: u64, stride: usize, plane_len: usize, w: usize, h: usize) -> i32 {
+    if refs == (0 as *mut jxl_refs.JxlRefs) {
+        return jxl_err.JX_BAD
+    }
+    let n: usize = vec.vec_len[JxlPatchPos](&(*p).pos)
+    var i: usize = 0
+    while i < n {
+        let pos: *mut JxlPatchPos = vec.vec_elem_ptr[JxlPatchPos](&(*p).pos, i)
+        let rf: *mut JxlPatchRef = vec.vec_elem_ptr[JxlPatchRef](&(*p).refs, (*pos).ref_idx as usize)
+        if !jxl_refs.refs_valid(refs, (*rf).slot as usize) {
+            return jxl_err.JX_BAD
+        }
+        let slot: *mut jxl_refs.JxlRefSlot = &(*refs).slots[(*rf).slot as usize]
+        if ((*rf).x0 + (*rf).w) as usize > (*slot).w || ((*rf).y0 + (*rf).h) as usize > (*slot).h {
+            return jxl_err.JX_BAD
+        }
+        if ((*pos).x + (*rf).w) as usize > w || ((*pos).y + (*rf).h) as usize > h {
+            return jxl_err.JX_BAD
+        }
+        var c: usize = 0
+        while c < 3 {
+            var y: usize = 0
+            while y < ((*rf).h as usize) {
+                var x: usize = 0
+                while x < ((*rf).w as usize) {
+                    let di: usize = c * plane_len + (((*pos).y as usize) + y) * stride + ((*pos).x as usize) + x
+                    let si: usize = c * (*slot).plane_len + (((*rf).y0 as usize) + y) * (*slot).stride + ((*rf).x0 as usize) + x
+                    fst(planes, di, blend((*pos).mode, (*pos).clamp, fld(planes, di), fld((*slot).planes, si)))
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return jxl_err.JX_OK
+}
