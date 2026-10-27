@@ -120,15 +120,31 @@ fn cl_clear(l: *mut CellList) {
 }
 
 fn cl_push(l: *mut CellList, p: u64, n: usize) {
-    let off: usize = rt.buf_len(&(*l).data)
+    let off: usize = (*l).data.len
     rt.buf_push_bytes(&(*l).data, p, n)
-    let at: usize = rt.buf_len(&(*l).meta)
-    rt.buf_reserve(&(*l).meta, at + 8)
-    let m: u64 = rt.buf_ptr(&(*l).meta) + (at as u64)
-    rt.st32(m, 0, off as u32)
-    rt.st32(m, 1, n as u32)
-    rt.buf_set_len(&(*l).meta, at + 8)
+    let at: usize = (*l).meta.len
+    if at + 8 > (*l).meta.cap {
+        rt.buf_reserve(&(*l).meta, at + 8)
+    }
+    rt.st64((*l).meta.ptr +% (at as u64), 0, (off as u64) | ((n as u64) << 32))
+    (*l).meta.len = at + 8
     (*l).n = (*l).n + 1
+}
+
+fn cl_append(dst: *mut CellList, src: *mut CellList) {
+    let base: usize = (*dst).data.len
+    rt.buf_push_bytes(&(*dst).data, (*src).data.ptr, (*src).data.len)
+    let cnt: usize = (*src).n
+    let at: usize = (*dst).meta.len
+    rt.buf_reserve(&(*dst).meta, at + cnt * 8)
+    var k: usize = 0
+    while k < cnt {
+        let m: u64 = rt.ld64((*src).meta.ptr, k)
+        rt.st64((*dst).meta.ptr +% (at as u64), k, m + (base as u64))
+        k = k + 1
+    }
+    (*dst).meta.len = at + cnt * 8
+    (*dst).n = (*dst).n + cnt
 }
 
 #[inline]
@@ -381,6 +397,81 @@ fn cell_parse(bt: *mut Bt, info: *mut PageInfo, off: usize, ci: *mut CellInfo) -
     return true
 }
 
+#[inline]
+fn cell_size_fast(d: u64, fl: u64, off: usize, u: usize) -> usize {
+    let b0: u64 = b8(d, off)
+    if fl == 13 {
+        if b0 < 128 && b0 <= ((u - 35) as u64) && off + 2 + (b0 as usize) <= u && b8(d, off + 1) < 128 {
+            let s13: usize = 2 + (b0 as usize)
+            if s13 < 4 {
+                return 4
+            }
+            return s13
+        }
+        return 0
+    }
+    if fl == 10 {
+        if b0 < 128 && (b0 as usize) <= max_local_of(10, u) && off + 1 + (b0 as usize) <= u {
+            let s10: usize = 1 + (b0 as usize)
+            if s10 < 4 {
+                return 4
+            }
+            return s10
+        }
+        return 0
+    }
+    if fl == 5 {
+        if off + 5 <= u && b8(d, off + 4) < 128 {
+            return 5
+        }
+        return 0
+    }
+    if fl == 2 {
+        if off + 5 <= u {
+            let c0: u64 = b8(d, off + 4)
+            if c0 < 128 && (c0 as usize) <= max_local_of(2, u) && off + 5 + (c0 as usize) <= u {
+                return 5 + (c0 as usize)
+            }
+        }
+        return 0
+    }
+    return 0
+}
+
+#[inline]
+fn index_payload_fast(bt: *mut Bt, info: *mut PageInfo, off: usize, out: *mut Payload) -> bool {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    if (*info).flags == 10 {
+        let b0: u64 = b8(d, off)
+        if b0 < 128 && (b0 as usize) <= max_local_of(10, u) && off + 1 + (b0 as usize) <= u {
+            (*out).p = d + ((off + 1) as u64)
+            (*out).n = b0 as usize
+            return true
+        }
+        return false
+    }
+    if (*info).flags == 2 && off + 5 <= u {
+        let c0: u64 = b8(d, off + 4)
+        if c0 < 128 && (c0 as usize) <= max_local_of(2, u) && off + 5 + (c0 as usize) <= u {
+            (*out).p = d + ((off + 5) as u64)
+            (*out).n = c0 as usize
+            return true
+        }
+    }
+    return false
+}
+
+fn cell_size_of(bt: *mut Bt, info: *mut PageInfo, off: usize) -> DbError!usize {
+    let fs: usize = cell_size_fast((*info).d, (*info).flags, off, usable_of(bt))
+    if fs != 0 {
+        return fs
+    }
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, info, off, &ci)
+    return ci.size
+}
+
 // The rowid of cell `off` of a table page (leaf or interior) without the rest of the parse.
 // Interior: [child 4][rowid varint]; leaf: [payload size varint][rowid varint]...
 #[inline]
@@ -593,6 +684,25 @@ fn page_defrag_after_remove(bt: *mut Bt, info: *mut PageInfo) -> DbError!bool {
 // Writes a fresh page from cells [from, to) of a list. `flags` the page
 // type; `right` the right-most child for an interior page. Page 1 keeps
 // its first 100 octets.
+#[inline]
+fn copy_cell(dst: u64, src: u64, n: usize) {
+    if n >= 8 && n <= 16 {
+        let head: u64 = rt.ld64(src, 0)
+        let tail: u64 = rt.ld64(src + ((n - 8) as u64), 0)
+        rt.st64(dst, 0, head)
+        rt.st64(dst + ((n - 8) as u64), 0, tail)
+        return
+    }
+    if n >= 4 && n < 8 {
+        let h4: u64 = rt.ld32(src, 0) as u64
+        let t4: u64 = rt.ld32(src + ((n - 4) as u64), 0) as u64
+        rt.st32(dst, 0, h4 as u32)
+        rt.st32(dst + ((n - 4) as u64), 0, t4 as u32)
+        return
+    }
+    util.move_bytes(dst, src, n)
+}
+
 fn page_build(bt: *mut Bt, pgno: u32, d: u64, flags: u64, l: *mut CellList, from: usize, to: usize,
     right: u32) -> DbError!bool {
     let u: usize = usable_of(bt)
@@ -624,7 +734,7 @@ fn page_build(bt: *mut Bt, pgno: u32, d: u64, flags: u64, l: *mut CellList, from
             return dberr.fail(DbError::Corrupt, "internal error: cells do not fit the page")
         }
         cs = cs - csz
-        util.move_bytes(d + (cs as u64), cl_ptr(l, i), n)
+        copy_cell(d + (cs as u64), cl_ptr(l, i), n)
         w16(d, arr + 2 * k, cs as u64)
         k = k + 1
         i = i + 1
@@ -635,15 +745,87 @@ fn page_build(bt: *mut Bt, pgno: u32, d: u64, flags: u64, l: *mut CellList, from
 }
 
 // the cells of a page, appended to a list (padded sizes), plus its right child
-fn page_to_list(bt: *mut Bt, info: *mut PageInfo, l: *mut CellList) -> DbError!bool {
-    var ci: CellInfo = cinfo_new()
-    var i: usize = 0
-    while i < (*info).ncells {
-        let o: usize = try cell_off(bt, info, i)
-        try cell_parse(bt, info, o, &ci)
-        cl_push(l, (*info).d + (o as u64), ci.size)
+fn page_cells_range(bt: *mut Bt, info: *mut PageInfo, l: *mut CellList, from: usize, to: usize) -> DbError!bool {
+    let d: u64 = (*info).d
+    let u: usize = usable_of(bt)
+    let fl: u64 = (*info).flags
+    let arr: usize = (*info).arr
+    let arr_end: usize = (*info).arr_end
+    var dptr: u64 = (*l).data.ptr
+    var dlen: usize = (*l).data.len
+    var dcap: usize = (*l).data.cap
+    var mptr: u64 = (*l).meta.ptr
+    var mlen: usize = (*l).meta.len
+    var mcap: usize = (*l).meta.cap
+    var cnt: usize = (*l).n
+    var i: usize = from
+    while i < to {
+        let o: usize = b16(d, arr + 2 * i) as usize
+        if o < arr_end || o + 4 > u {
+            (*l).data.len = dlen
+            (*l).meta.len = mlen
+            (*l).n = cnt
+            return dberr.fail(DbError::Corrupt, "cell offset out of range")
+        }
+        var sz: usize = cell_size_fast(d, fl, o, u)
+        if sz == 0 {
+            (*l).data.len = dlen
+            (*l).meta.len = mlen
+            (*l).n = cnt
+            sz = try cell_size_of(bt, info, o)
+        }
+        let sp: u64 = d + (o as u64)
+        if sz >= 8 && sz <= 32 && dlen + sz <= dcap && mlen + 8 <= mcap {
+            let dp: u64 = dptr +% (dlen as u64)
+            let tail: u64 = rt.ld64(sp + ((sz - 8) as u64), 0)
+            rt.st64(dp, 0, rt.ld64(sp, 0))
+            if sz > 16 {
+                rt.st64(dp, 1, rt.ld64(sp, 1))
+                rt.st64(dp + ((sz - 16) as u64), 0, rt.ld64(sp + ((sz - 16) as u64), 0))
+            }
+            rt.st64(dp + ((sz - 8) as u64), 0, tail)
+            rt.st64(mptr +% (mlen as u64), 0, (dlen as u64) | ((sz as u64) << 32))
+            dlen = dlen + sz
+            mlen = mlen + 8
+            cnt = cnt + 1
+        } else {
+            (*l).data.len = dlen
+            (*l).meta.len = mlen
+            (*l).n = cnt
+            cl_push(l, sp, sz)
+            dptr = (*l).data.ptr
+            dlen = (*l).data.len
+            dcap = (*l).data.cap
+            mptr = (*l).meta.ptr
+            mlen = (*l).meta.len
+            mcap = (*l).meta.cap
+            cnt = (*l).n
+        }
         i = i + 1
     }
+    (*l).data.len = dlen
+    (*l).meta.len = mlen
+    (*l).n = cnt
+    return true
+}
+
+fn page_to_list_ins(bt: *mut Bt, info: *mut PageInfo, l: *mut CellList, ins_at: usize, cell: u64, clen: usize) -> DbError!bool {
+    let n: usize = (*info).ncells
+    let u: usize = usable_of(bt)
+    rt.buf_reserve(&(*l).data, (*l).data.len + u + clen + 32)
+    rt.buf_reserve(&(*l).meta, (*l).meta.len + (n + 1) * 8)
+    if ins_at > n {
+        try page_cells_range(bt, info, l, 0, n)
+        return true
+    }
+    try page_cells_range(bt, info, l, 0, ins_at)
+    cl_push(l, cell, clen)
+    try page_cells_range(bt, info, l, ins_at, n)
+    return true
+}
+
+fn page_to_list(bt: *mut Bt, info: *mut PageInfo, l: *mut CellList) -> DbError!bool {
+    try page_to_list_ins(bt, info, l, (*info).ncells + 1, 0, 0)
     return true
 }
 
@@ -1309,11 +1491,7 @@ fn balance_nonroot(bt: *mut Bt, cur: *mut Cursor, level: usize) -> DbError!bool 
     // the pending list must survive: it is read below into `gather`
     while jj < nb {
         if (*bt).pend_active && spno[jj] == child_pno {
-            var k: usize = 0
-            while k < (*bt).pend.n {
-                cl_push(&(*bt).gather, cl_ptr(&(*bt).pend, k), cl_len(&(*bt).pend, k))
-                k = k + 1
-            }
+            cl_append(&(*bt).gather, &(*bt).pend)
             rights[jj] = (*bt).pend.right
         } else {
             let sd: u64 = try pager.pager_get(pg, spno[jj])
@@ -1341,9 +1519,14 @@ fn balance_nonroot(bt: *mut Bt, cur: *mut Cursor, level: usize) -> DbError!bool 
     let pre: u64 = rt.buf_ptr(&(*bt).tmp)
     var run: usize = 0
     var q: usize = 0
+    let gmeta: u64 = (*g).meta.ptr
     while q < total_n {
         util.wr64(pre, q * 8, run as u64)
-        run = run + cl_cost(g, q)
+        var cl2: usize = (rt.ld64(gmeta, q) >> 32) as usize
+        if cl2 < 4 {
+            cl2 = 4
+        }
+        run = run + cl2 + 2
         q = q + 1
     }
     util.wr64(pre, total_n * 8, run as u64)
@@ -1503,11 +1686,10 @@ fn balance_nonroot(bt: *mut Bt, cur: *mut Cursor, level: usize) -> DbError!bool 
     // ---- the new content of the parent
     cl_clear(&(*bt).pend)
     var pi: usize = 0
-    var dummy: CellInfo = cinfo_new()
     while pi < i0 {
         let o: usize = try cell_off(bt, &pinfo, pi)
-        try cell_parse(bt, &pinfo, o, &dummy)
-        cl_push(&(*bt).pend, pinfo.d + (o as u64), dummy.size)
+        let osz: usize = try cell_size_of(bt, &pinfo, o)
+        cl_push(&(*bt).pend, pinfo.d + (o as u64), osz)
         pi = pi + 1
     }
     var dv: usize = 0
@@ -1519,14 +1701,14 @@ fn balance_nonroot(bt: *mut Bt, cur: *mut Cursor, level: usize) -> DbError!bool 
     var rest: usize = i0 + nb - 1
     if rest < ncp {
         let o2: usize = try cell_off(bt, &pinfo, rest)
-        try cell_parse(bt, &pinfo, o2, &dummy)
-        cl_push(&(*bt).pend, pinfo.d + (o2 as u64), dummy.size)
+        let o2sz: usize = try cell_size_of(bt, &pinfo, o2)
+        cl_push(&(*bt).pend, pinfo.d + (o2 as u64), o2sz)
         w32(cl_ptr(&(*bt).pend, (*bt).pend.n - 1), 0, newp[npages - 1] as u64)
         rest = rest + 1
         while rest < ncp {
             let o3: usize = try cell_off(bt, &pinfo, rest)
-            try cell_parse(bt, &pinfo, o3, &dummy)
-            cl_push(&(*bt).pend, pinfo.d + (o3 as u64), dummy.size)
+            let o3sz: usize = try cell_size_of(bt, &pinfo, o3)
+            cl_push(&(*bt).pend, pinfo.d + (o3 as u64), o3sz)
             rest = rest + 1
         }
     } else {
@@ -1750,19 +1932,7 @@ fn insert_at_level(bt: *mut Bt, cur: *mut Cursor, info: *mut PageInfo, idx: usiz
     }
     // overflow: the page content plus the new cell becomes the pending list
     cl_clear(&(*bt).pend)
-    var ci: CellInfo = cinfo_new()
-    var i: usize = 0
-    while i <= (*info).ncells {
-        if i == idx {
-            cl_push(&(*bt).pend, cell, len)
-        }
-        if i < (*info).ncells {
-            let o: usize = try cell_off(bt, info, i)
-            try cell_parse(bt, info, o, &ci)
-            cl_push(&(*bt).pend, (*info).d + (o as u64), ci.size)
-        }
-        i = i + 1
-    }
+    try page_to_list_ins(bt, info, &(*bt).pend, idx, cell, len)
     (*bt).pend.right = (*info).right
     (*bt).pend_flags = (*info).flags
     (*bt).pend_active = true
@@ -1859,8 +2029,10 @@ fn descend_index(bt: *mut Bt, cur: *mut Cursor, key: *mut record.UKey, info: *mu
         while lo < hi {
             let mid: usize = (lo + hi) / 2
             let o: usize = try cell_off(bt, info, mid)
-            try cell_parse(bt, info, o, &ci)
-            try payload_get(bt, info, &ci, &pl)
+            if !index_payload_fast(bt, info, o, &pl) {
+                try cell_parse(bt, info, o, &ci)
+                try payload_get(bt, info, &ci, &pl)
+            }
             let r: i64 = try record.rec_compare_key(pl.p, pl.n, key)
             if r == 0 {
                 lo = mid

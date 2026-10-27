@@ -59,9 +59,25 @@ struct Dml {
     mode: u32,
     changes: i64,
     hook: i32,
+    gen: u64,
+}
+
+fn dml_sz_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn drop_cached(st: *mut dc.Stmt) {
+    let c: u64 = (*st).plan
+    if c == 0 {
+        return
+    }
+    (*st).plan = 0
+    dml_free(c as *mut Dml)
+    rt.heap_free(c, dml_sz_of[Dml]() + 64)
 }
 
 fn plan_free(st: *mut dc.Stmt) {
+    drop_cached(st)
 }
 
 fn text_msg2(a: str, p: u64, n: usize, b: str, p2: u64, n2: usize) -> str {
@@ -103,7 +119,7 @@ fn dml_new(db: *mut dc.Db, st: *mut dc.Stmt) -> Dml {
         cxc: ex.ctx_new(db, &(*db).schema.ast, 0 as *mut ar.Arena),
         rr: [ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }],
         arena: ar.arena_new(), nidx: 0, idx: [-1; 16], vals: 0, exc: 0, rec: rt.buf_new(), keyrec: rt.buf_new(),
-        kv: 0, vals_n: 0, dsrc: pl.source_new(), mode: ax.CF_ABORT, changes: 0, hook: 0 }
+        kv: 0, vals_n: 0, dsrc: pl.source_new(), mode: ax.CF_ABORT, changes: 0, hook: 0, gen: (*db).schema_gen }
     return dv
 }
 
@@ -677,19 +693,47 @@ fn next_rowid(e: *mut Dml) -> DbError!i64 {
 #[allow_escape]
 fn exec_insert(st: *mut dc.Stmt) -> DbError!bool {
     let db: *mut dc.Db = (*st).db
-    var e: Dml = dml_new(db, st)
-    let r: DbError!bool = insert_inner(&e, st)
-    dml_free(&e)
-    try r
+    if (*st).plan != 0 {
+        let ce: *mut Dml = (*st).plan as *mut Dml
+        if (*ce).gen == (*db).schema_gen {
+            (*ce).cx.params = rt.buf_ptr(&(*st).params)
+            (*ce).cx.nparams = (*st).nparams
+            (*ce).cxc.params = rt.buf_ptr(&(*st).params)
+            (*ce).cxc.nparams = (*st).nparams
+            let cr: DbError!bool = insert_inner(ce, st, false)
+            if dberr.failed_bool(cr) {
+                drop_cached(st)
+                try cr
+            }
+            return true
+        }
+        drop_cached(st)
+    }
+    let mem: u64 = rt.heap_alloc(dml_sz_of[Dml]() + 64)
+    if mem == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let e: *mut Dml = mem as *mut Dml
+    *e = dml_new(db, st)
+    let r: DbError!bool = insert_inner(e, st, true)
+    if dberr.failed_bool(r) || (*e).vals == 0 || (*ax.ast_n(&(*st).ast, (*st).root)).d >= 0 {
+        dml_free(e)
+        rt.heap_free(mem, dml_sz_of[Dml]() + 64)
+        try r
+        return true
+    }
+    (*st).plan = mem
     return true
 }
 
-fn insert_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
+fn insert_inner(e: *mut Dml, st: *mut dc.Stmt, fresh: bool) -> DbError!bool {
     let db: *mut dc.Db = (*e).db
     let ast: *mut ax.Ast = &(*st).ast
     let ins: *mut ax.Node = ax.ast_n(ast, (*st).root)
     let upsert: i32 = (*ins).d
-    try dml_start(e, (*ins).sp, (*ins).sn, upsert >= 0)
+    if fresh {
+        try dml_start(e, (*ins).sp, (*ins).sn, upsert >= 0)
+    }
     let t: *mut dc.Table = table_of(e)
     (*e).mode = (*ins).op
     var mapbuf: rt.Buf = rt.buf_new()
@@ -726,7 +770,7 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
         // DEFAULT VALUES
         var explicit: bool = false
         let rowid: i64 = try build_new_row(e, map, src, 0, &explicit)
-        let done: bool = try store_new_row(e, rowid, upsert)
+        let done: bool = try store_new_row(e, rowid, upsert, !explicit)
         if done {
             changes = changes + 1
             last = rowid
@@ -760,7 +804,7 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
             }
             var explicit2: bool = false
             let rowid: i64 = try build_new_row(e, map, src, cnt, &explicit2)
-            let done: bool = try store_new_row(e, rowid, upsert)
+            let done: bool = try store_new_row(e, rowid, upsert, !explicit2)
             if done {
                 changes = changes + 1
                 last = rowid
@@ -806,7 +850,7 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
                 try rr
             }
             let rowid: i64 = rr catch 0
-            let sr2: DbError!bool = store_new_row(e, rowid, upsert)
+            let sr2: DbError!bool = store_new_row(e, rowid, upsert, !explicit3)
             if dberr.failed_bool(sr2) {
                 rs.rs_free(&rows)
                 try sr2
@@ -841,9 +885,13 @@ fn drain_select(it: *mut sl.SelIter, r: *mut rs.RowSet) -> DbError!bool {
 }
 
 // Validates and writes e.vals as a new row. True if a row was stored (changes += 1).
-fn store_new_row(e: *mut Dml, rowid: i64, upsert: i32) -> DbError!bool {
+fn store_new_row(e: *mut Dml, rowid: i64, upsert: i32, fresh_rowid: bool) -> DbError!bool {
     try validate_row(e, rowid)
-    let u: i32 = try check_unique(e, rowid, -1, (*e).mode, upsert)
+    var own: i64 = -1
+    if fresh_rowid {
+        own = rowid
+    }
+    let u: i32 = try check_unique(e, rowid, own, (*e).mode, upsert)
     if u != 0 {
         return false
     }
