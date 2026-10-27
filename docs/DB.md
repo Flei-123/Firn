@@ -97,15 +97,15 @@ the **ratio** is what matters). Both columns do the same work through prepared s
 
 | work | lib/db | SQLite | ratio |
 |---|---:|---:|---:|
-| 100,000 inserts, one transaction (3 columns, one index) | 10,758 | 311 | 35 x |
-| 1,000,000 inserts, one transaction (no index) | 81,841 | 1,528 | 54 x |
+| 100,000 inserts, one transaction (3 columns, one index) | 1,066 | 282 | 3.8 x |
+| 1,000,000 inserts, one transaction (no index) | 9,012 | 1,556 | 5.8 x |
 | 10,000 inserts, each its own transaction, no fsync | 3,650 | 1,480 | 2.5 x |
 | 200 inserts, each its own transaction, with fsync | 1,281 | 794 | 1.6 x |
 | scan of 1,000,000 rows: `count(*) WHERE a = 7 AND b > 100` | 1,202 | 66 | 18 x |
 | scan of 1,000,000 rows: `sum(a * b)` | 1,902 | 160 | 12 x |
 | scan of 1,000,000 rows: text compare and `id % 3` | 2,688 | 171 | 16 x |
 | 500,000 rows through `stmt_step` | 1,466 | 176 | 8 x |
-| `CREATE INDEX` on 1,000,000 rows (two indexes, the second timed) | 33,597 | 562 | 60 x |
+| `CREATE INDEX` on 1,000,000 rows (two indexes, the second timed) | 8,763 | 633 | 14 x |
 | 100,000 lookups by rowid | 2,594 | 1,625 | 1.6 x |
 | 2,000 lookups through an index, 1,000 rows each | 9,740 | 176 | 55 x |
 | `ORDER BY b, id LIMIT 100000` of 1,000,000 rows | 9,236 | 13 | (SQLite walks an index; lib/db sorts) |
@@ -117,7 +117,7 @@ the **ratio** is what matters). Both columns do the same work through prepared s
 Reading it honestly:
 
 - **Where it is close**: commits (fsync dominates), single lookups by rowid, grouping.
-- **Where it is far**: bulk inserts and index maintenance (35 to 60 x), and index range reads. A profile (callgrind) of the insert shows no single hot spot: B-tree cell parsing, record comparison, varint and byte helpers, each a function call because the compiler does not inline across modules. About 90,000 instructions per insert.
+- **Where it is far**: index range reads (55 x), scans (12 to 18 x), `UPDATE`/`DELETE` with an index (12 x). Inserts were made 2 to 4 x faster (r1065): the INSERT executor is built once per prepared statement and reused while the schema is unchanged, a fresh automatic rowid is not probed, the balancer sizes cells without a full parse and moves cell lists in bulk, integer keys compare without building values. About 31,000 instructions per insert now (was 67,000); the 100,000-row and 1,000,000-row rows above were measured at low and moderate host load, the others are from the older run.
 - The `ORDER BY` row compares unlike things: SQLite reads the index `s_b` in order; lib/db's planner does not use an index to avoid a sort.
 - Typical use stays comfortable: a launcher's cache of a few thousand rows is a few hundred milliseconds even when it is rebuilt, and an interactive query touches few pages. The results are identical to SQLite's (`check` line of the benchmark: the same aggregates); the files have the same size within 7 %.
 - Open items for speed are in the roadmap: inlining of the B-tree primitives, a cached cursor path for sequential inserts, a planner that uses an index for `ORDER BY`.
