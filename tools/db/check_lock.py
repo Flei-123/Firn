@@ -11,6 +11,7 @@
 import os, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 fails = 0
 
 def expect(label, cond, extra=""):
@@ -26,7 +27,7 @@ def spawn(db, lines):
     sc = os.path.join(d, "s.sql")
     with open(sc, "w") as f:
         f.write("\n".join(lines) + "\n")
-    p = subprocess.Popen([probe, db, sc], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    p = subprocess.Popen(RUNNER + [probe, db, sc], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
     return p, d
 
 def read_until(p, token, timeout=10):
@@ -136,7 +137,7 @@ with tempfile.TemporaryDirectory() as d:
             # each statement is its own transaction; a busy answer is retried by the script's author:
             # here the busy timeout is long enough
             fh.write(".busy 30000\n" + "\n".join(["UPDATE ctr SET n = n + 1 WHERE id = 1"] * PER) + "\n")
-        procs.append((subprocess.Popen([probe, db2, f], stdout=subprocess.PIPE, stderr=subprocess.PIPE), sc))
+        procs.append((subprocess.Popen(RUNNER + [probe, db2, f], stdout=subprocess.PIPE, stderr=subprocess.PIPE), sc))
     threads = [threading.Thread(target=sqlite_worker) for _ in range(N_SQLITE)]
     for t in threads:
         t.start()

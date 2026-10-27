@@ -8,6 +8,7 @@
 import os, sqlite3, subprocess, sys, tempfile
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 fails = 0
 SEQ = False
 
@@ -22,7 +23,7 @@ def text_of(i, maxlen):
 
 def run(cmd, *args):
     name = cmd + "s" if SEQ and cmd in ("ins", "del") else cmd
-    return subprocess.run([probe, name] + [str(a) for a in args], capture_output=True, text=True)
+    return subprocess.run(RUNNER + [probe, name] + [str(a) for a in args], capture_output=True, text=True)
 
 def make(path, page_size):
     c = sqlite3.connect(path)

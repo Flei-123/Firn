@@ -7,6 +7,7 @@
 import itertools, os, sqlite3, struct, subprocess, sys, tempfile
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 conn = sqlite3.connect(":memory:")
 
 operands = ["0", "1", "-1", "2", "7", "-7", "255", "9223372036854775807", "-9223372036854775807", "4611686018427387904",
@@ -165,7 +166,7 @@ with tempfile.TemporaryDirectory() as d:
     with open(path, "w", encoding="utf-8") as f:
         for e in exprs:
             f.write(e.replace("\n", " ") + "\n")
-    r = subprocess.run([probe, path], capture_output=True)
+    r = subprocess.run(RUNNER + [probe, path], capture_output=True)
     mine = r.stdout.decode("utf-8", "replace").split("\n")
 fails = 0
 for i, e in enumerate(exprs):

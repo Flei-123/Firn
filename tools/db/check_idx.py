@@ -3,13 +3,14 @@
 # tools/db/check_idx.py <bt_probe> -- the INDEX B-tree of lib/db against SQLite.
 import os, sqlite3, subprocess, sys, tempfile
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 fails = 0
 def rowid_of(i): return (i * 2654435761) % 4294967296 + 1
 def text_of(i, maxlen):
     n = (i * 31 + 7) % maxlen
     return ''.join(chr(97 + (i + j) % 26) for j in range(n))
 def run(*a):
-    return subprocess.run([probe] + [str(x) for x in a], capture_output=True, text=True)
+    return subprocess.run(RUNNER + [probe] + [str(x) for x in a], capture_output=True, text=True)
 def make(path, ps):
     c = sqlite3.connect(path)
     c.execute(f"PRAGMA page_size={ps}")

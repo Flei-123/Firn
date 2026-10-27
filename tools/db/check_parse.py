@@ -7,6 +7,7 @@
 import subprocess, sqlite3, sys, os
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 here = os.path.dirname(os.path.abspath(__file__))
 conn = sqlite3.connect(":memory:")
 for ddl in ("CREATE TABLE t(a,b,c,d,e,x,y,z,id,v)", "CREATE TABLE u(a,b,z)", "CREATE TABLE w(a,z)"):
@@ -37,7 +38,7 @@ for line in open(os.path.join(here, "parse_corpus.txt"), encoding="utf-8"):
     sql = line[1:]
     n += 1
     theirs = sqlite_ok(sql)
-    r = subprocess.run([probe, sql], capture_output=True, text=True)
+    r = subprocess.run(RUNNER + [probe, sql], capture_output=True, text=True)
     mine = r.returncode == 0 and r.stdout.startswith("OK")
     if theirs != want:
         print(f"CORPUS WRONG (sqlite says {theirs}): {sql}")

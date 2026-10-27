@@ -25,8 +25,13 @@ trap 'rm -rf "$W"' EXIT
 rc=0
 HOSTILE=${HOSTILE_ROUNDS:-1500}
 [ "${1:-}" = "quick" ] && HOSTILE=300
+DBFLAGS=${DB_TARGET:+--target=$DB_TARGET}
+if [ -n "${DB_TARGET:-}" ] && [ -z "${RUNNER:-}" ]; then
+    case "$DB_TARGET" in aarch64-*) RUNNER=qemu-aarch64 ;; esac
+fi
+export RUNNER
 for t in sql_probe parse_probe expr_probe bt_probe; do
-    "$FIRNC" -o "$W/$t" "tools/db/$t.fi" > "$W/$t.log" 2>&1 || { echo "  FAIL $t does not build"; grep -v RWX "$W/$t.log" | head -5; rc=1; }
+    "${FIRNC}" $DBFLAGS -o "$W/$t" "tools/db/$t.fi" > "$W/$t.log" 2>&1 || { echo "  FAIL $t does not build"; grep -v RWX "$W/$t.log" | head -5; rc=1; }
 done
 [ $rc -eq 0 ] || exit 1
 run() {
@@ -51,7 +56,7 @@ run "crashes" 8 python3 tools/db/check_crash.py "$W/sql_probe"
 run "locks" 12 python3 tools/db/check_lock.py "$W/sql_probe"
 run "damaged files ($HOSTILE)" 4 python3 tools/db/check_hostile.py "$W/sql_probe" "$HOSTILE"
 run "damaged files harness (daemon left behind, r581)" 3 python3 tools/db/check_hostile_selftest.py
-if [ "${1:-}" != "quick" ]; then
+if [ "${1:-}" != "quick" ] && [ -z "${DB_TARGET:-}" ]; then
     WINE=${WINE:-}
     if [ -z "$WINE" ]; then
         for c in wine64 wine /usr/lib/wine/wine64; do
