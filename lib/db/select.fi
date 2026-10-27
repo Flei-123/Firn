@@ -1683,6 +1683,72 @@ fn acc_result(a: *mut Acc, ga: *mut ar.Arena) -> DbError!rc.Val {
 }
 
 // input record per joined row: [group exprs][aggregate arguments (+separator)][plain columns]
+fn agg_stream(it: *mut SelIter, A: usize) -> DbError!bool {
+    let cx: *mut ex.Ctx = &(*it).cx
+    var accs: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&accs, (A + 1) * sz_of_acc())
+    var k0: usize = 0
+    while k0 < A {
+        let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + k0
+        (*a).cat = rt.buf_new()
+        acc_init(a, (*ax.ast_n((*it).ast, buf_i32(&(*it).aggs, k0))).op)
+        k0 = k0 + 1
+    }
+    while true {
+        let ok: bool = try join_next(it)
+        if !ok {
+            break
+        }
+        var k: usize = 0
+        while k < A {
+            let a2: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + k
+            let an: *mut ax.Node = ax.ast_n((*it).ast, buf_i32(&(*it).aggs, k))
+            var arg: rc.Val = rc.val_int(1)
+            var sep: rc.Val = rc.val_null()
+            if ((*an).flag & 2) == 0 && (*an).a >= 0 {
+                arg = try ex.eval(cx, (*an).a)
+                let sepn: i32 = (*ax.ast_n((*it).ast, (*an).a)).next
+                if sepn >= 0 {
+                    sep = try ex.eval(cx, sepn)
+                }
+            }
+            acc_update(a2, &arg, ((*an).flag & 2) != 0, sep.p, sep.n, sep.t != 0, &(*it).garena)
+            k = k + 1
+        }
+        ar.arena_reset(&(*it).tmp)
+    }
+    var aggres: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&aggres, (A + 1) * 40)
+    let ares: *mut rc.Val = (rt.buf_ptr(&aggres)) as *mut rc.Val
+    var f: usize = 0
+    while f < A {
+        let a3: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + f
+        *(ares + f) = try acc_result(a3, &(*it).garena)
+        f = f + 1
+    }
+    (*it).cx.agg = rt.buf_ptr(&aggres)
+    (*it).cx.bare = 0
+    var keep: bool = true
+    if (*it).having >= 0 {
+        let t: i64 = try ex.eval_truth(cx, (*it).having)
+        keep = t == 1
+    }
+    if keep {
+        try project(it)
+        try rs.rs_add(&(*it).rs, (*it).out as *mut rc.Val, (*it).nout)
+    }
+    (*it).cx.agg = 0
+    var fa: usize = 0
+    while fa < A {
+        let ac: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + fa
+        rt.buf_free(&(*ac).cat)
+        fa = fa + 1
+    }
+    rt.buf_free(&accs)
+    rt.buf_free(&aggres)
+    return true
+}
+
 fn run_aggregate(it: *mut SelIter) -> DbError!bool {
     let G: usize = (*it).ngroup
     let A: usize = (*it).nagg
@@ -1695,6 +1761,18 @@ fn run_aggregate(it: *mut SelIter) -> DbError!bool {
     rt.buf_reserve(&vals, (total + 4) * 40)
     let vp: *mut rc.Val = (rt.buf_ptr(&vals)) as *mut rc.Val
     let cx: *mut ex.Ctx = &(*it).cx
+    var has_dist: bool = false
+    var d0: usize = 0
+    while d0 < A {
+        let an0: *mut ax.Node = ax.ast_n((*it).ast, buf_i32(&(*it).aggs, d0))
+        if (*an0).flag == 1 {
+            has_dist = true
+        }
+        d0 = d0 + 1
+    }
+    if G == 0 && B == 0 && !has_dist {
+        return try agg_stream(it, A)
+    }
     // ---- collect
     while true {
         let ok: bool = try join_next(it)
