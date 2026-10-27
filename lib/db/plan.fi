@@ -84,6 +84,7 @@ struct Source {
     matched: bool,
     rowid_col: i32,
     ncols_table: usize,
+    cover: bool,
 }
 
 fn val_blank() -> rc.Val {
@@ -98,7 +99,7 @@ fn source_new() -> Source {
         kv_lo: [val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank()],
         kv_hi: [val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank()],
         lok: rc.ukey_new(0, 0, 0), hik: rc.ukey_new(0, 0, 0), seek_gt: false, sub: 0, sub_pos: 0, state: 0,
-        matched: false, rowid_col: -1, ncols_table: 0 }
+        matched: false, rowid_col: -1, ncols_table: 0, cover: false }
 }
 
 fn src_reset(s: *mut Source) {
@@ -733,6 +734,77 @@ fn src_open(cx: *mut ex.Ctx, s: *mut Source) -> DbError!bool {
     }
     (*s).lok = rc.ukey_new(((&(*s).kv_lo[0]) as u64), nlo, (*ix).desc)
     (*s).hik = rc.ukey_new(((&(*s).kv_hi[0]) as u64), nhi, (*ix).desc)
+    var cov: bool = true
+    var ui: usize = 0
+    while ui < (*t).ncols {
+        let bit: u64 = ((*s).used[ui / 64] >> ((ui % 64) as u64)) & 1
+        if bit != 0 && cov {
+            var has: bool = false
+            if (*s).rowid_col >= 0 && ui == ((*s).rowid_col as usize) {
+                has = true
+            }
+            var kk: usize = 0
+            while kk < (*ix).ncols {
+                if (*ix).cols[kk] == (ui as i32) {
+                    has = true
+                }
+                kk = kk + 1
+            }
+            if !has {
+                cov = false
+            }
+        }
+        ui = ui + 1
+    }
+    (*s).cover = cov
+    return true
+}
+
+fn src_load_index_cover(cx: *mut ex.Ctx, s: *mut Source, p: u64, n: usize, rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*cx).db
+    let sc: *mut dc.Schema = &(*db).schema
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    let ix: *mut dc.Index = dc.index_at(sc, (*s).index as usize)
+    let ncols: usize = (*t).ncols
+    if (*s).vals == 0 {
+        (*s).vals = rt.heap_alloc(ncols * 40 + 40)
+        (*s).ncols = ncols
+        if (*s).vals == 0 {
+            return dberr.fail(DbError::NoMemory, "out of memory")
+        }
+    }
+    ar.arena_reset(&(*s).arena)
+    let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+    var i: usize = 0
+    while i < ncols {
+        *(vals + i) = rc.val_null()
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < (*ix).ncols {
+        let c: i32 = (*ix).cols[k]
+        if c >= 0 {
+            var w: rc.Val = try rc.rec_column(p, n, k)
+            if w.t == 3 || w.t == 4 {
+                w.p = ar.arena_copy(&(*s).arena, w.p, w.n)
+            } else {
+                if w.t == 1 {
+                    let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (c as usize)
+                    if (*col).aff == 4 {
+                        w = rc.val_real(w.i as f64)
+                    }
+                }
+            }
+            *(vals + (c as usize)) = w
+        }
+        k = k + 1
+    }
+    if (*t).rowid_col >= 0 {
+        let rcol: usize = (*t).rowid_col as usize
+        if rcol < ncols {
+            *(vals + rcol) = rc.val_int(rowid)
+        }
+    }
     return true
 }
 
@@ -943,6 +1015,10 @@ fn src_advance(cx: *mut ex.Ctx, s: *mut Source) -> DbError!bool {
         return dberr.fail(DbError::Corrupt, "index entry without a rowid")
     }
     (*s).rowid = rv.i
+    if (*s).cover {
+        try src_load_index_cover(cx, s, ip.p, ip.n, rv.i)
+        return true
+    }
     let found2: bool = try bx.bt_table_find(bt, (*t).root, rv.i, &pl)
     if !found2 {
         return dberr.fail(DbError::Corrupt, "row missing from the table: index points to a rowid that does not exist")

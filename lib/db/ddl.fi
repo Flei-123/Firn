@@ -400,13 +400,32 @@ fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
     }
     let unique: bool = ((*nd).flag & 1) != 0
     let root: u32 = try bx.bt_create(&(*db).bt, true)
+    var want: usize = 0
+    var w: usize = 0
+    while w < nc {
+        if cols[w] >= 0 && ((cols[w] + 1) as usize) > want {
+            want = (cols[w] + 1) as usize
+        }
+        w = w + 1
+    }
+    if (*t).rowid_col >= 0 && ((*t).rowid_col as usize) >= want {
+        want = ((*t).rowid_col as usize) + 1
+    }
+    if want == 0 {
+        want = 1
+    }
+    if want > (*t).ncols {
+        want = (*t).ncols
+    }
     // fill it from the table
     var cur: bx.Cursor = bx.cur_new((*t).root, false)
     var ok: bool = try bx.bt_first(&(*db).bt, &cur)
     var vbuf: rt.Buf = rt.buf_new()
-    rt.buf_reserve(&vbuf, ((*t).ncols + 2) * 40)
+    rt.buf_reserve(&vbuf, (want + 2) * 40)
     var kbuf: rt.Buf = rt.buf_new()
     rt.buf_reserve(&kbuf, 40 * 40)
+    var dv2: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&dv2, 40 * 40)
     var rec: rt.Buf = rt.buf_new()
     var failed: bool = false
     var ferr: DbError = DbError::Misuse
@@ -417,14 +436,14 @@ fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
         let rowid: i64 = try bx.bt_rowid(&(*db).bt, &cur)
         let pl: bx.Payload = try bx.bt_payload(&(*db).bt, &cur)
         var i: usize = 0
-        while i < (*t).ncols {
+        while i < want {
             *(vals + i) = rc.val_null()
             i = i + 1
         }
-        let got: usize = try rc.rec_decode(pl.p, pl.n, vals, (*t).ncols)
+        let got: usize = try rc.rec_decode(pl.p, pl.n, vals, want)
         // the default of columns the record does not have
         var j: usize = got
-        while j < (*t).ncols {
+        while j < want {
             let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + j
             if (*col).dflt >= 0 {
                 var es: ex.Scope = ex.scope_new()
@@ -454,13 +473,27 @@ fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
         *(kv + nc) = rc.val_int(rowid)
         rt.buf_clear(&rec)
         rc.rec_encode(kv, nc + 1, &rec)
-        // the key now lives in `rec`: decode it for the comparisons (nothing points into pages)
-        var dv2: rt.Buf = rt.buf_new()
-        rt.buf_reserve(&dv2, 40 * 40)
-        let dvp: *mut rc.Val = (rt.buf_ptr(&dv2)) as *mut rc.Val
-        let dn: usize = try rc.rec_decode(rt.buf_ptr(&rec), rt.buf_len(&rec), dvp, nc + 1)
-        if unique && !has_null {
-            var uk0: rc.UKey = rc.ukey_new(rt.buf_ptr(&dv2), nc, desc)
+        var ptrfree: bool = true
+        var pk: usize = 0
+        while pk <= nc {
+            let tv: i64 = (*(kv + pk)).t
+            if tv == 3 || tv == 4 {
+                ptrfree = false
+            }
+            pk = pk + 1
+        }
+        var dvp: *mut rc.Val = (rt.buf_ptr(&kbuf)) as *mut rc.Val
+        if !ptrfree {
+            rt.buf_clear(&dv2)
+            rt.buf_reserve(&dv2, 40 * 40)
+            dvp = (rt.buf_ptr(&dv2)) as *mut rc.Val
+            let dn: usize = try rc.rec_decode(rt.buf_ptr(&rec), rt.buf_len(&rec), dvp, nc + 1)
+            if dn == 0 {
+                failed = true
+            }
+        }
+        if unique && !has_null && !failed {
+            var uk0: rc.UKey = rc.ukey_new((dvp as u64), nc, desc)
             var icur: bx.Cursor = bx.cur_new(root, true)
             let found: bool = try bx.bt_index_seek(&(*db).bt, &icur, &uk0, bx.SEEK_GE)
             if found {
@@ -492,7 +525,7 @@ fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
             }
         }
         if !failed {
-            var uk: rc.UKey = rc.ukey_new(rt.buf_ptr(&dv2), nc + 1, desc)
+            var uk: rc.UKey = rc.ukey_new((dvp as u64), nc + 1, desc)
             let added: DbError!bool = bx.bt_index_insert(&(*db).bt, root, &uk, rt.buf_ptr(&rec), rt.buf_len(&rec))
             if dberr.failed_bool(added) {
                 rt.buf_free(&dv2)
@@ -502,11 +535,11 @@ fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
                 try added
             }
         }
-        rt.buf_free(&dv2)
         if !failed {
             ok = try bx.bt_next(&(*db).bt, &cur)
         }
     }
+    rt.buf_free(&dv2)
     rt.buf_free(&vbuf)
     rt.buf_free(&kbuf)
     rt.buf_free(&rec)

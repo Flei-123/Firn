@@ -405,7 +405,12 @@ fn delete_row_by_id(e: *mut Dml, rowid: i64) -> DbError!bool {
     if !found {
         return false
     }
-    let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+    return delete_row_vals(e, rowid, ((*s).vals as *mut rc.Val))
+}
+
+fn delete_row_vals(e: *mut Dml, rowid: i64, vals: *mut rc.Val) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
     var i: usize = 0
     while i < (*e).nidx {
         let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
@@ -1163,9 +1168,9 @@ fn run_filters(cx: *mut ex.Ctx, list: *mut i32, n: usize) -> DbError!bool {
     return true
 }
 
-// Collects the rowids of the rows that match `where_n`.
+// Collects the rowids and the values of the rows that match `where_n`.
 #[allow_escape]
-fn collect_rowids(e: *mut Dml, where_n: i32, out: *mut rt.Buf) -> DbError!bool {
+fn collect_rowids(e: *mut Dml, where_n: i32, out: *mut rt.Buf, rows: *mut rs.RowSet) -> DbError!bool {
     let st: *mut dc.Stmt = (*e).st
     let ast: *mut ax.Ast = &(*st).ast
     let t: *mut dc.Table = table_of(e)
@@ -1219,6 +1224,7 @@ fn collect_rowids(e: *mut Dml, where_n: i32, out: *mut rt.Buf) -> DbError!bool {
         rt.buf_reserve(out, at + 8)
         rt.st64(rt.buf_ptr(out) + (at as u64), 0, s.rowid as u64)
         rt.buf_set_len(out, at + 8)
+        try rs.rs_add(rows, (s.vals as *mut rc.Val), (*t).ncols)
     }
     (*e).rr[0].vals = (*e).vals
     pl.src_free(&s)
@@ -1259,16 +1265,14 @@ fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
     }
     try sl.resolve_stmt(db, st, &(*e).scope, (*un).b, false)
     var ids: rt.Buf = rt.buf_new()
-    let cr: DbError!bool = collect_rowids(e, (*un).b, &ids)
+    var oldrs: rs.RowSet = rs.rs_new()
+    let cr: DbError!bool = collect_rowids(e, (*un).b, &ids, &oldrs)
     if dberr.failed_bool(cr) {
         rt.buf_free(&ids)
+        rs.rs_free(&oldrs)
         try cr
     }
     let nrows: usize = rt.buf_len(&ids) / 8
-    var sctx: pl.Source = pl.source_new()
-    sctx.tbl = (*e).tidx
-    sctx.ncols_table = (*t).ncols
-    pl.mark_all_used(&sctx, (*t).ncols)
     var oldbuf: rt.Buf = rt.buf_new()
     rt.buf_reserve(&oldbuf, ((*t).ncols + 2) * 40)
     var newbuf: rt.Buf = rt.buf_new()
@@ -1281,26 +1285,18 @@ fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
     var failed: bool = false
     while i < nrows && !failed {
         let rowid: i64 = rt.ld64(rt.buf_ptr(&ids), i) as i64
+        let rpos: usize = i
         i = i + 1
         ar.arena_reset(&(*e).arena)
-        let lr: DbError!bool = pl.src_load_row(&(*e).cx, &sctx, rowid)
-        if dberr.failed_bool(lr) {
-            r = lr
-            failed = true
-            break
-        }
-        if !(lr catch false) {
-            continue
-        }
-        // old values (text copied: the source arena changes when the next row loads)
-        var j: usize = 0
+        let gn: usize = try rs.rs_get(&oldrs, rpos, ov, (*t).ncols)
+        var j: usize = gn
         while j < (*t).ncols {
-            var v: rc.Val = *((sctx.vals as *mut rc.Val) + j)
-            if v.t == 3 || v.t == 4 {
-                v.p = ar.arena_copy(&(*e).arena, v.p, v.n)
-            }
-            *(ov + j) = v
-            *(nv + j) = v
+            *(ov + j) = rc.val_null()
+            j = j + 1
+        }
+        j = 0
+        while j < (*t).ncols {
+            *(nv + j) = *(ov + j)
             j = j + 1
         }
         (*e).rr[0].vals = rt.buf_ptr(&oldbuf)
@@ -1360,10 +1356,10 @@ fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
             changes = changes + 1
         }
     }
-    pl.src_free(&sctx)
     rt.buf_free(&oldbuf)
     rt.buf_free(&newbuf)
     rt.buf_free(&ids)
+    rs.rs_free(&oldrs)
     if failed {
         try r
     }
@@ -1405,21 +1401,35 @@ fn delete_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
     }
     try sl.resolve_stmt(db, st, &(*e).scope, (*dn).a, false)
     var ids: rt.Buf = rt.buf_new()
-    let cr: DbError!bool = collect_rowids(e, (*dn).a, &ids)
+    var oldrs: rs.RowSet = rs.rs_new()
+    let cr: DbError!bool = collect_rowids(e, (*dn).a, &ids, &oldrs)
     if dberr.failed_bool(cr) {
         rt.buf_free(&ids)
+        rs.rs_free(&oldrs)
         try cr
     }
     let nrows: usize = rt.buf_len(&ids) / 8
+    var dvals: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&dvals, ((*t).ncols + 2) * 40)
+    let dvp: *mut rc.Val = (rt.buf_ptr(&dvals)) as *mut rc.Val
     var changes: i64 = 0
     var i2: usize = 0
     while i2 < nrows {
         let rowid: i64 = rt.ld64(rt.buf_ptr(&ids), i2) as i64
+        let rpos: usize = i2
         i2 = i2 + 1
         ar.arena_reset(&(*e).arena)
-        let dr: DbError!bool = delete_row_by_id(e, rowid)
+        let gn: usize = try rs.rs_get(&oldrs, rpos, dvp, (*t).ncols)
+        var z: usize = gn
+        while z < (*t).ncols {
+            *(dvp + z) = rc.val_null()
+            z = z + 1
+        }
+        let dr: DbError!bool = delete_row_vals(e, rowid, dvp)
         if dberr.failed_bool(dr) {
             rt.buf_free(&ids)
+            rt.buf_free(&dvals)
+            rs.rs_free(&oldrs)
             try dr
         }
         if dr catch false {
@@ -1427,6 +1437,8 @@ fn delete_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
         }
     }
     rt.buf_free(&ids)
+    rt.buf_free(&dvals)
+    rs.rs_free(&oldrs)
     (*db).changes = changes
     (*db).total_changes = (*db).total_changes + changes
     return true
