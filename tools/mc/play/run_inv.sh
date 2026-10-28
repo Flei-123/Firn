@@ -362,7 +362,7 @@ CJENV=(MC_VANILLA=1 "MC_VANILLA_JAR=$CJAR" "MC_VANILLA_ASSETS=${MC_VANILLA_ASSET
 [ -n "$CJAR" ] || { echo "  FAIL  cont ui: no client jar for $MCV"; ERR=1; }
 ccell() { grep "contui cell $2 " "$W/$1.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
 cclick() { local xy; xy=$(ccell "$1" "$2"); [ -n "$xy" ] || { echo "  FAIL  cont ui: no cell $2"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.8; }
-if [ "${RUN_INV_ONLY:-}" != trader ]; then
+if [ "${RUN_INV_ONLY:-}" != trader ] && [ "${RUN_INV_ONLY:-}" != player ]; then
 env "${CJENV[@]}" MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CONT_UI=1 MCPLAY_CONT_LOG=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player16 > "$W/an.out" 2>&1 &
 PP=$!
@@ -434,7 +434,9 @@ print("  server: pickaxe enchanted=%s lapis=%s" % (ench, cnt.group(1) if cnt els
 sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
 PY
 . tools/mc/play/inv_panel_stage.sh
-[ -n "$CJAR" ] && run_panel_stage
+[ -n "$CJAR" ] && [ "${RUN_INV_ONLY:-}" != player ] && run_panel_stage
+. tools/mc/play/inv_player_stage.sh
+[ -n "$CJAR" ] && run_player_stage
 fi
 if { [ "${RUN_INV_TRADER:-0}" = 1 ] || [ "${RUN_INV_ONLY:-}" = trader ]; } && [ -n "$CJAR" ]; then . tools/mc/play/inv_trader_stage.sh; run_trader_stage; fi
 fi

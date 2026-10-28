@@ -217,6 +217,60 @@ def check_creative_sprites(img, jar, errors, s=2, px=40, py=60):
         expect(f"creative sprite {name}", good, total, errors, 0.95)
 
 
+def check_inv_player(left, right, up, jar, errors):
+    w, h = left.size
+    s = lc.scale_for(w, h)
+    gw = (w + s - 1) // s
+    gh = (h + s - 1) // s
+    ox = (gw - 176) // 2
+    oy = (gh - 166) // 2
+    tex = load(jar, INVENTORY)
+    x0, y0, x1, y1 = (ox + 26) * s, (oy + 8) * s, (ox + 75) * s, (oy + 78) * s
+    for name, img in (("left", left), ("right", right), ("up", up)):
+        g, t = match(img, tex, s, ox + 26, oy + 8, 26, 8, 49, 70, 255)
+        drawn = t - g
+        ok = drawn > 1500 * s * s // 4
+        print(f"  {'ok  ' if ok else 'FAIL'}  inv player {name}: {drawn}/{t} px differ from the bare panel")
+        if not ok:
+            errors.append("player " + name)
+    teal = skin = 0
+    for x in range(x0, x1):
+        for y in range(y0, y1):
+            r, g, b = left.getpixel((x, y))
+            if r < 40 and g > 110 and b > 110 and abs(g - b) < 40:
+                teal += 1
+            elif 150 < r < 215 and 100 < g < 160 and 70 < b < 125 and r > g > b:
+                skin += 1
+    ok = teal > 150 * s * s // 4 and skin > 40 * s * s // 4
+    print(f"  {'ok  ' if ok else 'FAIL'}  inv player skin colours: shirt={teal} skin={skin}")
+    if not ok:
+        errors.append("player colours")
+    d = region_diff(left, right, x0, y0, x1, y1)
+    ok = d > 150 * s * s // 4
+    print(f"  {'ok  ' if ok else 'FAIL'}  inv player mouse left vs right: {d} px differ")
+    if not ok:
+        errors.append("player look")
+    d = region_diff(left, up, x0, y0, x1, y1)
+    ok = d > 40
+    print(f"  {'ok  ' if ok else 'FAIL'}  inv player mouse left vs top: {d} px differ")
+    if not ok:
+        errors.append("player pitch")
+    outside = 0
+    for (ax, ay, bx, by) in ((0, 0, w, y0), (0, y1, w, h), (0, y0, x0, y1), (x1, y0, w, y1)):
+        outside += region_diff(left, right, ax, ay, bx, by)
+    ok = outside == 0
+    print(f"  {'ok  ' if ok else 'FAIL'}  inv player: panel outside the model region unchanged by the mouse ({outside} px)")
+    if not ok:
+        errors.append("player outside")
+    frames = [(7, 7 + 18 * i, 18) for i in range(4)] + [(76, 61, 18)]
+    good = total = 0
+    for (gx, gy, wd) in frames:
+        g, t = match(left, tex, s, ox + gx, oy + gy, gx, gy, wd, 1, 255)
+        good += g
+        total += t
+    expect("armor + offhand slot frames", good, total, errors, 0.95)
+
+
 def main():
     mode, ppm, jar = sys.argv[1], sys.argv[2], sys.argv[3]
     img = read(ppm)
@@ -253,6 +307,8 @@ def main():
             check_creative_sprites(img, jar, errors)
         else:
             check_sprites(img, jar, sys.argv[4], errors)
+    elif mode == "invplayer":
+        check_inv_player(img, read(sys.argv[4]), read(sys.argv[5]), jar, errors)
     elif mode == "cont":
         check_container(img, jar, sys.argv[4], int(sys.argv[5]) if len(sys.argv) > 5 else 3, errors)
     elif mode == "furnace_lit":
