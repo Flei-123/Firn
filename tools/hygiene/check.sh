@@ -49,5 +49,8 @@ case "$LIBS_OUT" in *note:*) echo "HYGIENE: $LIBS_OUT" ;; esac
 EXPAND_OUT=$(python3 tools/strlib/expand.py --check 2>&1) || { echo "HYGIENE: $EXPAND_OUT"; echo "HYGIENE: run: python3 tools/strlib/expand.py --all"; rc=1; }
 GEN_OUT=$(bash lib/rc/gen_tests.sh --check 2>&1) || { echo "HYGIENE: $GEN_OUT"; echo "HYGIENE: run: bash lib/rc/gen_tests.sh"; rc=1; }
 
+HEAP_OUT=$(python3 tools/lint/heap_gc_fields.py 2>&1) || { echo "HYGIENE: $HEAP_OUT"; echo "HYGIENE: root the struct with gc_track[T] (or fix it), see tools/lint/heap_gc_fields.py"; rc=1; }
+HEAP_TEST_OUT=$(bash tools/lint/heap_gc_fields_test.sh 2>&1) || { echo "HYGIENE: $HEAP_TEST_OUT"; rc=1; }
+
 [ $rc = 0 ] && echo "HYGIENE: ok"
 exit $rc
