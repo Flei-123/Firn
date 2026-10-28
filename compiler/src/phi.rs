@@ -115,6 +115,28 @@ use crate::fir::{BlockId, Func, Inst, Module, Op, Term, Val};
 
 /// Runs over the whole module. Afterwards no `Op::Phi` exists any more.
 pub fn eliminate(m: &mut Module) -> Result<(), String> {
+    if std::env::var_os("FIRN_DUMP_POSTPHI").is_some() {
+        return eliminate_serial(m);
+    }
+    crate::parfn::try_each_mut(
+        &mut m.funcs,
+        crate::parfn::threads_from("FIRN_CODEGEN_THREADS"),
+        |f| if f.has_phi() { crate::parfn::weight(f) } else { 0 },
+        eliminate_func,
+    )
+}
+
+pub fn eliminate_all<'a>(funcs: impl Iterator<Item = &'a mut Func>) -> Result<(), String> {
+    let mut items: Vec<&mut Func> = funcs.collect();
+    crate::parfn::try_each_mut(
+        &mut items,
+        crate::parfn::threads_from("FIRN_CODEGEN_THREADS"),
+        |f| if f.has_phi() { crate::parfn::weight(f) } else { 0 },
+        |f| eliminate_func(&mut **f),
+    )
+}
+
+fn eliminate_serial(m: &mut Module) -> Result<(), String> {
     for f in m.funcs.iter_mut() {
         eliminate_func(f)?;
         if std::env::var("FIRN_DUMP_POSTPHI").map(|n| n == f.name).unwrap_or(false) {

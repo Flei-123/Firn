@@ -46,7 +46,7 @@ const MAX_CALLEE_BLOCKS: usize = 8;
 /// although `sink_emit_char` with 18 instructions and one block sits far
 /// below every callee bound. A big function is not automatically cold; with
 /// a state machine the opposite holds.
-const MAX_CALLER_INSTS: usize = 24000;
+pub(crate) const MAX_CALLER_INSTS: usize = 24000;
 const MAX_INLINES: usize = 2000;
 /// Upper bound on the instructions of a TRIVIAL LEAF (see `trivial_leaf`).
 const MAX_TRIVIAL_INSTS: usize = 6;
@@ -61,7 +61,7 @@ const MAX_GROWTH_PCT: usize = 40;
 const HEAT_GROWTH_PCT: usize = 50;
 /// Largest callee embedded into a (self-)recursive caller in the middle
 /// version kept for the frame budget (see `REC_SMALL`).
-const REC_CALLER_TIER: usize = 10;
+pub(crate) const REC_CALLER_TIER: usize = 10;
 
 /// ROUND TK2 (Certus, r136) -- THE FRAME BUDGET OF A RECURSIVE CALLER.
 ///
@@ -277,7 +277,7 @@ fn find_site_x(
     hot_only: bool,
     leaves: Option<&HashSet<String>>,
     idx: &HashMap<String, usize>,
-    cg: &mut CallGraph,
+    reach: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
@@ -349,7 +349,7 @@ fn find_site_x(
                     continue;
                 }
                 // Recursion (indirect one too) is not embedded.
-                if cg.reaches(gi, ci) {
+                if reach(gi, ci) {
                     continue;
                 }
                 // Self reachable bodies neither (see above).
@@ -399,7 +399,7 @@ fn inline_one_pooled(
     embed_body(caller, callee, bi, ii, pool);
 }
 
-fn embed_body(caller: &mut Func, callee: &Func, bi: usize, mut ii: usize, mut pool: Option<&mut SlotPool>) {
+pub(crate) fn embed_body(caller: &mut Func, callee: &Func, bi: usize, mut ii: usize, mut pool: Option<&mut SlotPool>) {
     let (args, dst, ret_ty, call_loc) = match &caller.blocks[bi].insts[ii] {
         // ROUND 94: the position of the CALL. Everything that belongs to the
         // call itself (the result travelling back) keeps it; everything that
@@ -1099,7 +1099,8 @@ pub(crate) struct CallGraph {
     memo: HashMap<(usize, usize), bool>,
     mark: Vec<u32>,
     epoch: u32,
-    sets: Vec<Option<Vec<u64>>>,
+    sets: Vec<std::sync::OnceLock<Vec<u64>>>,
+    on_cycle: Option<Vec<bool>>,
 }
 
 const REACH_SET_MAX_FUNCS: usize = 16384;
@@ -1125,8 +1126,8 @@ impl CallGraph {
                 v
             })
             .collect();
-        let sets = if m.funcs.len() <= REACH_SET_MAX_FUNCS { vec![None; m.funcs.len()] } else { Vec::new() };
-        CallGraph { succ, memo: HashMap::default(), mark: vec![0; m.funcs.len()], epoch: 0, sets }
+        let sets = if m.funcs.len() <= REACH_SET_MAX_FUNCS { (0..m.funcs.len()).map(|_| std::sync::OnceLock::new()).collect() } else { Vec::new() };
+        CallGraph { succ, memo: HashMap::default(), mark: vec![0; m.funcs.len()], epoch: 0, sets, on_cycle: None }
     }
 
     /// Can `from` reach `to` through calls (`from == to` counts)?
@@ -1135,12 +1136,7 @@ impl CallGraph {
             return true;
         }
         if !self.sets.is_empty() {
-            if self.sets[from].is_none() {
-                let set = self.reach_set(from);
-                self.sets[from] = Some(set);
-            }
-            let set = self.sets[from].as_ref().expect("reach set");
-            return set[to >> 6] >> (to & 63) & 1 == 1;
+            return self.reaches_shared(from, to);
         }
         if let Some(&r) = self.memo.get(&(from, to)) {
             return r;
@@ -1164,6 +1160,28 @@ impl CallGraph {
         found
     }
 
+    pub(crate) fn shareable(&self) -> bool {
+        !self.sets.is_empty()
+    }
+
+    pub(crate) fn reaches_shared(&self, from: usize, to: usize) -> bool {
+        if from == to {
+            return true;
+        }
+        let set = self.sets[from].get_or_init(|| self.reach_set(from));
+        set[to >> 6] >> (to & 63) & 1 == 1
+    }
+
+    pub(crate) fn callers_of(&self) -> Vec<Vec<usize>> {
+        let mut rev: Vec<Vec<usize>> = vec![Vec::new(); self.succ.len()];
+        for (c, ss) in self.succ.iter().enumerate() {
+            for &g in ss {
+                rev[g].push(c);
+            }
+        }
+        rev
+    }
+
     fn reach_set(&self, from: usize) -> Vec<u64> {
         let mut set = vec![0u64; (self.succ.len() + 63) >> 6];
         let mut stack = vec![from];
@@ -1180,8 +1198,70 @@ impl CallGraph {
 
     /// Can `g` reach itself through at least one call?
     pub(crate) fn self_recursive(&mut self, g: usize) -> bool {
-        let succ = self.succ[g].clone();
-        succ.into_iter().any(|c| self.reaches(c, g))
+        if self.on_cycle.is_none() {
+            self.on_cycle = Some(self.cycle_flags());
+        }
+        self.on_cycle.as_ref().expect("cycle flags")[g]
+    }
+
+    fn cycle_flags(&self) -> Vec<bool> {
+        let n = self.succ.len();
+        let mut flags = vec![false; n];
+        let mut index = vec![usize::MAX; n];
+        let mut low = vec![0usize; n];
+        let mut on_stack = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut counter = 0usize;
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        for root in 0..n {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            work.push((root, 0));
+            while let Some(&(v, k)) = work.last() {
+                if k == 0 {
+                    index[v] = counter;
+                    low[v] = counter;
+                    counter += 1;
+                    stack.push(v);
+                    on_stack[v] = true;
+                }
+                if k < self.succ[v].len() {
+                    work.last_mut().expect("frame").1 = k + 1;
+                    let w = self.succ[v][k];
+                    if w == v {
+                        flags[v] = true;
+                    }
+                    if index[w] == usize::MAX {
+                        work.push((w, 0));
+                    } else if on_stack[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                } else {
+                    work.pop();
+                    if let Some(&(parent, _)) = work.last() {
+                        low[parent] = low[parent].min(low[v]);
+                    }
+                    if low[v] == index[v] {
+                        let mut members: Vec<usize> = Vec::new();
+                        loop {
+                            let w = stack.pop().expect("scc member");
+                            on_stack[w] = false;
+                            members.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        if members.len() > 1 {
+                            for w in members {
+                                flags[w] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        flags
     }
 }
 
@@ -1267,9 +1347,28 @@ fn inline_by_size_with(
     // One tier per callee size, from just above the trivial leaves up: when
     // the growth guard stops the phase, it stops at a size boundary.
     let tiers: Vec<usize> = (MAX_TRIVIAL_INSTS + 1..=MAX_CALLEE_INSTS).collect();
+    let tier_threads = crate::parfn::threads();
+    let tier_parallel = tier_threads > 1 && nf >= 128 && cg.shareable() && !dbg && budget > 0 && max_growth > 0;
+    let cycle_flags: Vec<bool> = if tier_parallel { (0..nf).map(|i| cg.self_recursive(i)).collect() } else { Vec::new() };
     'tiers: for &tier in tiers.iter() {
         let at_start = n;
-        for ci in 0..nf {
+        if tier_parallel {
+            let env = crate::inline_tier::TierEnv { tier, rec_mode, idx: &idx, self_rec: &cycle_flags, cg: &cg };
+            let mut st = crate::inline_tier::TierState {
+                n: &mut n,
+                grown: &mut grown,
+                budget,
+                max_growth,
+                changed: &mut *changed,
+                kept: &mut kept,
+            };
+            if crate::inline_tier::run_tier(m, &env, &mut st, tier_threads) {
+                per_tier.push(n - at_start);
+                stopped_by_growth = n < budget;
+                break 'tiers;
+            }
+        }
+        for ci in 0..(if tier_parallel { 0 } else { nf }) {
             {
                 let c = &m.funcs[ci];
                 if c.constant_time || !c.secret.is_empty() {
@@ -1533,11 +1632,46 @@ fn inline_module_track_x(
     // restart made it run for minutes).
     let mut start = 0usize;
     let mut budgeted = 0usize;
+    let nf = m.funcs.len();
+    let nthreads = crate::parfn::threads();
+    let parallel = nthreads > 1 && nf >= 128 && cg.shareable();
+    let mut cache: Vec<Option<Option<(usize, usize, usize)>>> = Vec::new();
+    let mut callers_of: Vec<Vec<usize>> = Vec::new();
+    if parallel {
+        let all: Vec<usize> = (0..nf).collect();
+        let shared: &Module = m;
+        let cgr: &CallGraph = &cg;
+        let ctx = crate::target::state();
+        cache = crate::parfn::map_slice_with(nthreads, &all, |&ci| {
+            crate::target::set_state(ctx);
+            let mut reach = |a: usize, b: usize| cgr.reaches_shared(a, b);
+            Some(find_site_x(shared, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut reach))
+        });
+        callers_of = cg.callers_of();
+    }
     'outer: loop {
         for ci in start..m.funcs.len() {
-            if let Some((bi, ii, gi)) =
-                find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut cg)
-            {
+            let found = if parallel {
+                match cache[ci] {
+                    Some(r) => r,
+                    None => {
+                        let r = find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut |a, b| cg.reaches(a, b));
+                        cache[ci] = Some(r);
+                        r
+                    }
+                }
+            } else {
+                find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut |a, b| cg.reaches(a, b))
+            };
+            if let Some((bi, ii, gi)) = found {
+                if parallel {
+                    cache[ci] = None;
+                    for &cj in &callers_of[ci] {
+                        if cj > ci {
+                            cache[cj] = None;
+                        }
+                    }
+                }
                 if dbg {
                     eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
@@ -2041,5 +2175,37 @@ mod tests {
         let mut changed = Vec::new();
         let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0, 0);
         assert_eq!(n, 0);
+    }
+
+    fn calling_fn(name: &str, callees: &[&str]) -> Func {
+        let mut f = Func::new(name, vec![], FTy::I32);
+        for c in callees {
+            f.push(0, FTy::I32, Op::Call { name: (*c).into(), args: vec![] });
+        }
+        let z = f.push(0, FTy::I32, Op::Const(0));
+        f.set_term(0, Term::Ret(Some(z)));
+        f
+    }
+
+    #[test]
+    fn cycle_flags_match_reachability() {
+        let mut m = Module::new();
+        m.funcs.push(calling_fn("a", &["b"]));
+        m.funcs.push(calling_fn("b", &["c", "a"]));
+        m.funcs.push(calling_fn("c", &[]));
+        m.funcs.push(calling_fn("d", &["d"]));
+        m.funcs.push(calling_fn("e", &["a", "f"]));
+        m.funcs.push(calling_fn("f", &["g"]));
+        m.funcs.push(calling_fn("g", &["f"]));
+        let idx = name_index(&m);
+        let mut cg = CallGraph::new(&m, &idx);
+        let flags: Vec<bool> = (0..m.funcs.len()).map(|g| cg.self_recursive(g)).collect();
+        let mut reference = CallGraph::new(&m, &idx);
+        for g in 0..m.funcs.len() {
+            let succ = reference.succ[g].clone();
+            let want = succ.into_iter().any(|c| reference.reaches(c, g));
+            assert_eq!(flags[g], want, "function {}", m.funcs[g].name);
+        }
+        assert_eq!(flags, vec![true, true, false, true, false, true, true]);
     }
 }

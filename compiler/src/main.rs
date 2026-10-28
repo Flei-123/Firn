@@ -63,6 +63,7 @@ mod core;
 mod inline;
 mod inline_heat;
 mod inline_once;
+mod inline_tier;
 mod layout;
 mod lexer;
 mod licm;
@@ -1296,19 +1297,15 @@ fn run(opts: &Options) -> i32 {
     // budget (codegen_x86::emit chooses between the two bodies).
     {
         let mut kept = inline::rec_originals_take();
-        for f in kept.values_mut() {
-            if let Err(e) = phi::eliminate_func(f) {
-                eprintln!("error: {}", e);
-                return 1;
-            }
+        if let Err(e) = phi::eliminate_all(kept.values_mut()) {
+            eprintln!("error: {}", e);
+            return 1;
         }
         inline::rec_originals_put(kept);
         let mut small = inline::rec_small_take();
-        for f in small.values_mut() {
-            if let Err(e) = phi::eliminate_func(f) {
-                eprintln!("error: {}", e);
-                return 1;
-            }
+        if let Err(e) = phi::eliminate_all(small.values_mut()) {
+            eprintln!("error: {}", e);
+            return 1;
         }
         inline::rec_small_put(small);
     }

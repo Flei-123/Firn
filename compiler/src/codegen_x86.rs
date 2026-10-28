@@ -756,9 +756,29 @@ fn prune_unreachable(m: &Module, out: &str, ranges: &[(usize, usize)]) -> String
     if let Some(h) = crate::panic_rt::handler() {
         mark(&label(&h), &mut keep, &mut stack);
     }
+    let refs: Vec<Vec<u32>> = crate::parfn::map_slice_with(
+        crate::parfn::threads_from("FIRN_CODEGEN_THREADS"),
+        ranges,
+        |&(a, z)| {
+            let mut v: Vec<u32> = Vec::new();
+            asm_symbols(&out[a..z], |s| {
+                if let Some(&i) = by_sym.get(s) {
+                    v.push(i as u32);
+                }
+            });
+            v.sort_unstable();
+            v.dedup();
+            v
+        },
+    );
     while let Some(i) = stack.pop() {
-        let (a, z) = ranges[i];
-        asm_symbols(&out[a..z], |s| mark(s, &mut keep, &mut stack));
+        for &j in &refs[i] {
+            let j = j as usize;
+            if !keep[j] {
+                keep[j] = true;
+                stack.push(j);
+            }
+        }
     }
     if keep.iter().all(|k| *k) {
         return out.to_string();

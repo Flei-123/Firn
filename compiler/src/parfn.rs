@@ -49,7 +49,16 @@ where
     R: Send,
     F: Fn(&T) -> R + Sync,
 {
-    let nthreads = threads().min(items.len() / 64);
+    map_slice_with(threads(), items, work)
+}
+
+pub(crate) fn map_slice_with<T, R, F>(max_threads: usize, items: &[T], work: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let nthreads = max_threads.min(items.len() / 64);
     if nthreads <= 1 {
         return items.iter().map(&work).collect();
     }
@@ -189,4 +198,62 @@ where
         crate::ivsr::touched_extend(touched);
     }
     total
+}
+
+pub(crate) fn try_each_mut<T, W, F>(items: &mut [T], threads: usize, weight: W, work: F) -> Result<(), String>
+where
+    T: Send,
+    W: Fn(&T) -> usize,
+    F: Fn(&mut T) -> Result<(), String> + Sync,
+{
+    if threads <= 1 || items.len() < MIN_TASKS {
+        for it in items.iter_mut() {
+            work(it)?;
+        }
+        return Ok(());
+    }
+    let w: Vec<usize> = items.iter().map(&weight).collect();
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
+    let slots: Vec<Mutex<&mut T>> = items.iter_mut().map(Mutex::new).collect();
+    let next = AtomicUsize::new(0);
+    let target = crate::target::state();
+    let first_err: Mutex<Option<(usize, String)>> = Mutex::new(None);
+    let nthreads = threads.min(slots.len());
+    std::thread::scope(|sc| {
+        let mut hs = Vec::new();
+        for _ in 0..nthreads {
+            let (slots, order, next, work, first_err) = (&slots, &order, &next, &work, &first_err);
+            let h = std::thread::Builder::new()
+                .stack_size(WORKER_STACK)
+                .spawn_scoped(sc, move || {
+                    crate::target::set_state(target);
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= order.len() {
+                            break;
+                        }
+                        let i = order[k];
+                        let mut g = slots[i].lock().unwrap();
+                        if let Err(e) = work(&mut **g) {
+                            let mut fe = first_err.lock().unwrap();
+                            if fe.as_ref().map(|(j, _)| i < *j).unwrap_or(true) {
+                                *fe = Some((i, e));
+                            }
+                        }
+                    }
+                })
+                .expect("spawn worker");
+            hs.push(h);
+        }
+        for h in hs {
+            if let Err(e) = h.join() {
+                std::panic::resume_unwind(e);
+            }
+        }
+    });
+    match first_err.into_inner().unwrap() {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
+    }
 }
