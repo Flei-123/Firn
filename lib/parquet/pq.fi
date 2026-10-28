@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import compress.common
+import parquet.pqsrc
+import parquet.pqstr
+import parquet.pqmeta
+import parquet.pqpage
+
+export { ConvCol, pq_open, pq_free, pq_num_rows, pq_num_row_groups, pq_rg_rows,
+    pq_rg_comp_bytes, pq_rg_col_range, pq_num_cols, pq_col_name, pq_col_find, pq_col_shape, pq_read_strings, pq_read_conv,
+    pq_read_conv_fields, pq_conv_field_count, pq_conv_field_name, pq_last_error,
+    convcol_new, convcol_free,
+    PQ_SHAPE_FLAT_STRING, PQ_SHAPE_FLAT_OTHER, PQ_SHAPE_LIST_STRUCT, PQ_SHAPE_OTHER }
+
+const PQ_SHAPE_FLAT_STRING: u64 = 0
+const PQ_SHAPE_FLAT_OTHER: u64 = 1
+const PQ_SHAPE_LIST_STRUCT: u64 = 2
+const PQ_SHAPE_OTHER: u64 = 3
+
+const TAIL: usize = 65544
+const MAGIC: u32 = 0x31524150
+
+static mut LAST_ERROR: i64 = 0
+
+fn pq_last_error() -> i64 {
+    return LAST_ERROR
+}
+
+fn pq_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn pq_release[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+fn pq_free(pq: *mut pqmeta.Pq) {
+    if pq as u64 == 0 {
+        return
+    }
+    pqmeta.pq_free_meta(pq)
+    pq_release[pqmeta.Pq](pq as u64)
+}
+
+fn pq_open(src: *mut pqsrc.PqSrc) -> *mut pqmeta.Pq {
+    LAST_ERROR = 0
+    let size: u64 = (*src).size
+    if size < 12 {
+        LAST_ERROR = 1
+        return 0 as *mut pqmeta.Pq
+    }
+    var tn: usize = TAIL
+    if size < TAIL as u64 {
+        tn = size as usize
+    }
+    var tail: rt.Buf = rt.buf_new()
+    if !pqsrc.pq_src_read_buf(src, size - tn as u64, tn, &tail) {
+        rt.buf_free(&tail)
+        LAST_ERROR = 4
+        return 0 as *mut pqmeta.Pq
+    }
+    if common.ld32le(tail.ptr, tn - 4) != MAGIC {
+        rt.buf_free(&tail)
+        LAST_ERROR = 5
+        return 0 as *mut pqmeta.Pq
+    }
+    let flen: usize = common.ld32le(tail.ptr, tn - 8) as usize
+    if flen + 8 > size as usize || flen == 0 {
+        rt.buf_free(&tail)
+        LAST_ERROR = 6
+        return 0 as *mut pqmeta.Pq
+    }
+    var fp: u64 = 0
+    var foot: rt.Buf = rt.buf_new()
+    if flen + 8 <= tn {
+        fp = tail.ptr + (tn - 8 - flen) as u64
+    } else {
+        if !pqsrc.pq_src_read_buf(src, size - 8 - flen as u64, flen, &foot) {
+            rt.buf_free(&tail)
+            rt.buf_free(&foot)
+            LAST_ERROR = 4
+            return 0 as *mut pqmeta.Pq
+        }
+        fp = foot.ptr
+    }
+    let h: u64 = pq_alloc[pqmeta.Pq]()
+    if h == 0 {
+        rt.buf_free(&tail)
+        rt.buf_free(&foot)
+        LAST_ERROR = 3
+        return 0 as *mut pqmeta.Pq
+    }
+    let pq: *mut pqmeta.Pq = h as *mut pqmeta.Pq
+    (*pq).src.read_at = (*src).read_at
+    (*pq).src.ud = (*src).ud
+    (*pq).src.size = (*src).size
+    (*pq).schema = rt.buf_new()
+    (*pq).names = rt.buf_new()
+    (*pq).leaves = rt.buf_new()
+    (*pq).tops = rt.buf_new()
+    (*pq).rgs = rt.buf_new()
+    (*pq).chunks = rt.buf_new()
+    let ok: bool = pqmeta.pq_parse_footer(fp, flen, pq)
+    rt.buf_free(&tail)
+    rt.buf_free(&foot)
+    if !ok {
+        LAST_ERROR = 7
+        if (*pq).err != 0 {
+            LAST_ERROR = 10 + (*pq).err
+        }
+        pq_free(pq)
+        return 0 as *mut pqmeta.Pq
+    }
+    return pq
+}
+
+fn pq_num_rows(pq: *mut pqmeta.Pq) -> u64 {
+    return (*pq).num_rows
+}
+
+fn pq_num_row_groups(pq: *mut pqmeta.Pq) -> usize {
+    return (*pq).nrg
+}
+
+fn pq_rg_rows(pq: *mut pqmeta.Pq, rg: usize) -> u64 {
+    if rg >= (*pq).nrg {
+        return 0
+    }
+    return rt.ld64((*pq).rgs.ptr, rg * 2)
+}
+
+fn pq_rg_comp_bytes(pq: *mut pqmeta.Pq, rg: usize) -> u64 {
+    if rg >= (*pq).nrg {
+        return 0
+    }
+    return rt.ld64((*pq).rgs.ptr, rg * 2 + 1)
+}
+
+fn pq_num_cols(pq: *mut pqmeta.Pq) -> usize {
+    return (*pq).ntop
+}
+
+fn pq_col_name(pq: *mut pqmeta.Pq, i: usize, out: *mut rt.Buf) -> bool {
+    if i >= (*pq).ntop {
+        return false
+    }
+    let off: usize = pqmeta.tc_get(pq, i, pqmeta.TC_NAME_OFF) as usize
+    let len: usize = pqmeta.tc_get(pq, i, pqmeta.TC_NAME_LEN) as usize
+    rt.buf_push_bytes(out, (*pq).names.ptr + off as u64, len)
+    return true
+}
+
+fn pq_col_find(pq: *mut pqmeta.Pq, name: str) -> i64 {
+    var i: usize = 0
+    while i < (*pq).ntop {
+        let off: usize = pqmeta.tc_get(pq, i, pqmeta.TC_NAME_OFF) as usize
+        let len: usize = pqmeta.tc_get(pq, i, pqmeta.TC_NAME_LEN) as usize
+        if len == name.length() && rt.mem_eq((*pq).names.ptr + off as u64, name.p as u64, len) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn pq_col_shape(pq: *mut pqmeta.Pq, col: usize) -> u64 {
+    if col >= (*pq).ntop {
+        return PQ_SHAPE_OTHER
+    }
+    return pqmeta.tc_get(pq, col, pqmeta.TC_SHAPE)
+}
+
+fn pq_rg_col_range(pq: *mut pqmeta.Pq, rg: usize, col: usize, out_off: *mut u64, out_len: *mut u64) -> bool {
+    if rg >= (*pq).nrg || col >= (*pq).ntop {
+        return false
+    }
+    let lo: usize = pqmeta.tc_get(pq, col, pqmeta.TC_LO) as usize
+    let hi: usize = pqmeta.tc_get(pq, col, pqmeta.TC_HI) as usize
+    var first: u64 = 0xFFFFFFFFFFFFFFFF
+    var last: u64 = 0
+    var l: usize = lo
+    while l < hi {
+        let d: u64 = pqmeta.ck_get(pq, rg, l, pqmeta.CK_DATA_OFF)
+        let dd: u64 = pqmeta.ck_get(pq, rg, l, pqmeta.CK_DICT_OFF)
+        var s: u64 = d
+        if dd > 0 && dd < d {
+            s = dd
+        }
+        let e: u64 = s + pqmeta.ck_get(pq, rg, l, pqmeta.CK_COMP)
+        if s < first {
+            first = s
+        }
+        if e > last {
+            last = e
+        }
+        l = l + 1
+    }
+    if first > last {
+        return false
+    }
+    *out_off = first
+    *out_len = last - first
+    return true
+}
+
+fn pq_read_strings(pq: *mut pqmeta.Pq, rg: usize, col: usize, out: *mut pqstr.StrCol) -> bool {
+    if pq_col_shape(pq, col) != PQ_SHAPE_FLAT_STRING || rg >= (*pq).nrg {
+        return false
+    }
+    let leaf: usize = pqmeta.tc_get(pq, col, pqmeta.TC_LO) as usize
+    let ss: usize = pqmeta.pq_leaf_schema(pq, leaf)
+    let maxdef: u32 = pqmeta.sc_get(pq, ss, pqmeta.SC_MAXDEF) as u32
+    var lo: pqpage.LeafOut = pqpage.leaf_new()
+    var ok: bool = pqpage.pq_read_leaf(pq, rg, leaf, &lo)
+    if ok && lo.nlev as u64 != pq_rg_rows(pq, rg) {
+        ok = false
+    }
+    if !ok {
+        pqpage.leaf_free(&lo)
+        return false
+    }
+    pqstr.strcol_free(out)
+    var defined: usize = lo.nlev
+    if maxdef > 0 {
+        defined = 0
+        var i: usize = 0
+        while i < lo.nlev {
+            if rt.ld8(lo.defs.ptr, i) == maxdef as u8 {
+                defined = defined + 1
+            }
+            i = i + 1
+        }
+    }
+    if defined == lo.nlev {
+        *out = lo.vals
+        rt.buf_free(&lo.reps)
+        rt.buf_free(&lo.defs)
+        return true
+    }
+    *out = pqstr.strcol_new()
+    var vi: usize = 0
+    var j: usize = 0
+    while j < lo.nlev && ok {
+        if rt.ld8(lo.defs.ptr, j) == maxdef as u8 {
+            ok = pqstr.strcol_push(out, pqstr.strcol_ptr(&lo.vals, vi), pqstr.strcol_len(&lo.vals, vi))
+            vi = vi + 1
+        } else {
+            ok = pqstr.strcol_push_null(out)
+        }
+        j = j + 1
+    }
+    pqpage.leaf_free(&lo)
+    return ok
+}
+
+struct ConvCol {
+    nrows: usize,
+    nitems: usize,
+    row_offs: rt.Buf,
+    row_null: rt.Buf,
+    a: pqstr.StrCol,
+    b: pqstr.StrCol,
+}
+
+fn convcol_new() -> ConvCol {
+    var c: ConvCol = ConvCol { nrows: 0, nitems: 0, row_offs: rt.buf_new(), row_null: rt.buf_new(), a: pqstr.strcol_new(), b: pqstr.strcol_new() }
+    return c
+}
+
+fn convcol_free(c: *mut ConvCol) {
+    rt.buf_free(&(*c).row_offs)
+    rt.buf_free(&(*c).row_null)
+    pqstr.strcol_free(&(*c).a)
+    pqstr.strcol_free(&(*c).b)
+    (*c).nrows = 0
+    (*c).nitems = 0
+}
+
+fn pq_conv_field_count(pq: *mut pqmeta.Pq, col: usize) -> usize {
+    if col >= (*pq).ntop {
+        return 0
+    }
+    return (pqmeta.tc_get(pq, col, pqmeta.TC_HI) - pqmeta.tc_get(pq, col, pqmeta.TC_LO)) as usize
+}
+
+fn pq_conv_field_name(pq: *mut pqmeta.Pq, col: usize, k: usize, out: *mut rt.Buf) -> bool {
+    if k >= pq_conv_field_count(pq, col) {
+        return false
+    }
+    let leaf: usize = pqmeta.tc_get(pq, col, pqmeta.TC_LO) as usize + k
+    let ss: usize = pqmeta.pq_leaf_schema(pq, leaf)
+    let off: usize = pqmeta.sc_get(pq, ss, pqmeta.SC_NAME_OFF) as usize
+    let len: usize = pqmeta.sc_get(pq, ss, pqmeta.SC_NAME_LEN) as usize
+    rt.buf_push_bytes(out, (*pq).names.ptr + off as u64, len)
+    return true
+}
+
+fn item_value(l: *mut pqpage.LeafOut, def: u8, maxdef: u8, vi: *mut usize, dst: *mut pqstr.StrCol) -> bool {
+    if def == maxdef {
+        let i: usize = *vi
+        *vi = i + 1
+        return pqstr.strcol_push(dst, pqstr.strcol_ptr(&(*l).vals, i), pqstr.strcol_len(&(*l).vals, i))
+    }
+    return pqstr.strcol_push_null(dst)
+}
+
+fn assemble(la: *mut pqpage.LeafOut, lb: *mut pqpage.LeafOut, rdef: u8, maxa: u8, maxb: u8, out: *mut ConvCol) -> bool {
+    if (*la).nlev != (*lb).nlev || (*la).reps.len != (*la).nlev || (*la).defs.len != (*la).nlev || (*lb).defs.len != (*lb).nlev {
+        return false
+    }
+    var ia: usize = 0
+    var ib: usize = 0
+    var j: usize = 0
+    while j < (*la).nlev {
+        let rep: u8 = rt.ld8((*la).reps.ptr, j)
+        let da: u8 = rt.ld8((*la).defs.ptr, j)
+        let db: u8 = rt.ld8((*lb).defs.ptr, j)
+        if rep == 0 {
+            if !pqstr.push_u64(&(*out).row_offs, (*out).nitems as u64) {
+                return false
+            }
+            var isnull: u8 = 0
+            if da + 1 < rdef {
+                isnull = 1
+            }
+            rt.buf_push(&(*out).row_null, isnull)
+            (*out).nrows = (*out).nrows + 1
+        } else if (*out).nrows == 0 {
+            return false
+        }
+        if da >= rdef {
+            if !item_value(la, da, maxa, &ia, &(*out).a) || !item_value(lb, db, maxb, &ib, &(*out).b) {
+                return false
+            }
+            (*out).nitems = (*out).nitems + 1
+        }
+        j = j + 1
+    }
+    return pqstr.push_u64(&(*out).row_offs, (*out).nitems as u64)
+}
+
+fn pq_read_conv_fields(pq: *mut pqmeta.Pq, rg: usize, col: usize, ka: usize, kb: usize, out: *mut ConvCol) -> bool {
+    if pq_col_shape(pq, col) != PQ_SHAPE_LIST_STRUCT || rg >= (*pq).nrg {
+        return false
+    }
+    let n: usize = pq_conv_field_count(pq, col)
+    if ka >= n || kb >= n {
+        return false
+    }
+    let base: usize = pqmeta.tc_get(pq, col, pqmeta.TC_LO) as usize
+    let sa: usize = pqmeta.pq_leaf_schema(pq, base + ka)
+    let sb: usize = pqmeta.pq_leaf_schema(pq, base + kb)
+    var la: pqpage.LeafOut = pqpage.leaf_new()
+    var lb: pqpage.LeafOut = pqpage.leaf_new()
+    var ok: bool = pqpage.pq_read_leaf(pq, rg, base + ka, &la)
+    if ok {
+        ok = pqpage.pq_read_leaf(pq, rg, base + kb, &lb)
+    }
+    convcol_free(out)
+    *out = convcol_new()
+    if ok {
+        ok = assemble(&la, &lb, pqmeta.sc_get(pq, sa, pqmeta.SC_RDEF) as u8, pqmeta.sc_get(pq, sa, pqmeta.SC_MAXDEF) as u8,
+            pqmeta.sc_get(pq, sb, pqmeta.SC_MAXDEF) as u8, out)
+    }
+    if ok && (*out).nrows as u64 != pq_rg_rows(pq, rg) {
+        ok = false
+    }
+    pqpage.leaf_free(&la)
+    pqpage.leaf_free(&lb)
+    return ok
+}
+
+fn pq_read_conv(pq: *mut pqmeta.Pq, rg: usize, col: usize, out: *mut ConvCol) -> bool {
+    return pq_read_conv_fields(pq, rg, col, 0, 1, out)
+}

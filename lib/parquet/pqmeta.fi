@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import compress.common
+import parquet.pqsrc
+import parquet.pqthrift
+import parquet.pqstr
+
+export { Pq, pq_parse_footer, pq_free_meta, sc_get, ck_get, tc_get, pq_leaf_schema,
+    SC_PTYPE, SC_TLEN, SC_REP, SC_NAME_OFF, SC_NAME_LEN, SC_NCHILD, SC_CONV, SC_MAXDEF, SC_MAXREP, SC_LEAF, SC_RDEF,
+    CK_CODEC, CK_NVALS, CK_DATA_OFF, CK_DICT_OFF, CK_COMP, CK_UNCOMP, CK_PTYPE, CK_HAS,
+    TC_SCHEMA, TC_LO, TC_HI, TC_SHAPE, TC_NAME_OFF, TC_NAME_LEN,
+    SHAPE_FLAT_STRING, SHAPE_FLAT_OTHER, SHAPE_LIST_STRUCT, SHAPE_OTHER,
+    PT_BYTE_ARRAY, PT_FIXED, PT_GROUP, ERR_FOOTER, ERR_SCHEMA, ERR_MEM }
+
+const SC_K: usize = 11
+const SC_PTYPE: usize = 0
+const SC_TLEN: usize = 1
+const SC_REP: usize = 2
+const SC_NAME_OFF: usize = 3
+const SC_NAME_LEN: usize = 4
+const SC_NCHILD: usize = 5
+const SC_CONV: usize = 6
+const SC_MAXDEF: usize = 7
+const SC_MAXREP: usize = 8
+const SC_LEAF: usize = 9
+const SC_RDEF: usize = 10
+
+const CK_K: usize = 8
+const CK_CODEC: usize = 0
+const CK_NVALS: usize = 1
+const CK_DATA_OFF: usize = 2
+const CK_DICT_OFF: usize = 3
+const CK_COMP: usize = 4
+const CK_UNCOMP: usize = 5
+const CK_PTYPE: usize = 6
+const CK_HAS: usize = 7
+
+const TC_K: usize = 6
+const TC_SCHEMA: usize = 0
+const TC_LO: usize = 1
+const TC_HI: usize = 2
+const TC_SHAPE: usize = 3
+const TC_NAME_OFF: usize = 4
+const TC_NAME_LEN: usize = 5
+
+const SHAPE_FLAT_STRING: u64 = 0
+const SHAPE_FLAT_OTHER: u64 = 1
+const SHAPE_LIST_STRUCT: u64 = 2
+const SHAPE_OTHER: u64 = 3
+
+const PT_BYTE_ARRAY: u64 = 6
+const PT_FIXED: u64 = 7
+const PT_GROUP: u64 = 255
+
+const ERR_FOOTER: i64 = 1
+const ERR_SCHEMA: i64 = 2
+const ERR_MEM: i64 = 3
+
+const MAX_RECORDS: usize = 16777216
+const MAX_STACK: usize = 60
+
+struct Pq {
+    src: pqsrc.PqSrc,
+    num_rows: u64,
+    nschema: usize,
+    nleaves: usize,
+    nrg: usize,
+    ntop: usize,
+    schema: rt.Buf,
+    names: rt.Buf,
+    leaves: rt.Buf,
+    tops: rt.Buf,
+    rgs: rt.Buf,
+    chunks: rt.Buf,
+    err: i64,
+}
+
+fn sc_get(pq: *mut Pq, i: usize, f: usize) -> u64 {
+    return rt.ld64((*pq).schema.ptr, i * SC_K + f)
+}
+
+fn ck_get(pq: *mut Pq, rg: usize, leaf: usize, f: usize) -> u64 {
+    return rt.ld64((*pq).chunks.ptr, (rg * (*pq).nleaves + leaf) * CK_K + f)
+}
+
+fn tc_get(pq: *mut Pq, i: usize, f: usize) -> u64 {
+    return rt.ld64((*pq).tops.ptr, i * TC_K + f)
+}
+
+fn pq_leaf_schema(pq: *mut Pq, leaf: usize) -> usize {
+    return rt.ld64((*pq).leaves.ptr, leaf) as usize
+}
+
+fn pq_free_meta(pq: *mut Pq) {
+    rt.buf_free(&(*pq).schema)
+    rt.buf_free(&(*pq).names)
+    rt.buf_free(&(*pq).leaves)
+    rt.buf_free(&(*pq).tops)
+    rt.buf_free(&(*pq).rgs)
+    rt.buf_free(&(*pq).chunks)
+}
+
+fn grow_zero(b: *mut rt.Buf, words: usize) -> bool {
+    let bytes: usize = words * 8
+    if !common.buf_ensure(b, (*b).len + bytes) {
+        return false
+    }
+    rt.mem_set((*b).ptr + (*b).len as u64, 0, bytes)
+    (*b).len = (*b).len + bytes
+    return true
+}
+
+fn parse_schema_element(t: *mut pqthrift.Tr, pq: *mut Pq) -> bool {
+    let at: usize = (*pq).nschema
+    if !grow_zero(&(*pq).schema, SC_K) {
+        return false
+    }
+    let base: usize = at * SC_K
+    rt.st64((*pq).schema.ptr, base + SC_PTYPE, PT_GROUP)
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_I32 {
+            rt.st64((*pq).schema.ptr, base + SC_PTYPE, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 2 && ft == pqthrift.T_I32 {
+            rt.st64((*pq).schema.ptr, base + SC_TLEN, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 3 && ft == pqthrift.T_I32 {
+            rt.st64((*pq).schema.ptr, base + SC_REP, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 4 && ft == pqthrift.T_BINARY {
+            var p: u64 = 0
+            var n: usize = 0
+            if !pqthrift.tr_binary(t, &p, &n) {
+                return false
+            }
+            rt.st64((*pq).schema.ptr, base + SC_NAME_OFF, (*pq).names.len as u64)
+            rt.st64((*pq).schema.ptr, base + SC_NAME_LEN, n as u64)
+            rt.buf_push_bytes(&(*pq).names, p, n)
+        } else if last == 5 && ft == pqthrift.T_I32 {
+            rt.st64((*pq).schema.ptr, base + SC_NCHILD, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 6 && ft == pqthrift.T_I32 {
+            rt.st64((*pq).schema.ptr, base + SC_CONV, pqthrift.tr_zigzag(t) as u64)
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    (*pq).nschema = at + 1
+    return pqthrift.tr_ok(t)
+}
+
+fn derive_schema(pq: *mut Pq) -> bool {
+    let n: usize = (*pq).nschema
+    if n < 2 {
+        return false
+    }
+    var rem: [u64; 64] = [0; 64]
+    var defs: [u64; 64] = [0; 64]
+    var reps: [u64; 64] = [0; 64]
+    var rdefs: [u64; 64] = [0; 64]
+    var sp: usize = 1
+    rem[0] = sc_get(pq, 0, SC_NCHILD)
+    var i: usize = 1
+    while i < n {
+        while sp > 0 && rem[sp - 1] == 0 {
+            sp = sp - 1
+        }
+        if sp == 0 {
+            return false
+        }
+        rem[sp - 1] = rem[sp - 1] - 1
+        let rt_: u64 = sc_get(pq, i, SC_REP)
+        var d: u64 = defs[sp - 1]
+        var r: u64 = reps[sp - 1]
+        var rd: u64 = rdefs[sp - 1]
+        if rt_ != 0 {
+            d = d + 1
+        }
+        if rt_ == 2 {
+            r = r + 1
+            rd = d
+        }
+        let base: usize = i * SC_K
+        rt.st64((*pq).schema.ptr, base + SC_MAXDEF, d)
+        rt.st64((*pq).schema.ptr, base + SC_MAXREP, r)
+        rt.st64((*pq).schema.ptr, base + SC_RDEF, rd)
+        let nc: u64 = sc_get(pq, i, SC_NCHILD)
+        if sp == 1 {
+            if !grow_zero(&(*pq).tops, TC_K) {
+                return false
+            }
+            let tb: usize = (*pq).ntop * TC_K
+            rt.st64((*pq).tops.ptr, tb + TC_SCHEMA, i as u64)
+            rt.st64((*pq).tops.ptr, tb + TC_LO, (*pq).nleaves as u64)
+            rt.st64((*pq).tops.ptr, tb + TC_NAME_OFF, sc_get(pq, i, SC_NAME_OFF))
+            rt.st64((*pq).tops.ptr, tb + TC_NAME_LEN, sc_get(pq, i, SC_NAME_LEN))
+            (*pq).ntop = (*pq).ntop + 1
+        }
+        if nc > 0 {
+            if sp >= MAX_STACK || nc > n as u64 {
+                return false
+            }
+            rem[sp] = nc
+            defs[sp] = d
+            reps[sp] = r
+            rdefs[sp] = rd
+            sp = sp + 1
+        } else {
+            rt.st64((*pq).schema.ptr, base + SC_LEAF, (*pq).nleaves as u64)
+            pqstr.push_u64(&(*pq).leaves, i as u64)
+            (*pq).nleaves = (*pq).nleaves + 1
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < (*pq).ntop {
+        var hi: u64 = (*pq).nleaves as u64
+        if k + 1 < (*pq).ntop {
+            hi = tc_get(pq, k + 1, TC_LO)
+        }
+        rt.st64((*pq).tops.ptr, k * TC_K + TC_HI, hi)
+        k = k + 1
+    }
+    return true
+}
+
+fn classify(pq: *mut Pq) {
+    var k: usize = 0
+    while k < (*pq).ntop {
+        let lo: usize = tc_get(pq, k, TC_LO) as usize
+        let hi: usize = tc_get(pq, k, TC_HI) as usize
+        let sidx: usize = tc_get(pq, k, TC_SCHEMA) as usize
+        var shape: u64 = SHAPE_OTHER
+        if hi == lo + 1 && sc_get(pq, sidx, SC_NCHILD) == 0 {
+            let leaf_s: usize = pq_leaf_schema(pq, lo)
+            if sc_get(pq, leaf_s, SC_MAXREP) == 0 {
+                shape = SHAPE_FLAT_OTHER
+                let pt: u64 = sc_get(pq, leaf_s, SC_PTYPE)
+                if pt == PT_BYTE_ARRAY || pt == PT_FIXED {
+                    shape = SHAPE_FLAT_STRING
+                }
+            }
+        } else if hi > lo {
+            var all: bool = true
+            var j: usize = lo
+            while j < hi {
+                let ls: usize = pq_leaf_schema(pq, j)
+                if sc_get(pq, ls, SC_MAXREP) != 1 || sc_get(pq, ls, SC_PTYPE) != PT_BYTE_ARRAY {
+                    all = false
+                }
+                j = j + 1
+            }
+            if all {
+                shape = SHAPE_LIST_STRUCT
+            }
+        }
+        rt.st64((*pq).tops.ptr, k * TC_K + TC_SHAPE, shape)
+        k = k + 1
+    }
+}
+
+fn parse_column_meta(t: *mut pqthrift.Tr, pq: *mut Pq, rg: usize, leaf: usize) -> bool {
+    let base: usize = (rg * (*pq).nleaves + leaf) * CK_K
+    let cp: u64 = (*pq).chunks.ptr
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_I32 {
+            rt.st64(cp, base + CK_PTYPE, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 4 && ft == pqthrift.T_I32 {
+            rt.st64(cp, base + CK_CODEC, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 5 && ft == pqthrift.T_I64 {
+            rt.st64(cp, base + CK_NVALS, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 6 && ft == pqthrift.T_I64 {
+            rt.st64(cp, base + CK_UNCOMP, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 7 && ft == pqthrift.T_I64 {
+            rt.st64(cp, base + CK_COMP, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 9 && ft == pqthrift.T_I64 {
+            rt.st64(cp, base + CK_DATA_OFF, pqthrift.tr_zigzag(t) as u64)
+        } else if last == 11 && ft == pqthrift.T_I64 {
+            rt.st64(cp, base + CK_DICT_OFF, pqthrift.tr_zigzag(t) as u64)
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    rt.st64(cp, base + CK_HAS, 1)
+    return pqthrift.tr_ok(t)
+}
+
+fn parse_column_chunk(t: *mut pqthrift.Tr, pq: *mut Pq, rg: usize, leaf: usize) -> bool {
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 3 && ft == pqthrift.T_STRUCT {
+            if !parse_column_meta(t, pq, rg, leaf) {
+                return false
+            }
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    return pqthrift.tr_ok(t)
+}
+
+fn parse_row_group(t: *mut pqthrift.Tr, pq: *mut Pq, rg: usize) -> bool {
+    var last: i64 = 0
+    var ft: u32 = 0
+    let rb: usize = rg * 2
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_LIST {
+            var et: u32 = 0
+            let cnt: usize = pqthrift.tr_list(t, &et)
+            if cnt != (*pq).nleaves {
+                return false
+            }
+            var c: usize = 0
+            while c < cnt {
+                if !parse_column_chunk(t, pq, rg, c) {
+                    return false
+                }
+                c = c + 1
+            }
+        } else if last == 3 && ft == pqthrift.T_I64 {
+            rt.st64((*pq).rgs.ptr, rb, pqthrift.tr_zigzag(t) as u64)
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    var comp: u64 = 0
+    var c2: usize = 0
+    while c2 < (*pq).nleaves {
+        comp = comp + ck_get(pq, rg, c2, CK_COMP)
+        c2 = c2 + 1
+    }
+    rt.st64((*pq).rgs.ptr, rb + 1, comp)
+    return pqthrift.tr_ok(t)
+}
+
+fn pq_parse_footer(p: u64, n: usize, pq: *mut Pq) -> bool {
+    var t: pqthrift.Tr = pqthrift.tr_new(p, n)
+    var last: i64 = 0
+    var ft: u32 = 0
+    var have_schema: bool = false
+    while pqthrift.tr_field(&t, &last, &ft) {
+        if last == 2 && ft == pqthrift.T_LIST {
+            var et: u32 = 0
+            let cnt: usize = pqthrift.tr_list(&t, &et)
+            var i: usize = 0
+            while i < cnt {
+                if !parse_schema_element(&t, pq) {
+                    (*pq).err = ERR_SCHEMA
+                    return false
+                }
+                i = i + 1
+            }
+            if !derive_schema(pq) {
+                (*pq).err = ERR_SCHEMA
+                return false
+            }
+            classify(pq)
+            have_schema = true
+        } else if last == 3 && ft == pqthrift.T_I64 {
+            (*pq).num_rows = pqthrift.tr_zigzag(&t) as u64
+        } else if last == 4 && ft == pqthrift.T_LIST {
+            if !have_schema {
+                return false
+            }
+            var et: u32 = 0
+            let cnt: usize = pqthrift.tr_list(&t, &et)
+            if cnt > MAX_RECORDS || cnt * (*pq).nleaves > MAX_RECORDS {
+                return false
+            }
+            if !grow_zero(&(*pq).rgs, cnt * 2) || !grow_zero(&(*pq).chunks, cnt * (*pq).nleaves * CK_K) {
+                (*pq).err = ERR_MEM
+                return false
+            }
+            var g: usize = 0
+            while g < cnt {
+                if !parse_row_group(&t, pq, g) {
+                    return false
+                }
+                g = g + 1
+            }
+            (*pq).nrg = cnt
+        } else {
+            pqthrift.tr_skip(&t, ft)
+        }
+    }
+    return pqthrift.tr_ok(&t) && have_schema
+}

@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export { Tr, tr_new, tr_ok, tr_pos, tr_field, tr_zigzag, tr_varint, tr_binary, tr_list, tr_skip, tr_bool_elem,
+    T_BOOL_TRUE, T_BOOL_FALSE, T_BYTE, T_I16, T_I32, T_I64, T_DOUBLE, T_BINARY, T_LIST, T_SET, T_MAP, T_STRUCT }
+
+const T_BOOL_TRUE: u32 = 1
+const T_BOOL_FALSE: u32 = 2
+const T_BYTE: u32 = 3
+const T_I16: u32 = 4
+const T_I32: u32 = 5
+const T_I64: u32 = 6
+const T_DOUBLE: u32 = 7
+const T_BINARY: u32 = 8
+const T_LIST: u32 = 9
+const T_SET: u32 = 10
+const T_MAP: u32 = 11
+const T_STRUCT: u32 = 12
+const MAX_DEPTH: u32 = 48
+
+struct Tr {
+    p: u64,
+    n: usize,
+    pos: usize,
+    ok: bool,
+}
+
+fn tr_new(p: u64, n: usize) -> Tr {
+    return Tr { p: p, n: n, pos: 0, ok: true }
+}
+
+fn tr_ok(t: *mut Tr) -> bool {
+    return (*t).ok
+}
+
+fn tr_pos(t: *mut Tr) -> usize {
+    return (*t).pos
+}
+
+fn tr_byte(t: *mut Tr) -> u32 {
+    if (*t).pos >= (*t).n {
+        (*t).ok = false
+        return 0
+    }
+    let b: u32 = rt.ld8((*t).p, (*t).pos) as u32
+    (*t).pos = (*t).pos + 1
+    return b
+}
+
+fn tr_varint(t: *mut Tr) -> u64 {
+    var v: u64 = 0
+    var shift: u64 = 0
+    while shift < 70 {
+        let b: u64 = tr_byte(t) as u64
+        if !(*t).ok {
+            return 0
+        }
+        if shift < 64 {
+            v = v | ((b & 127) << shift)
+        }
+        if b < 128 {
+            return v
+        }
+        shift = shift + 7
+    }
+    (*t).ok = false
+    return 0
+}
+
+fn tr_zigzag(t: *mut Tr) -> i64 {
+    let v: u64 = tr_varint(t)
+    let half: i64 = (v >> 1) as i64
+    if v & 1 == 0 {
+        return half
+    }
+    return (0 - half) - 1
+}
+
+fn tr_field(t: *mut Tr, last: *mut i64, ftype: *mut u32) -> bool {
+    let b: u32 = tr_byte(t)
+    if !(*t).ok || b == 0 {
+        return false
+    }
+    let delta: u32 = b >> 4
+    if delta == 0 {
+        *last = tr_zigzag(t)
+    } else {
+        *last = *last + delta as i64
+    }
+    *ftype = b & 15
+    return (*t).ok
+}
+
+fn tr_binary(t: *mut Tr, outp: *mut u64, outn: *mut usize) -> bool {
+    let len: u64 = tr_varint(t)
+    if !(*t).ok || len > ((*t).n - (*t).pos) as u64 {
+        (*t).ok = false
+        return false
+    }
+    *outp = (*t).p + (*t).pos as u64
+    *outn = len as usize
+    (*t).pos = (*t).pos + len as usize
+    return true
+}
+
+fn tr_list(t: *mut Tr, etype: *mut u32) -> usize {
+    let b: u32 = tr_byte(t)
+    if !(*t).ok {
+        return 0
+    }
+    var size: u64 = (b >> 4) as u64
+    *etype = b & 15
+    if size == 15 {
+        size = tr_varint(t)
+    }
+    if size > ((*t).n - (*t).pos) as u64 {
+        (*t).ok = false
+        return 0
+    }
+    return size as usize
+}
+
+fn tr_bool_elem(t: *mut Tr) -> bool {
+    return tr_byte(t) == 1
+}
+
+fn skip_value(t: *mut Tr, ft: u32, depth: u32, in_list: bool) {
+    if !(*t).ok {
+        return
+    }
+    if depth > MAX_DEPTH {
+        (*t).ok = false
+        return
+    }
+    if ft == T_BOOL_TRUE || ft == T_BOOL_FALSE {
+        if in_list {
+            tr_byte(t)
+        }
+        return
+    }
+    if ft == T_BYTE {
+        tr_byte(t)
+        return
+    }
+    if ft == T_I16 || ft == T_I32 || ft == T_I64 {
+        tr_varint(t)
+        return
+    }
+    if ft == T_DOUBLE {
+        if (*t).n - (*t).pos < 8 {
+            (*t).ok = false
+            return
+        }
+        (*t).pos = (*t).pos + 8
+        return
+    }
+    if ft == T_BINARY {
+        var p: u64 = 0
+        var n: usize = 0
+        tr_binary(t, &p, &n)
+        return
+    }
+    if ft == T_LIST || ft == T_SET {
+        var et: u32 = 0
+        let size: usize = tr_list(t, &et)
+        var i: usize = 0
+        while i < size && (*t).ok {
+            skip_value(t, et, depth + 1, true)
+            i = i + 1
+        }
+        return
+    }
+    if ft == T_MAP {
+        let size: u64 = tr_varint(t)
+        if size > 0 {
+            let kv: u32 = tr_byte(t)
+            var i: u64 = 0
+            while i < size && (*t).ok {
+                skip_value(t, kv >> 4, depth + 1, true)
+                skip_value(t, kv & 15, depth + 1, true)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if ft == T_STRUCT {
+        var last: i64 = 0
+        var ftype: u32 = 0
+        while tr_field(t, &last, &ftype) {
+            skip_value(t, ftype, depth + 1, false)
+        }
+        return
+    }
+    (*t).ok = false
+}
+
+fn tr_skip(t: *mut Tr, ft: u32) {
+    skip_value(t, ft, 0, false)
+}

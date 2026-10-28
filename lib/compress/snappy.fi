@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import compress.common
+
+export { snappy_uncompressed_len, snappy_decompress, snappy_compress, snappy_bound }
+
+const SNAPPY_BLOCK: usize = 65536
+const SNAPPY_HASH_BITS: u32 = 14
+const SNAPPY_NO_LIMIT: usize = 4294967296
+
+fn read_varint(src: u64, n: usize, pos: *mut usize, out: *mut u64) -> bool {
+    var ip: usize = *pos
+    var v: u64 = 0
+    var shift: u64 = 0
+    while true {
+        if ip >= n {
+            return false
+        }
+        let b: u64 = rt.ld8(src, ip) as u64
+        ip = ip + 1
+        v = v | ((b & 127) << shift)
+        if b < 128 {
+            break
+        }
+        shift = shift + 7
+        if shift > 28 {
+            return false
+        }
+    }
+    *pos = ip
+    *out = v
+    return true
+}
+
+fn snappy_uncompressed_len(src: u64, n: usize) -> CompressError!usize {
+    var pos: usize = 0
+    var v: u64 = 0
+    if !read_varint(src, n, &pos, &v) {
+        return CompressError::Data
+    }
+    return v as usize
+}
+
+fn copy_overlap(dst: u64, op: usize, off: usize, len: usize) {
+    if off >= len {
+        rt.mem_copy(dst + op as u64, dst + (op - off) as u64, len)
+        return
+    }
+    var i: usize = 0
+    while i < len {
+        rt.st8(dst, op + i, rt.ld8(dst, op + i - off))
+        i = i + 1
+    }
+}
+
+fn snappy_decompress(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    var ip: usize = 0
+    var ulen64: u64 = 0
+    if !read_varint(src, n, &ip, &ulen64) {
+        return CompressError::Data
+    }
+    let ulen: usize = ulen64 as usize
+    var limit: usize = max
+    if limit == 0 {
+        limit = SNAPPY_NO_LIMIT
+    }
+    if ulen > limit {
+        return CompressError::TooLarge
+    }
+    let start: usize = (*out).len
+    if !common.buf_ensure(out, start + ulen + 32) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    let end: usize = start + ulen
+    var op: usize = start
+    while ip < n {
+        let tag: usize = rt.ld8(src, ip) as usize
+        ip = ip + 1
+        let kind: usize = tag & 3
+        if kind == 0 {
+            var len: usize = tag >> 2
+            if len >= 60 {
+                let extra: usize = len - 59
+                if n - ip < extra {
+                    return CompressError::Truncated
+                }
+                len = 0
+                var i: usize = 0
+                while i < extra {
+                    len = len | ((rt.ld8(src, ip + i) as usize) << (8 * i))
+                    i = i + 1
+                }
+                ip = ip + extra
+            }
+            len = len + 1
+            if len > n - ip {
+                return CompressError::Truncated
+            }
+            if len > end - op {
+                return CompressError::Data
+            }
+            rt.mem_copy(dst + op as u64, src + ip as u64, len)
+            ip = ip + len
+            op = op + len
+        } else {
+            var len: usize = 0
+            var off: usize = 0
+            if kind == 1 {
+                if n - ip < 1 {
+                    return CompressError::Truncated
+                }
+                len = 4 + ((tag >> 2) & 7)
+                off = ((tag >> 5) << 8) | (rt.ld8(src, ip) as usize)
+                ip = ip + 1
+            } else if kind == 2 {
+                if n - ip < 2 {
+                    return CompressError::Truncated
+                }
+                len = 1 + (tag >> 2)
+                off = common.ld16le(src, ip) as usize
+                ip = ip + 2
+            } else {
+                if n - ip < 4 {
+                    return CompressError::Truncated
+                }
+                len = 1 + (tag >> 2)
+                off = common.ld32le(src, ip) as usize
+                ip = ip + 4
+            }
+            if off == 0 || off > op - start {
+                return CompressError::Data
+            }
+            if len > end - op {
+                return CompressError::Data
+            }
+            copy_overlap(dst, op, off, len)
+            op = op + len
+        }
+    }
+    if op != end {
+        return CompressError::Truncated
+    }
+    (*out).len = end
+    return ulen
+}
+
+fn snappy_bound(n: usize) -> usize {
+    return 32 + n + n / 6
+}
+
+fn put_varint(dst: u64, pos: usize, v: usize) -> usize {
+    var p: usize = pos
+    var x: usize = v
+    while x >= 128 {
+        rt.st8(dst, p, ((x & 127) | 128) as u8)
+        p = p + 1
+        x = x >> 7
+    }
+    rt.st8(dst, p, x as u8)
+    return p + 1
+}
+
+fn emit_literal(dst: u64, pos: usize, src: u64, from: usize, len: usize) -> usize {
+    var p: usize = pos
+    let m: usize = len - 1
+    if m < 60 {
+        rt.st8(dst, p, (m << 2) as u8)
+        p = p + 1
+    } else {
+        var bytes: usize = 1
+        if m >= 256 {
+            bytes = 2
+        }
+        if m >= 65536 {
+            bytes = 3
+        }
+        if m >= 16777216 {
+            bytes = 4
+        }
+        rt.st8(dst, p, ((59 + bytes) << 2) as u8)
+        p = p + 1
+        var i: usize = 0
+        while i < bytes {
+            rt.st8(dst, p, ((m >> (8 * i)) & 255) as u8)
+            p = p + 1
+            i = i + 1
+        }
+    }
+    rt.mem_copy(dst + p as u64, src + from as u64, len)
+    return p + len
+}
+
+fn emit_copy2(dst: u64, pos: usize, off: usize, len: usize) -> usize {
+    rt.st8(dst, pos, (((len - 1) << 2) | 2) as u8)
+    rt.st8(dst, pos + 1, (off & 255) as u8)
+    rt.st8(dst, pos + 2, (off >> 8) as u8)
+    return pos + 3
+}
+
+fn emit_copy(dst: u64, pos: usize, off: usize, len: usize) -> usize {
+    var p: usize = pos
+    var m: usize = len
+    while m >= 68 {
+        p = emit_copy2(dst, p, off, 64)
+        m = m - 64
+    }
+    if m > 64 {
+        p = emit_copy2(dst, p, off, 60)
+        m = m - 60
+    }
+    if m < 12 && off < 2048 {
+        rt.st8(dst, p, (((off >> 8) << 5) | ((m - 4) << 2) | 1) as u8)
+        rt.st8(dst, p + 1, (off & 255) as u8)
+        return p + 2
+    }
+    return emit_copy2(dst, p, off, m)
+}
+
+fn hash4(v: u32) -> usize {
+    return ((v *% 506832829) >> (32 - SNAPPY_HASH_BITS)) as usize
+}
+
+fn compress_block(src: u64, bstart: usize, bend: usize, dst: u64, pos: usize, table: u64) -> usize {
+    var p: usize = pos
+    var anchor: usize = bstart
+    var ip: usize = bstart + 1
+    rt.mem_set(table, 0, (1 << SNAPPY_HASH_BITS) * 4)
+    while ip + 4 <= bend {
+        let cur: u32 = common.ld32le(src, ip)
+        let h: usize = hash4(cur)
+        let cand: usize = rt.ld32(table, h) as usize
+        rt.st32(table, h, ip as u32)
+        if cand >= bstart && cand < ip && ip - cand <= 65535 && common.ld32le(src, cand) == cur {
+            if ip > anchor {
+                p = emit_literal(dst, p, src, anchor, ip - anchor)
+            }
+            var mlen: usize = 4
+            while ip + mlen < bend && rt.ld8(src, cand + mlen) == rt.ld8(src, ip + mlen) {
+                mlen = mlen + 1
+            }
+            p = emit_copy(dst, p, ip - cand, mlen)
+            ip = ip + mlen
+            anchor = ip
+        } else {
+            ip = ip + 1 + ((ip - anchor) >> 5)
+        }
+    }
+    if anchor < bend {
+        p = emit_literal(dst, p, src, anchor, bend - anchor)
+    }
+    return p
+}
+
+fn snappy_compress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    let start: usize = (*out).len
+    let blocks: usize = n / SNAPPY_BLOCK + 1
+    if !common.buf_ensure(out, start + snappy_bound(n) + blocks * 8 + 16) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    var p: usize = put_varint(dst, start, n)
+    let table: u64 = rt.heap_alloc((1 << SNAPPY_HASH_BITS) * 4)
+    if table == 0 {
+        return CompressError::OutOfMemory
+    }
+    var at: usize = 0
+    while at < n {
+        var bend: usize = at + SNAPPY_BLOCK
+        if bend > n {
+            bend = n
+        }
+        if bend - at < 17 {
+            p = emit_literal(dst, p, src, at, bend - at)
+        } else {
+            p = compress_block(src, at, bend, dst, p, table)
+        }
+        at = bend
+    }
+    rt.heap_free(table, (1 << SNAPPY_HASH_BITS) * 4)
+    (*out).len = p
+    return p - start
+}

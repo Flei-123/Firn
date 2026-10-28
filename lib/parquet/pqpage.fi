@@ -1,0 +1,422 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import compress.common
+import parquet.pqsrc
+import parquet.pqthrift
+import parquet.pqstr
+import parquet.pqrle
+import parquet.pqdelta
+import parquet.pqcodec
+import parquet.pqmeta
+
+export { LeafOut, leaf_new, leaf_free, pq_read_leaf }
+
+const PAGE_DATA: i64 = 0
+const PAGE_DICT: i64 = 2
+const PAGE_DATA_V2: i64 = 3
+const ENC_PLAIN: i64 = 0
+const ENC_PLAIN_DICT: i64 = 2
+const ENC_RLE: i64 = 3
+const ENC_DELTA_LENGTH: i64 = 6
+const ENC_DELTA_BYTE_ARRAY: i64 = 7
+const ENC_RLE_DICT: i64 = 8
+
+struct LeafOut {
+    reps: rt.Buf,
+    defs: rt.Buf,
+    vals: pqstr.StrCol,
+    nlev: usize,
+}
+
+fn leaf_new() -> LeafOut {
+    return LeafOut { reps: rt.buf_new(), defs: rt.buf_new(), vals: pqstr.strcol_new(), nlev: 0 }
+}
+
+fn leaf_free(l: *mut LeafOut) {
+    rt.buf_free(&(*l).reps)
+    rt.buf_free(&(*l).defs)
+    pqstr.strcol_free(&(*l).vals)
+    (*l).nlev = 0
+}
+
+struct PageHdr {
+    ptype: i64,
+    usize_: usize,
+    csize: usize,
+    nvals: usize,
+    enc: i64,
+    def_enc: i64,
+    rep_enc: i64,
+    dl_len: usize,
+    rl_len: usize,
+    compressed: bool,
+    hdr_len: usize,
+}
+
+struct Ctx {
+    maxdef: u32,
+    maxrep: u32,
+    ptype: u64,
+    tlen: usize,
+    codec: u64,
+    dict: pqstr.StrCol,
+    have_dict: bool,
+    tmp: rt.Buf,
+    plain: rt.Buf,
+}
+
+fn parse_data_hdr(t: *mut pqthrift.Tr, h: *mut PageHdr, v2: bool) -> bool {
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_I32 {
+            (*h).nvals = pqthrift.tr_zigzag(t) as usize
+        } else if !v2 && last == 2 && ft == pqthrift.T_I32 {
+            (*h).enc = pqthrift.tr_zigzag(t)
+        } else if !v2 && last == 3 && ft == pqthrift.T_I32 {
+            (*h).def_enc = pqthrift.tr_zigzag(t)
+        } else if !v2 && last == 4 && ft == pqthrift.T_I32 {
+            (*h).rep_enc = pqthrift.tr_zigzag(t)
+        } else if v2 && last == 4 && ft == pqthrift.T_I32 {
+            (*h).enc = pqthrift.tr_zigzag(t)
+        } else if v2 && last == 5 && ft == pqthrift.T_I32 {
+            (*h).dl_len = pqthrift.tr_zigzag(t) as usize
+        } else if v2 && last == 6 && ft == pqthrift.T_I32 {
+            (*h).rl_len = pqthrift.tr_zigzag(t) as usize
+        } else if v2 && last == 7 && (ft == pqthrift.T_BOOL_TRUE || ft == pqthrift.T_BOOL_FALSE) {
+            (*h).compressed = ft == pqthrift.T_BOOL_TRUE
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    return pqthrift.tr_ok(t)
+}
+
+fn parse_dict_hdr(t: *mut pqthrift.Tr, h: *mut PageHdr) -> bool {
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_I32 {
+            (*h).nvals = pqthrift.tr_zigzag(t) as usize
+        } else if last == 2 && ft == pqthrift.T_I32 {
+            (*h).enc = pqthrift.tr_zigzag(t)
+        } else {
+            pqthrift.tr_skip(t, ft)
+        }
+    }
+    return pqthrift.tr_ok(t)
+}
+
+fn parse_page_header(p: u64, n: usize, h: *mut PageHdr) -> bool {
+    var t: pqthrift.Tr = pqthrift.tr_new(p, n)
+    (*h).ptype = 0 - 1
+    (*h).compressed = true
+    var last: i64 = 0
+    var ft: u32 = 0
+    while pqthrift.tr_field(&t, &last, &ft) {
+        if last == 1 && ft == pqthrift.T_I32 {
+            (*h).ptype = pqthrift.tr_zigzag(&t)
+        } else if last == 2 && ft == pqthrift.T_I32 {
+            (*h).usize_ = pqthrift.tr_zigzag(&t) as usize
+        } else if last == 3 && ft == pqthrift.T_I32 {
+            (*h).csize = pqthrift.tr_zigzag(&t) as usize
+        } else if last == 5 && ft == pqthrift.T_STRUCT {
+            if !parse_data_hdr(&t, h, false) {
+                return false
+            }
+        } else if last == 7 && ft == pqthrift.T_STRUCT {
+            if !parse_dict_hdr(&t, h) {
+                return false
+            }
+        } else if last == 8 && ft == pqthrift.T_STRUCT {
+            if !parse_data_hdr(&t, h, true) {
+                return false
+            }
+        } else {
+            pqthrift.tr_skip(&t, ft)
+        }
+    }
+    (*h).hdr_len = pqthrift.tr_pos(&t)
+    return pqthrift.tr_ok(&t)
+}
+
+fn plain_byte_array(p: u64, n: usize, count: usize, out: *mut pqstr.StrCol) -> bool {
+    var pos: usize = 0
+    var i: usize = 0
+    while i < count {
+        if n - pos < 4 {
+            return false
+        }
+        let len: usize = common.ld32le(p, pos) as usize
+        pos = pos + 4
+        if len > n - pos {
+            return false
+        }
+        if !pqstr.strcol_push(out, p + pos as u64, len) {
+            return false
+        }
+        pos = pos + len
+        i = i + 1
+    }
+    return true
+}
+
+fn plain_fixed(p: u64, n: usize, count: usize, tlen: usize, out: *mut pqstr.StrCol) -> bool {
+    if tlen == 0 || (n / tlen) < count {
+        return false
+    }
+    var i: usize = 0
+    while i < count {
+        if !pqstr.strcol_push(out, p + (i * tlen) as u64, tlen) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ensure_tmp(ctx: *mut Ctx, words: usize) -> bool {
+    return common.buf_ensure(&(*ctx).tmp, words * 4 + 16)
+}
+
+fn dict_values(ctx: *mut Ctx, p: u64, n: usize, count: usize, out: *mut pqstr.StrCol) -> bool {
+    if !(*ctx).have_dict || n < 1 || !ensure_tmp(ctx, count) {
+        return false
+    }
+    let width: u32 = rt.ld8(p, 0) as u32
+    if !pqrle.rle_read(p + 1, n - 1, width, count, (*ctx).tmp.ptr) {
+        return false
+    }
+    let dn: usize = pqstr.strcol_count(&(*ctx).dict)
+    var i: usize = 0
+    while i < count {
+        let idx: usize = rt.ld32((*ctx).tmp.ptr, i) as usize
+        if idx >= dn {
+            return false
+        }
+        if !pqstr.strcol_push(out, pqstr.strcol_ptr(&(*ctx).dict, idx), pqstr.strcol_len(&(*ctx).dict, idx)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn decode_values(ctx: *mut Ctx, enc: i64, p: u64, n: usize, count: usize, out: *mut pqstr.StrCol) -> bool {
+    if count == 0 {
+        return true
+    }
+    if enc == ENC_PLAIN {
+        if (*ctx).ptype == pqmeta.PT_BYTE_ARRAY {
+            return plain_byte_array(p, n, count, out)
+        }
+        if (*ctx).ptype == pqmeta.PT_FIXED {
+            return plain_fixed(p, n, count, (*ctx).tlen, out)
+        }
+        return false
+    }
+    if enc == ENC_PLAIN_DICT || enc == ENC_RLE_DICT {
+        return dict_values(ctx, p, n, count, out)
+    }
+    if enc == ENC_DELTA_LENGTH && (*ctx).ptype == pqmeta.PT_BYTE_ARRAY {
+        var used: usize = 0
+        return pqdelta.delta_length_read(p, n, count, out, &used)
+    }
+    if enc == ENC_DELTA_BYTE_ARRAY && (*ctx).ptype == pqmeta.PT_BYTE_ARRAY {
+        return pqdelta.delta_byte_array_read(p, n, count, out)
+    }
+    return false
+}
+
+fn append_levels(ctx: *mut Ctx, p: u64, n: usize, maxv: u32, count: usize, dst: *mut rt.Buf) -> bool {
+    if !ensure_tmp(ctx, count) || !common.buf_ensure(dst, (*dst).len + count) {
+        return false
+    }
+    if !pqrle.rle_read(p, n, pqrle.bit_width_for(maxv), count, (*ctx).tmp.ptr) {
+        return false
+    }
+    let base: u64 = (*dst).ptr + (*dst).len as u64
+    var i: usize = 0
+    while i < count {
+        let v: u32 = rt.ld32((*ctx).tmp.ptr, i)
+        if v > maxv {
+            return false
+        }
+        rt.st8(base, i, v as u8)
+        i = i + 1
+    }
+    (*dst).len = (*dst).len + count
+    return true
+}
+
+fn count_defined(defs: *mut rt.Buf, from: usize, maxdef: u32) -> usize {
+    var c: usize = 0
+    var i: usize = from
+    let e: usize = (*defs).len
+    let m: u8 = maxdef as u8
+    while i < e {
+        if rt.ld8((*defs).ptr, i) == m {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn decode_data_page(ctx: *mut Ctx, h: *mut PageHdr, body: u64, bn: usize, out: *mut LeafOut) -> bool {
+    let nv: usize = (*h).nvals
+    if nv > 1073741824 {
+        return false
+    }
+    var off: usize = 0
+    let defs_from: usize = (*out).defs.len
+    var vp: u64 = 0
+    var vn: usize = 0
+    if (*h).ptype == PAGE_DATA {
+        if (*ctx).maxrep > 0 {
+            if (*h).rep_enc != ENC_RLE || bn - off < 4 {
+                return false
+            }
+            let l: usize = common.ld32le(body, off) as usize
+            off = off + 4
+            if l > bn - off || !append_levels(ctx, body + off as u64, l, (*ctx).maxrep, nv, &(*out).reps) {
+                return false
+            }
+            off = off + l
+        }
+        if (*ctx).maxdef > 0 {
+            if (*h).def_enc != ENC_RLE || bn - off < 4 {
+                return false
+            }
+            let l: usize = common.ld32le(body, off) as usize
+            off = off + 4
+            if l > bn - off || !append_levels(ctx, body + off as u64, l, (*ctx).maxdef, nv, &(*out).defs) {
+                return false
+            }
+            off = off + l
+        }
+        vp = body + off as u64
+        vn = bn - off
+    } else {
+        if (*h).rl_len > bn || (*h).dl_len > bn - (*h).rl_len {
+            return false
+        }
+        if (*ctx).maxrep > 0 && !append_levels(ctx, body, (*h).rl_len, (*ctx).maxrep, nv, &(*out).reps) {
+            return false
+        }
+        if (*ctx).maxdef > 0 && !append_levels(ctx, body + (*h).rl_len as u64, (*h).dl_len, (*ctx).maxdef, nv, &(*out).defs) {
+            return false
+        }
+        off = (*h).rl_len + (*h).dl_len
+        vp = body + off as u64
+        vn = bn - off
+    }
+    var nn: usize = nv
+    if (*ctx).maxdef > 0 {
+        nn = count_defined(&(*out).defs, defs_from, (*ctx).maxdef)
+    }
+    if !decode_values(ctx, (*h).enc, vp, vn, nn, &(*out).vals) {
+        return false
+    }
+    (*out).nlev = (*out).nlev + nv
+    return true
+}
+
+fn pq_read_leaf(pq: *mut pqmeta.Pq, rg: usize, leaf: usize, out: *mut LeafOut) -> bool {
+    if rg >= (*pq).nrg || leaf >= (*pq).nleaves {
+        return false
+    }
+    let ss: usize = pqmeta.pq_leaf_schema(pq, leaf)
+    var ctx: Ctx = Ctx { maxdef: pqmeta.sc_get(pq, ss, pqmeta.SC_MAXDEF) as u32, maxrep: pqmeta.sc_get(pq, ss, pqmeta.SC_MAXREP) as u32,
+        ptype: pqmeta.sc_get(pq, ss, pqmeta.SC_PTYPE), tlen: pqmeta.sc_get(pq, ss, pqmeta.SC_TLEN) as usize,
+        codec: pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_CODEC), dict: pqstr.strcol_new(), have_dict: false,
+        tmp: rt.buf_new(), plain: rt.buf_new() }
+    var raw: rt.Buf = rt.buf_new()
+    var ok: bool = pqcodec.codec_supported(ctx.codec) && pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_HAS) == 1
+    let data_off: u64 = pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_DATA_OFF)
+    let dict_off: u64 = pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_DICT_OFF)
+    var start: u64 = data_off
+    if dict_off > 0 && dict_off < data_off {
+        start = dict_off
+    }
+    let size: u64 = pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_COMP)
+    let nvals: usize = pqmeta.ck_get(pq, rg, leaf, pqmeta.CK_NVALS) as usize
+    if ok {
+        ok = size < 4294967296 * 4 && pqsrc.pq_src_read_buf(&(*pq).src, start, size as usize, &raw)
+    }
+    var pos: usize = 0
+    while ok && (*out).nlev < nvals {
+        if pos >= raw.len {
+            ok = false
+            break
+        }
+        var h: PageHdr = PageHdr { ptype: 0, usize_: 0, csize: 0, nvals: 0, enc: 0, def_enc: 0, rep_enc: 0, dl_len: 0, rl_len: 0, compressed: true, hdr_len: 0 }
+        if !parse_page_header(raw.ptr + pos as u64, raw.len - pos, &h) {
+            ok = false
+            break
+        }
+        let body_at: usize = pos + h.hdr_len
+        if h.csize > raw.len - body_at {
+            ok = false
+            break
+        }
+        var bp: u64 = raw.ptr + body_at as u64
+        var bn: usize = h.csize
+        if h.ptype == PAGE_DATA_V2 {
+            let lv: usize = h.rl_len + h.dl_len
+            if lv > h.csize || lv > h.usize_ {
+                ok = false
+                break
+            }
+            if ctx.codec != pqcodec.CODEC_NONE && h.compressed {
+                rt.buf_clear(&ctx.plain)
+                rt.buf_push_bytes(&ctx.plain, bp, lv)
+                var vbuf: rt.Buf = rt.buf_new()
+                if !pqcodec.pq_decompress(ctx.codec, bp + lv as u64, h.csize - lv, h.usize_ - lv, &vbuf) {
+                    ok = false
+                    rt.buf_free(&vbuf)
+                    break
+                }
+                rt.buf_push_bytes(&ctx.plain, vbuf.ptr, vbuf.len)
+                rt.buf_free(&vbuf)
+                bp = ctx.plain.ptr
+                bn = ctx.plain.len
+            } else {
+                bn = h.csize
+            }
+        } else if ctx.codec != pqcodec.CODEC_NONE {
+            if !pqcodec.pq_decompress(ctx.codec, bp, h.csize, h.usize_, &ctx.plain) {
+                ok = false
+                break
+            }
+            bp = ctx.plain.ptr
+            bn = ctx.plain.len
+        }
+        if h.ptype == PAGE_DICT {
+            pqstr.strcol_clear(&ctx.dict)
+            if (h.enc != ENC_PLAIN && h.enc != ENC_PLAIN_DICT) || h.nvals > 1073741824 {
+                ok = false
+                break
+            }
+            if ctx.ptype == pqmeta.PT_BYTE_ARRAY {
+                ok = plain_byte_array(bp, bn, h.nvals, &ctx.dict)
+            } else if ctx.ptype == pqmeta.PT_FIXED {
+                ok = plain_fixed(bp, bn, h.nvals, ctx.tlen, &ctx.dict)
+            } else {
+                ok = false
+            }
+            ctx.have_dict = ok
+        } else if h.ptype == PAGE_DATA || h.ptype == PAGE_DATA_V2 {
+            ok = decode_data_page(&ctx, &h, bp, bn, out)
+        }
+        pos = body_at + h.csize
+    }
+    if ok && (*out).nlev != nvals {
+        ok = false
+    }
+    rt.buf_free(&raw)
+    rt.buf_free(&ctx.tmp)
+    rt.buf_free(&ctx.plain)
+    pqstr.strcol_free(&ctx.dict)
+    return ok
+}

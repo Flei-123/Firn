@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import parquet.pqthrift
+import parquet.pqstr
+import parquet.pqrle
+
+export { delta_read_ints, delta_length_read, delta_byte_array_read }
+
+fn delta_read_ints(src: u64, n: usize, max_count: usize, out: *mut rt.Buf, consumed: *mut usize) -> bool {
+    var t: pqthrift.Tr = pqthrift.tr_new(src, n)
+    let block_size: u64 = pqthrift.tr_varint(&t)
+    let minis: u64 = pqthrift.tr_varint(&t)
+    let total: u64 = pqthrift.tr_varint(&t)
+    var prev: i64 = pqthrift.tr_zigzag(&t)
+    if !pqthrift.tr_ok(&t) || minis == 0 || block_size == 0 || block_size % minis != 0 {
+        return false
+    }
+    let per_mini: u64 = block_size / minis
+    if per_mini % 8 != 0 || total > max_count as u64 {
+        return false
+    }
+    if total == 0 {
+        *consumed = pqthrift.tr_pos(&t)
+        return true
+    }
+    pqstr.push_u64(out, prev as u64)
+    var produced: u64 = 1
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&tmp, (per_mini as usize) * 4 + 16)
+    if tmp.cap < (per_mini as usize) * 4 + 16 {
+        return false
+    }
+    var pos: usize = pqthrift.tr_pos(&t)
+    while produced < total {
+        t.pos = pos
+        let min_delta: i64 = pqthrift.tr_zigzag(&t)
+        if !pqthrift.tr_ok(&t) || n - t.pos < minis as usize {
+            rt.buf_free(&tmp)
+            return false
+        }
+        let widths: usize = t.pos
+        pos = t.pos + minis as usize
+        var m: u64 = 0
+        while m < minis && produced < total {
+            let w: u32 = rt.ld8(src, widths + m as usize) as u32
+            let nbytes: u64 = per_mini * w as u64 / 8
+            if w > 32 || nbytes > (n - pos) as u64 {
+                rt.buf_free(&tmp)
+                return false
+            }
+            if !pqrle.unpack_bits(src + pos as u64, nbytes as usize, per_mini as usize, w, tmp.ptr, 0) {
+                rt.buf_free(&tmp)
+                return false
+            }
+            pos = pos + nbytes as usize
+            var k: u64 = 0
+            while k < per_mini && produced < total {
+                prev = prev +% min_delta +% (rt.ld32(tmp.ptr, k as usize) as i64)
+                pqstr.push_u64(out, prev as u64)
+                produced = produced + 1
+                k = k + 1
+            }
+            m = m + 1
+        }
+    }
+    rt.buf_free(&tmp)
+    *consumed = pos
+    return true
+}
+
+fn delta_length_read(src: u64, n: usize, count: usize, out: *mut pqstr.StrCol, consumed: *mut usize) -> bool {
+    var lens: rt.Buf = rt.buf_new()
+    var used: usize = 0
+    if !delta_read_ints(src, n, count, &lens, &used) {
+        rt.buf_free(&lens)
+        return false
+    }
+    if lens.len / 8 != count {
+        rt.buf_free(&lens)
+        return false
+    }
+    var pos: usize = used
+    var i: usize = 0
+    while i < count {
+        let l: i64 = pqstr.ld_u64(&lens, i) as i64
+        if l < 0 || l as u64 > (n - pos) as u64 {
+            rt.buf_free(&lens)
+            return false
+        }
+        if !pqstr.strcol_push(out, src + pos as u64, l as usize) {
+            rt.buf_free(&lens)
+            return false
+        }
+        pos = pos + l as usize
+        i = i + 1
+    }
+    rt.buf_free(&lens)
+    *consumed = pos
+    return true
+}
+
+fn delta_byte_array_read(src: u64, n: usize, count: usize, out: *mut pqstr.StrCol) -> bool {
+    var prefixes: rt.Buf = rt.buf_new()
+    var used: usize = 0
+    if !delta_read_ints(src, n, count, &prefixes, &used) || prefixes.len / 8 != count {
+        rt.buf_free(&prefixes)
+        return false
+    }
+    var suffixes: pqstr.StrCol = pqstr.strcol_new()
+    var used2: usize = 0
+    if !delta_length_read(src + used as u64, n - used, count, &suffixes, &used2) {
+        rt.buf_free(&prefixes)
+        pqstr.strcol_free(&suffixes)
+        return false
+    }
+    var cur: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    var i: usize = 0
+    while i < count && ok {
+        let pl: i64 = pqstr.ld_u64(&prefixes, i) as i64
+        if pl < 0 || pl as usize > cur.len {
+            ok = false
+        } else {
+            cur.len = pl as usize
+            let sl: usize = pqstr.strcol_len(&suffixes, i)
+            if sl > 0 {
+                rt.buf_push_bytes(&cur, pqstr.strcol_ptr(&suffixes, i), sl)
+            }
+            ok = pqstr.strcol_push(out, cur.ptr, cur.len)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&cur)
+    rt.buf_free(&prefixes)
+    pqstr.strcol_free(&suffixes)
+    return ok
+}
