@@ -47,3 +47,30 @@ Measured (release firnc, `--opt-level=release-safe`, busy host, `bash tools/cach
 `bash tools/cache/run_wasm.sh`: 48 checks for the wasm cache (hit/miss, byte identity against `--no-cache`, run under node, flag/opt-level/target/env changes, other compiler binary, include file and `__env_or` changes, damaged entry, failed build, parallel builds, cap 0, resolve manifest incl. shadowing file).
 
 (firnc0 on kmain.fi: cold 13.8 s, text hit 4.2 s, object hit 0.6 s on a busy host).
+
+## Function cache (design, not implemented yet)
+
+Today one changed file is a full rebuild. Measured baseline (OrientOS pin 5e447fc8, `kernel/kmain.fi`, firnc0 `--opt-level=release-safe --no-cache --timings`, host load about 28, object sha db5c81e34e2a): total 51.3 s = optimizer 35.7 s (69.7 %), `as` 9.0 s (17.6 %), codegen 3.3 s (6.4 %), sema 1.7 s, lower 0.6 s, lex+parse 0.6 s, mono 0.3 s. `FIRN_STAGE_TIMINGS=1` splits the optimizer: first batch 3.75 s, inline 1.09 s, batch after inline 25.9 s (5800 of 7918 functions re-optimized, 5545 inline-changed), inline again + batch 4.3 s, promote 0.3 s, late passes 0.4 s. So the optimizer comes first, codegen second (in Certus browser codegen is the larger share), `as` stays whole-program until the direct-object path lands.
+
+### Layer 1: memo of `opt::optimize_func`
+
+`optimize_func` is the single entry of every batch (`optimize_batch`, `optimize_map`, the promote closure; parfn workers call it too). `parfn.rs` documents it as a pure per-function transformation. Its inputs: the `Func`, `OptConfig`, `target::State`, the immutable-static size map (`statics::rodata_sizes`, read by `licm`), `rangecheck::LEN_GETTERS`, `gtaken::TAKEN` (read by `loadcse`), `ivsr::TOUCHED.contains(name)`, `FIRN_*` environment. Its outputs besides the mutated `Func`: the `OptStats` delta, the `UNSETTLED` push (`opt.rs`) and the `ivsr::TOUCHED` insert; both flags must be stored and replayed.
+
+- Key: `keyhash` 128 bit over context digest (compiler binary, command line without `-o`, `FIRN*` environment, `OptConfig`, target state, sorted digests of LEN_GETTERS, gtaken set and rodata sizes) + structural hash of the input `Func` + the TOUCHED bit.
+- Structural hash: `#[derive(Hash)]` on the FIR types (`Op` holds no float, only bit patterns; `secret` and `no_coalesce` are hashed sorted), fed into a `Hasher` built on `keyhash.rs`. A field added later is hashed automatically, so the key cannot go stale.
+- Storage: `fir_codec.rs` with `encode(&Func)` / `decode(&[u8])` (no crates available; exhaustive `match` over `Op` and `Term` without wildcard, so a new variant fails to compile until handled). Entry `fn/o/<key>.fo`: magic, length, 64-bit checksum, flags, stats, payload; temp file + rename; pruned with the same size cap as `objects/`.
+- Why this is exact without a dependency graph: when callee G changes, only the callers that inlined G get a different post-inline `Func`, so only their keys miss; every other function hits, in the first batch and in the batches after inlining. The module level phases (inline, inline_once, guardsplit, promote summary) stay uncached; they cost 1-2 s.
+- Later refinement: restrict the gtaken / rodata / len-getter digests to the names a function references, so an unrelated global change does not invalidate everything.
+
+### Layer 2: memo of the code generator per function
+
+Hook: `codegen_x86::emit`, the loop around `emit_func` after `chosen` (recursive-caller frame budget) is selected; `codegen_a64::emit` the same way. Key = context digest + structural hash of the chosen `Func` after `phi::eliminate`. Value = the function text (hot and cold half) + a journal of the global effects of the emission:
+
+- `fpool::intern` (labels `.Lfconst<N>` are global pool indices) and `panic_rt` message labels (`.Lpanicmsg<N>`): store placeholders for the journal ordinal, replay the interns in call order on a hit, substitute the new labels; `panic_rt::note_index_site` is replayed.
+- Reads that must be re-validated on a hit: `label(name)` of every callee (`extfn` extern / export names), `statics::label_of`, `iface::table_label`, `fnval::record_label`, `gc::runtime_active`, `stackguard::enabled`, `dwarf::fn_line`.
+- Anything else that touches a global during emission marks the function uncacheable (thread-local taint). Not cached: `dwarf::with_variables()`, Windows (`win::note`).
+- `.loc` carries absolute line numbers (they are part of the hash), so inserting a line shifts all functions below it in that file; storing lines relative to `dwarf::fn_line` would avoid that.
+
+### Switches and proof
+
+`--no-cache`, `FIRN_NO_CACHE`, `FIRN_CACHE_DIR`, `FIRN_CACHE_MAX_MB` stay valid. New: `FIRN_FNCACHE=0` switches both layers off, `FIRN_FNCACHE_VERIFY=1` recomputes on every hit and aborts on any difference (run it over the whole `tests/` corpus after priming the cache with a perturbed variant), `FIRN_CACHE_LOG=1` prints `cache: fn opt hit=<n> miss=<m> store=<k>` and the same for `cg`. Proof script `tools/cache/run_fn.sh`: cold, one-line change, warm; bytes identical to `--no-cache` (exe, asm, object); counters.
