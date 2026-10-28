@@ -90,6 +90,8 @@ import mc.mc_model_mesh
 import mc.mc_model_pick
 import mc.mc_stream
 import mc.mc_lod_policy
+import mc.mc_dig_progress
+import mc.mc_view_sync
 import mc.mc_perf
 import mc.mc_prof
 import mc.mc_frame_split
@@ -111,6 +113,7 @@ import mc.mc_shapes
 import mc.mc_hud
 import mc.mc_hud_text
 import mc.mc_pause
+import mc.mc_focus
 import mc.mc_opts
 import mc.mc_blockset
 import mc.mc_play
@@ -183,6 +186,7 @@ import mc.mc_snd_use
 import mc.mc_entity
 import mc.mc_entity_draw
 import mc.mc_player_draw
+import mc.mc_inv_player
 import mc.mc_skin_fetch
 import mc.mc_pskin
 import mc.v763.mc_snd_v763
@@ -426,6 +430,7 @@ struct Ctx {
     last_tp: u64,
     tp_quiet_until: u64, // ms: no position packet before this (r197: the server needs a tick between Teleport Confirm and the next move)
     grab: bool,
+    focus_lost: bool,
     closed: bool,
     resized: bool,
     fullscreen: bool,
@@ -449,6 +454,9 @@ struct Ctx {
     dig_z: i32,
     dig_t0: u64,
     dig_ms: u64,
+    dp: mc_dig_progress.DigProgress,
+    vsync: mc_view_sync.ViewSync,
+    dig_state: i32,
     crk: mc_crack.CrackTex,
     crk_tried: bool,
     crk_on: bool,
@@ -487,6 +495,9 @@ struct Ctx {
     handl: mc_entity_draw.EntList,
     pdraw: mc_player_draw.PlayerDraw,
     pdraw_on: bool,
+    ipl: mc_inv_player.InvPlayer,
+    ipl_on: bool,
+    ipl_freeze: bool,
     hand_on: bool,
     ent_t: u64, // ns of the last interpolation step
     ent_peak: usize, // most entities tracked at once
@@ -629,8 +640,7 @@ struct Ctx {
 
 // Chunks the server is asked for: the LOD radius when LOD is on, else the view distance.
 fn wire_view(c: *mut Ctx) -> i32 {
-    if (*c).lod > (*c).view { return (*c).lod }
-    return (*c).view
+    return mc_view_sync.vs_wire((*c).view, (*c).lod)
 }
 
 // Fog / far plane distance in chunks.
@@ -1138,11 +1148,24 @@ fn net_drain(c: *mut Ctx, limit: i32) -> bool {
 
 fn grab_mouse(c: *mut Ctx, on: bool) {
     if on {
-        window.cursor_mode((*c).wp, window.CURSOR_CAPTURED)
+        (*c).grab = window.cursor_mode((*c).wp, window.CURSOR_CAPTURED)
+        if !(*c).grab { say(f"mcplay: mouse grab refused\n") }
     } else {
         window.cursor_mode((*c).wp, window.CURSOR_NORMAL)
+        (*c).grab = false
     }
-    (*c).grab = on
+}
+
+fn focus_loss_apply(c: *mut Ctx) {
+    if !(*c).focus_lost { return }
+    (*c).focus_lost = false
+    say(f"mcplay: window focus lost grab={(*c).grab} pause_active={mc_pause.pause_active()}\n")
+    let plan: u32 = mc_focus.focus_loss_plan((*c).grab, mc_pause.pause_active(), mc_pause.pause_ready((*c).protocol), (*c).chat.open, (*c).show_inv, (*c).health.dead)
+    if (plan & mc_focus.FL_RELEASE) != 0 as u32 { grab_mouse(c, false) }
+    if (plan & mc_focus.FL_PAUSE) != 0 as u32 {
+        mc_pause.pause_bind_keys(&(*c).kb)
+        mc_pause.pause_open()
+    }
 }
 
 // Own event pump (raw.raw_pump drops EV_CONFIGURE / EV_CLOSED): keys + mouse go to raw_feed, resize / close are noted, the captured
@@ -1157,6 +1180,9 @@ fn pump(c: *mut Ctx) {
             mc_chat_ui.chat_ui_char(&(*c).chat, &(*c).chat_ui, window.ev_a((*c).wp), chat_allowed(c))
             anvil_char(c, window.ev_a((*c).wp))
             if cr_active(c) { mc_creative.cr_query_push(&(*c).cr, &(*c).reg, window.ev_a((*c).wp)) }
+        }
+        if k == window.EV_FOCUS && window.ev_a((*c).wp) == 0 as u32 {
+            (*c).focus_lost = true
         }
         if k == window.EV_CONFIGURE {
             (*c).resized = true
@@ -1314,6 +1340,7 @@ fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
 
 // Window events that change state: resize, fullscreen, mouse capture, quit key.
 fn handle_window(c: *mut Ctx) {
+    focus_loss_apply(c)
     if (*c).resized {
         (*c).resized = false
         let nw: i32 = window.width((*c).wp) as i32
@@ -1516,6 +1543,9 @@ fn do_tick(c: *mut Ctx) {
     (*c).acc_dy = 0.0
     (*c).want_fly = false
     (*c).want_noclip = false
+    (*c).pl.jump_boost = mc_effect.fx_jump(&(*c).fx)
+    (*c).pl.can_sprint = (*c).health.food > 6 || (*c).creative
+    (*c).pl.using_item = (*c).combat.using_item
     if !awaiting_loaded(c) { mc_input.player_tick(&(*c).pl, &ev, &(*c).world, &(*c).itb, (*c).dim.min_y) }
     // Player Loaded once the first chunks are in (1.21.4+): the server ignores sneak packets before that
     if (*c).have_pos && !(*c).loaded_sent && ((*c).n_chunks >= (*c).loaded_base + 9 as u64 || ((*c).loaded_since != 0 as u64 && now_ms() >= (*c).loaded_since + 3000 as u64)) {
@@ -1726,6 +1756,27 @@ fn apply_opts(c: *mut Ctx, start: bool) {
     if (*c).gl { glwindow.swap_interval(&(*c).gw, (*o).vsync) }
 }
 
+fn apply_view(c: *mut Ctx, requested: i32) {
+    let plan: mc_lod_policy.LodPlan = mc_lod_policy.lod_plan(requested, env_int("MCPLAY_LOD", mc_lod_policy.LOD_UNSET))
+    (*c).view = plan.view
+    (*c).lod = plan.lod
+    (*c).g.wr.dist = plan.view
+    mc_camera.camera_set_lens(&(*c).cam, (*c).cam.fov, (*c).cam.near, ((wire_view(c) as f64) + 2.0) * 16.0 * 1.5)
+    if (*c).join {
+        stream_make(c)
+        mc_client.client_send_settings(&(*c).cl, wire_view(c))
+    }
+    (*mc_pause.pause_opts()).view_actual = requested
+    mc_frame_split.fs_set(mc_frame_split.FS_VIEW, requested as u64)
+    mc_pause.pause_persist()
+    say(f"mcplay: view applied requested={requested} view={plan.view} lod={plan.lod} wire={wire_view(c)} cols={mc_world.world_count(&(*c).world)}\n")
+}
+
+fn view_poll(c: *mut Ctx, dragging: bool) {
+    let v: i32 = mc_view_sync.vs_poll(&(*c).vsync, (*mc_pause.pause_opts()).view, dragging)
+    if v > 0 { apply_view(c, v) }
+}
+
 fn pause_tick(c: *mut Ctx, r: *mut mc_raster.Raster) {
     mc_pause.pause_set_capture(mc_keybinds.kb_capture(&(*c).rw))
     let a: i32 = mc_pause.pause_frame(r, raw.mouse_x(&(*c).rw) as i32, raw.mouse_y(&(*c).rw) as i32, raw.mouse_pressed(&(*c).rw, raw.MB_LEFT), raw.mouse_down(&(*c).rw, raw.MB_LEFT), raw.wheel_y(&(*c).rw) as i32, now_ms(), raw.key_pressed(&(*c).rw, raw.KEY_ESC))
@@ -1779,7 +1830,7 @@ fn draw_cracks(c: *mut Ctx, r: *mut mc_raster.Raster) {
     if !mc_crack.crack_tex_ok(&(*c).crk) { return }
     let now: u64 = now_ms()
     if (*c).digging {
-        let st: i32 = mc_crack.crack_stage(now - (*c).dig_t0, (*c).dig_ms)
+        let st: i32 = mc_dig_progress.dp_stage(&(*c).dp)
         var b: mc_crack.CrackBox = mc_crack_view.crackv_unit_box((*c).dig_x, (*c).dig_y, (*c).dig_z)
         if (*c).hit && (*c).pk.x == (*c).dig_x && (*c).pk.y == (*c).dig_y && (*c).pk.z == (*c).dig_z && (*c).models_on {
             var mb: mc_model_pick.MpBox = sel_box(c)
@@ -1819,12 +1870,22 @@ fn draw_item_tooltip(c: *mut Ctx, r: *mut mc_raster.Raster, mx: i32, my: i32, s:
     mc_inv_tooltip.tip_draw_item(r, mx, my, s, rp, rn, p, n, (*c).cl.ver.protocol, ep, en)
 }
 
+fn draw_inv_player(c: *mut Ctx, v: *mut mc_inv_player.InvView, r: *mut mc_raster.Raster, s: i32, px: i32, py: i32) {
+    if !(*c).ipl_on { return }
+    mc_inv_player.ip_ensure_default(&(*c).ipl, 0 as u64, 0 as u64)
+    var t: f64 = 0.0
+    if !(*c).ipl_freeze { t = (now_ms() as f64) * 0.001 }
+    mc_inv_player.ip_draw(&(*c).ipl, r, v, s, px, py, raw.mouse_x(&(*c).rw) as i32, raw.mouse_y(&(*c).rw) as i32, t)
+}
+
 fn draw_player_panel(c: *mut Ctx, r: *mut mc_raster.Raster, s: i32) {
     let px: i32 = player_px(c, s)
     let py: i32 = player_py(c, s)
     let mx: i32 = raw.mouse_x(&(*c).rw) as i32
     let my: i32 = raw.mouse_y(&(*c).rw) as i32
     mc_inv_ui.iui_draw_bg(&(*c).iui, r, px, py, s)
+    var pv: mc_inv_player.InvView = mc_inv_player.view_inventory()
+    draw_inv_player(c, &pv, r, s, px, py)
     let hover: i32 = mc_inv_ui.iui_slot_at(px, py, s, mx, my)
     var ws: i32 = 0
     while ws < 46 {
@@ -1917,8 +1978,8 @@ fn draw_inventory_body(c: *mut Ctx, r: *mut mc_raster.Raster) {
         k = k + 1
     }
     if (*c).digging && (*c).dig_total > 0 {
-        var done: i32 = ((now_ms() - (*c).dig_t0) / 50 as u64) as i32
-        if done > (*c).dig_total { done = (*c).dig_total }
+        let frac: f64 = mc_dig_progress.dp_fraction(&(*c).dp)
+        let done: i32 = (frac * ((*c).dig_total as f64)) as i32
         let w: i32 = 40 * s
         let x0: i32 = ((*r).w - w) / 2
         let y0: i32 = (*r).h / 2 + 12 * s
@@ -2016,6 +2077,17 @@ fn break_local(c: *mut Ctx, x: i32, y: i32, z: i32) {
 
 // Break time in ms of the block state `state` with the item in hand (mc_dig): -1 unbreakable, 0 instant. Without a dig table for this
 // protocol (mc_dig_sel: 1.16.5 .. 1.20.2 and 1.21.1 .. 26.1 are generated) the fixed MCPLAY_DIG_MS is used.
+fn dig_damage_now(c: *mut Ctx, state: i32) -> f64 {
+    let fixed: f64 = (mc_dig_progress.TICK_MS as f64) / ((*c).dig_ms as f64)
+    if !mc_dig.dig_ok(&(*c).dg) { return fixed }
+    let blk: i32 = mc_registry.reg_block_of_state(&(*c).reg, state)
+    if blk < 0 { return fixed }
+    let item: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
+    let hard: i32 = mc_registry.reg_block_hardness_milli(&(*c).reg, blk)
+    let eff: i32 = mc_inv.inv_held_eff(&(*c).inv, (*c).pl.slot)
+    return mc_dig.dig_damage_fx(&(*c).dg, blk, hard, item, eff, mc_effect.fx_haste(&(*c).fx), mc_effect.fx_fatigue(&(*c).fx), (*c).pl.on_ground, mc_hud_play.hp_under_water(&(*c).hudp))
+}
+
 fn dig_time_ms(c: *mut Ctx, state: i32) -> i32 {
     if !mc_dig.dig_ok(&(*c).dg) { return env_int("MCPLAY_DIG_MS", 700) }
     let blk: i32 = mc_registry.reg_block_of_state(&(*c).reg, state)
@@ -2023,9 +2095,9 @@ fn dig_time_ms(c: *mut Ctx, state: i32) -> i32 {
     let item: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
     let hard: i32 = mc_registry.reg_block_hardness_milli(&(*c).reg, blk)
     let eff: i32 = mc_inv.inv_held_eff(&(*c).inv, (*c).pl.slot)
-    let t: i32 = mc_dig.dig_ticks_fx(&(*c).dg, blk, hard, item, eff, mc_effect.fx_haste(&(*c).fx), mc_effect.fx_fatigue(&(*c).fx), (*c).pl.on_ground, false)
+    let t: i32 = mc_dig.dig_ticks_fx(&(*c).dg, blk, hard, item, eff, mc_effect.fx_haste(&(*c).fx), mc_effect.fx_fatigue(&(*c).fx), (*c).pl.on_ground, mc_hud_play.hp_under_water(&(*c).hudp))
     (*c).fx_ticks = t
-    (*c).fx_plain = mc_dig.dig_ticks(&(*c).dg, blk, hard, item, 0, (*c).pl.on_ground, false)
+    (*c).fx_plain = mc_dig.dig_ticks(&(*c).dg, blk, hard, item, 0, (*c).pl.on_ground, mc_hud_play.hp_under_water(&(*c).hudp))
     if t <= 0 { return t }
     (*c).dig_total = t
     return t * 50
@@ -2626,6 +2698,10 @@ fn draw_creative(c: *mut Ctx, r: *mut mc_raster.Raster, s: i32) {
     let my: i32 = raw.mouse_y(&(*c).rw) as i32
     let tab: i32 = mc_creative.cr_tab(cr)
     mc_creative_ui.crui_draw(r, &(*c).crui, cr, px, py, s)
+    if tab == mc_creative_rules.TAB_INVENTORY {
+        var cv: mc_inv_player.InvView = mc_inv_player.view_creative()
+        draw_inv_player(c, &cv, r, s, px, py)
+    }
     log_creative_cells(c, px, py, s)
     let hit: i32 = mc_creative_ui.crui_hit(cr, px, py, s, mx, my)
     var t: i32 = 0
@@ -3393,7 +3469,7 @@ fn handle_mouse(c: *mut Ctx) {
     let rp: bool = mc_keybinds.kb_pressed(&(*c).kb, &(*c).rw, mc_keybinds.KB_USE)
     let rdown: bool = mc_keybinds.kb_down(&(*c).kb, &(*c).rw, mc_keybinds.KB_USE)
     if !(*c).grab {
-        if lp { grab_mouse(c, true) }
+        if lp && mc_focus.may_grab(raw.has_focus(&(*c).rw), mc_pause.pause_active(), (*c).chat.open, (*c).show_inv, (*c).health.dead) { grab_mouse(c, true) }
         return
     }
     if !(*c).have_pos { return }
@@ -3423,6 +3499,8 @@ fn handle_mouse(c: *mut Ctx) {
             (*c).dig_y = (*c).pk.y
             (*c).dig_z = (*c).pk.z
             (*c).dig_t0 = now_ms()
+            (*c).dig_state = (*c).pk.id
+            mc_dig_progress.dp_start(&(*c).dp, (*c).dig_t0)
             mc_snd_events.sev_dig_reset(&(*c).sev)
         }
     }
@@ -3430,17 +3508,24 @@ fn handle_mouse(c: *mut Ctx) {
         if (*c).aud {
             mc_snd_events.sev_dig_tick((*c).ma, &(*c).sev, &(*c).reg, (*c).pk.id, (*c).dig_x, (*c).dig_y, (*c).dig_z, now_ms() - (*c).dig_t0)
         }
+        let tick_now: u64 = now_ms()
+        while mc_dig_progress.dp_owed(&(*c).dp, tick_now) > 0 && !mc_dig_progress.dp_done(&(*c).dp) {
+            mc_dig_progress.dp_tick(&(*c).dp, dig_damage_now(c, (*c).dig_state))
+        }
         let same: bool = (*c).hit && (*c).pk.x == (*c).dig_x && (*c).pk.y == (*c).dig_y && (*c).pk.z == (*c).dig_z
         let face2: i32 = pick_face(c)
         if !lmb || !same {
             (*c).seq = (*c).seq + 1
             mc_play.send_dig(cl, mc_play.DIG_CANCEL, (*c).dig_x, (*c).dig_y, (*c).dig_z, face2, (*c).seq)
             (*c).digging = false
-        } else if now_ms() - (*c).dig_t0 >= (*c).dig_ms {
+            mc_dig_progress.dp_stop(&(*c).dp)
+        } else if mc_dig_progress.dp_done(&(*c).dp) {
+            if env_flag("MCPLAY_DIG_LOG", false) { say(f"mcplay: dig finished ticks={(*c).dp.ticks} planned={(*c).dig_total} ground={(*c).pl.on_ground}\n") }
             (*c).seq = (*c).seq + 1
             mc_play.send_dig(cl, mc_play.DIG_FINISH, (*c).dig_x, (*c).dig_y, (*c).dig_z, face2, (*c).seq)
             break_local(c, (*c).dig_x, (*c).dig_y, (*c).dig_z)
             (*c).digging = false
+            mc_dig_progress.dp_stop(&(*c).dp)
         }
     }
     let rfire: bool = rp || use_hold_due(c, rdown, now)
@@ -4431,6 +4516,7 @@ fn session_free(c: *mut Ctx) {
     mc_entity_draw.entlist_free(&(*c).entl)
     mc_entity_draw.entlist_free(&(*c).handl)
     mc_player_draw.pd_free(&(*c).pdraw)
+    mc_inv_player.ip_free(&(*c).ipl)
     mc_entity.store_free(&(*c).ents)
     mc_world.world_free(&(*c).world)
     mc_chunk.scratch_free(&(*c).sc)
@@ -4477,6 +4563,10 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     if (*ln).view > 0 { view_def = (*ln).view }
     var proto_def: i32 = 763
     if (*ln).proto > 0 { proto_def = (*ln).proto }
+    if !env.has("MCPLAY_VIEW") && mc_pause.pause_wanted() {
+        let saved_view: i32 = mc_pause.pause_saved_view()
+        if saved_view > 0 { view_def = saved_view }
+    }
     let view_req: i32 = env_int("MCPLAY_VIEW", view_def)
     let proto: i32 = env_int("MCPLAY_PROTOCOL", proto_def)
     let w0: i32 = env_int("MCPLAY_W", 854)
@@ -4551,16 +4641,16 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, models_on: models_on, ms: mc_model_mesh.ms_blank(), stm_live: true, lod: lod_n, pool: jobs.Jobs { blk: 0 }, win_cx: 1000000, win_cz: 1000000, win_n: 0 as u32, n_win: 0 as u64, t_stream: 0 as u64, max_stream: 0 as u64,
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
-        join: false, have_pos: false, last_tp: 0, tp_quiet_until: 0 as u64, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
+        join: false, have_pos: false, last_tp: 0, tp_quiet_until: 0 as u64, grab: false, focus_lost: false, closed: false, resized: false, fullscreen: false, hit: false,
         creative: env_flag("MCPLAY_CREATIVE", true), creative_fixed: env.has("MCPLAY_CREATIVE"),
         acc_dx: 0.0, acc_dy: 0.0, tot_dx: 0.0, tot_dy: 0.0, n_f11: 0, want_fly: false, want_noclip: false, sent_slot: 0 - 1,
-        digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, crk: mc_crack.crack_tex_new(), crk_tried: false, crk_on: env_flag("MCPLAY_CRACK", true), cra: mc_crack_anim.crack_anims_new(), crk_own: 0 as u64, bot: mc_dig_bot.digbot_new(env.has("MCPLAY_BOT_DIG_Y"), env_int("MCPLAY_BOT_DIG_X", 0), env_int("MCPLAY_BOT_DIG_Y", 0), env_int("MCPLAY_BOT_DIG_Z", 0), env_int("MCPLAY_BOT_DIG_MS", 3000) as u64), bot_go: env_str("MCPLAY_BOT_GO_FILE", ""), crk_other: 0 as u64, seq: 0,
+        digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, dp: mc_dig_progress.dp_new(), vsync: mc_view_sync.vs_new(view_req, env.has("MCPLAY_VIEW")), dig_state: 0, crk: mc_crack.crack_tex_new(), crk_tried: false, crk_on: env_flag("MCPLAY_CRACK", true), cra: mc_crack_anim.crack_anims_new(), crk_own: 0 as u64, bot: mc_dig_bot.digbot_new(env.has("MCPLAY_BOT_DIG_Y"), env_int("MCPLAY_BOT_DIG_X", 0), env_int("MCPLAY_BOT_DIG_Y", 0), env_int("MCPLAY_BOT_DIG_Z", 0), env_int("MCPLAY_BOT_DIG_MS", 3000) as u64), bot_go: env_str("MCPLAY_BOT_GO_FILE", ""), crk_other: 0 as u64, seq: 0,
         place_id: env_int("MCPLAY_PLACE_ID", 0), ticks_day: env_int("MCPLAY_TICKS", 2000),
         light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, n_region_moves: 0 as u64, day_time: 0, day_fixed: false, n_time: 0,
         aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
         eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
         cam3_mode: env_int("MCPLAY_CAM3P", 0), cam3: mc_camera3p.cam3p_new(),
-        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), handl: mc_entity_draw.entlist_new(), pdraw: mc_player_draw.pd_new(), pdraw_on: env_flag("MCPLAY_PLAYER_MODEL", true), hand_on: env_flag("MCPLAY_HAND", true), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
+        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), handl: mc_entity_draw.entlist_new(), pdraw: mc_player_draw.pd_new(), pdraw_on: env_flag("MCPLAY_PLAYER_MODEL", true), ipl: mc_inv_player.ip_new(), ipl_on: env_flag("MCPLAY_INV_PLAYER", true), ipl_freeze: env_flag("MCPLAY_INV_PLAYER_FREEZE", false), hand_on: env_flag("MCPLAY_HAND", true), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
         ent_frames: 0 as u64, ent_moving: 0 as u64, ent_resets: 0 as u64,
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, sev: mc_snd_events.sev_new(), su: mc_snd_use.su_new(), n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
@@ -4603,6 +4693,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     }
     mc_camera.camera_set_lens(&c.cam, 70.0, 0.05, (wire_view(&c) as f64 + 2.0) * 16.0 * 1.5)
     if mc_pause.pause_wanted() && mc_pause.pause_init_from_cfg() { apply_opts(&c, true) }
+    if mc_pause.pause_wanted() { (*mc_pause.pause_opts()).view_actual = view_req }
     c.sky.approx = !env_flag("MCPLAY_SKY_EXACT", false) // approximate glow + gradient (<= 1 level, ~2.5x faster at sunset)
     mc_sky.sky_set_time(&c.sky, c.ticks_day as i64, 0)
     mc_render_world.wr_set_flags(&c.g.wr, mc_mesh.F_GREEDY | mc_opts.opts_look_flags(mc_pause.pause_opts()))
@@ -4654,6 +4745,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
             var own_skin: mc_pskin.Skin = mc_pskin.skin_new()
             if mc_skin_fetch.skin_fetch(rt.buf_str(&hex), &own_skin) {
                 mc_player_draw.pd_set_self_skin(&c.pdraw, &own_skin)
+                mc_inv_player.ip_set_skin(&c.ipl, &own_skin)
                 say(f"mcplay: own skin loaded\n")
             } else {
                 say(f"mcplay: own skin download failed, default skin\n")
@@ -4760,6 +4852,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         var pl: u64 = f0
         pump(&c)
         handle_window(&c)
+        view_poll(&c, raw.mouse_down(&c.rw, raw.MB_LEFT))
         pl = mc_prof.prof_lap(mc_prof.PH_PUMP, pl)
         alive = net_drain(&c, 400)
         pl = mc_prof.prof_lap(mc_prof.PH_DRAIN, pl)
@@ -4771,6 +4864,11 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         pl = mc_prof.prof_lap(mc_prof.PH_WTICK, pl)
         handle_hotbar(&c)
         pl = mc_prof.prof_lap(mc_prof.PH_HOTBAR, pl)
+        if c.have_pos && (c.acc_dx != 0.0 || c.acc_dy != 0.0) {
+            mc_input.player_look(&c.pl, c.acc_dx, c.acc_dy)
+            c.acc_dx = 0.0
+            c.acc_dy = 0.0
+        }
         let nowm: u64 = now_ms()
         var nt: i32 = 0
         while nowm >= t_tick + TICK_MS && nt < 5 {
@@ -4786,13 +4884,14 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         let fs_t1: u64 = now_ns()
         if prog_on && c.n_ticks >= last_prog + 10 as u64 {
             last_prog = c.n_ticks
-            say(f"mcplay: progress ticks={c.n_ticks} pos={c.have_pos} chunks={c.n_chunks} ground={c.pl.on_ground} y_mm={(c.pl.y * 1000.0) as i64} walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps}\n")
+            say(f"mcplay: progress ticks={c.n_ticks} pos={c.have_pos} chunks={c.n_chunks} fsview={mc_frame_split.fs_get(mc_frame_split.FS_VIEW)} cols={mc_world.world_count(&c.world)} ssec={mc_stream.stream_sections(&c.stm)} view={c.view} lod={c.lod} ground={c.pl.on_ground} y_mm={(c.pl.y * 1000.0) as i64} walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps}\n")
         }
         if quit_file.length() > 0 && c.n_frames % 5 as u64 == 0 as u64 && fs.exists(quit_file) { c.closed = true }
         dig_bot_tick(&c)
         if spin_step != 0.0 { c.pl.yaw = c.pl.yaw + spin_step }
         if c.have_pos {
-            mc_input.player_set_camera(&c.pl, &c.cam)
+            let pt: f64 = (now_ms() - t_tick) as f64 / (TICK_MS as f64)
+            mc_input.player_set_camera_lerp(&c.pl, &c.cam, pt)
             if c.models_on {
                 c.hit = mc_model_pick.mp_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.ms, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
             } else {
@@ -4802,7 +4901,12 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         pl = mc_prof.prof_lap(mc_prof.PH_PICK, pl)
         pick_entity(&c)
         if c.have_pos && mc_camera3p.mode_is_third(c.cam3_mode) {
-            mc_camera3p.cam3p_apply(&c.cam, &c.world, c.dim.min_y, &c.itb, c.pl.x, c.pl.y + mc_input.player_eye(&c.pl), c.pl.z,
+            var lx: f64 = 0.0
+            var ly: f64 = 0.0
+            var lz: f64 = 0.0
+            let lpt: f64 = (now_ms() - t_tick) as f64 / (TICK_MS as f64)
+            mc_input.player_lerp_pos(&c.pl, lpt, &lx, &ly, &lz)
+            mc_camera3p.cam3p_apply(&c.cam, &c.world, c.dim.min_y, &c.itb, lx, ly + mc_input.player_lerp_eye(&c.pl, lpt), lz,
                 c.pl.yaw, c.pl.pitch, c.cam3_mode, mc_camera3p.CAM_DISTANCE, &c.cam3)
         }
         pl = mc_prof.prof_lap(mc_prof.PH_PICKENT, pl)
