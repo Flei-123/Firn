@@ -42,7 +42,7 @@ def parse_structs(files):
                 continue
             name = m.group(2)
             if m.group(1):
-                gc_classes.add(name)
+                gc_classes.add((path, name))
             body = lines[i].split("{", 1)[1]
             depth = 1 + body.count("{") - body.count("}")
             fields = [body]
@@ -54,26 +54,30 @@ def parse_structs(files):
             for chunk in " ".join(fields).split(","):
                 if ":" in chunk:
                     types.append(chunk.split(":", 1)[1].strip().rstrip("}").strip())
-            structs.setdefault(name, []).append(types)
+            structs.setdefault(name, []).append((path, types))
             i += 1
     return structs, gc_classes
 
 
-def type_holds_gc(t, structs, gc_classes, seen):
+def type_holds_gc(t, structs, gc_classes, seen, path=None):
     t = t.strip()
     if t == "str" or t.startswith("Gc[") or t.startswith("fn(") or t.startswith("fn "):
         return True
     if t.startswith("["):
         inner = t[1:].rsplit(";", 1)[0]
-        return type_holds_gc(inner, structs, gc_classes, seen)
+        return type_holds_gc(inner, structs, gc_classes, seen, path)
     if t.startswith("*") or t.startswith("Weak["):
         return False
     base = re.sub(r"\[.*$", "", t.split(".")[-1]).strip()
-    if base in gc_classes:
+    own = [d for p, d in structs.get(base, []) if p == path]
+    if own:
+        if (path, base) in gc_classes:
+            return True
+    elif any(n == base for _, n in gc_classes):
         return True
     if base in structs and base not in seen:
-        defs = structs[base]
-        return all(any(type_holds_gc(f, structs, gc_classes, seen | {base}) for f in d) for d in defs)
+        defs = [d for p, d in structs[base] if p == path] or [d for p, d in structs[base]]
+        return all(any(type_holds_gc(f, structs, gc_classes, seen | {base}, path) for f in d) for d in defs)
     return False
 
 
@@ -123,7 +127,7 @@ def scan(files, structs, gc_classes):
                     for m in call_re.finditer(l):
                         found.add(m.group(1))
             for t in sorted(found):
-                if t in structs and type_holds_gc(t, structs, gc_classes, frozenset()):
+                if t in structs and type_holds_gc(t, structs, gc_classes, frozenset(), path):
                     hits.append("%s:%s:%s" % (os.path.relpath(path, ROOT), fname, t))
     return hits
 
