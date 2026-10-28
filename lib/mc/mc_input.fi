@@ -3,10 +3,9 @@
 //
 //   * Mouse look: vanilla formula, degrees = pixels * (s*0.6+0.2)^3 * 8 * 0.15 with sensitivity s (default 0.5 -> 0.15 deg / pixel);
 //     yaw grows to the right (0 = south, 90 = west), pitch > 0 looks down, clamped to +-90.
-//   * Movement per tick, speeds in blocks per tick (x20 = blocks per second): walk 0.21585 (4.317), sprint 0.28060 (5.612),
-//     sneak 0.0648 (1.295), fly 0.546 (10.92, x2 sprinting), fly up / down 0.375. Diagonals are normalised. Ground: instant
-//     horizontal speed (no inertia), gravity vy = (vy - 0.08) * 0.98, jump 0.42, box 0.6 x 1.8 (sneaking 1.5), eye 1.62 (1.27).
-//     Fly mode (`flying`): no gravity; `noclip` additionally ignores all blocks. Collision: a 9x9x9 snapshot of the world around
+//   * Movement per tick: vanilla momentum physics (mc_phys: acceleration 0.098 * (0.6 / friction)^3 on the ground, 0.02 / 0.026 in the air, drag block friction * 0.91,
+//     gravity vy = (vy - 0.08) * 0.98, jump 0.42 + sprint push 0.2, jump delay 10), box 0.6 x 1.8 (sneaking 1.5), eye 1.62 (1.27).
+//     Fly mode (`flying`): momentum with flying speed 0.05; `noclip` additionally ignores all blocks. Collision: a 9x9x9 snapshot of the world around
 //     the player (unloaded chunks count as solid) + mc_math.grid_move. Water, lava, ladders: see mc_move_fluid (kinds in Player.mv). Step-up (stepHeight 0.6, vanilla Entity.collide, see move_step)
 //     only matters for partial shapes (solid table value 128 + k, see mc_math.shape_box / mc_shapes); the Auto-Jump option (`Player.autojump`, off by default) jumps against a 1 block step (see auto_jump_ok).
 //   * Pick: Amanatides-Woo DDA directly over mc_world (reach 5, creative 6). Hit = block + entered face (normal) + distance.
@@ -25,10 +24,11 @@ import mc.mc_fluid_flow
 import mc.mc_scaffold
 import mc.mc_slide
 import mc.mc_bounce
+import mc.mc_phys
 
 export {
     InputEvents, InputTables, Player, Pick, input_events_new, player_new, player_free, player_look, player_tick,
-    player_set_camera, player_reach, player_eye, player_height, HEIGHT_STAND, HEIGHT_SNEAK, HEIGHT_LOW, EYE_STAND, EYE_SNEAK, EYE_LOW, input_pick, input_pick_camera, input_draw_box, input_draw_aabb, input_draw_aabb_b, world_block_id,
+    player_set_camera, player_set_camera_lerp, player_lerp_pos, player_lerp_eye, player_reach, player_eye, player_height, HEIGHT_STAND, HEIGHT_SNEAK, HEIGHT_LOW, EYE_STAND, EYE_SNEAK, EYE_LOW, input_pick, input_pick_camera, input_draw_box, input_draw_aabb, input_draw_aabb_b, world_block_id,
     K_FORWARD, K_BACK, K_LEFT, K_RIGHT, K_JUMP, K_SNEAK, K_SPRINT,
 }
 
@@ -40,11 +40,6 @@ const K_JUMP: u32 = 16
 const K_SNEAK: u32 = 32
 const K_SPRINT: u32 = 64
 
-const SPEED_WALK: f64 = 0.21585
-const SPEED_SPRINT: f64 = 0.2806
-const SPEED_SNEAK: f64 = 0.0648
-const SPEED_FLY: f64 = 0.546
-const SPEED_FLY_VERT: f64 = 0.375
 const DIAG: f64 = 0.7071067811865476
 const SNAP_N: i32 = 9
 const STEP_HEIGHT: f64 = 0.6 // vanilla stepHeight of the player
@@ -88,10 +83,16 @@ struct Player {
     mv: u64, // u8 [65536] movement kind per block state (mc_math.MV_*; mc_shapes.move_fill), all 0 = no slowdown blocks
     vx: f64, vz: f64, // horizontal velocity in blocks per tick, only kept while in a fluid
     stuck: i32, // set by the last move: 0 none, 1 cobweb, 2 sweet berry bush (vanilla stuckSpeedMultiplier), used by the next move
-    slide: bool, // momentum mode (ice / slime friction): vx, vz carry the horizontal velocity on the ground and in the air
-    lvx: f64, lvz: f64, // steady-state velocity of the last instant-mode tick: the momentum when stepping onto a slippery block
     wet: bool,
-    sfr: f64, // horizontal speed ratio of the block speed factor at the current position (1.0 = none, see speed_ratio)
+    jump_delay: i32, // vanilla noJumpDelay: ticks until the next jump while the jump key stays down
+    aj_jump: bool, // auto-jump request: acts like the jump key on the next tick
+    sprint_trigger: i32, // double-tap W window (vanilla sprintTriggerTime)
+    enough_prev: bool, sneak_prev: bool, // last tick's forward impulse >= 0.8 / sneak key
+    hcol: bool, minor: bool, // last move: horizontal collision / collision along the input direction
+    jump_boost: i32, // Jump Boost level (amplifier + 1), 0 = none
+    can_sprint: bool, using_item: bool,
+    px: f64, py: f64, pz: f64, // feet position at the start of the last tick (render interpolation)
+    eye: f64, eye_prev: f64, // smoothed eye height now / one tick ago
 }
 
 struct Pick {
@@ -110,7 +111,8 @@ const CLS_N: usize = 65536
 fn player_new(x: f64, y: f64, z: f64) -> Player {
     var p: Player = Player {
         x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, fall: 0.0, flying: false, noclip: false, creative: false,
-        sneaking: false, sprinting: false, swimming: false, low_pose: false, crouched: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0, mv: 0, vx: 0.0, vz: 0.0, stuck: 0, slide: false, lvx: 0.0, lvz: 0.0, wet: false, sfr: 1.0,
+        sneaking: false, sprinting: false, swimming: false, low_pose: false, crouched: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0, mv: 0, vx: 0.0, vz: 0.0, stuck: 0, wet: false, jump_delay: 0, aj_jump: false, sprint_trigger: 0, enough_prev: false, sneak_prev: false,
+        hcol: false, minor: false, jump_boost: 0, can_sprint: true, using_item: false, px: x, py: y, pz: z, eye: EYE_STAND, eye_prev: EYE_STAND,
     }
     p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
     p.mv = rt.heap_alloc(CLS_N)
@@ -202,6 +204,33 @@ fn player_look(p: *mut Player, dx: f64, dy: f64) {
     if pt > 90.0 { pt = 90.0 }
     if pt < -90.0 { pt = -90.0 }
     (*p).pitch = pt
+}
+
+fn player_lerp_pos(p: *mut Player, t: f64, ox: *mut f64, oy: *mut f64, oz: *mut f64) {
+    let dx: f64 = (*p).x - (*p).px
+    let dy: f64 = (*p).y - (*p).py
+    let dz: f64 = (*p).z - (*p).pz
+    var k: f64 = t
+    if k < 0.0 { k = 0.0 }
+    if k > 1.0 { k = 1.0 }
+    if dx * dx + dy * dy + dz * dz > 16.0 { k = 1.0 }
+    *ox = mc_phys.lerp((*p).px, (*p).x, k)
+    *oy = mc_phys.lerp((*p).py, (*p).y, k)
+    *oz = mc_phys.lerp((*p).pz, (*p).z, k)
+}
+
+fn player_lerp_eye(p: *mut Player, t: f64) -> f64 {
+    return mc_phys.lerp((*p).eye_prev, (*p).eye, t)
+}
+
+fn player_set_camera_lerp(p: *mut Player, cam: *mut mc_camera.Camera, t: f64) {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
+    player_lerp_pos(p, t, &x, &y, &z)
+    mc_camera.camera_set_pos(cam, x, y + player_lerp_eye(p, t), z)
+    mc_camera.camera_set_angles(cam, (*p).yaw, (*p).pitch)
+    mc_camera.camera_update(cam)
 }
 
 fn player_set_camera(p: *mut Player, cam: *mut mc_camera.Camera) {
@@ -340,18 +369,11 @@ fn move_step(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dy: f64, 
 // this tick (ground 0.454 * speed, air 0.0196 / sprinting 0.02548) times the multiplier, and the fall distance is reset. Honey block wall slide
 // (HoneyBlock.isSlidingDown / doSlideMovement): in the air, below the block top, falling faster than 0.08, touching the side of a honey
 // block -> vy = -0.05, fall distance reset. Not modelled: flying (no factor / stuck), powder snow, fall damage, sounds.
-const F_GROUND: f64 = 0.546
 const STUCK_WEB_Y: f64 = 0.05000000074505806
-const AIR_ACCEL: f64 = 0.0196
-const AIR_ACCEL_SPRINT: f64 = 0.02548
 const BELOW: f64 = 0.500001
 
-fn speed_ratio(f: f64) -> f64 {
-    return (1.0 - F_GROUND) / (1.0 - F_GROUND * f)
-}
-
 fn kind_speed(k: i32) -> f64 {
-    if k == mc_math.MV_SOUL_SAND || k == mc_math.MV_HONEY { return 0.4 }
+    if k == mc_math.MV_SOUL_SAND || k == mc_math.MV_HONEY { return 0.4f as f64 }
     return 1.0
 }
 
@@ -497,53 +519,6 @@ fn ground_friction(p: *mut Player, v: *mut mc_world_view.WorldView) -> f64 {
     return mc_slide.kind_friction(mc_world_view.view_kind(v, (*p).mv, fx, math.floor((*p).y - BELOW) as i32, fz))
 }
 
-// Momentum mode on slippery blocks (vanilla LivingEntity.travel): velocity += input * speed * (0.6 / friction)^3 on the ground (air: 0.02 / 0.026),
-// the move uses the velocity, afterwards velocity *= friction * 0.91 (air 0.91). Returns the friction of the block below, 0.0 when not sliding.
-fn slide_prepare(p: *mut Player, v: *mut mc_world_view.WorldView, wx: f64, wz: f64, dx: *mut f64, dz: *mut f64) -> f64 {
-    let mu: f64 = ground_friction(p, v)
-    if !(*p).slide {
-        if !(*p).on_ground || mu == mc_slide.MU_DEFAULT {
-            (*p).lvx = *dx * F_GROUND
-            (*p).lvz = *dz * F_GROUND
-            return 0.0
-        }
-        (*p).slide = true
-        (*p).vx = (*p).lvx
-        (*p).vz = (*p).lvz
-    }
-    var ax: f64 = 0.0
-    var az: f64 = 0.0
-    if (*p).on_ground {
-        let k: f64 = (1.0 - F_GROUND) * mc_slide.accel_scale(mu)
-        ax = *dx * k
-        az = *dz * k
-    } else {
-        var aa: f64 = AIR_ACCEL
-        if (*p).sprinting { aa = AIR_ACCEL_SPRINT }
-        ax = wx * aa
-        az = wz * aa
-    }
-    (*p).vx = (*p).vx + ax
-    (*p).vz = (*p).vz + az
-    *dx = (*p).vx
-    *dz = (*p).vz
-    return mu
-}
-
-fn slide_finish(p: *mut Player, res: *mut mc_math.MoveResult, mu: f64, was_ground: bool) {
-    if (*res).hit_x { (*p).vx = 0.0 }
-    if (*res).hit_z { (*p).vz = 0.0 }
-    let f: f64 = mc_slide.drag_factor(mu, was_ground)
-    (*p).vx = (*p).vx * f
-    (*p).vz = (*p).vz * f
-    let rest: f64 = SPEED_WALK * F_GROUND
-    if was_ground && mu == mc_slide.MU_DEFAULT && (*p).vx * (*p).vx + (*p).vz * (*p).vz <= rest * rest {
-        (*p).slide = false
-        (*p).vx = 0.0
-        (*p).vz = 0.0
-    }
-}
-
 fn fluid_after_move(p: *mut Player, g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, res: *mut mc_math.MoveResult, lava: bool, shallow: bool, swimming: bool, climb: bool) {
     let hit: bool = (*res).hit_x || (*res).hit_z
     if hit && climb { (*p).vy = mc_move_fluid.CLIMB_UP }
@@ -560,8 +535,41 @@ fn fluid_after_move(p: *mut Player, g: *mut mc_math.BlockGrid, b: *mut mc_math.A
     }
 }
 
-// One game tick (20 Hz): mouse look, key movement, gravity / fly, collision. `w` may be an empty world (everything unloaded =
-// solid, so the player stands still in ground mode; use noclip / flying + noclip for a free camera).
+fn update_sprint(p: *mut Player, keys: u32, fwd_now: bool, enough_now: bool, slow: bool, in_water: bool, eye_water: bool, hcol_stop: bool) {
+    let sprint_key: bool = (keys & K_SPRINT) != 0 as u32
+    let sneak_key: bool = (keys & K_SNEAK) != 0 as u32
+    if (*p).sprint_trigger > 0 { (*p).sprint_trigger = (*p).sprint_trigger - 1 }
+    let can: bool = (*p).can_sprint && !(*p).using_item
+    if ((*p).on_ground || eye_water) && !(*p).sneak_prev && !(*p).enough_prev && enough_now && !(*p).sprinting && can {
+        if (*p).sprint_trigger <= 0 && !sprint_key { (*p).sprint_trigger = mc_phys.SPRINT_TAP_TICKS } else { (*p).sprinting = true }
+    }
+    if !(*p).sprinting && (!in_water || eye_water) && enough_now && can && sprint_key { (*p).sprinting = true }
+    if (*p).sprinting {
+        let stop_base: bool = !fwd_now || !(*p).can_sprint
+        let stop: bool = stop_base || hcol_stop || (in_water && !eye_water) || slow || (*p).using_item
+        if (*p).swimming {
+            if (!(*p).on_ground && !sneak_key && stop_base) || !in_water { (*p).sprinting = false }
+        } else if stop {
+            (*p).sprinting = false
+        }
+    }
+    if sneak_key && !(*p).flying { (*p).sprinting = false }
+    (*p).enough_prev = enough_now
+    (*p).sneak_prev = sneak_key
+}
+
+fn start_jump(p: *mut Player, v: *mut mc_world_view.WorldView) {
+    (*p).vy = mc_phys.jump_power(block_factor(p, v, true) as f32, (*p).jump_boost)
+    if (*p).sprinting { mc_phys.sprint_jump_boost(&(*p).vx, &(*p).vz, (*p).yaw) }
+    (*p).jump_delay = mc_phys.JUMP_DELAY_TICKS
+}
+
+fn horizontal_friction(p: *mut Player, v: *mut mc_world_view.WorldView) -> f32 {
+    return ground_friction(p, v) as f32
+}
+
+// One game tick (20 Hz): key movement, gravity / fly, collision (vanilla LocalPlayer.aiStep + LivingEntity.travel + Entity.move order).
+// `w` may be an empty world (everything unloaded = solid, so the player stands still in ground mode; use noclip / flying + noclip for a free camera).
 fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb: *mut InputTables, min_y: i32) {
     if (*ev).toggle_fly {
         (*p).flying = !(*p).flying
@@ -572,6 +580,10 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
         (*p).slot = mc_world.floor_mod((*p).slot + (*ev).slot_delta, 9)
     }
     player_look(p, (*ev).dx, (*ev).dy)
+    (*p).px = (*p).x
+    (*p).py = (*p).y
+    (*p).pz = (*p).z
+    (*p).eye_prev = (*p).eye
     var v: mc_world_view.WorldView = mc_world_view.view_new(w, min_y)
     let keys: u32 = (*ev).keys
     (*p).sneaking = (keys & K_SNEAK) != 0 as u32
@@ -586,7 +598,17 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     (*p).wet = in_fluid
     let climbing: bool = fp.climb && !in_fluid
     let slowed: bool = crawl_slowed(p, in_fluid)
-    (*p).sprinting = (keys & K_SPRINT) != 0 as u32 && fwd && !(*p).sneaking && !slowed && (!in_water || fp.eye_water || (*p).swimming)
+    let slow: bool = ((*p).sneaking && !(*p).flying) || slowed
+    let raw_fwd: f32 = mc_phys.impulse_axis(fwd, (keys & K_BACK) != 0 as u32)
+    let raw_left: f32 = mc_phys.impulse_axis((keys & K_LEFT) != 0 as u32, (keys & K_RIGHT) != 0 as u32)
+    let strafe: f32 = mc_phys.scale_impulse(raw_left, slow, (*p).using_item)
+    let forward: f32 = mc_phys.scale_impulse(raw_fwd, slow, (*p).using_item)
+    let fwd_now: bool = raw_fwd > 0.00001f
+    var pre_forward: f32 = raw_fwd
+    if slow { pre_forward = pre_forward * 0.3f }
+    let enough_now: bool = mc_phys.enough_impulse(pre_forward, fp.eye_water)
+    let hcol_stop: bool = (*p).hcol && !(*p).minor
+    update_sprint(p, keys, fwd_now, enough_now, slow, in_water, fp.eye_water, hcol_stop)
     let swimming: bool = (*p).sprinting && in_water && (fp.eye_water || (*p).swimming)
     (*p).swimming = swimming
     var mx: f64 = 0.0
@@ -598,80 +620,72 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     let yr: f64 = (*p).yaw * (math.PI() / 180.0)
     let sn: f64 = math.sin(yr)
     let cs: f64 = math.cos(yr)
-    // forward = (-sin, cos), right = (-cos, -sin) in (x, z)
     var wx: f64 = (0.0 - cs) * mx + (0.0 - sn) * mz
     var wz: f64 = (0.0 - sn) * mx + cs * mz
     if mx != 0.0 && mz != 0.0 {
         wx = wx * DIAG
         wz = wz * DIAG
     }
-    var speed: f64 = SPEED_WALK
-    if (*p).flying {
-        speed = SPEED_FLY
-        if (*p).sprinting { speed = SPEED_FLY * 2.0 }
-    } else if (*p).sneaking || slowed {
-        speed = SPEED_SNEAK
-    } else if (*p).sprinting {
-        speed = SPEED_SPRINT
+    let jump_key: bool = (keys & K_JUMP) != 0 as u32 || (*p).aj_jump
+    (*p).aj_jump = false
+    if (*p).jump_delay > 0 { (*p).jump_delay = (*p).jump_delay - 1 }
+    if !jump_key { (*p).jump_delay = 0 }
+    if (*p).noclip || (*p).flying {
+        (*p).stuck = 0
     }
-    var dx: f64 = wx * speed
-    var dz: f64 = wz * speed
-    var dy: f64 = 0.0
-    let jump_key: bool = (keys & K_JUMP) != 0 as u32
-    if (*p).flying || in_fluid { (*p).slide = false }
-    if (*p).flying {
-        if (keys & K_JUMP) != 0 as u32 { dy = dy + SPEED_FLY_VERT }
-        if (keys & K_SNEAK) != 0 as u32 { dy = dy - SPEED_FLY_VERT }
-    } else if in_fluid {
+    if in_fluid {
         apply_flow(p, &v, tb, h, in_water, in_lava)
         fluid_velocity(p, wx, wz, jump_key, swimming, in_water, in_lava, fp.water_h + fp.lava_h, fp.head_wet)
-        dx = (*p).vx
-        dz = (*p).vz
-        dy = (*p).vy
     } else {
-        if !(*p).slide {
-            (*p).vx = 0.0
-            (*p).vz = 0.0
+        (*p).vx = mc_phys.cutoff((*p).vx)
+        (*p).vz = mc_phys.cutoff((*p).vz)
+        (*p).vy = mc_phys.cutoff((*p).vy)
+        if (*p).flying {
+            var step: f64 = 0.0
+            if (keys & K_JUMP) != 0 as u32 { step = step + 1.0 }
+            if (*p).sneaking { step = step - 1.0 }
+            (*p).vy = (*p).vy + step * ((mc_phys.FLY_BASE * mc_phys.FLY_VERTICAL_STEP) as f64)
+        } else if jump_key && (*p).on_ground && (*p).jump_delay == 0 && !(*p).noclip {
+            start_jump(p, &v)
         }
-        if (keys & K_JUMP) != 0 as u32 && (*p).on_ground { (*p).vy = 0.42 * block_factor(p, &v, true) }
-        dy = (*p).vy
+    }
+    let was_ground: bool = (*p).on_ground
+    var fric: f32 = 0.6f
+    if !in_fluid && !(*p).noclip && was_ground { fric = horizontal_friction(p, &v) }
+    if !in_fluid {
+        var speed: f32 = mc_phys.air_speed((*p).sprinting)
+        if (*p).flying || (*p).noclip {
+            speed = mc_phys.fly_speed((*p).sprinting)
+        } else if was_ground {
+            speed = mc_phys.ground_speed((*p).sprinting, fric)
+        }
+        mc_phys.move_relative(&(*p).vx, &(*p).vz, strafe, forward, speed, (*p).yaw)
     }
     let stuck: i32 = (*p).stuck
     (*p).stuck = 0
+    var dx: f64 = (*p).vx
+    var dy: f64 = (*p).vy
+    var dz: f64 = (*p).vz
+    if climbing {
+        mc_move_fluid.climb_clamp(&(*p).vx, &(*p).vy, &(*p).vz, (*p).sneaking && !fp.scaffold)
+        dx = (*p).vx
+        dy = (*p).vy
+        dz = (*p).vz
+        (*p).fall = 0.0
+    }
     if stuck != 0 && !(*p).flying && !(*p).noclip && !in_fluid {
-        // makeStuckInBlock: the velocity is zeroed, only this tick's acceleration moves the player, scaled by the multiplier
-        var ax: f64 = wx * speed * (1.0 - F_GROUND)
-        var az: f64 = wz * speed * (1.0 - F_GROUND)
-        if !(*p).on_ground {
-            var aa: f64 = AIR_ACCEL
-            if (*p).sprinting { aa = AIR_ACCEL_SPRINT }
-            ax = wx * aa
-            az = wz * aa
-        }
         var mxz: f64 = 0.25
         var myv: f64 = STUCK_WEB_Y
         if stuck == 2 {
             mxz = 0.8
             myv = 0.75
         }
-        dx = ax * mxz
-        dz = az * mxz
+        dx = dx * mxz
         dy = dy * myv
-    } else if !(*p).flying && !(*p).noclip && !in_fluid {
-        dx = dx * (*p).sfr
-        dz = dz * (*p).sfr
-    }
-    var slide_mu: f64 = 0.0
-    let was_ground: bool = (*p).on_ground
-    if !(*p).flying && !(*p).noclip && !in_fluid && stuck == 0 && !climbing {
-        slide_mu = slide_prepare(p, &v, wx, wz, &dx, &dz)
-    } else {
-        (*p).slide = false
-    }
-    if climbing {
-        mc_move_fluid.climb_clamp(&dx, &dy, &dz, (*p).sneaking && !fp.scaffold)
-        (*p).vy = dy
-        (*p).fall = 0.0
+        dz = dz * mxz
+        (*p).vx = 0.0
+        (*p).vy = 0.0
+        (*p).vz = 0.0
     }
     if (*p).noclip {
         (*p).low_pose = false
@@ -681,7 +695,12 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
         (*p).z = (*p).z + dz
         (*p).on_ground = false
         (*p).fall = 0.0
-        if !(*p).flying { (*p).vy = ((*p).vy - 0.08) * 0.98 }
+        (*p).hcol = false
+        (*p).minor = false
+        (*p).vx = (*p).vx * mc_phys.drag_h(false, 0.6f)
+        (*p).vz = (*p).vz * mc_phys.drag_h(false, 0.6f)
+        if (*p).flying { (*p).vy = (*p).vy * mc_phys.FLY_Y_DRAG } else { (*p).vy = mc_phys.gravity_step((*p).vy) }
+        ease_eye(p)
         return
     }
     var g: mc_math.BlockGrid = mc_math.grid_view(0, 0, 0, 0, 0, 0, 0, 0, 0 as u32, false)
@@ -699,7 +718,10 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     (*p).z = (*p).z + res.dz
     (*p).on_ground = res.hit_y && dy < 0.0
     pose_after(p, &g, swimming)
-    if slide_mu > 0.0 { slide_finish(p, &res, slide_mu, was_ground) }
+    (*p).hcol = res.hit_x || res.hit_z
+    (*p).minor = (*p).hcol && mc_phys.minor_collision(strafe, forward, (*p).yaw, res.dx, res.dz)
+    if res.hit_x && !in_fluid { (*p).vx = 0.0 }
+    if res.hit_z && !in_fluid { (*p).vz = 0.0 }
     if (*p).on_ground || (*p).flying || in_fluid {
         (*p).fall = 0.0
     } else if res.dy < 0.0 {
@@ -707,29 +729,37 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     }
     var aj: bool = false
     if (*p).autojump && (*p).on_ground && !(*p).sneaking && !(*p).flying && (res.hit_x || res.hit_z) {
-        // blocked horizontally on the ground: the intended step, not the part the collision already allowed
         aj = auto_jump_ok(&g, &b, dx, dz)
     }
     if (*p).flying {
-        (*p).vy = 0.0
-        (*p).sfr = 1.0
+        (*p).vy = dy * mc_phys.FLY_Y_DRAG
+        (*p).vx = (*p).vx * mc_phys.drag_h(false, 0.6f)
+        (*p).vz = (*p).vz * mc_phys.drag_h(false, 0.6f)
     } else if in_fluid {
-        (*p).sfr = 1.0
         if res.hit_y { (*p).vy = 0.0 }
         if mc_move_fluid.bubble_effect(&v, (*p).mv, (*p).x, (*p).y, (*p).z, h, &(*p).vy) { (*p).fall = 0.0 }
         fluid_after_move(p, &g, &b, &res, in_lava, fp.lava_h + fp.water_h <= mc_move_fluid.FLUID_SHALLOW, in_water && (*p).sprinting, fp.climb)
     } else {
-        if stuck != 0 { (*p).vy = 0.0 }
         if res.hit_y {
             if dy < 0.0 { (*p).vy = landing_vy(p, &v) } else { (*p).vy = 0.0 }
         }
         if climbing && (res.hit_x || res.hit_z || jump_key) { (*p).vy = mc_move_fluid.CLIMB_UP }
         if mc_move_fluid.bubble_effect(&v, (*p).mv, (*p).x, (*p).y, (*p).z, h, &(*p).vy) { (*p).fall = 0.0 }
         check_inside(p, &v, h)
-        (*p).sfr = speed_ratio(block_factor(p, &v, false))
-        (*p).vy = ((*p).vy - 0.08) * 0.98
-        if aj { (*p).vy = 0.42 } // the jump starts with the next tick, exactly like a pressed Space
+        let sf: f64 = block_factor(p, &v, false)
+        (*p).vx = (*p).vx * sf
+        (*p).vz = (*p).vz * sf
+        let drag: f64 = mc_phys.drag_h(was_ground, fric)
+        (*p).vx = (*p).vx * drag
+        (*p).vz = (*p).vz * drag
+        (*p).vy = mc_phys.gravity_step((*p).vy)
+        if aj { (*p).aj_jump = true }
     }
+    ease_eye(p)
+}
+
+fn ease_eye(p: *mut Player) {
+    (*p).eye = mc_phys.eye_smooth((*p).eye, player_eye(p))
 }
 
 // ---------------------------------------------------------------- picking
