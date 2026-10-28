@@ -63,6 +63,7 @@ if [ -n "$WP" ]; then
   "$W/other" raw plain > "$W/other.log" 2>&1 & OP=$!
   for i in $(seq 1 50); do grep -q READY "$W/other.log" 2>/dev/null && break; sleep 0.2; done
   WO=$(xdotool search --name mffocus_b | head -1)
+  xdotool windowmove "$WO" 0 500
   xdotool windowfocus "$WO"; sleep 2
   check "$WP" pause
   xdotool windowfocus "$WP" 2>/dev/null; sleep 1
