@@ -1126,11 +1126,20 @@ fn xunlock(e: &mut Emitter) {
 // Code generation
 // =====================================================================
 
-/// Serial number for the labels of the `cpuid` sequence.
+thread_local! {
+    static LABELS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn labels_get() -> u64 {
+    LABELS.with(|c| c.get())
+}
+
+pub(crate) fn labels_set(n: u64) {
+    LABELS.with(|c| c.set(n));
+}
+
 fn next_label() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
+    LABELS.with(|c| c.replace(c.get() + 1))
 }
 
 /// `Op::Simd` -> machine instructions. The only place in the compiler where a

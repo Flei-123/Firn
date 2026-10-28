@@ -54,14 +54,24 @@
 
 use crate::fir::{BinOp, CmpOp, FTy, Func, Inst, Op, Term, Val};
 
-static SITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn sites_get() -> usize {
+    SITES.with(|c| c.get())
+}
+
+pub(crate) fn sites_set(n: usize) {
+    SITES.with(|c| c.set(n));
+}
 
 /// Emit the copy. `rdi` = dst, `rsi` = src, `rcx` = element count; `rax` is
 /// scratch (never the home of a value). `rep movs` has a start-up cost of a
 /// few dozen cycles, so a short copy (under 64 bytes) runs a plain loop with
 /// the same forward, element by element order instead.
 pub(crate) fn emit_rep(e: &mut crate::codegen_x86::Emitter, esz: u8) {
-    let id = SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = SITES.with(|c| c.replace(c.get() + 1));
     let small = format!(".Lmcpy_small{}", id);
     let big = format!(".Lmcpy_big{}", id);
     let done = format!(".Lmcpy_done{}", id);

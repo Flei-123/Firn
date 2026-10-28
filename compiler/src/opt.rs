@@ -916,17 +916,17 @@ fn redo_after_inline(settled: &[bool], changed: &[usize], nfuncs: usize) -> Opti
     Some(redo.iter().enumerate().filter(|(_, r)| **r).map(|(i, _)| i).collect())
 }
 
-struct StageClock {
+pub(crate) struct StageClock {
     on: bool,
     last: std::time::Instant,
 }
 
 impl StageClock {
-    fn new() -> StageClock {
+    pub(crate) fn new() -> StageClock {
         StageClock { on: std::env::var_os("FIRN_STAGE_TIMINGS").is_some(), last: std::time::Instant::now() }
     }
 
-    fn mark(&mut self, name: &str) {
+    pub(crate) fn mark(&mut self, name: &str) {
         if self.on {
             eprintln!("  stage {:<24} {:8.1} ms", name, self.last.elapsed().as_secs_f64() * 1000.0);
             self.last = std::time::Instant::now();

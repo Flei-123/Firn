@@ -33,7 +33,11 @@ const WORKER_STACK: usize = 128 << 20;
 
 /// How many threads a batch may use.
 pub(crate) fn threads() -> usize {
-    if let Some(n) = std::env::var("FIRN_OPT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+    threads_from("FIRN_OPT_THREADS")
+}
+
+pub(crate) fn threads_from(var: &str) -> usize {
+    if let Some(n) = std::env::var(var).ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.clamp(1, 64);
     }
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
@@ -111,7 +115,7 @@ impl Ctx {
     }
 }
 
-fn weight(f: &Func) -> usize {
+pub(crate) fn weight(f: &Func) -> usize {
     f.blocks.iter().map(|b| b.insts.len() + 1).sum()
 }
 

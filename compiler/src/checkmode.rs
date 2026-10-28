@@ -41,6 +41,10 @@ pub fn set_from_level(level: crate::opt::Level) {
     CHECKED.with(|c| c.set(checked));
 }
 
+pub(crate) fn set_checked(on: bool) {
+    CHECKED.with(|c| c.set(on));
+}
+
 /// Should `+ - * /` and a narrowing `as` be checked at THIS point in the
 /// lowering? `lower.rs` asks this once per arithmetic expression.
 pub fn is_checked() -> bool {

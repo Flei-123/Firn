@@ -97,6 +97,7 @@ use crate::fir::{BinOp, FTy};
 struct Table {
     /// message text -> its `.rodata` label index
     msgs: Vec<String>,
+    index: crate::fx::HashMap<String, usize>,
 }
 
 thread_local! {
@@ -120,11 +121,12 @@ pub fn reset() {
 pub fn intern(msg: &str) -> String {
     TABLE.with(|t| {
         let mut t = t.borrow_mut();
-        if let Some(i) = t.msgs.iter().position(|m| m == msg) {
+        if let Some(&i) = t.index.get(msg) {
             return label_of(i);
         }
         let i = t.msgs.len();
         t.msgs.push(msg.to_string());
+        t.index.insert(msg.to_string(), i);
         label_of(i)
     })
 }
@@ -142,6 +144,38 @@ fn msg_len(msg: &str) -> usize {
 /// program compiled `--opt-level=release-fast` (or one that simply never
 /// triggers a checked path) pays not one byte for the feature (SPEC §13,
 /// cost measured in `docs/ROUND72.md`).
+pub(crate) fn take_local() -> (Vec<String>, bool) {
+    let msgs = TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        t.index.clear();
+        std::mem::take(&mut t.msgs)
+    });
+    let used = INDEX_USED.with(|c| c.replace(false));
+    (msgs, used)
+}
+
+pub(crate) fn merge_all(parts: &[&[String]]) -> Vec<Vec<usize>> {
+    TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        parts
+            .iter()
+            .map(|part| {
+                part.iter()
+                    .map(|m| match t.index.get(m) {
+                        Some(i) => *i,
+                        None => {
+                            let i = t.msgs.len();
+                            t.msgs.push(m.clone());
+                            t.index.insert(m.clone(), i);
+                            i
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 pub fn any_registered() -> bool {
     TABLE.with(|t| !t.borrow().msgs.is_empty())
 }

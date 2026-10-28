@@ -8,6 +8,7 @@
 mod abi;
 mod layout_attrs;
 mod fx;
+mod parcodegen;
 mod parfn;
 mod alias;
 mod archsel;

@@ -125,6 +125,10 @@ pub fn active() -> Profile {
     ACTIVE.with(|a| a.get())
 }
 
+pub(crate) fn set_active(p: Profile) {
+    ACTIVE.with(|a| a.set(p));
+}
+
 pub fn is_kernel() -> bool {
     active() == Profile::Kernel
 }

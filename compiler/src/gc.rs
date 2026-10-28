@@ -179,6 +179,10 @@ pub(crate) fn runtime_remember() {
     RUNTIME_INSIDE.with(|c| c.set(true));
 }
 
+pub(crate) fn runtime_set(on: bool) {
+    RUNTIME_INSIDE.with(|c| c.set(on));
+}
+
 /// Reset before every compilation (one process can compile several —
 /// `cargo test`).
 pub(crate) fn runtime_reset() {

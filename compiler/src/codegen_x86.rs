@@ -174,6 +174,9 @@ pub(crate) struct Emitter {
 }
 
 impl Emitter {
+    pub(crate) fn fresh() -> Emitter {
+        Emitter { here: crate::fir::Loc::NONE, ..Default::default() }
+    }
     /// **ROUND 94** — announce the source position of what comes next.
     ///
     /// Three rules, and every one of them exists so that the line table can
@@ -323,6 +326,7 @@ pub fn function_sections() -> bool {
 }
 
 pub fn emit(m: &Module) -> Result<String, String> {
+    let mut clk = crate::opt::StageClock::new();
     crate::fpool::reset();
     let mut e = Emitter {
         out: String::new(),
@@ -446,6 +450,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // update: see docs/FUI-ALL.md there. Off by default -- the assembly is
     // byte for byte what it was -- and off with variable debug info, whose
     // unit range (`.Ltext_end - start`) has to lie in one section.
+    clk.mark("cg prelude");
     let fsec = !freestanding && function_sections();
     // Byte range of every function (with its cold half) in `e.out`, for
     // the pruning below.
@@ -457,46 +462,48 @@ pub fn emit(m: &Module) -> Result<String, String> {
     let mut kept = crate::inline::rec_originals_take();
     let mut small = crate::inline::rec_small_take();
     let budget_dbg = std::env::var_os("FIRNC_INLINE_STATS").is_some();
-    let (mut rec_in, mut rec_small, mut rec_out) = (0usize, 0usize, 0usize);
-    for f in &m.funcs {
-        let start = e.out.len();
-        if fsec {
-            e.raw(&format!(".section .text.{},\"ax\",@progbits", label(&f.name)));
-        }
-        let mut chosen: Option<Func> = None;
+    let mut tasks: Vec<(usize, Func, Option<Func>)> = Vec::new();
+    for (i, f) in m.funcs.iter().enumerate() {
         if let Some(orig) = kept.remove(&f.name) {
-            let fe = crate::regalloc::frame_bytes(f);
-            let fk = crate::regalloc::frame_bytes(&orig);
-            if crate::inline::rec_frame_within_budget(fe, fk) {
-                rec_in += 1;
-            } else {
-                let mid = small.remove(&f.name).filter(|mid| {
-                    crate::inline::rec_frame_within_budget(crate::regalloc::frame_bytes(mid), fk)
-                });
-                match mid {
-                    Some(mid) => {
-                        if budget_dbg {
-                            eprintln!(
-                                "frame-budget: {} {} -> {} octets, small bodies only",
-                                f.name, fk, fe
-                            );
-                        }
-                        rec_small += 1;
-                        chosen = Some(mid);
-                    }
-                    None => {
-                        if budget_dbg {
-                            eprintln!("frame-budget: {} {} -> {} octets, kept as it was", f.name, fk, fe);
-                        }
-                        rec_out += 1;
-                        chosen = Some(orig);
-                    }
-                }
-            }
+            tasks.push((i, orig, small.remove(&f.name)));
         }
-        emit_func(&mut e, chosen.as_ref().unwrap_or(f))?;
-        ranges.push((start, e.out.len()));
     }
+    let mut counts = (0usize, 0usize, 0usize);
+    if crate::parcodegen::enabled(m.funcs.len()) {
+        let weights: Vec<usize> = tasks.iter().map(|(i, _, _)| crate::parfn::weight(&m.funcs[*i])).collect();
+        let mut pre: Vec<Option<crate::parcodegen::Effects>> = (0..m.funcs.len()).map(|_| None).collect();
+        let mut chosen: Vec<Option<Func>> = (0..m.funcs.len()).map(|_| None).collect();
+        let done = crate::parcodegen::map_owned(tasks, weights, |(i, orig, mid)| (i, pick_body(&m.funcs[i], orig, mid)));
+        for ((i, pick), fx) in done {
+            pre[i] = Some(fx);
+            chosen[i] = apply_pick(&m.funcs[i], pick, budget_dbg, &mut counts);
+        }
+        clk.mark("cg select bodies");
+        let bodies: Vec<&Func> = m.funcs.iter().zip(&chosen).map(|(f, c)| c.as_ref().unwrap_or(f)).collect();
+        for out in crate::parcodegen::emit_all(&bodies, fsec, pre)? {
+            let start = e.out.len();
+            e.out.push_str(&out.text);
+            e.debug_funcs.extend(out.debug_funcs);
+            ranges.push((start, e.out.len()));
+        }
+    } else {
+        let mut pending: crate::fx::HashMap<usize, (Func, Option<Func>)> =
+            tasks.into_iter().map(|(i, orig, mid)| (i, (orig, mid))).collect();
+        for (i, f) in m.funcs.iter().enumerate() {
+            let start = e.out.len();
+            if fsec {
+                e.raw(&format!(".section .text.{},\"ax\",@progbits", label(&f.name)));
+            }
+            let chosen = match pending.remove(&i) {
+                Some((orig, mid)) => apply_pick(f, pick_body(f, orig, mid), budget_dbg, &mut counts),
+                None => None,
+            };
+            emit_func(&mut e, chosen.as_ref().unwrap_or(f))?;
+            ranges.push((start, e.out.len()));
+        }
+    }
+    let (rec_in, rec_small, rec_out) = counts;
+    clk.mark("cg functions");
     if budget_dbg {
         eprintln!(
             "frame-budget: {} recursive callers embedded, {} small bodies only, {} kept as they were",
@@ -594,8 +601,11 @@ pub fn emit(m: &Module) -> Result<String, String> {
         }
         e.raw(".section .note.GNU-stack,\"\",@progbits");
     }
+    clk.mark("cg tail");
     if !freestanding && !crate::target::windows() && prune_enabled() {
-        return Ok(prune_unreachable(m, &e.out, &ranges));
+        let pruned = prune_unreachable(m, &e.out, &ranges);
+        clk.mark("cg prune");
+        return Ok(pruned);
     }
     Ok(e.out)
 }
@@ -624,6 +634,48 @@ pub fn emit(m: &Module) -> Result<String, String> {
 /// base path and `regalloc::emit_func_ra`) and announces its own position,
 /// so dropping a whole function never leaves the next one on a stale line.
 /// `FIRN_KEEP_ALL=1` switches it off.
+enum Pick {
+    Embedded,
+    Small(Func, u64, u64),
+    Original(Func, u64, u64),
+}
+
+fn apply_pick(f: &Func, pick: Pick, dbg: bool, counts: &mut (usize, usize, usize)) -> Option<Func> {
+    match pick {
+        Pick::Embedded => {
+            counts.0 += 1;
+            None
+        }
+        Pick::Small(mid, fk, fe) => {
+            if dbg {
+                eprintln!("frame-budget: {} {} -> {} octets, small bodies only", f.name, fk, fe);
+            }
+            counts.1 += 1;
+            Some(mid)
+        }
+        Pick::Original(orig, fk, fe) => {
+            if dbg {
+                eprintln!("frame-budget: {} {} -> {} octets, kept as it was", f.name, fk, fe);
+            }
+            counts.2 += 1;
+            Some(orig)
+        }
+    }
+}
+
+fn pick_body(f: &Func, orig: Func, mid: Option<Func>) -> Pick {
+    let fe = crate::regalloc::frame_bytes(f);
+    let fk = crate::regalloc::frame_bytes(&orig);
+    if crate::inline::rec_frame_within_budget(fe, fk) {
+        return Pick::Embedded;
+    }
+    let mid = mid.filter(|mid| crate::inline::rec_frame_within_budget(crate::regalloc::frame_bytes(mid), fk));
+    match mid {
+        Some(mid) => Pick::Small(mid, fk, fe),
+        None => Pick::Original(orig, fk, fe),
+    }
+}
+
 pub fn prune_enabled() -> bool {
     !dwarf::with_variables()
         && !OBJECT_ONLY.load(std::sync::atomic::Ordering::Relaxed)
@@ -845,7 +897,7 @@ pub(crate) fn emit_frame(e: &mut Emitter, size: u64) {
     e.line(&format!("sub rsp, {}", size));
 }
 
-fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
+pub(crate) fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // HOOK opt: register allocation (compiler/src/regalloc.rs). Once the
     // register aware path yields `None`, the base path below takes over.
     if let Some(r) = crate::regalloc::emit_func_ra(e, f) {

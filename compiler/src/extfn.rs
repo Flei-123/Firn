@@ -125,6 +125,33 @@ pub(crate) fn reset() {
 }
 
 /// The libraries `#[link_lib(..)]` asked for (empty = a static image).
+#[derive(Clone)]
+pub(crate) struct Snapshot {
+    externs: HashMap<String, String>,
+    exported: HashMap<String, String>,
+    libs: Vec<String>,
+    abis: HashMap<String, ExportAbi>,
+    sigs: Vec<ExportSig>,
+}
+
+pub(crate) fn snapshot() -> Snapshot {
+    Snapshot {
+        externs: EXTERNS.with(|e| e.borrow().clone()),
+        exported: EXPORTED.with(|e| e.borrow().clone()),
+        libs: LIBS.with(|e| e.borrow().clone()),
+        abis: ABIS.with(|e| e.borrow().clone()),
+        sigs: SIGS.with(|e| e.borrow().clone()),
+    }
+}
+
+pub(crate) fn install(s: &Snapshot) {
+    EXTERNS.with(|e| *e.borrow_mut() = s.externs.clone());
+    EXPORTED.with(|e| *e.borrow_mut() = s.exported.clone());
+    LIBS.with(|e| *e.borrow_mut() = s.libs.clone());
+    ABIS.with(|e| *e.borrow_mut() = s.abis.clone());
+    SIGS.with(|e| *e.borrow_mut() = s.sigs.clone());
+}
+
 pub fn link_libs() -> Vec<String> {
     LIBS.with(|e| e.borrow().clone())
 }

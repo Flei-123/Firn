@@ -31,35 +31,52 @@
 
 use std::cell::RefCell;
 
+#[derive(Default)]
+struct Pool {
+    entries: Vec<(u64, bool)>,
+    index: std::collections::HashMap<(u64, bool), usize>,
+}
+
+impl Pool {
+    fn find_or_push(&mut self, key: (u64, bool)) -> usize {
+        if let Some(&i) = self.index.get(&key) {
+            return i;
+        }
+        self.entries.push(key);
+        self.index.insert(key, self.entries.len() - 1);
+        self.entries.len() - 1
+    }
+}
+
 thread_local! {
     /// (bit pattern, single precision?) in the order of first occurrence.
-    static POOL: RefCell<Vec<(u64, bool)>> = const { RefCell::new(Vec::new()) };
+    static POOL: RefCell<Pool> = RefCell::new(Pool::default());
 }
 
 /// Forget everything (one translation unit per run).
 pub fn reset() {
-    POOL.with(|p| p.borrow_mut().clear());
+    POOL.with(|p| *p.borrow_mut() = Pool::default());
 }
 
-/// Gibt es ueberhaupt Eintraege?
+pub(crate) fn take() -> Vec<(u64, bool)> {
+    POOL.with(|p| std::mem::take(&mut *p.borrow_mut()).entries)
+}
+
+pub(crate) fn merge_all(parts: &[&[(u64, bool)]]) -> Vec<Vec<usize>> {
+    POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        parts.iter().map(|part| part.iter().map(|k| pool.find_or_push(*k)).collect()).collect()
+    })
+}
+
+/// Are there any entries at all?
 pub fn any() -> bool {
-    POOL.with(|p| !p.borrow().is_empty())
+    POOL.with(|p| !p.borrow().entries.is_empty())
 }
 
 /// Enters the bit pattern (or finds it again) and returns the label.
 pub fn intern(bits: u64, single: bool) -> String {
-    POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        let key = (bits, single);
-        let idx = match p.iter().position(|e| *e == key) {
-            Some(i) => i,
-            None => {
-                p.push(key);
-                p.len() - 1
-            }
-        };
-        label_of(idx)
-    })
+    POOL.with(|p| label_of(p.borrow_mut().find_or_push((bits, single))))
 }
 
 fn label_of(i: usize) -> String {
@@ -76,7 +93,7 @@ pub fn operand(label: &str, single: bool) -> String {
 pub fn rodata_asm() -> String {
     let mut out = String::new();
     POOL.with(|p| {
-        let p = p.borrow();
+        let p = &p.borrow().entries;
         if p.is_empty() {
             return;
         }
