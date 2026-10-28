@@ -277,6 +277,7 @@ fn find_site_x(
     hot_only: bool,
     leaves: Option<&HashSet<String>>,
     idx: &HashMap<String, usize>,
+    from_block: usize,
     reach: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
@@ -311,7 +312,7 @@ fn find_site_x(
     if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
     }
-    for (bi, b) in caller.blocks.iter().enumerate() {
+    for (bi, b) in caller.blocks.iter().enumerate().skip(from_block) {
         if hot_only && !hot[bi] {
             continue;
         }
@@ -717,6 +718,11 @@ pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     if new_ids.is_empty() || after >= n {
         return;
     }
+    let k = new_ids.len();
+    if k < n && after < n - k && new_ids.iter().enumerate().all(|(i, &id)| id as usize == n - k + i) {
+        reorder_tail_blocks(f, after, k);
+        return;
+    }
     // The desired order: everything up to and including `after`, then the
     // new blocks, then the rest.
     let new_set: crate::fx::HashSet<u32> = new_ids.iter().copied().collect();
@@ -740,6 +746,48 @@ pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
         return; // something is off -- better not reorder at all
     }
     apply_block_order(f, &order);
+}
+
+fn reorder_tail_blocks(f: &mut Func, after: usize, k: usize) {
+    let n = f.blocks.len();
+    let base = n - k;
+    f.blocks[after + 1..].rotate_right(k);
+    let mv = |x: u32| -> u32 {
+        let x = x as usize;
+        (if x <= after {
+            x
+        } else if x >= base {
+            after + 1 + (x - base)
+        } else {
+            x + k
+        }) as u32
+    };
+    for (i, b) in f.blocks.iter_mut().enumerate() {
+        b.id = i as u32;
+        match &mut b.term {
+            Term::Br(t) => *t = mv(*t),
+            Term::BrCond { then_bb, else_bb, .. } => {
+                *then_bb = mv(*then_bb);
+                *else_bb = mv(*else_bb);
+            }
+            Term::Switch { cases, default, .. } => {
+                for c in cases.iter_mut() {
+                    c.1 = mv(c.1);
+                }
+                *default = mv(*default);
+            }
+            Term::Ret(_) | Term::Unset => {}
+        }
+        let np = b.phi_count();
+        for inst in b.insts[..np].iter_mut() {
+            if let Op::Phi { incoming } = &mut inst.op {
+                for e in incoming.iter_mut() {
+                    e.0 = mv(e.0);
+                }
+                incoming.sort_by_key(|(p, _)| *p);
+            }
+        }
+    }
 }
 
 /// Brings the blocks into the order `order` (old numbers, every block exactly once)
@@ -1645,30 +1693,33 @@ fn inline_module_track_x(
         cache = crate::parfn::map_slice_with(nthreads, &all, |&ci| {
             crate::target::set_state(ctx);
             let mut reach = |a: usize, b: usize| cgr.reaches_shared(a, b);
-            Some(find_site_x(shared, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut reach))
+            Some(find_site_x(shared, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, 0, &mut reach))
         });
         callers_of = cg.callers_of();
     }
+    let mut resume: Vec<usize> = vec![0; nf];
     'outer: loop {
         for ci in start..m.funcs.len() {
             let found = if parallel {
                 match cache[ci] {
                     Some(r) => r,
                     None => {
-                        let r = find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut |a, b| cg.reaches(a, b));
+                        let r = find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, resume[ci], &mut |a, b| cg.reaches(a, b));
                         cache[ci] = Some(r);
                         r
                     }
                 }
             } else {
-                find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, &mut |a, b| cg.reaches(a, b))
+                find_site_x(m, ci, &self_rec, requested_only, hot_only, leaves.as_ref(), &idx, 0, &mut |a, b| cg.reaches(a, b))
             };
             if let Some((bi, ii, gi)) = found {
                 if parallel {
                     cache[ci] = None;
+                    resume[ci] = if hot_only { 0 } else { bi };
                     for &cj in &callers_of[ci] {
                         if cj > ci {
                             cache[cj] = None;
+                            resume[cj] = 0;
                         }
                     }
                 }
