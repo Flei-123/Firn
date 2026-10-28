@@ -72,7 +72,7 @@ setup_cmds() {
     case $scene in
         ent_wall) echo "fill -30 121 3 30 126 3 stone" >&3; echo "tp $who 0.5 121 0.5 0 0" >&3 ;;
         ent_open) echo "tp $who 0.5 121 0.5 0 0" >&3 ;;
-        self_wall) echo "fill -30 121 -3 30 126 -3 stone" >&3; echo "tp $who 0.5 121 0.5 0 0" >&3 ;;
+        self_wall) echo "fill -30 121 -1 30 126 -1 stone" >&3; echo "tp $who 0.5 121 0.5 0 0" >&3 ;;
         hand_wall) echo "fill -30 121 1 30 126 1 stone" >&3; echo "tp $who 0.5 121 0.8 0 0" >&3 ;;
     esac
 }
