@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.http
+import net.download
+import std.hashfile
+import hf.hfnet
+
+export {
+    HfSrc, HfRemote,
+    hf_remote_open, hf_remote_open_ex, hf_remote_close, hf_remote_read,
+    hf_remote_cancel, hf_remote_set_cancel_flag, hf_remote_set_window,
+    hf_remote_set_retries, hf_remote_set_timeout,
+    hf_remote_bytes, hf_remote_requests, hf_remote_resolves,
+    hf_remote_retries, hf_remote_error, hf_remote_status, hf_remote_size,
+    hf_remote_url, hf_remote_net,
+    hf_download, hf_download_ex,
+}
+
+const DEFAULT_WINDOW: usize = 524288
+const MAX_REREAD: u64 = 3
+const DL_ROUNDS: u64 = 4
+
+struct HfSrc {
+    read_at: fn(u64, u64, u64, usize) -> bool,
+    ud: u64,
+    size: u64,
+}
+
+struct HfRemote {
+    net: *mut hfnet.HfNet,
+    link: rt.Buf,
+    res: hfnet.HfRes,
+    resolved: bool,
+    win: rt.Buf,
+    win_off: u64,
+    win_len: usize,
+    window: usize,
+    bytes: u64,
+    requests: u64,
+    err: u64,
+    status: u64,
+    want_off: u64,
+    dest: u64,
+    want: usize,
+    got: usize,
+    skip: u64,
+    sink_status: u64,
+    sink_bad: bool,
+}
+
+fn hfrem_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn hf_remote_read(ud: u64, offset: u64, dest: u64, n: usize) -> bool {
+    let r: *mut HfRemote = ud as *mut HfRemote
+    if n == 0 {
+        return true
+    }
+    (*r).err = hfnet.HF_OK
+    if offset + n as u64 > (*r).res.size {
+        (*r).err = hfnet.HF_ERR_SIZE
+        return false
+    }
+    if (*r).win_len > 0 && offset >= (*r).win_off &&
+        offset + n as u64 <= (*r).win_off + (*r).win_len as u64 {
+        rt.mem_copy(dest, (*r).win.ptr + (offset - (*r).win_off), n)
+        return true
+    }
+    if n >= (*r).window {
+        return fetch_range(r, offset, n, dest)
+    }
+    let size: u64 = (*r).res.size
+    var ws: u64 = offset
+    var we: u64 = offset + (*r).window as u64
+    if we > size {
+        we = size
+    }
+    if we - ws < (*r).window as u64 {
+        if we > (*r).window as u64 {
+            ws = we - (*r).window as u64
+        } else {
+            ws = 0
+        }
+    }
+    let len: usize = (we - ws) as usize
+    rt.buf_reserve(&(*r).win, len)
+    (*r).win_len = 0
+    if !fetch_range(r, ws, len, (*r).win.ptr) {
+        return false
+    }
+    (*r).win_off = ws
+    (*r).win_len = len
+    rt.mem_copy(dest, (*r).win.ptr + (offset - ws), n)
+    return true
+}
+
+fn cr_start(r: *mut HfRemote, ok: *mut bool) -> u64 {
+    var at: u64 = 0
+    var nm: str = "Content-Range"
+    let len: usize = http.resp_header(hfnet.hfnet_resp((*r).net), nm.p as u64, nm.n, &at)
+    *ok = false
+    if len < 7 {
+        return 0
+    }
+    var i: usize = 6
+    var e: usize = i
+    while e < len && rt.ld8(at, e) != 45 as u8 {
+        e = e + 1
+    }
+    return hfnet.hf_parse_u64(at + i as u64, e - i, ok)
+}
+
+fn range_sink(ud: u64, p: u64, count: usize) -> bool {
+    let r: *mut HfRemote = ud as *mut HfRemote
+    if count == 0 {
+        let st: u64 = http.client_body_status(hfnet.hfnet_data((*r).net)) as u64
+        (*r).sink_status = st
+        if st == 206 {
+            var ok: bool = false
+            let start: u64 = cr_start(r, &ok)
+            if !ok || start != (*r).want_off {
+                (*r).sink_bad = true
+                return false
+            }
+            (*r).skip = 0
+        } else {
+            (*r).skip = (*r).want_off
+        }
+        return true
+    }
+    var q: u64 = p
+    var m: usize = count
+    if (*r).skip > 0 {
+        var k: u64 = (*r).skip
+        if k > m as u64 {
+            k = m as u64
+        }
+        (*r).skip = (*r).skip - k
+        q = q + k
+        m = m - k as usize
+    }
+    if m > 0 {
+        var take: usize = (*r).want - (*r).got
+        if take > m {
+            take = m
+        }
+        rt.mem_copy((*r).dest + (*r).got as u64, q, take)
+        (*r).got = (*r).got + take
+    }
+    if (*r).got >= (*r).want && (*r).sink_status == 200 {
+        return false
+    }
+    return true
+}
+
+fn re_resolve(r: *mut HfRemote) -> bool {
+    (*r).resolved = false
+    let ok: bool = hfnet.hfnet_resolve((*r).net, hf_link(r), &(*r).res)
+    if !ok {
+        (*r).err = (*r).res.err
+        (*r).status = (*r).res.status
+        return false
+    }
+    (*r).resolved = true
+    return true
+}
+
+fn hf_link(r: *mut HfRemote) -> str {
+    return str { p: rt.buf_data(&(*r).link), n: (*r).link.len }
+}
+
+fn expired_status(st: u64) -> bool {
+    return st == 400 || st == 401 || st == 403 || st == 410
+}
+
+fn fetch_range(r: *mut HfRemote, off: u64, n: usize, dest: u64) -> bool {
+    let net: *mut hfnet.HfNet = (*r).net
+    let c: *mut http.Client = hfnet.hfnet_data(net)
+    var done: usize = 0
+    var round: u64 = 0
+    var rr: u64 = 0
+    var fresh: bool = false
+    while done < n {
+        if hfnet.hfnet_cancelled(net) {
+            (*r).err = hfnet.HF_ERR_CANCEL
+            return false
+        }
+        if !(*r).resolved {
+            if !re_resolve(r) {
+                return false
+            }
+            fresh = true
+        }
+        (*r).want_off = off + done as u64
+        (*r).dest = dest + done as u64
+        (*r).want = n - done
+        (*r).got = 0
+        (*r).skip = 0
+        (*r).sink_bad = false
+        (*r).sink_status = 0
+        hfnet.hfnet_headers(net, c, (*r).res.auth, true, off + done as u64, off + n as u64 - 1)
+        http.client_set_sink(c, range_sink, r as u64)
+        (*r).requests = (*r).requests + 1
+        let eu: u32 = http.http_get_num(c, (*r).res.url.ptr, (*r).res.url.len, hfnet.hfnet_resp(net))
+        http.client_clear_sink(c)
+        var e: u64 = eu as u64
+        var st: u64 = http.resp_status(hfnet.hfnet_resp(net)) as u64
+        let full: bool = (*r).got >= (*r).want
+        if e == 17 && ((*r).sink_status == 200 || (*r).sink_status == 206) {
+            st = (*r).sink_status
+            if full {
+                e = 0
+            }
+        }
+        if (*r).sink_bad {
+            (*r).err = hfnet.HF_ERR_PARSE
+            (*r).status = st
+            return false
+        }
+        (*r).bytes = (*r).bytes + (*r).got as u64
+        done = done + (*r).got
+        if (*r).got > 0 {
+            round = 0
+            fresh = false
+        }
+        if done >= n {
+            (*r).status = st
+            return true
+        }
+        (*r).status = st
+        if e == 13 || (e == 0 && (expired_status(st) || (st >= 300 && st < 400))) {
+            if rr >= MAX_REREAD || (fresh && (*r).got == 0) {
+                (*r).err = hfnet.HF_ERR_HTTP
+                return false
+            }
+            rr = rr + 1
+            http.client_close(c)
+            (*r).resolved = false
+            continue
+        }
+        if e == 0 && st != 200 && st != 206 && !hfnet.hfnet_transient(0, st) {
+            (*r).err = hfnet.HF_ERR_HTTP
+            return false
+        }
+        if e != 0 && !hfnet.hfnet_transient(e, st) && e != 17 {
+            (*r).err = hfnet.HF_ERR_NET
+            return false
+        }
+        if (*r).got > 0 {
+            continue
+        }
+        round = round + 1
+        if round >= hf_retries(net) {
+            if e != 0 {
+                (*r).err = hfnet.HF_ERR_NET
+            } else {
+                (*r).err = hfnet.HF_ERR_HTTP
+            }
+            return false
+        }
+        http.client_close(c)
+        if !hfnet.hfnet_backoff(net, round, e == 0) {
+            (*r).err = hfnet.HF_ERR_CANCEL
+            return false
+        }
+    }
+    return true
+}
+
+fn hf_retries(net: *mut hfnet.HfNet) -> u64 {
+    return hfnet.hfnet_retry_limit(net)
+}
+
+fn hf_remote_open(link: str, token: str, out: *mut HfSrc) -> bool {
+    var err: u64 = 0
+    var status: u64 = 0
+    return hf_remote_open_ex(link, token, out, &err, &status)
+}
+
+fn hf_remote_open_ex(link: str, token: str, out: *mut HfSrc, err: *mut u64, status: *mut u64) -> bool {
+    *err = hfnet.HF_OK
+    *status = 0
+    let net: *mut hfnet.HfNet = hfnet.hfnet_new(token)
+    if net == 0 as *mut hfnet.HfNet {
+        *err = hfnet.HF_ERR_NOMEM
+        return false
+    }
+    let blk: u64 = rt.heap_alloc(hfrem_size_of[HfRemote]())
+    if blk == 0 {
+        hfnet.hfnet_free(net)
+        return false
+    }
+    rt.mem_set(blk, 0 as u8, hfrem_size_of[HfRemote]())
+    let r: *mut HfRemote = blk as *mut HfRemote
+    (*r).net = net
+    (*r).link = rt.buf_new()
+    (*r).win = rt.buf_new()
+    (*r).res = hfnet.hf_res_new()
+    (*r).window = DEFAULT_WINDOW
+    rt.buf_push_bytes(&(*r).link, link.p as u64, link.n)
+    if !re_resolve(r) || !(*r).res.have_size {
+        if (*r).err == hfnet.HF_OK {
+            (*r).err = hfnet.HF_ERR_PARSE
+        }
+        *err = (*r).err
+        *status = (*r).status
+        (*out).ud = 0
+        (*out).size = 0
+        (*out).read_at = hf_remote_read
+        release(r)
+        return false
+    }
+    (*out).read_at = hf_remote_read
+    (*out).ud = blk
+    (*out).size = (*r).res.size
+    return true
+}
+
+fn release(r: *mut HfRemote) {
+    rt.buf_free(&(*r).link)
+    rt.buf_free(&(*r).win)
+    hfnet.hf_res_free(&(*r).res)
+    hfnet.hfnet_free((*r).net)
+    rt.heap_free(r as u64, hfrem_size_of[HfRemote]())
+}
+
+fn hf_remote_close(src: *mut HfSrc) {
+    if (*src).ud != 0 {
+        release((*src).ud as *mut HfRemote)
+        (*src).ud = 0
+    }
+}
+
+fn rem(src: *mut HfSrc) -> *mut HfRemote { return (*src).ud as *mut HfRemote }
+
+fn hf_remote_cancel(src: *mut HfSrc) { hfnet.hfnet_cancel((*rem(src)).net) }
+fn hf_remote_set_cancel_flag(src: *mut HfSrc, flag: u64) { hfnet.hfnet_set_cancel_flag((*rem(src)).net, flag) }
+fn hf_remote_set_window(src: *mut HfSrc, bytes: usize) {
+    var w: usize = bytes
+    if w < 4096 {
+        w = 4096
+    }
+    (*rem(src)).window = w
+    (*rem(src)).win_len = 0
+}
+fn hf_remote_set_retries(src: *mut HfSrc, attempts: u64, base_ms: u64, cap_ms: u64) {
+    hfnet.hfnet_set_retries((*rem(src)).net, attempts, base_ms, cap_ms)
+}
+fn hf_remote_set_timeout(src: *mut HfSrc, ms: u64) { hfnet.hfnet_set_timeout((*rem(src)).net, ms) }
+fn hf_remote_bytes(src: *mut HfSrc) -> u64 { return (*rem(src)).bytes }
+fn hf_remote_requests(src: *mut HfSrc) -> u64 { return (*rem(src)).requests + hfnet.hfnet_requests((*rem(src)).net) }
+fn hf_remote_resolves(src: *mut HfSrc) -> u64 { return hfnet.hfnet_resolves((*rem(src)).net) }
+fn hf_remote_retries(src: *mut HfSrc) -> u64 { return hfnet.hfnet_retries_used((*rem(src)).net) }
+fn hf_remote_error(src: *mut HfSrc) -> u64 { return (*rem(src)).err }
+fn hf_remote_status(src: *mut HfSrc) -> u64 { return (*rem(src)).status }
+fn hf_remote_size(src: *mut HfSrc) -> u64 { return (*src).size }
+fn hf_remote_url(src: *mut HfSrc) -> str { return hfnet.hf_res_url(&(*rem(src)).res) }
+fn hf_remote_net(src: *mut HfSrc) -> *mut hfnet.HfNet { return (*rem(src)).net }
+
+struct DlWatch {
+    d: *mut download.Dl,
+    flag: u64,
+    progress: u64,
+}
+
+fn dl_watch(ud: u64, ev: u32, idx: u64, a: u64, b: u64) {
+    let w: *mut DlWatch = ud as *mut DlWatch
+    if (*w).progress != 0 && ev == download.EV_PROGRESS {
+        *((*w).progress as *mut u64) = a
+        *(((*w).progress + 8) as *mut u64) = b
+    }
+    if (*w).flag != 0 && *((*w).flag as *mut u64) != 0 {
+        download.dl_cancel((*w).d)
+    }
+}
+
+fn hf_download(link: str, dest: str, token: str, resume: bool) -> u64 {
+    return hf_download_ex(link, dest, token, resume, 0, 0)
+}
+
+#[allow_escape]
+fn hf_download_ex(link: str, dest: str, token: str, resume: bool, cancel_flag: u64, progress: u64) -> u64 {
+    let net: *mut hfnet.HfNet = hfnet.hfnet_new(token)
+    if net == 0 as *mut hfnet.HfNet {
+        return hfnet.HF_ERR_NOMEM
+    }
+    hfnet.hfnet_set_cancel_flag(net, cancel_flag)
+    var res: hfnet.HfRes = hfnet.hf_res_new()
+    var result: u64 = hfnet.HF_ERR_NET
+    var round: u64 = 0
+    while round < DL_ROUNDS {
+        if !hfnet.hfnet_resolve(net, link, &res) {
+            result = res.err
+            break
+        }
+        var d: download.Dl = download.dl_new(1)
+        if d.p == 0 {
+            result = hfnet.HF_ERR_NOMEM
+            break
+        }
+        var w: DlWatch = DlWatch { d: &d, flag: cancel_flag, progress: progress }
+        download.dl_set_progress(&d, dl_watch, (&w) as u64)
+        if res.auth && hfnet.hfnet_token_len(net) > 0 {
+            var hb: rt.Buf = rt.buf_new()
+            var a: str = "Authorization: Bearer "
+            rt.buf_push_bytes(&hb, a.p as u64, a.n)
+            hfnet.hfnet_token_into(net, &hb)
+            rt.buf_push_bytes(&hb, "\r\n".p as u64, 2)
+            download.dl_set_headers(&d, str { p: rt.buf_data(&hb), n: hb.len })
+            rt.buf_free(&hb)
+        }
+        var flags: u32 = download.DL_META
+        if !resume {
+            flags = flags | download.DL_NORESUME | download.DL_FORCE
+        }
+        download.dl_set_flags(&d, flags)
+        download.dl_set_retries(&d, 3 as u32)
+        var algo: u32 = hashfile.HASH_NONE
+        var sha: str = ""
+        if res.have_sha {
+            algo = hashfile.HASH_SHA256
+            sha = hfnet.hf_res_sha(&res)
+        }
+        var size: u64 = 0
+        if res.have_size {
+            size = res.size
+        }
+        let idx: i64 = download.dl_add(&d, hfnet.hf_res_url(&res), dest, algo, sha, size)
+        if idx < 0 {
+            download.dl_free(&d)
+            result = hfnet.HF_ERR_URL
+            break
+        }
+        download.dl_run_inline(&d)
+        let state: u64 = download.dl_item_state(&d, 0)
+        let derr: u32 = download.dl_item_error(&d, 0)
+        let dhttp: u32 = download.dl_item_http(&d, 0)
+        download.dl_free(&d)
+        if state == download.DL_OK || state == download.DL_SKIPPED || state == download.DL_NOT_MODIFIED {
+            result = hfnet.HF_OK
+            break
+        }
+        if state == download.DL_CANCELLED {
+            result = hfnet.HF_ERR_CANCEL
+            break
+        }
+        if derr == download.DE_HTTP && (dhttp == 400 as u32 || dhttp == 401 as u32 || dhttp == 403 as u32 || dhttp == 410 as u32) {
+            round = round + 1
+            result = hfnet.HF_ERR_HTTP
+            continue
+        }
+        if derr == download.DE_HTTP {
+            result = hfnet.HF_ERR_HTTP
+        } else if derr == download.DE_SIZE || derr == download.DE_HASH {
+            result = hfnet.HF_ERR_SIZE
+        } else {
+            result = hfnet.HF_ERR_NET
+        }
+        break
+    }
+    hfnet.hf_res_free(&res)
+    hfnet.hfnet_free(net)
+    return result
+}

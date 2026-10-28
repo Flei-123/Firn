@@ -1,0 +1,483 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.str
+import std.json
+import net.http
+import hf.hfnet
+
+export {
+    HfCfg, HfList,
+    hf_cfg_default, hf_list_new, hf_list_free, hf_list_count,
+    hf_list_a, hf_list_b, hf_list_size,
+    hf_list_configs, hf_list_configs_cfg, hf_list_files, hf_list_files_cfg,
+    hf_probe, hf_probe_cfg, hf_id_ok,
+}
+
+const ENT_SIZE: usize = 40
+const MAX_PAGES: u64 = 40
+
+struct HfCfg {
+    endpoint: str,
+    server: str,
+}
+
+struct HfList {
+    data: rt.Buf,
+    ents: rt.Buf,
+    n: usize,
+}
+
+fn hf_cfg_default() -> HfCfg {
+    return HfCfg { endpoint: "https://huggingface.co", server: "https://datasets-server.huggingface.co" }
+}
+
+fn hf_list_new() -> HfList {
+    return HfList { data: rt.buf_new(), ents: rt.buf_new(), n: 0 }
+}
+
+fn hf_list_free(l: *mut HfList) {
+    rt.buf_free(&(*l).data)
+    rt.buf_free(&(*l).ents)
+    (*l).n = 0
+}
+
+fn hf_list_count(l: *mut HfList) -> usize { return (*l).n }
+
+fn ent(l: *mut HfList, i: usize) -> *mut u64 {
+    return ((*l).ents.ptr + (i * ENT_SIZE) as u64) as *mut u64
+}
+
+fn field(l: *mut HfList, i: usize, k: usize) -> str {
+    if i >= (*l).n {
+        return ""
+    }
+    let e: *mut u64 = ent(l, i)
+    let off: u64 = *((e as u64 + (k * 16) as u64) as *mut u64)
+    let len: u64 = *((e as u64 + (k * 16) as u64 + 8) as *mut u64)
+    return str { p: rt.ptr_of((*l).data.ptr + off), n: len as usize }
+}
+
+fn hf_list_a(l: *mut HfList, i: usize) -> str { return field(l, i, 0) }
+fn hf_list_b(l: *mut HfList, i: usize) -> str { return field(l, i, 1) }
+
+fn hf_list_size(l: *mut HfList, i: usize) -> u64 {
+    if i >= (*l).n {
+        return 0
+    }
+    return *((ent(l, i) as u64 + 32) as *mut u64)
+}
+
+fn list_add(l: *mut HfList, a: str, b: str, size: u64) {
+    let ao: u64 = (*l).data.len as u64
+    rt.buf_push_bytes(&(*l).data, a.p as u64, a.n)
+    let bo: u64 = (*l).data.len as u64
+    rt.buf_push_bytes(&(*l).data, b.p as u64, b.n)
+    var rec: [u64; 5] = [ao, a.n as u64, bo, b.n as u64, size]
+    rt.buf_push_bytes(&(*l).ents, (&rec[0]) as u64, ENT_SIZE)
+    (*l).n = (*l).n + 1
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn unreserved(c: u8, keep_slash: bool) -> bool {
+    if (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8) {
+        return true
+    }
+    if c == 45 as u8 || c == 95 as u8 || c == 46 as u8 || c == 126 as u8 {
+        return true
+    }
+    return keep_slash && c == 47 as u8
+}
+
+fn put_enc(b: *mut rt.Buf, s: str, keep_slash: bool) {
+    var hexd: str = "0123456789ABCDEF"
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = s.chars(i)
+        if unreserved(c, keep_slash) {
+            rt.buf_push(b, c)
+        } else {
+            rt.buf_push(b, 37 as u8)
+            rt.buf_push(b, hexd.chars((c >> 4) as usize))
+            rt.buf_push(b, hexd.chars((c & 15 as u8) as usize))
+        }
+        i = i + 1
+    }
+}
+
+fn hf_id_ok(id: str) -> bool {
+    if id.n == 0 || id.n > 200 {
+        return false
+    }
+    var i: usize = 0
+    while i < id.n {
+        let c: u8 = id.chars(i)
+        if !unreserved(c, true) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn jstr(d: *mut json.Json, o: u32, key: str) -> str {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return ""
+    }
+    let n: u32 = json.json_get(d, o, key.p as u64, key.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return ""
+    }
+    let sp: str.Span = json.json_string(d, n)
+    return str { p: sp.p, n: sp.n }
+}
+
+fn jint(d: *mut json.Json, o: u32, key: str) -> i64 {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return -1
+    }
+    let n: u32 = json.json_get(d, o, key.p as u64, key.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_NUMBER {
+        return -1
+    }
+    return json.json_int(d, n)
+}
+
+fn open_doc(d: *mut json.Json, body: *mut rt.Buf) -> bool {
+    if (*body).len == 0 {
+        return false
+    }
+    return json.json_parse(d, (*body).ptr, (*body).len) catch false
+}
+
+fn get_json(n: *mut hfnet.HfNet, link: *mut rt.Buf, d: *mut json.Json, status: *mut u64) -> u64 {
+    var body: rt.Buf = rt.buf_new()
+    let e: u64 = hfnet.hfnet_get_body(n, str { p: rt.buf_data(link), n: (*link).len }, &body, status)
+    var res: u64 = e
+    if e == hfnet.HF_OK {
+        if !open_doc(d, &body) {
+            res = hfnet.HF_ERR_PARSE
+        }
+    }
+    rt.buf_free(&body)
+    return res
+}
+
+fn configs_from_server(n: *mut hfnet.HfNet, cfg: *mut HfCfg, id: str, out: *mut HfList) -> bool {
+    var link: rt.Buf = rt.buf_new()
+    put(&link, (*cfg).server)
+    put(&link, "/splits?dataset=")
+    put_enc(&link, id, true)
+    var d: json.Json = json.json_new()
+    var st: u64 = 0
+    var found: bool = false
+    if get_json(n, &link, &d, &st) == hfnet.HF_OK {
+        let root: u32 = json.json_root(&d)
+        let arr: u32 = json.json_get(&d, root, "splits".p as u64, 6)
+        if arr != json.JSON_NONE && json.json_kind(&d, arr) == json.JSON_ARRAY {
+            var c: u32 = json.json_child(&d, arr)
+            while c != json.JSON_NONE {
+                let cf: str = jstr(&d, c, "config")
+                let sp: str = jstr(&d, c, "split")
+                if cf.n > 0 {
+                    list_add(out, cf, sp, 0)
+                    found = true
+                }
+                c = json.json_next(&d, c)
+            }
+        }
+    }
+    json.json_free(&d)
+    rt.buf_free(&link)
+    return found
+}
+
+fn configs_from_tree(n: *mut hfnet.HfNet, cfg: *mut HfCfg, id: str, out: *mut HfList) -> bool {
+    var link: rt.Buf = rt.buf_new()
+    put(&link, (*cfg).endpoint)
+    put(&link, "/api/datasets/")
+    put_enc(&link, id, true)
+    put(&link, "/tree/main")
+    var d: json.Json = json.json_new()
+    var st: u64 = 0
+    let e: u64 = get_json(n, &link, &d, &st)
+    var found: bool = false
+    var has_parquet: bool = false
+    if e == hfnet.HF_OK {
+        let root: u32 = json.json_root(&d)
+        if json.json_kind(&d, root) == json.JSON_ARRAY {
+            var c: u32 = json.json_child(&d, root)
+            while c != json.JSON_NONE {
+                let ty: str = jstr(&d, c, "type")
+                let path: str = jstr(&d, c, "path")
+                if ty == "directory" && path.n > 0 && path.chars(0) != 46 as u8 {
+                    list_add(out, path, "train", 0)
+                    found = true
+                } else if ty == "file" && path.n > 8 && path.ends_with(".parquet") {
+                    has_parquet = true
+                }
+                c = json.json_next(&d, c)
+            }
+        }
+    }
+    if !found && has_parquet {
+        list_add(out, "default", "train", 0)
+        found = true
+    }
+    json.json_free(&d)
+    rt.buf_free(&link)
+    return found
+}
+
+fn hf_list_configs_cfg(cfg: *mut HfCfg, id: str, token: str, out: *mut HfList) -> bool {
+    if !hf_id_ok(id) {
+        return false
+    }
+    let n: *mut hfnet.HfNet = hfnet.hfnet_new(token)
+    if n == 0 as *mut hfnet.HfNet {
+        return false
+    }
+    var ok: bool = configs_from_server(n, cfg, id, out)
+    if !ok {
+        ok = configs_from_tree(n, cfg, id, out)
+    }
+    hfnet.hfnet_free(n)
+    return ok
+}
+
+fn hf_list_configs(id: str, token: str, out: *mut HfList) -> bool {
+    var cfg: HfCfg = hf_cfg_default()
+    return hf_list_configs_cfg(&cfg, id, token, out)
+}
+
+fn next_link(n: *mut hfnet.HfNet, out: *mut rt.Buf) -> bool {
+    var at: u64 = 0
+    var nm: str = "Link"
+    let len: usize = http.resp_header(hfnet.hfnet_resp(n), nm.p as u64, nm.n, &at)
+    if len == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < len {
+        if rt.ld8(at, i) == 60 as u8 {
+            var e: usize = i + 1
+            while e < len && rt.ld8(at, e) != 62 as u8 {
+                e = e + 1
+            }
+            if e >= len {
+                return false
+            }
+            var t: usize = e + 1
+            while t < len && rt.ld8(at, t) != 44 as u8 {
+                t = t + 1
+            }
+            var rel: str = "rel=\"next\""
+            var k: usize = e + 1
+            while k + rel.n <= t {
+                if rt.mem_eq(at + k as u64, rel.p as u64, rel.n) {
+                    rt.buf_clear(out)
+                    rt.buf_push_bytes(out, at + (i + 1) as u64, e - i - 1)
+                    return true
+                }
+                k = k + 1
+            }
+            i = t
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn has_token(path: str, tok: str) -> bool {
+    var i: usize = 0
+    while i + tok.n <= path.n {
+        if rt.mem_eq(path.p as u64 + i as u64, tok.p as u64, tok.n) {
+            let before: bool = i == 0 || path.chars(i - 1) == 47 as u8 || path.chars(i - 1) == 45 as u8 || path.chars(i - 1) == 95 as u8
+            let after: bool = i + tok.n == path.n || path.chars(i + tok.n) == 47 as u8 || path.chars(i + tok.n) == 45 as u8 || path.chars(i + tok.n) == 95 as u8 || path.chars(i + tok.n) == 46 as u8
+            if before && after {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn files_from_tree(n: *mut hfnet.HfNet, cfg: *mut HfCfg, id: str, config: str, split: str, out: *mut HfList) -> bool {
+    var scoped: bool = config.n > 0 && !hfnet.hf_str_eq(config, "default")
+    var round: u64 = 0
+    while round < 2 {
+        var link: rt.Buf = rt.buf_new()
+        put(&link, (*cfg).endpoint)
+        put(&link, "/api/datasets/")
+        put_enc(&link, id, true)
+        put(&link, "/tree/main")
+        if scoped {
+            put(&link, "/")
+            put_enc(&link, config, true)
+        }
+        put(&link, "?recursive=true")
+        var all: HfList = hf_list_new()
+        var pages: u64 = 0
+        var ok: bool = true
+        while ok && pages < MAX_PAGES {
+            var d: json.Json = json.json_new()
+            var st: u64 = 0
+            let e: u64 = get_json(n, &link, &d, &st)
+            if e != hfnet.HF_OK {
+                json.json_free(&d)
+                ok = false
+                break
+            }
+            let root: u32 = json.json_root(&d)
+            if json.json_kind(&d, root) == json.JSON_ARRAY {
+                var c: u32 = json.json_child(&d, root)
+                while c != json.JSON_NONE {
+                    let ty: str = jstr(&d, c, "type")
+                    let path: str = jstr(&d, c, "path")
+                    if ty == "file" && path.n > 8 && path.ends_with(".parquet") {
+                        var size: i64 = jint(&d, c, "size")
+                        if size < 0 {
+                            size = 0
+                        }
+                        var u: rt.Buf = rt.buf_new()
+                        put(&u, (*cfg).endpoint)
+                        put(&u, "/datasets/")
+                        put_enc(&u, id, true)
+                        put(&u, "/resolve/main/")
+                        put_enc(&u, path, true)
+                        list_add(&all, str { p: rt.buf_data(&u), n: u.len }, path, size as u64)
+                        rt.buf_free(&u)
+                    }
+                    c = json.json_next(&d, c)
+                }
+            }
+            json.json_free(&d)
+            pages = pages + 1
+            if !next_link(n, &link) {
+                break
+            }
+        }
+        rt.buf_free(&link)
+        if ok && all.n > 0 {
+            var i: usize = 0
+            var matched: usize = 0
+            while split.n > 0 && i < all.n {
+                if has_token(hf_list_b(&all, i), split) {
+                    matched = matched + 1
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < all.n {
+                if split.n == 0 || matched == 0 || has_token(hf_list_b(&all, i), split) {
+                    list_add(out, hf_list_a(&all, i), hf_list_b(&all, i), hf_list_size(&all, i))
+                }
+                i = i + 1
+            }
+            hf_list_free(&all)
+            return true
+        }
+        hf_list_free(&all)
+        if !scoped {
+            return false
+        }
+        scoped = false
+        round = round + 1
+    }
+    return false
+}
+
+fn files_from_server(n: *mut hfnet.HfNet, cfg: *mut HfCfg, id: str, config: str, split: str, out: *mut HfList) -> bool {
+    var link: rt.Buf = rt.buf_new()
+    put(&link, (*cfg).server)
+    put(&link, "/parquet?dataset=")
+    put_enc(&link, id, true)
+    put(&link, "&config=")
+    put_enc(&link, config, false)
+    if split.n > 0 {
+        put(&link, "&split=")
+        put_enc(&link, split, false)
+    }
+    var d: json.Json = json.json_new()
+    var st: u64 = 0
+    var found: bool = false
+    if get_json(n, &link, &d, &st) == hfnet.HF_OK {
+        let root: u32 = json.json_root(&d)
+        let arr: u32 = json.json_get(&d, root, "parquet_files".p as u64, 13)
+        if arr != json.JSON_NONE && json.json_kind(&d, arr) == json.JSON_ARRAY {
+            var c: u32 = json.json_child(&d, arr)
+            while c != json.JSON_NONE {
+                let u: str = jstr(&d, c, "url")
+                let fname: str = jstr(&d, c, "filename")
+                var size: i64 = jint(&d, c, "size")
+                if size < 0 {
+                    size = 0
+                }
+                if u.n > 0 {
+                    list_add(out, u, fname, size as u64)
+                    found = true
+                }
+                c = json.json_next(&d, c)
+            }
+        }
+    }
+    json.json_free(&d)
+    rt.buf_free(&link)
+    return found
+}
+
+fn hf_list_files_cfg(cfg: *mut HfCfg, id: str, config: str, split: str, token: str, out: *mut HfList) -> bool {
+    if !hf_id_ok(id) {
+        return false
+    }
+    let n: *mut hfnet.HfNet = hfnet.hfnet_new(token)
+    if n == 0 as *mut hfnet.HfNet {
+        return false
+    }
+    var ok: bool = files_from_tree(n, cfg, id, config, split, out)
+    if !ok {
+        var cname: str = config
+        if cname.n == 0 {
+            cname = "default"
+        }
+        ok = files_from_server(n, cfg, id, cname, split, out)
+    }
+    hfnet.hfnet_free(n)
+    return ok
+}
+
+fn hf_list_files(id: str, config: str, split: str, token: str, out: *mut HfList) -> bool {
+    var cfg: HfCfg = hf_cfg_default()
+    return hf_list_files_cfg(&cfg, id, config, split, token, out)
+}
+
+#[allow_escape]
+fn hf_probe_cfg(link: str, token: str, size: *mut u64, sha: *mut rt.Buf) -> bool {
+    let n: *mut hfnet.HfNet = hfnet.hfnet_new(token)
+    if n == 0 as *mut hfnet.HfNet {
+        return false
+    }
+    var res: hfnet.HfRes = hfnet.hf_res_new()
+    var ok: bool = hfnet.hfnet_resolve(n, link, &res)
+    if ok && res.have_size {
+        *size = res.size
+        rt.buf_clear(sha)
+        let s: str = hfnet.hf_res_sha(&res)
+        rt.buf_push_bytes(sha, s.p as u64, s.n)
+    } else {
+        ok = false
+    }
+    hfnet.hf_res_free(&res)
+    hfnet.hfnet_free(n)
+    return ok
+}
+
+fn hf_probe(link: str, token: str, size: *mut u64) -> bool {
+    var sha: rt.Buf = rt.buf_new()
+    let ok: bool = hf_probe_cfg(link, token, size, &sha)
+    rt.buf_free(&sha)
+    return ok
+}

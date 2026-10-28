@@ -1,0 +1,258 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.net
+import std.fs
+import std.time
+import std.hashfile
+import http.server as http
+import hf.remote
+
+const KIND_SERVER: u64 = 7791
+const S_PORT: u64 = 0
+const S_QUIT: u64 = 8
+const S_READY: u64 = 16
+const S_MODE: u64 = 24
+const S_CDN: u64 = 32
+const S_RESOLVE: u64 = 40
+const S_AUTH_RESOLVE: u64 = 48
+const S_AUTH_CDN: u64 = 56
+const S_LAST_START: u64 = 64
+const S_SIZE: usize = 128
+const DATA_LEN: u64 = 2097152
+
+static mut SHARED: u64 = 0
+static mut SHA: [u8; 64] = [0; 64]
+
+fn ld(o: u64) -> u64 { return *((SHARED + o) as *mut u64) }
+fn st(o: u64, v: u64) { *((SHARED + o) as *mut u64) = v }
+fn bump(o: u64) { __atomic_add((SHARED + o) as *mut u64, 1) }
+
+fn byte_at(i: u64) -> u8 {
+    return ((((i *% 131) +% 17) ^ (i >> 8)) & 255) as u8
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == KIND_SERVER {
+        return serve_thread(arg)
+    }
+    return 0
+}
+
+fn push_s(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn on_resolve(r: *mut http.Req) {
+    bump(S_RESOLVE)
+    if http.header(r, "authorization").n > 0 {
+        st(S_AUTH_RESOLVE, 1)
+    }
+    var ex: rt.Buf = rt.buf_new()
+    push_s(&ex, "Location: http://localhost:")
+    rt.buf_push_dec_u64(&ex, ld(S_PORT))
+    push_s(&ex, "/cdn?v=")
+    rt.buf_push_dec_u64(&ex, ld(S_RESOLVE))
+    push_s(&ex, "\r\nX-Linked-Size: ")
+    rt.buf_push_dec_u64(&ex, DATA_LEN)
+    push_s(&ex, "\r\nX-Linked-ETag: \"")
+    rt.buf_push_bytes(&ex, (&SHA[0]) as u64, 64)
+    push_s(&ex, "\"\r\n")
+    http.reply_ex(r, 302, "text/plain", str { p: rt.buf_data(&ex), n: ex.len }, "")
+    rt.buf_free(&ex)
+}
+
+fn parse_start(rg: str, endp: *mut u64, has_end: *mut bool) -> u64 {
+    var v: u64 = 0
+    var i: usize = 6
+    while i < rg.n && rg.chars(i) != 45 as u8 {
+        v = v * 10 + (rg.chars(i) - 48 as u8) as u64
+        i = i + 1
+    }
+    var e: u64 = 0
+    *has_end = false
+    i = i + 1
+    while i < rg.n {
+        e = e * 10 + (rg.chars(i) - 48 as u8) as u64
+        *has_end = true
+        i = i + 1
+    }
+    *endp = e
+    return v
+}
+
+fn on_cdn(r: *mut http.Req) {
+    bump(S_CDN)
+    if http.header(r, "authorization").n > 0 {
+        st(S_AUTH_CDN, 1)
+    }
+    let mode: u64 = ld(S_MODE)
+    if mode == 1 {
+        st(S_MODE, 0)
+        http.reply(r, 403, "text/plain", "expired\n")
+        return
+    }
+    if mode == 2 {
+        st(S_MODE, 0)
+        http.reply(r, 500, "text/plain", "boom\n")
+        return
+    }
+    let rg: str = http.header(r, "range")
+    var start: u64 = 0
+    var last: u64 = DATA_LEN - 1
+    var ranged: bool = false
+    if mode != 3 && rg.n > 6 && rg.starts_with("bytes=") {
+        var e: u64 = 0
+        var he: bool = false
+        start = parse_start(rg, &e, &he)
+        if he && e < last {
+            last = e
+        }
+        ranged = true
+    }
+    st(S_LAST_START, start)
+    var data: rt.Buf = rt.buf_new()
+    var i: u64 = start
+    while i <= last {
+        rt.buf_push(&data, byte_at(i))
+        i = i + 1
+    }
+    if !ranged {
+        http.reply_ex(r, 200, "application/octet-stream", "Accept-Ranges: bytes\r\n",
+            str { p: rt.buf_data(&data), n: data.len })
+        rt.buf_free(&data)
+        return
+    }
+    var ex: rt.Buf = rt.buf_new()
+    push_s(&ex, "Content-Range: bytes ")
+    rt.buf_push_dec_u64(&ex, start)
+    push_s(&ex, "-")
+    rt.buf_push_dec_u64(&ex, last)
+    push_s(&ex, "/")
+    rt.buf_push_dec_u64(&ex, DATA_LEN)
+    push_s(&ex, "\r\n")
+    http.reply_ex(r, 206, "application/octet-stream", str { p: rt.buf_data(&ex), n: ex.len },
+        str { p: rt.buf_data(&data), n: data.len })
+    rt.buf_free(&ex)
+    rt.buf_free(&data)
+}
+
+#[allow_escape]
+fn serve_thread(sh: u64) -> u64 {
+    var port: u64 = 32000 + (rt.ld64(sh, 0) % 2000)
+    var tries: u32 = 0 as u32
+    while tries < 200 as u32 {
+        var app: http.App = http.app(port as u16)
+        app.addr = net.ADDR_LOCAL
+        http.set_quiet(&app, true)
+        http.route(&app, "/resolve", on_resolve)
+        http.route(&app, "/cdn", on_cdn)
+        if http.step(&app, 0) {
+            st(S_PORT, port)
+            st(S_READY, 1)
+            while ld(S_QUIT) == 0 {
+                http.step(&app, 10)
+            }
+            return 0
+        }
+        port = port + 1
+        tries = tries + 1 as u32
+    }
+    st(S_READY, 2)
+    return 0
+}
+
+fn same_bytes(p: u64, off: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != byte_at(off + i as u64) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    SHARED = rt.heap_alloc(S_SIZE)
+    rt.mem_set(SHARED, 0 as u8, S_SIZE)
+    st(0, time.monotonic_ns() % 1000003)
+    var all: rt.Buf = rt.buf_new()
+    var i: u64 = 0
+    while i < DATA_LEN {
+        rt.buf_push(&all, byte_at(i))
+        i = i + 1
+    }
+    let hex: str = hashfile.hash_bytes_hex(hashfile.HASH_SHA256, all.ptr, all.len)
+    rt.mem_copy((&SHA[0]) as u64, hex.p as u64, 64)
+    let th: u64 = thread_start(KIND_SERVER, SHARED)
+    var waited: u32 = 0 as u32
+    while ld(S_READY) == 0 && waited < 500 as u32 {
+        time.sleep_ms(10)
+        waited = waited + 1 as u32
+    }
+    if ld(S_READY) != 1 { return 1 as i32 }
+    var ub: rt.Buf = rt.buf_new()
+    push_s(&ub, "http://127.0.0.1:")
+    rt.buf_push_dec_u64(&ub, ld(S_PORT))
+    push_s(&ub, "/resolve")
+    let link: str = str { p: rt.buf_data(&ub), n: ub.len }
+    var rc: i32 = 0
+    var src: remote.HfSrc = remote.HfSrc { read_at: remote.hf_remote_read, ud: 0, size: 0 }
+    if !remote.hf_remote_open(link, "tok", &src) { return 2 as i32 }
+    if src.size != DATA_LEN { rc = 3 }
+    if ld(S_AUTH_RESOLVE) != 1 { rc = 4 }
+    if ld(S_AUTH_CDN) != 0 { rc = 5 }
+    remote.hf_remote_set_window(&src, 65536)
+    remote.hf_remote_set_retries(&src, 4, 20, 100)
+    let buf: u64 = rt.heap_alloc(400000)
+    let f: fn(u64, u64, u64, usize) -> bool = src.read_at
+    let c0: u64 = ld(S_CDN)
+    if !f(src.ud, 1000, buf, 100) || !same_bytes(buf, 1000, 100) { rc = 6 }
+    if !f(src.ud, 2000, buf, 100) || !same_bytes(buf, 2000, 100) { rc = 7 }
+    if ld(S_CDN) - c0 != 1 { rc = 8 }
+    if !f(src.ud, 500000, buf, 300000) || !same_bytes(buf, 500000, 300000) { rc = 9 }
+    if f(src.ud, DATA_LEN - 10, buf, 20) { rc = 10 }
+    if !f(src.ud, DATA_LEN - 8, buf, 8) || !same_bytes(buf, DATA_LEN - 8, 8) { rc = 11 }
+    let res0: u64 = remote.hf_remote_resolves(&src)
+    st(S_MODE, 1)
+    if !f(src.ud, 900000, buf, 200000) || !same_bytes(buf, 900000, 200000) { rc = 12 }
+    if remote.hf_remote_resolves(&src) != res0 + 1 { rc = 13 }
+    st(S_MODE, 2)
+    if !f(src.ud, 1200000, buf, 100000) || !same_bytes(buf, 1200000, 100000) { rc = 14 }
+    if remote.hf_remote_retries(&src) < 1 { rc = 15 }
+    st(S_MODE, 3)
+    if !f(src.ud, 1500000, buf, 100000) || !same_bytes(buf, 1500000, 100000) { rc = 16 }
+    st(S_MODE, 0)
+    if remote.hf_remote_bytes(&src) < 700000 { rc = 17 }
+    remote.hf_remote_cancel(&src)
+    if f(src.ud, 100, buf, 200000) { rc = 18 }
+    if remote.hf_remote_error(&src) != 5 { rc = 19 }
+    remote.hf_remote_close(&src)
+
+    var dirb: rt.Buf = rt.buf_new()
+    push_s(&dirb, "/tmp/firn-hf5722-")
+    rt.buf_push_dec_u64(&dirb, time.monotonic_ns())
+    let dir: str = str { p: rt.buf_data(&dirb), n: dirb.len }
+    let okm: bool = fs.mkdir_all(dir) catch false
+    if !okm { return 20 as i32 }
+    var db: rt.Buf = rt.buf_new()
+    push_s(&db, dir)
+    push_s(&db, "/out.bin")
+    let dest: str = str { p: rt.buf_data(&db), n: db.len }
+    var pb: rt.Buf = rt.buf_new()
+    push_s(&pb, dir)
+    push_s(&pb, "/out.bin.part")
+    let part: str = str { p: rt.buf_data(&pb), n: pb.len }
+    fs.write_file(part, all.ptr, 300000) catch 0
+    st(S_LAST_START, 0)
+    let dl: u64 = remote.hf_download(link, dest, "tok", true)
+    if dl != 0 { rc = 21 }
+    if ld(S_LAST_START) != 300000 { rc = 22 }
+    var got: rt.Buf = rt.buf_new()
+    let gn: usize = fs.read_file(dest, &got) catch 0
+    if gn != DATA_LEN as usize || !rt.mem_eq(got.ptr, all.ptr, gn) { rc = 23 }
+    st(S_QUIT, 1)
+    thread_wait(th)
+    return rc
+}
