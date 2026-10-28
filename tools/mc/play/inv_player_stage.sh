@@ -2,7 +2,7 @@
 player_shot() {
   local nm=$1 name=$2 x=$3 y=$4 wid=$5
   xdotool mousemove --window "$wid" "$x" "$y"; sleep 1
-  xwd -id "$wid" -silent -out "$W/$nm-$name.xwd" && python3 -I tools/mc/menu/xwd_to_ppm.py "$W/$nm-$name.xwd" "$W/$nm-$name.ppm"
+  xwd -id "$wid" -silent -out "$W/$nm-$name.xwd" && python3 -I tools/mc/menu/xwd_to_ppm.py "$W/$nm-$name.xwd" "$W/$nm-$name.ppm" && python3 -I -c 'import sys;from PIL import Image;Image.open(sys.argv[1]).save(sys.argv[2])' "$W/$nm-$name.ppm" "$W/$nm-$name.png"
 }
 
 run_player_stage() {
@@ -21,6 +21,7 @@ run_player_stage() {
   else
     echo "  FAIL  inv player: screenshot"; ERR=1
   fi
+  [ -n "${MCPLAY_KEEP_DIR:-}" ] && { mkdir -p "$MCPLAY_KEEP_DIR"; cp "$W"/$nm-*.ppm "$MCPLAY_KEEP_DIR"/ 2>/dev/null; }
   xdotool key Escape; sleep 1
   wait $PP
 }

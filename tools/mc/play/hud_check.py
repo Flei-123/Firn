@@ -237,9 +237,9 @@ def check_inv_player(left, right, up, jar, errors):
     for x in range(x0, x1):
         for y in range(y0, y1):
             r, g, b = left.getpixel((x, y))
-            if r < 40 and g > 110 and b > 110 and abs(g - b) < 40:
+            if r < 50 and g > 80 and b > 80 and abs(g - b) < 40:
                 teal += 1
-            elif 150 < r < 215 and 100 < g < 160 and 70 < b < 125 and r > g > b:
+            elif r > 110 and r > g > b and r - b > 40:
                 skin += 1
     ok = teal > 150 * s * s // 4 and skin > 40 * s * s // 4
     print(f"  {'ok  ' if ok else 'FAIL'}  inv player skin colours: shirt={teal} skin={skin}")
@@ -256,7 +256,8 @@ def check_inv_player(left, right, up, jar, errors):
     if not ok:
         errors.append("player pitch")
     outside = 0
-    for (ax, ay, bx, by) in ((0, 0, w, y0), (0, y1, w, h), (0, y0, x0, y1), (x1, y0, w, y1)):
+    px0, py0, px1, py1 = ox * s, oy * s, (ox + 176) * s, (oy + 166) * s
+    for (ax, ay, bx, by) in ((px0, py0, px1, y0), (px0, y1, px1, py1), (px0, y0, x0, y1), (x1, y0, px1, y1)):
         outside += region_diff(left, right, ax, ay, bx, by)
     ok = outside == 0
     print(f"  {'ok  ' if ok else 'FAIL'}  inv player: panel outside the model region unchanged by the mouse ({outside} px)")

@@ -435,9 +435,8 @@ sys.exit(0 if ench and cnt and int(cnt.group(1))==2 else 1)
 PY
 . tools/mc/play/inv_panel_stage.sh
 [ -n "$CJAR" ] && [ "${RUN_INV_ONLY:-}" != player ] && run_panel_stage
-. tools/mc/play/inv_player_stage.sh
-[ -n "$CJAR" ] && run_player_stage
 fi
+if [ "${RUN_INV_ONLY:-}" != trader ] && [ -n "$CJAR" ]; then . tools/mc/play/inv_player_stage.sh; run_player_stage; fi
 if { [ "${RUN_INV_TRADER:-0}" = 1 ] || [ "${RUN_INV_ONLY:-}" = trader ]; } && [ -n "$CJAR" ]; then . tools/mc/play/inv_trader_stage.sh; run_trader_stage; fi
 fi
 if [ -z "${RUN_INV_ONLY:-}" ]; then
