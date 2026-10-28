@@ -70,8 +70,8 @@ win() { local i w; for i in $(seq 1 60); do w=$(xdotool search --name mcplay 2>/
 shot() { xwd -id "$WIN" -silent -out "$W/$1.xwd" && python3 -I tools/mc/menu/xwd_to_ppm.py "$W/$1.xwd" "$W/$1.ppm"; }
 keep() { [ -n "${MCPLAY_KEEP_DIR:-}" ] && python3 -I -c "from PIL import Image; Image.open('$W/$1.ppm').save('$W/$1.png')"; }
 X=0
-MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_RUN_S=${CRACK_RUN_S:-170} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
-    MCPLAY_QUIT_FILE="$W/quit-V" timeout 230 $RUN 127.0.0.1 "$PORT" CrackV > "$W/CrackV.out" 2>&1 &
+MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_RUN_S=${CRACK_RUN_S:-240} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    MCPLAY_QUIT_FILE="$W/quit-V" timeout 300 $RUN 127.0.0.1 "$PORT" CrackV > "$W/CrackV.out" 2>&1 &
 PP=$!
 wj CrackV || { ERR=1; }
 for i in $(seq 1 1200); do [ "$(prog CrackV pos)" = true ] && [ "$(prog CrackV chunks)" -gt 10 ] 2>/dev/null && break; sleep 0.1; done
@@ -114,6 +114,29 @@ sleep 4
 shot other_after; keep other_after
 echo "  other player overlay:"
 python3 -I tools/mc/play/crack_check.py other "$W/other_before.ppm" "$W/other1.ppm" "$W/other2.ppm" "$W/other_after.ppm" || ERR=1
+echo "  occluded overlay (wall between the viewer and the dug block):"
+for cmd in "fill -3 119 -3 9 120 3 stone" "fill -3 121 -3 9 128 3 air" "setblock 6 121 0 stone" "tp CrackB -3.5 121 0.5" "tp CrackV 0.5 121 0.5 -90 0"; do echo "$cmd" >&3; done
+MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_RUN_S=60 MCPLAY_VIEW=$VIEW MCPLAY_FPS=10 MCPLAY_W=320 MCPLAY_H=200 \
+    MCPLAY_BOT_DIG_X=6 MCPLAY_BOT_DIG_Y=121 MCPLAY_BOT_DIG_Z=0 MCPLAY_BOT_DIG_MS=9000 MCPLAY_BOT_GO_FILE="$W/go2" \
+    MCPLAY_QUIT_FILE="$W/quit-C" DISPLAY=:$BDN timeout 100 $RUN 127.0.0.1 "$PORT" CrackC > "$W/CrackC.out" 2>&1 &
+BOT2_PID=$!
+wj CrackC || ERR=1
+echo "gamemode survival CrackC" >&3
+echo "tp CrackC 5.5 121 2.5 180 0" >&3
+sleep 4
+wait_ticks CrackV 30
+shot hid0; keep hid0
+touch "$W/go2"
+sleep 3.5
+shot hid1; keep hid1
+echo "fill 3 121 -3 3 126 3 stone" >&3
+sleep 2
+wait_ticks CrackV 20
+shot hid2; keep hid2
+sleep 9
+shot hid3; keep hid3
+python3 -I tools/mc/play/crack_check.py hidden "$W/hid0.ppm" "$W/hid1.ppm" "$W/hid2.ppm" "$W/hid3.ppm" || ERR=1
+touch "$W/quit-C"; wait $BOT2_PID 2>/dev/null
 grep -q "crack textures unavailable" "$W/CrackV.out" && { echo "  FAIL  crack textures did not load"; ERR=1; }
 grep -E "dig=" "$W/CrackV.out" | tail -1 | cut -c1-260 | sed "s/^/  viewer: /"
 grep "dig_bot" "$W/CrackB.out" | tr "\n" " " | sed "s/^/  bot: /"; echo

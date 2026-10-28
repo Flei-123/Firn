@@ -32,8 +32,25 @@ def differing(a_im, b_im):
     return n
 
 
+def main_hidden():
+    h0, h1, h2, h3 = [Image.open(p) for p in sys.argv[2:6]]
+    visible = darker(h0, h1, 25)
+    through = differing(h2, h3)
+    print(f"  hidden: visible crack dark pixels={visible} behind_wall_differing={through}")
+    ok = True
+    if visible < 15:
+        print("  FAIL  hidden: crack not visible without the wall (test setup)")
+        ok = False
+    if through > 30:
+        print(f"  FAIL  hidden: crack draws through the wall ({through} pixels differ)")
+        ok = False
+    sys.exit(0 if ok else 1)
+
+
 def main():
     mode = sys.argv[1]
+    if mode == "hidden":
+        main_hidden()
     before, s1, s2, after = [Image.open(p) for p in sys.argv[2:6]]
     d1 = darker(before, s1, 25)
     d2 = darker(before, s2, 25)
