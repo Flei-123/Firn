@@ -34,6 +34,7 @@ mod asm_intern;
 mod asm_x86;
 mod a64enc;
 mod asm_a64;
+mod asm_dwarf;
 mod elfobj;
 mod comptime;
 mod env;
@@ -340,6 +341,8 @@ fn usage() -> String {
          --test-limit=<s>   time limit per case in seconds (default 30, 0 = none)\n  \
          --no-run           with --test: only build, do not run\n  \
          --keep-asm         keep the generated .s file\n  \
+         --asm-intern       assemble with the built-in encoder (default for x86_64-linux)\n  \
+         --asm-as           assemble with the system `as` (or set FIRN_USE_AS=1)\n  \
          --version          print the version\n  \
          --print-sysroot    print the standard library directory ($FIRNLIB wins) and exit\n  \
          -h, --help         this help\n",
@@ -492,10 +495,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 }
             }
             "--keep-asm" => keep_asm = true,
-            // ROUND KODIERER: use the compiler's own binary encoder instead of `as`.
-            // The default stays `as` until the counter check over the whole tree
-            // is octet-identical (tools/kodierer/run.sh).
             "--asm-intern" => asm_intern::set(true),
+            "--asm-as" => asm_intern::set(false),
             "--stats" => stats = true,
             "--timings" => timings = true,
             _ if a.starts_with("--deps-out=") => {
@@ -668,6 +669,7 @@ fn object_only(args: &[String]) -> i32 {
         match args[i].as_str() {
             "--object-only" => {}
             "--asm-intern" => asm_intern::set(true),
+            "--asm-as" => asm_intern::set(false),
             "-o" => {
                 i += 1;
                 out = args.get(i).map(PathBuf::from);
@@ -1429,6 +1431,7 @@ fn make_object(
     asm_path: &Path,
     obj_path: &Path,
     slot: Option<&buildcache::Slot>,
+    keep_asm: bool,
     tm: &mut Timings,
 ) -> Result<(), i32> {
     if let Some(bytes) = cached.take() {
@@ -1439,12 +1442,19 @@ fn make_object(
         return Ok(());
     }
     let text = asm.unwrap_or("");
-    if let Err(e) = std::fs::write(asm_path, text.as_bytes()) {
-        eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
-        return Err(2);
+    let direct = asm_intern::get();
+    if !direct || keep_asm {
+        if let Err(e) = std::fs::write(asm_path, text.as_bytes()) {
+            eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
+            return Err(2);
+        }
+        tm.mark("write .s");
     }
-    tm.mark("write .s");
-    assemble(asm_path, obj_path)?;
+    if direct {
+        assemble_intern(text, obj_path)?;
+    } else {
+        assemble(asm_path, obj_path)?;
+    }
     if let Some(s) = slot {
         if objcache::save(s, obj_path) {
             buildcache::log("objsave");
@@ -1511,7 +1521,7 @@ fn finish(
                 None => out.with_extension("so"),
             };
             let obj_path = so.with_extension("o");
-            if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
+            if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, opts.keep_asm, tm) {
                 return code;
             }
             if !opts.keep_asm {
@@ -1528,7 +1538,7 @@ fn finish(
             Some(p) => p.clone(),
             None => out.with_extension("o"),
         };
-        if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
+        if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, opts.keep_asm, tm) {
             return code;
         }
         tm.mark("as");
@@ -1542,7 +1552,7 @@ fn finish(
     if let Err(code) = check_link(link) {
         return code;
     }
-    if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
+    if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, opts.keep_asm, tm) {
         return code;
     }
     if let Err(code) = link_executable(&obj_path, &out, link) {
@@ -1747,44 +1757,43 @@ fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
     }
 }
 
+fn assemble_intern(text: &str, obj: &Path) -> Result<(), i32> {
+    let t = target::active();
+    let res = if target::windows() {
+        Err(String::from(
+            "the integrated assembler writes ELF objects; x86_64-windows needs PE/COFF and uses `as`",
+        ))
+    } else {
+        match t {
+            target::Target::X86_64 => asm_x86::assemble_to_object(text),
+            target::Target::Aarch64 => asm_a64::assemble_to_object(text),
+            target::Target::Wasm32Browser => {
+                Err(String::from("the integrated assembler has no WebAssembly target"))
+            }
+        }
+    };
+    match res {
+        Ok(bytes) => match std::fs::write(obj, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: cannot write '{}': {}", obj.display(), e);
+                Err(3)
+            }
+        },
+        Err(e) => {
+            eprintln!("error: integrated assembler: {}", e);
+            Err(3)
+        }
+    }
+}
+
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
-    // ROUND KODIERER: the own way -- no process, no `as`.
     if asm_intern::get() {
-        let text = match std::fs::read_to_string(asm) {
-            Ok(t) => t,
+        return match std::fs::read_to_string(asm) {
+            Ok(text) => assemble_intern(&text, obj),
             Err(e) => {
                 eprintln!("error: cannot read '{}': {}", asm.display(), e);
-                return Err(3);
-            }
-        };
-        // The assembler writes ELF objects. Windows needs PE/COFF and stays
-        // on the default path through the system assembler, and a
-        // WebAssembly build has no assembler at all.
-        let res = if target::windows() {
-            Err(String::from(
-                "the integrated assembler writes ELF objects; x86_64-windows needs \
-                 PE/COFF and stays on the default path through `as`",
-            ))
-        } else {
-            match t {
-                target::Target::X86_64 => asm_x86::assemble_to_object(&text),
-                target::Target::Aarch64 => asm_a64::assemble_to_object(&text),
-                target::Target::Wasm32Browser => {
-                    Err(String::from("the integrated assembler has no WebAssembly target"))
-                }
-            }
-        };
-        return match res {
-            Ok(bytes) => match std::fs::write(obj, &bytes) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    eprintln!("error: cannot write '{}': {}", obj.display(), e);
-                    Err(3)
-                }
-            },
-            Err(e) => {
-                eprintln!("error: integrated assembler: {}", e);
                 Err(3)
             }
         };

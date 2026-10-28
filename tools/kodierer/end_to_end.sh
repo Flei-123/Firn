@@ -11,7 +11,7 @@
 # Usage: bash tools/kodierer/end_to_end.sh [pattern]
 set -u
 cd "$(dirname "$0")/../.."
-FIRNC="compiler/target/release/firnc"
+FIRNC="${FIRNC:-compiler/target/release/firnc}"
 export FIRNLIB="$(pwd)/lib"
 PATTERN="${1:-tests/*.fi}"
 W=$(mktemp -d)
@@ -31,7 +31,7 @@ run() { # $1 = program -> "rc|output"
 
 for t in $PATTERN; do
     [ -f "$t" ] || continue
-    if ! "$FIRNC" -o "$W/old" "$t" >"$W/old.log" 2>&1; then
+    if ! "$FIRNC" --asm-as -o "$W/old" "$t" >"$W/old.log" 2>&1; then
         old_fail=$((old_fail+1)); continue
     fi
     if ! "$FIRNC" --asm-intern -o "$W/new" "$t" >"$W/new.log" 2>&1; then

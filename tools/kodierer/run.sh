@@ -20,7 +20,7 @@
 # =====================================================================
 set -u
 cd "$(dirname "$0")/../.."
-FIRNC="compiler/target/release/firnc"
+FIRNC="${FIRNC:-compiler/target/release/firnc}"
 export FIRNLIB="$(pwd)/lib"
 
 ARCH=x86

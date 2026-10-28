@@ -49,6 +49,7 @@
 
 #![allow(dead_code)]
 
+use crate::asm_dwarf::{self, DebugParams, DebugSyms, LineEntry, SourceFile};
 use crate::x86enc::{self as E, Buf, Inst, Mem, Opnd};
 use crate::fx::HashMap;
 
@@ -102,6 +103,8 @@ pub struct Sym {
 pub struct Assembled {
     pub sections: Vec<Section>,
     pub symbols: Vec<Sym>,
+    pub files: Vec<SourceFile>,
+    pub lines: Vec<LineEntry>,
 }
 
 // ===========================================================================
@@ -125,6 +128,8 @@ enum Piece {
     Align { n: u64 },
     /// A label at this place.
     Label { name: String },
+    /// A source position (`.loc`) taking effect at this place.
+    Loc { file: u32, line: u32, col: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +162,8 @@ pub struct Asm {
     /// Counter for the numeric labels (`1:` ... `jnz 1f`).
     numeric: HashMap<u32, u32>,
     line_no: usize,
+    files: Vec<SourceFile>,
+    pending_loc: Option<(u32, u32, u32)>,
 }
 
 impl Default for Asm {
@@ -174,6 +181,8 @@ impl Asm {
             aligns: [1, 1, 1, 1, 1],
             numeric: HashMap::default(),
             line_no: 0,
+            files: Vec::new(),
+            pending_loc: None,
         }
     }
 
@@ -187,9 +196,27 @@ impl Asm {
 
     /// Takes in the whole assembler text.
     pub fn feed(&mut self, text: &str) -> Result<(), String> {
+        let lenient = std::env::var_os("FIRN_ASM_LENIENT").is_some();
+        let mut shapes: HashMap<String, (usize, String)> = HashMap::default();
         for (n, raw) in text.lines().enumerate() {
             self.line_no = n + 1;
-            self.line(raw)?;
+            if let Err(e) = self.line(raw) {
+                if !lenient {
+                    return Err(e);
+                }
+                let shape: String = e.split_once(": ").map_or(e.clone(), |x| x.1.to_string());
+                let key: String = shape.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+                let ent = shapes.entry(key).or_insert((0, format!("{} | {}", e, raw.trim())));
+                ent.0 += 1;
+            }
+        }
+        if lenient && !shapes.is_empty() {
+            let mut v: Vec<_> = shapes.into_iter().collect();
+            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (_, (count, example)) in v.iter().take(60) {
+                eprintln!("{:>8}  {}", count, example);
+            }
+            return Err(String::from("lenient run found unsupported lines"));
         }
         Ok(())
     }
@@ -282,8 +309,11 @@ impl Asm {
             None => (s, ""),
         };
         match d {
-            ".intel_syntax" | ".file" | ".loc" | ".ident" | ".cfi_startproc"
-            | ".cfi_endproc" | ".type" | ".size" => Ok(()),
+            ".intel_syntax" | ".ident" | ".cfi_startproc" | ".cfi_endproc" | ".type" | ".size" => {
+                Ok(())
+            }
+            ".file" => self.file_directive(rest),
+            ".loc" => self.loc_directive(rest),
             ".text" => {
                 self.cur = SEC_TEXT;
                 Ok(())
@@ -384,11 +414,51 @@ impl Asm {
         }
     }
 
+    fn file_directive(&mut self, rest: &str) -> Result<(), String> {
+        let (num, name) = match rest.split_once(char::is_whitespace) {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        let number: u32 = match num.parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        let raw = split_commas_strings(name.trim()).into_iter().next().unwrap_or_default();
+        let bytes = unescape(&raw)?;
+        let path = String::from_utf8_lossy(&bytes).into_owned();
+        self.files.push(SourceFile { number, path });
+        Ok(())
+    }
+
+    fn loc_directive(&mut self, rest: &str) -> Result<(), String> {
+        let mut it = rest.split_whitespace();
+        let mut next = |what: &str| -> Result<u32, String> {
+            it.next()
+                .and_then(|t| t.parse().ok())
+                .ok_or_else(|| format!("line {}: .loc {}", self.line_no, what))
+        };
+        let file = next("file")?;
+        let line = next("line")?;
+        let col = it.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        self.flush_loc();
+        self.pending_loc = Some((file, line, col));
+        Ok(())
+    }
+
+    fn flush_loc(&mut self) {
+        if let Some((file, line, col)) = self.pending_loc.take() {
+            if self.cur == SEC_TEXT {
+                self.push(Piece::Loc { file, line, col });
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Instructions
     // -----------------------------------------------------------------
 
     fn instruction(&mut self, s: &str) -> Result<(), String> {
+        self.flush_loc();
         let (mut m, mut rest) = match s.find(char::is_whitespace) {
             Some(i) => (s[..i].to_ascii_lowercase(), s[i..].trim()),
             None => (s.to_ascii_lowercase(), ""),
@@ -453,6 +523,9 @@ impl Asm {
                 add
             };
             out.push(PendReloc { at: f.at, name, kind, addend });
+        }
+        for f in &buf.fixups {
+            buf.code[f.at..f.at + f.size as usize].fill(0);
         }
         self.push(Piece::Fixed { bytes: buf.code, relocs: out });
         Ok(())
@@ -961,6 +1034,7 @@ impl Asm {
                         Piece::Label { name } => {
                             labels.insert(name.clone(), (sec, off));
                         }
+                        Piece::Loc { .. } => {}
                     }
                 }
                 offsets[sec] = v;
@@ -1060,12 +1134,16 @@ impl Asm {
             })
             .collect();
 
+        let mut lines: Vec<LineEntry> = Vec::new();
         for sec in 0..N_SEC {
             let pieces = std::mem::take(&mut self.pieces[sec]);
             for p in pieces {
                 let base = sections[sec].bytes.len() as u64;
                 match p {
                     Piece::Label { .. } => {}
+                    Piece::Loc { file, line, col } => {
+                        lines.push(LineEntry { addr: base, file, line, col });
+                    }
                     Piece::Align { n } => {
                         let r = base % n;
                         if r != 0 {
@@ -1147,7 +1225,7 @@ impl Asm {
             }
         }
 
-        Ok(Assembled { sections, symbols })
+        Ok(Assembled { sections, symbols, files: std::mem::take(&mut self.files), lines })
     }
 }
 
@@ -1547,6 +1625,7 @@ fn parse_mem(
     let mut index: Option<u8> = None;
     let mut scale: u8 = 1;
     let mut disp: i64 = 0;
+    let mut sym_term: Option<String> = None;
 
     // Split into pieces: separate at + and -, keep the sign.
     let mut terms: Vec<(i64, String)> = Vec::new();
@@ -1593,10 +1672,19 @@ fn parse_mem(
             disp += sg * v;
             continue;
         }
+        if sg > 0 && sym_term.is_none() && is_symbolish(&term) {
+            sym_term = Some(term);
+            continue;
+        }
         return Err(format!("cannot parse part '{}' in [{}]", term, inner));
     }
 
-    Ok(Opnd::Mem(Mem { base, index, scale, disp, rip: false, bits, disp_fix: None, seg: 0 }))
+    let disp_fix = sym_term.map(|name| {
+        let id = syms.len() as u32;
+        syms.push((name, disp, R_X86_64_32S));
+        id
+    });
+    Ok(Opnd::Mem(Mem { base, index, scale, disp, rip: false, bits, disp_fix, seg: 0 }))
 }
 
 /// How an instruction from the `0F` space distributes its operands.
@@ -1787,9 +1875,20 @@ fn sse_table(m: &str) -> Option<(u8, u8, u8, SseForm)> {
 
 /// The convenient overall entry: text in, object content out.
 pub fn assemble(text: &str) -> Result<Assembled, String> {
+    let timing = std::env::var_os("FIRN_STAGE_TIMINGS").is_some();
+    let start = std::time::Instant::now();
     let mut a = Asm::new();
     a.feed(text)?;
-    a.finish()
+    let parsed = start.elapsed();
+    let out = a.finish();
+    if timing {
+        eprintln!(
+            "assembler: parse {:.1} ms, layout+encode {:.1} ms",
+            parsed.as_secs_f64() * 1e3,
+            (start.elapsed() - parsed).as_secs_f64() * 1e3
+        );
+    }
+    out
 }
 
 // ===========================================================================
@@ -1833,7 +1932,7 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             });
         }
     }
-    let syms: Vec<crate::elfobj::OutSym> = a
+    let mut syms: Vec<crate::elfobj::OutSym> = a
         .symbols
         .iter()
         .map(|s| crate::elfobj::OutSym {
@@ -1844,6 +1943,36 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             is_section: s.is_section,
         })
         .collect();
+    if !a.lines.is_empty() {
+        let first = secs.len();
+        let mut section_sym = |index: usize| {
+            syms.push(crate::elfobj::OutSym {
+                name: String::new(),
+                section: Some(index),
+                value: 0,
+                global: false,
+                is_section: true,
+            });
+            syms.len() - 1
+        };
+        let debug_syms = DebugSyms {
+            text: 0,
+            line: section_sym(first),
+            info: section_sym(first + 1),
+            abbrev: section_sym(first + 2),
+            strings: section_sym(first + 4),
+        };
+        let _ = section_sym(first + 3);
+        let params = DebugParams {
+            files: &a.files,
+            entries: &a.lines,
+            text_len: a.sections[SEC_TEXT].bytes.len() as u64,
+            comp_dir: ".",
+            producer: "firnc integrated assembler",
+            syms: debug_syms,
+        };
+        secs.extend(asm_dwarf::sections(&params));
+    }
     Ok(crate::elfobj::write(crate::elfobj::EM_X86_64, &secs, &syms))
 }
 

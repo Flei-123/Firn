@@ -9,8 +9,8 @@ What is compared
   * the set of relocations (offset, symbol name, kind, addend) per section,
   * the defined global symbols with their value.
 
-NOT compared is the debug information (.debug_*): the internal way does not
-produce it (see docs/ROUND-KODIERER.md, "What is missing").
+For x86-64 the line table (.debug_line, .debug_info, .debug_abbrev,
+.debug_aranges) is compared too; .debug_str differs on purpose (producer).
 
 On a deviation the instruction where it begins is reported -- with expected and
 actual encoding and the nearest label, so that the place in the source can be
@@ -23,6 +23,7 @@ Usage:
 import os, re, subprocess, sys, tempfile, json
 
 COMPARED_SECTIONS = [".text", ".data", ".rodata", ".bss"]
+DEBUG_SECTIONS = [".debug_line", ".debug_info", ".debug_abbrev", ".debug_aranges"]
 
 
 # --------------------------------------------------------------------------
@@ -223,7 +224,7 @@ def check(firnc, s_path, tmpd, arch="x86"):
         result["errors"].append("ELF unreadable: %s" % ex)
         return result
 
-    for sec in COMPARED_SECTIONS:
+    for sec in COMPARED_SECTIONS + (DEBUG_SECTIONS if arch == "x86" else []):
         da, db = ea.data(sec), eb.data(sec)
         result["bytes"] += len(da)
         if da != db:
@@ -243,7 +244,8 @@ def check(firnc, s_path, tmpd, arch="x86"):
             msg += ["    " + x for x in disasm_at(b_o, sec, i)]
             result["errors"].append("\n".join(msg))
 
-        ra, rb = ea.relocs(sec), eb.relocs(sec)
+        ra = {r for r in ea.relocs(sec) if r[1] != ".debug_str"}
+        rb = {r for r in eb.relocs(sec) if r[1] != ".debug_str"}
         result["relocs"] += len(ra)
         if ra != rb:
             result["ok"] = False

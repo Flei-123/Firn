@@ -1,21 +1,20 @@
-//! **ROUND KODIERER (the encoder) -- the flag.**
-//!
-//! The old way (assembler text to `as`) stays the default until the counter
-//! check over the whole tree is octet-identical. `--asm-intern` switches to
-//! the compiler's own encoder. Deliberately a process-wide switch and not an
-//! option passed along: it touches exactly one place (`assemble()` in
-//! `main.rs`), and a compiler run has exactly one target machine.
-
+use crate::target;
 use std::cell::Cell;
 
 thread_local! {
-    static ON: Cell<bool> = const { Cell::new(false) };
+    static MODE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 pub fn set(v: bool) {
-    ON.with(|c| c.set(v));
+    MODE.with(|c| c.set(Some(v)));
+}
+
+fn default_on() -> bool {
+    target::active() == target::Target::X86_64
+        && !target::windows()
+        && std::env::var_os("FIRN_USE_AS").is_none()
 }
 
 pub fn get() -> bool {
-    ON.with(|c| c.get())
+    MODE.with(|c| c.get()).unwrap_or_else(default_on)
 }

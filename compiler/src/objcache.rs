@@ -12,7 +12,7 @@ fn tool_id() -> Option<String> {
         .get_or_init(|| {
             let t = target::active();
             if asm_intern::get() {
-                return Some(format!("intern:{}", t.as_flags().join(" ")));
+                return Some(format!("intern2:{}", t.as_flags().join(" ")));
             }
             let out = Command::new(t.assembler()).arg("--version").output().ok()?;
             if !out.status.success() {
