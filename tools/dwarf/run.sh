@@ -342,6 +342,30 @@ done
 echo
 
 echo
+echo "== 9. r1147: --opt-level=dev through the integrated assembler =="
+DEV_BIN="$TMPD/dev_intern"
+if "$FIRNC" --opt-level=dev -o "$DEV_BIN" tests/6104_dev_level_debug_sections.fi 2> "$TMPD/dev_intern.err"; then
+    ok
+else
+    bad "dev build with the integrated assembler failed: $(head -c 200 "$TMPD/dev_intern.err")"
+fi
+if "$DEV_BIN"; then ok; else bad "dev build of tests/6104 exits non-zero"; fi
+secs=$(readelf -S "$DEV_BIN" 2> /dev/null)
+for name in .debug_info .debug_abbrev .debug_line; do
+    if printf '%s' "$secs" | grep -q "$name"; then ok; else bad "dev build lacks $name"; fi
+done
+"$FIRNC" --opt-level=dev --asm-as -o "$TMPD/dev_as" tests/6104_dev_level_debug_sections.fi 2> /dev/null || bad "dev build with as failed"
+tags_intern=$(readelf --debug-dump=info "$DEV_BIN" 2> /dev/null | grep -c 'DW_TAG_')
+tags_as=$(readelf --debug-dump=info "$TMPD/dev_as" 2> /dev/null | grep -c 'DW_TAG_')
+if [ "$tags_intern" -gt 0 ] && [ "$tags_intern" -eq "$tags_as" ]; then ok; else bad "DIE count differs: intern=$tags_intern as=$tags_as"; fi
+gdb_out=$(gdb -batch -ex "break leaf" -ex run -ex "info args" -ex bt "$DEV_BIN" 2>&1)
+if printf '%s' "$gdb_out" | grep -q 'a = 7' && printf '%s' "$gdb_out" | grep -q 'tests/6104_dev_level_debug_sections.fi:'; then
+    ok
+else
+    bad "gdb on the dev build does not show args and source lines"
+fi
+
+echo
 echo "DWARF: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

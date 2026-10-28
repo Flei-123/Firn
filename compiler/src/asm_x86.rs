@@ -63,7 +63,9 @@ pub const SEC_RODATA: usize = 2;
 pub const SEC_NOTE: usize = 3;
 /// `.bss` -- content zero, but occupies room in the image (ELF: `NOBITS`).
 pub const SEC_BSS: usize = 4;
-pub const N_SEC: usize = 5;
+pub const SEC_DEBUG_ABBREV: usize = 5;
+pub const SEC_DEBUG_INFO: usize = 6;
+pub const N_SEC: usize = 7;
 
 /// Relocation kinds that occur here (values per the System V ABI, x86-64).
 pub const R_X86_64_64: u32 = 1;
@@ -175,10 +177,10 @@ impl Default for Asm {
 impl Asm {
     pub fn new() -> Asm {
         Asm {
-            pieces: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            pieces: std::array::from_fn(|_| Vec::new()),
             cur: SEC_TEXT,
             globals: Vec::new(),
-            aligns: [1, 1, 1, 1, 1],
+            aligns: [1; N_SEC],
             numeric: HashMap::default(),
             line_no: 0,
             files: Vec::new(),
@@ -330,6 +332,8 @@ impl Asm {
                     ".rodata" => SEC_RODATA,
                     ".note.GNU-stack" => SEC_NOTE,
                     ".bss" => SEC_BSS,
+                    ".debug_abbrev" => SEC_DEBUG_ABBREV,
+                    ".debug_info" => SEC_DEBUG_INFO,
                     other => return Err(self.err(format!("unknown section {}", other))),
                 };
                 Ok(())
@@ -1110,10 +1114,21 @@ impl Asm {
         // the global ones. We need the section symbols anyway: relocations
         // against local labels go through them.
         let secnames: [&'static str; N_SEC] =
-            [".text", ".data", ".rodata", ".note.GNU-stack", ".bss"];
+            [
+            ".text",
+            ".data",
+            ".rodata",
+            ".note.GNU-stack",
+            ".bss",
+            ".debug_abbrev",
+            ".debug_info",
+        ];
         let mut symbols: Vec<Sym> = Vec::new();
         let mut symidx: HashMap<String, usize> = HashMap::default();
         for (i, n) in secnames.iter().enumerate() {
+            if i >= SEC_DEBUG_ABBREV && self.pieces[i].is_empty() {
+                continue;
+            }
             symidx.insert(format!("\u{3}sec{}", i), symbols.len());
             symbols.push(Sym {
                 name: (*n).to_string(),
@@ -1159,6 +1174,9 @@ impl Asm {
                 match p {
                     Piece::Label { .. } => {}
                     Piece::Loc { file, line, col } => {
+                        if sec != SEC_TEXT || line == 0 {
+                            continue;
+                        }
                         lines.push(LineEntry { addr: base, file, line, col });
                     }
                     Piece::Align { n } => {
@@ -1920,6 +1938,8 @@ fn elf_index(sec: usize) -> usize {
         SEC_DATA => 1,
         SEC_BSS => 2,
         SEC_RODATA => 3,
+        SEC_DEBUG_ABBREV => 5,
+        SEC_DEBUG_INFO => 6,
         _ => 4,
     }
 }
@@ -1938,6 +1958,15 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             a.sections[SEC_RODATA].align,
         ],
     );
+    let own_debug = !a.sections[SEC_DEBUG_INFO].bytes.is_empty();
+    if own_debug {
+        for sec in [SEC_DEBUG_ABBREV, SEC_DEBUG_INFO] {
+            secs.push(asm_dwarf::plain_section(
+                a.sections[sec].name,
+                a.sections[sec].bytes.clone(),
+            ));
+        }
+    }
     for s in 0..N_SEC {
         let ei = elf_index(s);
         for r in &a.sections[s].relocs {
@@ -1960,7 +1989,25 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             is_section: s.is_section,
         })
         .collect();
-    if !a.lines.is_empty() {
+    if own_debug && !a.lines.is_empty() {
+        let line_sym = syms.len();
+        syms.push(crate::elfobj::OutSym {
+            name: String::new(),
+            section: Some(secs.len()),
+            value: 0,
+            global: false,
+            is_section: true,
+        });
+        let params = DebugParams {
+            files: &a.files,
+            entries: &a.lines,
+            text_len: a.sections[SEC_TEXT].bytes.len() as u64,
+            comp_dir: ".",
+            producer: "firnc integrated assembler",
+            syms: DebugSyms { text: 0, line: line_sym, info: 0, abbrev: 0, strings: 0 },
+        };
+        secs.push(asm_dwarf::line_section(&params));
+    } else if !a.lines.is_empty() && !own_debug {
         let first = secs.len();
         let mut section_sym = |index: usize| {
             syms.push(crate::elfobj::OutSym {
@@ -2001,6 +2048,21 @@ mod tests {
     fn text_of(s: &str) -> String {
         let a = assemble(&format!(".intel_syntax noprefix\n.text\n{}\n", s)).expect("assembles");
         a.sections[SEC_TEXT].bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn own_debug_sections_are_passed_through() {
+        let text = ".intel_syntax noprefix\n.text\nf:\n    ret\n.Ltext_end:\n\
+            .section .debug_abbrev,\"\",@progbits\n    .byte 1,2,3\n\
+            .section .debug_info,\"\",@progbits\n    .byte 9\n    .quad f\n    .quad .Ltext_end\n.text\n";
+        let a = assemble(text).expect("assembles");
+        assert_eq!(a.sections[SEC_DEBUG_ABBREV].bytes, vec![1, 2, 3]);
+        assert_eq!(a.sections[SEC_DEBUG_INFO].bytes.len(), 17);
+        assert_eq!(a.sections[SEC_DEBUG_INFO].relocs.len(), 2);
+        assert_eq!(a.sections[SEC_DEBUG_INFO].relocs[0].offset, 1);
+        let obj = assemble_to_object(text).expect("object");
+        assert!(obj.windows(11).any(|w| w == b".debug_info"));
+        assert!(obj.windows(13).any(|w| w == b".debug_abbrev"));
     }
 
     /// The octets `as` produces (objdump of the same lines), checked in by hand

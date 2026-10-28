@@ -218,6 +218,15 @@ fn section(name: &str, bytes: Vec<u8>, align: u64, relocs: Vec<OutReloc>) -> Out
     OutSec { name: name.into(), bytes, align, kind: SHT_PROGBITS, flags: 0, relocs }
 }
 
+pub fn plain_section(name: &str, bytes: Vec<u8>) -> OutSec {
+    section(name, bytes, 1, Vec::new())
+}
+
+pub fn line_section(p: &DebugParams) -> OutSec {
+    let (bytes, relocs) = line_program(p);
+    section(".debug_line", bytes, 1, relocs)
+}
+
 fn rel(offset: u64, sym: usize, kind: u32, addend: i64) -> OutReloc {
     OutReloc { offset, sym, kind, addend }
 }
