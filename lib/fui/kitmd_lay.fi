@@ -1,0 +1,448 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import markdown.doc
+import markdown.md
+import fui.painter
+import fui.kitmd_types
+import fui.kitmd_measure
+import fui.kitmd_clean
+
+export { build }
+
+struct Lay {
+    z: *mut painter.Painter,
+    out: *mut kitmd_types.Layout,
+    d: *mut doc.Doc,
+    size: f64,
+    cur: f64,
+    y: f64,
+    left: f64,
+    right: f64,
+    x: f64,
+    ly: f64,
+    lcont: bool,
+    sp: bool,
+    last: i64,
+    ext: f64,
+    gap: f64,
+}
+
+fn item_at(l: *mut Lay, i: usize) -> *mut kitmd_types.Item {
+    return vec_elem_ptr[kitmd_types.Item](&(*(*l).out).items, i)
+}
+
+fn push_item(l: *mut Lay, it: kitmd_types.Item) -> usize {
+    let i: usize = vec_len[kitmd_types.Item](&(*(*l).out).items)
+    vec_push[kitmd_types.Item](&(*(*l).out).items, it)
+    return i
+}
+
+fn blank(kind: u32) -> kitmd_types.Item {
+    return kitmd_types.Item { kind: kind, flags: 0 as u32, role: kitmd_types.R_TEXT, off: 0 as u32, n: 0 as u32,
+        x: 0.0, y: 0.0, w: 0.0, h: 0.0, size: 0.0 }
+}
+
+fn lh_of(size: f64) -> f64 {
+    return size * 1.4
+}
+
+fn note_ext(l: *mut Lay, v: f64) {
+    if v > (*l).ext {
+        (*l).ext = v
+    }
+}
+
+fn begin_flow(l: *mut Lay, left: f64, right: f64, size: f64) {
+    (*l).left = left
+    (*l).right = right
+    (*l).cur = size
+    (*l).x = left
+    (*l).ly = (*l).y
+    (*l).lcont = false
+    (*l).sp = false
+    (*l).last = kitmd_types.NONE
+}
+
+fn new_line(l: *mut Lay) {
+    (*l).y = (*l).ly + lh_of((*l).cur)
+    (*l).ly = (*l).y
+    (*l).x = (*l).left
+    (*l).lcont = false
+    (*l).sp = false
+    (*l).last = kitmd_types.NONE
+}
+
+fn end_flow(l: *mut Lay) {
+    if (*l).lcont {
+        (*l).y = (*l).ly + lh_of((*l).cur)
+    }
+    (*l).last = kitmd_types.NONE
+}
+
+fn emit_text(l: *mut Lay, p: u64, n: usize, flags: u32, role: u32, x: f64, w: f64, merge: bool, space: bool) {
+    let out: *mut kitmd_types.Layout = (*l).out
+    if merge && (*l).last >= 0 {
+        let it: *mut kitmd_types.Item = item_at(l, (*l).last as usize)
+        if (*it).flags == flags && (*it).role == role {
+            if space {
+                rt.buf_push(&(*out).pool, 32 as u8)
+                (*it).n = (*it).n + (1 as u32)
+            }
+            rt.buf_push_bytes(&(*out).pool, p, n)
+            (*it).n = (*it).n + (n as u32)
+            (*it).w = (x + w) - (*it).x
+            return
+        }
+    }
+    var it: kitmd_types.Item = blank(kitmd_types.T_TEXT)
+    it.flags = flags
+    it.role = role
+    it.off = rt.buf_len(&(*out).pool) as u32
+    it.n = n as u32
+    it.x = x
+    it.y = (*l).ly
+    it.w = w
+    it.h = lh_of((*l).cur)
+    it.size = (*l).cur
+    rt.buf_push_bytes(&(*out).pool, p, n)
+    (*l).last = push_item(l, it) as i64
+}
+
+fn place_long(l: *mut Lay, p0: u64, n0: usize, flags: u32, role: u32) {
+    var p: u64 = p0
+    var n: usize = n0
+    if (*l).lcont {
+        new_line(l)
+    }
+    let avail: f64 = (*l).right - (*l).left
+    while n > 0 {
+        let k: usize = kitmd_measure.fit_bytes((*l).z, flags, (*l).cur, p, n, avail)
+        let w: f64 = kitmd_measure.word_w((*l).z, flags, (*l).cur, p, k)
+        emit_text(l, p, k, flags, role, (*l).left, w, false, false)
+        (*l).last = kitmd_types.NONE
+        (*l).x = (*l).left + w
+        (*l).lcont = true
+        note_ext(l, (*l).x)
+        p = p + (k as u64)
+        n = n - k
+        if n > 0 {
+            new_line(l)
+        }
+    }
+}
+
+fn place_word(l: *mut Lay, p: u64, n: usize, flags: u32, role: u32) {
+    let w: f64 = kitmd_measure.word_w((*l).z, flags, (*l).cur, p, n)
+    var sw: f64 = 0.0
+    var space: bool = false
+    if (*l).lcont && (*l).sp {
+        sw = kitmd_measure.space_w((*l).z, flags, (*l).cur)
+        space = true
+    }
+    if (*l).lcont && (*l).x + sw + w > (*l).right + 0.01 {
+        new_line(l)
+        sw = 0.0
+        space = false
+    }
+    if w > (*l).right - (*l).left + 0.01 {
+        place_long(l, p, n, flags, role)
+        (*l).sp = false
+        return
+    }
+    let px: f64 = (*l).x + sw
+    emit_text(l, p, n, flags, role, px, w, true, space)
+    (*l).x = px + w
+    (*l).lcont = true
+    (*l).sp = false
+    note_ext(l, (*l).x)
+}
+
+fn place_text(l: *mut Lay, p: u64, n: usize, flags: u32, role: u32) {
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        if b == (10 as u8) {
+            new_line(l)
+            i = i + 1
+        } else if b == (32 as u8) || b == (9 as u8) {
+            if (*l).lcont {
+                (*l).sp = true
+            }
+            i = i + 1
+        } else {
+            var j: usize = i
+            while j < n && rt.ld8(p, j) != (32 as u8) && rt.ld8(p, j) != (9 as u8) && rt.ld8(p, j) != (10 as u8) {
+                j = j + 1
+            }
+            place_word(l, p + (i as u64), j - i, flags, role)
+            i = j
+        }
+    }
+}
+
+fn inline_children(l: *mut Lay, n: u32, flags: u32, role: u32) {
+    var c: u32 = doc.node_first((*l).d, n)
+    while c != doc.NIL {
+        inline_node(l, c, flags, role)
+        c = doc.node_next((*l).d, c)
+    }
+}
+
+fn inline_node(l: *mut Lay, n: u32, flags: u32, role: u32) {
+    let k: u32 = doc.node_kind((*l).d, n)
+    if k == doc.K_TEXT || k == doc.K_HTML_INLINE {
+        let t: doc.Slice = doc.node_text((*l).d, n)
+        place_text(l, t.p, t.n, flags, role)
+    } else if k == doc.K_SOFTBREAK || k == doc.K_HARDBREAK {
+        new_line(l)
+    } else if k == doc.K_CODE {
+        let t: doc.Slice = doc.node_text((*l).d, n)
+        place_text(l, t.p, t.n, flags | kitmd_types.F_CODE, kitmd_types.R_CODE)
+    } else if k == doc.K_EMPH {
+        inline_children(l, n, flags | kitmd_types.F_ITALIC, role)
+    } else if k == doc.K_STRONG {
+        inline_children(l, n, flags | kitmd_types.F_BOLD, role)
+    } else if k == doc.K_LINK {
+        inline_children(l, n, flags, kitmd_types.R_ACCENT)
+    } else {
+        inline_children(l, n, flags, role)
+    }
+}
+
+fn flow_inline(l: *mut Lay, n: u32, left: f64, right: f64, size: f64, flags: u32) {
+    begin_flow(l, left, right, size)
+    inline_children(l, n, flags, kitmd_types.R_TEXT)
+    end_flow(l)
+}
+
+fn code_block(l: *mut Lay, n: u32, left: f64, right: f64) {
+    let t: doc.Slice = doc.node_text((*l).d, n)
+    let padx: f64 = (*l).size * 0.7
+    let pady: f64 = (*l).size * 0.45
+    let csize: f64 = (*l).size * 0.92
+    let clh: f64 = csize * 1.45
+    let avail: f64 = right - left - 2.0 * padx
+    var rect: kitmd_types.Item = blank(kitmd_types.T_RECT)
+    rect.role = kitmd_types.R_CODE_BG
+    rect.x = left
+    rect.y = (*l).y
+    rect.size = (*l).size
+    let ri: usize = push_item(l, rect)
+    var cy: f64 = (*l).y + pady
+    var widest: f64 = 0.0
+    var len: usize = t.n
+    if len > 0 && rt.ld8(t.p, len - 1) == (10 as u8) {
+        len = len - 1
+    }
+    var i: usize = 0
+    var lines: usize = 0
+    while i <= len && (i < len || lines == 0) {
+        var j: usize = i
+        while j < len && rt.ld8(t.p, j) != (10 as u8) {
+            j = j + 1
+        }
+        var p: u64 = t.p + (i as u64)
+        var n: usize = j - i
+        if n == 0 {
+            cy = cy + clh
+            lines = lines + 1
+        }
+        while n > 0 {
+            let k: usize = kitmd_measure.fit_bytes((*l).z, kitmd_types.F_CODE, csize, p, n, avail)
+            let w: f64 = kitmd_measure.word_w((*l).z, kitmd_types.F_CODE, csize, p, k)
+            var it: kitmd_types.Item = blank(kitmd_types.T_TEXT)
+            it.flags = kitmd_types.F_CODE | kitmd_types.F_BLOCK
+            it.role = kitmd_types.R_CODE
+            it.off = rt.buf_len(&(*(*l).out).pool) as u32
+            it.n = k as u32
+            it.x = left + padx
+            it.y = cy
+            it.w = w
+            it.h = clh
+            it.size = csize
+            rt.buf_push_bytes(&(*(*l).out).pool, p, k)
+            push_item(l, it)
+            if w > widest { widest = w }
+            cy = cy + clh
+            lines = lines + 1
+            p = p + (k as u64)
+            n = n - k
+        }
+        i = j + 1
+    }
+    let rp: *mut kitmd_types.Item = item_at(l, ri)
+    (*rp).w = widest + 2.0 * padx
+    (*rp).h = cy - (*l).y + pady
+    note_ext(l, left + (*rp).w)
+    (*l).y = (*l).y + (*rp).h
+    (*l).last = kitmd_types.NONE
+}
+
+fn digits_of(v: i64) -> usize {
+    var d: usize = 1
+    var x: i64 = v
+    while x >= 10 {
+        x = x / 10
+        d = d + 1
+    }
+    return d
+}
+
+fn marker_dec(out: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(out, v)
+    rt.buf_push(out, 46 as u8)
+}
+
+fn list_block(l: *mut Lay, n: u32, left: f64, right: f64) {
+    let d: *mut doc.Doc = (*l).d
+    let ordered: bool = doc.node_b(d, n) == 1
+    let tight: bool = doc.node_c(d, n) == 1
+    let start: i64 = doc.node_a(d, n)
+    let count: usize = doc.node_child_count(d, n)
+    let size: f64 = (*l).size
+    var indent: f64 = size * 1.5
+    if ordered {
+        var nine: [u8; 8] = [57 as u8; 8]
+        var dg: usize = digits_of(start + (count as i64))
+        if dg > 6 { dg = 6 }
+        nine[dg] = 46 as u8
+        let mw: f64 = kitmd_measure.word_w((*l).z, 0 as u32, size, (&nine[0]) as u64, dg + 1)
+        indent = mw + size * 0.55
+        if indent < size * 1.5 { indent = size * 1.5 }
+    }
+    let saved_gap: f64 = (*l).gap
+    var num: i64 = start
+    var c: u32 = doc.node_first(d, n)
+    while c != doc.NIL {
+        if doc.node_prev(d, c) != doc.NIL && !tight {
+            (*l).y = (*l).y + saved_gap
+        }
+        let iy: f64 = (*l).y
+        let lh: f64 = lh_of(size)
+        if ordered {
+            var mb: rt.Buf = rt.buf_new()
+            marker_dec(&mb, num)
+            let mw: f64 = kitmd_measure.word_w((*l).z, 0 as u32, size, mb.ptr as u64, mb.len)
+            begin_flow(l, left, right, size)
+            emit_text(l, mb.ptr as u64, mb.len, 0 as u32, kitmd_types.R_MUTED, left, mw, false, false)
+            (*l).last = kitmd_types.NONE
+            rt.buf_free(&mb)
+        } else {
+            var dot: kitmd_types.Item = blank(kitmd_types.T_DOT)
+            let dd: f64 = size * 0.3
+            dot.x = left + size * 0.45
+            dot.y = iy + (lh - dd) / 2.0
+            dot.w = dd
+            dot.h = dd
+            dot.size = size
+            push_item(l, dot)
+        }
+        num = num + 1
+        if tight {
+            (*l).gap = 0.0
+        }
+        blocks(l, c, left + indent, right)
+        (*l).gap = saved_gap
+        if (*l).y < iy + lh {
+            (*l).y = iy + lh
+        }
+        c = doc.node_next(d, c)
+    }
+    (*l).last = kitmd_types.NONE
+}
+
+fn quote_block(l: *mut Lay, n: u32, left: f64, right: f64) {
+    let y0: f64 = (*l).y
+    var bar: kitmd_types.Item = blank(kitmd_types.T_RECT)
+    bar.role = kitmd_types.R_RULE
+    bar.x = left
+    bar.y = y0
+    bar.w = (*l).size * 0.2
+    bar.size = (*l).size * 0.1
+    let bi: usize = push_item(l, bar)
+    blocks(l, n, left + (*l).size * 0.8, right)
+    let bp: *mut kitmd_types.Item = item_at(l, bi)
+    (*bp).h = (*l).y - y0
+}
+
+fn heading_scale(level: i64) -> f64 {
+    if level <= 1 { return 1.4 }
+    if level == 2 { return 1.25 }
+    if level == 3 { return 1.12 }
+    return 1.0
+}
+
+fn block(l: *mut Lay, n: u32, left: f64, right: f64) {
+    let d: *mut doc.Doc = (*l).d
+    let k: u32 = doc.node_kind(d, n)
+    if k == doc.K_PARA {
+        flow_inline(l, n, left, right, (*l).size, 0 as u32)
+    } else if k == doc.K_HEADING {
+        flow_inline(l, n, left, right, (*l).size * heading_scale(doc.node_a(d, n)), kitmd_types.F_BOLD)
+    } else if k == doc.K_CODE_BLOCK {
+        code_block(l, n, left, right)
+    } else if k == doc.K_LIST {
+        list_block(l, n, left, right)
+    } else if k == doc.K_QUOTE {
+        quote_block(l, n, left, right)
+    } else if k == doc.K_THEMATIC {
+        var rule: kitmd_types.Item = blank(kitmd_types.T_RULE)
+        rule.role = kitmd_types.R_RULE
+        rule.x = left
+        rule.y = (*l).y + lh_of((*l).size) / 2.0
+        rule.w = right - left
+        rule.size = (*l).size
+        push_item(l, rule)
+        (*l).y = (*l).y + lh_of((*l).size)
+    } else if k == doc.K_HTML_BLOCK {
+        let t: doc.Slice = doc.node_text(d, n)
+        begin_flow(l, left, right, (*l).size)
+        place_text(l, t.p, t.n, 0 as u32, kitmd_types.R_TEXT)
+        end_flow(l)
+    } else if doc.node_first(d, n) != doc.NIL {
+        if doc.node_is_block(d, doc.node_first(d, n)) {
+            blocks(l, n, left, right)
+        } else {
+            flow_inline(l, n, left, right, (*l).size, 0 as u32)
+        }
+    }
+}
+
+fn blocks(l: *mut Lay, n: u32, left: f64, right: f64) {
+    var c: u32 = doc.node_first((*l).d, n)
+    while c != doc.NIL {
+        if doc.node_prev((*l).d, c) != doc.NIL {
+            (*l).y = (*l).y + (*l).gap
+        }
+        block(l, c, left, right)
+        c = doc.node_next((*l).d, c)
+    }
+}
+
+fn opts() -> doc.Opts {
+    return doc.Opts { html: doc.HTML_IGNORE, tables: false, strike: false, autolink: false, tasks: false }
+}
+
+fn build(z: *mut painter.Painter, out: *mut kitmd_types.Layout, p: u64, n: usize, width: f64, size: f64) {
+    kitmd_types.layout_reset(out)
+    var clean: rt.Buf = rt.buf_new()
+    kitmd_clean.clean_into(z, &clean, p, n)
+    var d: doc.Doc = md.parse_bytes(clean.ptr as u64, clean.len, opts())
+    var l: Lay = Lay { z: z, out: out, d: &d, size: size, cur: size, y: 0.0, left: 0.0, right: width, x: 0.0, ly: 0.0,
+        lcont: false, sp: false, last: kitmd_types.NONE, ext: 0.0, gap: size * 0.5 }
+    blocks(&l, doc.doc_root(&d), 0.0, width)
+    if l.y <= 0.0 {
+        l.y = lh_of(size)
+    }
+    if vec_len[kitmd_types.Item](&(*out).items) == 0 {
+        var it: kitmd_types.Item = blank(kitmd_types.T_TEXT)
+        it.size = size
+        it.h = lh_of(size)
+        push_item(&l, it)
+    }
+    (*out).w = l.ext
+    (*out).h = l.y
+    doc.doc_free(&d)
+    rt.buf_free(&clean)
+}
