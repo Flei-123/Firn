@@ -1348,7 +1348,7 @@ fn inline_by_size_with(
     // the growth guard stops the phase, it stops at a size boundary.
     let tiers: Vec<usize> = (MAX_TRIVIAL_INSTS + 1..=MAX_CALLEE_INSTS).collect();
     let tier_threads = crate::parfn::threads();
-    let tier_parallel = tier_threads > 1 && nf >= 128 && cg.shareable() && !dbg && budget > 0 && max_growth > 0;
+    let tier_parallel = std::env::var_os("FIRN_INLINE_PAR_TIERS").is_some() && tier_threads > 1 && nf >= 128 && cg.shareable() && !dbg && budget > 0 && max_growth > 0;
     let cycle_flags: Vec<bool> = if tier_parallel { (0..nf).map(|i| cg.self_recursive(i)).collect() } else { Vec::new() };
     'tiers: for &tier in tiers.iter() {
         let at_start = n;
