@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.math
+import mc.mc_gui_tex
+import mc.mc_hud
+import mc.mc_raster
+import mc.mc_pskin
+import mc.mc_player_parts
+
+export { InvPlayer, InvView, ip_new, ip_free, ip_set_skin, ip_has_skin, ip_ensure_default, ip_draw, ip_render, view_inventory, view_creative }
+
+const DEG: f64 = 0.017453292519943295
+const PLAYER_UNIT: f64 = 0.05859375
+const FACES: i32 = 6
+const L0X: f64 = 0.14002800840280097
+const L0Y: f64 = 0.7001400420140049
+const L0Z: f64 = 0.7001400420140049
+const L1X: f64 = 0.19611613513818404
+const L1Y: f64 = 0.9805806756909202
+
+struct InvPlayer {
+    skin: mc_gui_tex.GuiTex,
+    slim: bool,
+    buf: mc_gui_tex.GuiTex,
+    depth: u64,
+    depth_n: usize,
+}
+
+struct InvView {
+    feet_x: i32,
+    feet_y: i32,
+    scale: i32,
+    look_dy: i32,
+    clip_x: i32,
+    clip_y: i32,
+    clip_w: i32,
+    clip_h: i32,
+}
+
+struct Stage {
+    part: usize,
+    hs: f64, hc: f64,
+    ps: f64, pc: f64,
+    zs: f64, zc: f64,
+    ys: f64, yc: f64,
+    ts: f64, tc: f64,
+    px: f64, py: f64, pz: f64,
+}
+
+struct FaceDef {
+    cs: [f64; 3],
+    ua: usize, us: f64,
+    va: usize, vs: f64,
+    tu: i32, tv: i32, tw: i32, th: i32,
+    n: [f64; 3],
+}
+
+struct Target {
+    buf: *mut mc_gui_tex.GuiTex,
+    depth: u64,
+    skin: *mut mc_gui_tex.GuiTex,
+    k: f64,
+    bx: f64,
+    by: f64,
+}
+
+fn view_inventory() -> InvView {
+    return InvView { feet_x: 51, feet_y: 75, scale: 30, look_dy: 50, clip_x: 26, clip_y: 8, clip_w: 49, clip_h: 70 }
+}
+
+fn view_creative() -> InvView {
+    return InvView { feet_x: 88, feet_y: 45, scale: 20, look_dy: 30, clip_x: 73, clip_y: 6, clip_w: 32, clip_h: 43 }
+}
+
+fn ip_new() -> InvPlayer {
+    return InvPlayer { skin: mc_gui_tex.gtex_empty(), slim: false, buf: mc_gui_tex.gtex_empty(), depth: 0 as u64, depth_n: 0 as usize }
+}
+
+fn ip_free(ip: *mut InvPlayer) {
+    mc_gui_tex.gtex_free(&(*ip).skin)
+    mc_gui_tex.gtex_free(&(*ip).buf)
+    if (*ip).depth != 0 as u64 { rt.heap_free((*ip).depth, (*ip).depth_n * 4) }
+    (*ip).depth = 0 as u64
+    (*ip).depth_n = 0 as usize
+}
+
+fn ip_has_skin(ip: *mut InvPlayer) -> bool {
+    return mc_gui_tex.gtex_ok(&(*ip).skin)
+}
+
+fn ip_set_skin(ip: *mut InvPlayer, s: *mut mc_pskin.Skin) {
+    mc_gui_tex.gtex_free(&(*ip).skin)
+    if !mc_pskin.skin_ok(s) { return }
+    if !mc_gui_tex.gtex_blank(&(*ip).skin, mc_pskin.SKIN_W, mc_pskin.SKIN_H) { return }
+    var y: i32 = 0
+    while y < mc_pskin.SKIN_H {
+        var x: i32 = 0
+        while x < mc_pskin.SKIN_W {
+            mc_gui_tex.gtex_set(&(*ip).skin, x, y, mc_pskin.skin_px(s, x, y))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*ip).slim = mc_pskin.skin_is_slim(s)
+}
+
+fn ip_ensure_default(ip: *mut InvPlayer, hi: u64, lo: u64) {
+    if ip_has_skin(ip) { return }
+    var s: mc_pskin.Skin = mc_pskin.skin_new()
+    mc_pskin.skin_default_for(&s, hi, lo)
+    ip_set_skin(ip, &s)
+    mc_pskin.skin_free(&s)
+}
+
+fn stage_new(part: usize, px: f64, py: f64, pz: f64) -> Stage {
+    return Stage { part: part, hs: 0.0, hc: 1.0, ps: 0.0, pc: 1.0, zs: 0.0, zc: 1.0, ys: 0.0, yc: 1.0, ts: 0.0, tc: 1.0, px: px, py: py, pz: pz }
+}
+
+fn to_view(st: *mut Stage, lx: f64, ly: f64, lz: f64, tr: f64, out: *mut [f64; 3]) {
+    var x: f64 = lx
+    var y: f64 = ly
+    var z: f64 = lz
+    if (*st).part == mc_player_parts.PART_HEAD {
+        let y1: f64 = y * (*st).pc + z * (*st).ps
+        let z1: f64 = z * (*st).pc - y * (*st).ps
+        y = y1
+        z = z1
+        let x2: f64 = x * (*st).hc + z * (*st).hs
+        let z2: f64 = z * (*st).hc - x * (*st).hs
+        x = x2
+        z = z2
+    } else if (*st).part == mc_player_parts.PART_RARM || (*st).part == mc_player_parts.PART_LARM {
+        let x1: f64 = x * (*st).zc - y * (*st).zs
+        let y1: f64 = x * (*st).zs + y * (*st).zc
+        x = x1
+        y = y1
+    }
+    x = x + (*st).px * tr
+    y = y + (*st).py * tr
+    z = z + (*st).pz * tr
+    let x3: f64 = x * (*st).yc + z * (*st).ys
+    let z3: f64 = z * (*st).yc - x * (*st).ys
+    x = x3
+    z = 0.0 - z3
+    let y4: f64 = y * (*st).tc - z * (*st).ts
+    let z4: f64 = y * (*st).ts + z * (*st).tc
+    (*out)[0] = 0.0 - x
+    (*out)[1] = 0.0 - y4
+    (*out)[2] = z4
+}
+
+fn face_def(f: i32, u: i32, v: i32, w: i32, h: i32, d: i32) -> FaceDef {
+    if f == 0 { return FaceDef { cs: [1.0, 1.0, 1.0], ua: 0 as usize, us: 0.0 - 1.0, va: 1 as usize, vs: 0.0 - 1.0, tu: u + d, tv: v + d, tw: w, th: h, n: [0.0, 0.0, 1.0] } }
+    if f == 1 { return FaceDef { cs: [0.0 - 1.0, 1.0, 0.0 - 1.0], ua: 0 as usize, us: 1.0, va: 1 as usize, vs: 0.0 - 1.0, tu: u + 2 * d + w, tv: v + d, tw: w, th: h, n: [0.0, 0.0, 0.0 - 1.0] } }
+    if f == 2 { return FaceDef { cs: [1.0, 1.0, 0.0 - 1.0], ua: 0 as usize, us: 0.0 - 1.0, va: 2 as usize, vs: 1.0, tu: u + d, tv: v, tw: w, th: d, n: [0.0, 1.0, 0.0] } }
+    if f == 3 { return FaceDef { cs: [1.0, 0.0 - 1.0, 1.0], ua: 0 as usize, us: 0.0 - 1.0, va: 2 as usize, vs: 0.0 - 1.0, tu: u + d + w, tv: v, tw: w, th: d, n: [0.0, 0.0 - 1.0, 0.0] } }
+    if f == 4 { return FaceDef { cs: [1.0, 1.0, 0.0 - 1.0], ua: 2 as usize, us: 1.0, va: 1 as usize, vs: 0.0 - 1.0, tu: u, tv: v + d, tw: d, th: h, n: [1.0, 0.0, 0.0] } }
+    return FaceDef { cs: [0.0 - 1.0, 1.0, 1.0], ua: 2 as usize, us: 0.0 - 1.0, va: 1 as usize, vs: 0.0 - 1.0, tu: u + d + w, tv: v + d, tw: d, th: h, n: [0.0 - 1.0, 0.0, 0.0] }
+}
+
+fn max0(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn light_of(nx: f64, ny: f64, nz: f64) -> u32 {
+    let a: f64 = max0(L0X * nx - L0Y * ny - L0Z * nz)
+    let b: f64 = max0(0.0 - L1X * nx - L1Y * ny)
+    var l: f64 = 0.4 + 0.6 * (a + b)
+    if l > 1.0 { l = 1.0 }
+    return (l * 255.0 + 0.5) as u32
+}
+
+fn lit(c: u32, l: u32) -> u32 {
+    let r: u32 = ((c & 255 as u32) * l) / 255 as u32
+    let g: u32 = (((c >> 8 as u32) & 255 as u32) * l) / 255 as u32
+    let b: u32 = (((c >> 16 as u32) & 255 as u32) * l) / 255 as u32
+    return 0xFF000000 as u32 | (b << 16 as u32) | (g << 8 as u32) | r
+}
+
+fn min4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    var m: f64 = a
+    if b < m { m = b }
+    if c < m { m = c }
+    if d < m { m = d }
+    return m
+}
+
+fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    var m: f64 = a
+    if b > m { m = b }
+    if c > m { m = c }
+    if d > m { m = d }
+    return m
+}
+
+fn raster_face(t: *mut Target, p0: *mut [f64; 3], pu: *mut [f64; 3], pv: *mut [f64; 3], fd: *mut FaceDef, light: u32) {
+    let k: f64 = (*t).k
+    let x0: f64 = (*t).bx + k * (*p0)[0]
+    let y0: f64 = (*t).by + k * (*p0)[1]
+    let exx: f64 = k * ((*pu)[0] - (*p0)[0])
+    let exy: f64 = k * ((*pu)[1] - (*p0)[1])
+    let eyx: f64 = k * ((*pv)[0] - (*p0)[0])
+    let eyy: f64 = k * ((*pv)[1] - (*p0)[1])
+    let det: f64 = exx * eyy - exy * eyx
+    if math.fabs(det) < 0.000001 { return }
+    let dzu: f64 = (*p0)[2] - (*pu)[2]
+    let dzv: f64 = (*p0)[2] - (*pv)[2]
+    let z0: f64 = 0.0 - (*p0)[2]
+    let bw: i32 = (*(*t).buf).w
+    let bh: i32 = (*(*t).buf).h
+    var ix0: i32 = math.floor(min4(x0, x0 + exx, x0 + eyx, x0 + exx + eyx)) as i32
+    var ix1: i32 = math.ceil(max4(x0, x0 + exx, x0 + eyx, x0 + exx + eyx)) as i32
+    var iy0: i32 = math.floor(min4(y0, y0 + exy, y0 + eyy, y0 + exy + eyy)) as i32
+    var iy1: i32 = math.ceil(max4(y0, y0 + exy, y0 + eyy, y0 + exy + eyy)) as i32
+    if ix0 < 0 { ix0 = 0 }
+    if iy0 < 0 { iy0 = 0 }
+    if ix1 > bw { ix1 = bw }
+    if iy1 > bh { iy1 = bh }
+    let eps: f64 = 0.000001
+    var y: i32 = iy0
+    while y < iy1 {
+        var x: i32 = ix0
+        while x < ix1 {
+            let dx: f64 = (x as f64) + 0.5 - x0
+            let dy: f64 = (y as f64) + 0.5 - y0
+            let s: f64 = (dx * eyy - dy * eyx) / det
+            let q: f64 = (exx * dy - exy * dx) / det
+            if s >= 0.0 - eps && s < 1.0 + eps && q >= 0.0 - eps && q < 1.0 + eps {
+                var tx: i32 = math.floor(s * ((*fd).tw as f64)) as i32
+                var ty: i32 = math.floor(q * ((*fd).th as f64)) as i32
+                if tx < 0 { tx = 0 }
+                if ty < 0 { ty = 0 }
+                if tx >= (*fd).tw { tx = (*fd).tw - 1 }
+                if ty >= (*fd).th { ty = (*fd).th - 1 }
+                let z: f64 = z0 + s * dzu + q * dzv
+                let zi: u32 = ((z + 512.0) * 2048.0) as u32
+                let at: usize = (y as usize) * (bw as usize) + (x as usize)
+                if zi > rt.ld32((*t).depth, at) {
+                    let c: u32 = mc_gui_tex.gtex_get((*t).skin, (*fd).tu + tx, (*fd).tv + ty)
+                    if (c >> 24 as u32) >= 128 as u32 {
+                        rt.st32((*t).depth, at, zi)
+                        mc_gui_tex.gtex_set((*t).buf, x, y, lit(c, light))
+                    }
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn draw_box(t: *mut Target, st: *mut Stage, pd: *mut mc_player_parts.PartDef, u: i32, v: i32, infl: f64) {
+    let half: [f64; 3] = [((*pd).w as f64) * 0.5 + infl, ((*pd).h as f64) * 0.5 + infl, ((*pd).d as f64) * 0.5 + infl]
+    let cen: [f64; 3] = [(*pd).cx - (*pd).px, (*pd).cy - (*pd).py, (*pd).cz - (*pd).pz]
+    var f: i32 = 0
+    while f < FACES {
+        var fd: FaceDef = face_def(f, u, v, (*pd).w, (*pd).h, (*pd).d)
+        var c0: [f64; 3] = [cen[0] + fd.cs[0] * half[0], cen[1] + fd.cs[1] * half[1], cen[2] + fd.cs[2] * half[2]]
+        var cu: [f64; 3] = [c0[0], c0[1], c0[2]]
+        var cv: [f64; 3] = [c0[0], c0[1], c0[2]]
+        cu[fd.ua] = cu[fd.ua] + fd.us * 2.0 * half[fd.ua]
+        cv[fd.va] = cv[fd.va] + fd.vs * 2.0 * half[fd.va]
+        var p0: [f64; 3] = [0.0; 3]
+        var pu: [f64; 3] = [0.0; 3]
+        var pv: [f64; 3] = [0.0; 3]
+        var nv: [f64; 3] = [0.0; 3]
+        to_view(st, c0[0], c0[1], c0[2], 1.0, &p0)
+        to_view(st, cu[0], cu[1], cu[2], 1.0, &pu)
+        to_view(st, cv[0], cv[1], cv[2], 1.0, &pv)
+        to_view(st, fd.n[0], fd.n[1], fd.n[2], 0.0, &nv)
+        raster_face(t, &p0, &pu, &pv, &fd, light_of(nv[0], nv[1], nv[2]))
+        f = f + 1
+    }
+}
+
+fn draw_part(t: *mut Target, st: *mut Stage, slim: bool) {
+    var pd: mc_player_parts.PartDef = mc_player_parts.part_def((*st).part, slim)
+    draw_box(t, st, &pd, pd.u, pd.v, 0.0)
+    draw_box(t, st, &pd, pd.ou, pd.ov, pd.infl)
+}
+
+fn prepare(ip: *mut InvPlayer, w: i32, h: i32) -> bool {
+    if (*ip).buf.w != w || (*ip).buf.h != h {
+        mc_gui_tex.gtex_free(&(*ip).buf)
+        if (*ip).depth != 0 as u64 { rt.heap_free((*ip).depth, (*ip).depth_n * 4) }
+        (*ip).depth = 0 as u64
+        (*ip).depth_n = 0 as usize
+        if !mc_gui_tex.gtex_blank(&(*ip).buf, w, h) { return false }
+        (*ip).depth_n = (w as usize) * (h as usize)
+        (*ip).depth = rt.heap_alloc((*ip).depth_n * 4)
+        if (*ip).depth == 0 as u64 { return false }
+    }
+    var i: usize = 0
+    while i < (*ip).depth_n {
+        rt.st32((*ip).buf.px, i, 0 as u32)
+        rt.st32((*ip).depth, i, 0 as u32)
+        i = i + 1
+    }
+    return true
+}
+
+fn ip_render(ip: *mut InvPlayer, v: *mut InvView, s: i32, look_x: f64, look_y: f64, time_s: f64) -> bool {
+    if !ip_has_skin(ip) { return false }
+    if !prepare(ip, (*v).clip_w * s, (*v).clip_h * s) { return false }
+    let f: f64 = math.atan(look_x / 40.0)
+    let g: f64 = math.atan(look_y / 40.0)
+    let body: f64 = f * 20.0 * DEG
+    let head_rel: f64 = f * 20.0 * DEG
+    let pitch_up: f64 = g * 20.0 * DEG
+    let tilt: f64 = g * 20.0 * DEG
+    let sway: f64 = (1.0 + math.cos(time_s * 1.8)) * 3.0 * DEG
+    var t: Target = Target {
+        buf: &(*ip).buf, depth: (*ip).depth, skin: &(*ip).skin,
+        k: ((*v).scale as f64) * PLAYER_UNIT * (s as f64),
+        bx: (((*v).feet_x - (*v).clip_x) * s) as f64,
+        by: (((*v).feet_y - (*v).clip_y) * s) as f64,
+    }
+    var i: usize = 0
+    while i < mc_player_parts.PART_COUNT {
+        var pd: mc_player_parts.PartDef = mc_player_parts.part_def(i, (*ip).slim)
+        var st: Stage = stage_new(i, pd.px, pd.py, pd.pz)
+        st.ys = math.sin(body)
+        st.yc = math.cos(body)
+        st.ts = math.sin(tilt)
+        st.tc = math.cos(tilt)
+        st.hs = math.sin(head_rel)
+        st.hc = math.cos(head_rel)
+        st.ps = math.sin(pitch_up)
+        st.pc = math.cos(pitch_up)
+        if i == mc_player_parts.PART_RARM {
+            st.zs = math.sin(sway)
+            st.zc = math.cos(sway)
+        } else if i == mc_player_parts.PART_LARM {
+            st.zs = math.sin(0.0 - sway)
+            st.zc = math.cos(sway)
+        }
+        draw_part(&t, &st, (*ip).slim)
+        i = i + 1
+    }
+    return true
+}
+
+fn ip_draw(ip: *mut InvPlayer, r: *mut mc_raster.Raster, v: *mut InvView, s: i32, px: i32, py: i32, mx: i32, my: i32, time_s: f64) {
+    let look_x: f64 = ((px + (*v).feet_x * s - mx) as f64) / (s as f64)
+    let look_y: f64 = ((py + ((*v).feet_y - (*v).look_dy) * s - my) as f64) / (s as f64)
+    if !ip_render(ip, v, s, look_x, look_y, time_s) { return }
+    blit(&(*ip).buf, r, px + (*v).clip_x * s, py + (*v).clip_y * s)
+}
+
+fn blit(t: *mut mc_gui_tex.GuiTex, r: *mut mc_raster.Raster, dx: i32, dy: i32) {
+    var y: i32 = 0
+    while y < (*t).h {
+        var x: i32 = 0
+        while x < (*t).w {
+            let c: u32 = mc_gui_tex.gtex_get(t, x, y)
+            if (c >> 24 as u32) == 0 as u32 {
+                x = x + 1
+                continue
+            }
+            var run: i32 = 1
+            while x + run < (*t).w && mc_gui_tex.gtex_get(t, x + run, y) == c { run = run + 1 }
+            mc_hud.hud_rect(r, dx + x, dy + y, run, 1, c)
+            x = x + run
+        }
+        y = y + 1
+    }
+}
