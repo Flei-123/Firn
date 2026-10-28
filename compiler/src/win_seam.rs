@@ -561,6 +561,19 @@ fn __win_init() {
     if __win_freq <= 0 {
         __win_freq = 10000000
     }
+    __win_tls_reserve()
+}
+
+fn __win_tls_reserve() {
+    if __win_tlsset != 0 {
+        return
+    }
+    let ix: i64 = (TlsAlloc() as i64) & 4294967295
+    if ix >= 64 {
+        return
+    }
+    __win_tlsidx = ix as u64
+    __win_tlsset = 1
 }
 
 // The block Linux would have left on the stack:
@@ -1879,8 +1892,8 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
     }
     if nr == 158 {
         // arch_prctl(ARCH_SET_FS, p): the thread block pointer of THIS
-        // thread goes into a TLS slot (the slot is allocated by the first
-        // call, which is the main thread's). `Op::ThreadSelf` reads the
+        // thread goes into a TLS slot (reserved in `__win_init`, before
+        // loaded DLLs can take all 64 inline slots). `Op::ThreadSelf` reads the
         // slot straight out of the TEB. Slots 0..63 only: the TEB keeps
         // those inline, which is what makes the read one instruction.
         if a1 == 7937 {
@@ -1896,13 +1909,9 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         if a1 != 4098 {
             return 0 - 22
         }
+        __win_tls_reserve()
         if __win_tlsset == 0 {
-            let ix: i64 = (TlsAlloc() as i64) & 4294967295
-            if ix >= 64 {
-                return 0 - 12
-            }
-            __win_tlsidx = ix as u64
-            __win_tlsset = 1
+            return 0 - 12
         }
         if TlsSetValue(__win_tlsidx as i64, a2) == 0 {
             return 0 - 12

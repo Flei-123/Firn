@@ -1,0 +1,159 @@
+// expect_exit: 42
+// tests/6101_threads_tls_exhausted.fi -- r1139: on Windows the thread block lives in a TLS slot. Drivers (NVIDIA
+// OpenGL/CUDA) take all 64 inline slots; a slot allocated on the first thread_start then failed and every thread ran
+// without a block, so the first collection with workers spun forever. The seam now reserves the slot at start-up.
+// Here the inline slots are drained before the first thread, then two workers allocate and write files while the
+// main thread allocates, collects and recycles thread entries. Also: the wall clock and the system UTC offset.
+import std.rt
+import std.fs
+import std.time
+import std.tzos
+import std.osinfo
+import std.dynlib
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+const K_WRITER: u64 = 1
+const K_SHORT: u64 = 2
+const FILE_BYTES: usize = 1048576
+
+fn drain_tls() -> u64 {
+    if !osinfo.is_windows() {
+        return 1
+    }
+    let h: u64 = dynlib.open("kernel32.dll")
+    if h == 0 {
+        return 0
+    }
+    let f: u64 = dynlib.sym(h, "TlsAlloc")
+    if f == 0 {
+        return 0
+    }
+    var n: u64 = 0
+    while n < 2000 {
+        let ix: u64 = dynlib.ci0(f) & 4294967295
+        if ix >= 64 {
+            return 1
+        }
+        n = n + 1
+    }
+    return 0
+}
+
+fn mk(i: u64, next: Gc[Cell]) -> AllocError!Gc[Cell] {
+    let c: Gc[Cell] = try gc Cell { next: next, value: i }
+    return c
+}
+
+fn alloc_work(rounds: u64) -> u64 {
+    var head: Gc[Cell] = gc_null[Cell]()
+    var sum: u64 = 0
+    var i: u64 = 0
+    while i < rounds {
+        var nx: Gc[Cell] = gc_null[Cell]()
+        if i % 50 == 0 {
+            nx = head
+        }
+        let c: Gc[Cell] = mk(i, nx) catch gc_null[Cell]()
+        if c == gc_null[Cell]() {
+            return 0
+        }
+        if i % 50 == 0 {
+            head = c
+        }
+        sum = sum + c.value
+        i = i + 1
+    }
+    var p: Gc[Cell] = head
+    while p != gc_null[Cell]() {
+        sum = sum + 1
+        p = p.next
+    }
+    return sum
+}
+
+fn file_path(id: u64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let td: str = fs.temp_dir()
+    rt.buf_push_bytes(&b, td.p as u64, td.length())
+    let name: str = "/firn_6101_"
+    rt.buf_push_bytes(&b, name.p as u64, name.length())
+    rt.buf_push_dec_u64(&b, id)
+    rt.buf_push(&b, 0 as u8)
+    return str { p: rt.buf_data(&b), n: rt.buf_len(&b) - 1 }
+}
+
+fn writer(id: u64) -> u64 {
+    let path: str = file_path(id)
+    var bad: u64 = 0
+    var round: u64 = 0
+    while round < 3 {
+        var body: rt.Buf = rt.buf_new()
+        var i: u64 = 0
+        while rt.buf_len(&body) < FILE_BYTES {
+            rt.buf_push_dec_u64(&body, i * 7 + id)
+            rt.buf_push(&body, 10 as u8)
+            i = i + 1
+        }
+        if alloc_work(20000) != 199990000 + 400 {
+            bad = bad + 1
+        }
+        let w: usize = fs.write_file(path, rt.buf_ptr(&body), rt.buf_len(&body)) catch 0
+        if w != rt.buf_len(&body) {
+            bad = bad + 1
+        }
+        rt.buf_free(&body)
+        round = round + 1
+    }
+    fs.remove(path) catch false
+    return bad
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == K_WRITER {
+        return writer(arg)
+    }
+    if kind == K_SHORT {
+        return alloc_work(arg)
+    }
+    return 0
+}
+
+fn clock_ok() -> bool {
+    let now: i64 = time.now_unix_ms()
+    if now < 1700000000000 {
+        return false
+    }
+    var off: i32 = 0 as i32
+    let got: bool = tzos.system_offset_min(now, &off)
+    if got != osinfo.is_windows() {
+        return false
+    }
+    return off >= (0 - 840) as i32 && off <= 840 as i32
+}
+
+fn main() -> i32 {
+    if drain_tls() == 0 { return 1 as i32 }
+    if !clock_ok() { return 2 as i32 }
+    let a: u64 = thread_start(K_WRITER, 1)
+    let b: u64 = thread_start(K_WRITER, 2)
+    if a == 0 || b == 0 { return 3 as i32 }
+    var bad: u64 = 0
+    var round: u64 = 0
+    while round < 12 {
+        let h: u64 = thread_start(K_SHORT, 2000)
+        if h == 0 { return 4 as i32 }
+        if alloc_work(10000) != 49995000 + 200 { bad = bad + 1 }
+        gc_collect()
+        if thread_wait(h) != 1999000 + 40 { bad = bad + 1 }
+        round = round + 1
+    }
+    bad = bad + thread_wait(a) + thread_wait(b)
+    if bad != 0 { return 5 as i32 }
+    if gc_collections() == 0 { return 6 as i32 }
+    if thread_count() != 1 { return 7 as i32 }
+    return 42 as i32
+}
