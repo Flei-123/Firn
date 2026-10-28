@@ -59,7 +59,7 @@ wait_cols() {
     echo "$c"; return 1
 }
 slider_px() { python3 -c "print(2*(62+($1-2)*142//30))"; }
-open_video() { xdotool key --window "$1" Escape; sleep 1; click "$1" 320 300; click "$1" 266 172; }
+open_video() { xdotool key --window "$1" Escape; sleep 4; click "$1" 320 300; sleep 4; click "$1" 266 172; sleep 4; }
 printf 'name=ViewV\nprotocol=763\n' > "$W/v.cfg"
 "$W/mcplay" 127.0.0.1 "$PORT" ViewV > "$W/A.out" 2>&1 & PP=$!
 for i in $(seq 1 1200); do grep -q "ViewV joined the game" "$W/server.log" 2>/dev/null && break; sleep 0.1; done
