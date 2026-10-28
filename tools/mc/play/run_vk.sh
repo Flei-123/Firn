@@ -7,6 +7,7 @@
 # lost run: lost=1 recovered=1 and the same picture afterwards. Swapchain (vk + vklost): `present=swapchain`, presents >= 30, and at exit the X window
 # content (XGetImage) == the read back colour image of the last frame (window_diff=0, octets); readback run: `present=readback`. Env: MC_VIEW (4), FIRNC, MCPLAY_VK_PNG_OUT=<prefix>. Start it via heavy.
 # Prints `RESULT mc-vk: ok`.
+export MCPLAY_WORKERS=${MCPLAY_WORKERS:-3}
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}

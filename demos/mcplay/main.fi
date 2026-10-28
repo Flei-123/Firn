@@ -20,9 +20,9 @@
 //                      full cubes. Needs packs (MC_PACKS ...); works on the CPU, GL (MCPLAY_GL=1) and Vulkan (MCPLAY_GFX=vk) back ends; works with mc_stream (worker meshing, MCPLAY_STREAM=1, default) and with MCPLAY_STREAM=0; no LOD; the T key reloads the models too.
 //   MCPLAY_PICK_PROBE="ox,oy,oz,dx,dy,dz[;...]"  pick rays (thousandths) at the end of the run, printed as `mcplay: probe ...` (tests; with MCPLAY_MODELS=1 through mc_model_pick)
 //   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
-//   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on every path incl. MCPLAY_GFX=vk (r167 TLS fix, r199 verified with lavapipe)
+//   MCPLAY_WORKERS=N   mesher threads of the stream (0 = inline on the render thread); default clamp(cores - 2, 2, 12) on every path incl. MCPLAY_GFX=vk
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
-//   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
+//   MCPLAY_FPS=N       frame cap override (0 = uncapped; default = Max Framerate option)   MCPLAY_VSYNC=0|1  vsync override (default = VSync option; GL swap interval / Vulkan FIFO vs IMMEDIATE)
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
 //   MCPLAY_POS_REPLY=1  old behaviour: answer a server teleport with Teleport Confirm + an immediate move (rubber band storm under load, r197; for A/B runs)
 //   MCPLAY_AUTOJUMP=1  Auto-Jump (vanilla option, default off): walking against a 1 block step jumps by itself
@@ -115,6 +115,9 @@ import mc.mc_hud_text
 import mc.mc_pause
 import mc.mc_focus
 import mc.mc_opts
+import mc.mc_frame_limit
+import mc.mc_workers
+import mc.mc_net_budget
 import mc.mc_blockset
 import mc.mc_play
 import mc.mc_chat
@@ -772,13 +775,16 @@ fn on_map_chunk(c: *mut Ctx) {
     let p: u64 = mc_chunk.chunk_alloc()
     if p == 0 { return }
     let ch: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    let td: u64 = mc_prof.prof_active_now()
     let ok: bool = mc_chunk.chunk_decode_for(&(*c).cl.ver, mc_client.client_body(&(*c).cl), &(*c).sc, ch, mc_dimension.dim_sections(&(*c).dim)) catch false
+    mc_prof.prof_add(mc_prof.PH_NCHDEC, mc_prof.prof_active_now() - td)
     if !ok || (*ch).ground_up == 0 {
         mc_chunk.chunk_release(p)
         return
     }
     let cx: i32 = (*ch).x
     let cz: i32 = (*ch).z
+    let tp: u64 = mc_prof.prof_active_now()
     if !mc_world.world_put(&(*c).world, p) {
         mc_chunk.chunk_release(p)
         return
@@ -788,6 +794,7 @@ fn on_map_chunk(c: *mut Ctx) {
     } else {
         mc_render_world.wr_mark_chunk(&(*c).g.wr, cx, cz)
     }
+    mc_prof.prof_add(mc_prof.PH_NCHPUT, mc_prof.prof_active_now() - tp)
     (*c).n_chunks = (*c).n_chunks + 1 as u64
 }
 
@@ -1124,11 +1131,12 @@ fn on_packet(c: *mut Ctx, id: i32) {
 }
 
 // Applies waiting packets (at most `limit`, stops at the first timeout). false = connection lost.
-fn net_drain(c: *mut Ctx, limit: i32) -> bool {
+fn net_drain(c: *mut Ctx, limit: i32, budget_ns: u64) -> bool {
     var n: i32 = 0
+    let t0: u64 = now_ns()
     while n < limit {
         let id: i32 = mc_client.client_next(&(*c).cl)
-        if id == mc_client.CL_TIMEOUT { return true }
+        if id == mc_client.CL_TIMEOUT { break }
         if id < 0 {
             if (*c).end_kind == END_QUIT && !(*c).closed {
                 (*c).end_kind = END_LOST
@@ -1140,7 +1148,9 @@ fn net_drain(c: *mut Ctx, limit: i32) -> bool {
         }
         on_packet(c, id)
         n = n + 1
+        if mc_net_budget.nb_over(t0, now_ns(), budget_ns) { break }
     }
+    mc_prof.prof_add(mc_prof.PH_NPKTS, n as u64)
     return true
 }
 
@@ -1748,12 +1758,29 @@ fn apply_opts(c: *mut Ctx, start: bool) {
             i = i + 1
         }
     }
+    apply_vsync(c, o)
     if start { return }
     if ((*o).fullscreen != 0) != (*c).fullscreen {
         (*c).fullscreen = !(*c).fullscreen
         window.fullscreen((*c).wp, (*c).fullscreen)
     }
-    if (*c).gl { glwindow.swap_interval(&(*c).gw, (*o).vsync) }
+}
+
+fn want_vsync() -> bool {
+    let o: *mut mc_opts.Opts = mc_pause.pause_opts()
+    return mc_frame_limit.fl_vsync_on((*o).vsync, env.has("MCPLAY_VSYNC"), env_int("MCPLAY_VSYNC", 1))
+}
+
+fn apply_vsync(c: *mut Ctx, o: *mut mc_opts.Opts) {
+    let on: bool = want_vsync()
+    if (*c).gl { glwindow.swap_interval(&(*c).gw, on as i32) }
+    if (*c).vk { vk_mc.vkbe_set_vsync(&(*c).vbk, on) }
+}
+
+fn frame_limit_ns(c: *mut Ctx) -> u64 {
+    let o: *mut mc_opts.Opts = mc_pause.pause_opts()
+    let gpu_present: bool = (*c).gl || ((*c).vk && vk_mc.vkbe_sc_on(&(*c).vbk))
+    return mc_frame_limit.fl_frame_ns((*o).fps_limit, env.has("MCPLAY_FPS"), env_int("MCPLAY_FPS", 0), gpu_present)
 }
 
 fn apply_view(c: *mut Ctx, requested: i32) {
@@ -4027,7 +4054,7 @@ fn draw_frame_gl(c: *mut Ctx) {
 
 fn gl_open_all(c: *mut Ctx, w0: i32, h0: i32) -> bool {
     var o: glwindow.Opts = glwindow.opts_default()
-    o.vsync = env_int("MCPLAY_VSYNC", 1)
+    o.vsync = want_vsync() as i32
     o.full_input = true
     var ok: bool = glwindow.open(&(*c).gw, w0, h0, "mcplay", o)
     if !ok && o.vsync != 0 {
@@ -4097,7 +4124,7 @@ fn vk_open_be(c: *mut Ctx, w: i32, h: i32) -> bool {
     var xid: u64 = 0
     if !want_vk_readback_present() && (*c).wp != (0 as *mut window.Window) { xid = backend.r_native(&(*(*c).wp).p) }
     // MCPLAY_VSYNC=0: IMMEDIATE / MAILBOX present mode (uncapped, for benchmarks); default FIFO
-    if !vk_mc.vkbe_open_win_v(&(*c).vbk, w, h, cp, xid, 0, env_int("MCPLAY_VSYNC", 1) != 0) {
+    if !vk_mc.vkbe_open_win_v(&(*c).vbk, w, h, cp, xid, 0, want_vsync()) {
         say(f"mcplay: vk back end failed (step {(*c).vbk.step})\n")
         return false
     }
@@ -4571,7 +4598,6 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     let proto: i32 = env_int("MCPLAY_PROTOCOL", proto_def)
     let w0: i32 = env_int("MCPLAY_W", 854)
     let h0: i32 = env_int("MCPLAY_H", 480)
-    let fps_cap: i32 = env_int("MCPLAY_FPS", 60)
     let vanilla_ok: bool = mc_packs.res_vanilla_wanted(proto)
     let use_res: bool = vanilla_ok || mc_packs.res_env_wanted()
     let run_s: i32 = env_int("MCPLAY_RUN_S", 0)
@@ -4619,7 +4645,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     // (thread.rs use_gs), so glibc's TLS (`fs`) stays intact and GL dispatch / dlopen(libEGL) work next to the mesher threads.
     // Workers never call GL (upload only in `consume` on the render thread).
     // Vulkan too (r199): with the r167 TLS fix the mesher threads run next to libvulkan_lvp (gate tools/mc/play/run_vk.sh checks workers=3 pool=true).
-    let n_workers: i32 = env_int("MCPLAY_WORKERS", 3)
+    let n_workers: i32 = env_int("MCPLAY_WORKERS", mc_workers.workers_default())
     var dummy_tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     var eng: engine.Engine = engine.engine_new(AUDIO_RATE, 48 as u32)
     var bnk: bank.Bank = bank.bank_new()
@@ -4821,8 +4847,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     var t_tick: u64 = t_start
     var t_fps: u64 = t_start
     var f_fps: i32 = 0
-    var frame_ns: u64 = 1000000000 as u64 / 60 as u64
-    if fps_cap > 0 { frame_ns = 1000000000 as u64 / (fps_cap as u64) } else { frame_ns = 0 as u64 }
+    var frame_ns: u64 = frame_limit_ns(&c)
     var alive: bool = true
     var tick_dropped: u64 = 0 as u64
     let prog_on: bool = env_flag("MCPLAY_PROGRESS", false)
@@ -4842,6 +4867,8 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
     var prof_d0: u64 = 0 as u64
     var prof_t0: u64 = 0 as u64
     var prof_c0: u64 = 0 as u64
+    let nb_env_set: bool = env.has("MCPLAY_NET_BUDGET_US")
+    let nb_env_us: i32 = env_int("MCPLAY_NET_BUDGET_US", 0)
     mc_frame_split.fs_init()
     var fs_kind: u64 = mc_frame_split.BK_CPU
     if c.gl { fs_kind = mc_frame_split.BK_GL }
@@ -4854,7 +4881,7 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
         handle_window(&c)
         view_poll(&c, raw.mouse_down(&c.rw, raw.MB_LEFT))
         pl = mc_prof.prof_lap(mc_prof.PH_PUMP, pl)
-        alive = net_drain(&c, 400)
+        alive = net_drain(&c, 400, mc_net_budget.nb_limit_ns(now_ms(), c.have_pos, nb_env_set, nb_env_us))
         pl = mc_prof.prof_lap(mc_prof.PH_DRAIN, pl)
         sync_position(&c)
         pl = mc_prof.prof_lap(mc_prof.PH_SYNC, pl)
@@ -4963,8 +4990,14 @@ fn run_session(start: u64, ln: *mut Launch) -> i32 {
             rt.st64(fstats_buf, fstats_n, spent)
             fstats_n = fstats_n + 1
         }
-        if frame_ns > spent {
-            window.wait_event(c.wp, ((frame_ns - spent) / 1000000 as u64) as i64)
+        frame_ns = frame_limit_ns(&c)
+        var left_ns: u64 = 0 as u64
+        if frame_ns > spent { left_ns = frame_ns - spent }
+        while left_ns > 0 as u64 && !c.closed {
+            if left_ns >= 1000000 as u64 { window.wait_event(c.wp, (left_ns / 1000000 as u64) as i64) }
+            let used_ns: u64 = now_ns() - f0
+            if used_ns >= frame_ns { break }
+            left_ns = frame_ns - used_ns
         }
     }
     (*ln).end_kind = c.end_kind

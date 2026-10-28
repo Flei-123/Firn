@@ -7,6 +7,7 @@
 # line of mcplay must be y >= 80, a lost tp repeats the attempt (3x).
 # Checks: exit 0, frames, A has LOD columns drawn (lod_cols > 0) and LOD triangles, B none, the 3D view (without HUD) differs in >= 1 % of the pixels.
 # Env: MC_VIEW_SRV (10 = server view distance), FIRNC, MCPLAY_PNG_OUT (copy of the A screenshot), LOD_KEEP_DIR (copy of outs/pngs/server.log, always), LOD_RUN_S (45 = run time per mcplay). Start it via heavy (java server).
+export MCPLAY_WORKERS=${MCPLAY_WORKERS:-3}
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
