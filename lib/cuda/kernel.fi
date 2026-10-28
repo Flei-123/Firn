@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cuda/kernel.fi -- cuda.kernel: compile CUDA C with NVRTC, load the module, look up kernels, build argument blocks, launch.
+import std.rt
+import std.dynlib as dl
+import std.io as io
+import cuda.cutil as cx
+import cuda.driver as cu
+import cuda.nvrtc as nv
+
+export {
+    load_source, load_image, func, args_new, args_reset, arg_ptr, arg_i32, arg_u32, arg_f32,
+    launch, launch3, set_debug,
+}
+
+const NSLOT: usize = 16
+const S_READY: usize = 0
+const S_DEBUG: usize = 1
+const S_SCRATCH: usize = 4
+const F_LOAD: usize = 8
+const F_GETFN: usize = 9
+const F_LAUNCH: usize = 10
+const MAX_ARGS: usize = 32
+const A_PTRS: usize = 1
+const A_VALS: usize = 33
+
+static mut state_block: u64 = 0
+
+fn blk() -> u64 {
+    if state_block == 0 {
+        state_block = rt.heap_alloc(NSLOT * 8)
+    }
+    return state_block
+}
+
+fn sa(k: usize) -> u64 {
+    return blk() + ((S_SCRATCH + k) * 8) as u64
+}
+
+fn ready() -> bool {
+    let b: u64 = blk()
+    if rt.ld64(b, S_READY) != 0 {
+        return true
+    }
+    if !cu.init() {
+        return false
+    }
+    let a: u64 = cu.proc("cuModuleLoadData")
+    let c: u64 = cu.proc("cuModuleGetFunction")
+    let d: u64 = cu.proc("cuLaunchKernel")
+    if a == 0 || c == 0 || d == 0 {
+        return false
+    }
+    rt.st64(b, F_LOAD, a)
+    rt.st64(b, F_GETFN, c)
+    rt.st64(b, F_LAUNCH, d)
+    rt.st64(b, S_READY, 1)
+    return true
+}
+
+fn set_debug(on: bool) {
+    if on {
+        rt.st64(blk(), S_DEBUG, 1)
+    } else {
+        rt.st64(blk(), S_DEBUG, 0)
+    }
+}
+
+fn load_image(image: u64) -> u64 {
+    if !ready() {
+        return 0
+    }
+    let b: u64 = blk()
+    rt.st64(b, S_SCRATCH, 0)
+    if !cu.check(dl.ci2(rt.ld64(b, F_LOAD), sa(0), image), "cuModuleLoadData") {
+        return 0
+    }
+    return rt.ld64(b, S_SCRATCH)
+}
+
+fn load_source(src: str) -> u64 {
+    if !ready() {
+        return 0
+    }
+    if !nv.compile(src, cu.arch()) {
+        return 0
+    }
+    return load_image(nv.image())
+}
+
+fn func(module: u64, name: str) -> u64 {
+    if module == 0 || !ready() {
+        return 0
+    }
+    let b: u64 = blk()
+    let np: u64 = cx.cstr_alloc(name)
+    if np == 0 {
+        return 0
+    }
+    rt.st64(b, S_SCRATCH, 0)
+    let ok: bool = cu.check(dl.ci3(rt.ld64(b, F_GETFN), sa(0), module, np), "cuModuleGetFunction")
+    cx.cstr_free(np, name.length())
+    if !ok {
+        return 0
+    }
+    return rt.ld64(b, S_SCRATCH)
+}
+
+fn args_new() -> u64 {
+    return rt.heap_alloc((A_VALS + MAX_ARGS) * 8)
+}
+
+fn args_reset(a: u64) {
+    rt.st64(a, 0, 0)
+}
+
+fn push(a: u64, v: u64) {
+    let n: usize = rt.ld64(a, 0) as usize
+    if n >= MAX_ARGS {
+        io.eprint_line("cuda: too many kernel arguments")
+        return
+    }
+    rt.st64(a, A_VALS + n, v)
+    rt.st64(a, A_PTRS + n, a + ((A_VALS + n) * 8) as u64)
+    rt.st64(a, 0, (n + 1) as u64)
+}
+
+fn arg_ptr(a: u64, dev: u64) {
+    push(a, dev)
+}
+
+fn arg_u32(a: u64, v: u32) {
+    push(a, v as u64)
+}
+
+fn arg_i32(a: u64, v: i32) {
+    push(a, ((v as i64) & 4294967295) as u64)
+}
+
+fn arg_f32(a: u64, v: f32) {
+    push(a, __bits(v) as u64)
+}
+
+fn launch3(f: u64, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32, shared: u32, a: u64) -> bool {
+    var v: [u64; 11] = [0; 11]
+    v[0] = f
+    v[1] = gx as u64
+    v[2] = gy as u64
+    v[3] = gz as u64
+    v[4] = bx as u64
+    v[5] = by as u64
+    v[6] = bz as u64
+    v[7] = shared as u64
+    v[8] = 0
+    v[9] = a + (A_PTRS * 8) as u64
+    v[10] = 0
+    let b: u64 = blk()
+    if !cu.check(dl.callx(rt.ld64(b, F_LAUNCH), "iiiiiiiiiii", (&v[0]) as u64, false), "cuLaunchKernel") {
+        return false
+    }
+    if rt.ld64(b, S_DEBUG) != 0 {
+        return cu.sync()
+    }
+    return true
+}
+
+fn launch(f: u64, gx: u32, gy: u32, bx: u32, shared: u32, a: u64) -> bool {
+    return launch3(f, gx, gy, 1, bx, 1, 1, shared, a)
+}

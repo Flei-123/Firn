@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cuda/nvrtc.fi -- cuda.nvrtc: compile CUDA C source to a cubin (or PTX) at run time with NVRTC (nvrtc64_*.dll / libnvrtc.so).
+import std.rt
+import std.dynlib as dl
+import std.io as io
+import cuda.cutil as cx
+import cuda.loader as ldr
+import cuda.driver as cu
+
+export {
+    load, compile, image, image_size, image_is_ptx, log_ptr,
+}
+
+const NSLOT: usize = 32
+const S_LIB: usize = 0
+const S_IMG: usize = 1
+const S_IMG_N: usize = 2
+const S_PTX: usize = 3
+const S_LOG: usize = 4
+const S_SCRATCH: usize = 8
+const F_BASE: usize = 16
+const NFN: usize = 9
+const F_CREATE: usize = 16
+const F_COMPILE: usize = 17
+const F_LOG_SIZE: usize = 18
+const F_LOG: usize = 19
+const F_CUBIN_SIZE: usize = 20
+const F_CUBIN: usize = 21
+const F_PTX_SIZE: usize = 22
+const F_PTX: usize = 23
+const F_DESTROY: usize = 24
+
+static mut state_block: u64 = 0
+
+fn blk() -> u64 {
+    if state_block == 0 {
+        state_block = rt.heap_alloc(NSLOT * 8)
+    }
+    return state_block
+}
+
+fn sa(k: usize) -> u64 {
+    return blk() + ((S_SCRATCH + k) * 8) as u64
+}
+
+fn fname(i: usize) -> str {
+    if i == 0 {
+        return "nvrtcCreateProgram"
+    }
+    if i == 1 {
+        return "nvrtcCompileProgram"
+    }
+    if i == 2 {
+        return "nvrtcGetProgramLogSize"
+    }
+    if i == 3 {
+        return "nvrtcGetProgramLog"
+    }
+    if i == 4 {
+        return "nvrtcGetCUBINSize"
+    }
+    if i == 5 {
+        return "nvrtcGetCUBIN"
+    }
+    if i == 6 {
+        return "nvrtcGetPTXSize"
+    }
+    if i == 7 {
+        return "nvrtcGetPTX"
+    }
+    return "nvrtcDestroyProgram"
+}
+
+fn resolve_all(h: u64) -> bool {
+    var i: usize = 0
+    while i < NFN {
+        let p: u64 = dl.sym(h, fname(i))
+        if p == 0 {
+            return false
+        }
+        rt.st64(blk(), F_BASE + i, p)
+        i = i + 1
+    }
+    return true
+}
+
+fn load() -> bool {
+    let b: u64 = blk()
+    if rt.ld64(b, S_LIB) != 0 {
+        return true
+    }
+    var i: usize = 0
+    let n: usize = ldr.nvrtc_count()
+    while i < n {
+        ldr.prepare(i)
+        let h: u64 = dl.open(ldr.nvrtc_name(i))
+        if h != 0 && resolve_all(h) {
+            rt.st64(b, S_LIB, h)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn image() -> u64 {
+    return rt.ld64(blk(), S_IMG)
+}
+
+fn image_size() -> u64 {
+    return rt.ld64(blk(), S_IMG_N)
+}
+
+fn image_is_ptx() -> bool {
+    return rt.ld64(blk(), S_PTX) != 0
+}
+
+fn log_ptr() -> u64 {
+    return rt.ld64(blk(), S_LOG)
+}
+
+fn ok(r: u64) -> bool {
+    return (r & 4294967295) == 0
+}
+
+fn fetch_log(prog: u64) {
+    let b: u64 = blk()
+    rt.st64(b, S_SCRATCH, 0)
+    if !ok(dl.ci2(rt.ld64(b, F_LOG_SIZE), prog, sa(0))) {
+        return
+    }
+    let n: u64 = rt.ld64(b, S_SCRATCH)
+    if n == 0 {
+        return
+    }
+    let buf: u64 = rt.heap_alloc(n as usize + 1)
+    if buf == 0 {
+        return
+    }
+    if ok(dl.ci2(rt.ld64(b, F_LOG), prog, buf)) {
+        rt.st64(b, S_LOG, buf)
+    }
+}
+
+fn fetch_image(prog: u64, ptx: bool) -> bool {
+    let b: u64 = blk()
+    var fs: usize = F_CUBIN_SIZE
+    var fg: usize = F_CUBIN
+    if ptx {
+        fs = F_PTX_SIZE
+        fg = F_PTX
+    }
+    rt.st64(b, S_SCRATCH, 0)
+    if !ok(dl.ci2(rt.ld64(b, fs), prog, sa(0))) {
+        return false
+    }
+    let n: u64 = rt.ld64(b, S_SCRATCH)
+    if n == 0 {
+        return false
+    }
+    let buf: u64 = rt.heap_alloc(n as usize + 1)
+    if buf == 0 {
+        return false
+    }
+    if !ok(dl.ci2(rt.ld64(b, fg), prog, buf)) {
+        return false
+    }
+    rt.st64(b, S_IMG, buf)
+    rt.st64(b, S_IMG_N, n)
+    if ptx {
+        rt.st64(b, S_PTX, 1)
+    } else {
+        rt.st64(b, S_PTX, 0)
+    }
+    return true
+}
+
+fn arch_option(ptx: bool, arch: u32) -> u64 {
+    let buf: u64 = rt.heap_alloc(64)
+    if buf == 0 {
+        return 0
+    }
+    var off: usize = cx.put_str(buf, 0, "--gpu-architecture=")
+    if ptx {
+        off = cx.put_str(buf, off, "compute_")
+    } else {
+        off = cx.put_str(buf, off, "sm_")
+    }
+    off = cx.put_u32(buf, off, arch)
+    rt.st8(buf, off, 0 as u8)
+    return buf
+}
+
+fn compile_once(src: u64, ptx: bool, arch: u32) -> bool {
+    let b: u64 = blk()
+    let name: u64 = cx.cstr_alloc("kernels.cu")
+    var argv: [u64; 6] = [0; 6]
+    rt.st64(b, S_SCRATCH, 0)
+    argv[0] = sa(0)
+    argv[1] = src
+    argv[2] = name
+    if !ok(dl.callx(rt.ld64(b, F_CREATE), "iiiiii", (&argv[0]) as u64, false)) {
+        io.eprint_line("nvrtc: nvrtcCreateProgram failed")
+        return false
+    }
+    let prog: u64 = rt.ld64(b, S_SCRATCH)
+    let opt: u64 = arch_option(ptx, arch)
+    let opts: u64 = rt.heap_alloc(8)
+    rt.st64(opts, 0, opt)
+    let r: u64 = dl.ci3(rt.ld64(b, F_COMPILE), prog, 1, opts)
+    fetch_log(prog)
+    var good: bool = ok(r)
+    if good {
+        good = fetch_image(prog, ptx)
+    }
+    rt.st64(b, S_SCRATCH, prog)
+    dl.ci1(rt.ld64(b, F_DESTROY), sa(0))
+    rt.heap_free(opts, 8)
+    rt.heap_free(opt, 64)
+    return good
+}
+
+fn compile(src: str, arch: u32) -> bool {
+    if !load() {
+        io.eprint_line("nvrtc: library not found")
+        return false
+    }
+    let sp: u64 = cx.cstr_alloc(src)
+    if sp == 0 {
+        return false
+    }
+    rt.st64(blk(), S_LOG, 0)
+    var good: bool = compile_once(sp, false, arch)
+    if !good {
+        let lp: u64 = log_ptr()
+        if lp != 0 {
+            io.eprint_c(lp)
+            io.eprint_line("")
+        }
+        rt.st64(blk(), S_LOG, 0)
+        good = compile_once(sp, true, 80)
+        if !good {
+            let lp2: u64 = log_ptr()
+            if lp2 != 0 {
+                io.eprint_c(lp2)
+                io.eprint_line("")
+            }
+        }
+    }
+    cx.cstr_free(sp, src.length())
+    return good
+}
