@@ -115,7 +115,7 @@ shot other_after; keep other_after
 echo "  other player overlay:"
 python3 -I tools/mc/play/crack_check.py other "$W/other_before.ppm" "$W/other1.ppm" "$W/other2.ppm" "$W/other_after.ppm" || ERR=1
 echo "  occluded overlay (wall between the viewer and the dug block):"
-for cmd in "fill -3 119 -3 9 120 3 stone" "fill -3 121 -3 9 128 3 air" "setblock 6 121 0 stone" "tp CrackV 0.5 121 0.5 -90 0"; do echo "$cmd" >&3; done
+for cmd in "fill -3 119 -3 9 120 3 stone" "fill -3 121 -3 9 128 3 air" "setblock 6 121 0 stone" "tp CrackB -3.5 121 0.5" "tp CrackV 0.5 121 0.5 -90 0"; do echo "$cmd" >&3; done
 MCPLAY_PROGRESS=1 MCPLAY_AUDIO=0 MCPLAY_RUN_S=60 MCPLAY_VIEW=$VIEW MCPLAY_FPS=10 MCPLAY_W=320 MCPLAY_H=200 \
     MCPLAY_BOT_DIG_X=6 MCPLAY_BOT_DIG_Y=121 MCPLAY_BOT_DIG_Z=0 MCPLAY_BOT_DIG_MS=9000 MCPLAY_BOT_GO_FILE="$W/go2" \
     MCPLAY_QUIT_FILE="$W/quit-C" DISPLAY=:$BDN timeout 100 $RUN 127.0.0.1 "$PORT" CrackC > "$W/CrackC.out" 2>&1 &
