@@ -144,5 +144,41 @@ grep -q 'cache: hit' "$T/self3.log"; check "self build second run = hit" $?
 cmp -s "$T/self1" "$T/self2" && cmp -s "$T/self1" "$T/self3"; check "self build identical (uncached, miss, hit)" $?
 cmp -s "$T/self1.s" "$T/self3.s"; check "self build assembler text identical" $?
 
+echo "== 13. resolve manifest (hit without lexing) =="
+R="$T/rm"
+mkdir -p "$R/lib"
+cd "$R"
+printf 'import helper\nfn main() -> i32 {\n    return helper.val()\n}\n' > main.fi
+printf 'fn val() -> i32 {\n    return 3\n}\n' > lib/helper.fi
+export FIRN_CACHE_DIR="$R/cache"
+nrm() { ls "$FIRN_CACHE_DIR/objects" 2>/dev/null | grep -c '\.rm$'; }
+FIRNLIB="$R/lib" "$C1" main.fi -o m1 2> m1.log
+[ "$(ev m1.log)" = "cache: miss cache: store cache: objsave " ]; check "manifest build = miss" $?
+[ "$(nrm)" -eq 1 ]; check "one manifest written" $?
+FIRNLIB="$R/lib" "$C1" main.fi -o m2 2> m2.log
+[ "$(ev m2.log)" = "cache: hit cache: objload " ]; check "manifest build = hit" $?
+cmp -s m1 m2; check "manifest hit executable identical" $?
+printf 'fn val() -> i32 {\n    return 9\n}\n' > helper.fi
+FIRNLIB="$R/lib" "$C1" main.fi -o m3 2> m3.log
+[ "$(ev m3.log)" = "cache: miss cache: store cache: objsave " ]; check "shadowing file = miss" $?
+./m3; [ $? -eq 9 ]; check "shadowed module is used (exit 9)" $?
+FIRNLIB="$R/lib" "$C1" main.fi -o m4 2> m4.log
+[ "$(ev m4.log)" = "cache: hit cache: objload " ]; check "after shadowing = hit again" $?
+rm helper.fi
+FIRNLIB="$R/lib" "$C1" main.fi -o m5 2> m5.log
+[ "$(ev m5.log)" = "cache: hit cache: objload " ]; check "removing the shadow = hit on the first entry" $?
+cmp -s m1 m5; check "executable back to the first one" $?
+printf 'fn val() -> i32 {\n    return 4\n}\n' > lib/helper.fi
+FIRNLIB="$R/lib" "$C1" main.fi -o m6 2> m6.log
+[ "$(ev m6.log)" = "cache: miss cache: store cache: objsave " ]; check "module edit = miss" $?
+./m6; [ $? -eq 4 ]; check "edited module is used (exit 4)" $?
+printf 'x' >> "$FIRN_CACHE_DIR/objects/$(ls "$FIRN_CACHE_DIR/objects" | grep '\.rm$' | head -1)"
+FIRNLIB="$R/lib" "$C1" main.fi -o m7 2> m7.log
+[ "$(ev m7.log)" = "cache: hit cache: objload " ]; check "damaged manifest falls back to the full key" $?
+cmp -s m6 m7; check "damaged manifest executable identical" $?
+FIRNLIB="$R/lib" "$C1" main.fi -o m8 2> m8.log
+[ "$(ev m8.log)" = "cache: hit cache: objload " ]; check "manifest rewritten after damage" $?
+cd "$ROOT"
+
 echo "firnc1 cache: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
