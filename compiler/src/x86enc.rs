@@ -331,6 +331,7 @@ pub enum Inst {
     Cbw,
     RepMovsb,
     RepStosb,
+    RepString(&'static [u8]),
     /// `lock cmpxchg r/m, r` (F0 0F B1 /r).
     LockCmpxchg { mem: Mem, src: Gpr, bits: u16 },
     /// `lock xadd r/m, r` (F0 0F C1 /r).
@@ -982,6 +983,12 @@ pub fn encode(buf: &mut Buf, i: &Inst) -> Result<(), String> {
         Inst::RepStosb => {
             buf.b(0xF3);
             buf.b(0xAA);
+            Ok(())
+        }
+        Inst::RepString(bytes) => {
+            for b in bytes.iter() {
+                buf.b(*b);
+            }
             Ok(())
         }
         Inst::LockCmpxchg { mem, src, bits } => {

@@ -575,6 +575,17 @@ impl Asm {
                     Opnd::Xmm(x) => x,
                     _ => return Err(self.err(format!("{} needs xmm on the right", m))),
                 };
+                if let (true, Opnd::Reg(rn, _)) = (m == "pextrw", &dst) {
+                    return Ok((
+                        Inst::Sse {
+                            op: E::SseOp { pfx, esc: 0, op: 0xC5, w: false, digit: None },
+                            reg: *rn,
+                            rm: Opnd::Xmm(sx),
+                            imm: imm8,
+                        },
+                        std::mem::take(syms),
+                    ));
+                }
                 let w = m == "pextrq";
                 (pfx, op, None, w, sx, dst)
             }
@@ -686,6 +697,12 @@ impl Asm {
             let i = match r {
                 "movsb" => Inst::RepMovsb,
                 "stosb" => Inst::RepStosb,
+                "movsw" => Inst::RepString(&[0xF3, 0x66, 0xA5]),
+                "movsd" => Inst::RepString(&[0xF3, 0xA5]),
+                "movsq" => Inst::RepString(&[0xF3, 0x48, 0xA5]),
+                "stosw" => Inst::RepString(&[0xF3, 0x66, 0xAB]),
+                "stosd" => Inst::RepString(&[0xF3, 0xAB]),
+                "stosq" => Inst::RepString(&[0xF3, 0x48, 0xAB]),
                 other => return Err(self.err(format!("rep {}", other))),
             };
             return Ok((i, syms));

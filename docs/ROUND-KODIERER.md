@@ -103,3 +103,11 @@ debug information the default path keeps `as`.
 at the first deviation), `end_to_end.sh` (build both ways and run),
 `default_unchanged.sh` (the default path is octet-identical to an untouched
 compiler), `measure.sh` (compile time with and without `as`).
+
+## Update 28.10.2026: integrated assembler is the x86-64 Linux default
+
+* `--asm-intern` is now the default for `x86_64-linux`; `--asm-as` or `FIRN_USE_AS=1` selects `as`. Windows, aarch64 and wasm are unchanged.
+* The assembler text is no longer written to a file and read back; it is assembled from memory (`--keep-asm` still writes it).
+* `asm_dwarf.rs` writes `.debug_line`, `.debug_info`, `.debug_abbrev` and `.debug_aranges` byte-identical to `as` (DWARF 3 line program, same special-opcode choice); only `.debug_str` differs (producer name).
+* `compare.py` checks the debug sections for x86-64; `FIRN_ASM_LENIENT=1` lists every unsupported line in one run; `FIRN_STAGE_TIMINGS=1` prints parse and layout times.
+* Measured on bin/firnc1.fi (release-fast, host load 25-32): `as + ld` 2.9 s -> 1.1 s; assembler alone on its 16 MB text: `as` 1.9-2.5 s, own 1.0 s (parse+encode 0.84 s, layout 0.24 s).

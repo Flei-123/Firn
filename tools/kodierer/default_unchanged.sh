@@ -25,7 +25,7 @@ same=0; differ=0; skipped=0
 for t in $PATTERN; do
     [ -f "$t" ] || continue
     "$OLD" -o "$W/a" "$t" >/dev/null 2>&1 || { skipped=$((skipped+1)); continue; }
-    "$NEW" -o "$W/b" "$t" >/dev/null 2>&1 || { skipped=$((skipped+1)); continue; }
+    "$NEW" --asm-as -o "$W/b" "$t" >/dev/null 2>&1 || { skipped=$((skipped+1)); continue; }
     if cmp -s "$W/a" "$W/b"; then
         same=$((same+1))
     else

@@ -40,7 +40,7 @@ total_old=0
 total_new=0
 for f in "$@"; do
     [ -f "$f" ] || continue
-    a=$(best "$FIRNC" -c -o "$W/o1.o" "$f")
+    a=$(best "$FIRNC" --asm-as -c -o "$W/o1.o" "$f")
     b=$(best "$FIRNC" --asm-intern -c -o "$W/o2.o" "$f")
     diff=$((a - b))
     fac=$(python3 -c "print('%.2fx' % ($a / max($b,1)))")
