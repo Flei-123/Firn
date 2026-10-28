@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/resolvemanifest.fi -- firnc1.resolvemanifest: resolve manifest of the compile cache (hit without lexing)
+
+import rt
+import cache
+import package
+
+export { Recorder, rec_new, rec_free, rec_probe, rec_file, rec_encode, verify }
+
+struct Recorder {
+    on: bool,
+    ok: bool,
+    n_files: u64,
+    n_probes: u64,
+    files: rt.Buf,
+    probes: rt.Buf,
+}
+
+struct Cursor {
+    p: u64,
+    n: usize,
+    at: usize,
+}
+
+fn rec_new() -> Recorder {
+    return Recorder {
+        on: false, ok: true, n_files: 0, n_probes: 0,
+        files: rt.buf_new(), probes: rt.buf_new(),
+    }
+}
+
+fn rec_free(r: *mut Recorder) {
+    rt.buf_free(&(*r).files)
+    rt.buf_free(&(*r).probes)
+}
+
+fn lane2(p: u64, n: usize) -> u64 {
+    var h: u64 = (0xC2B2AE3D27D4EB4F as u64) ^ ((n as u64) << 1)
+    let mul: u64 = 0x9E3779B185EBCA87 as u64
+    var i: usize = 0
+    while i < n / 8 {
+        h = ((((h << 13) | (h >> 51)) *% mul) ^ rt.ld64(p, i))
+        i = i + 1
+    }
+    var b: usize = n / 8 * 8
+    while b < n {
+        h = ((((h << 13) | (h >> 51)) *% mul) ^ (rt.ld8(p, b) as u64))
+        b = b + 1
+    }
+    return h ^ (h >> 29)
+}
+
+fn has_newline(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 10 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn rec_probe(r: *mut Recorder, path: u64, answer: bool) {
+    if !(*r).on {
+        return
+    }
+    let n: usize = rt.c_length(path)
+    if has_newline(path, n) {
+        (*r).ok = false
+        return
+    }
+    var flag: u8 = 48 as u8
+    if answer {
+        flag = 49 as u8
+    }
+    rt.buf_push(&(*r).probes, flag)
+    rt.buf_push_bytes(&(*r).probes, path, n)
+    rt.buf_push(&(*r).probes, 10 as u8)
+    (*r).n_probes = (*r).n_probes + 1
+}
+
+fn rec_file(r: *mut Recorder, path: u64, path_n: usize, body: u64, body_n: usize) {
+    if !(*r).on {
+        return
+    }
+    if has_newline(path, path_n) {
+        (*r).ok = false
+        return
+    }
+    rt.buf_push_dec_u64(&(*r).files, body_n as u64)
+    rt.buf_push(&(*r).files, 32 as u8)
+    rt.buf_push_hex_u64(&(*r).files, cache.fast_sum(body, body_n), 16)
+    rt.buf_push(&(*r).files, 32 as u8)
+    rt.buf_push_hex_u64(&(*r).files, lane2(body, body_n), 16)
+    rt.buf_push(&(*r).files, 32 as u8)
+    rt.buf_push_bytes(&(*r).files, path, path_n)
+    rt.buf_push(&(*r).files, 10 as u8)
+    (*r).n_files = (*r).n_files + 1
+}
+
+fn push_key_line(b: *mut rt.Buf, key: u64, key_n: usize, p: u64, n: usize) {
+    rt.buf_push_bytes(b, key, key_n)
+    rt.buf_push_bytes(b, p, n)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn push_count_line(b: *mut rt.Buf, key: u64, key_n: usize, v: u64) {
+    rt.buf_push_bytes(b, key, key_n)
+    rt.buf_push_dec_u64(b, v)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn rec_encode(r: *mut Recorder, out: *mut rt.Buf, full: *mut rt.Buf, kernel: bool,
+    exelib: *mut rt.Buf) -> bool {
+    if !(*r).on || !(*r).ok || rt.buf_len(full) != 64 || has_newline(rt.buf_ptr(exelib), rt.buf_len(exelib)) {
+        return false
+    }
+    var magic: [u8; 8] = "FIRNRM1\n"
+    var k_full: [u8; 5] = "full="
+    var k_kernel: [u8; 7] = "kernel="
+    var k_exelib: [u8; 7] = "exelib="
+    var k_files: [u8; 6] = "files="
+    var k_probes: [u8; 7] = "probes="
+    var k_sum: [u8; 4] = "sum="
+    var flag: [u8; 1] = "0"
+    if kernel {
+        flag[0] = 49 as u8
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (&magic[0]) as u64, 8)
+    push_key_line(out, (&k_full[0]) as u64, 5, rt.buf_ptr(full), rt.buf_len(full))
+    push_key_line(out, (&k_kernel[0]) as u64, 7, (&flag[0]) as u64, 1)
+    push_key_line(out, (&k_exelib[0]) as u64, 7, rt.buf_ptr(exelib), rt.buf_len(exelib))
+    push_count_line(out, (&k_files[0]) as u64, 6, (*r).n_files)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*r).files), rt.buf_len(&(*r).files))
+    push_count_line(out, (&k_probes[0]) as u64, 7, (*r).n_probes)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*r).probes), rt.buf_len(&(*r).probes))
+    let sum: u64 = cache.fast_sum(rt.buf_ptr(out), rt.buf_len(out))
+    rt.buf_push_bytes(out, (&k_sum[0]) as u64, 4)
+    rt.buf_push_hex_u64(out, sum, 16)
+    rt.buf_push(out, 10 as u8)
+    return true
+}
+
+fn cur_line(c: *mut Cursor, s: *mut usize, e: *mut usize) -> bool {
+    if (*c).at >= (*c).n {
+        return false
+    }
+    let end: usize = cache.line_end((*c).p, (*c).at, (*c).n)
+    if end >= (*c).n {
+        return false
+    }
+    *s = (*c).at
+    *e = end
+    (*c).at = end + 1
+    return true
+}
+
+fn cur_expect(c: *mut Cursor, key: u64, key_n: usize, vs: *mut usize, ve: *mut usize) -> bool {
+    var s: usize = 0
+    var e: usize = 0
+    if !cur_line(c, &s, &e) {
+        return false
+    }
+    if !cache.has_prefix((*c).p, s, e, key, key_n) {
+        return false
+    }
+    *vs = s + key_n
+    *ve = e
+    return true
+}
+
+fn cur_count(c: *mut Cursor, key: u64, key_n: usize, out: *mut u64) -> bool {
+    var vs: usize = 0
+    var ve: usize = 0
+    if !cur_expect(c, key, key_n, &vs, &ve) {
+        return false
+    }
+    return cache.parse_decimal((*c).p + vs as u64, ve - vs, out)
+}
+
+fn check_file(c: *mut Cursor, body: *mut rt.Buf, path: *mut rt.Buf) -> bool {
+    var s: usize = 0
+    var e: usize = 0
+    if !cur_line(c, &s, &e) {
+        return false
+    }
+    let p: u64 = (*c).p
+    var sp: usize = s
+    while sp < e && rt.ld8(p, sp) != 32 as u8 {
+        sp = sp + 1
+    }
+    var size: u64 = 0
+    var sum1: u64 = 0
+    var sum2: u64 = 0
+    if sp + 36 > e || !cache.parse_decimal(p + s as u64, sp - s, &size) {
+        return false
+    }
+    if !cache.parse_hex(p + (sp + 1) as u64, 16, &sum1) || rt.ld8(p, sp + 17) != 32 as u8 {
+        return false
+    }
+    if !cache.parse_hex(p + (sp + 18) as u64, 16, &sum2) || rt.ld8(p, sp + 34) != 32 as u8 {
+        return false
+    }
+    rt.buf_clear(path)
+    rt.buf_push_bytes(path, p + (sp + 35) as u64, e - sp - 35)
+    rt.buf_push(path, 0 as u8)
+    rt.buf_clear(body)
+    if !rt.read_file(rt.buf_ptr(path), body) {
+        return false
+    }
+    if rt.buf_len(body) as u64 != size {
+        return false
+    }
+    if cache.fast_sum(rt.buf_ptr(body), rt.buf_len(body)) != sum1 {
+        return false
+    }
+    return lane2(rt.buf_ptr(body), rt.buf_len(body)) == sum2
+}
+
+fn check_probe(c: *mut Cursor, path: *mut rt.Buf) -> bool {
+    var s: usize = 0
+    var e: usize = 0
+    if !cur_line(c, &s, &e) || e <= s + 1 {
+        return false
+    }
+    let p: u64 = (*c).p
+    let flag: u8 = rt.ld8(p, s)
+    if flag != 48 as u8 && flag != 49 as u8 {
+        return false
+    }
+    rt.buf_clear(path)
+    rt.buf_push_bytes(path, p + (s + 1) as u64, e - s - 1)
+    rt.buf_push(path, 0 as u8)
+    return package.is_file(rt.buf_ptr(path)) == (flag == 49 as u8)
+}
+
+fn verify(data: *mut rt.Buf, exelib: *mut rt.Buf, full: *mut rt.Buf, kernel: *mut bool) -> bool {
+    var magic: [u8; 8] = "FIRNRM1\n"
+    var k_full: [u8; 5] = "full="
+    var k_kernel: [u8; 7] = "kernel="
+    var k_exelib: [u8; 7] = "exelib="
+    var k_files: [u8; 6] = "files="
+    var k_probes: [u8; 7] = "probes="
+    var k_sum: [u8; 4] = "sum="
+    let total: usize = rt.buf_len(data)
+    if total < 25 {
+        return false
+    }
+    let body_n: usize = total - 21
+    let p: u64 = rt.buf_ptr(data)
+    var want: u64 = 0
+    if !cache.has_prefix(p, body_n, total, (&k_sum[0]) as u64, 4) {
+        return false
+    }
+    if !cache.parse_hex(p + (body_n + 4) as u64, 16, &want) {
+        return false
+    }
+    if cache.fast_sum(p, body_n) != want {
+        return false
+    }
+    if !cache.has_prefix(p, 0, body_n, (&magic[0]) as u64, 8) {
+        return false
+    }
+    var c: Cursor = Cursor { p: p, n: body_n, at: 8 }
+    var vs: usize = 0
+    var ve: usize = 0
+    if !cur_expect(&c, (&k_full[0]) as u64, 5, &vs, &ve) || ve - vs != 64 {
+        return false
+    }
+    rt.buf_clear(full)
+    rt.buf_push_bytes(full, p + vs as u64, 64)
+    if !cur_expect(&c, (&k_kernel[0]) as u64, 7, &vs, &ve) || ve - vs != 1 {
+        return false
+    }
+    *kernel = rt.ld8(p, vs) == 49 as u8
+    if !cur_expect(&c, (&k_exelib[0]) as u64, 7, &vs, &ve) || ve - vs != rt.buf_len(exelib) {
+        return false
+    }
+    var i: usize = 0
+    while i < ve - vs {
+        if rt.ld8(p, vs + i) != rt.buf_at(exelib, i) {
+            return false
+        }
+        i = i + 1
+    }
+    var count: u64 = 0
+    if !cur_count(&c, (&k_files[0]) as u64, 6, &count) {
+        return false
+    }
+    var body: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    var k: u64 = 0
+    while ok && k < count {
+        ok = check_file(&c, &body, &path)
+        k = k + 1
+    }
+    rt.buf_free(&body)
+    if ok {
+        ok = cur_count(&c, (&k_probes[0]) as u64, 7, &count)
+    }
+    k = 0
+    while ok && k < count {
+        ok = check_probe(&c, &path)
+        k = k + 1
+    }
+    rt.buf_free(&path)
+    return ok && c.at == body_n
+}

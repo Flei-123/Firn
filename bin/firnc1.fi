@@ -43,6 +43,7 @@ import codegen
 import outstage
 import cache
 import cachekey
+import resolvemanifest
 import sha256
 
 // ---------------------------------------------------------- module system
@@ -158,6 +159,7 @@ struct SearchSpace {
     exelib: rt.Buf,
     cwd: rt.Buf,
     my_package: i64, // package of the importing file, -1 = none
+    rec: resolvemanifest.Recorder,
 }
 
 fn sr_new() -> SearchSpace {
@@ -165,6 +167,7 @@ fn sr_new() -> SearchSpace {
         dir: rt.buf_new(), root_dir: rt.buf_new(),
         firnlib: rt.buf_new(), exelib: rt.buf_new(),
         cwd: rt.buf_new(), my_package: 0 - 1,
+        rec: resolvemanifest.rec_new(),
     }
 }
 
@@ -174,6 +177,13 @@ fn sr_free(s: *mut SearchSpace) {
     rt.buf_free(&(*s).firnlib)
     rt.buf_free(&(*s).exelib)
     rt.buf_free(&(*s).cwd)
+    resolvemanifest.rec_free(&(*s).rec)
+}
+
+fn probe_file(s: *mut SearchSpace, p: u64) -> bool {
+    let found: bool = package.is_file(p)
+    resolvemanifest.rec_probe(&(*s).rec, p, found)
+    return found
 }
 
 fn buf_set(b: *mut rt.Buf, p: u64, n: usize) {
@@ -542,13 +552,13 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         var found: bool = false
         // (1) next to the importing file
         module_path(&path, &(*s).dir, l, i + 1, j)
-        if package.is_file(rt.buf_ptr(&path)) {
+        if probe_file(s, rt.buf_ptr(&path)) {
             found = true
         }
         // (2) next to the root file
         if !found {
             module_path(&path, &(*s).root_dir, l, i + 1, j)
-            if package.is_file(rt.buf_ptr(&path)) {
+            if probe_file(s, rt.buf_ptr(&path)) {
                 found = true
             }
         }
@@ -560,7 +570,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
                 while qi < package.world_source_count(w, mp) {
                     package.world_source_base(w, mp, qi, &base)
                     module_path(&path, &base, l, i + 1, j)
-                    if package.is_file(rt.buf_ptr(&path)) {
+                    if probe_file(s, rt.buf_ptr(&path)) {
                         found = true
                         break
                     }
@@ -584,7 +594,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
                     while qi < package.world_source_count(w, di as usize) {
                         package.world_source_base(w, di as usize, qi, &base)
                         module_path(&path, &base, l, of, j)
-                        if package.is_file(rt.buf_ptr(&path)) {
+                        if probe_file(s, rt.buf_ptr(&path)) {
                             found = true
                             break
                         }
@@ -610,7 +620,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
                     rt.buf_push_bytes(&pdir, (&at[0]) as u64, 7)
                     module_path(&path, &pdir, l, i + 1, j)
                     rt.buf_free(&pdir)
-                    if package.is_file(rt.buf_ptr(&path)) {
+                    if probe_file(s, rt.buf_ptr(&path)) {
                         found = true
                     }
                 }
@@ -621,7 +631,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         if !found {
             if rt.buf_len(&(*s).firnlib) > 0 {
                 module_path(&path, &(*s).firnlib, l, i + 1, j)
-                if package.is_file(rt.buf_ptr(&path)) {
+                if probe_file(s, rt.buf_ptr(&path)) {
                     found = true
                 }
             }
@@ -630,7 +640,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         if !found {
             if rt.buf_len(&(*s).exelib) > 0 {
                 module_path(&path, &(*s).exelib, l, i + 1, j)
-                if package.is_file(rt.buf_ptr(&path)) {
+                if probe_file(s, rt.buf_ptr(&path)) {
                     found = true
                 }
             }
@@ -849,11 +859,13 @@ fn cache_say(c: *mut cache.Cache, word: u64) {
     cache.cache_log(c, word, rt.c_length(word))
 }
 
-fn cache_build_key(c: *mut cache.Cache, start: u64, w: *mut package.World,
-    ml: *mut ModuleList, source: *mut rt.Buf) {
+fn cache_build_key(c: *mut cache.Cache, identity: *mut rt.Buf, w: *mut package.World,
+    ml: *mut ModuleList, source: *mut rt.Buf, rec: *mut resolvemanifest.Recorder,
+    full: *mut rt.Buf) {
     var kh: sha256.Hash = cachekey.key_new()
-    cachekey.key_start(&kh, start)
+    cachekey.key_start(&kh, identity)
     cachekey.key_file(&kh, ml_ptr(ml, 0), ml_length(ml, 0), rt.buf_ptr(source), rt.buf_len(source))
+    resolvemanifest.rec_file(rec, ml_ptr(ml, 0), ml_length(ml, 0), rt.buf_ptr(source), rt.buf_len(source))
     var path: rt.Buf = rt.buf_new()
     var body: rt.Buf = rt.buf_new()
     var i: usize = 1
@@ -864,6 +876,7 @@ fn cache_build_key(c: *mut cache.Cache, start: u64, w: *mut package.World,
         rt.buf_clear(&body)
         rt.read_file(rt.buf_ptr(&path), &body)
         cachekey.key_file(&kh, ml_ptr(ml, i), ml_length(ml, i), rt.buf_ptr(&body), rt.buf_len(&body))
+        resolvemanifest.rec_file(rec, ml_ptr(ml, i), ml_length(ml, i), rt.buf_ptr(&body), rt.buf_len(&body))
         i = i + 1
     }
     var p: usize = 0
@@ -874,10 +887,40 @@ fn cache_build_key(c: *mut cache.Cache, start: u64, w: *mut package.World,
     var hex: rt.Buf = rt.buf_new()
     cachekey.key_finish(&kh, &hex)
     cache.cache_set_key(c, &hex)
+    rt.buf_clear(full)
+    rt.buf_push_bytes(full, rt.buf_ptr(&hex), rt.buf_len(&hex))
     rt.buf_free(&hex)
     rt.buf_free(&body)
     rt.buf_free(&path)
     cachekey.key_free(&kh)
+}
+
+fn resolve_manifest_store(c: *mut cache.Cache, identity: *mut rt.Buf, rec: *mut resolvemanifest.Recorder,
+    full: *mut rt.Buf, kernel: bool, exelib: *mut rt.Buf) {
+    var data: rt.Buf = rt.buf_new()
+    if resolvemanifest.rec_encode(rec, &data, full, kernel, exelib) {
+        cache.cache_rm_store(c, identity, &data)
+    }
+    rt.buf_free(&data)
+}
+
+fn resolve_hit(c: *mut cache.Cache, identity: *mut rt.Buf, exelib: *mut rt.Buf,
+    has_target: bool, target: u64, target_n: usize, only_object: bool) -> i32 {
+    var data: rt.Buf = rt.buf_new()
+    var full: rt.Buf = rt.buf_new()
+    var kernel: bool = false
+    var served: i32 = -1
+    if cache.cache_rm_load(c, identity, &data) {
+        if resolvemanifest.verify(&data, exelib, &full, &kernel) {
+            cache.cache_set_key(c, &full)
+            if cache.cache_lookup(c) {
+                served = cache_serve(c, has_target, target, target_n, only_object || kernel)
+            }
+        }
+    }
+    rt.buf_free(&data)
+    rt.buf_free(&full)
+    return served
 }
 
 fn cache_remember(c: *mut cache.Cache, kernel: bool, split: u32, text: *mut rt.Buf,
@@ -1232,6 +1275,27 @@ fn main(start: u64) -> i32 {
         }
     }
 
+    var cch: cache.Cache = cache.cache_new(start, cache_off || env_log || tm_on != 0)
+    defer cache.cache_free(&cch)
+    var identity: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&identity)
+    var rm_exelib: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&rm_exelib)
+    var rm_on: bool = false
+    if cache.cache_active(&cch) {
+        cachekey.key_identity(start, &identity)
+        rm_on = pak == 0 && inp != 0 && !lock_write && !lock_check
+            && package.world_count(&w) == 0
+    }
+    if rm_on {
+        exe_search_path(&rm_exelib)
+        let early: i32 = resolve_hit(&cch, &identity, &rm_exelib, has_target,
+            rt.buf_ptr(&targetb), rt.buf_len(&targetb), only_object)
+        if early >= 0 {
+            return early
+        }
+    }
+
     var hold: lexhold.LexHold = lexhold.hold_new()
     defer lexhold.hold_free(&hold)
     let root: *mut lexhold.Held = lexhold.hold_slot(&hold, 0)
@@ -1262,6 +1326,7 @@ fn main(start: u64) -> i32 {
     // Both stay empty if they do not exist.
     var sr: SearchSpace = sr_new()
     defer sr_free(&sr)
+    sr.rec.on = rm_on
     var flname: [u8; 7] = "FIRNLIB"
     let flvalue: u64 = rt.env_value(start, (&flname[0]) as u64, 7)
     if flvalue != 0 {
@@ -1497,13 +1562,14 @@ fn main(start: u64) -> i32 {
         lock.lock_free(&lk)
     }
 
-    var cch: cache.Cache = cache.cache_new(start, cache_off || env_log || tm_on != 0)
-    defer cache.cache_free(&cch)
     var stored: bool = false
     var w_miss: [u8; 5] = "miss\0"
     var w_off: [u8; 4] = "off\0"
     if cache.cache_active(&cch) {
-        cache_build_key(&cch, start, &w, &ml, &source)
+        var full_key: rt.Buf = rt.buf_new()
+        cache_build_key(&cch, &identity, &w, &ml, &source, &sr.rec, &full_key)
+        resolve_manifest_store(&cch, &identity, &sr.rec, &full_key, kernel_early, &sr.exelib)
+        rt.buf_free(&full_key)
         if cache.cache_lookup(&cch) {
             let served: i32 = cache_serve(&cch, has_target, rt.buf_ptr(&targetb),
                 rt.buf_len(&targetb), only_object || kernel_early)
