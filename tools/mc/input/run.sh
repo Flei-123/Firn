@@ -52,9 +52,9 @@ counter() { # name sed-expression
     fi
 }
 counter "pick normal" 's/nx = 0 - sx/nx = sx/'
-counter "gravity" 's/(\*p).vy - 0.08/(*p).vy - 0.07/g'
+counter "gravity" 's/const GRAVITY: f64 = 0.08/const GRAVITY: f64 = 0.07/' mc_phys.fi
 counter "line rounding" 's/floor_div64(2 as i64 \* ddx \* i + n, 2 as i64 \* n)/floor_div64(2 as i64 * ddx * i, 2 as i64 * n)/'
-counter "soul sand speed ratio" 's/return (1.0 - F_GROUND) \/ (1.0 - F_GROUND \* f)/return f/'
+counter "soul sand speed factor" 's/return 0.4f as f64/return 0.5f as f64/'
 counter "honey jump factor" 's/MV_HONEY { return 0.5 }/MV_HONEY { return 1.0 }/'
 counter "cobweb multiplier" 's/var mxz: f64 = 0.25/var mxz: f64 = 0.5/'
 counter "honey slide speed" 's/(\*p).vy = -0.05/(*p).vy = -0.06/'

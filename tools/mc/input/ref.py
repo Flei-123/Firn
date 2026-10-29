@@ -3,7 +3,7 @@
 
 Reads <dir>/scenes.txt, worldA.bin, worldB.bin and the box framebuffers written by dump.fi and checks
   * mouse look: yaw / pitch BIT identical (no trig involved),
-  * movement physics: every tick of 7 scripted scenarios re-simulated with python floats (positions within 1e-9, flags exact);
+  * movement physics: every tick of 19 scripted scenarios re-simulated with the vanilla momentum model in python (f32 constants, positions within 1e-9, flags exact);
     collision = exact swept AABB against unit cubes written from the documented rules (y, x, z order, 1e-9 penetration rule,
     unloaded chunks solid),
   * picking: 600 random rays decided by a brute force slab test against every pickable block near the ray (not a DDA):
@@ -57,123 +57,14 @@ def look(yaw, pitch, sens, dx, dy):
     return yaw, pitch
 
 
-# ---------------------------------------------------------------- physics
-SOLID_IDS = {1}
+# ---------------------------------------------------------------- physics (vanilla momentum model, docs/mc/input.md)
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
-def is_solid(block, x, y, z):
-    b = block(x, y, z)
-    return b is None or b in SOLID_IDS
-
-
-def move_axis(block, box, axis, d):
-    """distance moved along `axis` (0 x, 1 y, 2 z) of the box [x0,y0,z0,x1,y1,z1] against solid unit cubes"""
-    lo, hi = box[axis], box[axis + 3]
-    others = [a for a in range(3) if a != axis]
-    rng = []
-    for a in range(3):
-        a0 = box[a] + (min(d, 0.0) if a == axis else 0.0)
-        a1 = box[a + 3] + (max(d, 0.0) if a == axis else 0.0)
-        rng.append(range(math.floor(a0) - 1, math.floor(a1) + 2))
-    out = d
-    for cx in rng[0]:
-        for cy in rng[1]:
-            for cz in rng[2]:
-                if not is_solid(block, cx, cy, cz):
-                    continue
-                c = (cx, cy, cz)
-                ok = True
-                for o in others:
-                    if not (box[o] + 1e-9 < c[o] + 1.0 and c[o] + 1e-9 < box[o + 3]):
-                        ok = False
-                if not ok:
-                    continue
-                if out > 0.0 and hi <= c[axis]:
-                    out = min(out, c[axis] - hi)
-                elif out < 0.0 and lo >= c[axis] + 1.0:
-                    out = max(out, c[axis] + 1.0 - lo)
-    return out
-
-
-def simulate(block, start, yaw, ticks):
-    x, y, z = start
-    pitch = 0.0
-    vy = 0.0
-    ground = flying = noclip = False
-    slot = 0
-    sens = 0.5
-    res = []
-    for t in ticks:
-        dxm, dym, keys, tf, tn, sd = t
-        if tf:
-            flying = not flying
-            vy = 0.0
-        if tn:
-            noclip = not noclip
-        if sd:
-            slot = (slot + sd) % 9
-        yaw, pitch = look(yaw, pitch, sens, dxm, dym)
-        fwd = bool(keys & 1)
-        sneak = bool(keys & 32)
-        sprint = bool(keys & 64) and fwd and not sneak
-        mx = (1.0 if keys & 8 else 0.0) - (1.0 if keys & 4 else 0.0)
-        mz = (1.0 if fwd else 0.0) - (1.0 if keys & 2 else 0.0)
-        yr = yaw * (math.pi / 180.0)
-        sn, cs = math.sin(yr), math.cos(yr)
-        wx = (0.0 - cs) * mx + (0.0 - sn) * mz
-        wz = (0.0 - sn) * mx + cs * mz
-        if mx != 0.0 and mz != 0.0:
-            wx *= 0.7071067811865476
-            wz *= 0.7071067811865476
-        if flying:
-            speed = 0.546 * (2.0 if sprint else 1.0)
-        elif sneak:
-            speed = 0.0648
-        elif sprint:
-            speed = 0.2806
-        else:
-            speed = 0.21585
-        dx, dz = wx * speed, wz * speed
-        dy = 0.0
-        if flying:
-            if keys & 16:
-                dy += 0.375
-            if keys & 32:
-                dy -= 0.375
-        else:
-            if (keys & 16) and ground:
-                vy = 0.42
-            dy = vy
-        if noclip:
-            x, y, z = x + dx, y + dy, z + dz
-            ground = False
-            if not flying:
-                vy = (vy - 0.08) * 0.98
-        else:
-            h = 1.5 if sneak else 1.8
-            box = [x - 0.3, y, z - 0.3, x + 0.3, y + h, z + 0.3]
-            my = move_axis(block, box, 1, dy)
-            box[1] += my
-            box[4] += my
-            mxx = move_axis(block, box, 0, dx)
-            box[0] += mxx
-            box[3] += mxx
-            mzz = move_axis(block, box, 2, dz)
-            x, y, z = x + mxx, y + my, z + mzz
-            hit_y = my != dy
-            ground = hit_y and dy < 0.0
-            if flying:
-                vy = 0.0
-            else:
-                if hit_y:
-                    vy = 0.0
-                vy = (vy - 0.08) * 0.98
-        res.append((x, y, z, yaw, pitch, ground, slot))
-    return res
-
-
-# ---------------------------------------------------------------- slowdown blocks (world C of dump.fi)
-# ids: 1 stone, 4 soul sand (14/16), 5 honey (1/16..15/16), 6 cobweb, 7 sweet berry bush, 8 / 9 pane post with XZ offset (max 0.25 / 0.125)
+SIN_SCALE = f32(10430.378)
+DEG = f32(0.017453292)
+BOXES_A = {1: [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]}
 BOXES_C = {
     1: [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
     4: [(0.0, 0.0, 0.0, 1.0, 0.875, 1.0)],
@@ -183,12 +74,13 @@ BOXES_C = {
 }
 OFFSET_MAX = {8: 0.25, 9: 0.125}
 KIND = {4: "sand", 5: "honey", 6: "web", 7: "berry"}
-F_GROUND = 0.546
 STUCK_WEB_Y = 0.05000000074505806
-
-
-def f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+STEP_HEIGHT = 0.6
+BELOW = 0.500001
+DRAG_Y = float(f32(0.98))
+BASE_DRAG = float(f32(0.91))
+SPEED_FACTOR = float(f32(0.4))
+GRAVITY = 0.08
 
 
 def s64(v):
@@ -197,7 +89,6 @@ def s64(v):
 
 
 def block_seed(x, y, z):
-    """Mth.getSeed with Java int / long wrap-around"""
     xm = (x * 3129871) & 0xFFFFFFFF
     if xm >> 31:
         xm -= 1 << 32
@@ -213,14 +104,67 @@ def block_offset(x, z, mx):
     return [max(-mx, min(mx, (v - 0.5) * 0.5)) for v in (a, b)]
 
 
-def boxes_at(block, cx, cy, cz):
+def mth_sin(x):
+    return f32(math.sin((int(f32(x * SIN_SCALE)) & 65535) * math.pi * 2.0 / 65536.0))
+
+
+def mth_cos(x):
+    return f32(math.sin((int(f32(f32(x * SIN_SCALE) + f32(16384.0))) & 65535) * math.pi * 2.0 / 65536.0))
+
+
+def yaw_rad(yaw):
+    return f32(f32(yaw) * DEG)
+
+
+def move_relative(v, strafe, forward, speed, yaw):
+    x, z = float(strafe), float(forward)
+    d0 = x * x + z * z
+    if d0 < 0.0000001:
+        return
+    ix, iz = x, z
+    if d0 > 1.0:
+        d = math.sqrt(d0)
+        if d < 0.00001:
+            ix = iz = 0.0
+        else:
+            ix, iz = x / d, z / d
+    ax, az = ix * float(speed), iz * float(speed)
+    r = yaw_rad(yaw)
+    sn, cs = float(mth_sin(r)), float(mth_cos(r))
+    v[0] += ax * cs - az * sn
+    v[2] += az * cs + ax * sn
+
+
+def scale_impulse(raw, slow):
+    v = raw
+    if slow:
+        v = f32(v * f32(0.3))
+    return f32(v * f32(0.98))
+
+
+def axis_impulse(positive, negative):
+    if positive == negative:
+        return f32(0.0)
+    return f32(1.0) if positive else f32(-1.0)
+
+
+def ground_speed(sprinting, friction):
+    attr = 0.10000000149011612
+    if sprinting:
+        attr = attr * (1.0 + 0.30000001192092896)
+    attr = f32(attr)
+    cube = f32(f32(friction * friction) * friction)
+    return f32(attr * f32(f32(0.21600002) / cube))
+
+
+def boxes_at(block, table, cx, cy, cz):
     b = block(cx, cy, cz)
     if b is None:
-        return [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]  # unloaded = solid
-    if b not in BOXES_C:
+        return [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]
+    if b not in table:
         return []
     out = []
-    for bx in BOXES_C[b]:
+    for bx in table[b]:
         if b in OFFSET_MAX:
             ox, oz = block_offset(cx, cz, OFFSET_MAX[b])
             bx = (bx[0] + ox, bx[1], bx[2] + oz, bx[3] + ox, bx[4], bx[5] + oz)
@@ -228,7 +172,7 @@ def boxes_at(block, cx, cy, cz):
     return out
 
 
-def move_axis_c(block, box, axis, d):
+def move_axis(block, table, box, axis, d):
     lo, hi = box[axis], box[axis + 3]
     others = [a for a in range(3) if a != axis]
     rng = []
@@ -241,7 +185,7 @@ def move_axis_c(block, box, axis, d):
         for cy in rng[1]:
             for cz in rng[2]:
                 c = (cx, cy, cz)
-                for sb in boxes_at(block, cx, cy, cz):
+                for sb in boxes_at(block, table, cx, cy, cz):
                     ok = True
                     for o in others:
                         if not (box[o] + 1e-9 < c[o] + sb[o + 3] and c[o] + sb[o] + 1e-9 < box[o + 3]):
@@ -255,6 +199,87 @@ def move_axis_c(block, box, axis, d):
     return out
 
 
+def grid_move(block, table, box, dx, dy, dz):
+    b = list(box)
+    res = []
+    for axis, d in ((1, dy), (0, dx), (2, dz)):
+        m = move_axis(block, table, b, axis, d)
+        b[axis] += m
+        b[axis + 3] += m
+        res.append(m)
+    return res[1], res[0], res[2]
+
+
+def overlaps(block, table, box):
+    for cx in range(math.floor(box[0]), math.floor(box[3]) + 1):
+        for cy in range(math.floor(box[1]) - 1, math.floor(box[4]) + 1):
+            for cz in range(math.floor(box[2]), math.floor(box[5]) + 1):
+                for sb in boxes_at(block, table, cx, cy, cz):
+                    if (box[0] + 1e-9 < cx + sb[3] and cx + sb[0] + 1e-9 < box[3]
+                            and box[1] + 1e-9 < cy + sb[4] and cy + sb[1] + 1e-9 < box[4]
+                            and box[2] + 1e-9 < cz + sb[5] and cz + sb[2] + 1e-9 < box[5]):
+                        return True
+    return False
+
+
+def shifted(box, dx, dy, dz):
+    return [box[0] + dx, box[1] + dy, box[2] + dz, box[3] + dx, box[4] + dy, box[5] + dz]
+
+
+def edge_shrink(d):
+    if d < 0.05 and d >= -0.05:
+        return 0.0
+    return d - 0.05 if d > 0.0 else d + 0.05
+
+
+def sneak_edge(block, table, box, dx, dz):
+    def free(a, b):
+        return not overlaps(block, table, shifted(box, a, -STEP_HEIGHT, b))
+    d0, d1 = dx, dz
+    while d0 != 0.0 and free(d0, 0.0):
+        d0 = edge_shrink(d0)
+    while d1 != 0.0 and free(0.0, d1):
+        d1 = edge_shrink(d1)
+    while d0 != 0.0 and d1 != 0.0 and free(d0, d1):
+        d0, d1 = edge_shrink(d0), edge_shrink(d1)
+    return d0, d1
+
+
+def move_step(block, table, box, dx, dy, dz, was_ground):
+    out = list(grid_move(block, table, box, dx, dy, dz))
+    hit_y = out[1] != dy
+    flag = was_ground or (hit_y and dy < 0.0)
+    hit_x, hit_z = out[0] != dx, out[2] != dz
+    if not flag or not (hit_x or hit_z):
+        return out[0], out[1], out[2]
+    r1 = grid_move(block, table, box, dx, STEP_HEIGHT, dz)
+    e = [box[0] + min(dx, 0.0), box[1], box[2] + min(dz, 0.0), box[3] + max(dx, 0.0), box[4], box[5] + max(dz, 0.0)]
+    r2 = grid_move(block, table, e, 0.0, STEP_HEIGHT, 0.0)
+    sx, sy, sz = r1
+    if r2[1] < STEP_HEIGHT:
+        r3 = grid_move(block, table, shifted(box, 0.0, r2[1], 0.0), dx, 0.0, dz)
+        if r3[0] * r3[0] + r3[2] * r3[2] > sx * sx + sz * sz:
+            sx, sy, sz = r3[0], r2[1], r3[2]
+    if sx * sx + sz * sz > out[0] * out[0] + out[2] * out[2]:
+        r4 = grid_move(block, table, shifted(box, sx, sy, sz), 0.0, dy - sy, 0.0)
+        return sx, sy + r4[1], sz
+    return out[0], out[1], out[2]
+
+
+def minor_collision(strafe, forward, yaw, mx, mz):
+    r = yaw_rad(yaw)
+    sn, cs = float(mth_sin(r)), float(mth_cos(r))
+    xa, za = float(strafe), float(forward)
+    d2 = xa * cs - za * sn
+    d3 = za * cs + xa * sn
+    d4 = d2 * d2 + d3 * d3
+    d5 = mx * mx + mz * mz
+    if d4 < 0.00001 or d5 < 0.00001:
+        return False
+    c = (d2 * mx + d3 * mz) / math.sqrt(d4 * d5)
+    return math.atan2(math.sqrt(max(0.0, 1.0 - c * c)), c) < 0.13962634
+
+
 def kind_at(block, mvon, x, y, z):
     b = block(x, y, z)
     if not mvon or b is None or b == -2:
@@ -262,93 +287,159 @@ def kind_at(block, mvon, x, y, z):
     return KIND.get(b, "")
 
 
+def kind_factor(k, jump):
+    if jump:
+        return 0.5 if k == "honey" else 1.0
+    return SPEED_FACTOR if k in ("sand", "honey") else 1.0
+
+
 def block_factor(block, mvon, x, y, z, jump):
-    def fac(k):
-        if jump:
-            return 0.5 if k == "honey" else 1.0
-        return 0.4 if k in ("sand", "honey") else 1.0
     fx, fz = math.floor(x), math.floor(z)
-    f = fac(kind_at(block, mvon, fx, math.floor(y), fz))
+    f = kind_factor(kind_at(block, mvon, fx, math.floor(y), fz), jump)
     if f != 1.0:
         return f
-    return fac(kind_at(block, mvon, fx, math.floor(y - 0.500001), fz))
+    return kind_factor(kind_at(block, mvon, fx, math.floor(y - BELOW), fz), jump)
 
 
-def simulate_slow(block, mvon, start, yaw, ticks):
-    """ground mode with the slowdown rules (no sneak / fly / noclip / step-up needed by the scenes)"""
+def simulate(block, table, mvon, start, yaw, ticks):
     x, y, z = start
     pitch = 0.0
-    vy = fall = 0.0
-    ground = False
-    stuck = 0
-    sfr = 1.0
+    v = [0.0, 0.0, 0.0]
+    ground = flying = noclip = False
+    sprinting = False
+    hcol = minor = False
+    enough_prev = sneak_prev = False
+    sprint_trigger = jump_delay = stuck = 0
+    fall = 0.0
+    slot = 0
     res = []
     for t in ticks:
         dxm, dym, keys, tf, tn, sd = t
+        if tf:
+            flying = not flying
+            v[1] = 0.0
+        if tn:
+            noclip = not noclip
+        if sd:
+            slot = (slot + sd) % 9
         yaw, pitch = look(yaw, pitch, 0.5, dxm, dym)
+        sneak_key = bool(keys & 32)
+        sprint_key = bool(keys & 64)
         fwd = bool(keys & 1)
-        sprint = bool(keys & 64) and fwd
-        mx = (1.0 if keys & 8 else 0.0) - (1.0 if keys & 4 else 0.0)
-        mz = (1.0 if fwd else 0.0) - (1.0 if keys & 2 else 0.0)
-        yr = yaw * (math.pi / 180.0)
-        sn, cs = math.sin(yr), math.cos(yr)
-        wx = (0.0 - cs) * mx + (0.0 - sn) * mz
-        wz = (0.0 - sn) * mx + cs * mz
-        if mx != 0.0 and mz != 0.0:
-            wx *= 0.7071067811865476
-            wz *= 0.7071067811865476
-        speed = 0.2806 if sprint else 0.21585
-        dx, dz = wx * speed, wz * speed
-        if (keys & 16) and ground:
-            vy = 0.42 * block_factor(block, mvon, x, y, z, True)
-        dy = vy
+        height = 1.5 if sneak_key else 1.8
+        slow = sneak_key and not flying
+        raw_fwd = axis_impulse(fwd, bool(keys & 2))
+        raw_left = axis_impulse(bool(keys & 4), bool(keys & 8))
+        strafe = scale_impulse(raw_left, slow)
+        forward = scale_impulse(raw_fwd, slow)
+        fwd_now = raw_fwd > 0.00001
+        pre = f32(raw_fwd * f32(0.3)) if slow else raw_fwd
+        enough_now = pre >= f32(0.8)
+        hcol_stop = hcol and not minor
+        if sprint_trigger > 0:
+            sprint_trigger -= 1
+        if ground and not sneak_prev and not enough_prev and enough_now and not sprinting:
+            if sprint_trigger <= 0 and not sprint_key:
+                sprint_trigger = 7
+            else:
+                sprinting = True
+        if not sprinting and enough_now and sprint_key:
+            sprinting = True
+        if sprinting and (not fwd_now or hcol_stop or slow):
+            sprinting = False
+        if sneak_key and not flying:
+            sprinting = False
+        enough_prev, sneak_prev = enough_now, sneak_key
+        jump_key = bool(keys & 16)
+        if jump_delay > 0:
+            jump_delay -= 1
+        if not jump_key:
+            jump_delay = 0
+        if noclip or flying:
+            stuck = 0
+        v = [0.0 if abs(c) < 0.003 else c for c in v]
+        if flying:
+            step = (1.0 if keys & 16 else 0.0) - (1.0 if sneak_key else 0.0)
+            v[1] += step * float(f32(f32(0.05) * f32(3.0)))
+        elif jump_key and ground and jump_delay == 0 and not noclip:
+            v[1] = float(f32(f32(0.42) * f32(block_factor(block, mvon, x, y, z, True))))
+            if sprinting:
+                r = yaw_rad(yaw)
+                v[0] += float(f32(f32(0.0 - mth_sin(r)) * f32(0.2)))
+                v[2] += float(f32(mth_cos(r) * f32(0.2)))
+            jump_delay = 10
+        was_ground = ground
+        fric = f32(0.6)
+        if flying or noclip:
+            speed = f32(0.05) * 2 if sprinting else f32(0.05)
+            speed = f32(speed)
+        elif was_ground:
+            speed = ground_speed(sprinting, fric)
+        else:
+            speed = f32(0.025999999) if sprinting else f32(0.02)
+        move_relative(v, strafe, forward, speed, yaw)
         st = stuck
         stuck = 0
-        if st:
-            ax, az = wx * speed * (1.0 - F_GROUND), wz * speed * (1.0 - F_GROUND)
-            if not ground:
-                aa = 0.02548 if sprint else 0.0196
-                ax, az = wx * aa, wz * aa
+        dx, dy, dz = v
+        if st and not flying and not noclip:
             mxz, myv = (0.25, STUCK_WEB_Y) if st == 1 else (0.8, 0.75)
-            dx, dz, dy = ax * mxz, az * mxz, dy * myv
-        else:
-            dx, dz = dx * sfr, dz * sfr
-        box = [x - 0.3, y, z - 0.3, x + 0.3, y + 1.8, z + 0.3]
-        my = move_axis_c(block, box, 1, dy)
-        box[1] += my
-        box[4] += my
-        mxx = move_axis_c(block, box, 0, dx)
-        box[0] += mxx
-        box[3] += mxx
-        mzz = move_axis_c(block, box, 2, dz)
-        x, y, z = x + mxx, y + my, z + mzz
-        hit_y = my != dy
-        ground = hit_y and dy < 0.0
-        if ground:
+            dx, dy, dz = dx * mxz, dy * myv, dz * mxz
+            v = [0.0, 0.0, 0.0]
+        if noclip:
+            x, y, z = x + dx, y + dy, z + dz
+            ground = False
             fall = 0.0
-        elif my < 0.0:
-            fall = fall - my
-        if st:
-            vy = 0.0
-        if hit_y:
-            vy = 0.0
-        # checkInsideBlocks
-        for cz in range(math.floor(z - 0.3 + 1e-7), math.floor(z + 0.3 - 1e-7) + 1):
-            for cy in range(math.floor(y + 1e-7), math.floor(y + 1.8 - 1e-7) + 1):
-                for cx in range(math.floor(x - 0.3 + 1e-7), math.floor(x + 0.3 - 1e-7) + 1):
-                    k = kind_at(block, mvon, cx, cy, cz)
-                    if k == "web":
-                        stuck, fall = 1, 0.0
-                    elif k == "berry":
-                        stuck, fall = 2, 0.0
-                    elif k == "honey":
-                        if (not ground and y <= cy + 0.9375 - 1e-7 and vy < -0.08
-                                and (abs(cx + 0.5 - x) + 1e-7 > 0.7375 or abs(cz + 0.5 - z) + 1e-7 > 0.7375)):
-                            vy, fall = -0.05, 0.0
-        f = block_factor(block, mvon, x, y, z, False)
-        sfr = (1.0 - F_GROUND) / (1.0 - F_GROUND * f)
-        vy = (vy - 0.08) * 0.98
-        res.append((x, y, z, yaw, pitch, ground, 0))
+            hcol = minor = False
+            v[0] *= BASE_DRAG
+            v[2] *= BASE_DRAG
+            v[1] = v[1] * 0.6 if flying else (v[1] - GRAVITY) * DRAG_Y
+            res.append((x, y, z, yaw, pitch, ground, slot))
+            continue
+        box = [x - 0.3, y, z - 0.3, x + 0.3, y + height, z + 0.3]
+        mdx, mdz = dx, dz
+        if sneak_key and not flying and (dx != 0.0 or dz != 0.0):
+            above = ground or (fall < STEP_HEIGHT and overlaps(block, table, shifted(box, 0.0, fall - STEP_HEIGHT, 0.0)))
+            if above:
+                mdx, mdz = sneak_edge(block, table, box, dx, dz)
+        rx, ry, rz = move_step(block, table, box, mdx, dy, mdz, ground and not flying)
+        x, y, z = x + rx, y + ry, z + rz
+        hit_x, hit_y, hit_z = rx != mdx, ry != dy, rz != mdz
+        ground = hit_y and dy < 0.0
+        hcol = hit_x or hit_z
+        minor = hcol and minor_collision(strafe, forward, yaw, rx, rz)
+        if hit_x:
+            v[0] = 0.0
+        if hit_z:
+            v[2] = 0.0
+        if ground or flying:
+            fall = 0.0
+        elif ry < 0.0:
+            fall = fall - ry
+        if flying:
+            v[1] = dy * 0.6
+            v[0] *= BASE_DRAG
+            v[2] *= BASE_DRAG
+        else:
+            if hit_y:
+                v[1] = 0.0
+            for cz in range(math.floor(z - 0.3 + 1e-7), math.floor(z + 0.3 - 1e-7) + 1):
+                for cy in range(math.floor(y + 1e-7), math.floor(y + height - 1e-7) + 1):
+                    for cx in range(math.floor(x - 0.3 + 1e-7), math.floor(x + 0.3 - 1e-7) + 1):
+                        k = kind_at(block, mvon, cx, cy, cz)
+                        if k == "web":
+                            stuck, fall = 1, 0.0
+                        elif k == "berry":
+                            stuck, fall = 2, 0.0
+                        elif k == "honey":
+                            if (not ground and y <= cy + 0.9375 - 1e-7 and v[1] < -0.08
+                                    and (abs(cx + 0.5 - x) + 1e-7 > 0.7375 or abs(cz + 0.5 - z) + 1e-7 > 0.7375)):
+                                v[1], fall = -0.05, 0.0
+            sf = block_factor(block, mvon, x, y, z, False)
+            drag = float(f32(fric * f32(0.91))) if was_ground else BASE_DRAG
+            v[0] = v[0] * sf * drag
+            v[2] = v[2] * sf * drag
+            v[1] = (v[1] - GRAVITY) * DRAG_Y
+        res.append((x, y, z, yaw, pitch, ground, slot))
     return res
 
 
@@ -483,9 +574,9 @@ def main(d):
             i += 1 + n
             ticks = [(f64(r[1]), f64(r[2]), int(r[3]), int(r[4]), int(r[5]), int(r[6]) - OFF) for r in rows]
             if name.startswith("slow_"):
-                sim = simulate_slow(wc, not name.endswith("_off"), start, yaw0, ticks)
+                sim = simulate(wc, BOXES_C, not name.endswith("_off"), start, yaw0, ticks)
             else:
-                sim = simulate(wa, start, yaw0, ticks)
+                sim = simulate(wa, BOXES_A, False, start, yaw0, ticks)
             worst = 0.0
             msg = None
             for k, (r, s) in enumerate(zip(rows, sim)):
