@@ -57,8 +57,8 @@ const MAX_TRIVIAL_INLINES: usize = 200_000;
 const MAX_PRIO_INLINES: usize = 200_000;
 /// Growth guard of the size-ordered phase, in percent of the module size
 /// before it started.
-const MAX_GROWTH_PCT: usize = 40;
-const HEAT_GROWTH_PCT: usize = 50;
+const MAX_GROWTH_PCT: usize = 80;
+const HEAT_GROWTH_PCT: usize = 100;
 /// Largest callee embedded into a (self-)recursive caller in the middle
 /// version kept for the frame budget (see `REC_SMALL`).
 pub(crate) const REC_CALLER_TIER: usize = 10;
@@ -1313,6 +1313,10 @@ impl CallGraph {
     }
 }
 
+fn growth_base(m: &Module) -> usize {
+    m.funcs.iter().map(|f| f.inst_count()).filter(|&n| n <= MAX_CALLER_INSTS).sum()
+}
+
 /// Phase 2 of the first round (Certus, round INLGZ) -- THE BUDGET GOES TO
 /// THE SMALLEST BODIES FIRST, NOT TO THE FIRST FUNCTIONS OF THE MODULE.
 ///
@@ -1384,7 +1388,7 @@ fn inline_by_size_with(
     let mut cg = CallGraph::new(m, &idx);
     let nf = m.funcs.len();
     let mut self_rec: Vec<Option<bool>> = vec![None; nf];
-    let base = m.inst_count();
+    let base = growth_base(m);
     let max_growth = base * growth_pct / 100;
     let mut grown = 0usize;
     let mut n = 0usize;
