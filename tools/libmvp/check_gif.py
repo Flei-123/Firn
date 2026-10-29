@@ -204,11 +204,12 @@ out = os.path.join(work, "out.raw")
 for f in files:
     try:
         im = Image.open(f); nf = getattr(im, "n_frames", 1)
+        screen = struct.unpack("<HH", open(f, "rb").read(10)[6:10])
         refs = []
         for i in range(nf):
-            im.seek(i); refs.append((im.convert("RGBA").tobytes(), im.info.get("duration", 0)))
+            im.seek(i); refs.append((im.convert("RGBA").crop((0, 0) + screen).tobytes(), im.info.get("duration", 0)))
         loop = im.info.get("loop", None)
-        size = im.size
+        size = screen
     except Exception as e:
         print("  note: Pillow refuses %s (%s)" % (os.path.basename(f), type(e).__name__))
         continue
