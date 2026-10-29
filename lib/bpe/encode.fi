@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/encode.fi -- bpe.encode: BPE encoder (pretokenize, per-piece lowest-rank-first merging on a small array, direct-mapped word cache).
+import std.rt
+import std.vec
+import bpe.model as bm
+import bpe.pretok as pt
+import bpe.hashing as hs
+
+export { Enc, enc_new, enc_free, encode_bytes, encode_piece, CACHE_KEY_MAX }
+
+const CACHE_SLOTS: usize = 32768
+const CACHE_SLOT_BYTES: usize = 96
+const CACHE_KEY_MAX: usize = 24
+const NO_RANK: u32 = 4294967295
+
+struct Enc {
+    model: *mut bm.Model,
+    cache: u64,
+    ids: u64,
+    ranks: u64,
+}
+
+fn enc_new(model: *mut bm.Model) -> Enc {
+    return Enc { model: model, cache: rt.heap_alloc(CACHE_SLOTS * CACHE_SLOT_BYTES), ids: rt.heap_alloc(pt.PIECE_MAX * 4 + 8), ranks: rt.heap_alloc(pt.PIECE_MAX * 4 + 8) }
+}
+
+fn enc_free(e: *mut Enc) {
+    if (*e).cache != 0 {
+        rt.heap_free((*e).cache, CACHE_SLOTS * CACHE_SLOT_BYTES)
+    }
+    if (*e).ids != 0 {
+        rt.heap_free((*e).ids, pt.PIECE_MAX * 4 + 8)
+    }
+    if (*e).ranks != 0 {
+        rt.heap_free((*e).ranks, pt.PIECE_MAX * 4 + 8)
+    }
+    (*e).cache = 0
+    (*e).ids = 0
+    (*e).ranks = 0
+}
+
+fn rank_of(e: *mut Enc, a: u32, b: u32) -> u32 {
+    let r: u32 = bm.pair_rank((*e).model, a, b)
+    if r == 0 {
+        return NO_RANK
+    }
+    return r - 1
+}
+
+fn merge_piece(e: *mut Enc, p: u64, len: usize) -> usize {
+    let ids: u64 = (*e).ids
+    let ranks: u64 = (*e).ranks
+    var i: usize = 0
+    while i < len {
+        rt.st32(ids, i, rt.ld8(p, i) as u32)
+        i = i + 1
+    }
+    i = 0
+    while i + 1 < len {
+        rt.st32(ranks, i, rank_of(e, rt.ld32(ids, i), rt.ld32(ids, i + 1)))
+        i = i + 1
+    }
+    var count: usize = len
+    while count > 1 {
+        var best: u32 = NO_RANK
+        var at: usize = 0
+        var j: usize = 0
+        while j + 1 < count {
+            let r: u32 = rt.ld32(ranks, j)
+            if r < best {
+                best = r
+                at = j
+            }
+            j = j + 1
+        }
+        if best == NO_RANK {
+            break
+        }
+        rt.st32(ids, at, (bm.BYTE_TOKENS as u32) + best)
+        j = at + 1
+        while j + 1 < count {
+            rt.st32(ids, j, rt.ld32(ids, j + 1))
+            j = j + 1
+        }
+        j = at
+        while j + 2 < count {
+            rt.st32(ranks, j, rt.ld32(ranks, j + 1))
+            j = j + 1
+        }
+        count = count - 1
+        if at > 0 {
+            rt.st32(ranks, at - 1, rank_of(e, rt.ld32(ids, at - 1), rt.ld32(ids, at)))
+        }
+        if at + 1 < count {
+            rt.st32(ranks, at, rank_of(e, rt.ld32(ids, at), rt.ld32(ids, at + 1)))
+        }
+    }
+    return count
+}
+
+fn push_ids(e: *mut Enc, count: usize, out: *mut Vec[u16]) {
+    var i: usize = 0
+    while i < count {
+        vec_push[u16](out, rt.ld32((*e).ids, i) as u16)
+        i = i + 1
+    }
+}
+
+fn encode_piece(e: *mut Enc, p: u64, len: usize, out: *mut Vec[u16]) {
+    if len == 1 {
+        vec_push[u16](out, rt.ld8(p, 0) as u16)
+        return
+    }
+    if len > CACHE_KEY_MAX {
+        let count: usize = merge_piece(e, p, len)
+        push_ids(e, count, out)
+        return
+    }
+    let h: u64 = hs.piece_hash(p, len)
+    let slot: u64 = (*e).cache + ((h & ((CACHE_SLOTS - 1) as u64)) * (CACHE_SLOT_BYTES as u64))
+    if rt.ld64(slot, 0) == h && (rt.ld8(slot, 8) as usize) == len && rt.mem_eq(slot + 16, p, len) {
+        let nt: usize = rt.ld8(slot, 9) as usize
+        var t: usize = 0
+        while t < nt {
+            vec_push[u16](out, rt.ld16(slot + 40, t))
+            t = t + 1
+        }
+        return
+    }
+    let count: usize = merge_piece(e, p, len)
+    push_ids(e, count, out)
+    rt.st64(slot, 0, h)
+    rt.st8(slot, 8, len as u8)
+    rt.st8(slot, 9, count as u8)
+    rt.mem_copy(slot + 16, p, len)
+    var t: usize = 0
+    while t < count {
+        rt.st16(slot + 40, t, rt.ld32((*e).ids, t) as u16)
+        t = t + 1
+    }
+}
+
+fn encode_bytes(e: *mut Enc, p: u64, n: usize, out: *mut Vec[u16]) {
+    var i: usize = 0
+    while i < n {
+        let end: usize = pt.next_piece(p, n, i)
+        encode_piece(e, p + (i as u64), end - i, out)
+        i = end
+    }
+}

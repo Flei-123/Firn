@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/pairs.fi -- bpe.pairs: trainer pair registry (pair -> id, counts, per-pair word lists) and a lazy max-heap ordered by count desc, then (left id, right id) asc.
+import std.rt
+import std.vec
+
+export { Pairs, NONE, pairs_new, pairs_free, pairs_pid, pairs_add, pairs_count, pairs_left, pairs_right, pairs_zero, pairs_head, pairs_node_word, pairs_node_next, heap_push, heap_pop_best, heap_len, pairs_total, touched_flush }
+
+const NONE: u32 = 4294967295
+const EMPTY_KEY: u64 = 18446744073709551615
+const KEY_MUL: u64 = 11400714819323198485
+
+struct Pairs {
+    tab: u64,
+    tvals: u64,
+    mask: u64,
+    slots: usize,
+    used: usize,
+    pa: Vec[u32],
+    pb: Vec[u32],
+    cnt: Vec[i64],
+    head: Vec[u32],
+    last: Vec[u32],
+    nw: Vec[u32],
+    nn: Vec[u32],
+    hc: Vec[i64],
+    hp: Vec[u32],
+    touched: Vec[u32],
+}
+
+fn table_alloc(p: *mut Pairs, slots: usize) {
+    (*p).slots = slots
+    (*p).mask = (slots - 1) as u64
+    (*p).tab = rt.heap_alloc(slots * 8)
+    (*p).tvals = rt.heap_alloc(slots * 4)
+    rt.mem_set((*p).tab, 255 as u8, slots * 8)
+}
+
+fn pairs_new() -> Pairs {
+    var p: Pairs = Pairs { tab: 0, tvals: 0, mask: 0, slots: 0, used: 0, pa: vec_new[u32](), pb: vec_new[u32](), cnt: vec_new[i64](), head: vec_new[u32](), last: vec_new[u32](), nw: vec_new[u32](), nn: vec_new[u32](), hc: vec_new[i64](), hp: vec_new[u32](), touched: vec_new[u32]() }
+    table_alloc(&p, 1048576)
+    return p
+}
+
+fn pairs_free(p: *mut Pairs) {
+    rt.heap_free((*p).tab, (*p).slots * 8)
+    rt.heap_free((*p).tvals, (*p).slots * 4)
+    vec_free[u32](&(*p).pa)
+    vec_free[u32](&(*p).pb)
+    vec_free[i64](&(*p).cnt)
+    vec_free[u32](&(*p).head)
+    vec_free[u32](&(*p).last)
+    vec_free[u32](&(*p).nw)
+    vec_free[u32](&(*p).nn)
+    vec_free[i64](&(*p).hc)
+    vec_free[u32](&(*p).hp)
+    vec_free[u32](&(*p).touched)
+}
+
+fn pairs_total(p: *mut Pairs) -> usize {
+    return vec_len[u32](&(*p).pa)
+}
+
+fn pairs_left(p: *mut Pairs, pid: u32) -> u32 {
+    return rt.ld32(vec_ptr[u32](&(*p).pa), pid as usize)
+}
+
+fn pairs_right(p: *mut Pairs, pid: u32) -> u32 {
+    return rt.ld32(vec_ptr[u32](&(*p).pb), pid as usize)
+}
+
+fn pairs_count(p: *mut Pairs, pid: u32) -> i64 {
+    return rt.ld64(vec_ptr[i64](&(*p).cnt), pid as usize) as i64
+}
+
+fn pairs_zero(p: *mut Pairs, pid: u32) {
+    rt.st64(vec_ptr[i64](&(*p).cnt), pid as usize, 0)
+}
+
+fn pairs_head(p: *mut Pairs, pid: u32) -> u32 {
+    return rt.ld32(vec_ptr[u32](&(*p).head), pid as usize)
+}
+
+fn pairs_node_word(p: *mut Pairs, node: u32) -> u32 {
+    return rt.ld32(vec_ptr[u32](&(*p).nw), (node - 1) as usize)
+}
+
+fn pairs_node_next(p: *mut Pairs, node: u32) -> u32 {
+    return rt.ld32(vec_ptr[u32](&(*p).nn), (node - 1) as usize)
+}
+
+fn slot_of(p: *mut Pairs, key: u64) -> usize {
+    var h: u64 = ((key *% KEY_MUL) >> 24) & (*p).mask
+    let tab: u64 = (*p).tab
+    while true {
+        let k: u64 = rt.ld64(tab, h as usize)
+        if k == key || k == EMPTY_KEY {
+            return h as usize
+        }
+        h = (h + 1) & (*p).mask
+    }
+    return 0
+}
+
+fn table_grow(p: *mut Pairs) {
+    let old_tab: u64 = (*p).tab
+    let old_vals: u64 = (*p).tvals
+    let old_slots: usize = (*p).slots
+    table_alloc(p, old_slots * 2)
+    var i: usize = 0
+    while i < old_slots {
+        let k: u64 = rt.ld64(old_tab, i)
+        if k != EMPTY_KEY {
+            let s: usize = slot_of(p, k)
+            rt.st64((*p).tab, s, k)
+            rt.st32((*p).tvals, s, rt.ld32(old_vals, i))
+        }
+        i = i + 1
+    }
+    rt.heap_free(old_tab, old_slots * 8)
+    rt.heap_free(old_vals, old_slots * 4)
+}
+
+fn pairs_pid(p: *mut Pairs, a: u32, b: u32, create: bool) -> u32 {
+    let key: u64 = ((a as u64) << 32) | (b as u64)
+    var s: usize = slot_of(p, key)
+    if rt.ld64((*p).tab, s) == key {
+        return rt.ld32((*p).tvals, s)
+    }
+    if !create {
+        return NONE
+    }
+    if ((*p).used + 1) * 2 > (*p).slots {
+        table_grow(p)
+        s = slot_of(p, key)
+    }
+    let pid: u32 = vec_len[u32](&(*p).pa) as u32
+    vec_push[u32](&(*p).pa, a)
+    vec_push[u32](&(*p).pb, b)
+    vec_push[i64](&(*p).cnt, 0)
+    vec_push[u32](&(*p).head, 0)
+    vec_push[u32](&(*p).last, 0)
+    rt.st64((*p).tab, s, key)
+    rt.st32((*p).tvals, s, pid)
+    (*p).used = (*p).used + 1
+    vec_push[u32](&(*p).touched, pid)
+    return pid
+}
+
+fn pairs_add(p: *mut Pairs, a: u32, b: u32, delta: i64, word: u32) {
+    var create: bool = false
+    if delta > 0 {
+        create = true
+    }
+    let pid: u32 = pairs_pid(p, a, b, create)
+    if pid == NONE {
+        return
+    }
+    let cp: u64 = vec_ptr[i64](&(*p).cnt)
+    rt.st64(cp, pid as usize, ((rt.ld64(cp, pid as usize) as i64) + delta) as u64)
+    if delta > 0 {
+        let lp: u64 = vec_ptr[u32](&(*p).last)
+        if rt.ld32(lp, pid as usize) != word + 1 {
+            rt.st32(lp, pid as usize, word + 1)
+            let hp: u64 = vec_ptr[u32](&(*p).head)
+            vec_push[u32](&(*p).nw, word)
+            vec_push[u32](&(*p).nn, rt.ld32(hp, pid as usize))
+            rt.st32(hp, pid as usize, vec_len[u32](&(*p).nw) as u32)
+        }
+    }
+}
+
+fn better(p: *mut Pairs, c1: i64, p1: u32, c2: i64, p2: u32) -> bool {
+    if c1 != c2 {
+        return c1 > c2
+    }
+    let a1: u32 = pairs_left(p, p1)
+    let a2: u32 = pairs_left(p, p2)
+    if a1 != a2 {
+        return a1 < a2
+    }
+    return pairs_right(p, p1) < pairs_right(p, p2)
+}
+
+fn heap_len(p: *mut Pairs) -> usize {
+    return vec_len[u32](&(*p).hp)
+}
+
+fn heap_push(p: *mut Pairs, count: i64, pid: u32) {
+    vec_push[i64](&(*p).hc, count)
+    vec_push[u32](&(*p).hp, pid)
+    let hc: u64 = vec_ptr[i64](&(*p).hc)
+    let hp: u64 = vec_ptr[u32](&(*p).hp)
+    var i: usize = vec_len[u32](&(*p).hp) - 1
+    while i > 0 {
+        let parent: usize = (i - 1) / 2
+        if !better(p, rt.ld64(hc, i) as i64, rt.ld32(hp, i), rt.ld64(hc, parent) as i64, rt.ld32(hp, parent)) {
+            break
+        }
+        let tc: u64 = rt.ld64(hc, i)
+        let tp: u32 = rt.ld32(hp, i)
+        rt.st64(hc, i, rt.ld64(hc, parent))
+        rt.st32(hp, i, rt.ld32(hp, parent))
+        rt.st64(hc, parent, tc)
+        rt.st32(hp, parent, tp)
+        i = parent
+    }
+}
+
+fn heap_pop_raw(p: *mut Pairs) {
+    let n: usize = vec_len[u32](&(*p).hp)
+    let hc: u64 = vec_ptr[i64](&(*p).hc)
+    let hp: u64 = vec_ptr[u32](&(*p).hp)
+    rt.st64(hc, 0, rt.ld64(hc, n - 1))
+    rt.st32(hp, 0, rt.ld32(hp, n - 1))
+    vec_shorten[i64](&(*p).hc, n - 1)
+    vec_shorten[u32](&(*p).hp, n - 1)
+    let m: usize = n - 1
+    var i: usize = 0
+    while true {
+        var best: usize = i
+        let l: usize = 2 * i + 1
+        let r: usize = 2 * i + 2
+        if l < m && better(p, rt.ld64(hc, l) as i64, rt.ld32(hp, l), rt.ld64(hc, best) as i64, rt.ld32(hp, best)) {
+            best = l
+        }
+        if r < m && better(p, rt.ld64(hc, r) as i64, rt.ld32(hp, r), rt.ld64(hc, best) as i64, rt.ld32(hp, best)) {
+            best = r
+        }
+        if best == i {
+            break
+        }
+        let tc: u64 = rt.ld64(hc, i)
+        let tp: u32 = rt.ld32(hp, i)
+        rt.st64(hc, i, rt.ld64(hc, best))
+        rt.st32(hp, i, rt.ld32(hp, best))
+        rt.st64(hc, best, tc)
+        rt.st32(hp, best, tp)
+        i = best
+    }
+}
+
+fn heap_pop_best(p: *mut Pairs, min_count: i64) -> u32 {
+    while heap_len(p) > 0 {
+        let hc: u64 = vec_ptr[i64](&(*p).hc)
+        let hp: u64 = vec_ptr[u32](&(*p).hp)
+        let c: i64 = rt.ld64(hc, 0) as i64
+        let pid: u32 = rt.ld32(hp, 0)
+        heap_pop_raw(p)
+        let cur: i64 = pairs_count(p, pid)
+        if cur < min_count {
+            continue
+        }
+        if cur != c {
+            heap_push(p, cur, pid)
+            continue
+        }
+        return pid
+    }
+    return NONE
+}
+
+fn touched_flush(p: *mut Pairs) {
+    var i: usize = 0
+    let n: usize = vec_len[u32](&(*p).touched)
+    while i < n {
+        let pid: u32 = rt.ld32(vec_ptr[u32](&(*p).touched), i)
+        let c: i64 = pairs_count(p, pid)
+        if c > 0 {
+            heap_push(p, c, pid)
+        }
+        i = i + 1
+    }
+    vec_clear[u32](&(*p).touched)
+}

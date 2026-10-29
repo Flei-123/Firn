@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/words.fi -- bpe.words: trainer word-frequency table (unique pretokenizer pieces with counts, byte arena, open-addressing index).
+import std.rt
+import std.vec
+import bpe.pretok as pt
+import bpe.hashing as hs
+
+export { Words, words_boxed, words_unbox, words_new, words_free, words_add, words_add_text, words_absorb, words_count, word_ptr, word_len, word_freq, words_total_freq }
+
+struct Words {
+    off: Vec[u32],
+    len: Vec[u32],
+    freq: Vec[u64],
+    hash: Vec[u64],
+    bytes: rt.Buf,
+    tab: u64,
+    slots: usize,
+    mask: u64,
+}
+
+fn alloc_one[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn free_one[T](a: u64) {
+    rt.heap_free(a, size_of[T]())
+}
+
+fn tab_alloc(w: *mut Words, slots: usize) {
+    (*w).slots = slots
+    (*w).mask = (slots - 1) as u64
+    (*w).tab = rt.heap_alloc(slots * 4)
+}
+
+fn words_new() -> Words {
+    var w: Words = Words { off: vec_new[u32](), len: vec_new[u32](), freq: vec_new[u64](), hash: vec_new[u64](), bytes: rt.buf_new(), tab: 0, slots: 0, mask: 0 }
+    tab_alloc(&w, 65536)
+    return w
+}
+
+fn words_free(w: *mut Words) {
+    vec_free[u32](&(*w).off)
+    vec_free[u32](&(*w).len)
+    vec_free[u64](&(*w).freq)
+    vec_free[u64](&(*w).hash)
+    rt.buf_free(&(*w).bytes)
+    rt.heap_free((*w).tab, (*w).slots * 4)
+}
+
+fn words_count(w: *mut Words) -> usize {
+    return vec_len[u32](&(*w).off)
+}
+
+fn word_ptr(w: *mut Words, i: usize) -> u64 {
+    return rt.buf_ptr(&(*w).bytes) + (rt.ld32(vec_ptr[u32](&(*w).off), i) as u64)
+}
+
+fn word_len(w: *mut Words, i: usize) -> usize {
+    return rt.ld32(vec_ptr[u32](&(*w).len), i) as usize
+}
+
+fn word_freq(w: *mut Words, i: usize) -> u64 {
+    return rt.ld64(vec_ptr[u64](&(*w).freq), i)
+}
+
+fn words_total_freq(w: *mut Words) -> u64 {
+    var t: u64 = 0
+    var i: usize = 0
+    let n: usize = words_count(w)
+    while i < n {
+        t = t + word_freq(w, i)
+        i = i + 1
+    }
+    return t
+}
+
+fn tab_grow(w: *mut Words) {
+    let old: u64 = (*w).tab
+    let old_slots: usize = (*w).slots
+    tab_alloc(w, old_slots * 2)
+    var i: usize = 0
+    let hp: u64 = vec_ptr[u64](&(*w).hash)
+    while i < old_slots {
+        let e: u32 = rt.ld32(old, i)
+        if e != 0 {
+            var h: u64 = rt.ld64(hp, (e - 1) as usize) & (*w).mask
+            while rt.ld32((*w).tab, h as usize) != 0 {
+                h = (h + 1) & (*w).mask
+            }
+            rt.st32((*w).tab, h as usize, e)
+        }
+        i = i + 1
+    }
+    rt.heap_free(old, old_slots * 4)
+}
+
+fn add_hashed(w: *mut Words, p: u64, len: usize, h: u64, count: u64) {
+    var s: u64 = h & (*w).mask
+    while true {
+        let e: u32 = rt.ld32((*w).tab, s as usize)
+        if e == 0 {
+            break
+        }
+        let idx: usize = (e - 1) as usize
+        if rt.ld64(vec_ptr[u64](&(*w).hash), idx) == h && word_len(w, idx) == len && rt.mem_eq(word_ptr(w, idx), p, len) {
+            let fp: u64 = vec_ptr[u64](&(*w).freq)
+            rt.st64(fp, idx, rt.ld64(fp, idx) + count)
+            return
+        }
+        s = (s + 1) & (*w).mask
+    }
+    let idx: usize = words_count(w)
+    vec_push[u32](&(*w).off, rt.buf_len(&(*w).bytes) as u32)
+    vec_push[u32](&(*w).len, len as u32)
+    vec_push[u64](&(*w).freq, count)
+    vec_push[u64](&(*w).hash, h)
+    rt.buf_push_bytes(&(*w).bytes, p, len)
+    rt.st32((*w).tab, s as usize, (idx + 1) as u32)
+    if (idx + 1) * 2 > (*w).slots {
+        tab_grow(w)
+    }
+}
+
+fn words_add(w: *mut Words, p: u64, len: usize) {
+    add_hashed(w, p, len, hs.piece_hash(p, len), 1)
+}
+
+fn words_add_text(w: *mut Words, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let e: usize = pt.next_piece(p, n, i)
+        words_add(w, p + (i as u64), e - i)
+        i = e
+    }
+}
+
+fn words_absorb(dst: *mut Words, src: *mut Words) {
+    var i: usize = 0
+    let n: usize = words_count(src)
+    while i < n {
+        add_hashed(dst, word_ptr(src, i), word_len(src, i), rt.ld64(vec_ptr[u64](&(*src).hash), i), word_freq(src, i))
+        i = i + 1
+    }
+}
+
+fn words_boxed() -> u64 {
+    let a: u64 = alloc_one[Words]()
+    *(a as *mut Words) = words_new()
+    return a
+}
+
+fn words_unbox(a: u64) {
+    words_free(a as *mut Words)
+    free_one[Words](a)
+}

@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/serial.fi -- bpe.serial: binary model format (FBPE v1, checksummed) and tokenizer.json (HF tokenizers, ByteLevel BPE) export.
+import std.rt
+import std.vec
+import std.fs
+import bpe.model as bm
+import bpe.hashing as hs
+
+export { model_save, model_load, model_to_bytes, model_from_bytes, export_json, json_regex }
+
+const FORMAT_VERSION: u32 = 1
+const PRETOK_VERSION: u32 = 1
+const MAGIC: u32 = 1162037830
+
+fn push32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn push16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+}
+
+fn model_to_bytes(m: *mut bm.Model, out: *mut rt.Buf) {
+    push32(out, MAGIC)
+    push32(out, FORMAT_VERSION)
+    push32(out, PRETOK_VERSION)
+    push32(out, bm.merge_count(m) as u32)
+    push32(out, bm.special_count(m) as u32)
+    var k: usize = 0
+    while k < bm.merge_count(m) {
+        push16(out, bm.merge_a(m, k))
+        push16(out, bm.merge_b(m, k))
+        k = k + 1
+    }
+    k = 0
+    while k < bm.special_count(m) {
+        let id: usize = bm.special_index_id(m, k)
+        push16(out, bm.token_len(m, id) as u32)
+        rt.buf_push_bytes(out, bm.token_ptr(m, id), bm.token_len(m, id))
+        k = k + 1
+    }
+    let h: u64 = hs.piece_hash(rt.buf_ptr(out), rt.buf_len(out))
+    push32(out, (h & 4294967295) as u32)
+    push32(out, (h >> 32) as u32)
+}
+
+fn model_save(m: *mut bm.Model, path: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    model_to_bytes(m, &b)
+    let ok: bool = fs.write_atomic(path, rt.buf_ptr(&b), rt.buf_len(&b)) catch | e | false
+    rt.buf_free(&b)
+    return ok
+}
+
+fn get32(p: u64, at: usize) -> u32 {
+    return (rt.ld8(p, at) as u32) | ((rt.ld8(p, at + 1) as u32) << 8) | ((rt.ld8(p, at + 2) as u32) << 16) | ((rt.ld8(p, at + 3) as u32) << 24)
+}
+
+fn get16(p: u64, at: usize) -> u32 {
+    return (rt.ld8(p, at) as u32) | ((rt.ld8(p, at + 1) as u32) << 8)
+}
+
+fn model_from_bytes(p: u64, n: usize, m: *mut bm.Model) -> bool {
+    if n < 28 || get32(p, 0) != MAGIC || get32(p, 4) != FORMAT_VERSION || get32(p, 8) != PRETOK_VERSION {
+        return false
+    }
+    let h: u64 = hs.piece_hash(p, n - 8)
+    if (h & 4294967295) as u32 != get32(p, n - 8) || (h >> 32) as u32 != get32(p, n - 4) {
+        return false
+    }
+    let merges: usize = get32(p, 12) as usize
+    let specials: usize = get32(p, 16) as usize
+    var at: usize = 20
+    if at + merges * 4 > n - 8 {
+        return false
+    }
+    let ma: u64 = rt.heap_alloc(merges * 4 + 4)
+    let mb: u64 = rt.heap_alloc(merges * 4 + 4)
+    var k: usize = 0
+    while k < merges {
+        rt.st32(ma, k, get16(p, at))
+        rt.st32(mb, k, get16(p, at + 2))
+        at = at + 4
+        k = k + 1
+    }
+    var names: Vec[str] = vec_new[str]()
+    var ok: bool = true
+    k = 0
+    while k < specials && ok {
+        if at + 2 > n - 8 {
+            ok = false
+            break
+        }
+        let l: usize = get16(p, at) as usize
+        at = at + 2
+        if at + l > n - 8 {
+            ok = false
+            break
+        }
+        vec_push[str](&names, str { p: (p + (at as u64)) as *mut u8, n: l })
+        at = at + l
+        k = k + 1
+    }
+    if ok {
+        ok = bm.model_build(m, ma, mb, merges, &names)
+    }
+    vec_free[str](&names)
+    rt.heap_free(ma, merges * 4 + 4)
+    rt.heap_free(mb, merges * 4 + 4)
+    return ok
+}
+
+fn model_load(path: str, m: *mut bm.Model) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(path, &b) catch | e | (0 -% 1)
+    var ok: bool = false
+    if got != (0 -% 1) {
+        ok = model_from_bytes(rt.buf_ptr(&b), rt.buf_len(&b), m)
+    }
+    rt.buf_free(&b)
+    return ok
+}
+
+fn json_regex() -> str {
+    return "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+}
+
+fn mapped_cp(b: u32) -> u32 {
+    if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174 {
+        return b
+    }
+    var n: u32 = 0
+    var i: u32 = 0
+    while i < b {
+        if !((i >= 33 && i <= 126) || (i >= 161 && i <= 172) || i >= 174) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return 256 + n
+}
+
+fn push_cp(out: *mut rt.Buf, cp: u32) {
+    if cp < 128 {
+        if cp == 34 || cp == 92 {
+            rt.buf_push(out, 92 as u8)
+        }
+        rt.buf_push(out, cp as u8)
+        return
+    }
+    rt.buf_push(out, (192 | (cp >> 6)) as u8)
+    rt.buf_push(out, (128 | (cp & 63)) as u8)
+}
+
+fn push_token_json(m: *mut bm.Model, id: usize, out: *mut rt.Buf) {
+    let p: u64 = bm.token_ptr(m, id)
+    var i: usize = 0
+    while i < bm.token_len(m, id) {
+        push_cp(out, mapped_cp(rt.ld8(p, i) as u32))
+        i = i + 1
+    }
+}
+
+fn push_text(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+fn push_escaped(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 34 || c == 92 {
+            rt.buf_push(out, 92 as u8)
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+fn export_json(m: *mut bm.Model, out: *mut rt.Buf) {
+    push_text(out, "{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[")
+    var k: usize = 0
+    while k < bm.special_count(m) {
+        let id: usize = bm.special_index_id(m, k)
+        if k > 0 {
+            rt.buf_push(out, 44 as u8)
+        }
+        push_text(out, "{\"id\":")
+        rt.buf_push_dec_u64(out, id as u64)
+        push_text(out, ",\"content\":\"")
+        push_escaped(out, bm.token_ptr(m, id), bm.token_len(m, id))
+        push_text(out, "\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true}")
+        k = k + 1
+    }
+    push_text(out, "],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Split\",\"pattern\":{\"Regex\":\"")
+    push_escaped(out, json_regex().p as u64, json_regex().n)
+    push_text(out, "\"},\"behavior\":\"Isolated\",\"invert\":false},{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":false}]},\"post_processor\":null,\"decoder\":{\"type\":\"ByteLevel\",\"add_prefix_space\":true,\"trim_offsets\":true,\"use_regex\":true},\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":\"\",\"end_of_word_suffix\":\"\",\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,\"vocab\":{")
+    var id: usize = 0
+    let plain: usize = bm.BYTE_TOKENS + bm.merge_count(m)
+    while id < plain {
+        if id > 0 {
+            rt.buf_push(out, 44 as u8)
+        }
+        rt.buf_push(out, 34 as u8)
+        push_token_json(m, id, out)
+        push_text(out, "\":")
+        rt.buf_push_dec_u64(out, id as u64)
+        id = id + 1
+    }
+    push_text(out, "},\"merges\":[")
+    k = 0
+    while k < bm.merge_count(m) {
+        if k > 0 {
+            rt.buf_push(out, 44 as u8)
+        }
+        rt.buf_push(out, 34 as u8)
+        push_token_json(m, bm.merge_a(m, k) as usize, out)
+        rt.buf_push(out, 32 as u8)
+        push_token_json(m, bm.merge_b(m, k) as usize, out)
+        rt.buf_push(out, 34 as u8)
+        k = k + 1
+    }
+    push_text(out, "]}}")
+}

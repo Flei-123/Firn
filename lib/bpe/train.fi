@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/train.fi -- bpe.train: deterministic byte-level BPE trainer (word-frequency table, parallel corpus counting over files, inverted pair->word index, incremental merge updates, count-desc then id-asc tie-break).
+import std.rt
+import std.vec
+import std.fs
+import jobs.jobs
+import jobs.pmap
+import bpe.model as bm
+import bpe.words as bw
+import bpe.pairs as bp
+
+export { TrainOpts, opts_default, train_files, train_text, corpus_words, train_words, thread_work }
+
+struct TrainOpts {
+    vocab_size: usize,
+    min_count: i64,
+    threads: u64,
+}
+
+fn opts_default(vocab_size: usize) -> TrainOpts {
+    return TrainOpts { vocab_size: vocab_size, min_count: 2, threads: 1 }
+}
+
+fn thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+fn count_file(path: *str, text: *str, out: *mut u64) {
+    let w: u64 = bw.words_boxed()
+    bw.words_add_text(w as *mut bw.Words, (*text).p as u64, (*text).n)
+    *out = w
+}
+
+fn corpus_words(files: *mut Vec[str], threads: u64, dst: *mut bw.Words) -> bool {
+    var j: jobs.Jobs = jobs.create(threads - 1)
+    var parts: Vec[u64] = vec_new[u64]()
+    let ok: bool = jobs_map_texts[u64](&j, files, count_file, &parts)
+    jobs.destroy(&j)
+    if !ok {
+        return false
+    }
+    var i: usize = 0
+    while i < vec_len[u64](&parts) {
+        let w: u64 = vec_at[u64](&parts, i)
+        if w != 0 {
+            bw.words_absorb(dst, w as *mut bw.Words)
+            bw.words_unbox(w)
+        }
+        i = i + 1
+    }
+    vec_free[u64](&parts)
+    return true
+}
+
+fn apply_merge(ps: *mut bp.Pairs, toks: u64, base: usize, len: usize, a: u32, b: u32, x: u32, freq: i64, word: u32) -> usize {
+    var i: usize = 0
+    var out: usize = 0
+    while i < len {
+        let cur: u32 = rt.ld32(toks, base + i)
+        if i + 1 < len && cur == a && rt.ld32(toks, base + i + 1) == b {
+            if out > 0 {
+                let prev: u32 = rt.ld32(toks, base + out - 1)
+                bp.pairs_add(ps, prev, a, 0 - freq, word)
+                bp.pairs_add(ps, prev, x, freq, word)
+            }
+            if i + 2 < len {
+                let next: u32 = rt.ld32(toks, base + i + 2)
+                bp.pairs_add(ps, b, next, 0 - freq, word)
+                bp.pairs_add(ps, x, next, freq, word)
+            }
+            rt.st32(toks, base + out, x)
+            out = out + 1
+            i = i + 2
+        } else {
+            rt.st32(toks, base + out, cur)
+            out = out + 1
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn train_words(w: *mut bw.Words, target_merges: usize, min_count: i64, out_a: *mut Vec[u32], out_b: *mut Vec[u32]) {
+    let n: usize = bw.words_count(w)
+    var total_bytes: usize = 0
+    var i: usize = 0
+    while i < n {
+        total_bytes = total_bytes + bw.word_len(w, i)
+        i = i + 1
+    }
+    let toks: u64 = rt.heap_alloc(total_bytes * 4 + 4)
+    let offs: u64 = rt.heap_alloc(n * 4 + 4)
+    let lens: u64 = rt.heap_alloc(n * 4 + 4)
+    var pos: usize = 0
+    i = 0
+    while i < n {
+        let l: usize = bw.word_len(w, i)
+        let src: u64 = bw.word_ptr(w, i)
+        rt.st32(offs, i, pos as u32)
+        rt.st32(lens, i, l as u32)
+        var k: usize = 0
+        while k < l {
+            rt.st32(toks, pos + k, rt.ld8(src, k) as u32)
+            k = k + 1
+        }
+        pos = pos + l
+        i = i + 1
+    }
+    var ps: bp.Pairs = bp.pairs_new()
+    i = 0
+    while i < n {
+        let l: usize = rt.ld32(lens, i) as usize
+        let f: i64 = bw.word_freq(w, i) as i64
+        let o: usize = rt.ld32(offs, i) as usize
+        var k: usize = 0
+        while k + 1 < l {
+            bp.pairs_add(&ps, rt.ld32(toks, o + k), rt.ld32(toks, o + k + 1), f, i as u32)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    bp.touched_flush(&ps)
+    var merge: usize = 0
+    while merge < target_merges {
+        let pid: u32 = bp.heap_pop_best(&ps, min_count)
+        if pid == bp.NONE {
+            break
+        }
+        let a: u32 = bp.pairs_left(&ps, pid)
+        let b: u32 = bp.pairs_right(&ps, pid)
+        let x: u32 = (bm.BYTE_TOKENS + merge) as u32
+        vec_push[u32](out_a, a)
+        vec_push[u32](out_b, b)
+        var node: u32 = bp.pairs_head(&ps, pid)
+        while node != 0 {
+            let wi: u32 = bp.pairs_node_word(&ps, node)
+            let o: usize = rt.ld32(offs, wi as usize) as usize
+            let l: usize = rt.ld32(lens, wi as usize) as usize
+            let nl: usize = apply_merge(&ps, toks, o, l, a, b, x, bw.word_freq(w, wi as usize) as i64, wi)
+            rt.st32(lens, wi as usize, nl as u32)
+            node = bp.pairs_node_next(&ps, node)
+        }
+        bp.pairs_zero(&ps, pid)
+        bp.touched_flush(&ps)
+        merge = merge + 1
+    }
+    bp.pairs_free(&ps)
+    rt.heap_free(toks, total_bytes * 4 + 4)
+    rt.heap_free(offs, n * 4 + 4)
+    rt.heap_free(lens, n * 4 + 4)
+}
+
+fn finish_model(w: *mut bw.Words, opts: TrainOpts, specials: *mut Vec[str], m: *mut bm.Model) -> bool {
+    let ns: usize = vec_len[str](specials)
+    if opts.vocab_size < bm.BYTE_TOKENS + ns {
+        return false
+    }
+    var ma: Vec[u32] = vec_new[u32]()
+    var mb: Vec[u32] = vec_new[u32]()
+    train_words(w, opts.vocab_size - bm.BYTE_TOKENS - ns, opts.min_count, &ma, &mb)
+    let ok: bool = bm.model_build(m, vec_ptr[u32](&ma), vec_ptr[u32](&mb), vec_len[u32](&ma), specials)
+    vec_free[u32](&ma)
+    vec_free[u32](&mb)
+    return ok
+}
+
+fn train_files(files: *mut Vec[str], opts: TrainOpts, specials: *mut Vec[str], m: *mut bm.Model) -> bool {
+    var w: bw.Words = bw.words_new()
+    var threads: u64 = opts.threads
+    if threads < 1 {
+        threads = 1
+    }
+    if !corpus_words(files, threads, &w) {
+        bw.words_free(&w)
+        return false
+    }
+    let ok: bool = finish_model(&w, opts, specials, m)
+    bw.words_free(&w)
+    return ok
+}
+
+fn train_text(text: str, opts: TrainOpts, specials: *mut Vec[str], m: *mut bm.Model) -> bool {
+    var w: bw.Words = bw.words_new()
+    bw.words_add_text(&w, text.p as u64, text.n)
+    let ok: bool = finish_model(&w, opts, specials, m)
+    bw.words_free(&w)
+    return ok
+}

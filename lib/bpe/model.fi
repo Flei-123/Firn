@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/bpe/model.fi -- bpe.model: byte-level BPE model (256 byte tokens, ranked merges, special tokens at the end of the vocabulary), token byte table and pair->rank hash table.
+import std.rt
+import std.vec
+
+export { Model, BYTE_TOKENS, model_new, model_free, model_build, pair_rank, vocab_size, merge_count, special_count, token_ptr, token_len, special_id, special_index_id, first_special_id, merge_a, merge_b }
+
+const BYTE_TOKENS: usize = 256
+const PAIR_MUL: u64 = 11400714819323198485
+
+struct Model {
+    merges: usize,
+    specials: usize,
+    vocab: usize,
+    merge_a_ptr: u64,
+    merge_b_ptr: u64,
+    tok_off: u64,
+    tok_bytes: u64,
+    tok_bytes_n: usize,
+    pair_tab: u64,
+    pair_mask: u64,
+    pair_slots: usize,
+}
+
+fn model_new() -> Model {
+    return Model { merges: 0, specials: 0, vocab: 256, merge_a_ptr: 0, merge_b_ptr: 0, tok_off: 0, tok_bytes: 0, tok_bytes_n: 0, pair_tab: 0, pair_mask: 0, pair_slots: 0 }
+}
+
+fn model_free(m: *mut Model) {
+    if (*m).merge_a_ptr != 0 {
+        rt.heap_free((*m).merge_a_ptr, (*m).merges * 4 + 4)
+    }
+    if (*m).merge_b_ptr != 0 {
+        rt.heap_free((*m).merge_b_ptr, (*m).merges * 4 + 4)
+    }
+    if (*m).tok_off != 0 {
+        rt.heap_free((*m).tok_off, ((*m).vocab + 1) * 4)
+    }
+    if (*m).tok_bytes != 0 {
+        rt.heap_free((*m).tok_bytes, (*m).tok_bytes_n + 1)
+    }
+    if (*m).pair_tab != 0 {
+        rt.heap_free((*m).pair_tab, (*m).pair_slots * 8)
+    }
+    *m = model_new()
+}
+
+fn vocab_size(m: *mut Model) -> usize {
+    return (*m).vocab
+}
+
+fn merge_count(m: *mut Model) -> usize {
+    return (*m).merges
+}
+
+fn special_count(m: *mut Model) -> usize {
+    return (*m).specials
+}
+
+fn first_special_id(m: *mut Model) -> usize {
+    return BYTE_TOKENS + (*m).merges
+}
+
+fn merge_a(m: *mut Model, k: usize) -> u32 {
+    return rt.ld32((*m).merge_a_ptr, k)
+}
+
+fn merge_b(m: *mut Model, k: usize) -> u32 {
+    return rt.ld32((*m).merge_b_ptr, k)
+}
+
+fn token_ptr(m: *mut Model, id: usize) -> u64 {
+    return (*m).tok_bytes + (rt.ld32((*m).tok_off, id) as u64)
+}
+
+fn token_len(m: *mut Model, id: usize) -> usize {
+    return (rt.ld32((*m).tok_off, id + 1) - rt.ld32((*m).tok_off, id)) as usize
+}
+
+fn pair_rank(m: *mut Model, a: u32, b: u32) -> u32 {
+    let key: u64 = ((a as u64) << 16) | (b as u64)
+    var h: u64 = ((key *% PAIR_MUL) >> 28) & (*m).pair_mask
+    let tab: u64 = (*m).pair_tab
+    while true {
+        let s: u64 = rt.ld64(tab, h as usize)
+        if s == 0 {
+            return 0
+        }
+        if (s >> 17) == key {
+            return (s & 131071) as u32
+        }
+        h = (h + 1) & (*m).pair_mask
+    }
+    return 0
+}
+
+fn pair_insert(m: *mut Model, a: u32, b: u32, rank: usize) {
+    let key: u64 = ((a as u64) << 16) | (b as u64)
+    var h: u64 = ((key *% PAIR_MUL) >> 28) & (*m).pair_mask
+    let tab: u64 = (*m).pair_tab
+    while rt.ld64(tab, h as usize) != 0 {
+        h = (h + 1) & (*m).pair_mask
+    }
+    rt.st64(tab, h as usize, (key << 17) | ((rank as u64) + 1))
+}
+
+fn special_index_id(m: *mut Model, index: usize) -> usize {
+    return BYTE_TOKENS + (*m).merges + index
+}
+
+fn special_id(m: *mut Model, name: str) -> i64 {
+    var k: usize = 0
+    while k < (*m).specials {
+        let id: usize = special_index_id(m, k)
+        let n: usize = token_len(m, id)
+        if n == name.n && rt.mem_eq(token_ptr(m, id), name.p as u64, n) {
+            return id as i64
+        }
+        k = k + 1
+    }
+    return 0 -% 1
+}
+
+fn model_build(m: *mut Model, merge_a_src: u64, merge_b_src: u64, merges: usize, specials: *mut Vec[str]) -> bool {
+    model_free(m)
+    let ns: usize = vec_len[str](specials)
+    let vocab: usize = BYTE_TOKENS + merges + ns
+    if vocab > 65535 {
+        return false
+    }
+    (*m).merges = merges
+    (*m).specials = ns
+    (*m).vocab = vocab
+    (*m).merge_a_ptr = rt.heap_alloc(merges * 4 + 4)
+    (*m).merge_b_ptr = rt.heap_alloc(merges * 4 + 4)
+    (*m).tok_off = rt.heap_alloc((vocab + 1) * 4)
+    var slots: usize = 16
+    while slots < merges * 2 + 16 {
+        slots = slots * 2
+    }
+    (*m).pair_slots = slots
+    (*m).pair_mask = (slots - 1) as u64
+    (*m).pair_tab = rt.heap_alloc(slots * 8)
+    if (*m).merge_a_ptr == 0 || (*m).merge_b_ptr == 0 || (*m).tok_off == 0 || (*m).pair_tab == 0 {
+        model_free(m)
+        return false
+    }
+    var k: usize = 0
+    while k < merges {
+        let a: u32 = rt.ld32(merge_a_src, k)
+        let b: u32 = rt.ld32(merge_b_src, k)
+        if (a as usize) >= BYTE_TOKENS + k || (b as usize) >= BYTE_TOKENS + k {
+            model_free(m)
+            return false
+        }
+        rt.st32((*m).merge_a_ptr, k, a)
+        rt.st32((*m).merge_b_ptr, k, b)
+        pair_insert(m, a, b, k)
+        k = k + 1
+    }
+    var lens_total: usize = 0
+    var id: usize = 0
+    let lens: u64 = rt.heap_alloc(vocab * 4 + 4)
+    if lens == 0 {
+        model_free(m)
+        return false
+    }
+    while id < vocab {
+        var n: usize = 1
+        if id >= BYTE_TOKENS + merges {
+            n = (*(vec_elem_ptr[str](specials, id - BYTE_TOKENS - merges))).n
+        }
+        if id >= BYTE_TOKENS && id < BYTE_TOKENS + merges {
+            let kk: usize = id - BYTE_TOKENS
+            n = (rt.ld32(lens, rt.ld32((*m).merge_a_ptr, kk) as usize) + rt.ld32(lens, rt.ld32((*m).merge_b_ptr, kk) as usize)) as usize
+        }
+        rt.st32(lens, id, n as u32)
+        rt.st32((*m).tok_off, id, lens_total as u32)
+        lens_total = lens_total + n
+        id = id + 1
+    }
+    rt.st32((*m).tok_off, vocab, lens_total as u32)
+    rt.heap_free(lens, vocab * 4 + 4)
+    (*m).tok_bytes_n = lens_total
+    (*m).tok_bytes = rt.heap_alloc(lens_total + 1)
+    if (*m).tok_bytes == 0 {
+        model_free(m)
+        return false
+    }
+    id = 0
+    while id < vocab {
+        let dst: u64 = token_ptr(m, id)
+        if id < BYTE_TOKENS {
+            rt.st8(dst, 0, id as u8)
+        }
+        if id >= BYTE_TOKENS && id < BYTE_TOKENS + merges {
+            let kk: usize = id - BYTE_TOKENS
+            let ta: usize = rt.ld32((*m).merge_a_ptr, kk) as usize
+            let tb: usize = rt.ld32((*m).merge_b_ptr, kk) as usize
+            let la: usize = token_len(m, ta)
+            rt.mem_copy(dst, token_ptr(m, ta), la)
+            rt.mem_copy(dst + (la as u64), token_ptr(m, tb), token_len(m, tb))
+        }
+        if id >= BYTE_TOKENS + merges {
+            let sp: str = *(vec_elem_ptr[str](specials, id - BYTE_TOKENS - merges))
+            rt.mem_copy(dst, sp.p as u64, sp.n)
+        }
+        id = id + 1
+    }
+    return true
+}
