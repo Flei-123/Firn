@@ -1,0 +1,136 @@
+// expect_exit: 0
+import std.rt
+import std.vec
+import bpe.bpe
+import bpe.util as ut
+import bpe.model as bm
+import bpe.stream as bs
+import bpe.serial as sr
+
+fn roundtrip_ok(m: *mut bm.Model, p: u64, n: usize) -> bool {
+    var ids: Vec[u16] = vec_new[u16]()
+    bpe.encode(m, str { p: p as *mut u8, n: n }, &ids)
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = bpe.decode(m, &ids, &out) && rt.buf_len(&out) == n && rt.mem_eq(rt.buf_ptr(&out), p, n)
+    rt.buf_free(&out)
+    vec_free[u16](&ids)
+    return ok
+}
+
+fn stream_ok(m: *mut bm.Model, p: u64, n: usize, chunk: usize) -> bool {
+    var batch: Vec[u16] = vec_new[u16]()
+    bpe.encode(m, str { p: p as *mut u8, n: n }, &batch)
+    var s: bs.Stream = bpe.stream_new(m)
+    var got: Vec[u16] = vec_new[u16]()
+    var at: usize = 0
+    while at < n {
+        var k: usize = chunk
+        if at + k > n {
+            k = n - at
+        }
+        bpe.stream_feed(&s, str { p: (p + (at as u64)) as *mut u8, n: k }, &got)
+        at = at + k
+    }
+    bpe.stream_finish(&s, &got)
+    bpe.stream_free(&s)
+    let same: bool = vec_len[u16](&got) == vec_len[u16](&batch) && rt.mem_eq(vec_ptr[u16](&got), vec_ptr[u16](&batch), vec_len[u16](&batch) * 2)
+    vec_free[u16](&batch)
+    vec_free[u16](&got)
+    return same
+}
+
+fn main() -> i32 {
+    var corpus: rt.Buf = rt.buf_new()
+    if !ut.read_all("testdata/bpe/corpus.txt", &corpus) {
+        return 1
+    }
+    var specials: Vec[str] = vec_new[str]()
+    vec_push[str](&specials, "<|bos|>")
+    vec_push[str](&specials, "<|eos|>")
+    var trained: bm.Model = bpe.model_new()
+    if !bpe.train_text(rt.buf_str(&corpus), 512, &specials, &trained) || bpe.vocab_size(&trained) != 512 {
+        return 2
+    }
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    sr.model_to_bytes(&trained, &a)
+    if !ut.read_all("testdata/bpe/tiny.bpe", &b) || rt.buf_len(&a) != rt.buf_len(&b) || !rt.mem_eq(rt.buf_ptr(&a), rt.buf_ptr(&b), rt.buf_len(&a)) {
+        return 3
+    }
+    var m: bm.Model = bpe.model_new()
+    if !bpe.model_load("testdata/bpe/tiny.bpe", &m) || bpe.special_id(&m, "<|eos|>") != 511 || bpe.special_id(&m, "<|bos|>") != 510 || bpe.special_id(&m, "x") != -1 {
+        return 4
+    }
+    var all: rt.Buf = rt.buf_new()
+    var i: u32 = 0
+    while i < 256 {
+        rt.buf_push(&all, i as u8)
+        i = i + 1
+    }
+    var seed: u64 = 12345
+    var k: usize = 0
+    while k < 5000 {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&all, (seed >> 56) as u8)
+        k = k + 1
+    }
+    if !roundtrip_ok(&m, rt.buf_ptr(&all), rt.buf_len(&all)) || !roundtrip_ok(&m, rt.buf_ptr(&corpus), rt.buf_len(&corpus)) || !roundtrip_ok(&m, rt.buf_ptr(&all), 0) {
+        return 5
+    }
+    var mix: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&mix, "Größe äöü ß 😀🎉 日本語 12345 it's don't\r\n\r\n  x\t\ty ".p as u64, 61)
+    rt.buf_push_bytes(&mix, rt.buf_ptr(&corpus), 3000)
+    rt.buf_push(&mix, 195 as u8)
+    var c: usize = 1
+    while c < 40 {
+        if !stream_ok(&m, rt.buf_ptr(&mix), rt.buf_len(&mix), c) {
+            return 100 + (c as i32)
+        }
+        c = c + 1
+    }
+    if !stream_ok(&m, rt.buf_ptr(&all), rt.buf_len(&all), 7) || !stream_ok(&m, rt.buf_ptr(&all), 0, 3) {
+        return 6
+    }
+    var gold: rt.Buf = rt.buf_new()
+    if !ut.read_all("testdata/bpe/golden.txt", &gold) {
+        return 7
+    }
+    let g: u64 = rt.buf_ptr(&gold)
+    let gn: usize = rt.buf_len(&gold)
+    var at: usize = 0
+    var line_no: i32 = 0
+    while at < gn {
+        var e: usize = at
+        var bar: usize = 0
+        while e < gn && rt.ld8(g, e) != 10 {
+            if rt.ld8(g, e) == 124 {
+                bar = e
+            }
+            e = e + 1
+        }
+        var raw: rt.Buf = rt.buf_new()
+        if !ut.unescape_bytes(str { p: (g + (at as u64)) as *mut u8, n: bar - at }, &raw) {
+            return 8
+        }
+        var ids: Vec[u16] = vec_new[u16]()
+        bpe.encode(&m, rt.buf_str(&raw), &ids)
+        var want: Vec[u16] = vec_new[u16]()
+        ut.parse_ids(str { p: (g + (bar as u64) + 1) as *mut u8, n: e - bar - 1 }, &want)
+        if vec_len[u16](&ids) != vec_len[u16](&want) || !rt.mem_eq(vec_ptr[u16](&ids), vec_ptr[u16](&want), vec_len[u16](&want) * 2) {
+            return 200 + line_no
+        }
+        line_no = line_no + 1
+        at = e + 1
+    }
+    if line_no != 12 {
+        return 9
+    }
+    var bad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&bad, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.st8(rt.buf_ptr(&bad), 30, 7 as u8)
+    var m3: bm.Model = bpe.model_new()
+    if sr.model_from_bytes(rt.buf_ptr(&bad), rt.buf_len(&bad), &m3) {
+        return 10
+    }
+    return 0
+}

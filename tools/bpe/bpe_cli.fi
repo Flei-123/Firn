@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/bpe/bpe_cli.fi -- bpe_cli: train, encode, decode, stats, roundtrip, words and merges commands for lib/bpe.
+import std.rt
+import std.io
+import std.vec
+import std.fs
+import std.time
+import std.cpus
+import bpe.bpe
+import bpe.util as ut
+import bpe.words as bw
+import bpe.model as bm
+import bpe.train as bt
+import bpe.stream as bs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    return bpe.thread_work(kind, arg)
+}
+
+fn say(s: str) {
+    io.print_line(s)
+}
+
+fn ms_since(t0: u64) -> u64 {
+    return (time.monotonic_ns() - t0) / 1000000
+}
+
+fn opt_value(start: u64, name: str, fallback: str) -> str {
+    let n: usize = rt.arg_count(start)
+    var i: usize = 2
+    while i + 1 < n {
+        if ut.arg_str(start, i) == name {
+            return ut.arg_str(start, i + 1)
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn parse_num(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = rt.ld8(s.p as u64, i) as u32
+        if c >= 48 && c <= 57 {
+            v = v * 10 + ((c - 48) as u64)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn collect_free_args(start: u64, files: *mut Vec[str], specials: *mut Vec[str]) {
+    let n: usize = rt.arg_count(start)
+    var i: usize = 2
+    while i < n {
+        let a: str = ut.arg_str(start, i)
+        if a == "--special" && i + 1 < n {
+            vec_push[str](specials, ut.arg_str(start, i + 1))
+            i = i + 2
+        } else {
+            if a.n > 2 && rt.ld8(a.p as u64, 0) == 45 && rt.ld8(a.p as u64, 1) == 45 {
+                i = i + 2
+            } else {
+                vec_push[str](files, a)
+                i = i + 1
+            }
+        }
+    }
+}
+
+fn load_model(start: u64, m: *mut bm.Model) -> bool {
+    let path: str = opt_value(start, "--model", "")
+    if path.n == 0 || !bpe.model_load(path, m) {
+        say("cannot load model (--model)")
+        return false
+    }
+    return true
+}
+
+fn cmd_train(start: u64) -> i32 {
+    var files: Vec[str] = vec_new[str]()
+    var specials: Vec[str] = vec_new[str]()
+    collect_free_args(start, &files, &specials)
+    let out: str = opt_value(start, "--out", "")
+    let vocab: u64 = parse_num(opt_value(start, "--vocab", "32768"))
+    let threads: u64 = parse_num(opt_value(start, "--threads", "4"))
+    let min_count: u64 = parse_num(opt_value(start, "--min-count", "2"))
+    if out.n == 0 || vec_len[str](&files) == 0 {
+        say("usage: bpe_cli train --out model.bpe --vocab 32768 --threads 4 --min-count 2 [--special <name>]... files...")
+        return 2
+    }
+    var m: bm.Model = bpe.model_new()
+    let t0: u64 = time.monotonic_ns()
+    var o: bt.TrainOpts = bpe.train_opts(vocab as usize, min_count as i64, threads)
+    if !bt.train_files(&files, o, &specials, &m) {
+        say("train failed")
+        return 1
+    }
+    say("train_ms " + ut.dec(ms_since(t0)) + " vocab " + ut.dec(bpe.vocab_size(&m) as u64) + " merges " + ut.dec(bpe.merge_count(&m) as u64))
+    if !bpe.model_save(&m, out) {
+        say("save failed")
+        return 1
+    }
+    return 0
+}
+
+fn cmd_encode(start: u64) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var inp: rt.Buf = rt.buf_new()
+    if !ut.read_all(opt_value(start, "--in", ""), &inp) {
+        say("cannot read --in")
+        return 2
+    }
+    var ids: Vec[u16] = vec_new[u16]()
+    let t0: u64 = time.monotonic_ns()
+    bpe.encode(&m, rt.buf_str(&inp), &ids)
+    let ms: u64 = ms_since(t0)
+    let out: str = opt_value(start, "--out", "")
+    if out.n > 0 {
+        fs.write_file(out, vec_ptr[u16](&ids), vec_len[u16](&ids) * 2) catch | e | 0
+    }
+    say("bytes " + ut.dec(rt.buf_len(&inp) as u64) + " tokens " + ut.dec(vec_len[u16](&ids) as u64) + " ms " + ut.dec(ms))
+    return 0
+}
+
+fn cmd_decode(start: u64) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var inp: rt.Buf = rt.buf_new()
+    if !ut.read_all(opt_value(start, "--in", ""), &inp) {
+        say("cannot read --in")
+        return 2
+    }
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = bd_range(&m, &inp, &out)
+    fs.write_file(opt_value(start, "--out", "/dev/stdout"), rt.buf_ptr(&out), rt.buf_len(&out)) catch | e | 0
+    if !ok {
+        say("invalid token id in input")
+        return 1
+    }
+    return 0
+}
+
+fn bd_range(m: *mut bm.Model, inp: *mut rt.Buf, out: *mut rt.Buf) -> bool {
+    var ids: Vec[u16] = vec_new[u16]()
+    vec_reserve[u16](&ids, rt.buf_len(inp) / 2)
+    rt.mem_copy(vec_ptr[u16](&ids), rt.buf_ptr(inp), rt.buf_len(inp) / 2 * 2)
+    ids.len = rt.buf_len(inp) / 2
+    return bpe.decode(m, &ids, out)
+}
+
+fn cmd_stats(start: u64, check: bool) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var files: Vec[str] = vec_new[str]()
+    var specials: Vec[str] = vec_new[str]()
+    collect_free_args(start, &files, &specials)
+    let chunk: usize = parse_num(opt_value(start, "--chunk", "1048573")) as usize
+    var bad: u64 = 0
+    var total_bytes: u64 = 0
+    var total_tokens: u64 = 0
+    var total_ms: u64 = 0
+    var i: usize = 0
+    while i < vec_len[str](&files) {
+        let path: str = *(vec_elem_ptr[str](&files, i))
+        i = i + 1
+        var inp: rt.Buf = rt.buf_new()
+        if !ut.read_all(path, &inp) {
+            say("cannot read " + path)
+            bad = bad + 1
+            continue
+        }
+        let n: usize = rt.buf_len(&inp)
+        var ids: Vec[u16] = vec_new[u16]()
+        vec_reserve[u16](&ids, n / 3)
+        let t0: u64 = time.monotonic_ns()
+        bpe.encode(&m, rt.buf_str(&inp), &ids)
+        let ms: u64 = ms_since(t0)
+        total_bytes = total_bytes + (n as u64)
+        total_tokens = total_tokens + (vec_len[u16](&ids) as u64)
+        total_ms = total_ms + ms
+        var line: str = path + " bytes " + ut.dec(n as u64) + " tokens " + ut.dec(vec_len[u16](&ids) as u64) + " bytes_per_token_x1000 " + ut.dec((n as u64) * 1000 / (vec_len[u16](&ids) as u64 + 1)) + " encode_ms " + ut.dec(ms)
+        if check {
+            var back: rt.Buf = rt.buf_new()
+            bpe.decode(&m, &ids, &back)
+            var same: bool = rt.buf_len(&back) == n && rt.mem_eq(rt.buf_ptr(&back), rt.buf_ptr(&inp), n)
+            var s: bs.Stream = bpe.stream_new(&m)
+            var sids: Vec[u16] = vec_new[u16]()
+            var at: usize = 0
+            while at < n {
+                var k: usize = chunk
+                if at + k > n {
+                    k = n - at
+                }
+                bpe.stream_feed(&s, str { p: (rt.buf_ptr(&inp) + (at as u64)) as *mut u8, n: k }, &sids)
+                at = at + k
+            }
+            bpe.stream_finish(&s, &sids)
+            bpe.stream_free(&s)
+            var same_stream: bool = vec_len[u16](&sids) == vec_len[u16](&ids) && rt.mem_eq(vec_ptr[u16](&sids), vec_ptr[u16](&ids), vec_len[u16](&ids) * 2)
+            line = line + " roundtrip " + bool_text(same) + " stream_eq_batch " + bool_text(same_stream)
+            if !same || !same_stream {
+                bad = bad + 1
+            }
+            rt.buf_free(&back)
+            vec_free[u16](&sids)
+        }
+        say(line)
+        vec_free[u16](&ids)
+        rt.buf_free(&inp)
+    }
+    say("TOTAL bytes " + ut.dec(total_bytes) + " tokens " + ut.dec(total_tokens) + " bytes_per_token_x1000 " + ut.dec(total_bytes * 1000 / (total_tokens + 1)) + " encode_ms " + ut.dec(total_ms) + " kb_per_s " + ut.dec(total_bytes / (total_ms + 1)) + " bad " + ut.dec(bad))
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn bool_text(b: bool) -> str {
+    if b {
+        return "ok"
+    }
+    return "FAIL"
+}
+
+fn cmd_words(start: u64) -> i32 {
+    var files: Vec[str] = vec_new[str]()
+    var specials: Vec[str] = vec_new[str]()
+    collect_free_args(start, &files, &specials)
+    var w: bw.Words = bw.words_new()
+    if !bt.corpus_words(&files, 1, &w) {
+        return 1
+    }
+    var i: usize = 0
+    var line: rt.Buf = rt.buf_new()
+    while i < bw.words_count(&w) {
+        rt.buf_clear(&line)
+        rt.buf_push_dec_u64(&line, bw.word_freq(&w, i))
+        rt.buf_push(&line, 124 as u8)
+        ut.escape_bytes(bw.word_ptr(&w, i), bw.word_len(&w, i), &line)
+        io.print_line(rt.buf_str(&line))
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmd_merges(start: u64) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var k: usize = 0
+    var line: rt.Buf = rt.buf_new()
+    while k < bpe.merge_count(&m) {
+        rt.buf_clear(&line)
+        rt.buf_push_dec_u64(&line, bm.merge_a(&m, k) as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, bm.merge_b(&m, k) as u64)
+        io.print_line(rt.buf_str(&line))
+        k = k + 1
+    }
+    return 0
+}
+
+fn cmd_export(start: u64) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var out: rt.Buf = rt.buf_new()
+    bpe.export_tokenizer_json(&m, &out)
+    fs.write_file(opt_value(start, "--out", "/dev/stdout"), rt.buf_ptr(&out), rt.buf_len(&out)) catch | e | 0
+    return 0
+}
+
+fn cmd_golden(start: u64) -> i32 {
+    var m: bm.Model = bpe.model_new()
+    if !load_model(start, &m) {
+        return 2
+    }
+    var inp: rt.Buf = rt.buf_new()
+    if !ut.read_all(opt_value(start, "--in", ""), &inp) {
+        return 2
+    }
+    var at: usize = 0
+    let n: usize = rt.buf_len(&inp)
+    let base: u64 = rt.buf_ptr(&inp)
+    while at < n {
+        var e: usize = at
+        while e < n && rt.ld8(base, e) != 10 {
+            e = e + 1
+        }
+        var raw: rt.Buf = rt.buf_new()
+        ut.unescape_bytes(str { p: (base + (at as u64)) as *mut u8, n: e - at }, &raw)
+        var ids: Vec[u16] = vec_new[u16]()
+        bpe.encode(&m, rt.buf_str(&raw), &ids)
+        var line: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&line, base + (at as u64), e - at)
+        rt.buf_push(&line, 124 as u8)
+        ut.ids_to_text(&ids, &line)
+        io.print_line(rt.buf_str(&line))
+        at = e + 1
+    }
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    let cmd: str = ut.arg_str(start, 1)
+    if cmd == "train" {
+        return cmd_train(start)
+    }
+    if cmd == "encode" {
+        return cmd_encode(start)
+    }
+    if cmd == "decode" {
+        return cmd_decode(start)
+    }
+    if cmd == "stats" {
+        return cmd_stats(start, false)
+    }
+    if cmd == "roundtrip" {
+        return cmd_stats(start, true)
+    }
+    if cmd == "words" {
+        return cmd_words(start)
+    }
+    if cmd == "merges" {
+        return cmd_merges(start)
+    }
+    if cmd == "export-json" {
+        return cmd_export(start)
+    }
+    if cmd == "golden" {
+        return cmd_golden(start)
+    }
+    say("usage: bpe_cli train|encode|decode|stats|roundtrip|words|merges|export-json|golden")
+    return 2
+}
