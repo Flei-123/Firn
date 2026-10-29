@@ -63,7 +63,13 @@ def wasm(lines):
     for i, l in enumerate(lines):
         m = re.match(r"\s+\(func (?:\$(?:_F0\.)?(\w+))?", l)
         if m: fn = m.group(1) or "?"; res[fn] = 0; continue
-        if fn and re.match(r"\s+i64\.const (\d+)$", l) and i + 1 < len(lines) and "i32.wrap_i64" in lines[i + 1]:
+        if not fn: continue
+        m = re.match(r"\s+i32\.const (\d+)$", l)
+        if m and 64 <= int(m.group(1)) < 65536 and i + 2 < len(lines):
+            nxt = lines[i + 1].strip()
+            if re.match(r"i32\.load", nxt) or (re.match(r"i32\.const \d+$", nxt) and lines[i + 2].strip() == "memory.copy"):
+                res[fn] += 1
+        if re.match(r"\s+i64\.const (\d+)$", l) and i + 1 < len(lines) and "i32.wrap_i64" in lines[i + 1]:
             if 64 <= int(re.search(r"(\d+)", l).group(1)) < 65536: res[fn] += 1
     return res
 

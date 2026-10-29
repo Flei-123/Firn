@@ -24,4 +24,8 @@ for lvl in dev dev-fast release-safe release-fast; do
 done
 # the checker must be able to fail
 if python3 -I tools/toctou/check.py x86 "$W/x.s" --mutate > /dev/null 2>&1; then echo "  FAIL mutation not detected"; rc=1; else echo "  ok  mutation detected"; fi
+if command -v wasm2wat >/dev/null; then
+    "$FIRNC" --target=wasm32-browser --opt-level=release-fast tools/toctou/toctou.fi -o "$W/w.wasm" > "$W/c.log" 2>&1 && wasm2wat "$W/w.wasm" > "$W/w.wat"
+    if python3 -I tools/toctou/check.py wasm "$W/w.wat" --mutate > /dev/null 2>&1; then echo "  FAIL wasm mutation not detected"; rc=1; else echo "  ok  wasm mutation detected"; fi
+fi
 exit $rc

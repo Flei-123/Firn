@@ -248,6 +248,7 @@ impl Asm {
                 self.cur = match name {
                     ".text" => SEC_TEXT,
                     ".data" => SEC_DATA,
+                    ".data.rel.ro" => SEC_DATA,
                     ".rodata" => SEC_RODATA,
                     ".note.GNU-stack" => SEC_NOTE,
                     ".bss" => SEC_BSS,

@@ -136,14 +136,14 @@ while IFS= read -r f; do
     tmo=$(run_timeout)
     # The reference run is measured in CPU seconds. A program that is slow by
     # nature (firnc1 emits slower code: 2831 needs 9 s with firnc0 and 68 s with
-    # firnc1) gets a budget of 15x the reference CPU time + 20 s, scaled by the
+    # firnc1) gets a budget of 30x the reference CPU time (rounded up) + 20 s, scaled by the
     # same load factor; so neither a busy machine nor a heavy test turns into a
     # false deviation. (r480)
     rm -f "$WORK/ref.cpu"
     /usr/bin/time -f %U -o "$WORK/ref.cpu" timeout "$tmo" "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
     rref=$?
-    rcpu=$(tail -1 "$WORK/ref.cpu" 2>/dev/null | awk '{printf "%d", $1}')
-    tmo=$(awk -v t="$tmo" -v c="${rcpu:-0}" 'BEGIN{x=(c*15+20)*t/20; if (x<t) x=t; printf "%d", x}')
+    rcpu=$(tail -1 "$WORK/ref.cpu" 2>/dev/null | awk '{printf "%d", int($1) + ($1 > int($1))}')
+    tmo=$(awk -v t="$tmo" -v c="${rcpu:-0}" 'BEGIN{x=(c*30+20)*t/20; if (x<t) x=t; printf "%d", x}')
     timeout "$tmo" "$WORK/a.bin" > "$WORK/a.out" 2>/dev/null
     ra=$?
     if [ "$rref" -eq "$ra" ] && cmp -s "$WORK/ref.out" "$WORK/a.out"; then
