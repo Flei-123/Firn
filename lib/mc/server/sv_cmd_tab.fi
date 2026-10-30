@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_cmd_tab.fi -- tab completion: argument suggestion hooks (players, selectors, game modes, time units) and the suggestions packet.
+
+import std.rt
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.casing as cs
+import brigadier.reader as rd
+import brigadier.suggest as sg
+import brigadier.dispatcher as dp
+import mc.mc_sem
+import mc.mc_version
+import mc.cmd.cmd_tree as ct
+import mc.cmd.cmd_args as ca
+import mc.cmd.cmd_wire as cw
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_ops
+import mc.server.sv_select
+import mc.server.sv_cmd_state
+
+export { tab_handle, type_suggest }
+
+const CH_AT: u32 = 64
+const CH_SLASH: u32 = 47
+const SELECTOR_TYPES: str = "pares"
+
+fn suggest_text(b: *mut sg.SuggBuilder, s: str) {
+    sg.sb_suggest(b, tx.u16_from_str((*b).a, s))
+}
+
+fn suggest_selectors(b: *mut sg.SuggBuilder) {
+    suggest_text(b, "@p")
+    suggest_text(b, "@a")
+    suggest_text(b, "@r")
+    suggest_text(b, "@s")
+    suggest_text(b, "@e")
+}
+
+fn selector_char(c: u32) -> bool {
+    var i: usize = 0
+    while i < SELECTOR_TYPES.n {
+        if rt.ld8(SELECTOR_TYPES.p as u64, i) as u32 == c {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn suggest_open_bracket(b: *mut sg.SuggBuilder) {
+    m.arr_push[sg.Sugg]((*b).a, &(*b).result, sg.Sugg { start: (*b).start + 2, end: (*b).input.n, text: tx.u16_from_str((*b).a, "["), is_int: false, ival: 0 })
+}
+
+fn suggest_entity(c: *mut sv_cmd_state.Cmds, b: *mut sg.SuggBuilder) {
+    let rem: tx.U16 = (*b).remaining
+    let allowed: bool = sv_ops.op_level((*c).srv, (*c).cur) >= sv_select.SELECTOR_LEVEL
+    if rem.n > 0 && tx.u16_at(rem, 0) == CH_AT {
+        if !allowed {
+            return
+        }
+        if rem.n == 1 {
+            suggest_selectors(b)
+        } else if rem.n == 2 && selector_char(tx.u16_at(rem, 1)) {
+            suggest_open_bracket(b)
+        }
+        return
+    }
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at((*c).srv, i)
+        if (*o).used && (*o).joined && !(*o).closing {
+            let name: tx.U16 = tx.u16_from_str((*b).a, str { p: (&(*o).name[0]) as *mut u8, n: (*o).name_n })
+            if tx.u16_starts_with(cs.u16_lower((*b).a, name), (*b).remaining_lower) {
+                sg.sb_suggest(b, name)
+            }
+        }
+        i = i + 1
+    }
+    if allowed {
+        suggest_selectors(b)
+    }
+}
+
+fn suggest_word(b: *mut sg.SuggBuilder, word: str) {
+    let w: tx.U16 = tx.u16_from_str((*b).a, word)
+    if tx.u16_starts_with(w, (*b).remaining_lower) {
+        sg.sb_suggest(b, w)
+    }
+}
+
+fn float_prefix(rem: tx.U16) -> usize {
+    var n: usize = 0
+    var digits: usize = 0
+    var dots: usize = 0
+    while n < rem.n {
+        let ch: u32 = tx.u16_at(rem, n)
+        if ch >= 48 && ch <= 57 {
+            digits = digits + 1
+        } else if ch == 46 {
+            dots = dots + 1
+        } else if !(ch == 45 && n == 0) {
+            break
+        }
+        n = n + 1
+    }
+    if digits == 0 || dots > 1 {
+        return 0
+    }
+    return n
+}
+
+fn suggest_time_units(b: *mut sg.SuggBuilder) {
+    let n: usize = float_prefix((*b).remaining)
+    if n == 0 {
+        return
+    }
+    var sub: sg.SuggBuilder = sg.sb_new((*b).a, (*b).input, (*b).input_lower, (*b).start + n)
+    suggest_word(&sub, "d")
+    suggest_word(&sub, "s")
+    suggest_word(&sub, "t")
+    var i: usize = 0
+    while i < m.arr_len[sg.Sugg](&sub.result) {
+        m.arr_push[sg.Sugg]((*b).a, &(*b).result, *m.arr_at[sg.Sugg](&sub.result, i))
+        i = i + 1
+    }
+}
+
+fn type_suggest(user: u64, id: i32, bp: u64) {
+    let t: *mut ct.CmdTree = user as *mut ct.CmdTree
+    let c: *mut sv_cmd_state.Cmds = (*t).owner as *mut sv_cmd_state.Cmds
+    let b: *mut sg.SuggBuilder = bp as *mut sg.SuggBuilder
+    let k: i32 = (*ct.tree_spec(t, id)).kind
+    if k == ca.PK_ENTITY || k == ca.PK_GAME_PROFILE {
+        suggest_entity(c, b)
+    } else if k == ca.PK_GAMEMODE {
+        suggest_word(b, "survival")
+        suggest_word(b, "creative")
+        suggest_word(b, "adventure")
+        suggest_word(b, "spectator")
+    } else if k == ca.PK_TIME {
+        suggest_time_units(b)
+    }
+}
+
+fn push_string(out: *mut rt.Buf, s: str) {
+    cw.push_varint(out, s.n as u32)
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+fn tab_handle(c: *mut sv_cmd_state.Cmds, txn: i32, p: u64, n: usize) {
+    let input: tx.U16 = tx.u16_from_str(&(*c).work, str { p: p as *mut u8, n: n })
+    var d: dp.Dispatcher = dp.Dispatcher { a: &(*c).work, root: (*c).tree.root, hooks: (*c).hooks }
+    var r: rd.Reader = rd.reader_new(&(*c).work, input)
+    if rd.can_read(&r) && rd.peek(&r) == CH_SLASH {
+        rd.skip(&r)
+    }
+    var parsed: dp.Parsed = dp.parse_reader(&d, &r, (*c).cur as i64)
+    let sug: sg.Suggestions = dp.completion_suggestions(&d, &parsed)
+    var out: rt.Buf = rt.buf_new()
+    cw.push_varint(&out, txn as u32)
+    cw.push_varint(&out, sug.start as u32)
+    cw.push_varint(&out, (sug.end - sug.start) as u32)
+    let count: usize = m.arr_len[sg.Sugg](&sug.list)
+    cw.push_varint(&out, count as u32)
+    var i: usize = 0
+    while i < count {
+        push_string(&out, tx.u16_to_str(&(*c).work, (*m.arr_at[sg.Sugg](&sug.list, i)).text))
+        rt.buf_push(&out, 0 as u8)
+        i = i + 1
+    }
+    sv_send.send_raw((*c).srv, (*c).cur, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_TAB_COMPLETE, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+}
