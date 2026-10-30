@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import jobs.jobs
+import scene3d.render_types
+import scene3d.render_order
+
+export {
+    build_bins,
+}
+
+const BIN_CHUNK: usize = 4096
+
+fn bin_add(r: *mut render_types.Renderer, counts: u64, t: *mut render_types.Tri) {
+    let bh: i32 = (*r).band_h
+    var b: i32 = (*t).row_lo / bh
+    let b1: i32 = ((*t).row_hi - 1) / bh
+    while b <= b1 {
+        rt.st32(counts, b as usize, rt.ld32(counts, b as usize) + 1 as u32)
+        b = b + 1
+    }
+}
+
+fn bin_fill(r: *mut render_types.Renderer, cursor: u64, items: u64, t: *mut render_types.Tri, id: u32) {
+    let bh: i32 = (*r).band_h
+    var b: i32 = (*t).row_lo / bh
+    let b1: i32 = ((*t).row_hi - 1) / bh
+    while b <= b1 {
+        let at: u32 = rt.ld32(cursor, b as usize)
+        rt.st32(items, at as usize, id)
+        rt.st32(cursor, b as usize, at + 1 as u32)
+        b = b + 1
+    }
+}
+
+fn scratch_of(r: *mut render_types.Renderer, c: usize) -> u64 {
+    let words: usize = ((*r).nbands as usize) * 2 + 2
+    return vec.vec_ptr[u32](&(*r).ps.bcnt) +% ((c * words * 4) as u64)
+}
+
+fn chunk_end(r: *mut render_types.Renderer, c: usize) -> usize {
+    let nt: usize = vec.vec_len[render_types.Tri](&(*r).tris)
+    var e: usize = (c + 1) * BIN_CHUNK
+    if e > nt { e = nt }
+    return e
+}
+
+fn count_task(ctx: u64, lo: u64, hi: u64) {
+    let r: *mut render_types.Renderer = ctx as *mut render_types.Renderer
+    let nb: usize = (*r).nbands as usize
+    var c: usize = lo as usize
+    while c < (hi as usize) {
+        let sc: u64 = scratch_of(r, c)
+        var z: usize = 0
+        while z < nb * 2 + 2 {
+            rt.st32(sc, z, 0 as u32)
+            z = z + 1
+        }
+        var n_op: u32 = 0 as u32
+        var n_tr: u32 = 0 as u32
+        let e: usize = chunk_end(r, c)
+        var i: usize = c * BIN_CHUNK
+        while i < e {
+            let t: *mut render_types.Tri = vec.vec_elem_ptr[render_types.Tri](&(*r).tris, i)
+            if (*t).opaque {
+                bin_add(r, sc, t)
+                n_op = n_op + 1 as u32
+            } else {
+                bin_add(r, sc +% ((nb * 4) as u64), t)
+                n_tr = n_tr + 1 as u32
+            }
+            i = i + 1
+        }
+        rt.st32(sc, nb * 2, n_op)
+        rt.st32(sc, nb * 2 + 1, n_tr)
+        c = c + 1
+    }
+}
+
+fn fill_task(ctx: u64, lo: u64, hi: u64) {
+    let r: *mut render_types.Renderer = ctx as *mut render_types.Renderer
+    let nb: usize = (*r).nbands as usize
+    var c: usize = lo as usize
+    while c < (hi as usize) {
+        let sc: u64 = scratch_of(r, c)
+        var at: u32 = rt.ld32(sc, nb * 2 + 1)
+        let e: usize = chunk_end(r, c)
+        var i: usize = c * BIN_CHUNK
+        while i < e {
+            let t: *mut render_types.Tri = vec.vec_elem_ptr[render_types.Tri](&(*r).tris, i)
+            if (*t).opaque {
+                bin_fill(r, sc, (*r).bi_op.p, t, i as u32)
+            } else {
+                let it: *mut render_types.SortItem = vec.vec_elem_ptr[render_types.SortItem](&(*r).order, at as usize)
+                *it = render_types.SortItem { order: (*t).order, unit: (*t).group, uk: 0.0, ue: 0.0, key: (*t).key, back: (*t).back, id: i as u32 }
+                at = at + 1 as u32
+            }
+            i = i + 1
+        }
+        c = c + 1
+    }
+}
+
+fn run_bins(r: *mut render_types.Renderer, body: fn(u64, u64, u64), n: usize) {
+    if (*r).use_pool {
+        jobs.parallel_for(&(*r).pool, 0 as u64, n as u64, 1 as u64, body, r as u64)
+    } else {
+        body(r as u64, 0 as u64, n as u64)
+    }
+}
+
+#[allow_escape]
+fn build_bins(r: *mut render_types.Renderer, units: usize) {
+    let nb: usize = (*r).nbands as usize
+    let nt: usize = vec.vec_len[render_types.Tri](&(*r).tris)
+    let nc: usize = (nt + BIN_CHUNK - 1) / BIN_CHUNK
+    render_types.blk_ensure(&(*r).bs_op, (nb + 1) * 4)
+    render_types.blk_ensure(&(*r).bs_tr, (nb + 1) * 4)
+    render_types.blk_ensure(&(*r).cnt, nb * 8 + 16)
+    vec.vec_clear[u32](&(*r).ps.bcnt)
+    vec.vec_reserve[u32](&(*r).ps.bcnt, nc * (nb * 2 + 2) + 1)
+    run_bins(r, count_task, nc)
+    let so: u64 = (*r).bs_op.p
+    let st: u64 = (*r).bs_tr.p
+    var acc_o: u32 = 0 as u32
+    var acc_t: u32 = 0 as u32
+    var b: usize = 0
+    while b < nb {
+        rt.st32(so, b, acc_o)
+        rt.st32(st, b, acc_t)
+        var c: usize = 0
+        while c < nc {
+            let sc: u64 = scratch_of(r, c)
+            let o: u32 = rt.ld32(sc, b)
+            rt.st32(sc, b, acc_o)
+            acc_o = acc_o + o
+            acc_t = acc_t + rt.ld32(sc, nb + b)
+            c = c + 1
+        }
+        b = b + 1
+    }
+    rt.st32(so, nb, acc_o)
+    rt.st32(st, nb, acc_t)
+    var n_op: u32 = 0 as u32
+    var n_tr: u32 = 0 as u32
+    var c: usize = 0
+    while c < nc {
+        let sc: u64 = scratch_of(r, c)
+        let po: u32 = rt.ld32(sc, nb * 2)
+        let pt: u32 = rt.ld32(sc, nb * 2 + 1)
+        rt.st32(sc, nb * 2 + 1, n_tr)
+        n_op = n_op + po
+        n_tr = n_tr + pt
+        c = c + 1
+    }
+    (*r).n_opaque = n_op as i32
+    (*r).n_transp = n_tr as i32
+    render_types.blk_ensure(&(*r).bi_op, (acc_o as usize) * 4 + 16)
+    render_types.blk_ensure(&(*r).bi_tr, (acc_t as usize) * 4 + 16)
+    vec.vec_clear[render_types.SortItem](&(*r).order)
+    vec.vec_reserve[render_types.SortItem](&(*r).order, (n_tr as usize) + 1)
+    (*r).order.len = n_tr as usize
+    run_bins(r, fill_task, nc)
+    render_order.stats_reset(&(*r).ps.ustat, units)
+    var i: usize = 0
+    while i < (n_tr as usize) {
+        let it: *mut render_types.SortItem = vec.vec_elem_ptr[render_types.SortItem](&(*r).order, i)
+        render_order.stats_add(&(*r).ps.ustat, (*it).unit, (*it).key)
+        i = i + 1
+    }
+    i = 0
+    while i < (n_tr as usize) {
+        render_order.stats_apply(&(*r).ps.ustat, vec.vec_elem_ptr[render_types.SortItem](&(*r).order, i))
+        i = i + 1
+    }
+    let sorted: u64 = render_order.sort_items(r)
+    let cur: u64 = (*r).cnt.p
+    b = 0
+    while b < nb {
+        rt.st32(cur, b, rt.ld32(st, b))
+        b = b + 1
+    }
+    i = 0
+    while i < (n_tr as usize) {
+        let it: *mut render_types.SortItem = vec.vec_elem_ptr[render_types.SortItem](&(*r).order, rt.ld32(sorted, i) as usize)
+        let t: *mut render_types.Tri = vec.vec_elem_ptr[render_types.Tri](&(*r).tris, (*it).id as usize)
+        bin_fill(r, cur, (*r).bi_tr.p, t, (*it).id)
+        i = i + 1
+    }
+}
