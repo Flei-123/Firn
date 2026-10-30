@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_chunks.fi -- chunk streaming: per player window of sent columns, nearest first, rate limited.
+
+import std.rt
+import std.bytes
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_world
+import mc.server.sv_chunk_enc
+import mc.server.v763.sv_codec_v763
+
+export { chunks_init, chunks_stream, chunks_send_center, chunks_sent_count }
+
+fn key_of(cx: i32, cz: i32) -> u64 {
+    return (((cx + 1073741824) as u64) << 32 as u64) | ((cz + 1073741824) as u64)
+}
+
+fn key_cx(k: u64) -> i32 { return ((k >> 32 as u64) as i32) - 1073741824 }
+
+fn key_cz(k: u64) -> i32 { return ((k & 4294967295 as u64) as i32) - 1073741824 }
+
+fn wrap(v: i32, w: i32) -> usize {
+    var m: i32 = v % w
+    if m < 0 { m = m + w }
+    return m as usize
+}
+
+fn slot_of(s: *mut sv_state.Session, cx: i32, cz: i32) -> usize {
+    return wrap(cx, (*s).chunks_w) * ((*s).chunks_w as usize) + wrap(cz, (*s).chunks_w)
+}
+
+fn chunks_init(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    let w: i32 = (*srv).cfg.view * 2 + 3
+    (*s).chunks_w = w
+    let n: usize = (w * w) as usize
+    (*s).chunks = rt.heap_alloc(n * 8)
+    rt.mem_set((*s).chunks, 0 as u8, n * 8)
+    (*s).sent_chunks = 0
+}
+
+fn chunks_sent_count(s: *mut sv_state.Session) -> u64 { return (*s).sent_chunks }
+
+fn chunks_send_center(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "chunkX", (*s).cx as i64)
+    mc_encode.vals_i64(&v, "chunkZ", (*s).cz as i64)
+    sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_UPDATE_VIEW_POSITION, &v)
+    rt.buf_free(&v)
+}
+
+fn build_tail(srv: *mut sv_state.Server, blocks: u64) {
+    let nsec: usize = sv_world.world_sections(&(*srv).world)
+    var hm: bytes.Bytes = bytes.bytes_new()
+    sv_chunk_enc.chunk_enc_heightmap(&(*srv).enc, blocks, nsec, &hm)
+    var data: bytes.Bytes = bytes.bytes_new()
+    sv_chunk_enc.chunk_enc_data(&(*srv).enc, blocks, nsec, (*srv).world.biome, &data)
+    rt.buf_clear(&(*srv).tail)
+    mc_encode.vals_hex(&(*srv).tail, "heightmaps", bytes.bytes_ptr(&hm), bytes.bytes_len(&hm))
+    mc_encode.vals_hex(&(*srv).tail, "chunkData", bytes.bytes_ptr(&data), bytes.bytes_len(&data))
+    mc_encode.vals_raw(&(*srv).tail, "blockEntities", "#0")
+    sv_chunk_enc.chunk_enc_light(&(*srv).enc, blocks, nsec, &(*srv).tail)
+    bytes.bytes_free(&hm)
+    bytes.bytes_free(&data)
+}
+
+fn send_column(srv: *mut sv_state.Server, s: *mut sv_state.Session, cx: i32, cz: i32) -> bool {
+    if !(*srv).world.uniform || !(*srv).tail_ready {
+        if !sv_world.world_fill(&(*srv).world, cx, cz, (*srv).column) { return false }
+        build_tail(srv, (*srv).column)
+        (*srv).tail_ready = true
+    }
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "x", cx as i64)
+    mc_encode.vals_i64(&v, "z", cz as i64)
+    rt.buf_push_bytes(&v, rt.buf_ptr(&(*srv).tail), rt.buf_len(&(*srv).tail))
+    let ok: bool = sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_MAP_CHUNK, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+fn send_unload(srv: *mut sv_state.Server, s: *mut sv_state.Session, cx: i32, cz: i32) {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "chunkX", cx as i64)
+    mc_encode.vals_i64(&v, "chunkZ", cz as i64)
+    sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_UNLOAD_CHUNK, &v)
+    rt.buf_free(&v)
+}
+
+fn in_window(s: *mut sv_state.Session, cx: i32, cz: i32) -> bool {
+    var dx: i32 = cx - (*s).cx
+    var dz: i32 = cz - (*s).cz
+    if dx < 0 { dx = 0 - dx }
+    if dz < 0 { dz = 0 - dz }
+    return dx <= (*s).view && dz <= (*s).view
+}
+
+fn unload_outside(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    let n: usize = ((*s).chunks_w * (*s).chunks_w) as usize
+    var i: usize = 0
+    while i < n {
+        let k: u64 = rt.ld64((*s).chunks, i)
+        if k != 0 as u64 && !in_window(s, key_cx(k), key_cz(k)) {
+            send_unload(srv, s, key_cx(k), key_cz(k))
+            rt.st64((*s).chunks, i, 0 as u64)
+        }
+        i = i + 1
+    }
+}
+
+fn chunks_stream(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    if !(*s).joined || (*s).chunks == 0 { return }
+    unload_outside(srv, s)
+    var budget: i32 = (*srv).cfg.chunks_per_tick
+    var d: i32 = 0
+    while d <= (*s).view && budget > 0 {
+        var dx: i32 = 0 - d
+        while dx <= d && budget > 0 {
+            var dz: i32 = 0 - d
+            while dz <= d && budget > 0 {
+                var ax: i32 = dx
+                var az: i32 = dz
+                if ax < 0 { ax = 0 - ax }
+                if az < 0 { az = 0 - az }
+                if ax == d || az == d {
+                    let cx: i32 = (*s).cx + dx
+                    let cz: i32 = (*s).cz + dz
+                    let slot: usize = slot_of(s, cx, cz)
+                    if rt.ld64((*s).chunks, slot) != key_of(cx, cz) {
+                        if send_column(srv, s, cx, cz) {
+                            rt.st64((*s).chunks, slot, key_of(cx, cz))
+                            (*s).sent_chunks = (*s).sent_chunks + 1
+                        }
+                        budget = budget - 1
+                    }
+                }
+                dz = dz + 1
+            }
+            dx = dx + 1
+        }
+        d = d + 1
+    }
+}

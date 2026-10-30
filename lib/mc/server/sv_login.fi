@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_login.fi -- handshake, status (server list ping) and offline login.
+
+import std.rt
+import std.bytes
+import std.md5
+import mc.mc_codec
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_send
+
+export { handle_handshake, handle_status, handle_login }
+
+fn status_json(srv: *mut sv_state.Server, out: *mut rt.Buf) {
+    sv_send.push_str(out, "{\"version\":{\"name\":\"")
+    rt.buf_push_bytes(out, (*srv).ver.name, (*srv).ver.name_len)
+    sv_send.push_str(out, "\",\"protocol\":")
+    rt.buf_push_dec_i64(out, (*srv).ver.protocol as i64)
+    sv_send.push_str(out, "},\"players\":{\"max\":")
+    rt.buf_push_dec_i64(out, (*srv).cfg.max_players as i64)
+    sv_send.push_str(out, ",\"online\":")
+    rt.buf_push_dec_i64(out, (*srv).online as i64)
+    sv_send.push_str(out, ",\"sample\":[]},\"description\":")
+    sv_send.json_text(out, (*srv).cfg.motd.p as u64, (*srv).cfg.motd.n)
+    sv_send.push_str(out, ",\"enforcesSecureChat\":false}")
+}
+
+fn handle_handshake(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    if !sv_send.sem_is(srv, id, mc_sem.SEM_HANDSHAKE_C2S_SET_PROTOCOL) {
+        (*s).closing = true
+        return
+    }
+    var next: i32 = 0
+    var proto: i32 = 0
+    sv_send.field_varint(srv, mc_version.ST_HANDSHAKE, id, "nextState", body, &next)
+    sv_send.field_varint(srv, mc_version.ST_HANDSHAKE, id, "protocolVersion", body, &proto)
+    if next == 1 {
+        (*s).state = mc_version.ST_STATUS
+    } else if next == 2 {
+        (*s).state = mc_version.ST_LOGIN
+        (*s).proto = proto
+    } else {
+        (*s).closing = true
+    }
+}
+
+fn handle_status(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    if sv_send.sem_is(srv, id, mc_sem.SEM_STATUS_C2S_PING_START) {
+        var json: rt.Buf = rt.buf_new()
+        status_json(srv, &json)
+        var v: rt.Buf = rt.buf_new()
+        mc_encode.vals_text(&v, "response", rt.buf_ptr(&json), rt.buf_len(&json))
+        sv_send.send_vals(srv, s, mc_version.ST_STATUS, mc_sem.SEM_STATUS_S2C_SERVER_INFO, &v)
+        rt.buf_free(&v)
+        rt.buf_free(&json)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_STATUS_C2S_PING) {
+        var t: i64 = 0
+        sv_send.field_i64(srv, mc_version.ST_STATUS, id, "time", body, &t)
+        var v: rt.Buf = rt.buf_new()
+        mc_encode.vals_i64(&v, "time", t)
+        sv_send.send_vals(srv, s, mc_version.ST_STATUS, mc_sem.SEM_STATUS_S2C_PING, &v)
+        rt.buf_free(&v)
+        (*s).closing = true
+    } else {
+        (*s).closing = true
+    }
+}
+
+fn name_taken(srv: *mut sv_state.Server, s: *mut sv_state.Session) -> bool {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if o != s && (*o).used && (*o).joined && (*o).name_n == (*s).name_n
+            && rt.mem_eq((&(*o).name[0]) as u64, (&(*s).name[0]) as u64, (*s).name_n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn valid_name(p: u64, n: usize) -> bool {
+    if n == 0 || n > sv_state.SESSION_NAME_MAX { return false }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c <= 32 as u8 || c >= 127 as u8 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn handle_login(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) -> bool {
+    if !sv_send.sem_is(srv, id, mc_sem.SEM_LOGIN_C2S_LOGIN_START) {
+        (*s).closing = true
+        return false
+    }
+    if (*s).proto != (*srv).ver.protocol {
+        sv_send.send_kick(srv, s, "Outdated client")
+        return false
+    }
+    var p: u64 = 0
+    var n: usize = 0
+    if !sv_send.field_text(srv, mc_version.ST_LOGIN, id, "username", body, &p, &n) || !valid_name(p, n) {
+        sv_send.send_kick(srv, s, "Invalid player name")
+        return false
+    }
+    rt.mem_copy((&(*s).name[0]) as u64, p, n)
+    (*s).name_n = n
+    if (*srv).online >= (*srv).cfg.max_players {
+        sv_send.send_kick(srv, s, "The server is full")
+        return false
+    }
+    if name_taken(srv, s) {
+        sv_send.send_kick(srv, s, "You logged in from another location")
+        return false
+    }
+    md5.md5_offline_uuid((&(*s).name[0]) as u64, n, &(*s).uuid_hi, &(*s).uuid_lo)
+    if (*srv).cfg.compression >= 0 && mc_version.version_has(&(*srv).ver, mc_version.FLAG_COMPRESSION) {
+        var c: rt.Buf = rt.buf_new()
+        mc_encode.vals_i64(&c, "threshold", (*srv).cfg.compression as i64)
+        sv_send.send_vals(srv, s, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_S2C_COMPRESS, &c)
+        rt.buf_free(&c)
+        mc_codec.wire_set_threshold(&(*s).wire, (*srv).cfg.compression)
+    }
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_uuid(&v, "uuid", (*s).uuid_hi, (*s).uuid_lo)
+    mc_encode.vals_text(&v, "username", (&(*s).name[0]) as u64, n)
+    mc_encode.vals_raw(&v, "properties", "#0")
+    let ok: bool = sv_send.send_vals(srv, s, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_S2C_SUCCESS, &v)
+    rt.buf_free(&v)
+    if !ok {
+        (*s).closing = true
+        return false
+    }
+    (*s).state = mc_version.ST_PLAY
+    return true
+}
