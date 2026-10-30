@@ -14,7 +14,7 @@
 #      execute if block per edit, player position and hotbar restored on rejoin, no warnings; wrong expectation is detected
 #   J  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
 #      declare_commands subtree (gamemode say teleport time tp) structurally equal; mutated frame / chat line is detected
-# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_WORLD=<dir with level.dat>
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_KEEP=<dir> copies bot json and server logs there, MCS_ONLY_SAVE=1 runs only H, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -31,6 +31,7 @@ cleanup() {
     for p in $VPID $SVPID $XVPID $VEPID; do kill "$p" 2>/dev/null; done
     sleep 1
     for p in $VPID $SVPID $XVPID $VEPID; do kill -9 "$p" 2>/dev/null; done
+    if [ -n "${MCS_KEEP:-}" ]; then mkdir -p "$MCS_KEEP"; cp "$W"/*.json "$W"/*.out "$W"/vsave/server.out "$MCS_KEEP"/ 2>/dev/null; echo "kept logs in: $MCS_KEEP"; fi
     rm -rf "$W"
 }
 trap cleanup EXIT
@@ -78,6 +79,13 @@ grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server did n
 if [ -n "${MCS_ONLY_CMDS:-}" ]; then
     source "$TOOLS/stage_cmds.sh"
     echo stop >&3
+    [ -f "$W/failed" ] && ERR=1
+    exit $ERR
+fi
+
+if [ -n "${MCS_ONLY_SAVE:-}" ]; then
+    echo stop >&3
+    source "$TOOLS/stage_save.sh"
     [ -f "$W/failed" ] && ERR=1
     exit $ERR
 fi

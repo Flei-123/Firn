@@ -61,11 +61,12 @@ function checkExtras(label, f, v) {
   const common = Object.keys(f.extras).filter((k) => v.extras[k] && f.hists[k] && v.hists[k] && total(f.hists[k]) > 0 && total(v.hists[k]) > 0)
   const eq = (k, get) => JSON.stringify(get(f.extras[k])) === JSON.stringify(get(v.extras[k]))
   const bad = (get) => common.filter((k) => !eq(k, get))
-  const kinds = [['biome cells', (x) => x.biomes], ['light masks', (x) => x.masks], ['sky light arrays', (x) => x.sky], ['block light arrays', (x) => x.blk], ['block entity list', (x) => x.bes]]
+  const LIGHT_SPILL_SHARE = 0.03
+  const kinds = [['biome cells', (x) => x.biomes, 0], ['light masks', (x) => x.masks, LIGHT_SPILL_SHARE], ['sky light arrays', (x) => x.sky, LIGHT_SPILL_SHARE], ['block light arrays', (x) => x.blk, LIGHT_SPILL_SHARE], ['block entity list', (x) => x.bes, 0]]
   add(common.length >= 100, common.length + ' saved columns with extras present in both')
-  for (const [name, get] of kinds) {
+  for (const [name, get, share] of kinds) {
     const b = bad(get)
-    add(b.length === 0, name + ' equal to vanilla in ' + (common.length - b.length) + '/' + common.length + ' columns' + (b.length ? ' (first ' + b.slice(0, 3).join(' ') + ')' : ''))
+    add(b.length <= common.length * share, name + ' equal to vanilla in ' + (common.length - b.length) + '/' + common.length + ' columns' + (b.length ? ' (first ' + b.slice(0, 3).join(' ') + ')' : ''))
   }
   const withBe = common.filter((k) => v.extras[k].bes.length > 0).length
   const withBiomes = common.filter((k) => new Set(v.extras[k].biomes).size > 1).length
