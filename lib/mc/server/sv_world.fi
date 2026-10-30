@@ -1,14 +1,47 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/mc/server/sv_world.fi -- the world source interface of the integrated server.
-// A source fills one chunk column of global block state ids: index ((y - min_y) * 16 + z) * 16 + x.
+// A source fills one Column: global block state ids (index ((y - min_y) * 16 + z) * 16 + x), biome ids per 4x4x4 cell
+// (section * 64 + y4 * 16 + z4 * 4 + x4), sky / block light (2048 octets per light section, section -1 first) and block entities.
 
 import std.rt
+import std.bytes
 
-export { WorldSource, world_sections, world_column_bytes, world_fill, world_free }
+export {
+    WorldSource, Column, column_new, column_free, column_reset, column_light_slot, column_be_add,
+    world_sections, world_fill, world_free, BE_HEADER, be_u32, be_i32,
+}
+
+const BE_HEADER: usize = 20
+
+fn be_u32(p: u64, at: usize) -> u32 {
+    return ((rt.ld8(p, at) as u32) << 24) | ((rt.ld8(p, at + 1) as u32) << 16) | ((rt.ld8(p, at + 2) as u32) << 8) | (rt.ld8(p, at + 3) as u32)
+}
+
+fn be_i32(p: u64, at: usize) -> i32 {
+    let raw: u64 = be_u32(p, at) as u64
+    if raw >= 2147483648 as u64 { return (raw as i64 - 4294967296) as i32 }
+    return raw as i32
+}
+const LIGHT_BYTES: usize = 2048
+
+struct Column {
+    blocks: u64,
+    biomes: u64,
+    sky: u64,
+    blk: u64,
+    sky_mask: u64,
+    blk_mask: u64,
+    sky_empty: u64,
+    blk_empty: u64,
+    has_light: bool,
+    be: bytes.Bytes,
+    be_count: u32,
+    nsec: usize,
+}
 
 struct WorldSource {
     ctx: u64,
-    fill: fn(u64, i32, i32, u64) -> bool,
+    fill: fn(u64, i32, i32, *mut Column) -> bool,
     release: fn(u64),
     min_y: i32,
     height: i32,
@@ -19,16 +52,58 @@ struct WorldSource {
     uniform: bool,
 }
 
+fn column_new(nsec: usize) -> Column {
+    return Column { blocks: rt.heap_alloc(nsec * 8192), biomes: rt.heap_alloc(nsec * 128), sky: rt.heap_alloc((nsec + 2) * LIGHT_BYTES),
+        blk: rt.heap_alloc((nsec + 2) * LIGHT_BYTES), sky_mask: 0, blk_mask: 0, sky_empty: 0, blk_empty: 0, has_light: false,
+        be: bytes.bytes_new(), be_count: 0, nsec: nsec }
+}
+
+fn column_free(c: *mut Column) {
+    rt.heap_free((*c).blocks, (*c).nsec * 8192)
+    rt.heap_free((*c).biomes, (*c).nsec * 128)
+    rt.heap_free((*c).sky, ((*c).nsec + 2) * LIGHT_BYTES)
+    rt.heap_free((*c).blk, ((*c).nsec + 2) * LIGHT_BYTES)
+    bytes.bytes_free(&(*c).be)
+}
+
+fn column_reset(c: *mut Column) {
+    (*c).sky_mask = 0
+    (*c).blk_mask = 0
+    (*c).sky_empty = 0
+    (*c).blk_empty = 0
+    (*c).has_light = false
+    (*c).be_count = 0
+    bytes.bytes_clear(&(*c).be)
+}
+
+fn column_light_slot(c: *mut Column, sky: bool, index: usize) -> u64 {
+    if sky { return (*c).sky + (index * LIGHT_BYTES) as u64 }
+    return (*c).blk + (index * LIGHT_BYTES) as u64
+}
+
+fn column_be_add(c: *mut Column, x: i32, y: i32, z: i32, kind: u32, nbt: u64, nbt_len: usize) {
+    bytes.put_i32(&(*c).be, x)
+    bytes.put_i32(&(*c).be, y)
+    bytes.put_i32(&(*c).be, z)
+    bytes.put_u32(&(*c).be, kind)
+    bytes.put_u32(&(*c).be, nbt_len as u32)
+    bytes.put_raw(&(*c).be, nbt, nbt_len)
+    (*c).be_count = (*c).be_count + 1
+}
+
 fn world_sections(w: *mut WorldSource) -> usize {
     return ((*w).height / 16) as usize
 }
 
-fn world_column_bytes(w: *mut WorldSource) -> usize {
-    return ((*w).height as usize) * 256 * 2
-}
-
-fn world_fill(w: *mut WorldSource, cx: i32, cz: i32, blocks: u64) -> bool {
-    return (*w).fill((*w).ctx, cx, cz, blocks)
+fn world_fill(w: *mut WorldSource, cx: i32, cz: i32, col: *mut Column) -> bool {
+    column_reset(col)
+    var i: usize = 0
+    let cells: usize = (*col).nsec * 64
+    while i < cells {
+        rt.st16((*col).biomes, i, (*w).biome as u16)
+        i = i + 1
+    }
+    return (*w).fill((*w).ctx, cx, cz, col)
 }
 
 fn world_free(w: *mut WorldSource) {

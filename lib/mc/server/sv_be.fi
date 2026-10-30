@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_be.fi -- saved block entities -> chunk packet entries (type id, update tag) of the protocol 763 table.
+
+import std.rt
+import std.bytes
+import std.nbt
+import mc.mc_nbt
+import mc.server.sv_world
+import mc.server.sv_edits
+import mc.server.v763.sv_be_v763
+
+export { be_add_from_nbt, be_type_lookup, be_drop_edited }
+
+const MODE_EMPTY: i32 = 0
+const MODE_FULL: i32 = 1
+const MODE_SPAWNER: i32 = 2
+const MODE_ITEM_ONLY: i32 = 3
+
+fn be_type_lookup(p: u64, n: usize, mode: *mut i32) -> i32 {
+    var at: usize = 0
+    if n >= 10 && rt.mem_eq(p, "minecraft:".p as u64, 10) { at = 10 }
+    let name_len: usize = n - at
+    let table: str = sv_be_v763.BE_TABLE
+    var i: usize = 0
+    var idx: i32 = 0
+    while i < table.n {
+        var j: usize = i
+        while rt.ld8(table.p as u64, j) != 58 { j = j + 1 }
+        var e: usize = j + 1
+        while rt.ld8(table.p as u64, e) != 10 { e = e + 1 }
+        if j - i == name_len && rt.mem_eq(table.p as u64 + i as u64, p + at as u64, name_len) {
+            *mode = (rt.ld8(table.p as u64, j + 1) as i32) - 48
+            return idx
+        }
+        idx = idx + 1
+        i = e + 1
+    }
+    return 0 - 1
+}
+
+fn name_is(d: *mut mc_nbt.Doc, n: u32, s: str) -> bool {
+    var len: usize = 0
+    let p: u64 = mc_nbt.nbt_name(d, n, &len)
+    return len == s.n && rt.mem_eq(p, s.p as u64, s.n)
+}
+
+fn skipped(d: *mut mc_nbt.Doc, c: u32, mode: i32) -> bool {
+    if mode == MODE_ITEM_ONLY { return !name_is(d, c, "item") }
+    if name_is(d, c, "id") || name_is(d, c, "x") || name_is(d, c, "y") || name_is(d, c, "z") || name_is(d, c, "keepPacked") { return true }
+    if mode == MODE_SPAWNER && name_is(d, c, "SpawnPotentials") { return true }
+    return false
+}
+
+fn put_name(b: *mut bytes.Bytes, p: u64, n: usize) {
+    bytes.put_u16(b, n as u16)
+    bytes.put_raw(b, p, n)
+}
+
+fn put_air_item(b: *mut bytes.Bytes) {
+    bytes.put_u8(b, nbt.TAG_COMPOUND)
+    put_name(b, "item".p as u64, 4)
+    bytes.put_u8(b, nbt.TAG_STRING)
+    put_name(b, "id".p as u64, 2)
+    put_name(b, "minecraft:air".p as u64, 13)
+    bytes.put_u8(b, nbt.TAG_BYTE)
+    put_name(b, "Count".p as u64, 5)
+    bytes.put_u8(b, 0 as u8)
+    bytes.put_u8(b, nbt.TAG_END)
+}
+
+fn build_tag(d: *mut mc_nbt.Doc, node: u32, mode: i32, out: *mut bytes.Bytes) {
+    var body: bytes.Bytes = bytes.bytes_new()
+    var kept: usize = 0
+    var item: bool = false
+    var c: u32 = mc_nbt.nbt_first(d, node)
+    while c != 0 as u32 {
+        if !skipped(d, c, mode) {
+            var len: usize = 0
+            let p: u64 = mc_nbt.nbt_name(d, c, &len)
+            bytes.put_u8(&body, mc_nbt.nbt_kind(d, c))
+            put_name(&body, p, len)
+            mc_nbt.doc_write_node(d, c, &body)
+            kept = kept + 1
+            item = true
+        }
+        c = mc_nbt.nbt_next(d, c)
+    }
+    if mode == MODE_ITEM_ONLY && !item {
+        put_air_item(&body)
+        kept = 1
+    }
+    if kept > 0 {
+        bytes.put_u8(out, nbt.TAG_COMPOUND)
+        bytes.put_u16(out, 0 as u16)
+        bytes.put_raw(out, bytes.bytes_ptr(&body), bytes.bytes_len(&body))
+        bytes.put_u8(out, nbt.TAG_END)
+    }
+    bytes.bytes_free(&body)
+}
+
+fn int_of(d: *mut mc_nbt.Doc, node: u32, name: str) -> i32 {
+    let n: u32 = mc_nbt.nbt_get(d, node, name.p as u64, name.n)
+    if n == 0 as u32 { return 0 }
+    return mc_nbt.nbt_i64(d, n) as i32
+}
+
+fn be_add_from_nbt(col: *mut sv_world.Column, d: *mut mc_nbt.Doc, node: u32) {
+    let idn: u32 = mc_nbt.nbt_get(d, node, "id".p as u64, 2)
+    if idn == 0 as u32 { return }
+    var len: usize = 0
+    let p: u64 = mc_nbt.nbt_str(d, idn, &len)
+    var mode: i32 = MODE_EMPTY
+    let kind: i32 = be_type_lookup(p, len, &mode)
+    if kind < 0 { return }
+    var tag: bytes.Bytes = bytes.bytes_new()
+    if mode != MODE_EMPTY { build_tag(d, node, mode, &tag) }
+    sv_world.column_be_add(col, int_of(d, node, "x"), int_of(d, node, "y"), int_of(d, node, "z"), kind as u32,
+        bytes.bytes_ptr(&tag), bytes.bytes_len(&tag))
+    bytes.bytes_free(&tag)
+}
+
+fn be_drop_edited(col: *mut sv_world.Column, edits: *mut sv_edits.Edits) {
+    if (*col).be_count == 0 as u32 || sv_edits.edits_total(edits) == 0 { return }
+    var kept: bytes.Bytes = bytes.bytes_new()
+    let base: u64 = bytes.bytes_ptr(&(*col).be)
+    var at: usize = 0
+    var i: u32 = 0
+    var left: u32 = 0
+    while i < (*col).be_count {
+        let len: usize = sv_world.be_u32(base, at + 16) as usize
+        let total: usize = sv_world.BE_HEADER + len
+        var v: i32 = 0
+        if !sv_edits.edits_get(edits, sv_world.be_i32(base, at), sv_world.be_i32(base, at + 4), sv_world.be_i32(base, at + 8), &v) {
+            bytes.put_raw(&kept, base + at as u64, total)
+            left = left + 1
+        }
+        at = at + total
+        i = i + 1
+    }
+    bytes.bytes_clear(&(*col).be)
+    bytes.put_raw(&(*col).be, bytes.bytes_ptr(&kept), bytes.bytes_len(&kept))
+    (*col).be_count = left
+    bytes.bytes_free(&kept)
+}

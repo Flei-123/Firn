@@ -2,6 +2,8 @@
 const path = require('path')
 const root = process.env.MCBOT_MODULES || '/root/firn/tools/mcserver/node_modules'
 const mc = require(path.join(root, 'minecraft-protocol'))
+const crypto = require('crypto')
+const prismarineNbt = require(path.join(root, 'prismarine-nbt'))
 
 const [host, portArg, scenario, nameArg] = process.argv.slice(2)
 const port = parseInt(portArg, 10)
@@ -45,11 +47,13 @@ function parseColumn(data) {
   const o = { p: 0 }
   const hist = {}
   const column = []
+  const biomeIds = []
   let sections = 0
   while (o.p < buf.length && sections < 24) {
     const count = buf.readInt16BE(o.p); o.p += 2
     const blocks = container(buf, o, 8, 15)
-    container(buf, o, 3, 6)
+    const biomeBox = container(buf, o, 3, 6)
+    for (let i = 0; i < 64; i++) biomeIds.push(entry(biomeBox, i, 64))
     for (let i = 0; i < 4096; i++) {
       const id = entry(blocks, i, 4096)
       if (id !== 0) hist[id] = (hist[id] || 0) + 1
@@ -59,10 +63,46 @@ function parseColumn(data) {
   }
   let pad = 0
   while (o.p + pad < buf.length && buf[o.p + pad] === 0) pad++
-  return { sections, consumed: o.p + pad === buf.length, pad, hist }
+  return { sections, consumed: o.p + pad === buf.length, pad, hist, biomes: biomeIds.map((v) => String.fromCharCode(48 + v)).join('') }
 }
 
-function out(obj) { console.log(JSON.stringify(obj)) }
+function md5(b) { return crypto.createHash('md5').update(Buffer.from(b)).digest('hex') }
+
+function maskString(arr) { return (arr || []).map((v) => BigInt.asUintN(64, BigInt(v)).toString()).join(',') }
+
+function layerHashes(mask, arrays) {
+  const m = (mask && mask.length) ? BigInt.asUintN(64, BigInt(mask[0])) : 0n
+  const out = {}
+  let k = 0
+  for (let i = 0; i < 64; i++) {
+    if ((m >> BigInt(i)) & 1n) { out[i] = md5(arrays[k]); k++ }
+  }
+  return out
+}
+
+function columnExtras(data, biomes) {
+  const bes = (data.blockEntities || []).map((b) => {
+    let nbt = null
+    if (b.nbtData) nbt = JSON.stringify(sortKeys(prismarineNbt.simplify(b.nbtData)))
+    return [b.x, b.z, b.y, b.type, nbt].join('|')
+  }).sort()
+  return {
+    biomes,
+    masks: [maskString(data.skyLightMask), maskString(data.blockLightMask), maskString(data.emptySkyLightMask), maskString(data.emptyBlockLightMask)],
+    sky: layerHashes(data.skyLightMask, data.skyLight),
+    blk: layerHashes(data.blockLightMask, data.blockLight),
+    bes,
+  }
+}
+
+function sortKeys(v) {
+  if (Array.isArray(v)) return v.map(sortKeys)
+  if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v).sort()) o[k] = sortKeys(v[k]); return o }
+  if (typeof v === 'bigint') return v.toString()
+  return v
+}
+
+function out(obj) { console.log(JSON.stringify(obj, (k, v) => (typeof v === 'bigint' ? v.toString() : v))) }
 
 if (scenario === 'status') {
   const t0 = Date.now()
@@ -76,7 +116,7 @@ if (scenario === 'status') {
   if (scenario === 'silent') opts.keepAlive = false
   const client = mc.createClient(opts)
   const res = { order: [], keepalive: [], times: [], chunks: 0, columns: {}, hist: null, max_pad: 0, parse_ok: true, sections_ok: true,
-    center: [], system_chat: [], kicked: null, closed: false, position: null, errors: [], hists: {}, bad_columns: [] }
+    center: [], system_chat: [], kicked: null, closed: false, position: null, errors: [], hists: {}, extras: {}, bad_columns: [] }
   const t0 = Date.now()
   let moved = false
   let chatSent = false
@@ -110,6 +150,7 @@ if (scenario === 'status') {
           if (c.pad > res.max_pad) res.max_pad = c.pad
           if (c.sections !== 24 || !c.consumed) { res.sections_ok = false; res.bad_columns.push({ key, sections: c.sections, consumed: c.consumed, len: data.chunkData.length }) }
           if (process.env.BOT_HISTS) res.hists[key] = c.hist
+          if (process.env.BOT_FULL) res.extras[key] = columnExtras(data, c.biomes)
           if (data.x === 0 && data.z === 0) res.hist = c.hist
         } catch (e) { res.parse_ok = false; res.errors.push('parse ' + e.message) }
       }
@@ -117,7 +158,7 @@ if (scenario === 'status') {
       res.system_chat.push(meta.name + ':' + JSON.stringify(data).slice(0, 300))
     }
   })
-  const finish = (code) => { finished = true; if (!process.env.BOT_HISTS) delete res.hists; res.column_count = Object.keys(res.columns).length; delete res.columns; out(res); try { client.end('bye') } catch (e) {} ; setTimeout(() => process.exit(code), 100) }
+  const finish = (code) => { finished = true; if (!process.env.BOT_HISTS) delete res.hists; if (!process.env.BOT_FULL) delete res.extras; res.column_count = Object.keys(res.columns).length; delete res.columns; out(res); try { client.end('bye') } catch (e) {} ; setTimeout(() => process.exit(code), 100) }
   if (scenario === 'join') {
     const total = parseInt(process.env.BOT_SECONDS || '18', 10) * 1000
     setTimeout(() => {

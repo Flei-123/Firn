@@ -85,12 +85,15 @@ Every text/background pair of these tokens is checked at 4.5:1 for light and dar
 
 (Append the public API of each component below, one line per function.)
 
-DS2c catalog components (immediate mode, colours via lib/fui/ds_catalog_tok.fi).
+DS2c catalog components (immediate mode, colours and sizes via lib/fui/ds_catalog_tok.fi, which reads ds_tokens / ds_tokens_comp card, nav, row from the live theme).
 
 - `ds_appcard`: `card_new`, `draw(k,c,x,y,w,h,icon,name,sub,meta,px,py)`, `preferred_h(c)`, `set_state(S_INSTALL|S_OPEN|S_UPDATE|S_INSTALLING|S_UNAVAILABLE)`, `set_progress(permille, -1 = unknown)`, `press`/`release`/`click` -> `ACT_*`, `key`/`text`, `set_focus`, `hit`, `button_rect`.
 - `ds_navview`: `nv_new`, `add`/`add_header`/`add_footer`, `set_badge`, `set_back`, `layout(v,c,x,y,w,h)` (expanded >= 1008 dp, compact >= 641, else minimal), `draw`, `draw_overlay`, `press`/`key` -> `EV_*`, `select`/`selected`, `content_x/y/w/h`, `mode`.
 - `ds_listdetail`: `ld_new`, `set_count`, `set_break`, `set_list_width`, `set_row`, `layout`, `begin_list`/`row_draw`/`finish_list`, `draw_chrome`, `press`/`key` -> `EV_*`, `open_detail`, `back`, `detail_x/y/w/h`, `stacked`.
 - `ds_vgrid`: `grid_new`, `set_count`, `set_cell(min_w_pt,h_pt,gap_pt)`, `set_pad`, `layout`, `first`/`end_index`, `cell_rect`, `index_at`, `begin`/`finish`, `move`, `press`, `drag`/`release`, `wheel`, `pan`/`fling`, `tick`, `key`, `select`, `scroll_to`.
+- `ds_vgrid` OrientOS store API: `set_count(n)` (5000+ is cheap, only visible rows are drawn); `set_cell(min_w_pt,h_pt,gap_pt)` (columns fit to the width, 1 on phones); `draw_each(g,c,name,cb,user)` with `cb(c,index,x,y,w,h,state,user)` per visible cell, `state` = `ST_SELECTED|ST_HOVERED|ST_KEYFOCUS`; hit index via `index_at(x,y)` / `press(x,y)` (`NONE` for gaps, bars, misses); `scroll_to(i)`; `key(code,mods)` (arrows, Home/End, PgUp/PgDn); `select`/`selected`; `stop` ends a running fling.
+- `ds_vgrid_touch`: `touch_new`, `touch_down(t,g,x,y,us)`, `touch_move(t,g,c,y,us)` (8 dp slop, then 1:1 pan with overscroll), `touch_up(t,g,us)` -> tapped index or `NONE`; starts a fling when the finger was still moving (`FLING_MIN_PER_MS`, none after 80 ms rest). Timestamps in microseconds come from the caller (host event time; tests pass a virtual clock).
+- Goldens: `tools/fui/ds_catalog_golden.sh` paints appcard (install/open/update/progress), navview (expanded/compact/minimal/overlay), listdetail (split/stacked/detail), vgrid (360/800/1240), light and dark, and diffs them against `tools/fui/golden_ds/` (limit 0.5 %).
 
 DS2a settings, icon button, breadcrumb (immediate mode, colours/sizes via the adapter lib/fui/ds_look.fi; switch to ds_tokens there).
 
@@ -103,3 +106,14 @@ DS2a settings, icon button, breadcrumb (immediate mode, colours/sizes via the ad
 - `ds_iconbtn` input: `press`/`release`/`click`, `hit`, `key`, `text`, `fired`, `focus_id`, `set_focus`, `rect_of`, `revision`; glyph helpers `back_glyph`, `forward_glyph`, `close_glyph`, `more_glyph`.
 - `ds_crumb`: `crumbs_new`, `begin(k,c,x,y,w,px,py)`, `draw(k,c,"a|b|c") -> height`, `end(k,c)` (overflow menu), `set_more_name`.
 - `ds_crumb` input: `press`/`release`/`click` -> absolute segment index, `key`, `text`, `fired`, `focus_id`, `set_focus`, `hidden_count`, `menu_open`, `close_menu`, `count`, `revision`.
+
+DS2b feedback components (immediate mode, colours via lib/fui/ds_fbtok.fi -> ds_tokens; time = caller-passed ms, virtual-clock friendly).
+
+- `ds_infobar`: `bar_new`, `draw(b,c,x,y,w,kind,title,msg,action,closable,px,py) -> height` (kind `ds_fbtok.INFO|SUCCESS|WARNING|ERROR`), `press`/`key`/`text` -> `EV_ACTION|EV_CLOSE|EV_FOCUS|EV_NONE`, `is_open`/`set_open`, `set_focus`, `action_count`/`close_count`, `action_rect`/`close_rect`/`bar_rect`.
+- `ds_toast` (wraps `kit.Toasts`): `feed_new`, `push(f,kind,title,msg,action,now_ms,dur_ms|DUR_AUTO) -> id`, `tick(f,now_ms,hover_id)` (hover and keyboard focus pause the timer), `draw`/`frame(f,c,win_w,win_h,px,py,now_ms)`, `hover_at`, `press`/`key`/`text` -> `EV_ACTION|EV_CLOSE|EV_BODY|EV_FOCUS`, `focus_newest`, `dismiss`, `state_of` (`SHOWING|CLOSING|GONE`), `live_text`/`live_rev`/`live_urgent` (live region), `ms_of_us(app.mono_us())`.
+- `ds_swatch`: `swatch_new`, `set_palette(pal,names)`, `set_custom(on)`, `draw(s,c,x,y,w,label,px,py) -> height`, `press`/`key`/`text`, `selected`/`set_selected`, `rgb`/`set_rgb`, `count`, `columns`, `cell_rect`, `editing`, `revision`; `accent_palette`/`accent_names` (32 Fluent accents); hex helpers `kitcolor.parse_hex`/`hex_digits`.
+- `ds_combo`: `combo_new`, `set_items("a|b|c")`, `set_rows`, `draw(cb,c,x,y,w,label,hint,px,py,win_h) -> height`, `end(cb,c)` (popup, flips above near the window bottom), `press`/`key`/`text`/`wheel`, `focus`/`blur`, `value`/`set_value`, `text_of`, `is_open`, `active_row`, `result_count`/`result_item`, `announce_text`/`announce_rev`, `revision`.
+DS3b page templates (immediate mode; reference HTML + SSIM gate in tools/fui/ds_ref, golden refs in tools/fui/golden/ds_tpl).
+
+- `ds_tpl_settings`: `new(title, apply, fire, ud)`, `page(icon,title)`, `section`, `toggle`/`combo`/`slider`/`link`/`value`/`button`(id,icon,title,sub,...), `set`/`get`, `set_texts`, `run(start,t,w,h)`; NavigationView at >= 641 px, stacked list + back below; search across all pages; live apply via `apply(ud,id,value)` / `fire(ud,id)`; example `examples/fui_apps/tpl_settings`.
+- `ds_tpl_wizard`: `new(title, draw_step, can_next, finish, ud)`, `welcome(icon,title,lines)`, `step(title,lines)`, `on_input(press,key,text)`, `set_labels`, `current`, `run(start,w,w,h)`; one task per page, progress dots, Back/Next, Finish on the last step; example `examples/fui_apps/tpl_wizard`.

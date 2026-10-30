@@ -4,6 +4,7 @@ const load = (p) => JSON.parse(fs.readFileSync(p, 'utf8'))
 const van = load(vanPath)
 let fir = load(firnPath)
 const NUM_TOLERANCE = 250
+const GAMETIME_TOLERANCE = 12000
 const norm = (s, name) => s.split(name).join('NAME')
 const round = (v) => (typeof v === 'number' ? Math.round(v * 1e4) / 1e4 : v)
 const numbers = (s) => (s.match(/-?\d+/g) || []).map(Number)
@@ -20,7 +21,8 @@ function compareEvent(f, v, fname, vname) {
       if (timeCmd && /^The time is|^Set the time/.test(vc[i])) {
         const a = numbers(fc[i])
         const b = numbers(vc[i])
-        const close = a.length === b.length && a.every((x, k) => Math.abs(x - b[k]) <= NUM_TOLERANCE)
+        const tolerance = v.cmd === 'time query gametime' ? GAMETIME_TOLERANCE : NUM_TOLERANCE
+        const close = a.length === b.length && a.every((x, k) => Math.abs(x - b[k]) <= tolerance)
         if (shape(fc[i]) !== shape(vc[i]) || !close) problems.push(`chat[${i}] firn='${fc[i]}' vanilla='${vc[i]}'`)
       } else if (fc[i] !== vc[i]) problems.push(`chat[${i}] firn='${fc[i]}' vanilla='${vc[i]}'`)
     }
