@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_core.fi -- the integrated server: construction, tick phases, main loop, thread entry.
+
+import std.net
+import std.rt
+import std.io
+import std.time
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_clock
+import mc.server.sv_phase
+import mc.server.sv_world
+import mc.server.sv_chunk_enc
+import mc.server.sv_chunks
+import mc.server.sv_net
+import mc.server.sv_flat
+import mc.server.sv_play
+
+export { server_new, server_box, server_destroy, server_start, server_run, server_free, server_thread_main, now_ms }
+
+fn now_ms() -> i64 {
+    return (time.monotonic_ns() / 1000000 as u64) as i64
+}
+
+fn srv_of(ctx: u64) -> *mut sv_state.Server { return ctx as *mut sv_state.Server }
+
+fn phase_net_in(ctx: u64) {
+    let srv: *mut sv_state.Server = srv_of(ctx)
+    sv_net.net_pump_play(srv, (*srv).now_ms)
+}
+
+fn phase_time(ctx: u64) {
+    let srv: *mut sv_state.Server = srv_of(ctx)
+    (*srv).game_time = (*srv).game_time + 1
+    (*srv).day_time = (*srv).day_time + 1
+    if (*srv).clock.ticks % sv_play.TIME_BROADCAST_TICKS == 0 as u64 { sv_play.play_time_all(srv) }
+}
+
+fn phase_keepalive(ctx: u64) {
+    let srv: *mut sv_state.Server = srv_of(ctx)
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).joined && !(*s).closing { sv_play.play_keepalive(srv, s, (*srv).now_ms) }
+        i = i + 1
+    }
+}
+
+fn phase_chunks(ctx: u64) {
+    let srv: *mut sv_state.Server = srv_of(ctx)
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).joined && !(*s).closing { sv_chunks.chunks_stream(srv, s) }
+        i = i + 1
+    }
+}
+
+fn phase_reap(ctx: u64) {
+    sv_net.net_reap(srv_of(ctx))
+}
+
+fn server_new(cfg: sv_state.Config, ver: mc_version.Version, world: sv_world.WorldSource, join: fn(*mut sv_state.Server, *mut sv_state.Session) -> bool) -> sv_state.Server {
+    let n: usize = sv_state.MAX_SESSIONS
+    let sess: u64 = rt.heap_alloc(n * sv_state.session_size())
+    var w: sv_world.WorldSource = world
+    var i: usize = 0
+    while i < n {
+        let p: *mut sv_state.Session = (sess + (i * sv_state.session_size()) as u64) as *mut sv_state.Session
+        *p = sv_state.session_empty()
+        i = i + 1
+    }
+    var phases: sv_phase.Phases = sv_phase.phases_new()
+    sv_phase.phases_add(&phases, "net_in", phase_net_in)
+    sv_phase.phases_add(&phases, "time", phase_time)
+    sv_phase.phases_add(&phases, "keepalive", phase_keepalive)
+    sv_phase.phases_add(&phases, "chunks", phase_chunks)
+    sv_phase.phases_add(&phases, "reap", phase_reap)
+    return sv_state.Server { cfg: cfg, ver: ver, clock: sv_clock.clock_new(0), phases: phases, world: world,
+        enc: sv_chunk_enc.chunk_enc_new(), listener: net.listener_from_fd(0 - 1), sess: sess, shared: sv_state.shared_new(),
+        column: rt.heap_alloc(sv_world.world_column_bytes(&w)), tail: rt.buf_new(), tail_ready: false, game_time: 0,
+        day_time: 6000, next_eid: 1, online: 0, now_ms: 0, tick_us: 0, join: join, ticks_run: 0 }
+}
+
+fn server_start(srv: *mut sv_state.Server, port: u16) -> bool {
+    let l: net.Listener = net.listener_new_nb((*srv).cfg.bind_addr, port, 64) catch net.listener_from_fd(0 - 1)
+    (*srv).listener = l
+    if !net.listener_is_open(&(*srv).listener) {
+        sv_state.shared_set((*srv).shared, sv_state.SH_FAILED, 1 as u64)
+        return false
+    }
+    sv_state.shared_set((*srv).shared, sv_state.SH_PORT_BOUND, net.listener_port(&(*srv).listener) as u64)
+    sv_state.shared_set((*srv).shared, sv_state.SH_READY, 1 as u64)
+    return true
+}
+
+fn publish(srv: *mut sv_state.Server) {
+    let sh: u64 = (*srv).shared
+    sv_state.shared_set(sh, sv_state.SH_ONLINE, (*srv).online as u64)
+    sv_state.shared_set(sh, sv_state.SH_TICKS, (*srv).clock.ticks)
+    sv_state.shared_set(sh, sv_state.SH_AVG_US, sv_clock.clock_avg_us(&(*srv).clock))
+    sv_state.shared_set(sh, sv_state.SH_TPS_X100, sv_clock.clock_tps_x100(&(*srv).clock))
+}
+
+fn run_tick(srv: *mut sv_state.Server, now: i64) {
+    var behind_ms: i64 = 0
+    var behind_ticks: i64 = 0
+    if sv_clock.clock_overload_check(&(*srv).clock, now, &behind_ms, &behind_ticks) {
+        var m: rt.Buf = rt.buf_new()
+        sv_clock.clock_overload_message(&m, behind_ms, behind_ticks)
+        io.eprint_line_bytes(rt.buf_ptr(&m), rt.buf_len(&m))
+        rt.buf_free(&m)
+    }
+    let t0: u64 = time.monotonic_ns()
+    sv_phase.phases_run(&(*srv).phases, srv as u64)
+    let us: u64 = (time.monotonic_ns() - t0) / 1000 as u64
+    (*srv).tick_us = us
+    sv_clock.clock_tick_done(&(*srv).clock, us)
+    (*srv).ticks_run = (*srv).ticks_run + 1
+    publish(srv)
+}
+
+fn server_run(srv: *mut sv_state.Server) {
+    (*srv).clock = sv_clock.clock_new(now_ms())
+    while sv_state.shared_get((*srv).shared, sv_state.SH_STOP) == 0 as u64 {
+        let now: i64 = now_ms()
+        (*srv).now_ms = now
+        sv_net.net_accept_all(srv, now)
+        sv_net.net_pump_pre(srv, now)
+        sv_net.net_reap(srv)
+        if sv_clock.clock_due(&(*srv).clock, now) {
+            run_tick(srv, now)
+        } else {
+            var w: i64 = sv_clock.clock_wait_ms(&(*srv).clock, now)
+            if w > 2 { w = 2 }
+            if w < 1 { w = 1 }
+            time.sleep_ms(w as u64)
+        }
+    }
+    sv_net.net_drop_all(srv, "Server closed")
+    net.close_listener(&(*srv).listener)
+    publish(srv)
+}
+
+fn server_free(srv: *mut sv_state.Server) {
+    sv_chunk_enc.chunk_enc_free(&(*srv).enc)
+    rt.heap_free((*srv).column, sv_world.world_column_bytes(&(*srv).world))
+    rt.heap_free((*srv).sess, sv_state.MAX_SESSIONS * sv_state.session_size())
+    rt.buf_free(&(*srv).tail)
+    sv_state.shared_free((*srv).shared)
+}
+
+fn server_box(srv: sv_state.Server) -> *mut sv_state.Server {
+    var a: [sv_state.Server; 2] = [srv; 2]
+    let sz: usize = ((&a[1]) as u64 - (&a[0]) as u64) as usize
+    let p: u64 = rt.heap_alloc(sz)
+    *(p as *mut sv_state.Server) = srv
+    return p as *mut sv_state.Server
+}
+
+fn server_destroy(srv: *mut sv_state.Server) {
+    sv_flat.flat_source_free(&(*srv).world)
+    server_free(srv)
+    var a: [sv_state.Server; 2] = [*srv; 2]
+    rt.heap_free(srv as u64, ((&a[1]) as u64 - (&a[0]) as u64) as usize)
+}
+
+fn server_thread_main(arg: u64) -> u64 {
+    let srv: *mut sv_state.Server = arg as *mut sv_state.Server
+    if !server_start(srv, sv_state.shared_get((*srv).shared, sv_state.SH_PORT_WANT) as u16) { return 1 as u64 }
+    server_run(srv)
+    return 0 as u64
+}

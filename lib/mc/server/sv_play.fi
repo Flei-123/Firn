@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_play.fi -- the play state: join, teleport confirm, movement, keep alive, chat echo, time broadcast.
+
+import std.rt
+import std.bytes
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_chunks
+
+export {
+    play_join, play_handle, play_keepalive, play_time_all, play_broadcast_chat, send_time,
+    TIME_BROADCAST_TICKS, CHAT_MAX,
+}
+
+const TIME_BROADCAST_TICKS: u64 = 20
+const CHAT_MAX: usize = 256
+const COORD_LIMIT: f64 = 30000000.0
+
+fn chunk_of(v: f64) -> i32 {
+    var c: f64 = v
+    if c > COORD_LIMIT { c = COORD_LIMIT }
+    if c < 0.0 - COORD_LIMIT { c = 0.0 - COORD_LIMIT }
+    var f: i32 = c as i32
+    if (f as f64) > c { f = f - 1 }
+    return (f - (((f % 16) + 16) % 16)) / 16
+}
+
+fn valid_coord(v: f64) -> bool {
+    return v == v && v < COORD_LIMIT && v > 0.0 - COORD_LIMIT
+}
+
+fn send_time(srv: *mut sv_state.Server, s: *mut sv_state.Session) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "age", (*srv).game_time)
+    mc_encode.vals_i64(&v, "time", (*srv).day_time)
+    let ok: bool = sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_UPDATE_TIME, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+fn play_join(srv: *mut sv_state.Server, s: *mut sv_state.Session, now_ms: i64) -> bool {
+    (*s).eid = (*srv).next_eid
+    (*srv).next_eid = (*srv).next_eid + 1
+    (*s).view = (*srv).cfg.view
+    (*s).x = (*srv).world.spawn_x as f64 + 0.5
+    (*s).y = (*srv).world.spawn_y as f64
+    (*s).z = (*srv).world.spawn_z as f64 + 0.5
+    (*s).cx = chunk_of((*s).x)
+    (*s).cz = chunk_of((*s).z)
+    (*s).ka_next = now_ms + (*srv).cfg.keepalive_interval_ms
+    sv_chunks.chunks_init(srv, s)
+    if !(*srv).join(srv, s) {
+        (*s).closing = true
+        return false
+    }
+    sv_chunks.chunks_send_center(srv, s)
+    (*s).joined = true
+    (*srv).online = (*srv).online + 1
+    return !(*s).closing
+}
+
+fn handle_position(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes, with_pos: bool, with_look: bool) {
+    if with_pos {
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        var z: f64 = 0.0
+        if !sv_send.field_f64(srv, mc_version.ST_PLAY, id, "x", body, &x) { return }
+        if !sv_send.field_f64(srv, mc_version.ST_PLAY, id, "y", body, &y) { return }
+        if !sv_send.field_f64(srv, mc_version.ST_PLAY, id, "z", body, &z) { return }
+        if !valid_coord(x) || !valid_coord(y) || !valid_coord(z) { return }
+        if (*s).tp_pending == 0 {
+            (*s).x = x
+            (*s).y = y
+            (*s).z = z
+            let ncx: i32 = chunk_of(x)
+            let ncz: i32 = chunk_of(z)
+            if ncx != (*s).cx || ncz != (*s).cz {
+                (*s).cx = ncx
+                (*s).cz = ncz
+                sv_chunks.chunks_send_center(srv, s)
+            }
+        }
+    }
+    if with_look {
+        var yaw: f32 = 0.0f
+        var pitch: f32 = 0.0f
+        if sv_send.field_f32(srv, mc_version.ST_PLAY, id, "yaw", body, &yaw) && yaw == yaw { (*s).yaw = yaw }
+        if sv_send.field_f32(srv, mc_version.ST_PLAY, id, "pitch", body, &pitch) && pitch == pitch { (*s).pitch = pitch }
+    }
+    var og: bool = false
+    if sv_send.field_bool(srv, mc_version.ST_PLAY, id, "onGround", body, &og) { (*s).on_ground = og }
+}
+
+fn play_broadcast_chat(srv: *mut sv_state.Server, p: u64, n: usize) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*o).used && (*o).joined && !(*o).closing {
+            sv_send.send_system_chat(srv, o, p, n)
+        }
+        i = i + 1
+    }
+}
+
+fn handle_chat(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    var p: u64 = 0
+    var n: usize = 0
+    if !sv_send.field_text(srv, mc_version.ST_PLAY, id, "message", body, &p, &n) { return }
+    if n == 0 || n > CHAT_MAX { return }
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push(&line, 60 as u8)
+    rt.buf_push_bytes(&line, (&(*s).name[0]) as u64, (*s).name_n)
+    sv_send.push_str(&line, "> ")
+    rt.buf_push_bytes(&line, p, n)
+    play_broadcast_chat(srv, rt.buf_ptr(&line), rt.buf_len(&line))
+    rt.buf_free(&line)
+}
+
+fn play_handle(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    let st: i32 = mc_version.ST_PLAY
+    if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) {
+        var t: i32 = 0
+        if sv_send.field_varint(srv, st, id, "teleportId", body, &t) && t == (*s).tp_pending { (*s).tp_pending = 0 }
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_KEEP_ALIVE) {
+        var k: i64 = 0
+        if sv_send.field_i64(srv, st, id, "keepAliveId", body, &k) && (*s).ka_pending && k == (*s).ka_id {
+            (*s).ka_pending = false
+        }
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_POSITION) {
+        handle_position(srv, s, id, body, true, false)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_POSITION_LOOK) {
+        handle_position(srv, s, id, body, true, true)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_LOOK) {
+        handle_position(srv, s, id, body, false, true)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_FLYING) {
+        handle_position(srv, s, id, body, false, false)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_CHAT) {
+        handle_chat(srv, s, id, body)
+    }
+}
+
+fn play_keepalive(srv: *mut sv_state.Server, s: *mut sv_state.Session, now_ms: i64) {
+    if (*s).ka_pending {
+        if now_ms > (*s).ka_deadline {
+            sv_send.send_kick(srv, s, "Timed out")
+            (*s).closing = true
+        }
+        return
+    }
+    if now_ms >= (*s).ka_next {
+        (*s).ka_id = now_ms
+        (*s).ka_pending = true
+        (*s).ka_deadline = now_ms + (*srv).cfg.keepalive_timeout_ms
+        (*s).ka_next = now_ms + (*srv).cfg.keepalive_interval_ms
+        var v: rt.Buf = rt.buf_new()
+        mc_encode.vals_i64(&v, "keepAliveId", now_ms)
+        sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_KEEP_ALIVE, &v)
+        rt.buf_free(&v)
+    }
+}
+
+fn play_time_all(srv: *mut sv_state.Server) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*o).used && (*o).joined && !(*o).closing { send_time(srv, o) }
+        i = i + 1
+    }
+}

@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_net.fi -- non-blocking accept, per session packet pump, hung client reaping.
+
+import std.net
+import std.rt
+import std.bytes
+import mc.mc_codec
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_login
+import mc.server.sv_play
+
+export { net_accept_all, net_pump_pre, net_pump_play, net_reap, net_drop_all, PUMP_PLAY_LIMIT, PUMP_PRE_LIMIT }
+
+const PUMP_PLAY_LIMIT: i32 = 256
+const PUMP_PRE_LIMIT: i32 = 8
+const ACCEPT_BURST: i32 = 16
+const READ_TIMEOUT: i32 = 0 - 1
+const READ_FAILED: i32 = 0 - 2
+
+fn read_code(e: WireError) -> i32 {
+    if e == WireError::Timeout { return READ_TIMEOUT }
+    return READ_FAILED
+}
+
+fn free_slot(srv: *mut sv_state.Server) -> i32 {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        if !(*sv_state.session_at(srv, i)).used { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn net_accept_all(srv: *mut sv_state.Server, now_ms: i64) {
+    var n: i32 = 0
+    while n < ACCEPT_BURST {
+        n = n + 1
+        var c: net.Conn = net.accept_nb(&(*srv).listener) catch net.conn_from_fd(0 - 1)
+        if !net.conn_is_open(&c) { return }
+        let slot: i32 = free_slot(srv)
+        if slot < 0 {
+            net.close(&c)
+        } else {
+            let s: *mut sv_state.Session = sv_state.session_at(srv, slot as usize)
+            *s = sv_state.session_empty()
+            (*s).wire = mc_codec.wire_open(c)
+            mc_codec.wire_poll_gate(&(*s).wire, true)
+            net.set_no_delay(&(*s).wire.conn, true) catch false
+            (*s).used = true
+            (*s).born_ms = now_ms
+        }
+    }
+}
+
+fn dispatch(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes, now_ms: i64) {
+    let st: i32 = (*s).state
+    if st == mc_version.ST_HANDSHAKE {
+        sv_login.handle_handshake(srv, s, id, body)
+    } else if st == mc_version.ST_STATUS {
+        sv_login.handle_status(srv, s, id, body)
+    } else if st == mc_version.ST_LOGIN {
+        if sv_login.handle_login(srv, s, id, body) { sv_play.play_join(srv, s, now_ms) }
+    } else if st == mc_version.ST_PLAY {
+        sv_play.play_handle(srv, s, id, body)
+    }
+}
+
+fn pump(srv: *mut sv_state.Server, s: *mut sv_state.Session, limit: i32, play: bool, now_ms: i64) {
+    var body: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    var n: i32 = 0
+    while n < limit && !(*s).closing && (((*s).state == mc_version.ST_PLAY) == play) {
+        let id: i32 = mc_codec.wire_read_packet(&(*s).wire, &body) catch | e | (read_code(e))
+        if id < 0 {
+            if id == READ_FAILED { (*s).closing = true }
+            return
+        }
+        dispatch(srv, s, id, &body, now_ms)
+        n = n + 1
+    }
+}
+
+fn net_pump_pre(srv: *mut sv_state.Server, now_ms: i64) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && !(*s).closing && (*s).state != mc_version.ST_PLAY {
+            pump(srv, s, PUMP_PRE_LIMIT, false, now_ms)
+            if !(*s).closing && (*s).state != mc_version.ST_PLAY && now_ms - (*s).born_ms > sv_state.HANDSHAKE_TIMEOUT_MS {
+                (*s).closing = true
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn net_pump_play(srv: *mut sv_state.Server, now_ms: i64) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && !(*s).closing && (*s).state == mc_version.ST_PLAY {
+            pump(srv, s, PUMP_PLAY_LIMIT, true, now_ms)
+        }
+        i = i + 1
+    }
+}
+
+fn net_reap(srv: *mut sv_state.Server) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).closing {
+            if (*s).joined { (*srv).online = (*srv).online - 1 }
+            mc_codec.wire_close(&(*s).wire)
+            sv_state.session_reset(s)
+        }
+        i = i + 1
+    }
+}
+
+fn net_drop_all(srv: *mut sv_state.Server, text: str) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && !(*s).closing && (*s).state >= mc_version.ST_LOGIN {
+            sv_send.send_kick(srv, s, text)
+        }
+        (*s).closing = (*s).closing || (*s).used
+        i = i + 1
+    }
+    net_reap(srv)
+}
