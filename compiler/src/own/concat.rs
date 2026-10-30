@@ -65,3 +65,18 @@ pub(crate) fn lower_into(lw: &mut Lower, e: &Expr, addr: crate::fir::Val) -> Opt
     let parts: Vec<Expr> = refs.into_iter().cloned().collect();
     lw.lower_call(name, &parts, Some(addr), e.span).map(|_| ())
 }
+
+pub(crate) fn wants_assign(lw: &Lower, value: &Expr) -> bool {
+    if !super::enabled() {
+        return false;
+    }
+    let n = chain_len(lw, value);
+    (2..=3).contains(&n)
+}
+
+pub(crate) fn lower_assign(lw: &mut Lower, target: &Expr, value: &Expr, addr: crate::fir::Val, span: crate::diag::Span) -> Option<()> {
+    let mut parts: Vec<Expr> = vec![target.clone()];
+    parts.extend(split(lw, value, 3).into_iter().cloned());
+    let name = if parts.len() == 4 { FN_CONCAT4 } else { FN_CONCAT3 };
+    lw.lower_call(name, &parts, Some(addr), span).map(|_| ())
+}
