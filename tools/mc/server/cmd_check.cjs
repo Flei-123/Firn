@@ -32,12 +32,20 @@ function compareEvent(f, v, fname, vname) {
   return problems
 }
 
-function compareTimes(f, v, vNext, fNext) {
-  const last = (e) => e.times[e.times.length - 1]
-  const a = last(fNext)
-  const b = last(vNext)
-  const ok = a !== undefined && b !== undefined && Math.abs(a - b) <= NUM_TOLERANCE
-  return ok ? [] : [`update_time after command firn=${a} vanilla=${b}`]
+function timeSeen(events, i, expected) {
+  const times = events[i].times.concat(events[i + 1] ? events[i + 1].times : [])
+  const circular = (x) => Math.abs((((x - expected) % 24000) + 36000) % 24000 - 12000)
+  return times.some((t) => circular(t) <= NUM_TOLERANCE)
+}
+
+function compareTimes(fir, van, i) {
+  const message = van.events[i].chat[0] || ''
+  const expected = /^Set the time/.test(message) ? numbers(message)[0] : undefined
+  if (expected === undefined) return []
+  const problems = []
+  if (!timeSeen(van.events, i, expected)) problems.push(`vanilla sent no update_time near ${expected}`)
+  if (!timeSeen(fir.events, i, expected)) problems.push(`firn sent no update_time near ${expected}`)
+  return problems
 }
 
 function mutate(doc) {
@@ -51,8 +59,7 @@ if (mode === 'mutate') fir = mutate(fir)
 let bad = 0
 for (let i = 0; i < van.events.length; i++) {
   const problems = compareEvent(fir.events[i], van.events[i], fir.name, van.name)
-  const next = van.events[i + 1]
-  if (/^time (set|add)/.test(van.events[i].cmd) && next && !/^time (set|add)/.test(next.cmd)) problems.push(...compareTimes(fir.events[i], van.events[i], next, fir.events[i + 1]))
+  if (/^time (set|add)/.test(van.events[i].cmd)) problems.push(...compareTimes(fir, van, i))
   if (problems.length) {
     bad++
     if (mode !== 'mutate') console.log(`  FAIL  cmd '${van.events[i].cmd}': ${problems.join('; ')}`)

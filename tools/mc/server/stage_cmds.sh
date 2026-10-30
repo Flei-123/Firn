@@ -29,7 +29,7 @@ if python3 -I "$TOOLS/cmd_tree_cmp.py" "$W/decl_v.json" "$W/decl_mut.json" "$REP
 else
     echo "  ok    counter-check: a mutated declare_commands frame is detected"
 fi
-unzip -p "$JARS/server-1.20.1.jar" assets/minecraft/lang/en_us.json > "$W/en_us.json"
+unzip -p "${MC_VANILLA_JAR:-$JARS/client-1.20.1.jar}" assets/minecraft/lang/en_us.json > "$W/en_us.json"
 export CMD_LANG="$W/en_us.json"
 node "$TOOLS/cmd_bot.cjs" 127.0.0.1 $VPORT CmdVan "$TOOLS/cmd_list.txt" "$W/cmd_v.json" 2> "$W/cmd_bot_v.err" &
 B1=$!
