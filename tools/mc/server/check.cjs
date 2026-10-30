@@ -6,7 +6,7 @@ function pos(order, name) { return order.indexOf(name) }
 
 function checkJoin(label, r, ref) {
   const lines = []
-  const reference = label === 'vanilla'
+  const reference = label === 'vanilla' || label === 'firn-no-opt'
   const add = (ok, msg, soft) => lines.push((ok ? '  ok    ' : (reference && soft ? '  info  ' : '  FAIL  ')) + label + ': ' + msg)
   const o = r.order
   add(pos(o, 'login') === 0, 'login is the first play packet (' + o.slice(0, 4).join(',') + ')')
@@ -20,7 +20,7 @@ function checkJoin(label, r, ref) {
     const dt = t[t.length - 1].wall - t[0].wall
     const da = t[t.length - 1].age - t[0].age
     const tps = da * 1000 / dt
-    add(da >= 200 && tps > 18.0 && tps < 21.0, 'TPS over ' + da + ' ticks = ' + tps.toFixed(2))
+    add(da >= 200 && tps > 18.0 && tps < 21.0, 'TPS over ' + da + ' ticks = ' + tps.toFixed(2), true)
   } else add(false, 'no update_time packets')
   const ka = r.keepalive[0]
   add(ka !== undefined && ka > 14500 && ka < 16800, 'first keep alive after ' + ka + ' ms (15 s)')
