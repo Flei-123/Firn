@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MPL-2.0
+// expect_exit: 0
+import jobs.jobs
+import scene3d.render
+import scene3d.scene
+import scene3d.camera
+import scene3d.surface
+import scene3d.vec3
+import scene3d.material
+import scene3d.light
+import scene3d.geom
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+struct Cfg {
+    shadow: bool,
+    size: i32,
+    soft: f64,
+    glass: bool,
+    strength: f64,
+    box_mat_cast: bool,
+    box_node_cast: bool,
+    ground_mat_recv: bool,
+    ground_node_recv: bool,
+    two_lights: bool,
+}
+
+fn cfg_default() -> Cfg {
+    return Cfg {
+        shadow: true, size: 2048, soft: 1.5, glass: false, strength: 0.6,
+        box_mat_cast: true, box_node_cast: true, ground_mat_recv: true, ground_node_recv: true, two_lights: false,
+    }
+}
+
+fn build(sc: *mut scene.Scene, c: *mut Cfg) {
+    let ground_mesh: i32 = scene.scene_add_mesh(sc, geom.geom_plane(20.0, 20.0, 1, 1))
+    let box_mesh: i32 = scene.scene_add_mesh(sc, geom.geom_box(2.0, 2.0, 2.0))
+    var gm: material.Material = material.mat_standard(vec3.v3(0.7, 0.7, 0.7), 0.0, 0.8)
+    gm.receive_shadow = (*c).ground_mat_recv
+    var bm: material.Material = material.mat_standard(vec3.v3(0.8, 0.2, 0.2), 0.0, 0.6)
+    if (*c).glass {
+        bm = material.mat_glass(vec3.v3(0.6, 0.7, 1.0), 0.4)
+        bm.shadow_strength = (*c).strength
+    }
+    bm.cast_shadow = (*c).box_mat_cast
+    let ground_mat: i32 = scene.scene_add_material(sc, gm)
+    let box_mat: i32 = scene.scene_add_material(sc, bm)
+    let gn: i32 = scene.scene_add_mesh_node(sc, 0 - 1, ground_mesh, ground_mat)
+    let bn: i32 = scene.scene_add_mesh_node(sc, 0 - 1, box_mesh, box_mat)
+    scene.node_set_pos(scene.scene_node(sc, bn), vec3.v3(0.0, 1.0, 0.0))
+    scene.node_set_shadow(scene.scene_node(sc, bn), (*c).box_node_cast, true)
+    scene.node_set_shadow(scene.scene_node(sc, gn), true, (*c).ground_node_recv)
+    var inten: f64 = 1.0
+    if (*c).two_lights { inten = 0.6 }
+    var a: light.Light = light.light_dir(vec3.v3(0.0 - 1.0, 1.0, 0.0), vec3.v3(1.0, 1.0, 1.0), inten)
+    if (*c).shadow { light.light_set_shadow(&a, (*c).size, 0.004, (*c).soft) }
+    scene.scene_add_light(sc, a)
+    if (*c).two_lights {
+        var b: light.Light = light.light_dir(vec3.v3(1.0, 1.0, 0.0), vec3.v3(1.0, 1.0, 1.0), inten)
+        if (*c).shadow { light.light_set_shadow(&b, (*c).size, 0.004, (*c).soft) }
+        scene.scene_add_light(sc, b)
+    }
+}
+
+fn make_cam() -> camera.Camera {
+    var cam: camera.Camera = camera.cam_new(96, 64)
+    camera.cam_look_at(&cam, vec3.v3(0.5, 14.0, 6.0), vec3.v3(0.0, 0.0, 0.0))
+    return cam
+}
+
+fn shot(c: *mut Cfg, threads: i32, out: *mut surface.Surface) {
+    var sc: scene.Scene = scene.scene_new()
+    build(&sc, c)
+    var cam: camera.Camera = make_cam()
+    var r: render.Renderer = render.renderer_new(96, 64, 1, threads)
+    render.render(&r, &sc, &cam, out)
+    render.renderer_free(&r)
+    scene.scene_free(&sc)
+}
+
+fn pix(s: *mut surface.Surface, x: f64, y: f64, z: f64) -> u32 {
+    let cam: camera.Camera = make_cam()
+    var o: vec3.V3 = vec3.v3_zero()
+    if camera.cam_project(cam, vec3.v3(x, y, z), &o) == false { return 0 as u32 }
+    return surface.surface_get(s, o.x as i32, o.y as i32)
+}
+
+fn luma(s: *mut surface.Surface, x: f64, y: f64, z: f64) -> i32 {
+    let p: u32 = pix(s, x, y, z)
+    return ((p & 255 as u32) as i32) + (((p >> 8 as u32) & 255 as u32) as i32) + (((p >> 16 as u32) & 255 as u32) as i32)
+}
+
+fn same(a: *mut surface.Surface, b: *mut surface.Surface) -> bool {
+    var i: i32 = 0
+    while i < (*a).w * (*a).h {
+        if surface.surface_get(a, i % (*a).w, i / (*a).w) != surface.surface_get(b, i % (*a).w, i / (*a).w) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn mismatches(a: *mut surface.Surface, b: *mut surface.Surface, x0: f64, x1: f64, y: f64, z0: f64, z1: f64, step: f64) -> i32 {
+    var n: i32 = 0
+    var x: f64 = x0
+    while x <= x1 {
+        var z: f64 = z0
+        while z <= z1 {
+            if pix(a, x, y, z) != pix(b, x, y, z) { n = n + 1 }
+            z = z + step
+        }
+        x = x + step
+    }
+    return n
+}
+
+fn pcf_values(s: *mut surface.Surface, lit: i32, dark: i32) -> i32 {
+    var n: i32 = 0
+    var x: f64 = 0.0 - 1.0
+    while x <= 6.0 {
+        let l: i32 = luma(s, x, 0.0, 0.0)
+        if x > 1.2 && l > dark + 6 && l < lit - 6 { n = n + 1 }
+        x = x + 0.1
+    }
+    return n
+}
+
+fn main(start: u64) -> i32 {
+    var off: surface.Surface = surface.surface_new(96, 64)
+    var on: surface.Surface = surface.surface_new(96, 64)
+    var t: surface.Surface = surface.surface_new(96, 64)
+    var u: surface.Surface = surface.surface_new(96, 64)
+    var c: Cfg = cfg_default()
+    c.shadow = false
+    shot(&c, 0, &off)
+    c.shadow = true
+    shot(&c, 0, &on)
+    var code: i32 = 0
+    let lit_off: i32 = luma(&off, 2.0, 0.0, 0.0)
+    let lit_on: i32 = luma(&on, 0.0 - 5.0, 0.0, 0.0)
+    let dark_on: i32 = luma(&on, 2.0, 0.0, 0.0)
+    if lit_on != luma(&off, 0.0 - 5.0, 0.0, 0.0) { code = 1 }
+    if code == 0 && dark_on * 100 >= lit_off * 65 { code = 2 }
+    if code == 0 && dark_on * 100 < lit_off * 5 { code = 3 }
+    if code == 0 && mismatches(&on, &off, 0.0 - 9.0, 0.0 - 3.0, 0.0, 0.0 - 4.0, 4.0, 0.5) != 0 { code = 4 }
+    if code == 0 && mismatches(&on, &off, 0.0 - 0.6, 0.6, 2.0, 0.0 - 0.6, 0.6, 0.3) != 0 { code = 5 }
+    if code == 0 && mismatches(&on, &off, 4.0, 9.0, 0.0, 0.0 - 4.0, 4.0, 0.5) != 0 { code = 6 }
+    if code == 0 && mismatches(&on, &off, 0.0 - 9.0, 9.0, 0.0, 2.0, 8.0, 0.5) != 0 { code = 7 }
+
+    c = cfg_default()
+    c.box_mat_cast = false
+    shot(&c, 0, &t)
+    if code == 0 && same(&t, &off) == false { code = 8 }
+    c = cfg_default()
+    c.box_node_cast = false
+    shot(&c, 0, &t)
+    if code == 0 && same(&t, &off) == false { code = 9 }
+    c = cfg_default()
+    c.ground_mat_recv = false
+    shot(&c, 0, &t)
+    if code == 0 && same(&t, &off) == false { code = 10 }
+    c = cfg_default()
+    c.ground_node_recv = false
+    shot(&c, 0, &t)
+    if code == 0 && same(&t, &off) == false { code = 11 }
+
+    c = cfg_default()
+    c.glass = true
+    shot(&c, 0, &t)
+    let glass_dark: i32 = luma(&t, 2.0, 0.0, 0.0)
+    let glass_lit: i32 = luma(&t, 0.0 - 5.0, 0.0, 0.0)
+    if code == 0 && glass_dark >= glass_lit - 10 { code = 12 }
+    if code == 0 && glass_dark <= dark_on + 10 { code = 13 }
+    c.strength = 0.0
+    shot(&c, 0, &t)
+    c.shadow = false
+    shot(&c, 0, &u)
+    if code == 0 && same(&t, &u) == false { code = 14 }
+
+    c = cfg_default()
+    c.size = 64
+    c.soft = 2.0
+    shot(&c, 0, &t)
+    let coarse_lit: i32 = luma(&t, 0.0 - 5.0, 0.0, 0.0)
+    if code == 0 && pcf_values(&t, coarse_lit, luma(&t, 2.0, 0.0, 0.0) ) < 3 { code = 15 }
+    if code == 0 && luma(&t, 2.0, 0.0, 0.0) * 100 >= lit_off * 80 { code = 16 }
+
+    c = cfg_default()
+    c.two_lights = true
+    shot(&c, 0, &t)
+    c.shadow = false
+    shot(&c, 0, &u)
+    let two_a: i32 = luma(&t, 2.0, 0.0, 0.0)
+    let two_b: i32 = luma(&t, 0.0 - 2.0, 0.0, 0.0)
+    if code == 0 && (two_a * 100 >= luma(&u, 2.0, 0.0, 0.0) * 95 || two_b * 100 >= luma(&u, 0.0 - 2.0, 0.0, 0.0) * 95) { code = 17 }
+    if code == 0 && (two_a <= dark_on + 10 || two_b <= dark_on + 10) { code = 18 }
+
+    var ti: i32 = 0
+    while ti < 4 && code == 0 {
+        var th: i32 = 0
+        if ti == 1 { th = 1 }
+        if ti == 2 { th = 3 }
+        if ti == 3 { th = 7 }
+        c = cfg_default()
+        c.glass = true
+        c.two_lights = true
+        c.size = 256
+        shot(&c, 0, &t)
+        shot(&c, th, &u)
+        if same(&t, &u) == false { code = 20 + ti }
+        ti = ti + 1
+    }
+
+    var sc: scene.Scene = scene.scene_new()
+    c = cfg_default()
+    c.shadow = false
+    build(&sc, &c)
+    var cam: camera.Camera = make_cam()
+    var r: render.Renderer = render.renderer_new(96, 64, 1, 0)
+    render.render(&r, &sc, &cam, &t)
+    if code == 0 && r.shadow != 0 as u64 { code = 30 }
+    render.renderer_free(&r)
+    scene.scene_free(&sc)
+
+    surface.surface_free(&off)
+    surface.surface_free(&on)
+    surface.surface_free(&t)
+    surface.surface_free(&u)
+    return code
+}
