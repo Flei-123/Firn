@@ -2343,6 +2343,16 @@ else
     grep -E '^[-+][a-z]|^FAIL' "$WORK/safety149.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 150. scene3d: software 3D renderer and video (lib/scene3d: mesh, curves, rasterizer, overlay labels, camera keys, timeline; tools/scene3d/run.sh renders a clip and a still, ffprobe checks frames, size, codec; tests/6300-6303 run in section 3) =="
+FIRNC="$FIRNC" bash tools/scene3d/run.sh > "$WORK/scene3d150.log" 2>&1 && F150RC=0 || F150RC=$?
+if [ "$F150RC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/scene3d150.log" | sed 's/^/ /'
+else
+    bad "tools/scene3d/run.sh failed (see .test-work/scene3d150.log)"
+    grep -E 'FAIL' "$WORK/scene3d150.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

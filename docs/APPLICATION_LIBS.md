@@ -232,3 +232,16 @@ single lookups) and the Windows state (Wine only): [DB.md](DB.md).
 | module | what it does | held against |
 |---|---|---|
 | `db.sqlite` (`lib/db/sqlite.fi`) and 20 more files in `lib/db/` | `db_open/exec/prepare`, `stmt_step`, bound parameters of every type, column accessors, transactions with statement savepoints, `db_query_*`; SELECT with joins, aggregates, sub-selects, compound selects; INSERT/UPDATE/DELETE with upsert; CREATE/DROP/ALTER ADD COLUMN; PRAGMAs; ~45 functions incl. date and time; rollback journal, SQLite's own lock bytes (`flock`, `LockFileEx` on Windows) | Python `sqlite3` (SQLite 3.40.1): 70 statements parsed alike, 25,842 expressions bit for bit, 106 SELECTs, 1,500 random statements, files exchanged both ways with `integrity_check`; a kill at every commit event plus 25 random `kill -9`; SQLite and lib/db processes on one file; 1,500 damaged files without a crash, panic or hang; the Windows build under Wine (`tools/db/run.sh`, `tests/2160`-`2165`, `examples/db_modrinth_cache.fi`, `examples/db_game_history.fi`) |
+
+## 3D scenes as video (lib/scene3d, [SCENE3D.md](SCENE3D.md))
+
+A software 3D renderer and an MP4 encoder front end, the replacement for three.js explainer animations: build a scene, drive it as a pure function of time, render frames on all cores, pipe them to ffmpeg.
+
+| module | what it does | held against |
+|---|---|---|
+| `scene3d.vec3`, `quat`, `mat4`, `camera` | V3/Q4/M4 maths (right-handed, Y up), perspective and look-at, `cam_project` to pixels | `tests/6300`, `tests/6302` |
+| `scene3d.mesh`, `geom`, `curve` | indexed meshes with normals/UV; box (also open), cylinder/cone, sphere, plane, torus, tube along a curve; Catmull-Rom curves with an arc-length table and helix | `tests/6300`: volumes and areas against the formulas, winding against normals, no twist jumps |
+| `scene3d.surface`, `material`, `light`, `scene`, `render` | scene graph with visibility/opacity cascade, standard/glass/emissive/unlit/textured materials, hemisphere + directional + point lights; rasterizer with near clipping, visibility buffer, sorted transparency, SSAA, band-parallel over `jobs`; bit-identical for any thread count | `tests/6302`: expected pixels, thread-count equality |
+| `scene3d.overlay`, `labels`, `ov_shapes`, `ov_px` | 2D drawing into any surface: text (DejaVu fallback chain, umlauts), AA lines/discs/rounded rectangles, plots, 3D labels with leader line, clamping, fading and overlap avoidance | `tests/6301` |
+| `scene3d.anim` | `CamKeys` (smoothstep between keys), `Timeline` with fly-in/fade/show/hide tracks applied by `timeline_apply(tl, &scene, t)`, easing functions | `tests/6303` |
+| `scene3d.video`, `video_opts` | `video_run` renders frames `t = i/fps` and pipes raw RGBA into ffmpeg (libx264, yuv420p, crf 21, faststart); `video_still` writes one PNG; CLI flags `--out --fps --duration --width --height --threads --ss --crf --still --from --to` | `tools/scene3d/run.sh` (test.sh section 150): ffprobe frames/size/codec, frame range, still PNG, determinism over thread counts |

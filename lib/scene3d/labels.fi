@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import scene3d.vec3
+import scene3d.camera
+import scene3d.surface
+import scene3d.ov_px
+import scene3d.ov_shapes
+import scene3d.overlay
+
+export {
+    LabelStyle, LabelBox, label_style, ov_label, ov_label_ex, ov_text_block, CAND_COUNT,
+}
+
+const CAND_COUNT: usize = 8
+const PUSH_STEPS: usize = 12
+
+struct LabelStyle {
+    size: f64,
+    pad: f64,
+    radius: f64,
+    gap: f64,
+    dx: f64,
+    dy: f64,
+    auto: bool,
+    text_color: u32,
+    fill: u32,
+    border: u32,
+    border_w: f64,
+    line_color: u32,
+    line_w: f64,
+    dot_r: f64,
+    bold_title: bool,
+    shadow: bool,
+    margin: f64,
+}
+
+struct LabelBox {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    ax: f64,
+    ay: f64,
+}
+
+fn label_style() -> LabelStyle {
+    return LabelStyle {
+        size: 18.0,
+        pad: 8.0,
+        radius: 6.0,
+        gap: 34.0,
+        dx: 40.0,
+        dy: -40.0,
+        auto: true,
+        text_color: ov_px.rgba(255, 255, 255, 255),
+        fill: ov_px.rgba(18, 24, 38, 215),
+        border: ov_px.rgba(120, 170, 255, 255),
+        border_w: 1.5,
+        line_color: ov_px.rgba(230, 240, 255, 235),
+        line_w: 2.0,
+        dot_r: 3.5,
+        bold_title: true,
+        shadow: false,
+        margin: 6.0,
+    }
+}
+
+fn line_end(p: u64, n: usize, start: usize) -> usize {
+    var i: usize = start
+    while i < n && (rt.ld8(p, i) as i32) != 10 {
+        i = i + 1
+    }
+    return i
+}
+
+fn ov_text_block(o: *mut overlay.Overlay, text: str, st: LabelStyle, out_w: *mut f64, out_h: *mut f64) -> usize {
+    let p: u64 = text.p as u64
+    let n: usize = text.n
+    var lines: usize = 0
+    var wmax: f64 = 0.0
+    var s: usize = 0
+    while true {
+        let e: usize = line_end(p, n, s)
+        let bold: bool = st.bold_title && lines == 0
+        let w: f64 = overlay.ov_text_width_raw(o, st.size, p + (s as u64), e - s, bold)
+        if w > wmax { wmax = w }
+        lines = lines + 1
+        if e >= n { break }
+        s = e + 1
+    }
+    *out_w = wmax + st.pad * 2.0
+    *out_h = (lines as f64) * overlay.ov_line_height(st.size) + st.pad * 2.0
+    return lines
+}
+
+fn rect_overlap(ax: f64, ay: f64, aw: f64, ah: f64, bx: f64, by: f64, bw: f64, bh: f64) -> f64 {
+    let ow: f64 = vec3.minf(ax + aw, bx + bw) - vec3.maxf(ax, bx)
+    let oh: f64 = vec3.minf(ay + ah, by + bh) - vec3.maxf(ay, by)
+    if ow <= 0.0 || oh <= 0.0 { return 0.0 }
+    return ow * oh
+}
+
+fn placed_overlap(o: *mut overlay.Overlay, x: f64, y: f64, w: f64, h: f64) -> f64 {
+    var total: f64 = 0.0
+    var i: usize = 0
+    while i < (*o).placed_n {
+        total = total + rect_overlap(x, y, w, h, (*o).placed[i * 4], (*o).placed[i * 4 + 1],
+            (*o).placed[i * 4 + 2], (*o).placed[i * 4 + 3])
+        i = i + 1
+    }
+    return total
+}
+
+fn clamp_axis(v: f64, size: f64, limit: f64, margin: f64) -> f64 {
+    let hi: f64 = limit - size - margin
+    if hi < margin { return margin }
+    return vec3.clampf(v, margin, hi)
+}
+
+fn candidate(k: usize, ax: f64, ay: f64, w: f64, h: f64, gap: f64, ox: *mut f64, oy: *mut f64) {
+    if k == 0 { *ox = ax + gap; *oy = ay - gap - h }
+    if k == 1 { *ox = ax - gap - w; *oy = ay - gap - h }
+    if k == 2 { *ox = ax + gap; *oy = ay + gap }
+    if k == 3 { *ox = ax - gap - w; *oy = ay + gap }
+    if k == 4 { *ox = ax + gap; *oy = ay - h * 0.5 }
+    if k == 5 { *ox = ax - gap - w; *oy = ay - h * 0.5 }
+    if k == 6 { *ox = ax - w * 0.5; *oy = ay - gap - h }
+    if k == 7 { *ox = ax - w * 0.5; *oy = ay + gap }
+}
+
+fn placed_index_hit(o: *mut overlay.Overlay, x: f64, y: f64, w: f64, h: f64) -> usize {
+    var i: usize = 0
+    while i < (*o).placed_n {
+        if rect_overlap(x, y, w, h, (*o).placed[i * 4], (*o).placed[i * 4 + 1],
+            (*o).placed[i * 4 + 2], (*o).placed[i * 4 + 3]) > 0.0 {
+            return i
+        }
+        i = i + 1
+    }
+    return PLACED_NONE
+}
+
+const PLACED_NONE: usize = 1000000
+
+fn place_auto(o: *mut overlay.Overlay, ax: f64, ay: f64, w: f64, h: f64, st: LabelStyle,
+    sw: f64, sh: f64, ox: *mut f64, oy: *mut f64) {
+    var best: f64 = 1.0e30
+    var k: usize = 0
+    while k < CAND_COUNT {
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        candidate(k, ax, ay, w, h, st.gap, &cx, &cy)
+        let px: f64 = clamp_axis(cx, w, sw, st.margin)
+        let py: f64 = clamp_axis(cy, h, sh, st.margin)
+        var pen: f64 = placed_overlap(o, px, py, w, h) + (vec3.absf(px - cx) + vec3.absf(py - cy)) * 60.0 + (k as f64)
+        if rect_overlap(px - 4.0, py - 4.0, w + 8.0, h + 8.0, ax - 1.0, ay - 1.0, 2.0, 2.0) > 0.0 {
+            pen = pen + 100000.0
+        }
+        if pen < best {
+            best = pen
+            *ox = px
+            *oy = py
+        }
+        k = k + 1
+    }
+}
+
+fn push_apart(o: *mut overlay.Overlay, w: f64, h: f64, sh: f64, margin: f64, oy: *mut f64, x: f64) {
+    var step: usize = 0
+    while step < PUSH_STEPS {
+        let hit: usize = placed_index_hit(o, x, *oy, w, h)
+        if hit == PLACED_NONE { return }
+        let ry: f64 = (*o).placed[hit * 4 + 1]
+        let rh: f64 = (*o).placed[hit * 4 + 3]
+        var ny: f64 = ry + rh + 4.0
+        if ny + h + margin > sh {
+            ny = ry - h - 4.0
+        }
+        if ny < margin { return }
+        *oy = ny
+        step = step + 1
+    }
+}
+
+fn ov_label_ex(o: *mut overlay.Overlay, dst: *mut surface.Surface, cam: *mut camera.Camera,
+    anchor: vec3.V3, text: str, st: LabelStyle, alpha: f64, out: *mut LabelBox) -> bool {
+    if alpha <= 0.0 { return false }
+    var pt: vec3.V3 = vec3.v3_zero()
+    if !camera.cam_project(*cam, anchor, &pt) { return false }
+    let sw: f64 = (*dst).w as f64
+    let sh: f64 = (*dst).h as f64
+    let ax: f64 = pt.x
+    let ay: f64 = pt.y
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    let nlines: usize = ov_text_block(o, text, st, &w, &h)
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    if st.auto {
+        place_auto(o, ax, ay, w, h, st, sw, sh, &bx, &by)
+    } else {
+        bx = clamp_axis(ax + st.dx, w, sw, st.margin)
+        by = clamp_axis(ay + st.dy, h, sh, st.margin)
+    }
+    push_apart(o, w, h, sh, st.margin, &by, bx)
+    by = clamp_axis(by, h, sh, st.margin)
+    if (*o).placed_n < overlay.PLACED_MAX {
+        let k: usize = (*o).placed_n
+        (*o).placed[k * 4] = bx
+        (*o).placed[k * 4 + 1] = by
+        (*o).placed[k * 4 + 2] = w
+        (*o).placed[k * 4 + 3] = h
+        (*o).placed_n = k + 1
+    }
+    (*out).x = bx
+    (*out).y = by
+    (*out).w = w
+    (*out).h = h
+    (*out).ax = ax
+    (*out).ay = ay
+    let ex: f64 = vec3.clampf(ax, bx, bx + w)
+    let ey: f64 = vec3.clampf(ay, by, by + h)
+    let lc: u32 = ov_px.color_fade(st.line_color, alpha)
+    if vec3.absf(ex - ax) + vec3.absf(ey - ay) > 1.0 {
+        ov_shapes.ov_line(dst, ex, ey, ax, ay, st.line_w, lc)
+    }
+    ov_shapes.ov_disc(dst, ax, ay, st.dot_r, lc)
+    ov_shapes.ov_round_rect(dst, bx, by, w, h, st.radius, ov_px.color_fade(st.fill, alpha), ov_px.color_fade(st.border, alpha), st.border_w)
+    let p: u64 = text.p as u64
+    let n: usize = text.n
+    let lh: f64 = overlay.ov_line_height(st.size)
+    var line: usize = 0
+    var s: usize = 0
+    while line < nlines {
+        let e: usize = line_end(p, n, s)
+        overlay.ov_text_raw(o, dst, bx + st.pad, by + st.pad + (line as f64) * lh + st.size, st.size,
+            ov_px.color_fade(st.text_color, alpha), p + (s as u64), e - s, st.shadow, st.bold_title && line == 0)
+        line = line + 1
+        s = e + 1
+    }
+    return true
+}
+
+fn ov_label(o: *mut overlay.Overlay, dst: *mut surface.Surface, cam: *mut camera.Camera,
+    anchor: vec3.V3, text: str, st: LabelStyle, alpha: f64) -> bool {
+    var b: LabelBox = LabelBox { x: 0.0, y: 0.0, w: 0.0, h: 0.0, ax: 0.0, ay: 0.0 }
+    return ov_label_ex(o, dst, cam, anchor, text, st, alpha, &b)
+}

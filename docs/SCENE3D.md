@@ -4,7 +4,7 @@ Worktree: /root/jarvis/data/staff_wt/firn/scene3d (branch staff/scene3d). Librar
 Right-handed, Y up, camera looks down -Z in view space. Triangles CCW seen from outside. Colors V3 = LINEAR rgb 0..1 (`vec3.rgb_hex(0xRRGGBB)` converts from sRGB). Pixels = u32 0xAABBGGRR (R low byte), straight alpha.
 Rules: code English, NO comments except the one-line `// SPDX-License-Identifier: MPL-2.0`, small modules, every module has an `export { ... }` list, never name a variable like an imported module (`mesh`, `scene`, `camera`, `light`, `surface`, `material`, `render`, `curve`, `anim`, `overlay`), f64 everywhere, `v[i]` works on Vec, `vec_elem_ptr[T](&v, i)` for pointers, f64 consts need `math.PI()` style functions or own `const`. See skill firn-lib-test-compile-quirks.
 
-## Done (compiles, checked)
+## Done (compiles, checked; all modules below exist, see tests/6300-6303 and tools/scene3d/run.sh)
 vec3.fi (V3, PI/TAU/DEG, v3_*, clampf/clamp01/lerpf/smoothstep, rgb8/rgb_hex), quat.fi (Q4, q_axis_angle/q_euler/q_mul/q_rotate/q_slerp), mat4.fi (M4 row-major, V4, m4_compose/m4_mul/m4_perspective/m4_look_at/m4_point/m4_dir/m4_xform4/m4_cofactor3/m4_inverse_affine), camera.fi (Camera{pos,target,up,fov(deg),near,far,w,h}, cam_new/cam_view/cam_proj/cam_view_proj/cam_project(cam,p,&out)->bool: out.x,y pixel (origin top-left), out.z = view depth).
 
 ## To build (file ownership, no overlaps)
@@ -15,4 +15,10 @@ vec3.fi (V3, PI/TAU/DEG, v3_*, clampf/clamp01/lerpf/smoothstep, rgb8/rgb_hex), q
 5. DEMO (examples/scene3d/coldfusion/): the cold-fusion calorimeter scene, 48 s, 25 fps, 1280x720, German labels, as specified by Justin (table, styrofoam box 26x28x26 open front, glass cooling jacket r9 h21 with blue water, beaker r5 h18.5 with D2O to ~15, Pd cathode wire, Pt anode helix r2.4 8 turns, heater, thermometer, stopper + gas hose + bubble counter, pump + reservoir + hoses, yellow temperature probes T_ein/T_aus, power supply with display 3.20V/0.500A + red/black cables, data logger + laptop with curve; timeline: title, parts fly in with labels, power on at 26.5 s with bubbles + blue/orange particles, HUD bottom right with energy balance P_ein=1.60 W, P_Gas=0.77 W, heat 0.83 W, flow 0.2 g/s, T_aus to ~19 C, final "Kontrolle nicht vergessen" with glowing heater; 5 camera moves).
 
 ## Integration (manager)
-test.sh section + stages.txt entry + docs/LIBS.md (`bash tools/gen_libs_index.sh`) + docs/APPLICATION_LIBS.md line + tests/63xx numbers 6300-6309 reserved. Workers do NOT commit and do NOT touch test.sh/docs/LIBS.md.
+test.sh section + stages.txt entry + docs/LIBS.md (`bash tools/gen_libs_index.sh`) + docs/APPLICATION_LIBS.md line + tests/63xx numbers 6300-6309 reserved. Integrated: test.sh section 150 (tools/scene3d/run.sh), stages.txt stage 7, docs/APPLICATION_LIBS.md, docs/LIBS.md.
+
+## ANIM API (anim.fi, video.fi)
+anim: `camkeys_new/free/add(k,t,pos,target,fov)/camkeys_at(k,t,&cam)` (smoothstep per segment, hold before first/after last key). `timeline_new/free`, `timeline_fly_in(tl,node,base:V3,t0,dur,offset:V3,fade:bool,ease)`, `timeline_fade(tl,node,t0,dur,from,to,ease)`, `timeline_show/hide(tl,node,t0)`, `timeline_apply(tl,&scene,t)` (pure function of t; node base position is passed explicitly at fly_in). Ease ids: EASE_LINEAR/IN_OUT/OUT_CUBIC/IN_CUBIC/OUT_BACK; `ease_apply(kind,u)`.
+video: `video_opts_default()`, `video_parse_args(&opts, start)`, `video_run(&opts, frame_cb: fn(u64 ctx, u64 frame, f64 t, *mut Surface), ctx)`: frames t=i/fps for i in from..to, piped as raw RGBA into ffmpeg (libx264 yuv420p crf 21 faststart, no frame files on disk); `--still <t>` writes one PNG. CLI: --out --fps --duration --width --height --threads --ss --still --from --to.
+
+Video notes: frames are piped to ffmpeg (no frame files, 1280x720x48 s would be 3+ GB on disk); odd sizes are scaled to even; threads/ss are read by the program's own renderer from VideoOpts. Mini demo: tools/scene3d/mini.fi (gate program).
