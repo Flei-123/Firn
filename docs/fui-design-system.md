@@ -74,3 +74,15 @@ DS2c catalog components (immediate mode, colours via lib/fui/ds_catalog_tok.fi).
 - `ds_navview`: `nv_new`, `add`/`add_header`/`add_footer`, `set_badge`, `set_back`, `layout(v,c,x,y,w,h)` (expanded >= 1008 dp, compact >= 641, else minimal), `draw`, `draw_overlay`, `press`/`key` -> `EV_*`, `select`/`selected`, `content_x/y/w/h`, `mode`.
 - `ds_listdetail`: `ld_new`, `set_count`, `set_break`, `set_list_width`, `set_row`, `layout`, `begin_list`/`row_draw`/`finish_list`, `draw_chrome`, `press`/`key` -> `EV_*`, `open_detail`, `back`, `detail_x/y/w/h`, `stacked`.
 - `ds_vgrid`: `grid_new`, `set_count`, `set_cell(min_w_pt,h_pt,gap_pt)`, `set_pad`, `layout`, `first`/`end_index`, `cell_rect`, `index_at`, `begin`/`finish`, `move`, `press`, `drag`/`release`, `wheel`, `pan`/`fling`, `tick`, `key`, `select`, `scroll_to`.
+
+DS2a settings, icon button, breadcrumb (immediate mode, colours/sizes via the adapter lib/fui/ds_look.fi; switch to ds_tokens there).
+
+- `ds_settings`: `panel_new`, `begin(p,c,x,y,w,px,py)`, `end(p,c)`, `y_end(p)`, `body_height(c,plain,with_sub)`.
+- `ds_settings` rows: `row_plain`, `row_chevron`, `row_toggle`, `row_combo(list "a|b")`, `row_slider(lo,hi,unit)`, `row_button(label)`, `row_value(value,chevron)` (all `(p,c,id,icon,title,sub,...)`, id < 48).
+- `ds_settings` groups: `group_begin(p,c,id,icon,title,sub,body_h) -> expanded`, `group_end`, `expanded`, `set_expanded`.
+- `ds_settings` input: `press`/`release`/`click` -> activated id, `fired` (consumed), `pointer(kind,x,y)` for the slider drag, `key`, `text`, `focus_id`, `set_focus`, `reset`.
+- `ds_settings` state: `val`, `set_val`, `set_enabled`, `enabled`, `revision`, `row_rect`, `control_rect`, `item_rect`, `combo_open`.
+- `ds_iconbtn`: `btns_new`, `begin(b,c,px,py)`, `add(b,c,id,x,y,glyph,name,big,enabled) -> size`, `add_tip(...,tip,...)`, `end(b,c)` (tooltip), `set_bounds`, `tip_shown`.
+- `ds_iconbtn` input: `press`/`release`/`click`, `hit`, `key`, `text`, `fired`, `focus_id`, `set_focus`, `rect_of`, `revision`; glyph helpers `back_glyph`, `forward_glyph`, `close_glyph`, `more_glyph`.
+- `ds_crumb`: `crumbs_new`, `begin(k,c,x,y,w,px,py)`, `draw(k,c,"a|b|c") -> height`, `end(k,c)` (overflow menu), `set_more_name`.
+- `ds_crumb` input: `press`/`release`/`click` -> absolute segment index, `key`, `text`, `fired`, `focus_id`, `set_focus`, `hidden_count`, `menu_open`, `close_menu`, `count`, `revision`.
