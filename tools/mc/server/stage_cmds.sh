@@ -43,3 +43,6 @@ else
     echo "  FAIL  commands: a bot produced no output"; head -3 "$W/cmd_bot_v.err" "$W/cmd_bot_f.err"; touch "$W/failed"
 fi
 wait $CF
+if [ -z "${MCS_NO_SEL:-}" ]; then
+    source "$TOOLS/stage_sel.sh"
+fi

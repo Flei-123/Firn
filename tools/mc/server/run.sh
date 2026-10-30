@@ -14,7 +14,7 @@
 #      execute if block per edit, player position and hotbar restored on rejoin, no warnings; wrong expectation is detected
 #   J  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
 #      declare_commands subtree (gamemode say teleport time tp) structurally equal; mutated frame / chat line is detected
-# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_KEEP=<dir> copies bot json and server logs there, MCS_ONLY_SAVE=1 runs only H, MCS_WORLD=<dir with level.dat>
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_ONLY_SEL=1 only the two-bot part of J, MCS_NO_SEL=1 skips it, MCS_KEEP=<dir> copies bot json and server logs there, MCS_ONLY_SAVE=1 runs only H, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -31,7 +31,7 @@ cleanup() {
     for p in $VPID $SVPID $XVPID $VEPID; do kill "$p" 2>/dev/null; done
     sleep 1
     for p in $VPID $SVPID $XVPID $VEPID; do kill -9 "$p" 2>/dev/null; done
-    if [ -n "${MCS_KEEP:-}" ]; then mkdir -p "$MCS_KEEP"; cp "$W"/*.json "$W"/*.out "$W"/vsave/server.out "$MCS_KEEP"/ 2>/dev/null; echo "kept logs in: $MCS_KEEP"; fi
+    if [ -n "${MCS_KEEP:-}" ]; then mkdir -p "$MCS_KEEP"; cp "$W"/*.json "$W"/*.out "$W"/vsave/server.out "$MCS_KEEP"/ 2>/dev/null; cp -r "$W"/sel_f "$W"/sel_v "$MCS_KEEP"/ 2>/dev/null; echo "kept logs in: $MCS_KEEP"; fi
     rm -rf "$W"
 }
 trap cleanup EXIT
@@ -66,7 +66,16 @@ gamemode=creative
 motd=vanilla
 PROPS
 echo "eula=true" > "$W/vanilla/eula.txt"
-echo '[{"uuid":"6ade27ea-d949-3c28-97f0-896712d0dd56","name":"CmdVan","level":4,"bypassesPlayerLimit":false}]' > "$W/vanilla/ops.json"
+python3 -I - "$W/vanilla/ops.json" CmdVan:4 OpBot:4 Op2:2 <<'PY'
+import hashlib, json, sys, uuid
+def offline(name):
+    b = bytearray(hashlib.md5(("OfflinePlayer:" + name).encode()).digest())
+    b[6] = (b[6] & 0x0f) | 0x30
+    b[8] = (b[8] & 0x3f) | 0x80
+    return str(uuid.UUID(bytes=bytes(b)))
+ops = [a.split(":") for a in sys.argv[2:]]
+json.dump([{"uuid": offline(n), "name": n, "level": int(l), "bypassesPlayerLimit": False} for n, l in ops], open(sys.argv[1], "w"))
+PY
 mkfifo "$W/vanilla/in"; exec 3<>"$W/vanilla/in"
 ( cd "$W/vanilla" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vanilla/in" > server.out 2>&1 ) &
 VPID=$!
@@ -75,6 +84,13 @@ $FIRNC --no-opt -o "$W/mcsrv_noopt" demos/mcsrv/main.fi 2>"$W/err" || { echo "  
 
 for i in $(seq 1 120); do grep -q 'Done (' "$W/vanilla/server.out" 2>/dev/null && break; sleep 1; done
 grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server did not start"; tail -5 "$W/vanilla/server.out"; exit 1; }
+
+if [ -n "${MCS_ONLY_SEL:-}" ]; then
+    source "$TOOLS/stage_sel.sh"
+    echo stop >&3
+    [ -f "$W/failed" ] && ERR=1
+    exit $ERR
+fi
 
 if [ -n "${MCS_ONLY_CMDS:-}" ]; then
     source "$TOOLS/stage_cmds.sh"

@@ -143,7 +143,8 @@ def main():
         print("  V " + l)
     for l in only_f:
         print("  F " + l)
-    sys.exit(1 if only_v or only_f or not van_lines else 0)
+    expect_empty = len(sys.argv) > 5 and sys.argv[5] == "empty"
+    sys.exit(1 if only_v or only_f or (bool(van_lines) == expect_empty) else 0)
 
 
 main()

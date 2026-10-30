@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_cmd_player.fi -- teleport and gamemode handlers: targets come from the selector resolver, messages follow vanilla.
+
+import std.rt
+import brigadier.bmem as m
+import brigadier.exc as ex
+import brigadier.argtype as at
+import mc.cmd.cmd_args as ca
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_select
+import mc.server.sv_chunks
+import mc.server.sv_cmd_state
+import mc.server.sv_cmd_util as cu
+import mc.server.v763.sv_fx_v763
+
+export { handlers_register }
+
+fn session_of(list: *mut m.Arr[u64], i: usize) -> *mut sv_state.Session {
+    let p: u64 = *m.arr_at[u64](list, i)
+    return p as *mut sv_state.Session
+}
+
+fn push_target(b: *mut rt.Buf, list: *mut m.Arr[u64]) {
+    let n: usize = m.arr_len[u64](list)
+    if n == 1 {
+        cu.push_name(b, session_of(list, 0))
+        return
+    }
+    rt.buf_push_dec_u64(b, n as u64)
+    sv_send.push_str(b, " entities")
+}
+
+fn settle(c: *mut sv_cmd_state.Cmds, t: *mut sv_state.Session, x: f64, y: f64, z: f64) {
+    (*t).x = x
+    (*t).y = y
+    (*t).z = z
+    (*t).cx = sv_chunks.chunk_of(x)
+    (*t).cz = sv_chunks.chunk_of(z)
+}
+
+fn move_to_location(c: *mut sv_cmd_state.Cmds, t: *mut sv_state.Session, cs: *mut ca.Coords, w: ca.V3) {
+    var flags: i64 = sv_fx_v763.REL_ROT
+    var px: f64 = w.x
+    var py: f64 = w.y
+    var pz: f64 = w.z
+    if (*cs).x.relative {
+        flags = flags | sv_fx_v763.REL_X
+        px = w.x - (*t).x
+    }
+    if (*cs).y.relative {
+        flags = flags | sv_fx_v763.REL_Y
+        py = w.y - (*t).y
+    }
+    if (*cs).z.relative {
+        flags = flags | sv_fx_v763.REL_Z
+        pz = w.z - (*t).z
+    }
+    settle(c, t, w.x, w.y, w.z)
+    sv_fx_v763.send_position_relative((*c).srv, t, px, py, pz, flags)
+    sv_chunks.chunks_send_center((*c).srv, t)
+}
+
+fn move_to_session(c: *mut sv_cmd_state.Cmds, t: *mut sv_state.Session, d: *mut sv_state.Session) {
+    let x: f64 = (*d).x
+    let y: f64 = (*d).y
+    let z: f64 = (*d).z
+    (*t).yaw = (*d).yaw
+    (*t).pitch = (*d).pitch
+    settle(c, t, x, y, z)
+    sv_fx_v763.send_position_to((*c).srv, t, x, y, z, (*d).yaw, (*d).pitch, 0)
+    sv_chunks.chunks_send_center((*c).srv, t)
+}
+
+fn teleport_coords(c: *mut sv_cmd_state.Cmds, ctx: u64, list: *mut m.Arr[u64], err: *mut ex.Exc) -> i32 {
+    let v: *mut at.Value = cu.arg_of(c, ctx, "location")
+    let cs: *mut ca.Coords = (*v).i as u64 as *mut ca.Coords
+    let s: *mut sv_state.Session = (*c).cur
+    if (*cs).local {
+        return cu.fail(c, err, "Local coordinates are not supported")
+    }
+    let w: ca.V3 = ca.coords_world(cs, (*s).x, (*s).y, (*s).z)
+    if !cu.in_bounds(w.x, w.y, w.z) {
+        return cu.fail(c, err, "Invalid position for teleport")
+    }
+    let n: usize = m.arr_len[u64](list)
+    var i: usize = 0
+    while i < n {
+        move_to_location(c, session_of(list, i), cs, w)
+        i = i + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "Teleported ")
+    push_target(&b, list)
+    sv_send.push_str(&b, " to ")
+    cu.push_fixed6(&b, w.x)
+    sv_send.push_str(&b, ", ")
+    cu.push_fixed6(&b, w.y)
+    sv_send.push_str(&b, ", ")
+    cu.push_fixed6(&b, w.z)
+    cu.reply_buf(c, &b)
+    rt.buf_free(&b)
+    return n as i32
+}
+
+fn teleport_session(c: *mut sv_cmd_state.Cmds, ctx: u64, list: *mut m.Arr[u64], err: *mut ex.Exc) -> i32 {
+    var dest: m.Arr[u64] = m.arr_new[u64]()
+    if !cu.resolve_targets(c, ctx, "destination", sv_select.MSG_NO_ENTITY, &dest, err) {
+        return 0
+    }
+    let d: *mut sv_state.Session = session_of(&dest, 0)
+    let n: usize = m.arr_len[u64](list)
+    var i: usize = 0
+    while i < n {
+        move_to_session(c, session_of(list, i), d)
+        i = i + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "Teleported ")
+    push_target(&b, list)
+    sv_send.push_str(&b, " to ")
+    cu.push_name(&b, d)
+    cu.reply_buf(c, &b)
+    rt.buf_free(&b)
+    return n as i32
+}
+
+fn self_list(c: *mut sv_cmd_state.Cmds) -> m.Arr[u64] {
+    var list: m.Arr[u64] = m.arr_new[u64]()
+    m.arr_push[u64](&(*c).work, &list, (*c).cur as u64)
+    return list
+}
+
+fn h_teleport_location(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = self_list(c)
+    return teleport_coords(c, ctx, &list, err)
+}
+
+fn h_teleport_destination(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = self_list(c)
+    return teleport_session(c, ctx, &list, err)
+}
+
+fn h_teleport_targets_location(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = m.arr_new[u64]()
+    if !cu.resolve_targets(c, ctx, "targets", sv_select.MSG_NO_ENTITY, &list, err) {
+        return 0
+    }
+    return teleport_coords(c, ctx, &list, err)
+}
+
+fn h_teleport_targets_destination(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = m.arr_new[u64]()
+    if !cu.resolve_targets(c, ctx, "targets", sv_select.MSG_NO_ENTITY, &list, err) {
+        return 0
+    }
+    return teleport_session(c, ctx, &list, err)
+}
+
+fn mode_label(mode: i32) -> str {
+    if mode == sv_fx_v763.GM_SURVIVAL { return "Survival Mode" }
+    if mode == sv_fx_v763.GM_CREATIVE { return "Creative Mode" }
+    if mode == sv_fx_v763.GM_ADVENTURE { return "Adventure Mode" }
+    return "Spectator Mode"
+}
+
+fn apply_mode(c: *mut sv_cmd_state.Cmds, list: *mut m.Arr[u64], mode: i32) -> i32 {
+    var changed: i32 = 0
+    let n: usize = m.arr_len[u64](list)
+    var i: usize = 0
+    while i < n {
+        let t: *mut sv_state.Session = session_of(list, i)
+        i = i + 1
+        if (*t).gamemode == mode {
+            continue
+        }
+        (*t).gamemode = mode
+        sv_fx_v763.send_game_mode((*c).srv, t)
+        changed = changed + 1
+        var b: rt.Buf = rt.buf_new()
+        if t as u64 == (*c).cur as u64 {
+            sv_send.push_str(&b, "Set own game mode to ")
+        } else {
+            var told: rt.Buf = rt.buf_new()
+            sv_send.push_str(&told, "Your game mode has been updated to ")
+            sv_send.push_str(&told, mode_label(mode))
+            sv_send.send_system_chat((*c).srv, t, rt.buf_ptr(&told), rt.buf_len(&told))
+            rt.buf_free(&told)
+            sv_send.push_str(&b, "Set ")
+            cu.push_name(&b, t)
+            sv_send.push_str(&b, "'s game mode to ")
+        }
+        sv_send.push_str(&b, mode_label(mode))
+        cu.reply_buf(c, &b)
+        rt.buf_free(&b)
+    }
+    return changed
+}
+
+fn h_gamemode_self(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = self_list(c)
+    return apply_mode(c, &list, (*cu.arg_of(c, ctx, "gamemode")).i as i32)
+}
+
+fn h_gamemode_target(cu_: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu_ as *mut sv_cmd_state.Cmds
+    var list: m.Arr[u64] = m.arr_new[u64]()
+    if !cu.resolve_targets(c, ctx, "target", sv_select.MSG_NO_PLAYER, &list, err) {
+        return 0
+    }
+    return apply_mode(c, &list, (*cu.arg_of(c, ctx, "gamemode")).i as i32)
+}
+
+fn handlers_register(c: *mut sv_cmd_state.Cmds) {
+    cu.add(c, "teleport location", h_teleport_location)
+    cu.add(c, "teleport destination", h_teleport_destination)
+    cu.add(c, "teleport targets location", h_teleport_targets_location)
+    cu.add(c, "teleport targets destination", h_teleport_targets_destination)
+    cu.add(c, "gamemode gamemode", h_gamemode_self)
+    cu.add(c, "gamemode gamemode target", h_gamemode_target)
+}
