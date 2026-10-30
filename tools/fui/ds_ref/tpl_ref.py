@@ -1,30 +1,52 @@
 #!/usr/bin/env python3
-import json
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONTS = os.path.abspath(os.path.join(HERE, "..", "..", "..", "lib", "fui", "fonts"))
-ICONS = os.environ.get("LUCIDE_NODES", "/root/icon-src/lucide/icon-nodes.json")
-
+LIB = os.path.abspath(os.path.join(HERE, "..", "..", "..", "lib", "fui"))
+NAME_MAP = {"monitor": "display", "wifi": "wifi_1", "lock": "lock", "moon": "moon", "globe": "globe", "sun": "brightness",
+            "clock": "clock", "hard-drive": "hard_drive", "chevron-down": "chevron_down", "chevron-right": "chevron_right",
+            "menu": "list", "search": "search", "arrow-left": "back", "sparkles": "sparkle", "palette": "personalize"}
 LIGHT = dict(base="#F3F3F3", surface="#F9F9F9", raised="#FFFFFF", button="#EEEEEE", border="#D0D0D0", sep="#E0E0E0",
              text="#1B1B1B", muted="#5C5C5C", disabled="#6B6B6B", on_accent="#FFFFFF", accent="#0067C0", select="#CCE4F7")
 DARK = dict(base="#202020", surface="#282828", raised="#303030", button="#3A3A3A", border="#4A4A4A", sep="#3A3A3A",
             text="#FFFFFF", muted="#C4C4C4", disabled="#B0B0B0", on_accent="#000000", accent="#4CC2FF", select="#264F78")
 
-NODES = None
+PATHS = {}
+NAMES = None
 
 
-def icon(name, x, y, size, color, sw=2):
-    global NODES
-    if NODES is None:
-        NODES = json.load(open(ICONS))
-    body = ""
-    for tag, attrs in NODES[name]:
-        a = " ".join('%s="%s"' % (k, v) for k, v in attrs.items())
-        body += "<%s %s/>" % (tag, a)
-    return ('<svg style="position:absolute;left:%spx;top:%spx" width="%s" height="%s" viewBox="0 0 24 24" fill="none" '
-            'stroke="%s" stroke-width="%s" stroke-linecap="round" stroke-linejoin="round">%s</svg>') % (x, y, size, size, color, sw, body)
+def load_names():
+    import re
+    src = open(os.path.join(LIB, "ds_icons_names.fi")).read()
+    body = src[src.index("fn name_of"):]
+    return {n: int(i) for i, n in re.findall(r'if id == (\d+) \{ return "([a-z0-9_]+)" \}', body)}
+
+
+def load_grade(g):
+    import re
+    src = open(os.path.join(LIB, "ds_icons_data%d.fi" % g)).read()
+    reg = src[src.index("fn regular"):src.index("fn filled")]
+    return {int(i): d for i, d in re.findall(r'if id == (\d+) \{\s*return "([^"]*)"', reg)}
+
+
+def icon(name, x, y, size, color):
+    global NAMES
+    if NAMES is None:
+        NAMES = load_names()
+        for g in (16, 20, 24):
+            PATHS[g] = load_grade(g)
+    iid = NAMES[NAME_MAP[name]]
+    grade = 24 if size > 22 else (20 if size > 18 else 16)
+    order = {16: (16, 20, 24), 20: (20, 24, 16), 24: (24, 20, 16)}[grade]
+    d = ""
+    for g in order:
+        d = PATHS[g].get(iid, "")
+        if d:
+            break
+    return ('<svg style="position:absolute;left:%spx;top:%spx" width="%s" height="%s" viewBox="0 0 24 24" fill="%s">'
+            '<path d="%s"/></svg>') % (x, y, size, size, color, d)
 
 
 def box(x, y, w, h, bg=None, r=0, border=None, extra=""):
@@ -141,7 +163,7 @@ DEMO = [
     ("row", ("clock", "Sleep when idle", "Save energy after 10 minutes", ("toggle", False))),
     ("row", ("hard-drive", "Storage", "Manage disks and cleanup", ("chevron",))),
 ]
-PAGES = [("monitor", "System"), ("wifi", "Network"), ("lock", "Privacy")]
+PAGES = [("monitor", "System"), ("wifi", "Network"), ("lock", "Privacy"), ("palette", "Personalization")]
 
 
 def settings_desktop(c, w, h):
@@ -264,6 +286,7 @@ TARGETS = {
     "settings_page": phone_page,
     "wizard_welcome": wizard_welcome,
     "wizard_region": wizard_region,
+    "wizard_region_m": wizard_region,
 }
 
 
