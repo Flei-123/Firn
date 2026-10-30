@@ -24,7 +24,7 @@ SECS=${BOT_SECONDS:-18}
 export BOT_SECONDS=$SECS
 BOT="node $TOOLS/bot.cjs"
 
-report() { while IFS= read -r l; do echo "$l"; case "$l" in *FAIL*) ERR=1;; esac; done; }
+report() { while IFS= read -r l; do echo "$l"; case "$l" in *FAIL*) touch "$W/failed";; esac; done; }
 
 mkdir -p "$W/vanilla"
 cat > "$W/vanilla/server.properties" <<PROPS
@@ -105,4 +105,5 @@ for f in f1 f2; do
   tps=$(echo "$line" | sed -n 's/.*tps_x100=\([0-9]*\).*/\1/p')
   if [ -n "$tps" ] && [ "$tps" -ge 1900 ]; then echo "  ok    graceful stop ($f): $line"; else echo "  FAIL  stop/tps ($f): '$line'"; ERR=1; fi
 done
+[ -f "$W/failed" ] && ERR=1
 exit $ERR
