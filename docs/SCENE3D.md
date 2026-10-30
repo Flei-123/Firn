@@ -22,3 +22,13 @@ anim: `camkeys_new/free/add(k,t,pos,target,fov)/camkeys_at(k,t,&cam)` (smoothste
 video: `video_opts_default()`, `video_parse_args(&opts, start)`, `video_run(&opts, frame_cb: fn(u64 ctx, u64 frame, f64 t, *mut Surface), ctx)`: frames t=i/fps for i in from..to, piped as raw RGBA into ffmpeg (libx264 yuv420p crf 21 faststart, no frame files on disk); `--still <t>` writes one PNG. CLI: --out --fps --duration --width --height --threads --ss --still --from --to.
 
 Video notes: frames are piped to ffmpeg (no frame files, 1280x720x48 s would be 3+ GB on disk); odd sizes are scaled to even; threads/ss are read by the program's own renderer from VideoOpts. Mini demo: tools/scene3d/mini.fi (gate program).
+
+## OVERLAY ALPHA
+
+- All overlay drawing (`ov_text*`, `ov_label*`, `ov_shapes.*`, `ov_px.px_blend`) composites straight-alpha "over" on a destination of ANY alpha (pixel `0xAABBGGRR`).
+- Destination alpha 0: result RGB = source RGB, alpha = coverage * colour alpha (no halo, no mixing with black). Opaque destination: unchanged from before (identical path).
+- Text: `overlay_new2` enables `fallback.ctx_set_straight(&ctx, true)`. The default of `lib/font/fallback.fi` is unchanged (`straight=false`: destination treated as opaque, alpha forced to 0xFF), so other users of `chain_paint` are unaffected. Bitmap (CBDT) glyphs still write opaque.
+- Shadow (`shadow=true`) is black with alpha `colour alpha * 150 / 255`, composited first, then the text; correct on transparent surfaces.
+- Transparent clear: `surface.surface_clear(&s, 0)`.
+- Label billboard recipe: `surface_new(w, h)` + `surface_clear(&s, 0)`, draw with `ov_text_ex` / `ov_shapes.ov_round_rect` (fill, border) at pixel coordinates (baseline y = top + size), then use the surface as a material texture. The renderer must honour the texture alpha (Material.tex_alpha, renderer worker) and treat texels as straight (non-premultiplied) alpha.
+- Pixels with alpha 0 may keep the text RGB (very low coverage); this is intended for filtering without dark fringes.
