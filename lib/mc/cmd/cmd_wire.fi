@@ -6,7 +6,7 @@ import std.math
 import brigadier.mem as m
 import mc.cmd.cmd_tree as ct
 
-export { wire_declare, parser_id }
+export { wire_declare, wire_declare_level, parser_id, push_varint }
 
 const FLAG_LITERAL: u8 = 1
 const FLAG_ARGUMENT: u8 = 2
@@ -74,6 +74,44 @@ fn parser_id(table: str, name: str) -> i32 {
     return 0 - 1
 }
 
+struct Vis {
+    root: u32,
+    levels: str,
+    level: i32,
+}
+
+fn table_level(levels: str, name: str) -> i32 {
+    var i: usize = 0
+    while i < levels.n {
+        var j: usize = i
+        while j < levels.n && rt.ld8(levels.p as u64, j) != 10 as u8 {
+            j = j + 1
+        }
+        var eq: usize = i
+        while eq < j && rt.ld8(levels.p as u64, eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq < j && eq - i == name.n && span_equals(levels, i, name.n, name) {
+            var v: i32 = 0
+            var k: usize = eq + 1
+            while k < j {
+                v = v * 10 + (rt.ld8(levels.p as u64, k) as i32 - 48)
+                k = k + 1
+            }
+            return v
+        }
+        i = j + 1
+    }
+    return 0
+}
+
+fn visible(d: *mut json.Json, v: *mut Vis, parent: u32, child: u32) -> bool {
+    if parent != (*v).root || (*v).levels.n == 0 {
+        return true
+    }
+    return table_level((*v).levels, ct.span_str(json.json_key(d, child))) <= (*v).level
+}
+
 fn index_of(order: *mut m.Arr[u32], node: u32) -> i32 {
     var i: usize = 0
     while i < m.arr_len[u32](order) {
@@ -111,19 +149,21 @@ fn redirect_target(d: *mut json.Json, root: u32, node: u32) -> u32 {
     return cur
 }
 
-fn enqueue_children(a: *mut m.Arena, d: *mut json.Json, node: u32, queue: *mut m.Arr[u32]) {
+fn enqueue_children(a: *mut m.Arena, d: *mut json.Json, v: *mut Vis, node: u32, queue: *mut m.Arr[u32]) {
     let ch: u32 = child_obj(d, node)
     if ch == json.JSON_NONE {
         return
     }
     var c: u32 = json.json_child(d, ch)
     while c != json.JSON_NONE {
-        m.arr_push[u32](a, queue, c)
+        if visible(d, v, node, c) {
+            m.arr_push[u32](a, queue, c)
+        }
         c = json.json_next(d, c)
     }
 }
 
-fn enumerate_nodes(a: *mut m.Arena, d: *mut json.Json, root: u32, order: *mut m.Arr[u32]) {
+fn enumerate_nodes(a: *mut m.Arena, d: *mut json.Json, v: *mut Vis, root: u32, order: *mut m.Arr[u32]) {
     var queue: m.Arr[u32] = m.arr_new[u32]()
     m.arr_push[u32](a, &queue, root)
     var head: usize = 0
@@ -134,7 +174,7 @@ fn enumerate_nodes(a: *mut m.Arena, d: *mut json.Json, root: u32, order: *mut m.
             continue
         }
         m.arr_push[u32](a, order, node)
-        enqueue_children(a, d, node, &queue)
+        enqueue_children(a, d, v, node, &queue)
         let rt_node: u32 = redirect_target(d, root, node)
         if rt_node != json.JSON_NONE {
             m.arr_push[u32](a, &queue, rt_node)
@@ -209,7 +249,7 @@ fn push_props(b: *mut rt.Buf, d: *mut json.Json, parser: str, props: u32) {
     }
 }
 
-fn push_node(b: *mut rt.Buf, d: *mut json.Json, root: u32, node: u32, key: str, order: *mut m.Arr[u32], parsers: str) -> bool {
+fn push_node(b: *mut rt.Buf, d: *mut json.Json, v: *mut Vis, root: u32, node: u32, key: str, order: *mut m.Arr[u32], parsers: str) -> bool {
     var kind: str = ""
     ct.jfind_str(d, node, "type", &kind)
     var flags: u8 = 0 as u8
@@ -224,10 +264,20 @@ fn push_node(b: *mut rt.Buf, d: *mut json.Json, root: u32, node: u32, key: str, 
     if ch == json.JSON_NONE {
         push_varint(b, 0 as u32)
     } else {
-        push_varint(b, json.json_count(d, ch) as u32)
+        var shown: u32 = 0
         var c: u32 = json.json_child(d, ch)
         while c != json.JSON_NONE {
-            push_varint(b, index_of(order, c) as u32)
+            if visible(d, v, node, c) {
+                shown = shown + 1
+            }
+            c = json.json_next(d, c)
+        }
+        push_varint(b, shown)
+        c = json.json_child(d, ch)
+        while c != json.JSON_NONE {
+            if visible(d, v, node, c) {
+                push_varint(b, index_of(order, c) as u32)
+            }
             c = json.json_next(d, c)
         }
     }
@@ -246,6 +296,10 @@ fn push_node(b: *mut rt.Buf, d: *mut json.Json, root: u32, node: u32, key: str, 
 }
 
 fn wire_declare(json_p: u64, json_n: usize, parsers: str, out: *mut rt.Buf) -> bool {
+    return wire_declare_level(json_p, json_n, parsers, "", 0, out)
+}
+
+fn wire_declare_level(json_p: u64, json_n: usize, parsers: str, levels: str, level: i32, out: *mut rt.Buf) -> bool {
     var d: json.Json = json.json_new()
     let parsed: bool = json.json_parse(&d, json_p, json_n) catch false
     if !parsed || !json.json_valid(&d) {
@@ -255,7 +309,8 @@ fn wire_declare(json_p: u64, json_n: usize, parsers: str, out: *mut rt.Buf) -> b
     var a: m.Arena = m.arena_new()
     var order: m.Arr[u32] = m.arr_new[u32]()
     let root: u32 = json.json_root(&d)
-    enumerate_nodes(&a, &d, root, &order)
+    var vis: Vis = Vis { root: root, levels: levels, level: level }
+    enumerate_nodes(&a, &d, &vis, root, &order)
     push_varint(out, m.arr_len[u32](&order) as u32)
     var ok: bool = true
     var i: usize = 0
@@ -263,7 +318,7 @@ fn wire_declare(json_p: u64, json_n: usize, parsers: str, out: *mut rt.Buf) -> b
         let node: u32 = *m.arr_at[u32](&order, i)
         var key: str = ""
         if node != root { key = ct.span_str(json.json_key(&d, node)) }
-        ok = push_node(out, &d, root, node, key, &order, parsers)
+        ok = push_node(out, &d, &vis, root, node, key, &order, parsers)
         i = i + 1
     }
     push_varint(out, 0 as u32)

@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_select.fi -- resolves a parsed entity selector (name, uuid, @p/@a/@r/@s/@e with filters) against the online players.
+
+import std.rt
+import brigadier.mem as m
+import brigadier.text as tx
+import mc.cmd.cmd_entity as ce
+import mc.cmd.cmd_range as cr
+import mc.server.sv_state
+import mc.server.sv_ops
+
+export { select_find, select_allowed, MSG_NO_PLAYER, MSG_NO_ENTITY, MSG_NOT_SINGLE, MSG_SELECTOR_DENIED, SELECTOR_LEVEL }
+
+const MSG_NO_PLAYER: str = "No player was found"
+const MSG_NO_ENTITY: str = "No entity was found"
+const MSG_NOT_SINGLE: str = "Only one entity is allowed, but the provided selector allows more than one"
+const MSG_SELECTOR_DENIED: str = "Selector not allowed"
+const SELECTOR_LEVEL: i32 = 2
+const PLAYER_TYPE: str = "minecraft:player"
+const HALF_WIDTH: f64 = 0.3
+const HEIGHT: f64 = 1.8
+const ROT_MAX_DEFAULT: f64 = 359.0
+
+struct Pos {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+fn lower_ascii(c: u32) -> u32 {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+fn name_equals(s: *mut sv_state.Session, t: tx.U16, nocase: bool) -> bool {
+    if t.n != (*s).name_n {
+        return false
+    }
+    var i: usize = 0
+    while i < t.n {
+        var a: u32 = (*s).name[i] as u32
+        var b: u32 = tx.u16_at(t, i)
+        if nocase {
+            a = lower_ascii(a)
+            b = lower_ascii(b)
+        }
+        if a != b {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn text_is(t: tx.U16, s: str) -> bool {
+    if t.n != s.n {
+        return false
+    }
+    var i: usize = 0
+    while i < t.n {
+        if tx.u16_at(t, i) != rt.ld8(s.p as u64, i) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn wrap_degrees(v: f64) -> f64 {
+    var f: f64 = v - 360.0 * ((v / 360.0) as i64 as f64)
+    if f >= 180.0 {
+        f = f - 360.0
+    }
+    if f < 0.0 - 180.0 {
+        f = f + 360.0
+    }
+    return f
+}
+
+fn range_has(g: *mut cr.Range, v: f64) -> bool {
+    if (*g).has_min && v < (*g).min {
+        return false
+    }
+    if (*g).has_max && v > (*g).max {
+        return false
+    }
+    return true
+}
+
+fn range_has_sqr(g: *mut cr.Range, v: f64) -> bool {
+    if (*g).has_min && v < (*g).min * (*g).min {
+        return false
+    }
+    if (*g).has_max && v > (*g).max * (*g).max {
+        return false
+    }
+    return true
+}
+
+fn range_unset(g: *mut cr.Range) -> bool {
+    return !(*g).has_min && !(*g).has_max
+}
+
+fn rotation_ok(g: *mut cr.Range, v: f64) -> bool {
+    if range_unset(g) {
+        return true
+    }
+    var lo: f64 = 0.0
+    var hi: f64 = ROT_MAX_DEFAULT
+    if (*g).has_min {
+        lo = wrap_degrees((*g).min)
+    }
+    if (*g).has_max {
+        hi = wrap_degrees((*g).max)
+    } else {
+        hi = wrap_degrees(hi)
+    }
+    let w: f64 = wrap_degrees(v)
+    if lo > hi {
+        return w >= lo || w <= hi
+    }
+    return w >= lo && w <= hi
+}
+
+fn axis_lo(d: f64) -> f64 {
+    if d < 0.0 {
+        return d
+    }
+    return 0.0
+}
+
+fn axis_hi(d: f64) -> f64 {
+    if d < 0.0 {
+        return 1.0
+    }
+    return d + 1.0
+}
+
+fn box_hit(sel: *mut ce.Sel, p: Pos, o: *mut sv_state.Session) -> bool {
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dz: f64 = 0.0
+    if (*sel).has_dx { dx = (*sel).dx }
+    if (*sel).has_dy { dy = (*sel).dy }
+    if (*sel).has_dz { dz = (*sel).dz }
+    let min_x: f64 = p.x + axis_lo(dx)
+    let max_x: f64 = p.x + axis_hi(dx)
+    let min_y: f64 = p.y + axis_lo(dy)
+    let max_y: f64 = p.y + axis_hi(dy)
+    let min_z: f64 = p.z + axis_lo(dz)
+    let max_z: f64 = p.z + axis_hi(dz)
+    return min_x < (*o).x + HALF_WIDTH && max_x > (*o).x - HALF_WIDTH && min_y < (*o).y + HEIGHT && max_y > (*o).y && min_z < (*o).z + HALF_WIDTH && max_z > (*o).z - HALF_WIDTH
+}
+
+fn dist_sq(o: *mut sv_state.Session, p: Pos) -> f64 {
+    let dx: f64 = (*o).x - p.x
+    let dy: f64 = (*o).y - p.y
+    let dz: f64 = (*o).z - p.z
+    return dx * dx + dy * dy + dz * dz
+}
+
+fn filter_ok(f: *mut ce.Filter, o: *mut sv_state.Session) -> bool {
+    var hit: bool = false
+    if (*f).kind == ce.F_NAME {
+        hit = name_equals(o, (*f).text, false)
+    } else if (*f).kind == ce.F_GAMEMODE {
+        hit = (*o).gamemode == (*f).num
+    } else if (*f).kind == ce.F_TEAM {
+        hit = (*f).text.n == 0
+    } else if (*f).kind == ce.F_TYPE {
+        hit = text_is((*f).text, PLAYER_TYPE)
+    } else if (*f).kind == ce.F_TYPE_TAG {
+        hit = false
+    } else if (*f).kind == ce.F_TAG {
+        hit = (*f).text.n == 0
+    } else {
+        return false
+    }
+    return hit != (*f).inverted
+}
+
+fn matches(sel: *mut ce.Sel, p: Pos, o: *mut sv_state.Session) -> bool {
+    if !range_unset(&(*sel).distance) && !range_has_sqr(&(*sel).distance, dist_sq(o, p)) {
+        return false
+    }
+    if ((*sel).has_dx || (*sel).has_dy || (*sel).has_dz) && !box_hit(sel, p, o) {
+        return false
+    }
+    if !range_has(&(*sel).level, 0.0) {
+        return false
+    }
+    if !rotation_ok(&(*sel).rot_x, (*o).pitch as f64) || !rotation_ok(&(*sel).rot_y, (*o).yaw as f64) {
+        return false
+    }
+    if (*sel).has_scores || (*sel).has_advancements {
+        return false
+    }
+    var i: usize = 0
+    while i < ce.sel_filter_count(sel) {
+        if !filter_ok(ce.sel_filter_at(sel, i), o) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn live(o: *mut sv_state.Session) -> bool {
+    return (*o).used && (*o).joined && !(*o).closing
+}
+
+fn find_by_name(srv: *mut sv_state.Server, t: tx.U16, out: *mut m.Arr[u64], a: *mut m.Arena) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if live(o) && name_equals(o, t, true) {
+            m.arr_push[u64](a, out, o as u64)
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn find_by_uuid(srv: *mut sv_state.Server, sel: *mut ce.Sel, out: *mut m.Arr[u64], a: *mut m.Arena) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if live(o) && (*o).uuid_hi as i64 == (*sel).uuid_hi && (*o).uuid_lo as i64 == (*sel).uuid_lo {
+            m.arr_push[u64](a, out, o as u64)
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn origin_of(sel: *mut ce.Sel, cur: *mut sv_state.Session) -> Pos {
+    var p: Pos = Pos { x: (*cur).x, y: (*cur).y, z: (*cur).z }
+    if (*sel).has_x { p.x = (*sel).x }
+    if (*sel).has_y { p.y = (*sel).y }
+    if (*sel).has_z { p.z = (*sel).z }
+    return p
+}
+
+fn sort_by_distance(a: *mut m.Arena, list: *mut m.Arr[u64], p: Pos, descending: bool) {
+    let n: usize = m.arr_len[u64](list)
+    var i: usize = 1
+    while i < n {
+        let cur: u64 = *m.arr_at[u64](list, i)
+        let key: f64 = dist_sq(cur as *mut sv_state.Session, p)
+        var j: usize = i
+        while j > 0 {
+            let prev: u64 = *m.arr_at[u64](list, j - 1)
+            let pk: f64 = dist_sq(prev as *mut sv_state.Session, p)
+            var move: bool = pk > key
+            if descending {
+                move = pk < key
+            }
+            if !move {
+                break
+            }
+            *m.arr_at[u64](list, j) = prev
+            j = j - 1
+        }
+        *m.arr_at[u64](list, j) = cur
+        i = i + 1
+    }
+}
+
+fn shuffle(srv: *mut sv_state.Server, list: *mut m.Arr[u64]) {
+    var seed: u64 = ((*srv).now_ms as u64) * 6364136223846793005 as u64 + 1442695040888963407 as u64
+    var i: usize = m.arr_len[u64](list)
+    while i > 1 {
+        seed = seed * 6364136223846793005 as u64 + 1442695040888963407 as u64
+        let j: usize = ((seed >> 33 as u64) % (i as u64)) as usize
+        let tmp: u64 = *m.arr_at[u64](list, i - 1)
+        *m.arr_at[u64](list, i - 1) = *m.arr_at[u64](list, j)
+        *m.arr_at[u64](list, j) = tmp
+        i = i - 1
+    }
+}
+
+fn select_allowed(srv: *mut sv_state.Server, cur: *mut sv_state.Session, sel: *mut ce.Sel) -> bool {
+    return !(*sel).uses_selectors || sv_ops.op_level(srv, cur) >= SELECTOR_LEVEL
+}
+
+fn select_find(srv: *mut sv_state.Server, cur: *mut sv_state.Session, sel: *mut ce.Sel, out: *mut m.Arr[u64], a: *mut m.Arena) {
+    if (*sel).kind == ce.SK_NAME {
+        find_by_name(srv, (*sel).player_name, out, a)
+        return
+    }
+    if (*sel).kind == ce.SK_UUID {
+        find_by_uuid(srv, sel, out, a)
+        return
+    }
+    let p: Pos = origin_of(sel, cur)
+    if (*sel).current_entity {
+        if matches(sel, p, cur) {
+            m.arr_push[u64](a, out, cur as u64)
+        }
+        return
+    }
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if live(o) && matches(sel, p, o) {
+            m.arr_push[u64](a, out, o as u64)
+        }
+        i = i + 1
+    }
+    if m.arr_len[u64](out) > 1 {
+        if (*sel).order == ce.OR_NEAREST {
+            sort_by_distance(a, out, p, false)
+        } else if (*sel).order == ce.OR_FURTHEST {
+            sort_by_distance(a, out, p, true)
+        } else if (*sel).order == ce.OR_RANDOM {
+            shuffle(srv, out)
+        }
+    }
+    if (*sel).max_results >= 0 && m.arr_len[u64](out) > (*sel).max_results as usize {
+        m.arr_truncate[u64](out, (*sel).max_results as usize)
+    }
+}

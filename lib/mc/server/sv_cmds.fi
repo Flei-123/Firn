@@ -18,13 +18,26 @@ import mc.server.sv_state
 import mc.server.sv_send
 import mc.server.sv_cmd_state
 import mc.server.sv_cmd_impl
+import mc.server.sv_cmd_tab
+import mc.server.sv_ops
 
-export { cmds_send_declare, cmds_execute, cmds_free }
+export { cmds_send_declare, cmds_execute, cmds_tab, cmds_free }
 
 const CONTEXT_AMOUNT: usize = 10
 
-fn hk_requirement(user: u64, source: i64, level: i32) -> bool {
-    return true
+fn level_of_name(name: str) -> i32 {
+    var v: i32 = 0
+    var i: usize = 0
+    while i < name.n {
+        v = v * 10 + (rt.ld8(name.p as u64, i) as i32 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn hk_requirement(user: u64, source: i64, req: i32) -> bool {
+    let c: *mut sv_cmd_state.Cmds = user as *mut sv_cmd_state.Cmds
+    return sv_ops.op_level((*c).srv, (*c).cur) >= level_of_name(ct.tree_level_name(&(*c).tree, req))
 }
 
 fn hk_command(user: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
@@ -57,15 +70,14 @@ fn hk_sugg(user: u64, ctx: u64, id: i32, b: u64) {
 fn hk_consumer(user: u64, ctx: u64, ok: bool, res: i32) {
 }
 
-fn th_suggest(user: u64, id: i32, b: u64) {
-}
-
 fn cmds_build(srv: *mut sv_state.Server) -> u64 {
     var json: str = ""
     var parsers: str = ""
     if !cmd_data.data_for((*srv).ver.protocol, &json, &parsers) {
         return 0
     }
+    let types: str = cmd_data.entity_types_for((*srv).ver.protocol)
+    let levels: str = cmd_data.levels_for((*srv).ver.protocol)
     let p: u64 = rt.heap_alloc(sv_cmd_state.cmds_size())
     let c: *mut sv_cmd_state.Cmds = p as *mut sv_cmd_state.Cmds
     (*c).srv = srv
@@ -73,17 +85,21 @@ fn cmds_build(srv: *mut sv_state.Server) -> u64 {
     (*c).a = m.arena_new()
     (*c).work = m.arena_new()
     (*c).tree = ct.tree_new(&(*c).a)
-    (*c).declare = rt.buf_new()
     (*c).handlers = m.arr_new[sv_cmd_state.Handler]()
     (*c).hooks = dp.Hooks { user: p, requirement: hk_requirement, command: hk_command, modifier: hk_modifier, sugg: hk_sugg,
-        consumer: hk_consumer, types: at.TypeHooks { user: ((&(*c).tree) as *mut ct.CmdTree) as u64, parse: ca.args_hook, suggest: th_suggest } }
+        consumer: hk_consumer, types: at.TypeHooks { user: ((&(*c).tree) as *mut ct.CmdTree) as u64, parse: ca.args_hook, suggest: sv_cmd_tab.type_suggest } }
+    (*c).json = json
+    (*c).parsers = parsers
+    (*c).levels = levels
+    (*c).tree.owner = p
     ct.tree_load(&(*c).tree, json.p as u64, json.n)
     ca.args_bind(&(*c).tree)
+    ca.args_set_entity_types(&(*c).tree, types)
+    ct.tree_apply_levels(&(*c).tree, levels)
     if (*srv).ver.protocol < 764 {
-        ca.args_set_quirks(&(*c).tree, ca.QUIRK_TIME_NO_CONTEXT)
+        ca.args_set_quirks(&(*c).tree, ca.QUIRK_TIME_NO_CONTEXT | ca.QUIRK_NO_AT_N)
     }
     sv_cmd_impl.handlers_register(c)
-    cw.wire_declare(json.p as u64, json.n, parsers, &(*c).declare)
     return p
 }
 
@@ -99,7 +115,6 @@ fn cmds_free(srv: *mut sv_state.Server) {
         return
     }
     let c: *mut sv_cmd_state.Cmds = (*srv).cmds as *mut sv_cmd_state.Cmds
-    rt.buf_free(&(*c).declare)
     m.arena_free(&(*c).work)
     m.arena_free(&(*c).a)
     rt.heap_free((*srv).cmds, sv_cmd_state.cmds_size())
@@ -108,10 +123,25 @@ fn cmds_free(srv: *mut sv_state.Server) {
 
 fn cmds_send_declare(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
     let c: *mut sv_cmd_state.Cmds = cmds_get(srv)
-    if c as u64 == 0 || rt.buf_len(&(*c).declare) == 0 {
+    if c as u64 == 0 {
         return
     }
-    sv_send.send_raw(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_DECLARE_COMMANDS, rt.buf_ptr(&(*c).declare), rt.buf_len(&(*c).declare))
+    var out: rt.Buf = rt.buf_new()
+    if cw.wire_declare_level((*c).json.p as u64, (*c).json.n, (*c).parsers, (*c).levels, sv_ops.op_level(srv, s), &out) {
+        sv_send.send_raw(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_DECLARE_COMMANDS, rt.buf_ptr(&out), rt.buf_len(&out))
+    }
+    rt.buf_free(&out)
+}
+
+fn cmds_tab(srv: *mut sv_state.Server, s: *mut sv_state.Session, txn: i32, p: u64, n: usize) {
+    let c: *mut sv_cmd_state.Cmds = cmds_get(srv)
+    if c as u64 == 0 {
+        return
+    }
+    m.arena_reset(&(*c).work)
+    (*c).cur = s
+    sv_cmd_tab.tab_handle(c, txn, p, n)
+    m.arena_reset(&(*c).work)
 }
 
 fn send_error_text(srv: *mut sv_state.Server, s: *mut sv_state.Session, text: str, color: str) {
