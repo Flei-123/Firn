@@ -1321,9 +1321,7 @@ fn scan(
                         continue;
                     }
                 }
-                // stack slots are mem2reg's business (and our own slots
-                // would be found again)
-                if matches!(cx.op_of(root).map(|i| &i.op), Some(Op::Alloca { .. })) {
+                if cx.private.contains(&root) {
                     continue;
                 }
                 let k = Cell { root, off, ty: i.ty };

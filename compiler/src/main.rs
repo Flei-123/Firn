@@ -70,6 +70,7 @@ mod licm;
 mod tailrec;
 mod guardsplit;
 mod phi;
+mod phi_exit;
 mod lower;
 mod lower_errors;
 mod lower_match;
