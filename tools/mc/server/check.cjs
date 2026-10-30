@@ -38,6 +38,42 @@ function checkSilent(label, r) {
   return ['  ' + (closed && /imed|timeout/i.test(reason) ? 'ok    ' : 'FAIL  ') + label + ': silent client dropped by keep alive timeout ' + reason.slice(0, 80)]
 }
 
+function total(h) { return Object.values(h).reduce((a, b) => a + b, 0) }
+
+function checkWorld(label, f, v) {
+  const lines = []
+  const add = (ok, msg) => lines.push((ok ? '  ok    ' : '  FAIL  ') + label + ': ' + msg)
+  const common = Object.keys(f.hists).filter((k) => v.hists[k] && total(f.hists[k]) > 0)
+  const same = common.filter((k) => same_h(f.hists[k], v.hists[k]))
+  const drift = common.filter((k) => !same.includes(k) && Math.abs(total(f.hists[k]) - total(v.hists[k])) > Math.max(8, total(v.hists[k]) * 0.005))
+  add(f.parse_ok && f.sections_ok && f.max_pad === 0, 'every column parses, data fully consumed, no padding (pad ' + f.max_pad + ')')
+  add(v.parse_ok && v.sections_ok, 'vanilla columns parse (padding up to ' + v.max_pad + ' bytes tolerated)')
+  add(common.length >= 100, common.length + ' saved columns present in both')
+  add(same.length >= common.length * 0.9, same.length + ' of ' + common.length + ' column histograms equal vanilla (rest differ by fluid/vegetation ticks)')
+  add(drift.length === 0, 'no column differs by more than 0.5% of its blocks (' + drift.slice(0, 3).join(' ') + ')')
+  add(f.position && Math.abs(f.position.x - 0.5) < 1e9 && f.position.y > 0, 'spawn from level.dat ' + JSON.stringify(f.position))
+  return lines
+}
+
+function same_h(a, b) { return JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort()) }
+
+if (process.argv[2] === 'world' || process.argv[2] === 'world-mutate') {
+  const f = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))
+  const v = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'))
+  if (process.argv[2] === 'world-mutate') {
+    for (const k of Object.keys(f.hists)) {
+      if (!v.hists[k]) continue
+      const id = Object.keys(f.hists[k])[0]
+      f.hists[k][id] += 100000
+    }
+    const lines = checkWorld('counter-check', f, v)
+    process.exit(lines.some((l) => l.indexOf('FAIL') !== -1) ? 0 : 1)
+  }
+  const lines = checkWorld(process.argv[5], f, v)
+  console.log(lines.join('\n'))
+  process.exit(lines.some((l) => l.indexOf('FAIL') !== -1) ? 1 : 0)
+}
+
 if (process.argv[2] === 'join') {
   const r = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))
   const ref = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'))

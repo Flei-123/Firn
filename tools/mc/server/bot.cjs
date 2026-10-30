@@ -57,7 +57,9 @@ function parseColumn(data) {
     }
     sections++
   }
-  return { sections, consumed: o.p === buf.length, hist }
+  let pad = 0
+  while (o.p + pad < buf.length && buf[o.p + pad] === 0) pad++
+  return { sections, consumed: o.p + pad === buf.length, pad, hist }
 }
 
 function out(obj) { console.log(JSON.stringify(obj)) }
@@ -73,8 +75,8 @@ if (scenario === 'status') {
   const opts = { host, port, username: name, auth: 'offline', version: VERSION, hideErrors: true }
   if (scenario === 'silent') opts.keepAlive = false
   const client = mc.createClient(opts)
-  const res = { order: [], keepalive: [], times: [], chunks: 0, columns: {}, hist: null, parse_ok: true, sections_ok: true,
-    center: [], system_chat: [], kicked: null, closed: false, position: null, errors: [] }
+  const res = { order: [], keepalive: [], times: [], chunks: 0, columns: {}, hist: null, max_pad: 0, parse_ok: true, sections_ok: true,
+    center: [], system_chat: [], kicked: null, closed: false, position: null, errors: [], hists: {}, bad_columns: [] }
   const t0 = Date.now()
   let moved = false
   let chatSent = false
@@ -83,8 +85,9 @@ if (scenario === 'status') {
   client.on('end', (r) => { res.closed = true; res.end_reason = String(r) })
   client.on('kick_disconnect', (p) => { res.kicked = p.reason })
   client.on('disconnect', (p) => { res.kicked = p.reason })
+  let finished = false
   client.on('packet', (data, meta) => {
-    if (meta.state !== 'play') return
+    if (meta.state !== 'play' || finished) return
     const now = Date.now() - t0
     if (!seen.has(meta.name) && res.order.length < 40) { seen.add(meta.name); res.order.push(meta.name) }
     if (meta.name === 'position') {
@@ -104,7 +107,9 @@ if (scenario === 'status') {
         res.columns[key] = true
         try {
           const c = parseColumn(data)
-          if (c.sections !== 24 || !c.consumed) res.sections_ok = false
+          if (c.pad > res.max_pad) res.max_pad = c.pad
+          if (c.sections !== 24 || !c.consumed) { res.sections_ok = false; res.bad_columns.push({ key, sections: c.sections, consumed: c.consumed, len: data.chunkData.length }) }
+          if (process.env.BOT_HISTS) res.hists[key] = c.hist
           if (data.x === 0 && data.z === 0) res.hist = c.hist
         } catch (e) { res.parse_ok = false; res.errors.push('parse ' + e.message) }
       }
@@ -112,7 +117,7 @@ if (scenario === 'status') {
       res.system_chat.push(meta.name + ':' + JSON.stringify(data).slice(0, 300))
     }
   })
-  const finish = (code) => { res.column_count = Object.keys(res.columns).length; delete res.columns; out(res); try { client.end('bye') } catch (e) {} ; setTimeout(() => process.exit(code), 100) }
+  const finish = (code) => { finished = true; if (!process.env.BOT_HISTS) delete res.hists; res.column_count = Object.keys(res.columns).length; delete res.columns; out(res); try { client.end('bye') } catch (e) {} ; setTimeout(() => process.exit(code), 100) }
   if (scenario === 'join') {
     const total = parseInt(process.env.BOT_SECONDS || '18', 10) * 1000
     setTimeout(() => {

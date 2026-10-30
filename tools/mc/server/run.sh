@@ -6,7 +6,11 @@
 #   D  chat echo, graceful stop (mcsrv --ticks N prints the tick statistics)
 #   E  a client that never answers keep alive is dropped (30 s timeout)
 #   F  negative controls: wrong protocol is refused; a mutated reference histogram must be detected
-#   G  real mcplay joins the Firn server and its screenshot is not empty (MC_SERVER_PLAY=1, needs Xvfb)
+#   G  real mcplay --singleplayer (integrated server in the same process): flat world and a saved vanilla world; joined log,
+#      spawn time, screenshot not empty and different between the two worlds, a missing world directory is refused
+#   H  saved world: the Firn server serves a real vanilla 1.20.1 world (cache $SAVE_CACHE/v1201, level.dat spawn, region files, palettes);
+#      per column block histograms equal the vanilla server running on a copy of the same world (random ticks off); mutated histogram is detected
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -16,10 +20,23 @@ export FIRNLIB="$REPO/lib"
 JARS=${MC_JARS:-/root/.w5/jars}
 TOOLS="$REPO/tools/mc/server"
 W=$(mktemp -d)
-trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$W"' EXIT
+VPID=""; SVPID=""; XVPID=""
+cleanup() {
+    exec 3>&- 4>&- 2>/dev/null
+    kill $(jobs -p) 2>/dev/null
+    for p in $VPID $SVPID $XVPID; do kill "$p" 2>/dev/null; done
+    sleep 1
+    for p in $VPID $SVPID $XVPID; do kill -9 "$p" 2>/dev/null; done
+    rm -rf "$W"
+}
+trap cleanup EXIT
 ERR=0
-VPORT=${MCS_VPORT:-25941}
-FPORT=${MCS_FPORT:-25942}
+free_port() { python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+VPORT=${MCS_VPORT:-$(free_port)}
+FPORT=${MCS_FPORT:-$(free_port)}
+FPORT2=$(free_port)
+SAVE_CACHE=${SAVE_CACHE:-/root/.w5/savetest}
+WORLD=${MCS_WORLD:-$SAVE_CACHE/v1201/world}
 SECS=${BOT_SECONDS:-18}
 export BOT_SECONDS=$SECS
 BOT="node $TOOLS/bot.cjs"
@@ -44,7 +61,9 @@ gamemode=creative
 motd=vanilla
 PROPS
 echo "eula=true" > "$W/vanilla/eula.txt"
-(cd "$W/vanilla" && java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui > server.out 2>&1 < <(sleep 400) &)
+mkfifo "$W/vanilla/in"; exec 3<>"$W/vanilla/in"
+( cd "$W/vanilla" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vanilla/in" > server.out 2>&1 ) &
+VPID=$!
 $FIRNC -o "$W/mcsrv" demos/mcsrv/main.fi 2>"$W/err" || { echo "  FAIL  compile mcsrv"; head -5 "$W/err"; exit 1; }
 $FIRNC --no-opt -o "$W/mcsrv_noopt" demos/mcsrv/main.fi 2>"$W/err" || { echo "  FAIL  compile mcsrv --no-opt"; head -5 "$W/err"; exit 1; }
 
@@ -54,7 +73,7 @@ grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server did n
 STOP_TICKS=${MCS_STOP_TICKS:-1300}
 "$W/mcsrv" --port "$FPORT" --ticks $STOP_TICKS > "$W/f1.out" 2>&1 &
 F1=$!
-"$W/mcsrv_noopt" --port $(( FPORT + 1 )) --ticks $STOP_TICKS > "$W/f2.out" 2>&1 &
+"$W/mcsrv_noopt" --port $FPORT2 --ticks $STOP_TICKS > "$W/f2.out" 2>&1 &
 F2=$!
 sleep 1
 
@@ -69,7 +88,7 @@ $BOT 127.0.0.1 $VPORT join VanBot > "$W/join_v.json" &
 J1=$!
 $BOT 127.0.0.1 $FPORT join FirnBot > "$W/join_f1.json" &
 J2=$!
-$BOT 127.0.0.1 $(( FPORT + 1 )) join FirnBot2 > "$W/join_f2.json" &
+$BOT 127.0.0.1 $FPORT2 join FirnBot2 > "$W/join_f2.json" &
 J3=$!
 BOT_SECONDS=52 $BOT 127.0.0.1 $VPORT silent VanSilent > "$W/sil_v.json" &
 S1=$!
@@ -105,5 +124,13 @@ for f in f1 f2; do
   tps=$(echo "$line" | sed -n 's/.*tps_x100=\([0-9]*\).*/\1/p')
   if [ -n "$tps" ] && [ "$tps" -ge 1900 ]; then echo "  ok    graceful stop ($f): $line"; else echo "  FAIL  stop/tps ($f): '$line'"; ERR=1; fi
 done
+echo stop >&3
+
+if [ -z "${MCS_NO_SAVE:-}" ]; then
+    source "$TOOLS/stage_save.sh"
+fi
+if [ -z "${MCS_NO_PLAY:-}" ]; then
+    source "$TOOLS/stage_play.sh"
+fi
 [ -f "$W/failed" ] && ERR=1
 exit $ERR
