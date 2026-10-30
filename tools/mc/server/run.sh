@@ -10,9 +10,11 @@
 #      spawn time, screenshot not empty and different between the two worlds, a missing world directory is refused
 #   H  saved world: the Firn server serves a real vanilla 1.20.1 world (cache $SAVE_CACHE/v1201, level.dat spawn, region files, palettes);
 #      per column block histograms equal the vanilla server running on a copy of the same world (random ticks off); mutated histogram is detected
-#   I  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
+#   I  block edits: a bot digs and places (acks, block_change), the Firn server saves on stop, vanilla 1.20.1 loads the saved copy:
+#      execute if block per edit, player position and hotbar restored on rejoin, no warnings; wrong expectation is detected
+#   J  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
 #      declare_commands subtree (gamemode say teleport time tp) structurally equal; mutated frame / chat line is detected
-# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_CMDS=1 skips I, MCS_ONLY_CMDS=1 runs only I, MCS_WORLD=<dir with level.dat>
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -22,13 +24,13 @@ export FIRNLIB="$REPO/lib"
 JARS=${MC_JARS:-/root/.w5/jars}
 TOOLS="$REPO/tools/mc/server"
 W=$(mktemp -d)
-VPID=""; SVPID=""; XVPID=""
+VPID=""; SVPID=""; XVPID=""; VEPID=""
 cleanup() {
     exec 3>&- 4>&- 2>/dev/null
     kill $(jobs -p) 2>/dev/null
-    for p in $VPID $SVPID $XVPID; do kill "$p" 2>/dev/null; done
+    for p in $VPID $SVPID $XVPID $VEPID; do kill "$p" 2>/dev/null; done
     sleep 1
-    for p in $VPID $SVPID $XVPID; do kill -9 "$p" 2>/dev/null; done
+    for p in $VPID $SVPID $XVPID $VEPID; do kill -9 "$p" 2>/dev/null; done
     rm -rf "$W"
 }
 trap cleanup EXIT
@@ -141,6 +143,9 @@ echo stop >&3
 
 if [ -z "${MCS_NO_SAVE:-}" ]; then
     source "$TOOLS/stage_save.sh"
+fi
+if [ -z "${MCS_NO_EDIT:-}" ]; then
+    source "$TOOLS/stage_edit.sh"
 fi
 if [ -z "${MCS_NO_PLAY:-}" ]; then
     source "$TOOLS/stage_play.sh"

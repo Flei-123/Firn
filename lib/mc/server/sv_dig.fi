@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_dig.fi -- block interaction of a player: dig, place, creative slots, held slot; changes go into the edit overlay and to all players.
+
+import std.rt
+import std.bytes
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_registry
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_edits
+import mc.server.sv_world
+
+export { dig_handle, world_peek, pos_unpack }
+
+const STATUS_START: i32 = 0
+const STATUS_CANCEL: i32 = 1
+const STATUS_FINISH: i32 = 2
+const HAND_MAIN: i32 = 0
+const REACH_SQ: f64 = 64.0
+const EYE_HEIGHT: f64 = 1.62
+const HOTBAR_FIRST: i32 = 36
+const HOTBAR_COUNT: i32 = 9
+
+fn pos_unpack(v: i64, x: *mut i32, y: *mut i32, z: *mut i32) {
+    let u: u64 = v as u64
+    var rx: i64 = ((u >> 38 as u64) & 67108863 as u64) as i64
+    var rz: i64 = ((u >> 12 as u64) & 67108863 as u64) as i64
+    var ry: i64 = (u & 4095 as u64) as i64
+    if rx >= 33554432 { rx = rx - 67108864 }
+    if rz >= 33554432 { rz = rz - 67108864 }
+    if ry >= 2048 { ry = ry - 4096 }
+    *x = rx as i32
+    *y = ry as i32
+    *z = rz as i32
+}
+
+fn in_height(srv: *mut sv_state.Server, y: i32) -> bool {
+    return y >= (*srv).world.min_y && y < (*srv).world.min_y + (*srv).world.height
+}
+
+fn world_peek(srv: *mut sv_state.Server, x: i32, y: i32, z: i32) -> i32 {
+    if !in_height(srv, y) { return 0 - 1 }
+    var v: i32 = 0
+    if sv_edits.edits_get(&(*srv).edits, x, y, z, &v) { return v }
+    let cx: i32 = x >> 4
+    let cz: i32 = z >> 4
+    if !(*srv).peek_ok || (*srv).peek_cx != cx || (*srv).peek_cz != cz {
+        if !sv_world.world_fill(&(*srv).world, cx, cz, (*srv).peek) { return 0 - 1 }
+        (*srv).peek_ok = true
+        (*srv).peek_cx = cx
+        (*srv).peek_cz = cz
+    }
+    let idx: usize = (((y - (*srv).world.min_y) as usize) * 16 + ((z & 15) as usize)) * 16 + ((x & 15) as usize)
+    return rt.ld16((*srv).peek, idx) as i32
+}
+
+fn in_reach(s: *mut sv_state.Session, x: i32, y: i32, z: i32) -> bool {
+    let dx: f64 = (x as f64) + 0.5 - (*s).x
+    let dy: f64 = (y as f64) + 0.5 - ((*s).y + EYE_HEIGHT)
+    let dz: f64 = (z as f64) + 0.5 - (*s).z
+    return dx * dx + dy * dy + dz * dz <= REACH_SQ
+}
+
+fn send_change(srv: *mut sv_state.Server, o: *mut sv_state.Session, x: i32, y: i32, z: i32, state: i32) {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "location.x", x as i64)
+    mc_encode.vals_i64(&v, "location.y", y as i64)
+    mc_encode.vals_i64(&v, "location.z", z as i64)
+    mc_encode.vals_i64(&v, "type", state as i64)
+    sv_send.send_vals(srv, o, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_BLOCK_CHANGE, &v)
+    rt.buf_free(&v)
+}
+
+fn broadcast_change(srv: *mut sv_state.Server, x: i32, y: i32, z: i32, state: i32) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let o: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*o).used && (*o).joined && !(*o).closing { send_change(srv, o, x, y, z, state) }
+        i = i + 1
+    }
+}
+
+fn send_ack(srv: *mut sv_state.Server, s: *mut sv_state.Session, seq: i32) {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "sequenceId", seq as i64)
+    sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_ACK_BLOCK_CHANGE, &v)
+    rt.buf_free(&v)
+}
+
+fn apply_change(srv: *mut sv_state.Server, x: i32, y: i32, z: i32, state: i32) {
+    sv_edits.edits_set(&(*srv).edits, x, y, z, state)
+    broadcast_change(srv, x, y, z, state)
+}
+
+fn field_byte(srv: *mut sv_state.Server, id: i32, name: str, body: *mut bytes.Bytes, out: *mut i32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !sv_send.field_view(srv, mc_version.ST_PLAY, id, name, body, &v) || v.len != 1 { return false }
+    *out = (rt.ld8(v.data, 0) as i32)
+    if *out >= 128 { *out = *out - 256 }
+    return true
+}
+
+fn field_short(srv: *mut sv_state.Server, id: i32, name: str, body: *mut bytes.Bytes, out: *mut i32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !sv_send.field_view(srv, mc_version.ST_PLAY, id, name, body, &v) || v.len != 2 { return false }
+    var r: i32 = ((rt.ld8(v.data, 0) as i32) << 8) | (rt.ld8(v.data, 1) as i32)
+    if r >= 32768 { r = r - 65536 }
+    *out = r
+    return true
+}
+
+fn field_position(srv: *mut sv_state.Server, id: i32, body: *mut bytes.Bytes, x: *mut i32, y: *mut i32, z: *mut i32) -> bool {
+    var raw: i64 = 0
+    if !sv_send.field_i64(srv, mc_version.ST_PLAY, id, "location", body, &raw) { return false }
+    pos_unpack(raw, x, y, z)
+    return true
+}
+
+fn handle_dig(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    var status: i32 = 0
+    var seq: i32 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    var z: i32 = 0
+    if !sv_send.field_varint(srv, mc_version.ST_PLAY, id, "status", body, &status) { return }
+    if !field_position(srv, id, body, &x, &y, &z) { return }
+    sv_send.field_varint(srv, mc_version.ST_PLAY, id, "sequence", body, &seq)
+    if status > STATUS_FINISH { return }
+    let creative: bool = (*srv).cfg.game_mode == 1
+    let breaks: bool = (creative && status == STATUS_START) || (!creative && status == STATUS_FINISH)
+    if breaks && in_height(srv, y) && in_reach(s, x, y, z) {
+        if world_peek(srv, x, y, z) > 0 { apply_change(srv, x, y, z, 0) }
+    } else if in_height(srv, y) {
+        let cur: i32 = world_peek(srv, x, y, z)
+        if cur >= 0 { send_change(srv, s, x, y, z, cur) }
+    }
+    send_ack(srv, s, seq)
+}
+
+fn name_in(reg: *mut mc_registry.Registry, state: i32, want: str) -> bool {
+    var l: usize = 0
+    let p: u64 = mc_registry.reg_block_name(reg, mc_registry.reg_block_of_state(reg, state), &l)
+    return l == want.n && rt.mem_eq(p, want.p as u64, l)
+}
+
+fn replaceable(reg: *mut mc_registry.Registry, state: i32) -> bool {
+    if state == 0 { return true }
+    return name_in(reg, state, "water") || name_in(reg, state, "lava") || name_in(reg, state, "cave_air") || name_in(reg, state, "void_air") || name_in(reg, state, "grass") || name_in(reg, state, "tall_grass")
+}
+
+fn face_offset(face: i32, dx: *mut i32, dy: *mut i32, dz: *mut i32) {
+    *dx = 0
+    *dy = 0
+    *dz = 0
+    if face == 0 { *dy = 0 - 1 }
+    if face == 1 { *dy = 1 }
+    if face == 2 { *dz = 0 - 1 }
+    if face == 3 { *dz = 1 }
+    if face == 4 { *dx = 0 - 1 }
+    if face == 5 { *dx = 1 }
+}
+
+fn held_block_state(reg: *mut mc_registry.Registry, s: *mut sv_state.Session) -> i32 {
+    if (*s).held < 0 || (*s).held >= HOTBAR_COUNT { return 0 - 1 }
+    let item: i32 = (*s).hotbar[(*s).held as usize]
+    if item <= 0 { return 0 - 1 }
+    var l: usize = 0
+    let p: u64 = mc_registry.reg_item_name(reg, item, &l)
+    let b: i32 = mc_registry.reg_block_by_name(reg, p, l)
+    if b < 0 { return 0 - 1 }
+    return mc_registry.reg_block_default_state(reg, b)
+}
+
+fn handle_place(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    var hand: i32 = 0
+    var face: i32 = 0
+    var seq: i32 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    var z: i32 = 0
+    if !sv_send.field_varint(srv, mc_version.ST_PLAY, id, "hand", body, &hand) { return }
+    if !field_position(srv, id, body, &x, &y, &z) { return }
+    if !sv_send.field_varint(srv, mc_version.ST_PLAY, id, "direction", body, &face) { return }
+    sv_send.field_varint(srv, mc_version.ST_PLAY, id, "sequence", body, &seq)
+    var dx: i32 = 0
+    var dy: i32 = 0
+    var dz: i32 = 0
+    face_offset(face, &dx, &dy, &dz)
+    let tx: i32 = x + dx
+    let ty: i32 = y + dy
+    let tz: i32 = z + dz
+    var reg: mc_registry.Registry = (*srv).ver.registry_of()
+    let state: i32 = held_block_state(&reg, s)
+    if hand == HAND_MAIN && state > 0 && in_height(srv, ty) && in_reach(s, tx, ty, tz) && face >= 0 && face <= 5 {
+        let cur: i32 = world_peek(srv, tx, ty, tz)
+        if cur >= 0 && replaceable(&reg, cur) {
+            apply_change(srv, tx, ty, tz, state)
+            send_ack(srv, s, seq)
+            return
+        }
+    }
+    if in_height(srv, ty) {
+        let cur: i32 = world_peek(srv, tx, ty, tz)
+        if cur >= 0 { send_change(srv, s, tx, ty, tz, cur) }
+    }
+    send_ack(srv, s, seq)
+}
+
+fn handle_creative_slot(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    if (*srv).cfg.game_mode != 1 { return }
+    var slot: i32 = 0
+    if !field_short(srv, id, "slot", body, &slot) { return }
+    if slot < HOTBAR_FIRST || slot >= HOTBAR_FIRST + HOTBAR_COUNT { return }
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !sv_send.field_view(srv, mc_version.ST_PLAY, id, "item", body, &v) { return }
+    var item: i32 = 0
+    if v.len > 0 && rt.ld8(v.data, 0) != 0 as u8 {
+        v.pos = 1
+        item = bytes.get_varint(&v) catch 0
+    }
+    (*s).hotbar[(slot - HOTBAR_FIRST) as usize] = item
+}
+
+fn handle_held(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
+    var slot: i32 = 0
+    if !field_short(srv, id, "slotId", body, &slot) { return }
+    if slot >= 0 && slot < HOTBAR_COUNT { (*s).held = slot }
+}
+
+fn dig_handle(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) -> bool {
+    if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_BLOCK_DIG) {
+        handle_dig(srv, s, id, body)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_BLOCK_PLACE) {
+        handle_place(srv, s, id, body)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_SET_CREATIVE_SLOT) {
+        handle_creative_slot(srv, s, id, body)
+    } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_HELD_ITEM_SLOT) {
+        handle_held(srv, s, id, body)
+    } else {
+        return false
+    }
+    return true
+}

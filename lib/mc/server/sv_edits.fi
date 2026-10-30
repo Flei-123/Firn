@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_edits.fi -- block edits of the running world: position -> state id overlay and the set of dirty chunks.
+
+import std.rt
+
+export {
+    Edits, edits_new, edits_free, edits_set, edits_get, edits_apply_column, edits_dirty_count, edits_dirty_at,
+    edits_clear_dirty, edits_has_in_section, edits_section_mask, edits_total, pos_key, key_x, key_y, key_z, chunk_key, chunk_key_x, chunk_key_z,
+}
+
+const EMPTY: u64 = 0
+const MIN_CAP: usize = 256
+
+struct Edits {
+    keys: u64,
+    vals: u64,
+    cap: usize,
+    used: usize,
+    dirty: u64,
+    pend: u64,
+    dirty_cap: usize,
+    dirty_used: usize,
+}
+
+fn pos_key(x: i32, y: i32, z: i32) -> u64 {
+    let ux: u64 = ((x as i64) & 67108863) as u64
+    let uz: u64 = ((z as i64) & 67108863) as u64
+    let uy: u64 = (((y + 2048) as i64) & 4095) as u64
+    return ((ux << 38 as u64) | (uz << 12 as u64) | uy) + 1 as u64
+}
+
+fn key_x(k: u64) -> i32 {
+    let raw: i64 = (((k - 1 as u64) >> 38 as u64) & 67108863 as u64) as i64
+    if raw >= 33554432 { return (raw - 67108864) as i32 }
+    return raw as i32
+}
+
+fn key_z(k: u64) -> i32 {
+    let raw: i64 = (((k - 1 as u64) >> 12 as u64) & 67108863 as u64) as i64
+    if raw >= 33554432 { return (raw - 67108864) as i32 }
+    return raw as i32
+}
+
+fn key_y(k: u64) -> i32 {
+    return ((((k - 1 as u64) & 4095 as u64) as i64) - 2048) as i32
+}
+
+fn chunk_key(cx: i32, cz: i32) -> u64 {
+    return (((cx + 1073741824) as u64) << 32 as u64) | ((cz + 1073741824) as u64)
+}
+
+fn chunk_key_x(k: u64) -> i32 { return ((k >> 32 as u64) as i32) - 1073741824 }
+
+fn chunk_key_z(k: u64) -> i32 { return ((k & 4294967295 as u64) as i32) - 1073741824 }
+
+fn mix(k: u64) -> u64 {
+    var h: u64 = k *% 11400714819323198485 as u64
+    h = h ^ (h >> 29 as u64)
+    return h
+}
+
+fn edits_new() -> Edits {
+    var e: Edits = Edits { keys: rt.heap_alloc(MIN_CAP * 8), vals: rt.heap_alloc(MIN_CAP * 8), cap: MIN_CAP, used: 0,
+        dirty: rt.heap_alloc(MIN_CAP * 8), pend: rt.heap_alloc(MIN_CAP * 8), dirty_cap: MIN_CAP, dirty_used: 0 }
+    rt.mem_set(e.keys, 0 as u8, MIN_CAP * 8)
+    rt.mem_set(e.vals, 0 as u8, MIN_CAP * 8)
+    rt.mem_set(e.dirty, 0 as u8, MIN_CAP * 8)
+    rt.mem_set(e.pend, 0 as u8, MIN_CAP * 8)
+    return e
+}
+
+fn edits_free(e: *mut Edits) {
+    rt.heap_free((*e).keys, (*e).cap * 8)
+    rt.heap_free((*e).vals, (*e).cap * 8)
+    rt.heap_free((*e).dirty, (*e).dirty_cap * 8)
+    rt.heap_free((*e).pend, (*e).dirty_cap * 8)
+}
+
+fn slot_of(keys: u64, cap: usize, k: u64) -> usize {
+    var i: usize = (mix(k) & ((cap - 1) as u64)) as usize
+    while rt.ld64(keys, i) != EMPTY && rt.ld64(keys, i) != k {
+        i = (i + 1) & (cap - 1)
+    }
+    return i
+}
+
+fn grow_edits(e: *mut Edits) {
+    let ncap: usize = (*e).cap * 2
+    let nk: u64 = rt.heap_alloc(ncap * 8)
+    let nv: u64 = rt.heap_alloc(ncap * 8)
+    rt.mem_set(nk, 0 as u8, ncap * 8)
+    rt.mem_set(nv, 0 as u8, ncap * 8)
+    var i: usize = 0
+    while i < (*e).cap {
+        let k: u64 = rt.ld64((*e).keys, i)
+        if k != EMPTY {
+            let s: usize = slot_of(nk, ncap, k)
+            rt.st64(nk, s, k)
+            rt.st64(nv, s, rt.ld64((*e).vals, i))
+        }
+        i = i + 1
+    }
+    rt.heap_free((*e).keys, (*e).cap * 8)
+    rt.heap_free((*e).vals, (*e).cap * 8)
+    (*e).keys = nk
+    (*e).vals = nv
+    (*e).cap = ncap
+}
+
+fn grow_dirty(e: *mut Edits) {
+    let ncap: usize = (*e).dirty_cap * 2
+    let nd: u64 = rt.heap_alloc(ncap * 8)
+    let np: u64 = rt.heap_alloc(ncap * 8)
+    rt.mem_set(nd, 0 as u8, ncap * 8)
+    rt.mem_set(np, 0 as u8, ncap * 8)
+    var i: usize = 0
+    while i < (*e).dirty_cap {
+        let k: u64 = rt.ld64((*e).dirty, i)
+        if k != EMPTY {
+            let s: usize = slot_of(nd, ncap, k)
+            rt.st64(nd, s, k)
+            rt.st64(np, s, rt.ld64((*e).pend, i))
+        }
+        i = i + 1
+    }
+    rt.heap_free((*e).dirty, (*e).dirty_cap * 8)
+    rt.heap_free((*e).pend, (*e).dirty_cap * 8)
+    (*e).dirty = nd
+    (*e).pend = np
+    (*e).dirty_cap = ncap
+}
+
+fn mark_dirty(e: *mut Edits, cx: i32, cz: i32) {
+    let k: u64 = chunk_key(cx, cz)
+    let s: usize = slot_of((*e).dirty, (*e).dirty_cap, k)
+    rt.st64((*e).pend, s, 1 as u64)
+    if rt.ld64((*e).dirty, s) == k { return }
+    rt.st64((*e).dirty, s, k)
+    (*e).dirty_used = (*e).dirty_used + 1
+    if (*e).dirty_used * 4 > (*e).dirty_cap * 3 { grow_dirty(e) }
+}
+
+fn edits_set(e: *mut Edits, x: i32, y: i32, z: i32, state: i32) {
+    let k: u64 = pos_key(x, y, z)
+    let s: usize = slot_of((*e).keys, (*e).cap, k)
+    if rt.ld64((*e).keys, s) != k {
+        rt.st64((*e).keys, s, k)
+        (*e).used = (*e).used + 1
+    }
+    rt.st64((*e).vals, s, state as u64)
+    mark_dirty(e, x >> 4, z >> 4)
+    if (*e).used * 4 > (*e).cap * 3 { grow_edits(e) }
+}
+
+fn edits_get(e: *mut Edits, x: i32, y: i32, z: i32, out: *mut i32) -> bool {
+    let k: u64 = pos_key(x, y, z)
+    let s: usize = slot_of((*e).keys, (*e).cap, k)
+    if rt.ld64((*e).keys, s) != k { return false }
+    *out = rt.ld64((*e).vals, s) as i32
+    return true
+}
+
+fn edits_total(e: *mut Edits) -> usize { return (*e).used }
+
+fn edits_apply_column(e: *mut Edits, cx: i32, cz: i32, min_y: i32, height: i32, blocks: u64) {
+    if (*e).used == 0 { return }
+    let dk: u64 = chunk_key(cx, cz)
+    if rt.ld64((*e).dirty, slot_of((*e).dirty, (*e).dirty_cap, dk)) != dk { return }
+    var i: usize = 0
+    while i < (*e).cap {
+        let k: u64 = rt.ld64((*e).keys, i)
+        if k != EMPTY {
+            let x: i32 = key_x(k)
+            let z: i32 = key_z(k)
+            let y: i32 = key_y(k)
+            if (x >> 4) == cx && (z >> 4) == cz && y >= min_y && y < min_y + height {
+                let idx: usize = (((y - min_y) as usize) * 16 + ((z & 15) as usize)) * 16 + ((x & 15) as usize)
+                rt.st16(blocks, idx, rt.ld64((*e).vals, i) as u16)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn edits_has_in_section(e: *mut Edits, cx: i32, cz: i32, sec_y: i32) -> bool {
+    var i: usize = 0
+    while i < (*e).cap {
+        let k: u64 = rt.ld64((*e).keys, i)
+        if k != EMPTY && (key_x(k) >> 4) == cx && (key_z(k) >> 4) == cz && (key_y(k) >> 4) == sec_y { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn edits_section_mask(e: *mut Edits, cx: i32, cz: i32, lo_sec: i32) -> u64 {
+    var mask: u64 = 0
+    var i: usize = 0
+    while i < (*e).cap {
+        let k: u64 = rt.ld64((*e).keys, i)
+        if k != EMPTY && (key_x(k) >> 4) == cx && (key_z(k) >> 4) == cz {
+            mask = mask | ((1 as u64) << (((key_y(k) >> 4) - lo_sec) as u64))
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+fn edits_dirty_count(e: *mut Edits) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*e).dirty_cap {
+        if rt.ld64((*e).dirty, i) != EMPTY && rt.ld64((*e).pend, i) != 0 as u64 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn edits_dirty_at(e: *mut Edits, n: usize) -> u64 {
+    var seen: usize = 0
+    var i: usize = 0
+    while i < (*e).dirty_cap {
+        let k: u64 = rt.ld64((*e).dirty, i)
+        if k != EMPTY && rt.ld64((*e).pend, i) != 0 as u64 {
+            if seen == n { return k }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return EMPTY
+}
+
+fn edits_clear_dirty(e: *mut Edits) {
+    rt.mem_set((*e).pend, 0 as u8, (*e).dirty_cap * 8)
+}

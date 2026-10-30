@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_persist_chunks.fi -- writes the edited chunks of a saved world back into its region files.
+
+import std.rt
+import std.bytes
+import std.time
+import mc.mc_anvil
+import mc.mc_nbt
+import mc.mc_registry
+import mc.save.save_world
+import mc.save.save_chunk
+import mc.save.save_patch
+import mc.save.save_store
+import mc.server.sv_state
+import mc.server.sv_edits
+import mc.server.sv_world
+
+export { persist_chunks }
+
+fn world_dir_str(srv: *mut sv_state.Server) -> str {
+    return str { p: (*srv).world_dir.ptr as *mut u8, n: (*srv).world_dir.len }
+}
+
+fn hook_edited(ctx: u64, x: i32, y: i32, z: i32) -> bool {
+    var v: i32 = 0
+    return sv_edits.edits_get(ctx as *mut sv_edits.Edits, x, y, z, &v)
+}
+
+fn patch_into(srv: *mut sv_state.Server, ck: *mut save_chunk.Chunk, cx: i32, cz: i32, out: *mut bytes.Bytes) -> bool {
+    if !save_chunk.chunk_is_full(ck) { return false }
+    if !sv_world.world_fill(&(*srv).world, cx, cz, (*srv).column) { return false }
+    sv_edits.edits_apply_column(&(*srv).edits, cx, cz, (*srv).world.min_y, (*srv).world.height, (*srv).column)
+    let mask: u64 = sv_edits.edits_section_mask(&(*srv).edits, cx, cz, save_patch.SEC_LO)
+    var reg: mc_registry.Registry = (*srv).ver.registry_of()
+    let hooks: save_patch.PatchHooks = save_patch.PatchHooks { ctx: (&(*srv).edits) as u64, edited: hook_edited }
+    return save_patch.patch_chunk(ck, &reg, (*srv).column, mask, hooks, out)
+}
+
+fn persist_chunk(srv: *mut sv_state.Server, cx: i32, cz: i32) -> bool {
+    let rx: i32 = cx >> 5
+    let rz: i32 = cz >> 5
+    let lx: i32 = cx & 31
+    let lz: i32 = cz & 31
+    var dir: rt.Buf = rt.buf_new()
+    save_world.path_c(&dir, world_dir_str(srv), "region")
+    let dirs: str = str { p: dir.ptr as *mut u8, n: dir.len - 1 }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, dir.ptr, dir.len - 1)
+    rt.buf_push_bytes(&path, "/r.".p as u64, 3)
+    rt.buf_push_dec_i64(&path, rx as i64)
+    rt.buf_push(&path, 46 as u8)
+    rt.buf_push_dec_i64(&path, rz as i64)
+    rt.buf_push_bytes(&path, ".mca".p as u64, 4)
+    rt.buf_push(&path, 0 as u8)
+    var region: mc_anvil.Region = mc_anvil.region_new()
+    var good: bool = mc_anvil.region_load(path.ptr, &region) catch false
+    if good && !mc_anvil.region_has(&region, lx, lz) { good = false }
+    var raw: rt.Buf = rt.buf_new()
+    var n: usize = 0
+    if good {
+        n = save_world.world_read_chunk(dirs, rx, rz, &region, lx, lz, &raw) catch 99999999999
+        good = n != 99999999999
+    }
+    var ck: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    if good { good = save_chunk.chunk_open(&ck, raw.ptr, n) catch false }
+    if good {
+        var out: bytes.Bytes = bytes.bytes_new()
+        good = patch_into(srv, &ck, cx, cz, &out)
+        if good {
+            let stamp: u32 = (time.now_unix_ms() / 1000) as u32
+            good = save_store.store_put_chunk(dirs, rx, rz, &region, lx, lz, bytes.bytes_ptr(&out), bytes.bytes_len(&out), mc_anvil.CT_ZLIB, stamp)
+        }
+        bytes.bytes_free(&out)
+        save_chunk.chunk_close(&ck)
+        if good { good = mc_anvil.region_save(&region, path.ptr) }
+    }
+    mc_anvil.region_free(&region)
+    rt.buf_free(&raw)
+    rt.buf_free(&path)
+    rt.buf_free(&dir)
+    return good
+}
+
+fn persist_chunks(srv: *mut sv_state.Server) {
+    let total: usize = sv_edits.edits_dirty_count(&(*srv).edits)
+    var keys: u64 = rt.heap_alloc((total + 1) * 8)
+    var i: usize = 0
+    while i < total {
+        rt.st64(keys, i, sv_edits.edits_dirty_at(&(*srv).edits, i))
+        i = i + 1
+    }
+    i = 0
+    while i < total {
+        let k: u64 = rt.ld64(keys, i)
+        persist_chunk(srv, sv_edits.chunk_key_x(k), sv_edits.chunk_key_z(k))
+        i = i + 1
+    }
+    rt.heap_free(keys, (total + 1) * 8)
+}
