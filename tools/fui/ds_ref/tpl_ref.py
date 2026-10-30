@@ -3,6 +3,8 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 FONTS = os.path.abspath(os.path.join(HERE, "..", "..", "..", "lib", "fui", "fonts"))
 LIB = os.path.abspath(os.path.join(HERE, "..", "..", "..", "lib", "fui"))
 NAME_MAP = {"monitor": "display", "wifi": "wifi_1", "lock": "lock", "moon": "moon", "globe": "globe", "sun": "brightness",
@@ -37,7 +39,7 @@ def icon(name, x, y, size, color):
         NAMES = load_names()
         for g in (16, 20, 24):
             PATHS[g] = load_grade(g)
-    iid = NAMES[NAME_MAP[name]]
+    iid = NAMES[NAME_MAP.get(name, name)]
     grade = 24 if size > 22 else (20 if size > 18 else 16)
     order = {16: (16, 20, 24), 20: (20, 24, 16), 24: (24, 20, 16)}[grade]
     d = ""
@@ -291,6 +293,10 @@ TARGETS = {
 
 
 def main():
+    import tpl_ref_files
+    import tpl_ref_store
+    TARGETS.update(tpl_ref_store.TARGETS)
+    TARGETS.update(tpl_ref_files.TARGETS)
     name, theme, w, h, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
     c = DARK if theme == "dark" else LIGHT
     open(out, "w").write(TARGETS[name](c, w, h))
