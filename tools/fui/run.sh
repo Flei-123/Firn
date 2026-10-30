@@ -1959,5 +1959,14 @@ build gpuchain
 "$W/gpuchain"
 bash tools/fui/gpuvalidate.sh
 
+echo "== DESIGN LINT (r578): lint self-test + examples/fui_apps must be clean =="
+if command -v python3 >/dev/null 2>&1; then
+    python3 -I tools/fui/designlint_test/run.py
+    python3 -I tools/fui/designlint.py examples/fui_apps
+    echo "  design lint clean     OK"
+else
+    echo "  SKIP: no python3"
+fi
+
 echo
 echo "ALL CHECKS PASSED."
