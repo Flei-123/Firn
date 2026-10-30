@@ -195,14 +195,14 @@ def decompress(ct, data):
     raise ValueError("compression %d" % ct)
 
 
-def region_chunks(path):
+def region_chunks(path, only=None):
     raw = open(path, "rb").read()
     d = os.path.dirname(path)
     if not raw:
         return
     for s in range(1024):
         e = struct.unpack(">I", raw[s * 4:s * 4 + 4])[0]
-        if not e:
+        if not e or (only is not None and s != only):
             continue
         off, cnt = e >> 8, e & 255
         ln = struct.unpack(">I", raw[off * 4096:off * 4096 + 4])[0]
@@ -358,9 +358,8 @@ def cmd_picks(regiondir, count, seed, lo, hi):
         key = (cx, cz)
         if key not in cache:
             cache[key] = None
-            for s, data in region_chunks(os.path.join(regiondir, rf)):
-                if s == (cx & 31) + (cz & 31) * 32:
-                    cache[key] = parse_nbt(data)
+            for s, data in region_chunks(os.path.join(regiondir, rf), (cx & 31) + (cz & 31) * 32):
+                cache[key] = parse_nbt(data)
         root = cache[key]
         if root is None or get(root, b"Status") is None and get(root, b"status") is None:
             continue
