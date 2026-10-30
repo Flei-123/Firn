@@ -19,13 +19,15 @@
 
 import std.rt
 import std.deflate
+import mc.save.save_lz4
 
 export {
     Region, AnvilError,
     region_new, region_free, region_from_bytes, region_load, region_save, region_check,
     region_has, region_count, region_sector_count, region_timestamp,
     region_read, region_read_raw, region_write, region_remove,
-    CT_GZIP, CT_ZLIB, CT_NONE, CT_LZ4,
+    CT_GZIP, CT_ZLIB, CT_NONE, CT_LZ4, CT_EXTERNAL,
+    anvil_inflate, anvil_pack, region_mark_external,
     MAX_SECTORS_PER_CHUNK, MAX_CHUNK_BYTES,
 }
 
@@ -34,6 +36,7 @@ const CT_GZIP: u8 = 1
 const CT_ZLIB: u8 = 2
 const CT_NONE: u8 = 3
 const CT_LZ4: u8 = 4
+const CT_EXTERNAL: u8 = 128
 const MAX_SECTORS_PER_CHUNK: usize = 255 // the count is one octet
 const MAX_CHUNK_BYTES: usize = 1044480 // 255 sectors minus the 5 octet header, rounded down
 const MAX_INFLATED: usize = 67108864 // 64 MiB cap on a decompressed chunk (bomb guard)
@@ -47,6 +50,7 @@ error AnvilError {
     Inflate, // the compressed data is damaged
     TooBig, // the chunk does not fit in 255 sectors
     Memory, // out of memory
+    External, // the chunk lives in a separate .mcc file
 }
 
 struct Region {
@@ -132,6 +136,11 @@ fn region_load(path: u64, out: *mut Region) -> AnvilError!bool {
     if !rt.read_file(path, &f) {
         rt.buf_free(&f)
         return AnvilError::Format
+    }
+    if f.len == 0 {
+        rt.buf_free(&f)
+        *out = region_new()
+        return true
     }
     let ok: bool = region_from_bytes(f.ptr, f.len, out) catch false
     rt.buf_free(&f)
@@ -255,6 +264,29 @@ fn region_read_raw(r: *mut Region, x: i32, z: i32, ctype: *mut u8, out: *mut rt.
     return n
 }
 
+// Decompresses `n` octets stored with compression `ct` (CT_GZIP, CT_ZLIB, CT_NONE, CT_LZ4), appended to `out`.
+fn anvil_inflate(ct: u8, p: u64, n: usize, out: *mut rt.Buf) -> AnvilError!usize {
+    let before: usize = (*out).len
+    var got: usize = 0
+    if ct == CT_NONE {
+        rt.buf_push_bytes(out, p, n)
+        return n
+    } else if ct == CT_ZLIB {
+        got = deflate.zlib_decompress(p, n, out) catch 99999999999
+    } else if ct == CT_GZIP {
+        got = deflate.gzip_decompress_limited(p, n, MAX_INFLATED, out) catch 99999999999
+    } else if ct == CT_LZ4 {
+        got = save_lz4.lz4s_decompress(p, n, MAX_INFLATED, out) catch 99999999999
+    } else {
+        return AnvilError::Compression
+    }
+    if got == 99999999999 {
+        (*out).len = before
+        return AnvilError::Inflate
+    }
+    return got
+}
+
 // The decompressed NBT bytes of chunk (x, z), appended to `out`. Returns their number.
 fn region_read(r: *mut Region, x: i32, z: i32, out: *mut rt.Buf) -> AnvilError!usize {
     var raw: rt.Buf = rt.buf_new()
@@ -267,31 +299,18 @@ fn region_read(r: *mut Region, x: i32, z: i32, out: *mut rt.Buf) -> AnvilError!u
         }
         return AnvilError::Range
     }
-    var got: usize = 0
-    if ct == CT_NONE {
-        rt.buf_push_bytes(out, raw.ptr, n)
-        got = n
-    } else if ct == CT_ZLIB {
-        let before: usize = (*out).len
-        got = deflate.zlib_decompress(raw.ptr, n, out) catch 99999999999
-        if got == 99999999999 {
-            (*out).len = before
-            rt.buf_free(&raw)
-            return AnvilError::Inflate
-        }
-    } else if ct == CT_GZIP {
-        let before: usize = (*out).len
-        got = deflate.gzip_decompress_limited(raw.ptr, n, MAX_INFLATED, out) catch 99999999999
-        if got == 99999999999 {
-            (*out).len = before
-            rt.buf_free(&raw)
-            return AnvilError::Inflate
-        }
-    } else {
+    if ct >= CT_EXTERNAL {
         rt.buf_free(&raw)
-        return AnvilError::Compression
+        return AnvilError::External
     }
+    let got: usize = anvil_inflate(ct, raw.ptr, n, out) catch 99999999999
     rt.buf_free(&raw)
+    if got == 99999999999 {
+        if ct == 0 as u8 || ct > CT_LZ4 {
+            return AnvilError::Compression
+        }
+        return AnvilError::Inflate
+    }
     return got
 }
 
@@ -351,6 +370,56 @@ fn grow_to(r: *mut Region, sectors: usize) -> bool {
     return true
 }
 
+// Compresses `n` octets with `ctype` (CT_GZIP, CT_ZLIB, CT_LZ4) into `out`; returns the compressed size.
+fn anvil_pack(ctype: u8, p: u64, n: usize, out: *mut rt.Buf) -> AnvilError!usize {
+    var k: usize = 99999999999
+    if ctype == CT_ZLIB {
+        k = deflate.zlib_compress(p, n, 6, out) catch 99999999999
+    } else if ctype == CT_GZIP {
+        k = deflate.gzip_compress(p, n, 6, out) catch 99999999999
+    } else if ctype == CT_LZ4 {
+        k = save_lz4.lz4s_compress(p, n, out)
+    } else {
+        return AnvilError::Compression
+    }
+    if k == 99999999999 {
+        return AnvilError::Memory
+    }
+    return k
+}
+
+// Registers chunk (x, z) as stored in an external .mcc file: one sector with the length 1 and the flag octet.
+fn region_mark_external(r: *mut Region, x: i32, z: i32, ctype: u8, stamp: u32) -> AnvilError!bool {
+    let s: usize = slot(x, z)
+    var off: usize = 0
+    if loc_cnt(r, s) > 0 && entry_ok(r, s) {
+        off = loc_off(r, s)
+    } else {
+        off = find_free(r, 1, s)
+        if off == 0 {
+            off = nsectors(r)
+            if !grow_to(r, off + 1) {
+                return AnvilError::Memory
+            }
+        }
+    }
+    let at: usize = off * SECTOR
+    var i: usize = 0
+    while i < SECTOR {
+        rt.st8(base(r), at + i, 0 as u8)
+        i = i + 1
+    }
+    st32be(base(r), at, 1 as u32)
+    rt.st8(base(r), at + 4, ctype | CT_EXTERNAL)
+    var cnt: usize = 1
+    if loc_cnt(r, s) > 0 && loc_off(r, s) == off {
+        cnt = loc_cnt(r, s)
+    }
+    set_loc(r, s, off, cnt)
+    st32be(base(r), SECTOR + s * 4, stamp)
+    return true
+}
+
 // Stores `n` octets of NBT as chunk (x, z) with compression `ctype` (CT_ZLIB, CT_GZIP or CT_NONE).
 // An existing chunk is replaced in place when the new data fits its sectors, otherwise it moves to
 // the first free run (or the end of the file). `stamp` is the timestamp (seconds).
@@ -358,25 +427,14 @@ fn region_write(r: *mut Region, x: i32, z: i32, p: u64, n: usize, ctype: u8, sta
     var packed: rt.Buf = rt.buf_new()
     var src: u64 = p
     var m: usize = n
-    if ctype == CT_ZLIB {
-        let k: usize = deflate.zlib_compress(p, n, 6, &packed) catch 99999999999
+    if ctype != CT_NONE {
+        let k: usize = anvil_pack(ctype, p, n, &packed) catch 99999999999
         if k == 99999999999 {
             rt.buf_free(&packed)
-            return AnvilError::Memory
+            return AnvilError::Compression
         }
         src = packed.ptr
         m = k
-    } else if ctype == CT_GZIP {
-        let k: usize = deflate.gzip_compress(p, n, 6, &packed) catch 99999999999
-        if k == 99999999999 {
-            rt.buf_free(&packed)
-            return AnvilError::Memory
-        }
-        src = packed.ptr
-        m = k
-    } else if ctype != CT_NONE {
-        rt.buf_free(&packed)
-        return AnvilError::Compression
     }
     let total: usize = m + 5
     let need: usize = (total + SECTOR - 1) / SECTOR

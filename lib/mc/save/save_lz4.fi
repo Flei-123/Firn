@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/save/save_lz4.fi -- the LZ4 block stream of region files (compression 4): magic "LZ4Block",
+// then per block: token (0x10 raw | 0x20 lz4, low nibble = block size log2 - 10), compressed length,
+// original length, xxHash32 (seed 0x9747b28c, low 28 bits) of the original, all little endian; an empty raw block ends it.
+import std.rt
+import compress.common
+import compress.lz4
+
+export {
+    lz4s_decompress, lz4s_compress, LZ4S_MAX_BLOCK,
+}
+
+const LZ4S_MAX_BLOCK: usize = 33554432
+const BLOCK_SIZE: usize = 65536
+const LEVEL_NIBBLE: u8 = 6
+const SEED: u32 = 2538058380
+const CHECK_MASK: u32 = 268435455
+
+fn ld32le(p: u64, o: usize) -> u32 {
+    return (rt.ld8(p, o) as u32) | ((rt.ld8(p, o + 1) as u32) << 8) | ((rt.ld8(p, o + 2) as u32) << 16) | ((rt.ld8(p, o + 3) as u32) << 24)
+}
+
+fn push32le(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn has_magic(src: u64, n: usize) -> bool {
+    if n < 8 {
+        return false
+    }
+    return rt.mem_eq(src, "LZ4Block".p as u64, 8)
+}
+
+fn lz4s_decompress(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    let start: usize = (*out).len
+    var at: usize = 0
+    var total: usize = 0
+    while at < n {
+        if n - at < 21 || !has_magic(src + at as u64, n - at) {
+            (*out).len = start
+            return CompressError::Format
+        }
+        let token: u8 = rt.ld8(src, at + 8)
+        let method: u8 = token & 240 as u8
+        let clen: usize = ld32le(src, at + 9) as usize
+        let olen: usize = ld32le(src, at + 13) as usize
+        let check: u32 = ld32le(src, at + 17)
+        at = at + 21
+        if olen == 0 && clen == 0 {
+            return total
+        }
+        if clen > n - at || olen > LZ4S_MAX_BLOCK || total + olen > max {
+            (*out).len = start
+            return CompressError::TooLarge
+        }
+        let before: usize = (*out).len
+        if method == 16 as u8 {
+            if clen != olen {
+                (*out).len = start
+                return CompressError::Data
+            }
+            rt.buf_push_bytes(out, src + at as u64, olen)
+        } else if method == 32 as u8 {
+            let got: usize = lz4.lz4_block_decompress(src + at as u64, clen, olen, out) catch 99999999999
+            if got != olen {
+                (*out).len = start
+                return CompressError::Data
+            }
+        } else {
+            (*out).len = start
+            return CompressError::Format
+        }
+        if (common.xxh32((*out).ptr + before as u64, olen, SEED) & CHECK_MASK) != check {
+            (*out).len = start
+            return CompressError::Checksum
+        }
+        at = at + clen
+        total = total + olen
+    }
+    return total
+}
+
+fn put_block(out: *mut rt.Buf, p: u64, n: usize, packed: *mut rt.Buf) {
+    rt.buf_clear(packed)
+    let m: usize = lz4.lz4_block_compress(p, n, packed)
+    rt.buf_push_bytes(out, "LZ4Block".p as u64, 8)
+    if m < n {
+        rt.buf_push(out, (32 as u8) | LEVEL_NIBBLE)
+        push32le(out, m as u32)
+        push32le(out, n as u32)
+        push32le(out, common.xxh32(p, n, SEED) & CHECK_MASK)
+        rt.buf_push_bytes(out, (*packed).ptr, m)
+    } else {
+        rt.buf_push(out, (16 as u8) | LEVEL_NIBBLE)
+        push32le(out, n as u32)
+        push32le(out, n as u32)
+        push32le(out, common.xxh32(p, n, SEED) & CHECK_MASK)
+        rt.buf_push_bytes(out, p, n)
+    }
+}
+
+fn lz4s_compress(src: u64, n: usize, out: *mut rt.Buf) -> usize {
+    let start: usize = (*out).len
+    var packed: rt.Buf = rt.buf_new()
+    var at: usize = 0
+    while at < n {
+        var k: usize = n - at
+        if k > BLOCK_SIZE {
+            k = BLOCK_SIZE
+        }
+        put_block(out, src + at as u64, k, &packed)
+        at = at + k
+    }
+    rt.buf_push_bytes(out, "LZ4Block".p as u64, 8)
+    rt.buf_push(out, (16 as u8) | LEVEL_NIBBLE)
+    push32le(out, 0 as u32)
+    push32le(out, 0 as u32)
+    push32le(out, 0 as u32)
+    rt.buf_free(&packed)
+    return (*out).len - start
+}

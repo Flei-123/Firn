@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/save/save_world.fi -- a world directory as a list of files and the chunk access on top of it.
+// Layouts differ by version (world/region, world/DIM-1/region, world/dimensions/<ns>/<dim>/region ...),
+// so the walk is generic: every file under the root, classified by name and parent directory.
+import std.rt
+import std.dir
+import std.fs
+import std.deflate
+import mc.mc_anvil
+
+export {
+    FileList, FILE_REGION, FILE_MCC, FILE_NBT, FILE_OTHER,
+    world_list, list_count, list_get, classify, path_c, parent_dir_name,
+    region_coords, mcc_name, world_read_chunk, read_nbt_file, mkdir_parents,
+}
+
+const FILE_REGION: u8 = 1
+const FILE_MCC: u8 = 2
+const FILE_NBT: u8 = 3
+const FILE_OTHER: u8 = 0
+const MAX_DEPTH: i32 = 12
+
+struct FileList {
+    names: rt.Buf,
+    count: usize,
+}
+
+fn path_c(out: *mut rt.Buf, a: str, b: str) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, a.p as u64, a.n)
+    if b.n > 0 {
+        rt.buf_push(out, 47 as u8)
+        rt.buf_push_bytes(out, b.p as u64, b.n)
+    }
+    rt.buf_push(out, 0 as u8)
+}
+
+#[allow_escape]
+fn walk(cur: *mut rt.Buf, root_len: usize, list: *mut FileList, depth: i32) {
+    if depth > MAX_DEPTH {
+        return
+    }
+    let keep: usize = (*cur).len
+    var d: dir.Dir = dir.open(str { p: (*cur).ptr as *mut u8, n: keep })
+    while dir.next(&d) {
+        rt.buf_push(cur, 47 as u8)
+        rt.buf_push_bytes(cur, d.name.p as u64, d.name.n)
+        if d.kind == dir.KIND_DIR {
+            walk(cur, root_len, list, depth + 1)
+        } else if d.kind == dir.KIND_FILE {
+            rt.buf_push_bytes(&(*list).names, (*cur).ptr + (root_len + 1) as u64, (*cur).len - root_len - 1)
+            rt.buf_push(&(*list).names, 0 as u8)
+            (*list).count = (*list).count + 1
+        }
+        (*cur).len = keep
+    }
+    dir.close(&d)
+}
+
+fn world_list(root: str, list: *mut FileList) {
+    *list = FileList { names: rt.buf_new(), count: 0 }
+    var cur: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cur, root.p as u64, root.n)
+    walk(&cur, root.n, list, 0)
+    rt.buf_free(&cur)
+}
+
+fn list_count(l: *mut FileList) -> usize {
+    return (*l).count
+}
+
+fn list_get(l: *mut FileList, i: usize) -> str {
+    var at: usize = 0
+    var k: usize = 0
+    while k < i {
+        while rt.ld8((*l).names.ptr, at) != 0 as u8 {
+            at = at + 1
+        }
+        at = at + 1
+        k = k + 1
+    }
+    var e: usize = at
+    while rt.ld8((*l).names.ptr, e) != 0 as u8 {
+        e = e + 1
+    }
+    return str { p: ((*l).names.ptr + at as u64) as *mut u8, n: e - at }
+}
+
+fn ends_with(s: str, t: str) -> bool {
+    return s.n >= t.n && rt.mem_eq((s.p as u64) + (s.n - t.n) as u64, t.p as u64, t.n)
+}
+
+fn parent_dir_name(rel: str) -> str {
+    var last: usize = rel.n
+    while last > 0 && rt.ld8(rel.p as u64, last - 1) != 47 as u8 {
+        last = last - 1
+    }
+    if last == 0 {
+        return str { p: rel.p, n: 0 }
+    }
+    var start: usize = last - 1
+    while start > 0 && rt.ld8(rel.p as u64, start - 1) != 47 as u8 {
+        start = start - 1
+    }
+    return str { p: ((rel.p as u64) + start as u64) as *mut u8, n: last - 1 - start }
+}
+
+fn classify(rel: str) -> u8 {
+    if ends_with(rel, ".mca") {
+        return FILE_REGION
+    }
+    if ends_with(rel, ".mcc") {
+        return FILE_MCC
+    }
+    if ends_with(rel, ".dat") || ends_with(rel, ".dat_old") {
+        return FILE_NBT
+    }
+    return FILE_OTHER
+}
+
+fn parse_int(p: u64, n: usize, at: *mut usize) -> i32 {
+    var neg: bool = false
+    var i: usize = *at
+    if i < n && rt.ld8(p, i) == 45 as u8 {
+        neg = true
+        i = i + 1
+    }
+    var v: i32 = 0
+    while i < n && rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(p, i) - 48 as u8) as i32
+        i = i + 1
+    }
+    *at = i
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn region_coords(rel: str, rx: *mut i32, rz: *mut i32) -> bool {
+    var last: usize = rel.n
+    while last > 0 && rt.ld8(rel.p as u64, last - 1) != 47 as u8 {
+        last = last - 1
+    }
+    let p: u64 = (rel.p as u64) + last as u64
+    let n: usize = rel.n - last
+    if n < 8 || rt.ld8(p, 0) != 114 as u8 || rt.ld8(p, 1) != 46 as u8 {
+        return false
+    }
+    var at: usize = 2
+    *rx = parse_int(p, n, &at)
+    if at >= n || rt.ld8(p, at) != 46 as u8 {
+        return false
+    }
+    at = at + 1
+    *rz = parse_int(p, n, &at)
+    return true
+}
+
+fn mcc_name(dirpath: str, cx: i32, cz: i32, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, dirpath.p as u64, dirpath.n)
+    rt.buf_push_bytes(out, "/c.".p as u64, 3)
+    rt.buf_push_dec_i64(out, cx as i64)
+    rt.buf_push(out, 46 as u8)
+    rt.buf_push_dec_i64(out, cz as i64)
+    rt.buf_push_bytes(out, ".mcc".p as u64, 4)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn world_read_chunk(dirpath: str, rx: i32, rz: i32, r: *mut mc_anvil.Region, lx: i32, lz: i32, out: *mut rt.Buf) -> AnvilError!usize {
+    var got: usize = mc_anvil.region_read(r, lx, lz, out) catch 99999999999
+    if got != 99999999999 {
+        return got
+    }
+    var raw: rt.Buf = rt.buf_new()
+    var ct: u8 = 0
+    let rn: usize = mc_anvil.region_read_raw(r, lx, lz, &ct, &raw) catch 99999999999
+    rt.buf_free(&raw)
+    if rn == 99999999999 || ct < mc_anvil.CT_EXTERNAL {
+        return AnvilError::Range
+    }
+    var name: rt.Buf = rt.buf_new()
+    mcc_name(dirpath, rx * 32 + lx, rz * 32 + lz, &name)
+    var file: rt.Buf = rt.buf_new()
+    if !rt.read_file(name.ptr, &file) {
+        rt.buf_free(&name)
+        rt.buf_free(&file)
+        return AnvilError::Missing
+    }
+    rt.buf_free(&name)
+    got = mc_anvil.anvil_inflate(ct - mc_anvil.CT_EXTERNAL, file.ptr, file.len, out) catch 99999999999
+    rt.buf_free(&file)
+    if got == 99999999999 {
+        return AnvilError::Inflate
+    }
+    return got
+}
+
+fn read_nbt_file(path: u64, out: *mut rt.Buf) -> AnvilError!usize {
+    var raw: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &raw) {
+        rt.buf_free(&raw)
+        return AnvilError::Format
+    }
+    var got: usize = raw.len
+    if raw.len >= 2 && rt.ld8(raw.ptr, 0) == 31 as u8 && rt.ld8(raw.ptr, 1) == 139 as u8 {
+        got = deflate.gzip_decompress_limited(raw.ptr, raw.len, 268435456, out) catch 99999999999
+        if got == 99999999999 {
+            rt.buf_free(&raw)
+            return AnvilError::Inflate
+        }
+    } else {
+        rt.buf_push_bytes(out, raw.ptr, raw.len)
+    }
+    rt.buf_free(&raw)
+    return got
+}
+
+fn mkdir_parents(path: str) {
+    fs.mkdir_all(path) catch false
+}

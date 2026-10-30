@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/save/save_digest.fi -- a canonical text form of an NBT tree as an FNV-1a 64 digest, for the
+// comparison with independent readers. One line per node: `path=tag:value`, where path is /name for
+// compound entries and [i] for list elements; integers decimal, floats as their bits, strings as hex,
+// arrays as `count:fnv(payload)`, lists `L<elem>:<count>`, compounds `C`.
+import std.rt
+import mc.mc_nbt
+
+export {
+    Digest, digest_new, digest_tree, fnv64, fnv_step, FNV_BASIS,
+}
+
+const FNV_BASIS: u64 = 14695981039346656037
+const FNV_PRIME: u64 = 1099511628211
+
+struct Digest {
+    h: u64,
+    lines: u64,
+    path: rt.Buf,
+    tmp: rt.Buf,
+}
+
+fn digest_new() -> Digest {
+    return Digest { h: FNV_BASIS, lines: 0, path: rt.buf_new(), tmp: rt.buf_new() }
+}
+
+fn fnv_step(h: u64, b: u8) -> u64 {
+    return (h ^ (b as u64)) *% FNV_PRIME
+}
+
+fn fnv64(p: u64, n: usize) -> u64 {
+    var h: u64 = FNV_BASIS
+    var i: usize = 0
+    while i < n {
+        h = fnv_step(h, rt.ld8(p, i))
+        i = i + 1
+    }
+    return h
+}
+
+fn feed(g: *mut Digest, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        (*g).h = fnv_step((*g).h, rt.ld8(p, i))
+        i = i + 1
+    }
+}
+
+fn feed_buf(g: *mut Digest, b: *mut rt.Buf) {
+    feed(g, (*b).ptr, (*b).len)
+}
+
+fn push_hex(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(out, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+fn payload_bytes(kind: u8, count: u32) -> usize {
+    if kind == 7 as u8 {
+        return count as usize
+    }
+    if kind == 11 as u8 {
+        return (count as usize) * 4
+    }
+    return (count as usize) * 8
+}
+
+fn emit(g: *mut Digest, d: *mut mc_nbt.Doc, n: u32) {
+    let kind: u8 = mc_nbt.nbt_kind(d, n)
+    var t: *mut rt.Buf = &(*g).tmp
+    rt.buf_clear(t)
+    rt.buf_push_bytes(t, (*g).path.ptr, (*g).path.len)
+    rt.buf_push(t, 61 as u8)
+    rt.buf_push_dec_u64(t, kind as u64)
+    rt.buf_push(t, 58 as u8)
+    if kind >= 1 as u8 && kind <= 4 as u8 {
+        rt.buf_push_dec_i64(t, mc_nbt.nbt_i64(d, n))
+    } else if kind == 5 as u8 {
+        rt.buf_push_dec_u64(t, mc_nbt.nbt_f32(d, n) as u64)
+    } else if kind == 6 as u8 {
+        rt.buf_push_dec_u64(t, mc_nbt.nbt_f64(d, n))
+    } else if kind == 8 as u8 {
+        var sl: usize = 0
+        let sp: u64 = mc_nbt.nbt_str(d, n, &sl)
+        push_hex(t, sp, sl)
+    } else if kind == 7 as u8 || kind == 11 as u8 || kind == 12 as u8 {
+        let c: u32 = mc_nbt.nbt_count(d, n)
+        rt.buf_push_dec_u64(t, c as u64)
+        rt.buf_push(t, 58 as u8)
+        rt.buf_push_dec_u64(t, fnv64(mc_nbt.nbt_arr_ptr(d, n), payload_bytes(kind, c)))
+    } else if kind == 9 as u8 {
+        rt.buf_push(t, 76 as u8)
+        rt.buf_push_dec_u64(t, mc_nbt.nbt_elem_kind(d, n) as u64)
+        rt.buf_push(t, 58 as u8)
+        rt.buf_push_dec_u64(t, mc_nbt.nbt_count(d, n) as u64)
+    } else {
+        rt.buf_push(t, 67 as u8)
+    }
+    rt.buf_push(t, 10 as u8)
+    feed_buf(g, t)
+    (*g).lines = (*g).lines + 1 as u64
+}
+
+fn walk(g: *mut Digest, d: *mut mc_nbt.Doc, n: u32) {
+    emit(g, d, n)
+    let kind: u8 = mc_nbt.nbt_kind(d, n)
+    let keep: usize = (*g).path.len
+    if kind == 10 as u8 {
+        var c: u32 = mc_nbt.nbt_first(d, n)
+        while c != 0 as u32 {
+            var nl: usize = 0
+            let np: u64 = mc_nbt.nbt_name(d, c, &nl)
+            rt.buf_push(&(*g).path, 47 as u8)
+            rt.buf_push_bytes(&(*g).path, np, nl)
+            walk(g, d, c)
+            (*g).path.len = keep
+            c = mc_nbt.nbt_next(d, c)
+        }
+    } else if kind == 9 as u8 {
+        var c: u32 = mc_nbt.nbt_first(d, n)
+        var i: u64 = 0
+        while c != 0 as u32 {
+            rt.buf_push(&(*g).path, 91 as u8)
+            rt.buf_push_dec_u64(&(*g).path, i)
+            rt.buf_push(&(*g).path, 93 as u8)
+            walk(g, d, c)
+            (*g).path.len = keep
+            c = mc_nbt.nbt_next(d, c)
+            i = i + 1 as u64
+        }
+    }
+}
+
+fn digest_tree(g: *mut Digest, d: *mut mc_nbt.Doc) {
+    (*g).h = FNV_BASIS
+    (*g).lines = 0
+    rt.buf_clear(&(*g).path)
+    walk(g, d, mc_nbt.doc_root(d))
+}

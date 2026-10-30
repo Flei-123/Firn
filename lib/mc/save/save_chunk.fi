@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/save/save_chunk.fi -- the chunk NBT as data (any version, no vanilla tables).
+// Layouts: 1.18+ (sections[].block_states / biomes with palette + data, root fields) and 1.16-1.17
+// (Level.Sections[].Palette + BlockStates). Sections decode into arrays of palette indices
+// (index = y * 256 + z * 16 + x for blocks, y4 * 16 + z4 * 4 + x4 for biomes) and encode back.
+import std.rt
+import std.bytes
+import std.nbt
+import mc.mc_nbt
+import mc.save.save_bits
+import mc.save.save_digest
+
+export {
+    Chunk, SaveError, chunk_open, chunk_close, chunk_data_version, chunk_pos, chunk_status,
+    chunk_section_count, chunk_section, chunk_section_y, chunk_block_entity_count,
+    section_blocks, section_biomes, section_block_palette_size, section_biome_palette_size,
+    section_block_entry_hash, section_biome_entry_hash, section_light_sum,
+    section_blocks_repack_equal, section_biomes_repack_equal, chunk_heightmap_hash,
+    section_block_hash, section_biome_hash, section_block_name, SECTION_BLOCKS, SECTION_BIOMES,
+    write_block_states, write_biomes,
+}
+
+const SECTION_BLOCKS: usize = 4096
+const SECTION_BIOMES: usize = 64
+const MIN_BLOCK_BITS: usize = 4
+
+error SaveError {
+    Parse,
+    Layout,
+    Palette,
+    Bits,
+    Memory,
+    Io,
+}
+
+struct Chunk {
+    doc: mc_nbt.Doc,
+    level: u32,
+    legacy: bool,
+}
+
+fn key(d: *mut mc_nbt.Doc, n: u32, name: str) -> u32 {
+    return mc_nbt.nbt_get(d, n, name.p as u64, name.n)
+}
+
+fn chunk_open(c: *mut Chunk, p: u64, n: usize) -> SaveError!bool {
+    (*c).doc = mc_nbt.doc_new()
+    (*c).level = 0 as u32
+    (*c).legacy = false
+    var v: bytes.Bytes = bytes.Bytes { data: p, cap: n, len: n, pos: 0, bad: false }
+    let ok: bool = mc_nbt.doc_parse(&(*c).doc, &v, false, false) catch false
+    if !ok {
+        mc_nbt.doc_free(&(*c).doc)
+        return SaveError::Parse
+    }
+    let root: u32 = mc_nbt.doc_root(&(*c).doc)
+    let lv: u32 = key(&(*c).doc, root, "Level")
+    if lv != 0 as u32 {
+        (*c).level = lv
+        (*c).legacy = true
+    } else {
+        (*c).level = root
+    }
+    return true
+}
+
+fn chunk_close(c: *mut Chunk) {
+    mc_nbt.doc_free(&(*c).doc)
+}
+
+fn chunk_data_version(c: *mut Chunk) -> i32 {
+    let n: u32 = key(&(*c).doc, mc_nbt.doc_root(&(*c).doc), "DataVersion")
+    return mc_nbt.nbt_i64(&(*c).doc, n) as i32
+}
+
+fn chunk_pos(c: *mut Chunk, x: *mut i32, z: *mut i32) {
+    *x = mc_nbt.nbt_i64(&(*c).doc, key(&(*c).doc, (*c).level, "xPos")) as i32
+    *z = mc_nbt.nbt_i64(&(*c).doc, key(&(*c).doc, (*c).level, "zPos")) as i32
+}
+
+fn chunk_status(c: *mut Chunk, len: *mut usize) -> u64 {
+    var n: u32 = key(&(*c).doc, (*c).level, "Status")
+    if n == 0 as u32 {
+        n = key(&(*c).doc, (*c).level, "status")
+    }
+    if n == 0 as u32 {
+        *len = 0
+        return 0
+    }
+    return mc_nbt.nbt_str(&(*c).doc, n, len)
+}
+
+fn sections_node(c: *mut Chunk) -> u32 {
+    var n: u32 = key(&(*c).doc, (*c).level, "sections")
+    if n == 0 as u32 {
+        n = key(&(*c).doc, (*c).level, "Sections")
+    }
+    return n
+}
+
+fn chunk_section_count(c: *mut Chunk) -> u32 {
+    let s: u32 = sections_node(c)
+    if s == 0 as u32 {
+        return 0 as u32
+    }
+    return mc_nbt.nbt_count(&(*c).doc, s)
+}
+
+fn chunk_section(c: *mut Chunk, i: u32) -> u32 {
+    return mc_nbt.nbt_at(&(*c).doc, sections_node(c), i)
+}
+
+fn chunk_section_y(c: *mut Chunk, sec: u32) -> i32 {
+    var n: u32 = key(&(*c).doc, sec, "Y")
+    if n == 0 as u32 {
+        n = key(&(*c).doc, sec, "y")
+    }
+    return mc_nbt.nbt_i64(&(*c).doc, n) as i32
+}
+
+fn chunk_block_entity_count(c: *mut Chunk) -> u32 {
+    var n: u32 = key(&(*c).doc, (*c).level, "block_entities")
+    if n == 0 as u32 {
+        n = key(&(*c).doc, (*c).level, "TileEntities")
+    }
+    if n == 0 as u32 {
+        return 0 as u32
+    }
+    return mc_nbt.nbt_count(&(*c).doc, n)
+}
+
+fn block_palette(c: *mut Chunk, sec: u32) -> u32 {
+    if (*c).legacy {
+        return key(&(*c).doc, sec, "Palette")
+    }
+    return key(&(*c).doc, key(&(*c).doc, sec, "block_states"), "palette")
+}
+
+fn block_data(c: *mut Chunk, sec: u32) -> u32 {
+    if (*c).legacy {
+        return key(&(*c).doc, sec, "BlockStates")
+    }
+    return key(&(*c).doc, key(&(*c).doc, sec, "block_states"), "data")
+}
+
+fn biome_palette(c: *mut Chunk, sec: u32) -> u32 {
+    return key(&(*c).doc, key(&(*c).doc, sec, "biomes"), "palette")
+}
+
+fn biome_data(c: *mut Chunk, sec: u32) -> u32 {
+    return key(&(*c).doc, key(&(*c).doc, sec, "biomes"), "data")
+}
+
+fn section_block_palette_size(c: *mut Chunk, sec: u32) -> u32 {
+    let p: u32 = block_palette(c, sec)
+    if p == 0 as u32 {
+        return 0 as u32
+    }
+    return mc_nbt.nbt_count(&(*c).doc, p)
+}
+
+fn section_biome_palette_size(c: *mut Chunk, sec: u32) -> u32 {
+    let p: u32 = biome_palette(c, sec)
+    if p == 0 as u32 {
+        return 0 as u32
+    }
+    return mc_nbt.nbt_count(&(*c).doc, p)
+}
+
+fn decode(c: *mut Chunk, pal: u32, data: u32, count: usize, min_bits: usize, out: u64) -> SaveError!bool {
+    if pal == 0 as u32 {
+        return SaveError::Layout
+    }
+    let np: usize = mc_nbt.nbt_count(&(*c).doc, pal) as usize
+    if np == 0 {
+        return SaveError::Palette
+    }
+    if np == 1 || data == 0 as u32 {
+        rt.mem_set(out, 0 as u8, count * 2)
+        return true
+    }
+    var bits: usize = save_bits.bits_for_palette(np)
+    if bits < min_bits {
+        bits = min_bits
+    }
+    let nl: usize = mc_nbt.nbt_count(&(*c).doc, data) as usize
+    var ok: bool = false
+    if (*c).legacy && chunk_data_version(c) < 2529 {
+        ok = save_bits.bits_unpack_spanning(mc_nbt.nbt_arr_ptr(&(*c).doc, data), nl, bits, count, out)
+    } else {
+        ok = save_bits.bits_unpack(mc_nbt.nbt_arr_ptr(&(*c).doc, data), nl, bits, count, out)
+    }
+    if !ok {
+        return SaveError::Bits
+    }
+    var i: usize = 0
+    while i < count {
+        if (rt.ld16(out, i) as usize) >= np {
+            return SaveError::Palette
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn section_blocks(c: *mut Chunk, sec: u32, out: u64) -> SaveError!bool {
+    return try decode(c, block_palette(c, sec), block_data(c, sec), SECTION_BLOCKS, MIN_BLOCK_BITS, out)
+}
+
+fn section_biomes(c: *mut Chunk, sec: u32, out: u64) -> SaveError!bool {
+    return try decode(c, biome_palette(c, sec), biome_data(c, sec), SECTION_BIOMES, 1, out)
+}
+
+fn entry_hash(c: *mut Chunk, pal: u32, i: u32, scratch: *mut rt.Buf) -> u64 {
+    let d: *mut mc_nbt.Doc = &(*c).doc
+    let e: u32 = mc_nbt.nbt_at(d, pal, i)
+    rt.buf_clear(scratch)
+    if mc_nbt.nbt_kind(d, e) == 8 as u8 {
+        var sl: usize = 0
+        let sp: u64 = mc_nbt.nbt_str(d, e, &sl)
+        rt.buf_push_bytes(scratch, sp, sl)
+    } else {
+        var nl: usize = 0
+        let nm: u32 = key(d, e, "Name")
+        let np: u64 = mc_nbt.nbt_str(d, nm, &nl)
+        rt.buf_push_bytes(scratch, np, nl)
+        let props: u32 = key(d, e, "Properties")
+        if props != 0 as u32 {
+            var pc: u32 = mc_nbt.nbt_first(d, props)
+            var first: bool = true
+            while pc != 0 as u32 {
+                if first {
+                    rt.buf_push(scratch, 91 as u8)
+                } else {
+                    rt.buf_push(scratch, 44 as u8)
+                }
+                first = false
+                var kl: usize = 0
+                let kp: u64 = mc_nbt.nbt_name(d, pc, &kl)
+                rt.buf_push_bytes(scratch, kp, kl)
+                rt.buf_push(scratch, 61 as u8)
+                var vl: usize = 0
+                let vp: u64 = mc_nbt.nbt_str(d, pc, &vl)
+                rt.buf_push_bytes(scratch, vp, vl)
+                pc = mc_nbt.nbt_next(d, pc)
+            }
+            rt.buf_push(scratch, 93 as u8)
+        }
+    }
+    return save_digest.fnv64((*scratch).ptr, (*scratch).len)
+}
+
+fn section_block_entry_hash(c: *mut Chunk, sec: u32, i: u32, scratch: *mut rt.Buf) -> u64 {
+    return entry_hash(c, block_palette(c, sec), i, scratch)
+}
+
+fn section_biome_entry_hash(c: *mut Chunk, sec: u32, i: u32, scratch: *mut rt.Buf) -> u64 {
+    return entry_hash(c, biome_palette(c, sec), i, scratch)
+}
+
+fn index_hash(idx: u64, count: usize, c: *mut Chunk, palnode: u32, scratch: *mut rt.Buf) -> u64 {
+    let np: usize = mc_nbt.nbt_count(&(*c).doc, palnode) as usize
+    var table: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&table, np * 8 + 8)
+    table.len = np * 8
+    var k: usize = 0
+    while k < np {
+        rt.st64(table.ptr, k, entry_hash(c, palnode, k as u32, scratch))
+        k = k + 1
+    }
+    var h: u64 = save_digest.FNV_BASIS
+    var i: usize = 0
+    while i < count {
+        h = (h ^ rt.ld64(table.ptr, rt.ld16(idx, i) as usize)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    rt.buf_free(&table)
+    return h
+}
+
+fn section_block_hash(c: *mut Chunk, sec: u32, idx: u64, scratch: *mut rt.Buf) -> u64 {
+    return index_hash(idx, SECTION_BLOCKS, c, block_palette(c, sec), scratch)
+}
+
+fn section_biome_hash(c: *mut Chunk, sec: u32, idx: u64, scratch: *mut rt.Buf) -> u64 {
+    return index_hash(idx, SECTION_BIOMES, c, biome_palette(c, sec), scratch)
+}
+
+fn section_block_name(c: *mut Chunk, sec: u32, i: u32, len: *mut usize) -> u64 {
+    let e: u32 = mc_nbt.nbt_at(&(*c).doc, block_palette(c, sec), i)
+    return mc_nbt.nbt_str(&(*c).doc, key(&(*c).doc, e, "Name"), len)
+}
+
+fn section_light_sum(c: *mut Chunk, sec: u32, name: str) -> u64 {
+    let n: u32 = key(&(*c).doc, sec, name)
+    if n == 0 as u32 {
+        return 0
+    }
+    let p: u64 = mc_nbt.nbt_arr_ptr(&(*c).doc, n)
+    let cnt: usize = mc_nbt.nbt_count(&(*c).doc, n) as usize
+    var s: u64 = 0
+    var i: usize = 0
+    while i < cnt {
+        let b: u64 = rt.ld8(p, i) as u64
+        s = s + (b & 15 as u64) + (b >> 4 as u64)
+        i = i + 1
+    }
+    return s
+}
+
+fn repack_equal(c: *mut Chunk, pal: u32, data: u32, idx: u64, count: usize, min_bits: usize) -> bool {
+    let np: usize = mc_nbt.nbt_count(&(*c).doc, pal) as usize
+    if np <= 1 {
+        return data == 0 as u32
+    }
+    var bits: usize = save_bits.bits_for_palette(np)
+    if bits < min_bits {
+        bits = min_bits
+    }
+    var out: rt.Buf = rt.buf_new()
+    let n: usize = save_bits.bits_pack(idx, count, bits, &out)
+    let same: bool = data != 0 as u32 && n == (mc_nbt.nbt_count(&(*c).doc, data) as usize) && rt.mem_eq(out.ptr, mc_nbt.nbt_arr_ptr(&(*c).doc, data), n * 8)
+    rt.buf_free(&out)
+    return same
+}
+
+fn section_blocks_repack_equal(c: *mut Chunk, sec: u32, idx: u64) -> bool {
+    return repack_equal(c, block_palette(c, sec), block_data(c, sec), idx, SECTION_BLOCKS, MIN_BLOCK_BITS)
+}
+
+fn section_biomes_repack_equal(c: *mut Chunk, sec: u32, idx: u64) -> bool {
+    return repack_equal(c, biome_palette(c, sec), biome_data(c, sec), idx, SECTION_BIOMES, 1)
+}
+
+fn chunk_heightmap_hash(c: *mut Chunk, name: str) -> u64 {
+    let hm: u32 = key(&(*c).doc, key(&(*c).doc, (*c).level, "Heightmaps"), name)
+    if hm == 0 as u32 {
+        return 0
+    }
+    let nl: usize = mc_nbt.nbt_count(&(*c).doc, hm) as usize
+    var bits: usize = 1
+    while bits <= 32 && save_bits.bits_long_count(256, bits) != nl {
+        bits = bits + 1
+    }
+    if bits > 32 {
+        return 1
+    }
+    var vals: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&vals, 512)
+    vals.len = 512
+    let ok: bool = save_bits.bits_unpack(mc_nbt.nbt_arr_ptr(&(*c).doc, hm), nl, bits, 256, vals.ptr)
+    var h: u64 = save_digest.FNV_BASIS
+    var i: usize = 0
+    while ok && i < 256 {
+        let v: u64 = rt.ld16(vals.ptr, i) as u64
+        h = (h ^ (v & 255 as u64)) *% 1099511628211 as u64
+        h = (h ^ (v >> 8 as u64)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    rt.buf_free(&vals)
+    return h
+}
+
+fn write_palette_data(b: *mut bytes.Bytes, idx: u64, count: usize, np: usize, min_bits: usize, field: str) {
+    if np <= 1 {
+        return
+    }
+    var bits: usize = save_bits.bits_for_palette(np)
+    if bits < min_bits {
+        bits = min_bits
+    }
+    var packed: rt.Buf = rt.buf_new()
+    let n: usize = save_bits.bits_pack(idx, count, bits, &packed)
+    bytes.put_u8(b, nbt.TAG_LONG_ARRAY)
+    nbt.nbt_name(b, field.p as u64, field.n)
+    bytes.put_i32(b, n as i32)
+    bytes.put_raw(b, packed.ptr, n * 8)
+    rt.buf_free(&packed)
+}
+
+fn split_name(names: str, at: usize, len: *mut usize) -> usize {
+    var e: usize = at
+    while e < names.n && rt.ld8(names.p as u64, e) != 10 as u8 {
+        e = e + 1
+    }
+    *len = e - at
+    return e + 1
+}
+
+fn write_block_states(b: *mut bytes.Bytes, names: str, np: usize, idx: u64) {
+    nbt.nbt_compound_begin(b, "block_states".p as u64, 12)
+    nbt.nbt_list_open(b, "palette".p as u64, 7, 10 as u8, np as i32)
+    var i: usize = 0
+    var at: usize = 0
+    while i < np {
+        var l: usize = 0
+        let nx: usize = split_name(names, at, &l)
+        nbt.nbt_string(b, "Name".p as u64, 4, (names.p as u64) + at as u64, l)
+        nbt.nbt_end(b)
+        at = nx
+        i = i + 1
+    }
+    write_palette_data(b, idx, SECTION_BLOCKS, np, MIN_BLOCK_BITS, "data")
+    nbt.nbt_end(b)
+}
+
+fn write_biomes(b: *mut bytes.Bytes, names: str, np: usize, idx: u64) {
+    nbt.nbt_compound_begin(b, "biomes".p as u64, 6)
+    nbt.nbt_list_open(b, "palette".p as u64, 7, 8 as u8, np as i32)
+    var i: usize = 0
+    var at: usize = 0
+    while i < np {
+        var l: usize = 0
+        let nx: usize = split_name(names, at, &l)
+        nbt.nbt_raw_string(b, (names.p as u64) + at as u64, l)
+        at = nx
+        i = i + 1
+    }
+    write_palette_data(b, idx, SECTION_BIOMES, np, 1, "data")
+    nbt.nbt_end(b)
+}
