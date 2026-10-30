@@ -1,7 +1,7 @@
 import os
 
 from . import allow, calls, lexer, markers
-from .rules import REGISTRY
+from .rules import PROJECT_REGISTRY, REGISTRY
 
 
 class Context:
@@ -46,12 +46,24 @@ def lint_source(path, src, rules=None):
     return found
 
 
+def lint_project(files, rules=None):
+    out = []
+    for rule_id, _summary, fn in PROJECT_REGISTRY:
+        if rules and rule_id not in rules:
+            continue
+        out.extend(fn(files))
+    return out
+
+
 def lint_paths(paths, rules=None):
     out = []
+    loaded = []
     for path in collect_files(paths):
         with open(path, encoding="utf-8", errors="replace") as fh:
             src = fh.read()
+        loaded.append((display_path(path), src))
         out.extend(lint_source(display_path(path), src, rules))
+    out.extend(lint_project(loaded, rules))
     return out
 
 

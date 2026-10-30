@@ -8,17 +8,19 @@ import fui.painter
 import fui.render
 import fui.screenax
 import fui.sizeclass
+import fui.viewport
 import fui.widget
+import std.rt
 
 export {
     NavView, nv_new, add, add_header, add_footer, set_badge, select, selected, item_count, label_at, set_back, layout,
     draw, draw_overlay, press, key, hover_at, mode, overlay_open, close_overlay, content_x, content_y, content_w, content_h,
-    pane_w, pane_rect, is_footer, MODE_EXPANDED, MODE_COMPACT, MODE_MINIMAL,
+    pane_w, pane_rect, is_footer, wheel, pan, fling, tick, scroll_y, scroll_max, MODE_EXPANDED, MODE_COMPACT, MODE_MINIMAL,
     EV_NONE, EV_SELECT, EV_BACK, EV_TOGGLE, EV_DISMISS, NONE,
 }
 
 const NONE: usize = 18446744073709551615
-const MAX_BODY: usize = 12
+const BODY_CAP0: usize = 16
 const MAX_FOOT: usize = 4
 
 const MODE_EXPANDED: u32 = 0
@@ -43,7 +45,10 @@ const LINE_COMPACT: i64 = 641
 const LINE_EXPANDED: i64 = 1008
 
 struct NavView {
-    items: [kit.NavItem; 12],
+    body: u64,
+    cap: usize,
+    vp: viewport.Viewport,
+    reveal: bool,
     n: usize,
     foot: [kit.NavItem; 4],
     nf: usize,
@@ -78,28 +83,45 @@ fn blank() -> kit.NavItem {
 fn nv_new() -> NavView {
     var t: sizeclass.Tracker = sizeclass.tracker_new()
     sizeclass.set_lines(&t, LINE_COMPACT, LINE_EXPANDED)
-    return NavView { items: [blank(); 12], n: 0, foot: [blank(); 4], nf: 0, top: [blank(); 2], nt: 0, sel: NONE,
+    return NavView { body: 0 as u64, cap: 0, vp: viewport.viewport_new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0), reveal: false, n: 0, foot: [blank(); 4], nf: 0, top: [blank(); 2], nt: 0, sel: NONE,
         hov_reg: REG_NONE, hov_idx: NONE, tracker: t, mode: MODE_EXPANDED, user_compact: false, overlay: false, back: false,
         foc: false, kbd: false, ctx: 0 as u64, x: 0.0, y: 0.0, w: 0.0, h: 0.0, pw: 0.0, cx: 0.0, cy: 0.0, cw: 0.0, chh: 0.0 }
 }
 
-fn body_ptr(v: *mut NavView) -> *mut kit.NavItem { return &(*v).items[0] }
+fn body_ptr(v: *mut NavView) -> *mut kit.NavItem { return (*v).body as *mut kit.NavItem }
 fn foot_ptr(v: *mut NavView) -> *mut kit.NavItem { return &(*v).foot[0] }
 fn top_ptr(v: *mut NavView) -> *mut kit.NavItem { return &(*v).top[0] }
 
-fn add(v: *mut NavView, icon: i64, label: str) -> usize {
-    if (*v).n >= MAX_BODY { return NONE }
-    (*v).items[(*v).n] = kit.NavItem { icon: icon, label: label, badge: 0, header: false }
+fn grow_body(v: *mut NavView) {
+    var ncap: usize = BODY_CAP0
+    if (*v).cap > 0 { ncap = (*v).cap * 2 }
+    let sz: usize = kit.nav_item_size()
+    let nb: u64 = rt.heap_alloc(ncap * sz)
+    var i: usize = 0
+    while i < (*v).n {
+        *kit.nav_at(nb as *mut kit.NavItem, i) = *kit.nav_at(body_ptr(v), i)
+        i = i + 1
+    }
+    if (*v).cap > 0 { rt.heap_free((*v).body, (*v).cap * sz) }
+    (*v).body = nb
+    (*v).cap = ncap
+}
+
+fn push_body(v: *mut NavView, it: kit.NavItem) -> usize {
+    if (*v).n >= (*v).cap { grow_body(v) }
+    *kit.nav_at(body_ptr(v), (*v).n) = it
     (*v).n = (*v).n + 1
+    return (*v).n - 1
+}
+
+fn add(v: *mut NavView, icon: i64, label: str) -> usize {
+    push_body(v, kit.NavItem { icon: icon, label: label, badge: 0, header: false })
     if (*v).sel == NONE { (*v).sel = (*v).n - 1 }
     return (*v).n - 1
 }
 
 fn add_header(v: *mut NavView, label: str) -> usize {
-    if (*v).n >= MAX_BODY { return NONE }
-    (*v).items[(*v).n] = kit.NavItem { icon: kit.ICON_NONE, label: label, badge: 0, header: true }
-    (*v).n = (*v).n + 1
-    return (*v).n - 1
+    return push_body(v, kit.NavItem { icon: kit.ICON_NONE, label: label, badge: 0, header: true })
 }
 
 fn add_footer(v: *mut NavView, icon: i64, label: str) -> usize {
@@ -133,7 +155,9 @@ fn selectable(v: *mut NavView, u: usize) -> bool {
 }
 
 fn select(v: *mut NavView, u: usize) {
-    if u == NONE || selectable(v, u) { (*v).sel = u }
+    if u != NONE && !selectable(v, u) { return }
+    if (*v).sel != u { (*v).reveal = true }
+    (*v).sel = u
 }
 
 fn selected(v: *mut NavView) -> usize { return (*v).sel }
@@ -191,6 +215,7 @@ fn layout(v: *mut NavView, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
     (*v).pw = 0.0
     if m == MODE_EXPANDED { (*v).pw = ds_catalog_tok.nav_w_expanded(c) }
     if m == MODE_COMPACT { (*v).pw = ds_catalog_tok.nav_w_compact(c) }
+    sync_body(v, c, x, (*v).pw)
     (*v).cx = x + (*v).pw
     (*v).cy = y
     (*v).cw = w - (*v).pw
@@ -203,6 +228,85 @@ fn layout(v: *mut NavView, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
 
 fn top_h(v: *mut NavView, c: *mut render.Ctx) -> f64 { return kit.nav_item_y(c, top_ptr(v), (*v).nt) }
 fn foot_h(v: *mut NavView, c: *mut render.Ctx) -> f64 { return kit.nav_item_y(c, foot_ptr(v), (*v).nf) }
+
+fn body_top(v: *mut NavView, c: *mut render.Ctx) -> f64 { return (*v).y + top_h(v, c) }
+
+fn body_h(v: *mut NavView, c: *mut render.Ctx) -> f64 {
+    let h: f64 = (*v).h - top_h(v, c) - foot_h(v, c)
+    if h < 0.0 { return 0.0 }
+    return h
+}
+
+fn reveal_selected(v: *mut NavView, c: *mut render.Ctx) {
+    (*v).reveal = false
+    if (*v).sel == NONE || (*v).sel >= (*v).n { return }
+    var first: usize = (*v).sel
+    while first > 0 && (*kit.nav_at(body_ptr(v), first - 1)).header { first = first - 1 }
+    var y0: f64 = kit.nav_item_y(c, body_ptr(v), first)
+    if first == 0 { y0 = 0.0 }
+    let y1: f64 = kit.nav_item_y(c, body_ptr(v), (*v).sel + 1)
+    viewport.viewport_ensure_visible(&(*v).vp, 0.0, y0, 1.0, y1 - y0)
+}
+
+fn sync_body(v: *mut NavView, c: *mut render.Ctx, x: f64, w: f64) {
+    let vp: *mut viewport.Viewport = &(*v).vp
+    viewport.viewport_set_bar(vp, 0)
+    viewport.viewport_set_rect(vp, x, body_top(v, c), w, body_h(v, c))
+    viewport.viewport_set_content(vp, w, kit.nav_item_y(c, body_ptr(v), (*v).n))
+    if (*v).reveal { reveal_selected(v, c) }
+}
+
+fn scroll_y(v: *mut NavView) -> f64 { return viewport.viewport_off_y(&(*v).vp) }
+fn scroll_max(v: *mut NavView) -> f64 { return viewport.viewport_max_y(&(*v).vp) }
+
+fn active_pane_w(v: *mut NavView) -> f64 {
+    if (*v).overlay { return overlay_w(v, (*v).ctx as *mut render.Ctx) }
+    return (*v).pw
+}
+
+fn over_body(v: *mut NavView, px: f64, py: f64) -> bool {
+    if (*v).ctx == 0 as u64 { return false }
+    if (*v).mode == MODE_MINIMAL && !(*v).overlay { return false }
+    let c: *mut render.Ctx = (*v).ctx as *mut render.Ctx
+    rebuild_top(v)
+    let w: f64 = active_pane_w(v)
+    sync_body(v, c, (*v).x, w)
+    if scroll_max(v) <= 0.0 { return false }
+    let by: f64 = body_top(v, c)
+    return px >= (*v).x && px < (*v).x + w && py >= by && py < by + body_h(v, c)
+}
+
+fn wheel(v: *mut NavView, px: f64, py: f64, dy: f64) -> bool {
+    if !over_body(v, px, py) { return false }
+    viewport.viewport_scroll_by(&(*v).vp, 0.0, dy * kit.ln((*v).ctx as *mut render.Ctx, 48))
+    return true
+}
+
+fn pan(v: *mut NavView, px: f64, py: f64, dy: f64, now_ms: i64) -> bool {
+    if !over_body(v, px, py) { return false }
+    let vp: *mut viewport.Viewport = &(*v).vp
+    let before: f64 = viewport.viewport_off_y(vp)
+    viewport.viewport_set_overscroll(vp, true)
+    viewport.viewport_drag(vp, 0.0, 0.0 - dy, now_ms)
+    return viewport.viewport_off_y(vp) != before
+}
+
+fn fling(v: *mut NavView, vy_per_s: f64, now_ms: i64, px_per_160dp: f64) {
+    viewport.viewport_fling_android(&(*v).vp, 0.0, 0.0 - vy_per_s / 1000.0, now_ms, px_per_160dp)
+}
+
+fn tick(v: *mut NavView, now_ms: i64) -> bool { return viewport.viewport_tick(&(*v).vp, now_ms) }
+
+fn draw_thumb(v: *mut NavView, c: *mut render.Ctx, x: f64, w: f64, by: f64, bh: f64) {
+    let mx: f64 = scroll_max(v)
+    let total: f64 = bh + mx
+    var th: f64 = bh * bh / total
+    if th < kit.ln(c, 24) { th = kit.ln(c, 24) }
+    if th > bh { th = bh }
+    let ty: f64 = by + scroll_y(v) / mx * (bh - th)
+    let tw: f64 = kit.ln(c, 3)
+    painter.round_rect(render.ctx_painter(c), x + w - tw - kit.ln(c, 3), ty, tw, th, tw / 2.0, ds_catalog_tok.muted(c))
+}
 
 fn bar_button(v: *mut NavView, c: *mut render.Ctx, k: usize) -> f64 {
     return (*v).x + (ds_catalog_tok.top_bar_h(c)) * (k as f64)
@@ -238,8 +342,11 @@ fn locate(v: *mut NavView, c: *mut render.Ctx, px: f64, py: f64, idx: *mut usize
     let fh: f64 = foot_h(v, c)
     var i: usize = kit.nav_hit(c, top_ptr(v), (*v).nt, pane_x, (*v).y, pane_wd, collapsed, px, py)
     if i != NONE { *idx = i; return REG_TOP }
-    i = kit.nav_hit(c, body_ptr(v), (*v).n, pane_x, (*v).y + th, pane_wd, collapsed, px, py)
-    if i != NONE { *idx = i; return REG_BODY }
+    sync_body(v, c, pane_x, pane_wd)
+    if py >= (*v).y + th && py < (*v).y + th + body_h(v, c) {
+        i = kit.nav_hit(c, body_ptr(v), (*v).n, pane_x, (*v).y + th - scroll_y(v), pane_wd, collapsed, px, py)
+        if i != NONE { *idx = i; return REG_BODY }
+    }
     i = kit.nav_hit(c, foot_ptr(v), (*v).nf, pane_x, (*v).y + (*v).h - fh, pane_wd, collapsed, px, py)
     if i != NONE { *idx = (*v).n + i; return REG_FOOT }
     return REG_NONE
@@ -270,10 +377,20 @@ fn draw_pane(v: *mut NavView, c: *mut render.Ctx, x: f64, w: f64, collapsed: boo
     if (*v).sel != NONE && (*v).sel < (*v).n { sb = (*v).sel }
     if (*v).sel != NONE && (*v).sel >= (*v).n { sf = (*v).sel - (*v).n }
     screenax.note(widget.KIND_MENU, 0 as u32, "Navigation", x, (*v).y, w, (*v).h, 0)
-    var body_h: f64 = (*v).h - th - fh
-    if body_h < 0.0 { body_h = 0.0 }
+    var bh: f64 = (*v).h - th - fh
+    if bh < 0.0 { bh = 0.0 }
     kit.nav_draw(c, top_ptr(v), (*v).nt, NONE, ht, false, x, (*v).y, w, th, collapsed)
-    kit.nav_draw(c, body_ptr(v), (*v).n, sb, hb, (*v).foc && (*v).kbd, x, (*v).y + th, w, body_h, collapsed)
+    sync_body(v, c, x, w)
+    if scroll_max(v) > 0.0 {
+        if viewport.viewport_begin(c, &(*v).vp) {
+            kit.nav_draw(c, body_ptr(v), (*v).n, sb, hb, (*v).foc && (*v).kbd, x, (*v).y + th - scroll_y(v),
+                w, kit.nav_item_y(c, body_ptr(v), (*v).n), collapsed)
+            viewport.viewport_end(c, &(*v).vp)
+        }
+        draw_thumb(v, c, x, w, (*v).y + th, bh)
+    } else {
+        kit.nav_draw(c, body_ptr(v), (*v).n, sb, hb, (*v).foc && (*v).kbd, x, (*v).y + th, w, bh, collapsed)
+    }
     kit.nav_draw(c, foot_ptr(v), (*v).nf, sf, hf, (*v).foc && (*v).kbd, x, (*v).y + (*v).h - fh, w, fh, collapsed)
 }
 
@@ -388,6 +505,7 @@ fn key(v: *mut NavView, code: u32, mods: u32) -> u32 {
     (*v).foc = true
     (*v).kbd = true
     if t == (*v).sel { return EV_NONE }
+    (*v).reveal = true
     (*v).sel = t
     return EV_SELECT
 }

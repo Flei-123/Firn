@@ -9,7 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from designlint_lib import allow, engine
-from designlint_lib.rules import REGISTRY
+from designlint_lib.rules import PROJECT_REGISTRY, REGISTRY
 
 DEFAULT_ALLOW = os.path.join(HERE, "designlint_allow.txt")
 DEFAULT_PATHS = ["examples/fui_apps"]
@@ -27,7 +27,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.list_rules:
-        for rule_id, summary, _fn in REGISTRY:
+        for rule_id, summary, _fn in REGISTRY + PROJECT_REGISTRY:
             print(rule_id + "\t" + summary)
         return 0
 
@@ -44,7 +44,7 @@ def main(argv=None):
         for f in kept:
             print("%s:%d: %s: %s [%s]" % (f["file"], f["line"], f["rule"], f["message"], f["text"]))
         if args.counts or kept:
-            for rule_id, _s, _fn in REGISTRY:
+            for rule_id, _s, _fn in REGISTRY + PROJECT_REGISTRY:
                 print("%-20s %d" % (rule_id, counts.get(rule_id, 0)))
             print("allowed: %d" % len(skipped))
     return 1 if kept else 0

@@ -74,6 +74,12 @@ def main():
     if code != 1 or any(line.split(": ")[1:2] not in ([], ["PAGING"]) for line in out.splitlines() if ".fi:" in line):
         failures.append("cli: --rules filter")
 
+    for app, want in (("bad_app", 1), ("good_app", 0), ("core_app", 0)):
+        checks += 1
+        code, out = run_cli(["--no-allow", os.path.join(HERE, "icon_install", app)])
+        if code != want or (want == 1 and "ICON_NOT_INSTALLED" not in out):
+            failures.append("icon_install/%s: exit %d, output %s" % (app, code, out.strip()))
+
     for f in failures:
         print("FAIL: " + f)
     print("designlint tests: %d checks, %d failed" % (checks, len(failures)))
