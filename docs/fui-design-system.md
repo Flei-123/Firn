@@ -64,6 +64,23 @@ Motion `M_*` (ms, easing): PRESS 50 linear, HOVER 83 linear, FOCUS 100 standard,
 
 `tools/fui/ds_tokens_main.fi` (run.sh section 2a): WCAG AA (4.5:1) for every text pair in light and dark for all 8 accents, 3:1 for focus ring and accent against the page, all roles defined, accent switch, theme equals tokens, scales monotone, motion matches `anim.DUR_*`.
 
+## Component tokens (`lib/fui/ds_tokens_comp.fi`)
+
+All colours are `0xAARRGGBB` (alpha 0 = no fill), all lengths device px, text sizes via `ds_tokens.type_of(m, tok.text_role)`.
+
+| Call | Struct fields |
+|---|---|
+| `button(m, BTN_STANDARD/PRIMARY/SUBTLE/CRITICAL)` | bg, bg_hover, bg_pressed, bg_disabled, fg, fg_disabled, border, border_disabled, ring, radius, height, pad_x, pad_y, gap, icon_px, border_w, ring_w, text_role |
+| `card(m)` | bg, bg_hover, border, radius, pad, gap, border_w, elevation |
+| `row(m)` | bg, bg_hover, bg_pressed, bg_selected, fg, fg_secondary, divider, indicator, height, pad_x, gap, radius, indicator_w, indicator_h, icon_px |
+| `input(m)` | bg, bg_hover, bg_focus, bg_disabled, fg, fg_placeholder, fg_disabled, border, border_error, accent_line, ring, radius, height, pad_x, border_w, line_w, text_role |
+| `nav(m)` | pane_bg, bg_hover, bg_selected, fg, fg_selected, indicator, pane_w, pane_w_compact, item_h, item_radius, item_pad_x, item_gap, indicator_w, indicator_h, icon_px, text_role |
+| `infobar(m, SEV_INFO/SUCCESS/WARNING/ERROR)` | bg, border, icon, fg, fg_secondary, radius, min_h, pad_x, pad_y, gap, icon_px, border_w, title_role, body_role |
+| `toast(m, SEV_*)` | bg, fg, fg_secondary, border, accent_bar, radius, pad_x, pad_y, gap, width, icon_px, border_w, elevation, enter_ms, exit_ms, duration_ms, title_role, body_role |
+| `severity_color(m, SEV_*)` | status colour for icons and bars |
+
+Every text/background pair of these tokens is checked at 4.5:1 for light and dark and all accents in `ds_tokens_main.fi`.
+
 ## Components
 
 (Append the public API of each component below, one line per function.)
