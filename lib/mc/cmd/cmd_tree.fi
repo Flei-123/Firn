@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/cmd/cmd_tree.fi -- builds a lib/brigadier tree from a Vanilla commands.json datagen report and dumps it back in canonical text.
+import std.rt
+import std.json as json
+import std.str
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.argtype as at
+import brigadier.node as nn
+import brigadier.javanum as jn
+
+export { CmdTree, Spec, PathEnt, tree_new, tree_load, tree_dump, tree_spec, tree_path_of, tree_level_name, str_eq, push_str, buf_copy_pub }
+
+struct Spec {
+    parser: str,
+    props: str,
+    kind: i32,
+    p0: i64,
+}
+
+struct PathEnt {
+    h: u64,
+    path: str,
+}
+
+struct CmdTree {
+    a: *mut m.Arena,
+    root: u64,
+    specs: m.Arr[Spec],
+    paths: m.Arr[PathEnt],
+    perm_names: m.Arr[str],
+}
+
+struct Pair {
+    key: str,
+    val: str,
+}
+
+struct Pending {
+    h: u64,
+    target: str,
+}
+
+const F32_MAX: f64 = 3.4028234663852886e38
+const F64_MAX: f64 = 1.7976931348623157e308
+const I32_MIN: i64 = -2147483648
+const I32_MAX: i64 = 2147483647
+const I64_MIN: i64 = -9223372036854775807 - 1
+const I64_MAX: i64 = 9223372036854775807
+
+fn tree_new(a: *mut m.Arena) -> CmdTree {
+    return CmdTree { a: a, root: nn.node_root(a), specs: m.arr_new[Spec](), paths: m.arr_new[PathEnt](), perm_names: m.arr_new[str]() }
+}
+
+fn copy_bytes(a: *mut m.Arena, p: u64, n: usize) -> str {
+    let d: u64 = m.arena_alloc(a, n + 1)
+    var i: usize = 0
+    while i < n {
+        rt.st8(d, i, rt.ld8(p, i))
+        i = i + 1
+    }
+    return str { p: d as *mut u8, n: n }
+}
+
+fn copy_span(a: *mut m.Arena, s: str.Span) -> str {
+    return copy_bytes(a, s.p as u64, s.n)
+}
+
+fn buf_copy_pub(a: *mut m.Arena, b: *mut rt.Buf) -> str {
+    return buf_copy(a, b)
+}
+
+fn buf_copy(a: *mut m.Arena, b: *mut rt.Buf) -> str {
+    return copy_bytes(a, rt.buf_ptr(b), rt.buf_len(b))
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn str_eq(x: str, y: str) -> bool {
+    if x.n != y.n {
+        return false
+    }
+    var i: usize = 0
+    while i < x.n {
+        if rt.ld8(x.p as u64, i) != rt.ld8(y.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn str_lt(x: str, y: str) -> bool {
+    var i: usize = 0
+    while i < x.n && i < y.n {
+        let a: u8 = rt.ld8(x.p as u64, i)
+        let b: u8 = rt.ld8(y.p as u64, i)
+        if a != b {
+            return a < b
+        }
+        i = i + 1
+    }
+    return x.n < y.n
+}
+
+fn span_str(s: str.Span) -> str {
+    return str { p: s.p, n: s.n }
+}
+
+fn jfind(d: *mut json.Json, obj: u32, key: str) -> u32 {
+    return json.json_get(d, obj, key.p as u64, key.n)
+}
+
+fn jfind_str(d: *mut json.Json, obj: u32, key: str, out: *mut str) -> bool {
+    let n: u32 = jfind(d, obj, key)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return false
+    }
+    *out = span_str(json.json_string(d, n))
+    return true
+}
+
+fn put_num(a: *mut m.Arena, out: *mut rt.Buf, v: f64, as_float: bool) {
+    var b: m.Arr[u16] = tx.b16_new()
+    if as_float {
+        jn.put_float(a, &b, v as f32)
+    } else {
+        jn.put_double(a, &b, v)
+    }
+    push_str(out, tx.u16_to_str(a, tx.b16_view(&b)))
+}
+
+fn props_text(t: *mut CmdTree, d: *mut json.Json, props: u32, out: *mut rt.Buf) {
+    var pairs: m.Arr[Pair] = m.arr_new[Pair]()
+    if props != json.JSON_NONE {
+        var c: u32 = json.json_child(d, props)
+        while c != json.JSON_NONE {
+            var v: rt.Buf = rt.buf_new()
+            if json.json_kind(d, c) == json.JSON_STRING {
+                push_str(&v, span_str(json.json_string(d, c)))
+            } else if json.json_kind(d, c) == json.JSON_NUMBER {
+                if json.json_is_int(d, c) {
+                    rt.buf_push_dec_i64(&v, json.json_int(d, c))
+                } else {
+                    put_num((*t).a, &v, json.json_number(d, c), false)
+                }
+            }
+            m.arr_push[Pair]((*t).a, &pairs, Pair { key: copy_span((*t).a, json.json_key(d, c)), val: buf_copy((*t).a, &v) })
+            rt.buf_free(&v)
+            c = json.json_next(d, c)
+        }
+    }
+    let n: usize = m.arr_len[Pair](&pairs)
+    var i: usize = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && str_lt((*m.arr_at[Pair](&pairs, j)).key, (*m.arr_at[Pair](&pairs, j - 1)).key) {
+            let tmp: Pair = *m.arr_at[Pair](&pairs, j)
+            *m.arr_at[Pair](&pairs, j) = *m.arr_at[Pair](&pairs, j - 1)
+            *m.arr_at[Pair](&pairs, j - 1) = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        push_str(out, "-")
+        return
+    }
+    i = 0
+    while i < n {
+        if i > 0 {
+            rt.buf_push(out, 59 as u8)
+        }
+        push_str(out, (*m.arr_at[Pair](&pairs, i)).key)
+        rt.buf_push(out, 61 as u8)
+        push_str(out, (*m.arr_at[Pair](&pairs, i)).val)
+        i = i + 1
+    }
+}
+
+fn prop_i64(d: *mut json.Json, props: u32, key: str, dflt: i64) -> i64 {
+    if props == json.JSON_NONE {
+        return dflt
+    }
+    let n: u32 = jfind(d, props, key)
+    if n == json.JSON_NONE {
+        return dflt
+    }
+    return json.json_int(d, n)
+}
+
+fn prop_f64(d: *mut json.Json, props: u32, key: str, dflt: f64) -> f64 {
+    if props == json.JSON_NONE {
+        return dflt
+    }
+    let n: u32 = jfind(d, props, key)
+    if n == json.JSON_NONE {
+        return dflt
+    }
+    return json.json_number(d, n)
+}
+
+fn native_type(d: *mut json.Json, parser: str, props: u32, out: *mut at.ArgType) -> bool {
+    if str_eq(parser, "brigadier:bool") {
+        *out = at.at_bool()
+        return true
+    }
+    if str_eq(parser, "brigadier:integer") {
+        *out = at.at_int(prop_i64(d, props, "min", I32_MIN) as i32, prop_i64(d, props, "max", I32_MAX) as i32)
+        return true
+    }
+    if str_eq(parser, "brigadier:long") {
+        *out = at.at_long(prop_i64(d, props, "min", I64_MIN), prop_i64(d, props, "max", I64_MAX))
+        return true
+    }
+    if str_eq(parser, "brigadier:float") {
+        *out = at.at_float(prop_f64(d, props, "min", 0.0 - F32_MAX) as f32, prop_f64(d, props, "max", F32_MAX) as f32)
+        return true
+    }
+    if str_eq(parser, "brigadier:double") {
+        *out = at.at_double(prop_f64(d, props, "min", 0.0 - F64_MAX), prop_f64(d, props, "max", F64_MAX))
+        return true
+    }
+    if str_eq(parser, "brigadier:string") {
+        var kind: str = ""
+        if props != json.JSON_NONE {
+            jfind_str(d, props, "type", &kind)
+        }
+        if str_eq(kind, "word") {
+            *out = at.at_word()
+        } else if str_eq(kind, "greedy") {
+            *out = at.at_greedy()
+        } else {
+            *out = at.at_string()
+        }
+        return true
+    }
+    return false
+}
+
+fn level_index(t: *mut CmdTree, name: str) -> i32 {
+    var i: usize = 0
+    while i < m.arr_len[str](&(*t).perm_names) {
+        if str_eq(*m.arr_at[str](&(*t).perm_names, i), name) {
+            return (i as i32) + 1
+        }
+        i = i + 1
+    }
+    m.arr_push[str]((*t).a, &(*t).perm_names, name)
+    return m.arr_len[str](&(*t).perm_names) as i32
+}
+
+fn tree_level_name(t: *mut CmdTree, req: i32) -> str {
+    if req <= 0 || (req as usize) > m.arr_len[str](&(*t).perm_names) {
+        return "-"
+    }
+    return *m.arr_at[str](&(*t).perm_names, (req - 1) as usize)
+}
+
+fn perm_level_of(t: *mut CmdTree, d: *mut json.Json, node: u32) -> i32 {
+    let p: u32 = jfind(d, node, "permissions")
+    if p == json.JSON_NONE {
+        return 0
+    }
+    let inner: u32 = jfind(d, p, "permission")
+    if inner == json.JSON_NONE {
+        return 0
+    }
+    var lv: str = ""
+    if !jfind_str(d, inner, "level", &lv) {
+        return 0
+    }
+    return level_index(t, copy_bytes((*t).a, lv.p as u64, lv.n))
+}
+
+fn join_path(a: *mut m.Arena, parent: str, name: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    if parent.n > 0 {
+        push_str(&b, parent)
+        rt.buf_push(&b, 32 as u8)
+    }
+    push_str(&b, name)
+    let r: str = buf_copy(a, &b)
+    rt.buf_free(&b)
+    return r
+}
+
+fn make_node(t: *mut CmdTree, d: *mut json.Json, jnode: u32, name: str, pend: *mut m.Arr[Pending], path: str) -> u64 {
+    var kind: str = ""
+    jfind_str(d, jnode, "type", &kind)
+    let a: *mut m.Arena = (*t).a
+    let uname: tx.U16 = tx.u16_from_str(a, name)
+    var h: u64 = 0
+    if str_eq(kind, "literal") {
+        h = nn.node_literal(a, uname)
+    } else {
+        var parser: str = ""
+        jfind_str(d, jnode, "parser", &parser)
+        let props: u32 = jfind(d, jnode, "properties")
+        var ty: at.ArgType = at.at_bool()
+        if native_type(d, parser, props, &ty) {
+            h = nn.node_argument(a, uname, ty)
+        } else {
+            var pb: rt.Buf = rt.buf_new()
+            props_text(t, d, props, &pb)
+            m.arr_push[Spec](a, &(*t).specs, Spec { parser: copy_bytes(a, parser.p as u64, parser.n), props: buf_copy(a, &pb), kind: 0, p0: 0 })
+            rt.buf_free(&pb)
+            h = nn.node_argument(a, uname, at.at_custom(m.arr_len[Spec](&(*t).specs) as i32))
+        }
+    }
+    (*nn.nd(h)).req = perm_level_of(t, d, jnode)
+    let ex: u32 = jfind(d, jnode, "executable")
+    m.arr_push[PathEnt](a, &(*t).paths, PathEnt { h: h, path: path })
+    if ex != json.JSON_NONE && json.json_kind(d, ex) == json.JSON_TRUE {
+        (*nn.nd(h)).cmd = m.arr_len[PathEnt](&(*t).paths) as i32
+    }
+    let rd: u32 = jfind(d, jnode, "redirect")
+    if rd != json.JSON_NONE && json.json_count(d, rd) > 0 {
+        var pb: rt.Buf = rt.buf_new()
+        var c: u32 = json.json_child(d, rd)
+        while c != json.JSON_NONE {
+            if rt.buf_len(&pb) > 0 {
+                rt.buf_push(&pb, 32 as u8)
+            }
+            push_str(&pb, span_str(json.json_string(d, c)))
+            c = json.json_next(d, c)
+        }
+        m.arr_push[Pending](a, pend, Pending { h: h, target: buf_copy(a, &pb) })
+        rt.buf_free(&pb)
+    }
+    return h
+}
+
+fn load_children(t: *mut CmdTree, d: *mut json.Json, jnode: u32, parent: u64, parent_path: str, pend: *mut m.Arr[Pending]) {
+    let ch: u32 = jfind(d, jnode, "children")
+    if ch == json.JSON_NONE {
+        return
+    }
+    var c: u32 = json.json_child(d, ch)
+    while c != json.JSON_NONE {
+        let name: str = copy_span((*t).a, json.json_key(d, c))
+        let path: str = join_path((*t).a, parent_path, name)
+        let h: u64 = make_node(t, d, c, name, pend, path)
+        load_children(t, d, c, h, path, pend)
+        nn.node_add_child((*t).a, parent, h)
+        c = json.json_next(d, c)
+    }
+}
+
+fn find_path(t: *mut CmdTree, path: str) -> u64 {
+    var i: usize = 0
+    while i < m.arr_len[PathEnt](&(*t).paths) {
+        let e: *mut PathEnt = m.arr_at[PathEnt](&(*t).paths, i)
+        if str_eq((*e).path, path) {
+            return (*e).h
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn tree_load(t: *mut CmdTree, p: u64, n: usize) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, p, n) catch false
+    if !ok || !json.json_valid(&d) {
+        json.json_free(&d)
+        return false
+    }
+    var pend: m.Arr[Pending] = m.arr_new[Pending]()
+    load_children(t, &d, json.json_root(&d), (*t).root, "", &pend)
+    var i: usize = 0
+    while i < m.arr_len[Pending](&pend) {
+        let e: *mut Pending = m.arr_at[Pending](&pend, i)
+        let target: u64 = find_path(t, (*e).target)
+        if target != 0 {
+            nn.node_forward((*e).h, target, 0, false)
+        }
+        i = i + 1
+    }
+    json.json_free(&d)
+    return true
+}
+
+fn tree_spec(t: *mut CmdTree, custom: i32) -> *mut Spec {
+    return m.arr_at[Spec](&(*t).specs, (custom - 1) as usize)
+}
+
+fn tree_path_of(t: *mut CmdTree, h: u64) -> str {
+    var i: usize = 0
+    while i < m.arr_len[PathEnt](&(*t).paths) {
+        let e: *mut PathEnt = m.arr_at[PathEnt](&(*t).paths, i)
+        if (*e).h == h {
+            return (*e).path
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+fn dump_range(t: *mut CmdTree, ty: *mut at.ArgType, out: *mut rt.Buf) {
+    var lo_d: i64 = I32_MIN
+    var hi_d: i64 = I32_MAX
+    if (*ty).kind == at.AT_LONG {
+        lo_d = I64_MIN
+        hi_d = I64_MAX
+    }
+    var any: bool = false
+    if (*ty).imax != hi_d {
+        push_str(out, "max=")
+        rt.buf_push_dec_i64(out, (*ty).imax)
+        any = true
+    }
+    if (*ty).imin != lo_d {
+        if any {
+            rt.buf_push(out, 59 as u8)
+        }
+        push_str(out, "min=")
+        rt.buf_push_dec_i64(out, (*ty).imin)
+        any = true
+    }
+    if !any {
+        push_str(out, "-")
+    }
+}
+
+fn dump_frange(t: *mut CmdTree, ty: *mut at.ArgType, out: *mut rt.Buf) {
+    let is_f: bool = (*ty).kind == at.AT_FLOAT
+    var lim: f64 = F64_MAX
+    if is_f {
+        lim = F32_MAX
+    }
+    var any: bool = false
+    if (*ty).fmax != lim {
+        push_str(out, "max=")
+        put_num((*t).a, out, (*ty).fmax, is_f)
+        any = true
+    }
+    if (*ty).fmin != 0.0 - lim {
+        if any {
+            rt.buf_push(out, 59 as u8)
+        }
+        push_str(out, "min=")
+        put_num((*t).a, out, (*ty).fmin, is_f)
+        any = true
+    }
+    if !any {
+        push_str(out, "-")
+    }
+}
+
+fn dump_native_props(t: *mut CmdTree, ty: *mut at.ArgType, out: *mut rt.Buf) {
+    if (*ty).kind == at.AT_INT || (*ty).kind == at.AT_LONG {
+        dump_range(t, ty, out)
+    } else if (*ty).kind == at.AT_FLOAT || (*ty).kind == at.AT_DOUBLE {
+        dump_frange(t, ty, out)
+    } else if (*ty).kind == at.AT_WORD {
+        push_str(out, "type=word")
+    } else if (*ty).kind == at.AT_STRING {
+        push_str(out, "type=phrase")
+    } else if (*ty).kind == at.AT_GREEDY {
+        push_str(out, "type=greedy")
+    } else {
+        push_str(out, "-")
+    }
+}
+
+fn native_name(kind: i32) -> str {
+    if kind == at.AT_BOOL { return "brigadier:bool" }
+    if kind == at.AT_INT { return "brigadier:integer" }
+    if kind == at.AT_LONG { return "brigadier:long" }
+    if kind == at.AT_FLOAT { return "brigadier:float" }
+    if kind == at.AT_DOUBLE { return "brigadier:double" }
+    return "brigadier:string"
+}
+
+fn tree_dump(t: *mut CmdTree, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < m.arr_len[PathEnt](&(*t).paths) {
+        let e: *mut PathEnt = m.arr_at[PathEnt](&(*t).paths, i)
+        let n: *mut nn.Node = nn.nd((*e).h)
+        push_str(out, (*e).path)
+        rt.buf_push(out, 9 as u8)
+        if (*n).kind == nn.NK_LITERAL {
+            push_str(out, "literal\t-\t-")
+        } else {
+            push_str(out, "argument\t")
+            if (*n).atype.kind == at.AT_CUSTOM {
+                let sp: *mut Spec = tree_spec(t, (*n).atype.custom)
+                push_str(out, (*sp).parser)
+                rt.buf_push(out, 9 as u8)
+                push_str(out, (*sp).props)
+            } else {
+                push_str(out, native_name((*n).atype.kind))
+                rt.buf_push(out, 9 as u8)
+                dump_native_props(t, &(*n).atype, out)
+            }
+        }
+        push_str(out, "\texec=")
+        if (*n).cmd != 0 {
+            push_str(out, "1")
+        } else {
+            push_str(out, "0")
+        }
+        push_str(out, "\tperm=")
+        push_str(out, tree_level_name(t, (*n).req))
+        push_str(out, "\tredirect=")
+        if (*n).redirect != 0 {
+            push_str(out, tree_path_of(t, (*n).redirect))
+        } else {
+            push_str(out, "-")
+        }
+        rt.buf_push(out, 10 as u8)
+        i = i + 1
+    }
+}
