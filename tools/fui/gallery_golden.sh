@@ -5,7 +5,7 @@ cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
 MAX="${GALLERY_GOLDEN_MAX:-0.5}"
-PAGES="${GALLERY_PAGES:-14}"
+PAGES="${GALLERY_PAGES:-16}"
 MODE=compare
 [ "$1" = "--update" ] && MODE=update
 T="$(mktemp -d)"

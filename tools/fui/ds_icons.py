@@ -44,6 +44,8 @@ ICONS = [
     ("cursor", "Cursor Click"), ("apps_list", "Apps List"),
 ]
 
+CORE = ("back", "list", "chevron_up", "chevron_down", "checkmark")
+
 TOKEN = re.compile(r"([MmLlHhVvCcSsQqTtAaZz])|(-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
 ARGS = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
 
@@ -154,19 +156,74 @@ def emit(out_dir, icons, data):
         names_fi += '    if id == %d { return "%s" }\n' % (i, n)
     names_fi += '    return ""\n}\n'
     open(os.path.join(out_dir, "ds_icons_names.fi"), "w").write(names_fi)
+    core = open_module(head, "ds_icons_core")
+    for size in SIZES:
+        core += "\n"
+        for style in STYLES:
+            core += "\nfn %s%d(id: i64) -> str {\n" % (style, size)
+            core += variants(icons, data, size, style, True)
+            core += '    return ""\n}\n'
+    open(os.path.join(out_dir, "ds_icons_core.fi"), "w").write(core)
     for size in SIZES:
         o = head + "\nexport { regular, filled }\n"
         for style in STYLES:
             o += "\nfn %s(id: i64) -> str {\n" % style
-            for i, (n, f) in enumerate(icons):
-                d = data.get((n, size, style))
-                if d:
-                    o += '    if id == %d {\n        return "%s"\n    }\n' % (i, d)
+            o += variants(icons, data, size, style, False)
             o += '    return ""\n}\n'
         open(os.path.join(out_dir, "ds_icons_data%d.fi" % size), "w").write(o)
 
 
+def open_module(head, name):
+    exports = ", ".join("%s%d" % (st, sz) for sz in SIZES for st in STYLES)
+    return head + "\nexport { %s }\n" % exports
+
+
+def variants(icons, data, size, style, core):
+    o = ""
+    for i, (n, f) in enumerate(icons):
+        if (n in CORE) != core:
+            continue
+        d = data.get((n, size, style))
+        if d:
+            o += '    if id == %d {\n        return "%s"\n    }\n' % (i, d)
+    return o
+
+
+def load_existing(out_dir, icons):
+    data = {}
+    for size in SIZES:
+        sources = [os.path.join(out_dir, "ds_icons_data%d.fi" % size)]
+        for path in sources:
+            text = open(path).read()
+            for style in STYLES:
+                a = text.index("fn %s(id: i64)" % style)
+                b = text.find("\nfn ", a + 4)
+                body = text[a:] if b < 0 else text[a:b]
+                for m in re.finditer(r'if id == (\d+) \{\s*return "([^"]*)"', body):
+                    data[(icons[int(m.group(1))][0], size, style)] = m.group(2)
+    core_path = os.path.join(out_dir, "ds_icons_core.fi")
+    if os.path.exists(core_path):
+        text = open(core_path).read()
+        for size in SIZES:
+            for style in STYLES:
+                a = text.index("fn %s%d(id: i64)" % (style, size))
+                b = text.find("\nfn ", a + 4)
+                body = text[a:] if b < 0 else text[a:b]
+                for m in re.finditer(r'if id == (\d+) \{\s*return "([^"]*)"', body):
+                    data[(icons[int(m.group(1))][0], size, style)] = m.group(2)
+    return data
+
+
+def resplit(out_dir):
+    names = re.findall(r'if id == \d+ \{ return "([^"]*)" \}', open(os.path.join(out_dir, "ds_icons_names.fi")).read())
+    icons = [(n, "") for n in names]
+    emit(out_dir, icons, load_existing(out_dir, icons))
+
+
 def main():
+    if sys.argv[1] == "--resplit":
+        resplit(sys.argv[2])
+        return
     out_dir = sys.argv[1]
     cache = sys.argv[2]
     os.makedirs(cache, exist_ok=True)
