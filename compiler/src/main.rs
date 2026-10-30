@@ -71,6 +71,7 @@ mod tailrec;
 mod guardsplit;
 mod phi;
 mod lower;
+mod own;
 mod lower_errors;
 mod lower_match;
 mod modules;
@@ -326,6 +327,7 @@ fn usage() -> String {
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
+         --ownership=<m>    off | on | check (automatic ownership, default off)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
@@ -414,6 +416,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--list-attrs" => {
                 print!("{}", attrs::attrs_text());
                 std::process::exit(0);
+            }
+            _ if a.starts_with("--ownership=") => {
+                let v = &a["--ownership=".len()..];
+                match own::parse(v) {
+                    Some(m) => own::set_mode(m),
+                    None => return Err(format!("unknown ownership mode '{}' (allowed: off, on, check)", v)),
+                }
             }
             _ if a.starts_with("--opt-level=") => {
                 let v = &a["--opt-level=".len()..];

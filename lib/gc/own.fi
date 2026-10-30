@@ -1,0 +1,264 @@
+// lib/gc/own.fi -- ownership runtime: early block release, poison check mode, fused str chains.
+
+const OWN_POISON: u32 = 64
+const OWN_POISON_WORD: u64 = 16059518370053521118
+const OWN_VERIFY_EVERY: u64 = 1024
+
+static mut OWN_FREED: u64 = 0
+static mut OWN_DEFERRED: u64 = 0
+static mut OWN_POISONED: u64 = 0
+
+fn __own_fail(code: u64, tid: u64) {
+    var m: [u8; 62] = "firn-own: use after free detected (ownership=check), code 0x?\n"
+    m[60] = (48 + (code & 7)) as u8
+    let p: u64 = (&m) as u64
+    syscall(GC_SYS_WRITE, 2, p as i64, 62, 0, 0, 0)
+    syscall(GC_SYS_EXIT_GROUP, 86, 0, 0, 0, 0, 0)
+}
+
+fn __own_block(a: u64) -> u64 {
+    if a == 0 {
+        return 0
+    }
+    let st: u64 = __gc_state() as u64
+    if (*((st + S_INIT) as *mut u64)) != 1 {
+        return 0
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return 0
+    }
+    if b + HEADER != a {
+        return 0
+    }
+    return b
+}
+
+fn __gc_free_block(p: *mut u8) {
+    let b: u64 = __own_block(p as u64)
+    if b == 0 {
+        return
+    }
+    if (*((b) as *mut u32)) == 0 {
+        return
+    }
+    if ((*((b + 4) as *mut u32)) & M_WITHOUT_MARK) != 0 {
+        return
+    }
+    let c: u64 = __gc_chunk_of(b)
+    if c == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    let class: u64 = (*((c + 40) as *mut u64))
+    *((b) as *mut u32) = 0
+    *((b + 8) as *mut u64) = 0
+    if class >= CLASSES {
+        OWN_DEFERRED = OWN_DEFERRED + 1
+        return
+    }
+    if (*((st + S_PHASE) as *mut u64)) != 0 {
+        OWN_DEFERRED = OWN_DEFERRED + 1
+        return
+    }
+    if (*((st + S_MULTI) as *mut u64)) != 0 {
+        return
+    }
+    *((b + 4) as *mut u32) = 0
+    let header: u64 = st + S_FREE + class * 8
+    *((b + HEADER) as *mut u64) = (*((header) as *mut u64))
+    *((header) as *mut u64) = b
+    let step: u64 = (*((c + 16) as *mut u64))
+    let since: u64 = (*((st + S_SINCE) as *mut u64))
+    if since >= step {
+        *((st + S_SINCE) as *mut u64) = since - step
+    }
+    OWN_FREED = OWN_FREED + 1
+}
+
+fn __gc_poison_block(p: *mut u8) {
+    let b: u64 = __own_block(p as u64)
+    if b == 0 {
+        return
+    }
+    let tid: u64 = (*((b) as *mut u32)) as u64
+    let zw: u32 = (*((b + 4) as *mut u32))
+    if tid == 0 {
+        __own_fail(1, 0)
+    }
+    if (zw & OWN_POISON) != 0 {
+        __own_fail(2, tid)
+    }
+    if (zw & M_WITHOUT_MARK) != 0 {
+        return
+    }
+    let c: u64 = __gc_chunk_of(b)
+    if c == 0 {
+        return
+    }
+    let block: u64 = (*((c + 16) as *mut u64))
+    var i: u64 = HEADER
+    while i + 8 <= block {
+        *((b + i) as *mut u64) = OWN_POISON_WORD
+        i = i + 8
+    }
+    *((b + 4) as *mut u32) = zw | OWN_POISON
+    OWN_POISONED = OWN_POISONED + 1
+    let n: u64 = OWN_POISONED
+    if (n & (n - 1)) == 0 || (n % OWN_VERIFY_EVERY) == 0 {
+        gc_own_verify()
+    }
+}
+
+fn __own_check_ref(v: u64) {
+    if v == 0 {
+        return
+    }
+    let bb: u64 = __gc_block_of(v)
+    if bb == 0 {
+        return
+    }
+    if (*((bb) as *mut u32)) == 0 {
+        return
+    }
+    if ((*((bb + 4) as *mut u32)) & OWN_POISON) != 0 {
+        __own_fail(3, (*((bb) as *mut u32)) as u64)
+    }
+}
+
+fn __own_verify_slots(obj: u64) {
+    let n: u64 = (*((obj) as *mut u64))
+    let desc: u64 = (*((obj + 8) as *mut u64))
+    let step: u64 = desc & 255
+    let mask: u64 = desc >> 8
+    if step == 0 || mask == 0 {
+        return
+    }
+    var i: u64 = 0
+    while i < n {
+        var j: u64 = 0
+        while j < step {
+            if ((mask >> j) & 1) != 0 {
+                __own_check_ref((*((obj + SLOT_HEADER + (i * step + j) * 8) as *mut u64)))
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn __own_verify_block(b: u64, tab: u64) {
+    let tid: u64 = (*((b) as *mut u32)) as u64
+    if tid == 0 {
+        return
+    }
+    let zw: u32 = (*((b + 4) as *mut u32))
+    if (zw & OWN_POISON) != 0 {
+        return
+    }
+    let obj: u64 = b + HEADER
+    if (zw & F_SLOTS) != 0 {
+        __own_verify_slots(obj)
+        return
+    }
+    if tid > (*((tab) as *mut u64)) {
+        return
+    }
+    let entry: u64 = tab + 8 + (tid - 1) * 64
+    let n: u64 = (*((entry + 16) as *mut u64))
+    let offs: u64 = (*((entry + 24) as *mut u64))
+    var i: u64 = 0
+    while i < n {
+        __own_check_ref((*((obj + (*((offs + i * 8) as *mut u64))) as *mut u64)))
+        i = i + 1
+    }
+}
+
+fn gc_own_verify() {
+    let st: u64 = __gc_state() as u64
+    if (*((st + S_INIT) as *mut u64)) != 1 {
+        return
+    }
+    let tab: u64 = (*((st + S_TABLE) as *mut u64))
+    if tab == 0 {
+        return
+    }
+    var c: u64 = (*((st + S_CHUNKS) as *mut u64))
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = (*((c + 16) as *mut u64))
+        let count: u64 = (*((c + 24) as *mut u64))
+        var i: u64 = 0
+        while i < count {
+            __own_verify_block(data + i * block, tab)
+            i = i + 1
+        }
+        c = (*((c) as *mut u64))
+    }
+}
+
+fn gc_own_freed() -> u64 {
+    return OWN_FREED
+}
+
+fn gc_own_deferred() -> u64 {
+    return OWN_DEFERRED
+}
+
+fn gc_own_poisoned() -> u64 {
+    return OWN_POISONED
+}
+
+fn __own_str_join(a: str, b: str, c: str, d: str) -> str {
+    let n: usize = a.n + b.n + c.n + d.n
+    if n == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let tid: u64 = __str_tid()
+    if tid == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let p: *mut u8 = __gc_alloc_raw(tid, n as u64)
+    if (p as u64) == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    var at: u64 = p as u64
+    __gc_blit(at, a.p as u64, a.n as u64)
+    at = at +% (a.n as u64)
+    __gc_blit(at, b.p as u64, b.n as u64)
+    at = at +% (b.n as u64)
+    __gc_blit(at, c.p as u64, c.n as u64)
+    at = at +% (c.n as u64)
+    __gc_blit(at, d.p as u64, d.n as u64)
+    return str { p: p, n: n }
+}
+
+fn __str_concat3(a: str, b: str, c: str) -> str {
+    return __own_str_join(a, b, c, str { p: 0 as *mut u8, n: 0 })
+}
+
+fn __str_concat4(a: str, b: str, c: str, d: str) -> str {
+    return __own_str_join(a, b, c, d)
+}
+
+fn __str_concat4_tail(t: str, b: str, c: str, d: str) -> str {
+    if (b.n + c.n + d.n) == 0 {
+        return t
+    }
+    let r: str = __own_str_join(t, b, c, d)
+    if (t.p as u64) != 0 {
+        __gc_free_block(t.p)
+    }
+    return r
+}
+
+fn __str_concat4_tail_check(t: str, b: str, c: str, d: str) -> str {
+    if (b.n + c.n + d.n) == 0 {
+        return t
+    }
+    let r: str = __own_str_join(t, b, c, d)
+    if (t.p as u64) != 0 {
+        __gc_poison_block(t.p)
+    }
+    return r
+}

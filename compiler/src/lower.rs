@@ -784,6 +784,9 @@ impl<'a> Lower<'a> {
             // HOOK str: `a + b` on `str` — the result comes from the
             // collector (strtype.rs, round 70).
             ExprKind::Binary(ast::BinOp::Add, a, b) if crate::strtype::is_str_like(&t) => {
+                if crate::own::concat::wants(self, e) {
+                    return crate::own::concat::lower_into(self, e, addr);
+                }
                 let a = (**a).clone();
                 let b = (**b).clone();
                 self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), e.span)?;

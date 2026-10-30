@@ -198,7 +198,7 @@ pub(crate) fn runtime_reset() {
 pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
     // ROUND 70: `a + b` on `str` allocates in the GC heap and is therefore
     // forbidden inside a `#[no_gc]` call tree, exactly like `gc C{…}`.
-    if name == crate::strtype::FN_CONCAT {
+    if name.starts_with(crate::strtype::FN_CONCAT) {
         return true;
     }
     if name.starts_with(P_NEW) {
@@ -1588,6 +1588,9 @@ pub(crate) fn runtime_source(
     if with_collections {
         s.push_str(RUNTIME_VEC);
         s.push_str(RUNTIME_MAP);
+    }
+    if crate::own::enabled() {
+        s.push_str(crate::own::RUNTIME);
     }
     s
 }
