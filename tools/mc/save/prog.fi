@@ -1,0 +1,664 @@
+// tools/mc/save/prog.fi -- the Firn side of the world differential test.
+//
+//     prog tree <world>                         read every NBT file / chunk, write it back byte-identically, print digests
+//     prog blocks <world>                       chunk codec digests of every region/ chunk
+//     prog pick <regiondir> <picks>             block name at "x y z" lines
+//     prog rewrite <src> <dst> <ctype>          write the whole world again with another compression
+//     prog fuzz <world> <rounds> <seed>         damaged chunk data: no crash, no hang
+//     prog bench <world>                        read speed (MB/s of NBT, chunks/s)
+import std.rt
+import std.io
+import std.bytes
+import std.time
+import std.fs
+import std.nbt
+import mc.mc_anvil
+import mc.mc_nbt
+import mc.save.save_world
+import mc.save.save_digest
+import mc.save.save_chunk
+import mc.save.save_lz4
+import mc.save.save_rewrite
+
+struct Ctx {
+    root: str,
+    line: rt.Buf,
+    path: rt.Buf,
+    bad: u64,
+    chunks: u64,
+    files: u64,
+    nbt_bytes: u64,
+}
+
+fn cstr(p: u64) -> str {
+    var n: usize = 0
+    while rt.ld8(p, n) != 0 as u8 {
+        n = n + 1
+    }
+    return str { p: p as *mut u8, n: n }
+}
+
+fn parse_u(p: u64) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 as u64 + ((rt.ld8(p, i) - 48 as u8) as u64)
+        i = i + 1
+    }
+    return v
+}
+
+fn emit(c: *mut Ctx) {
+    rt.buf_push(&(*c).line, 10 as u8)
+    io.print_str(rt.buf_str(&(*c).line))
+    rt.buf_clear(&(*c).line)
+}
+
+fn put(c: *mut Ctx, s: str) {
+    rt.buf_push_bytes(&(*c).line, s.p as u64, s.n)
+}
+
+fn put_u(c: *mut Ctx, v: u64) {
+    rt.buf_push_dec_u64(&(*c).line, v)
+}
+
+fn put_i(c: *mut Ctx, v: i64) {
+    rt.buf_push_dec_i64(&(*c).line, v)
+}
+
+fn sp(c: *mut Ctx) {
+    rt.buf_push(&(*c).line, 32 as u8)
+}
+
+fn roundtrip(c: *mut Ctx, p: u64, n: usize, g: *mut save_digest.Digest) -> bool {
+    var d: mc_nbt.Doc = mc_nbt.doc_new()
+    var v: bytes.Bytes = bytes.Bytes { data: p, cap: n, len: n, pos: 0, bad: false }
+    let ok: bool = mc_nbt.doc_parse(&d, &v, false, true) catch false
+    if !ok {
+        mc_nbt.doc_free(&d)
+        return false
+    }
+    var w: bytes.Bytes = bytes.bytes_new()
+    mc_nbt.doc_write(&d, &w)
+    let same: bool = bytes.bytes_len(&w) == n && rt.mem_eq(bytes.bytes_ptr(&w), p, n)
+    bytes.bytes_free(&w)
+    save_digest.digest_tree(g, &d)
+    mc_nbt.doc_free(&d)
+    return same
+}
+
+fn report_tree(c: *mut Ctx, tag: str, rel: str, slot: i64, p: u64, n: usize, g: *mut save_digest.Digest) {
+    let same: bool = roundtrip(c, p, n, g)
+    (*c).nbt_bytes = (*c).nbt_bytes + n as u64
+    if !same {
+        (*c).bad = (*c).bad + 1 as u64
+        put(c, "ERR ")
+        put(c, tag)
+        sp(c)
+        put(c, rel)
+        sp(c)
+        put_i(c, slot)
+        put(c, " roundtrip")
+        emit(c)
+        return
+    }
+    put(c, tag)
+    sp(c)
+    put(c, rel)
+    sp(c)
+    put_i(c, slot)
+    sp(c)
+    put_u(c, (*g).lines)
+    sp(c)
+    put_u(c, (*g).h)
+    emit(c)
+}
+
+fn visit_region(c: *mut Ctx, rel: str, mode: i32) {
+    var rx: i32 = 0
+    var rz: i32 = 0
+    if !save_world.region_coords(rel, &rx, &rz) {
+        return
+    }
+    var full: rt.Buf = rt.buf_new()
+    save_world.path_c(&full, (*c).root, rel)
+    var r: mc_anvil.Region = mc_anvil.region_new()
+    mc_anvil.region_free(&r)
+    let ok: bool = mc_anvil.region_load(full.ptr, &r) catch false
+    rt.buf_free(&full)
+    if !ok {
+        put(c, "ERR R ")
+        put(c, rel)
+        put(c, " load")
+        emit(c)
+        (*c).bad = (*c).bad + 1 as u64
+        return
+    }
+    var dirpath: rt.Buf = rt.buf_new()
+    var last: usize = rel.n
+    while last > 0 && rt.ld8(rel.p as u64, last - 1) != 47 as u8 {
+        last = last - 1
+    }
+    var dp: rt.Buf = rt.buf_new()
+    save_world.path_c(&dp, (*c).root, str { p: rel.p, n: last })
+    let dirstr: str = str { p: dp.ptr as *mut u8, n: dp.len - 2 }
+    var g: save_digest.Digest = save_digest.digest_new()
+    var s: i32 = 0
+    while s < 1024 {
+        let lx: i32 = s % 32
+        let lz: i32 = s / 32
+        if mc_anvil.region_has(&r, lx, lz) {
+            var out: rt.Buf = rt.buf_new()
+            let n: usize = save_world.world_read_chunk(dirstr, rx, rz, &r, lx, lz, &out) catch 99999999999
+            if n == 99999999999 {
+                (*c).bad = (*c).bad + 1 as u64
+                put(c, "ERR C ")
+                put(c, rel)
+                sp(c)
+                put_i(c, s as i64)
+                put(c, " read")
+                emit(c)
+            } else if mode == 2 {
+                var ch: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+                let okc: bool = save_chunk.chunk_open(&ch, out.ptr, n) catch false
+                if okc {
+                    save_chunk.chunk_close(&ch)
+                } else {
+                    (*c).bad = (*c).bad + 1 as u64
+                }
+                (*c).nbt_bytes = (*c).nbt_bytes + n as u64
+            } else if mode == 0 {
+                report_tree(c, "C", rel, s as i64, out.ptr, n, &g)
+            } else {
+                chunk_lines(c, rel, s as i64, out.ptr, n)
+            }
+            (*c).chunks = (*c).chunks + 1 as u64
+            rt.buf_free(&out)
+        }
+        s = s + 1
+    }
+    rt.buf_free(&dp)
+    rt.buf_free(&dirpath)
+    mc_anvil.region_free(&r)
+}
+
+fn chunk_lines(c: *mut Ctx, rel: str, slot: i64, p: u64, n: usize) {
+    var ch: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    let ok: bool = save_chunk.chunk_open(&ch, p, n) catch false
+    if !ok {
+        (*c).bad = (*c).bad + 1 as u64
+        put(c, "ERR K ")
+        put(c, rel)
+        sp(c)
+        put_i(c, slot)
+        put(c, " open")
+        emit(c)
+        return
+    }
+    var cx: i32 = 0
+    var cz: i32 = 0
+    save_chunk.chunk_pos(&ch, &cx, &cz)
+    var sl: usize = 0
+    let stp: u64 = save_chunk.chunk_status(&ch, &sl)
+    put(c, "K ")
+    put(c, rel)
+    sp(c)
+    put_i(c, slot)
+    put(c, " dv=")
+    put_i(c, save_chunk.chunk_data_version(&ch) as i64)
+    put(c, " pos=")
+    put_i(c, cx as i64)
+    rt.buf_push(&(*c).line, 44 as u8)
+    put_i(c, cz as i64)
+    put(c, " status=")
+    put(c, str { p: stp as *mut u8, n: sl })
+    put(c, " nsec=")
+    put_u(c, save_chunk.chunk_section_count(&ch) as u64)
+    put(c, " be=")
+    put_u(c, save_chunk.chunk_block_entity_count(&ch) as u64)
+    emit(c)
+    var blk: rt.Buf = rt.buf_new()
+    var bio: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&blk, 8192)
+    rt.buf_reserve(&bio, 128)
+    blk.len = 8192
+    bio.len = 128
+    var scratch: rt.Buf = rt.buf_new()
+    var i: u32 = 0
+    while i < save_chunk.chunk_section_count(&ch) {
+        let sec: u32 = save_chunk.chunk_section(&ch, i)
+        put(c, "S ")
+        put(c, rel)
+        sp(c)
+        put_i(c, slot)
+        put(c, " y=")
+        put_i(c, save_chunk.chunk_section_y(&ch, sec) as i64)
+        let b_ok: bool = save_chunk.section_blocks(&ch, sec, blk.ptr) catch false
+        let i_ok: bool = save_chunk.section_biomes(&ch, sec, bio.ptr) catch false
+        put(c, " bp=")
+        put_u(c, save_chunk.section_block_palette_size(&ch, sec) as u64)
+        put(c, " ip=")
+        put_u(c, save_chunk.section_biome_palette_size(&ch, sec) as u64)
+        put(c, " blk=")
+        if b_ok {
+            put_u(c, save_chunk.section_block_hash(&ch, sec, blk.ptr, &scratch))
+        } else {
+            put(c, "bad")
+            (*c).bad = (*c).bad + 1 as u64
+        }
+        put(c, " bio=")
+        if i_ok {
+            put_u(c, save_chunk.section_biome_hash(&ch, sec, bio.ptr, &scratch))
+        } else {
+            put(c, "bad")
+            (*c).bad = (*c).bad + 1 as u64
+        }
+        put(c, " sky=")
+        put_u(c, save_chunk.section_light_sum(&ch, sec, "SkyLight"))
+        put(c, " bl=")
+        put_u(c, save_chunk.section_light_sum(&ch, sec, "BlockLight"))
+        put(c, " rep=")
+        var rb: u64 = 0
+        var ri: u64 = 0
+        if b_ok && save_chunk.section_blocks_repack_equal(&ch, sec, blk.ptr) {
+            rb = 1
+        }
+        if i_ok && save_chunk.section_biomes_repack_equal(&ch, sec, bio.ptr) {
+            ri = 1
+        }
+        put_u(c, rb)
+        put_u(c, ri)
+        if rb == 0 as u64 || ri == 0 as u64 {
+            (*c).bad = (*c).bad + 1 as u64
+        }
+        emit(c)
+        i = i + 1 as u32
+    }
+    rt.buf_free(&scratch)
+    rt.buf_free(&blk)
+    rt.buf_free(&bio)
+    var hn: u32 = 0
+    while hn < 4 as u32 {
+        var name: str = "MOTION_BLOCKING"
+        if hn == 1 as u32 {
+            name = "WORLD_SURFACE"
+        } else if hn == 2 as u32 {
+            name = "OCEAN_FLOOR"
+        } else if hn == 3 as u32 {
+            name = "MOTION_BLOCKING_NO_LEAVES"
+        }
+        put(c, "H ")
+        put(c, rel)
+        sp(c)
+        put_i(c, slot)
+        sp(c)
+        put(c, name)
+        sp(c)
+        put_u(c, save_chunk.chunk_heightmap_hash(&ch, name))
+        emit(c)
+        hn = hn + 1 as u32
+    }
+    save_chunk.chunk_close(&ch)
+}
+
+fn visit_nbt(c: *mut Ctx, rel: str) {
+    var full: rt.Buf = rt.buf_new()
+    save_world.path_c(&full, (*c).root, rel)
+    var out: rt.Buf = rt.buf_new()
+    let n: usize = save_world.read_nbt_file(full.ptr, &out) catch 99999999999
+    rt.buf_free(&full)
+    var g: save_digest.Digest = save_digest.digest_new()
+    if n == 99999999999 {
+        (*c).bad = (*c).bad + 1 as u64
+        put(c, "ERR F ")
+        put(c, rel)
+        put(c, " read")
+        emit(c)
+    } else {
+        report_tree(c, "F", rel, 0 - 1, out.ptr, n, &g)
+    }
+    (*c).files = (*c).files + 1 as u64
+    rt.buf_free(&out)
+}
+
+fn cmd_scan(root: str, mode: i32) -> i32 {
+    var c: Ctx = Ctx { root: root, line: rt.buf_new(), path: rt.buf_new(), bad: 0, chunks: 0, files: 0, nbt_bytes: 0 }
+    var l: save_world.FileList = save_world.FileList { names: rt.buf_new(), count: 0 }
+    save_world.world_list(root, &l)
+    var i: usize = 0
+    while i < save_world.list_count(&l) {
+        let rel: str = save_world.list_get(&l, i)
+        let k: u8 = save_world.classify(rel)
+        let pd: str = save_world.parent_dir_name(rel)
+        let is_region_dir: bool = pd.n == 6 && rt.mem_eq(pd.p as u64, "region".p as u64, 6)
+        if k == save_world.FILE_REGION && (mode == 0 || is_region_dir) && !(mode == 2 && !is_region_dir) {
+            visit_region(&c, rel, mode)
+        } else if k == save_world.FILE_NBT && mode == 0 {
+            visit_nbt(&c, rel)
+        }
+        i = i + 1
+    }
+    put(&c, "# files=")
+    put_u(&c, c.files)
+    put(&c, " chunks=")
+    put_u(&c, c.chunks)
+    put(&c, " nbt_bytes=")
+    put_u(&c, c.nbt_bytes)
+    put(&c, " bad=")
+    put_u(&c, c.bad)
+    emit(&c)
+    if c.bad > 0 as u64 {
+        return 1
+    }
+    return 0
+}
+
+fn find_section(ch: *mut save_chunk.Chunk, sy: i32) -> u32 {
+    var i: u32 = 0
+    while i < save_chunk.chunk_section_count(ch) {
+        let sec: u32 = save_chunk.chunk_section(ch, i)
+        if save_chunk.chunk_section_y(ch, sec) == sy {
+            return sec
+        }
+        i = i + 1 as u32
+    }
+    return 0 as u32
+}
+
+fn pick_one(c: *mut Ctx, dirpath: str, x: i32, y: i32, z: i32) -> bool {
+    let cx: i32 = x >> 4
+    let cz: i32 = z >> 4
+    let rx: i32 = cx >> 5
+    let rz: i32 = cz >> 5
+    var name: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&name, dirpath.p as u64, dirpath.n)
+    rt.buf_push_bytes(&name, "/r.".p as u64, 3)
+    rt.buf_push_dec_i64(&name, rx as i64)
+    rt.buf_push(&name, 46 as u8)
+    rt.buf_push_dec_i64(&name, rz as i64)
+    rt.buf_push_bytes(&name, ".mca".p as u64, 4)
+    rt.buf_push(&name, 0 as u8)
+    var r: mc_anvil.Region = mc_anvil.region_new()
+    mc_anvil.region_free(&r)
+    let ok: bool = mc_anvil.region_load(name.ptr, &r) catch false
+    rt.buf_free(&name)
+    if !ok {
+        return false
+    }
+    var out: rt.Buf = rt.buf_new()
+    let n: usize = save_world.world_read_chunk(dirpath, rx, rz, &r, cx & 31, cz & 31, &out) catch 99999999999
+    mc_anvil.region_free(&r)
+    if n == 99999999999 {
+        rt.buf_free(&out)
+        return false
+    }
+    var ch: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    let oc: bool = save_chunk.chunk_open(&ch, out.ptr, n) catch false
+    if !oc {
+        rt.buf_free(&out)
+        return false
+    }
+    let sec: u32 = find_section(&ch, y >> 4)
+    var res: bool = false
+    if sec != 0 as u32 {
+        var idx: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&idx, 8192)
+        idx.len = 8192
+        let bo: bool = save_chunk.section_blocks(&ch, sec, idx.ptr) catch false
+        if bo {
+            let at: usize = (((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize
+            var nl: usize = 0
+            let np: u64 = save_chunk.section_block_name(&ch, sec, rt.ld16(idx.ptr, at) as u32, &nl)
+            put(c, str { p: np as *mut u8, n: nl })
+            res = true
+        }
+        rt.buf_free(&idx)
+    }
+    save_chunk.chunk_close(&ch)
+    rt.buf_free(&out)
+    return res
+}
+
+fn cmd_pick(dirpath: str, picks: str) -> i32 {
+    var c: Ctx = Ctx { root: dirpath, line: rt.buf_new(), path: rt.buf_new(), bad: 0, chunks: 0, files: 0, nbt_bytes: 0 }
+    var f: rt.Buf = rt.buf_new()
+    var pc: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pc, picks.p as u64, picks.n)
+    rt.buf_push(&pc, 0 as u8)
+    if !rt.read_file(pc.ptr, &f) {
+        return 3
+    }
+    var at: usize = 0
+    while at < f.len {
+        var v: [i32; 3] = [0, 0, 0]
+        var k: usize = 0
+        while k < 3 {
+            var neg: bool = false
+            if rt.ld8(f.ptr, at) == 45 as u8 {
+                neg = true
+                at = at + 1
+            }
+            var n: i32 = 0
+            while at < f.len && rt.ld8(f.ptr, at) >= 48 as u8 && rt.ld8(f.ptr, at) <= 57 as u8 {
+                n = n * 10 + (rt.ld8(f.ptr, at) - 48 as u8) as i32
+                at = at + 1
+            }
+            if neg {
+                n = 0 - n
+            }
+            v[k] = n
+            at = at + 1
+            k = k + 1
+        }
+        while at < f.len && rt.ld8(f.ptr, at) != 10 as u8 {
+            at = at + 1
+        }
+        at = at + 1
+        put_i(&c, v[0] as i64)
+        sp(&c)
+        put_i(&c, v[1] as i64)
+        sp(&c)
+        put_i(&c, v[2] as i64)
+        sp(&c)
+        if !pick_one(&c, dirpath, v[0], v[1], v[2]) {
+            put(&c, "?")
+        }
+        emit(&c)
+    }
+    return 0
+}
+
+fn rnd(x: *mut u64) -> u64 {
+    *x = (*x *% 6364136223846793005 as u64) +% 1442695040888963407 as u64
+    return *x >> 33
+}
+
+fn exercise(p: u64, n: usize) {
+    var ch: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    let ok: bool = save_chunk.chunk_open(&ch, p, n) catch false
+    if !ok {
+        return
+    }
+    var idx: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&idx, 8192)
+    idx.len = 8192
+    var scratch: rt.Buf = rt.buf_new()
+    var i: u32 = 0
+    while i < save_chunk.chunk_section_count(&ch) {
+        let sec: u32 = save_chunk.chunk_section(&ch, i)
+        let b: bool = save_chunk.section_blocks(&ch, sec, idx.ptr) catch false
+        if b {
+            save_chunk.section_block_hash(&ch, sec, idx.ptr, &scratch)
+            save_chunk.section_blocks_repack_equal(&ch, sec, idx.ptr)
+        }
+        let m: bool = save_chunk.section_biomes(&ch, sec, idx.ptr) catch false
+        i = i + 1 as u32
+    }
+    save_chunk.chunk_heightmap_hash(&ch, "MOTION_BLOCKING")
+    save_chunk.chunk_close(&ch)
+    rt.buf_free(&scratch)
+    rt.buf_free(&idx)
+}
+
+fn cmd_fuzz(root: str, rounds: u64, seed: u64) -> i32 {
+    var l: save_world.FileList = save_world.FileList { names: rt.buf_new(), count: 0 }
+    save_world.world_list(root, &l)
+    var st: u64 = seed
+    var samples: rt.Buf = rt.buf_new()
+    var total: u64 = 0
+    var detected: u64 = 0
+    var i: usize = 0
+    while i < save_world.list_count(&l) && samples.len < 4000000 {
+        let rel: str = save_world.list_get(&l, i)
+        let pd: str = save_world.parent_dir_name(rel)
+        if save_world.classify(rel) == save_world.FILE_REGION && pd.n == 6 && rt.mem_eq(pd.p as u64, "region".p as u64, 6) {
+            var rx: i32 = 0
+            var rz: i32 = 0
+            save_world.region_coords(rel, &rx, &rz)
+            var full: rt.Buf = rt.buf_new()
+            save_world.path_c(&full, root, rel)
+            var r: mc_anvil.Region = mc_anvil.region_new()
+            mc_anvil.region_free(&r)
+            let ok: bool = mc_anvil.region_load(full.ptr, &r) catch false
+            rt.buf_free(&full)
+            if ok {
+                var s: i32 = 0
+                while s < 1024 && samples.len < 4000000 {
+                    if mc_anvil.region_has(&r, s % 32, s / 32) && (rnd(&st) % 4 as u64) == 0 as u64 {
+                        var one: rt.Buf = rt.buf_new()
+                        let n: usize = mc_anvil.region_read(&r, s % 32, s / 32, &one) catch 99999999999
+                        if n != 99999999999 && n < 400000 {
+                            rt.buf_push(&samples, (n & 255) as u8)
+                            rt.buf_push(&samples, ((n >> 8) & 255) as u8)
+                            rt.buf_push(&samples, ((n >> 16) & 255) as u8)
+                            rt.buf_push_bytes(&samples, one.ptr, n)
+                        }
+                        rt.buf_free(&one)
+                    }
+                    s = s + 1
+                }
+                mc_anvil.region_free(&r)
+            }
+        }
+        i = i + 1
+    }
+    var round: u64 = 0
+    while round < rounds {
+        var at: usize = 0
+        var pick: u64 = rnd(&st) % 8 as u64
+        var ci: u64 = 0
+        while at + 3 <= samples.len {
+            let n: usize = (rt.ld8(samples.ptr, at) as usize) | ((rt.ld8(samples.ptr, at + 1) as usize) << 8) | ((rt.ld8(samples.ptr, at + 2) as usize) << 16)
+            if ci == pick {
+                var copy: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&copy, samples.ptr + (at + 3) as u64, n)
+                var k: u64 = 1 + rnd(&st) % 6 as u64
+                while k > 0 as u64 && n > 0 {
+                    let o: usize = (rnd(&st) % n as u64) as usize
+                    rt.st8(copy.ptr, o, rt.ld8(copy.ptr, o) ^ ((1 as u8) << ((rnd(&st) % 8 as u64) as u8)))
+                    k = k - 1 as u64
+                }
+                if round % 4 as u64 == 0 as u64 && n > 10 {
+                    copy.len = (rnd(&st) % n as u64) as usize
+                }
+                exercise(copy.ptr, copy.len)
+                var packed: rt.Buf = rt.buf_new()
+                save_lz4.lz4s_compress(samples.ptr + (at + 3) as u64, n, &packed)
+                var o2: usize = (rnd(&st) % packed.len as u64) as usize
+                rt.st8(packed.ptr, o2, rt.ld8(packed.ptr, o2) ^ ((1 as u8) << ((rnd(&st) % 8 as u64) as u8)))
+                var back: rt.Buf = rt.buf_new()
+                let g: usize = save_lz4.lz4s_decompress(packed.ptr, packed.len, 4000000, &back) catch 99999999999
+                if g == 99999999999 {
+                    detected = detected + 1 as u64
+                }
+                rt.buf_free(&back)
+                rt.buf_free(&packed)
+                rt.buf_free(&copy)
+                total = total + 1 as u64
+            }
+            at = at + 3 + n
+            ci = ci + 1 as u64
+        }
+        round = round + 1 as u64
+    }
+    var c: Ctx = Ctx { root: root, line: rt.buf_new(), path: rt.buf_new(), bad: 0, chunks: 0, files: 0, nbt_bytes: 0 }
+    put(&c, "fuzz rounds=")
+    put_u(&c, rounds)
+    put(&c, " damaged_chunks=")
+    put_u(&c, total)
+    put(&c, " lz4_damage_detected=")
+    put_u(&c, detected)
+    emit(&c)
+    return 0
+}
+
+fn cmd_mkmcc(root: str) -> i32 {
+    var nb: bytes.Bytes = bytes.bytes_new()
+    nbt.nbt_root_begin(&nb, "".p as u64, 0)
+    nbt.nbt_int(&nb, "DataVersion".p as u64, 11, 3465)
+    var big: rt.Buf = rt.buf_new()
+    var x: u64 = 12345
+    var i: usize = 0
+    while i < 160000 {
+        push_rand(&big, &x)
+        i = i + 1
+    }
+    bytes.put_u8(&nb, nbt.TAG_LONG_ARRAY)
+    nbt.nbt_name(&nb, "big".p as u64, 3)
+    bytes.put_i32(&nb, 160000)
+    bytes.put_raw(&nb, big.ptr, big.len)
+    nbt.nbt_end(&nb)
+    var packed: rt.Buf = rt.buf_new()
+    let m: usize = mc_anvil.anvil_pack(2 as u8, bytes.bytes_ptr(&nb), bytes.bytes_len(&nb), &packed) catch 99999999999
+    var dir: rt.Buf = rt.buf_new()
+    save_world.path_c(&dir, root, "region")
+    save_world.mkdir_parents(str { p: dir.ptr as *mut u8, n: dir.len - 1 })
+    var mcc: rt.Buf = rt.buf_new()
+    save_world.mcc_name(str { p: dir.ptr as *mut u8, n: dir.len - 1 }, 0, 0, &mcc)
+    var r: mc_anvil.Region = mc_anvil.region_new()
+    let mk: bool = mc_anvil.region_mark_external(&r, 0, 0, 2 as u8, 77 as u32) catch false
+    var rf: rt.Buf = rt.buf_new()
+    save_world.path_c(&rf, root, "region/r.0.0.mca")
+    if m == 99999999999 || !mk || !rt.write_file(mcc.ptr, packed.ptr, m) || !mc_anvil.region_save(&r, rf.ptr) {
+        return 1
+    }
+    return 0
+}
+
+fn push_rand(b: *mut rt.Buf, x: *mut u64) {
+    var k: usize = 0
+    while k < 8 {
+        rt.buf_push(b, (rnd(x) & 255 as u64) as u8)
+        k = k + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let mode: str = cstr(rt.arg_ptr(start, 1))
+    let a1: str = cstr(rt.arg_ptr(start, 2))
+    if mode.n == 4 && rt.mem_eq(mode.p as u64, "tree".p as u64, 4) {
+        return cmd_scan(a1, 0)
+    }
+    if mode.n == 6 && rt.mem_eq(mode.p as u64, "blocks".p as u64, 6) {
+        return cmd_scan(a1, 1)
+    }
+    if mode.n == 5 && rt.mem_eq(mode.p as u64, "bench".p as u64, 5) {
+        return cmd_scan(a1, 2)
+    }
+    if mode.n == 4 && rt.mem_eq(mode.p as u64, "pick".p as u64, 4) && rt.arg_count(start) >= 4 {
+        return cmd_pick(a1, cstr(rt.arg_ptr(start, 3)))
+    }
+    if mode.n == 7 && rt.mem_eq(mode.p as u64, "rewrite".p as u64, 7) && rt.arg_count(start) >= 5 {
+        return save_rewrite.world_rewrite(a1, cstr(rt.arg_ptr(start, 3)), (rt.ld8(rt.arg_ptr(start, 4), 0) - 48 as u8))
+    }
+    if mode.n == 5 && rt.mem_eq(mode.p as u64, "mkmcc".p as u64, 5) {
+        return cmd_mkmcc(a1)
+    }
+    if mode.n == 4 && rt.mem_eq(mode.p as u64, "fuzz".p as u64, 4) && rt.arg_count(start) >= 5 {
+        return cmd_fuzz(a1, parse_u(rt.arg_ptr(start, 3)), parse_u(rt.arg_ptr(start, 4)))
+    }
+    return 2
+}

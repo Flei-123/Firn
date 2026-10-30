@@ -1,0 +1,10 @@
+const mc = require('minecraft-protocol')
+const host = process.argv[2]
+const port = parseInt(process.argv[3], 10)
+const name = process.argv[4]
+const version = process.argv[5] || '1.20.1'
+const client = mc.createClient({ host, port, username: name, auth: 'offline', version, hideErrors: true })
+client.on('login', () => console.log('bot: login'))
+client.on('error', (e) => { console.log('bot: error ' + e.message); process.exit(1) })
+client.on('end', () => process.exit(0))
+setTimeout(() => process.exit(0), 120000)

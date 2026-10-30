@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/save/save_rewrite.fi -- writes a whole world again: every region file is rebuilt (chunks packed
+// densely, another compression), oversized chunks go to .mcc files, NBT files are compressed again.
+import std.rt
+import std.fs
+import std.deflate
+import mc.mc_anvil
+import mc.save.save_world
+
+export {
+    world_rewrite, rewrite_region,
+}
+
+fn parent_of(path: u64, n: usize) -> str {
+    var e: usize = n
+    while e > 0 && rt.ld8(path, e - 1) != 47 as u8 {
+        e = e - 1
+    }
+    if e == 0 {
+        return str { p: path as *mut u8, n: 0 }
+    }
+    return str { p: path as *mut u8, n: e - 1 }
+}
+
+fn dir_kind(rel: str) -> bool {
+    let pd: str = save_world.parent_dir_name(rel)
+    if pd.n == 6 && rt.mem_eq(pd.p as u64, "region".p as u64, 6) {
+        return true
+    }
+    if pd.n == 8 && rt.mem_eq(pd.p as u64, "entities".p as u64, 8) {
+        return true
+    }
+    return pd.n == 3 && rt.mem_eq(pd.p as u64, "poi".p as u64, 3)
+}
+
+fn rewrite_region(src_dir: str, dst_dir: str, rel: str, ctype: u8) -> bool {
+    var rx: i32 = 0
+    var rz: i32 = 0
+    if !save_world.region_coords(rel, &rx, &rz) {
+        return false
+    }
+    var sp: rt.Buf = rt.buf_new()
+    save_world.path_c(&sp, src_dir, rel)
+    var src: mc_anvil.Region = mc_anvil.region_new()
+    mc_anvil.region_free(&src)
+    let ok: bool = mc_anvil.region_load(sp.ptr, &src) catch false
+    rt.buf_free(&sp)
+    if !ok {
+        return false
+    }
+    var dp: rt.Buf = rt.buf_new()
+    save_world.path_c(&dp, dst_dir, rel)
+    let dd: str = parent_of(dp.ptr, dp.len - 1)
+    save_world.mkdir_parents(dd)
+    var sdirbuf: rt.Buf = rt.buf_new()
+    var sd: rt.Buf = rt.buf_new()
+    let relparent: str = parent_of(rel.p as u64, rel.n)
+    save_world.path_c(&sd, src_dir, relparent)
+    let sdir: str = str { p: sd.ptr as *mut u8, n: sd.len - 1 }
+    var dst: mc_anvil.Region = mc_anvil.region_new()
+    var s: i32 = 0
+    var good: bool = true
+    while s < 1024 {
+        let lx: i32 = s % 32
+        let lz: i32 = s / 32
+        if mc_anvil.region_has(&src, lx, lz) {
+            var data: rt.Buf = rt.buf_new()
+            let n: usize = save_world.world_read_chunk(sdir, rx, rz, &src, lx, lz, &data) catch 99999999999
+            if n == 99999999999 {
+                good = false
+            } else {
+                let stamp: u32 = mc_anvil.region_timestamp(&src, lx, lz)
+                let w: bool = mc_anvil.region_write(&dst, lx, lz, data.ptr, n, ctype, stamp) catch false
+                if !w {
+                    var packed: rt.Buf = rt.buf_new()
+                    let m: usize = mc_anvil.anvil_pack(ctype, data.ptr, n, &packed) catch 99999999999
+                    var mcc: rt.Buf = rt.buf_new()
+                    save_world.mcc_name(dd, rx * 32 + lx, rz * 32 + lz, &mcc)
+                    if m == 99999999999 || !rt.write_file(mcc.ptr, packed.ptr, m) {
+                        good = false
+                    }
+                    let mk: bool = mc_anvil.region_mark_external(&dst, lx, lz, ctype, stamp) catch false
+                    if !mk {
+                        good = false
+                    }
+                    rt.buf_free(&mcc)
+                    rt.buf_free(&packed)
+                }
+            }
+            rt.buf_free(&data)
+        }
+        s = s + 1
+    }
+    if !mc_anvil.region_save(&dst, dp.ptr) {
+        good = false
+    }
+    mc_anvil.region_free(&dst)
+    mc_anvil.region_free(&src)
+    rt.buf_free(&sd)
+    rt.buf_free(&sdirbuf)
+    rt.buf_free(&dp)
+    return good
+}
+
+fn rewrite_nbt(src_dir: str, dst_dir: str, rel: str) -> bool {
+    var sp: rt.Buf = rt.buf_new()
+    save_world.path_c(&sp, src_dir, rel)
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = save_world.read_nbt_file(sp.ptr, &data) catch 99999999999
+    rt.buf_free(&sp)
+    if n == 99999999999 {
+        rt.buf_free(&data)
+        return false
+    }
+    var packed: rt.Buf = rt.buf_new()
+    let m: usize = deflate.gzip_compress(data.ptr, n, 6, &packed) catch 99999999999
+    var dp: rt.Buf = rt.buf_new()
+    save_world.path_c(&dp, dst_dir, rel)
+    save_world.mkdir_parents(parent_of(dp.ptr, dp.len - 1))
+    let ok: bool = m != 99999999999 && rt.write_file(dp.ptr, packed.ptr, m)
+    rt.buf_free(&dp)
+    rt.buf_free(&packed)
+    rt.buf_free(&data)
+    return ok
+}
+
+fn world_rewrite(src_dir: str, dst_dir: str, ctype: u8) -> i32 {
+    var l: save_world.FileList = save_world.FileList { names: rt.buf_new(), count: 0 }
+    save_world.world_list(src_dir, &l)
+    var bad: i32 = 0
+    var i: usize = 0
+    while i < save_world.list_count(&l) {
+        let rel: str = save_world.list_get(&l, i)
+        let k: u8 = save_world.classify(rel)
+        if k == save_world.FILE_REGION && dir_kind(rel) {
+            if !rewrite_region(src_dir, dst_dir, rel, ctype) {
+                bad = bad + 1
+            }
+        } else if k == save_world.FILE_NBT {
+            if !rewrite_nbt(src_dir, dst_dir, rel) {
+                bad = bad + 1
+            }
+        }
+        i = i + 1
+    }
+    return bad
+}
