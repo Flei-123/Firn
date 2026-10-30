@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MIT
+// lib/brigadier/node.fi -- brigadier.node: command tree nodes (root, literal, argument) with insertion-ordered children and merge-on-add.
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.casing as cs
+import brigadier.exc as ex
+import brigadier.reader as rd
+import brigadier.argtype as at
+import brigadier.context as cn
+
+export { Node, nd, node_root, node_literal, node_argument, node_add_child, node_child_by_name, node_children_len, node_child_at,
+    node_relevant, node_parse, node_usage_text, node_forward, NK_ROOT, NK_LITERAL, NK_ARGUMENT }
+
+const NK_ROOT: i32 = 0
+const NK_LITERAL: i32 = 1
+const NK_ARGUMENT: i32 = 2
+
+struct Node {
+    kind: i32,
+    name: tx.U16,
+    lower: tx.U16,
+    atype: at.ArgType,
+    children: m.Arr[u64],
+    cmd: i32,
+    req: i32,
+    redirect: u64,
+    mod_id: i32,
+    forks: bool,
+    sugg: i32,
+}
+
+fn nd(h: u64) -> *mut Node {
+    return h as *mut Node
+}
+
+fn node_new(a: *mut m.Arena, kind: i32, name: tx.U16, t: at.ArgType) -> u64 {
+    let h: u64 = m.arena_obj[Node](a)
+    *nd(h) = Node {
+        kind: kind,
+        name: name,
+        lower: cs.u16_lower(a, name),
+        atype: t,
+        children: m.arr_new[u64](),
+        cmd: 0,
+        req: 0,
+        redirect: 0,
+        mod_id: 0,
+        forks: false,
+        sugg: 0,
+    }
+    return h
+}
+
+fn node_root(a: *mut m.Arena) -> u64 {
+    return node_new(a, NK_ROOT, tx.u16_empty(), at.at_bool())
+}
+
+fn node_literal(a: *mut m.Arena, name: tx.U16) -> u64 {
+    return node_new(a, NK_LITERAL, name, at.at_bool())
+}
+
+fn node_argument(a: *mut m.Arena, name: tx.U16, t: at.ArgType) -> u64 {
+    return node_new(a, NK_ARGUMENT, name, t)
+}
+
+fn node_forward(h: u64, target: u64, mod_id: i32, forks: bool) {
+    (*nd(h)).redirect = target
+    (*nd(h)).mod_id = mod_id
+    (*nd(h)).forks = forks
+}
+
+fn node_children_len(h: u64) -> usize {
+    return m.arr_len[u64](&(*nd(h)).children)
+}
+
+fn node_child_at(h: u64, i: usize) -> u64 {
+    return *m.arr_at[u64](&(*nd(h)).children, i)
+}
+
+fn node_child_by_name(h: u64, name: tx.U16) -> u64 {
+    var i: usize = 0
+    while i < node_children_len(h) {
+        let c: u64 = node_child_at(h, i)
+        if tx.u16_eq((*nd(c)).name, name) {
+            return c
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn node_add_child(a: *mut m.Arena, h: u64, child: u64) {
+    let existing: u64 = node_child_by_name(h, (*nd(child)).name)
+    if existing != 0 {
+        if (*nd(child)).cmd != 0 {
+            (*nd(existing)).cmd = (*nd(child)).cmd
+        }
+        var i: usize = 0
+        while i < node_children_len(child) {
+            node_add_child(a, existing, node_child_at(child, i))
+            i = i + 1
+        }
+        return
+    }
+    m.arr_push[u64](a, &(*nd(h)).children, child)
+}
+
+fn node_relevant(a: *mut m.Arena, h: u64, r: *mut rd.Reader, out: *mut m.Arr[u64]) {
+    var has_literals: bool = false
+    var i: usize = 0
+    while i < node_children_len(h) {
+        if (*nd(node_child_at(h, i))).kind == NK_LITERAL {
+            has_literals = true
+        }
+        i = i + 1
+    }
+    if has_literals {
+        let cursor: usize = (*r).cursor
+        var end: usize = cursor
+        while end < (*r).s.n && tx.u16_at((*r).s, end) != 32 {
+            end = end + 1
+        }
+        let text: tx.U16 = tx.u16_sub((*r).s, cursor, end)
+        i = 0
+        while i < node_children_len(h) {
+            let c: u64 = node_child_at(h, i)
+            if (*nd(c)).kind == NK_LITERAL && tx.u16_eq((*nd(c)).name, text) {
+                m.arr_push[u64](a, out, c)
+                return
+            }
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < node_children_len(h) {
+        let c: u64 = node_child_at(h, i)
+        if (*nd(c)).kind == NK_ARGUMENT {
+            m.arr_push[u64](a, out, c)
+        }
+        i = i + 1
+    }
+}
+
+fn literal_end(h: u64, r: *mut rd.Reader) -> i64 {
+    let start: usize = (*r).cursor
+    let lit: tx.U16 = (*nd(h)).name
+    if rd.can_read_n(r, lit.n) {
+        let end: usize = start + lit.n
+        if tx.u16_eq(tx.u16_sub((*r).s, start, end), lit) {
+            rd.set_cursor(r, end)
+            if !rd.can_read(r) || rd.peek(r) == 32 {
+                return end as i64
+            }
+            rd.set_cursor(r, start)
+        }
+    }
+    return -1
+}
+
+fn node_parse(a: *mut m.Arena, h: u64, r: *mut rd.Reader, ctx: u64, err: *mut ex.Exc, th: *mut at.TypeHooks) -> bool {
+    let n: *mut Node = nd(h)
+    if (*n).kind == NK_ROOT {
+        return true
+    }
+    let start: usize = (*r).cursor
+    if (*n).kind == NK_LITERAL {
+        let end: i64 = literal_end(h, r)
+        if end > -1 {
+            cn.ctx_with_node(a, ctx, h, start, end as usize, (*n).mod_id, (*n).forks)
+            return true
+        }
+        *err = ex.exc_builtin(a, ex.EX_LITERAL_INCORRECT, (*r).s, (*r).cursor, (*n).name, tx.u16_empty())
+        return false
+    }
+    var v: at.Value = at.Value { kind: 0, i: 0, f: 0.0, s: tx.u16_empty() }
+    if !at.at_parse(&(*n).atype, r, &v, err, th) {
+        return false
+    }
+    cn.ctx_with_arg(a, ctx, (*n).name, start, (*r).cursor, v)
+    cn.ctx_with_node(a, ctx, h, start, (*r).cursor, (*n).mod_id, (*n).forks)
+    return true
+}
+
+fn node_usage_text(a: *mut m.Arena, h: u64) -> tx.U16 {
+    let n: *mut Node = nd(h)
+    if (*n).kind == NK_ARGUMENT {
+        var b: m.Arr[u16] = tx.b16_new()
+        tx.b16_char(a, &b, 60)
+        tx.b16_text(a, &b, (*n).name)
+        tx.b16_char(a, &b, 62)
+        return tx.b16_view(&b)
+    }
+    return (*n).name
+}

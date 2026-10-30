@@ -1,0 +1,805 @@
+// SPDX-License-Identifier: MIT
+// tools/mc/brigadier/prog.fi -- differential driver: builds the tree from tree.txt, replays the corpus and prints exactly what Oracle.java prints.
+import std.rt
+import std.io
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.casing as cs
+import brigadier.exc as ex
+import brigadier.reader as rd
+import brigadier.argtype as at
+import brigadier.node as nn
+import brigadier.context as cn
+import brigadier.suggest as sg
+import brigadier.dispatcher as dp
+import brigadier.javanum as jn
+
+const CMD_SRC: i32 = 1000001
+const CMD_ERR: i32 = 1000002
+const MOD_ADD: i32 = 1
+const MOD_MULTI: i32 = 2
+const MOD_ODD: i32 = 3
+const MOD_ERR: i32 = 4
+const MOD_UNIT: i32 = 1000000
+
+struct SDef {
+    id: i32,
+    ints: bool,
+    strs: m.Arr[tx.U16],
+    vals: m.Arr[i32],
+}
+
+struct St {
+    a: *mut m.Arena,
+    out: m.Arr[u16],
+    sdefs: m.Arr[SDef],
+}
+
+struct Item {
+    h: u64,
+    top: bool,
+    label: str,
+}
+
+fn sbyte(s: str, i: usize) -> u32 {
+    return rt.ld8(s.p as u64, i) as u32
+}
+
+fn ssub(s: str, a: usize, b: usize) -> str {
+    return str { p: (s.p as u64 + a as u64) as *mut u8, n: b - a }
+}
+
+fn sfind(s: str, c: u32, from: usize) -> usize {
+    var i: usize = from
+    while i < s.n {
+        if sbyte(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return s.n
+}
+
+fn parse_i64(s: str) -> i64 {
+    var i: usize = 0
+    var neg: bool = false
+    if s.n > 0 && sbyte(s, 0) == 45 {
+        neg = true
+        i = 1
+    }
+    var v: i64 = 0
+    while i < s.n {
+        v = v * 10 + (sbyte(s, i) as i64 - 48)
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn o_str(st: *mut St, s: str) {
+    tx.b16_ascii((*st).a, &(*st).out, s)
+}
+
+fn o_txt(st: *mut St, t: tx.U16) {
+    tx.b16_text((*st).a, &(*st).out, t)
+}
+
+fn o_int(st: *mut St, v: i64) {
+    tx.b16_i64((*st).a, &(*st).out, v)
+}
+
+fn o_ch(st: *mut St, c: u32) {
+    tx.b16_char((*st).a, &(*st).out, c)
+}
+
+fn o_bool(st: *mut St, v: bool) {
+    if v {
+        o_str(st, "true")
+    } else {
+        o_str(st, "false")
+    }
+}
+
+fn o_range(st: *mut St, s: usize, e: usize) {
+    o_int(st, s as i64)
+    o_ch(st, 45)
+    o_int(st, e as i64)
+}
+
+fn flush(st: *mut St) {
+    let s: str = tx.u16_to_str((*st).a, tx.b16_view(&(*st).out))
+    io.print_bytes(s.p as u64, s.n)
+    m.arena_reset((*st).a)
+    (*st).out = tx.b16_new()
+}
+
+fn find_sdef(st: *mut St, id: i32) -> *mut SDef {
+    var i: usize = 0
+    while i < m.arr_len[SDef](&(*st).sdefs) {
+        let d: *mut SDef = m.arr_at[SDef](&(*st).sdefs, i)
+        if (*d).id == id {
+            return d
+        }
+        i = i + 1
+    }
+    return 0 as *mut SDef
+}
+
+fn hk_requirement(user: u64, source: i64, id: i32) -> bool {
+    return source >= ((id - 1) as i64)
+}
+
+fn hk_command(user: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let st: *mut St = user as *mut St
+    let c: *mut cn.Ctx = cn.cx(ctx)
+    if (*c).cmd == CMD_ERR {
+        *err = ex.exc_custom((*st).a, "boom")
+        return 0
+    }
+    if (*c).cmd == CMD_SRC {
+        return (*c).source as% i32
+    }
+    return (*c).cmd
+}
+
+fn hk_modifier(user: u64, ctx: u64, id: i32, out: *mut m.Arr[i64], err: *mut ex.Exc) -> bool {
+    let st: *mut St = user as *mut St
+    let s: i64 = (*cn.cx(ctx)).source
+    let kind: i32 = id / MOD_UNIT
+    let k: i64 = (id % MOD_UNIT) as i64
+    var vals: m.Arr[i64] = m.arr_new[i64]()
+    var fail: str = ""
+    if kind == MOD_ADD {
+        m.arr_push[i64]((*st).a, &vals, s +% k)
+    } else if kind == MOD_MULTI {
+        var i: i64 = 0
+        while i < k {
+            m.arr_push[i64]((*st).a, &vals, s *% 10 +% i)
+            i = i + 1
+        }
+    } else if kind == MOD_ERR {
+        fail = "modboom"
+    } else if kind == MOD_ODD {
+        if s % 2 != 0 {
+            fail = "odd"
+        } else {
+            m.arr_push[i64]((*st).a, &vals, s +% 1)
+        }
+    }
+    o_str(st, "M src=")
+    o_int(st, s)
+    if fail.n > 0 {
+        o_str(st, " !")
+        o_str(st, fail)
+        o_ch(st, 10)
+        *err = ex.exc_custom((*st).a, fail)
+        return false
+    }
+    o_str(st, " ->")
+    var i: usize = 0
+    while i < m.arr_len[i64](&vals) {
+        o_ch(st, 32)
+        o_int(st, *m.arr_at[i64](&vals, i))
+        m.arr_push[i64]((*st).a, out, *m.arr_at[i64](&vals, i))
+        i = i + 1
+    }
+    o_ch(st, 10)
+    return true
+}
+
+fn hk_sugg(user: u64, ctx: u64, id: i32, b: u64) {
+    let st: *mut St = user as *mut St
+    let sb: *mut sg.SuggBuilder = b as *mut sg.SuggBuilder
+    let d: *mut SDef = find_sdef(st, id)
+    if d as u64 == 0 {
+        return
+    }
+    let rl: tx.U16 = sg.sb_remaining_lower(sb)
+    var i: usize = 0
+    if !(*d).ints {
+        while i < m.arr_len[tx.U16](&(*d).strs) {
+            let s: tx.U16 = *m.arr_at[tx.U16](&(*d).strs, i)
+            if tx.u16_starts_with(cs.u16_lower((*sb).a, s), rl) {
+                sg.sb_suggest(sb, s)
+            }
+            i = i + 1
+        }
+        return
+    }
+    while i < m.arr_len[i32](&(*d).vals) {
+        let v: i32 = *m.arr_at[i32](&(*d).vals, i)
+        var t: m.Arr[u16] = tx.b16_new()
+        tx.b16_i64((*sb).a, &t, v as i64)
+        if tx.u16_starts_with(tx.b16_view(&t), rl) {
+            sg.sb_suggest_int(sb, v)
+        }
+        i = i + 1
+    }
+}
+
+fn nodes_text(st: *mut St, c: *mut cn.Ctx) {
+    var i: usize = 0
+    while i < m.arr_len[cn.PNode](&(*c).nodes) {
+        let p: *mut cn.PNode = m.arr_at[cn.PNode](&(*c).nodes, i)
+        if i > 0 {
+            o_ch(st, 44)
+        }
+        o_txt(st, (*nn.nd((*p).node)).name)
+        o_ch(st, 64)
+        o_range(st, (*p).start, (*p).end)
+        i = i + 1
+    }
+}
+
+fn last_arg(c: *mut cn.Ctx, name: tx.U16) -> *mut cn.PArg {
+    var found: *mut cn.PArg = 0 as *mut cn.PArg
+    var i: usize = 0
+    while i < m.arr_len[cn.PArg](&(*c).args) {
+        let p: *mut cn.PArg = m.arr_at[cn.PArg](&(*c).args, i)
+        if tx.u16_eq((*p).name, name) {
+            found = p
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn first_seen(c: *mut cn.Ctx, i: usize) -> bool {
+    var j: usize = 0
+    let name: tx.U16 = (*m.arr_at[cn.PArg](&(*c).args, i)).name
+    while j < i {
+        if tx.u16_eq((*m.arr_at[cn.PArg](&(*c).args, j)).name, name) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn args_of_builder(st: *mut St, c: *mut cn.Ctx) {
+    var n: usize = 0
+    var i: usize = 0
+    while i < m.arr_len[cn.PArg](&(*c).args) {
+        if first_seen(c, i) {
+            let p: *mut cn.PArg = last_arg(c, (*m.arr_at[cn.PArg](&(*c).args, i)).name)
+            if n > 0 {
+                o_ch(st, 44)
+            }
+            n = n + 1
+            o_txt(st, (*p).name)
+            o_ch(st, 61)
+            o_txt(st, at.value_text((*st).a, &(*p).v))
+            o_ch(st, 64)
+            o_range(st, (*p).start, (*p).end)
+        }
+        i = i + 1
+    }
+}
+
+fn args_of_context(st: *mut St, c: *mut cn.Ctx) {
+    var n: usize = 0
+    var i: usize = 0
+    while i < m.arr_len[cn.PNode](&(*c).nodes) {
+        let node: u64 = (*m.arr_at[cn.PNode](&(*c).nodes, i)).node
+        if (*nn.nd(node)).kind == nn.NK_ARGUMENT {
+            let p: *mut cn.PArg = last_arg(c, (*nn.nd(node)).name)
+            if n > 0 {
+                o_ch(st, 44)
+            }
+            n = n + 1
+            o_txt(st, (*nn.nd(node)).name)
+            o_ch(st, 61)
+            o_txt(st, at.value_text((*st).a, &(*p).v))
+        }
+        i = i + 1
+    }
+}
+
+fn hk_consumer(user: u64, ctx: u64, ok: bool, res: i32) {
+    let st: *mut St = user as *mut St
+    let c: *mut cn.Ctx = cn.cx(ctx)
+    o_str(st, "C ok=")
+    o_bool(st, ok)
+    o_str(st, " res=")
+    o_int(st, res as i64)
+    o_str(st, " src=")
+    o_int(st, (*c).source)
+    o_str(st, " range=")
+    o_range(st, (*c).start, (*c).end)
+    o_str(st, " forked=")
+    o_bool(st, (*c).forks)
+    o_str(st, " nodes=")
+    nodes_text(st, c)
+    o_str(st, " args=")
+    args_of_context(st, c)
+    o_ch(st, 10)
+}
+
+fn th_parse(user: u64, id: i32, r: u64, out: u64, err: u64) -> bool {
+    return false
+}
+
+fn th_suggest(user: u64, id: i32, b: u64) {
+}
+
+fn sort_texts(v: *mut m.Arr[tx.U16]) {
+    var i: usize = 1
+    while i < m.arr_len[tx.U16](v) {
+        let x: tx.U16 = *m.arr_at[tx.U16](v, i)
+        var j: usize = i
+        while j > 0 && tx.u16_cmp(*m.arr_at[tx.U16](v, j - 1), x) > 0 {
+            *m.arr_at[tx.U16](v, j) = *m.arr_at[tx.U16](v, j - 1)
+            j = j - 1
+        }
+        *m.arr_at[tx.U16](v, j) = x
+        i = i + 1
+    }
+}
+
+fn print_parse(st: *mut St, p: *mut dp.Parsed) {
+    var msgs: m.Arr[tx.U16] = m.arr_new[tx.U16]()
+    var i: usize = 0
+    while i < m.arr_len[dp.ErrEntry](&(*p).errs) {
+        let e: *mut dp.ErrEntry = m.arr_at[dp.ErrEntry](&(*p).errs, i)
+        m.arr_push[tx.U16]((*st).a, &msgs, ex.exc_message((*st).a, &(*e).exc))
+        i = i + 1
+    }
+    sort_texts(&msgs)
+    o_str(st, "P read=")
+    o_int(st, (*p).reader.cursor as i64)
+    o_ch(st, 47)
+    o_int(st, rd.total_length(&(*p).reader) as i64)
+    o_str(st, " errs=")
+    o_int(st, m.arr_len[tx.U16](&msgs) as i64)
+    i = 0
+    while i < m.arr_len[tx.U16](&msgs) {
+        o_str(st, " ; ")
+        o_txt(st, *m.arr_at[tx.U16](&msgs, i))
+        i = i + 1
+    }
+    o_ch(st, 10)
+    var h: u64 = (*p).ctx
+    var level: i64 = 0
+    while h != 0 {
+        let c: *mut cn.Ctx = cn.cx(h)
+        o_ch(st, 76)
+        o_int(st, level)
+        level = level + 1
+        o_str(st, " src=")
+        o_int(st, (*c).source)
+        o_str(st, " range=")
+        o_range(st, (*c).start, (*c).end)
+        o_str(st, " nodes=")
+        nodes_text(st, c)
+        o_str(st, " args=")
+        args_of_builder(st, c)
+        o_str(st, " cmd=")
+        o_bool(st, (*c).cmd != 0)
+        o_ch(st, 10)
+        h = (*c).child
+    }
+}
+
+fn cursor_list(len: usize, out: *mut m.Arr[usize], a: *mut m.Arena) {
+    if len <= 16 {
+        var i: usize = 0
+        while i <= len {
+            m.arr_push[usize](a, out, i)
+            i = i + 1
+        }
+        return
+    }
+    m.arr_push[usize](a, out, 0)
+    m.arr_push[usize](a, out, len / 4)
+    m.arr_push[usize](a, out, len / 2)
+    m.arr_push[usize](a, out, 3 * len / 4)
+    m.arr_push[usize](a, out, len - 1)
+    m.arr_push[usize](a, out, len)
+}
+
+fn print_suggestions(d: *mut dp.Dispatcher, st: *mut St, p: *mut dp.Parsed, cursor: usize, input: tx.U16) {
+    o_str(st, "S@")
+    o_int(st, cursor as i64)
+    o_ch(st, 32)
+    let s: sg.Suggestions = dp.completion_suggestions_at(d, p, cursor)
+    o_range(st, s.start, s.end)
+    let cut: tx.U16 = tx.u16_sub(input, 0, cursor)
+    var i: usize = 0
+    while i < m.arr_len[sg.Sugg](&s.list) {
+        let g: *mut sg.Sugg = m.arr_at[sg.Sugg](&s.list, i)
+        o_str(st, " | ")
+        o_txt(st, (*g).text)
+        o_str(st, " => ")
+        o_txt(st, sg.sugg_apply((*st).a, g, cut))
+        i = i + 1
+    }
+    o_ch(st, 10)
+}
+
+fn run_input(d: *mut dp.Dispatcher, st: *mut St, src: i64, rest: str) {
+    let a: *mut m.Arena = (*st).a
+    let input: tx.U16 = tx.u16_from_str(a, rest)
+    o_str(st, "## ")
+    o_int(st, src)
+    o_ch(st, 124)
+    o_txt(st, input)
+    o_ch(st, 10)
+    var p: dp.Parsed = dp.parse(d, input, src)
+    print_parse(st, &p)
+    var res: i32 = 0
+    var err: ex.Exc = ex.exc_none()
+    if dp.execute(d, &p, &res, &err) {
+        o_str(st, "R ")
+        o_int(st, res as i64)
+    } else {
+        o_str(st, "E ")
+        o_txt(st, ex.exc_message(a, &err))
+        o_str(st, " | raw=")
+        o_txt(st, ex.exc_raw(&err))
+        o_str(st, " | cursor=")
+        o_int(st, err.cursor)
+    }
+    o_ch(st, 10)
+    var cursors: m.Arr[usize] = m.arr_new[usize]()
+    cursor_list(input.n, &cursors, a)
+    var i: usize = 0
+    while i < m.arr_len[usize](&cursors) {
+        print_suggestions(d, st, &p, *m.arr_at[usize](&cursors, i), input)
+        i = i + 1
+    }
+}
+
+fn find_path(d: *mut dp.Dispatcher, a: *mut m.Arena, path: str) -> u64 {
+    var names: m.Arr[tx.U16] = m.arr_new[tx.U16]()
+    var i: usize = 0
+    while i <= path.n {
+        let j: usize = sfind(path, 32, i)
+        m.arr_push[tx.U16](a, &names, tx.u16_from_str(a, ssub(path, i, j)))
+        i = j + 1
+    }
+    var n: usize = m.arr_len[tx.U16](&names)
+    while n > 0 && (*m.arr_at[tx.U16](&names, n - 1)).n == 0 {
+        n = n - 1
+    }
+    var node: u64 = (*d).root
+    i = 0
+    while i < n {
+        node = nn.node_child_by_name(node, *m.arr_at[tx.U16](&names, i))
+        if node == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return node
+}
+
+fn run_usage(d: *mut dp.Dispatcher, st: *mut St, rest: str) {
+    let a: *mut m.Arena = (*st).a
+    var sp: usize = sfind(rest, 32, 0)
+    let src: i64 = parse_i64(ssub(rest, 0, sp))
+    var path: str = ""
+    if sp < rest.n {
+        path = ssub(rest, sp + 1, rest.n)
+    }
+    o_str(st, "U ")
+    o_int(st, src)
+    o_str(st, " path=")
+    o_txt(st, tx.u16_from_str(a, path))
+    o_ch(st, 10)
+    var node: u64 = 0
+    if path.n == 0 {
+        node = (*d).root
+    } else {
+        node = find_path(d, a, path)
+    }
+    if node == 0 {
+        o_str(st, "none\n")
+        return
+    }
+    var r: i32 = 0
+    while r < 2 {
+        let us: m.Arr[tx.U16] = dp.all_usage(d, node, src, r == 1)
+        var i: usize = 0
+        while i < m.arr_len[tx.U16](&us) {
+            if r == 1 {
+                o_str(st, "A1: ")
+            } else {
+                o_str(st, "A0: ")
+            }
+            o_txt(st, *m.arr_at[tx.U16](&us, i))
+            o_ch(st, 10)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    let sm: m.Arr[dp.SmartEntry] = dp.smart_usage(d, node, src)
+    var k: usize = 0
+    while k < m.arr_len[dp.SmartEntry](&sm) {
+        let e: *mut dp.SmartEntry = m.arr_at[dp.SmartEntry](&sm, k)
+        o_str(st, "S: ")
+        o_txt(st, nn.node_usage_text(a, (*e).node))
+        o_str(st, " => ")
+        o_txt(st, (*e).text)
+        o_ch(st, 10)
+        k = k + 1
+    }
+}
+
+fn run_line(d: *mut dp.Dispatcher, st: *mut St, line: str) {
+    if line.n > 7 && ssub(line, 0, 7) == "@usage " {
+        run_usage(d, st, ssub(line, 7, line.n))
+    } else {
+        let bar: usize = sfind(line, 124, 0)
+        run_input(d, st, parse_i64(ssub(line, 0, bar)), ssub(line, bar + 1, line.n))
+    }
+    flush(st)
+}
+
+fn parse_type(a: *mut m.Arena, spec: str) -> at.ArgType {
+    let c1: usize = sfind(spec, 58, 0)
+    let kind: str = ssub(spec, 0, c1)
+    var lo: str = ""
+    var hi: str = ""
+    var bounded: bool = false
+    if c1 < spec.n {
+        let c2: usize = sfind(spec, 58, c1 + 1)
+        lo = ssub(spec, c1 + 1, c2)
+        hi = ssub(spec, c2 + 1, spec.n)
+        bounded = true
+    }
+    if kind == "bool" {
+        return at.at_bool()
+    }
+    if kind == "int" {
+        if bounded {
+            return at.at_int(parse_i64(lo) as i32, parse_i64(hi) as i32)
+        }
+        return at.at_int(-2147483647 - 1, 2147483647)
+    }
+    if kind == "long" {
+        if bounded {
+            return at.at_long(parse_i64(lo), parse_i64(hi))
+        }
+        return at.at_long(-9223372036854775807 - 1, 9223372036854775807)
+    }
+    if kind == "float" {
+        if bounded {
+            var f0: f32 = 0.0
+            var f1: f32 = 0.0
+            jn.parse_float(a, tx.u16_from_str(a, lo), &f0)
+            jn.parse_float(a, tx.u16_from_str(a, hi), &f1)
+            return at.at_float(f0, f1)
+        }
+        return at.at_float(-3.4028235e38, 3.4028235e38)
+    }
+    if kind == "double" {
+        if bounded {
+            var d0: f64 = 0.0
+            var d1: f64 = 0.0
+            jn.parse_double(a, tx.u16_from_str(a, lo), &d0)
+            jn.parse_double(a, tx.u16_from_str(a, hi), &d1)
+            return at.at_double(d0, d1)
+        }
+        return at.at_double(-1.7976931348623157e308, 1.7976931348623157e308)
+    }
+    if kind == "word" {
+        return at.at_word()
+    }
+    if kind == "string" {
+        return at.at_string()
+    }
+    return at.at_greedy()
+}
+
+fn kv_get(toks: *mut m.Arr[str], from: usize, key: str, out: *mut str) -> bool {
+    var i: usize = from
+    while i < m.arr_len[str](toks) {
+        let t: str = *m.arr_at[str](toks, i)
+        let eq: usize = sfind(t, 61, 0)
+        if ssub(t, 0, eq) == key {
+            *out = ssub(t, eq + 1, t.n)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn mod_id_of(spec: str) -> i32 {
+    let c: usize = sfind(spec, 58, 0)
+    let kind: str = ssub(spec, 0, c)
+    var k: i32 = 0
+    if c < spec.n {
+        k = parse_i64(ssub(spec, c + 1, spec.n)) as i32
+    }
+    if kind == "add" {
+        return MOD_ADD * MOD_UNIT + k
+    }
+    if kind == "multi" {
+        return MOD_MULTI * MOD_UNIT + k
+    }
+    if kind == "odd" {
+        return MOD_ODD * MOD_UNIT
+    }
+    return MOD_ERR * MOD_UNIT
+}
+
+fn find_label(labels: *mut m.Arr[Item], name: str) -> u64 {
+    var i: usize = 0
+    while i < m.arr_len[Item](labels) {
+        let it: *mut Item = m.arr_at[Item](labels, i)
+        if (*it).label == name {
+            return (*it).h
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn make_node(d: *mut dp.Dispatcher, a: *mut m.Arena, labels: *mut m.Arr[Item], toks: *mut m.Arr[str]) -> u64 {
+    let kindtok: str = *m.arr_at[str](toks, 0)
+    let name: tx.U16 = tx.u16_from_str(a, *m.arr_at[str](toks, 1))
+    var h: u64 = 0
+    var next: usize = 2
+    if kindtok == "lit" {
+        h = nn.node_literal(a, name)
+    } else {
+        h = nn.node_argument(a, name, parse_type(a, *m.arr_at[str](toks, 2)))
+        next = 3
+    }
+    var v: str = ""
+    if kv_get(toks, next, "cmd", &v) {
+        if v == "src" {
+            (*nn.nd(h)).cmd = CMD_SRC
+        } else if v == "err" {
+            (*nn.nd(h)).cmd = CMD_ERR
+        } else {
+            (*nn.nd(h)).cmd = parse_i64(v) as i32
+        }
+    }
+    if kv_get(toks, next, "req", &v) {
+        (*nn.nd(h)).req = parse_i64(v) as i32 + 1
+    }
+    if kv_get(toks, next, "sugg", &v) {
+        (*nn.nd(h)).sugg = parse_i64(v) as i32
+    }
+    var target: str = ""
+    var forks: bool = false
+    var has_target: bool = false
+    if kv_get(toks, next, "redir", &target) {
+        has_target = true
+    } else if kv_get(toks, next, "fork", &target) {
+        has_target = true
+        forks = true
+    }
+    if has_target {
+        var t: u64 = (*d).root
+        if target != "root" {
+            t = find_label(labels, target)
+        }
+        var mid: i32 = 0
+        if kv_get(toks, next, "mod", &v) {
+            mid = mod_id_of(v)
+        }
+        nn.node_forward(h, t, mid, forks)
+    }
+    return h
+}
+
+fn finish_node(d: *mut dp.Dispatcher, a: *mut m.Arena, labels: *mut m.Arr[Item], stack: *mut m.Arr[Item]) {
+    let n: usize = m.arr_len[Item](stack)
+    let it: Item = *m.arr_at[Item](stack, n - 1)
+    m.arr_truncate[Item](stack, n - 1)
+    if n > 1 {
+        nn.node_add_child(a, (*m.arr_at[Item](stack, n - 2)).h, it.h)
+        return
+    }
+    nn.node_add_child(a, (*d).root, it.h)
+    if it.label.n > 0 {
+        m.arr_push[Item](a, labels, it)
+    }
+}
+
+fn load_tree(d: *mut dp.Dispatcher, st: *mut St, a: *mut m.Arena, text: *mut rt.Buf) {
+    var labels: m.Arr[Item] = m.arr_new[Item]()
+    var stack: m.Arr[Item] = m.arr_new[Item]()
+    var lr: io.LineReader = io.lines_of_buf(text)
+    var lp: u64 = 0
+    var ln: usize = 0
+    while io.lines_next(&lr, &lp, &ln) {
+        let raw: str = str { p: lp as *mut u8, n: ln }
+        var toks: m.Arr[str] = m.arr_new[str]()
+        var depth: usize = 0
+        while depth * 2 + 1 < raw.n && sbyte(raw, depth * 2) == 32 && sbyte(raw, depth * 2 + 1) == 32 {
+            depth = depth + 1
+        }
+        var i: usize = 0
+        while i < raw.n {
+            while i < raw.n && (sbyte(raw, i) == 32 || sbyte(raw, i) == 9) {
+                i = i + 1
+            }
+            let s: usize = i
+            while i < raw.n && sbyte(raw, i) != 32 && sbyte(raw, i) != 9 {
+                i = i + 1
+            }
+            if i > s {
+                m.arr_push[str](a, &toks, ssub(raw, s, i))
+            }
+        }
+        if m.arr_len[str](&toks) == 0 || sbyte(*m.arr_at[str](&toks, 0), 0) == 35 {
+            continue
+        }
+        let head: str = *m.arr_at[str](&toks, 0)
+        if head == "sugglist" || head == "suggint" {
+            var def: SDef = SDef {
+                id: parse_i64(*m.arr_at[str](&toks, 1)) as i32,
+                ints: head == "suggint",
+                strs: m.arr_new[tx.U16](),
+                vals: m.arr_new[i32](),
+            }
+            var k: usize = 2
+            while k < m.arr_len[str](&toks) {
+                let t: str = *m.arr_at[str](&toks, k)
+                if def.ints {
+                    m.arr_push[i32](a, &def.vals, parse_i64(t) as i32)
+                } else {
+                    m.arr_push[tx.U16](a, &def.strs, tx.u16_from_str(a, t))
+                }
+                k = k + 1
+            }
+            m.arr_push[SDef](a, &(*st).sdefs, def)
+            continue
+        }
+        while m.arr_len[Item](&stack) > depth {
+            finish_node(d, a, &labels, &stack)
+        }
+        let h: u64 = make_node(d, a, &labels, &toks)
+        var label: str = ""
+        kv_get(&toks, 2, "label", &label)
+        m.arr_push[Item](a, &stack, Item { h: h, top: depth == 0, label: label })
+    }
+    while m.arr_len[Item](&stack) > 0 {
+        finish_node(d, a, &labels, &stack)
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        io.eprint_line("usage: prog <tree.txt> <corpus.txt>")
+        return 2
+    }
+    var tree_buf: rt.Buf = rt.buf_new()
+    var corpus_buf: rt.Buf = rt.buf_new()
+    if !io.read_file(rt.arg_ptr(start, 1), &tree_buf) || !io.read_file(rt.arg_ptr(start, 2), &corpus_buf) {
+        io.eprint_line("cannot read input")
+        return 2
+    }
+    var tree_arena: m.Arena = m.arena_new()
+    var case_arena: m.Arena = m.arena_new()
+    var st: St = St { a: &case_arena, out: tx.b16_new(), sdefs: m.arr_new[SDef]() }
+    let stp: *mut St = &st
+    let hooks: dp.Hooks = dp.Hooks {
+        user: stp as u64,
+        requirement: hk_requirement,
+        command: hk_command,
+        modifier: hk_modifier,
+        sugg: hk_sugg,
+        consumer: hk_consumer,
+        types: at.TypeHooks { user: 0, parse: th_parse, suggest: th_suggest },
+    }
+    var build: dp.Dispatcher = dp.dispatcher_new(&tree_arena, hooks)
+    load_tree(&build, &st, &tree_arena, &tree_buf)
+    var run: dp.Dispatcher = dp.Dispatcher { a: &case_arena, root: build.root, hooks: hooks }
+    var lr: io.LineReader = io.lines_of_buf(&corpus_buf)
+    var lp: u64 = 0
+    var ln: usize = 0
+    while io.lines_next(&lr, &lp, &ln) {
+        if ln == 0 {
+            continue
+        }
+        run_line(&run, &st, str { p: lp as *mut u8, n: ln })
+    }
+    return 0
+}
