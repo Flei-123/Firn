@@ -50,7 +50,7 @@ for app in "${APPS[@]}"; do
 HTML
     "$FIRNC" --opt-level=dev -o "$OUT/native-$app" "examples/fui_apps/$app/main.fi" || { echo "RESULT $app NATIVE-FAILED"; fail=1; continue; }
     for th in light dark; do
-        "$OUT/native-$app" --theme $th --shot "$OUT/$app-native-$th.png" >/dev/null
+        "$OUT/native-$app" --theme $th --size 1100x700 --shot "$OUT/$app-native-$th.png" >/dev/null
     done
 done
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
