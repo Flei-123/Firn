@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/mg_random.fi -- the two random streams of Minecraft world generation, bit identical to the Java classes:
+// LegacyRandomSource (the 48-bit LCG of java.util.Random), XoroshiroRandomSource (Xoroshiro128++), and the
+// WorldgenRandom bit adapter (wrapped = true) that counts draws and derives xoroshiro bits from nextLong.
+// Primitives: lib/mc/mc_noise.fi (LCG), lib/noise/xoroshiro.fi, lib/noise/fdlibm.fi, lib/std/md5.fi.
+import std.math
+import std.md5
+import mc.mc_noise
+import noise.xoroshiro
+import noise.fdlibm
+import mc.gen.mg_mth
+
+export {
+    KIND_LEGACY, KIND_XORO, Rng, PosFactory, upgrade_seed_to_128, seed_from_hash_of,
+    rng_legacy, rng_xoro, rng_xoro_state, rng_wrap, rng_set_seed, rng_next_bits, rng_next_int, rng_next_int_bound,
+    rng_next_long, rng_next_bool, rng_next_float, rng_next_double, rng_next_gaussian, rng_consume, rng_fork,
+    rng_fork_positional, pos_at, pos_from_hash_of, pos_from_seed,
+}
+
+const KIND_LEGACY: i32 = 0
+const KIND_XORO: i32 = 1
+
+struct Rng {
+    kind: i32,
+    wrapped: bool,
+    count: i32,
+    lcg: mc_noise.JavaRandom,
+    x: xoroshiro.Xoro,
+    has_gauss: bool,
+    gauss: f64,
+}
+
+struct PosFactory {
+    kind: i32,
+    seed: i64,
+    lo: u64,
+    hi: u64,
+}
+
+fn upgrade_seed_to_128(seed: i64, lo: *mut u64, hi: *mut u64) {
+    let l: u64 = (seed as u64) ^ xoroshiro.SILVER_RATIO_64
+    let h: u64 = l +% xoroshiro.GOLDEN_RATIO_64
+    *lo = xoroshiro.mix_stafford13(l)
+    *hi = xoroshiro.mix_stafford13(h)
+}
+
+fn seed_from_hash_of(p: u64, n: usize, lo: *mut u64, hi: *mut u64) {
+    var d: [u8; 16] = [0; 16]
+    md5.md5(p, n, (&d[0]) as u64)
+    var a: u64 = 0
+    var b: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        a = (a << 8) | (d[i] as u64)
+        b = (b << 8) | (d[8 + i] as u64)
+        i = i + 1
+    }
+    *lo = a
+    *hi = b
+}
+
+fn blank(kind: i32) -> Rng {
+    return Rng {
+        kind: kind, wrapped: false, count: 0, lcg: mc_noise.jrandom_new(0), x: xoroshiro.xoro_new(1 as u64, 1 as u64),
+        has_gauss: false, gauss: 0.0,
+    }
+}
+
+fn rng_legacy(seed: i64) -> Rng {
+    var r: Rng = blank(KIND_LEGACY)
+    r.lcg = mc_noise.jrandom_new(seed)
+    return r
+}
+
+fn rng_xoro_state(lo: u64, hi: u64) -> Rng {
+    var r: Rng = blank(KIND_XORO)
+    r.x = xoroshiro.xoro_new(lo, hi)
+    return r
+}
+
+fn rng_xoro(seed: i64) -> Rng {
+    var lo: u64 = 0
+    var hi: u64 = 0
+    upgrade_seed_to_128(seed, &lo, &hi)
+    return rng_xoro_state(lo, hi)
+}
+
+fn rng_wrap(inner: Rng) -> Rng {
+    var r: Rng = inner
+    r.wrapped = true
+    r.count = 0
+    r.has_gauss = false
+    return r
+}
+
+fn rng_set_seed(r: *mut Rng, seed: i64) {
+    if (*r).kind == KIND_LEGACY {
+        (*r).lcg = mc_noise.jrandom_new(seed)
+    } else {
+        var lo: u64 = 0
+        var hi: u64 = 0
+        upgrade_seed_to_128(seed, &lo, &hi)
+        (*r).x = xoroshiro.xoro_new(lo, hi)
+    }
+    if !(*r).wrapped {
+        (*r).has_gauss = false
+    }
+}
+
+fn rng_next_bits(r: *mut Rng, bits: i32) -> i32 {
+    if (*r).wrapped {
+        (*r).count = (*r).count +% 1
+    }
+    if (*r).kind == KIND_LEGACY {
+        return mc_noise.jrandom_next_bits(&(*r).lcg, bits as u32)
+    }
+    let v: u64 = xoroshiro.xoro_next(&(*r).x)
+    return (v >> ((64 - bits) as u32)) as% i32
+}
+
+fn rng_next_int(r: *mut Rng) -> i32 {
+    if (*r).wrapped || (*r).kind == KIND_LEGACY {
+        return rng_next_bits(r, 32)
+    }
+    return xoroshiro.xoro_next(&(*r).x) as% i32
+}
+
+fn bits_int_bound(r: *mut Rng, bound: i32) -> i32 {
+    if (bound & (bound - 1)) == 0 {
+        return (((bound as i64) * (rng_next_bits(r, 31) as i64)) >> 31) as i32
+    }
+    var i: i32 = rng_next_bits(r, 31)
+    var j: i32 = i % bound
+    while ((i -% j) +% (bound - 1)) < 0 {
+        i = rng_next_bits(r, 31)
+        j = i % bound
+    }
+    return j
+}
+
+fn rng_next_int_bound(r: *mut Rng, bound: i32) -> i32 {
+    if (*r).wrapped || (*r).kind == KIND_LEGACY {
+        return bits_int_bound(r, bound)
+    }
+    let b: u64 = (bound as u32) as u64
+    var l: u64 = (rng_next_int(r) as% u32) as u64
+    var m: u64 = l * b
+    var n: u64 = m & 0xffffffff
+    if n < b {
+        let t: u64 = (((0 as u32) -% (bound as u32)) % (bound as u32)) as u64
+        while n < t {
+            l = (rng_next_int(r) as% u32) as u64
+            m = l * b
+            n = m & 0xffffffff
+        }
+    }
+    return (m >> 32) as i32
+}
+
+fn rng_next_long(r: *mut Rng) -> i64 {
+    if !(*r).wrapped && (*r).kind == KIND_XORO {
+        return xoroshiro.xoro_next(&(*r).x) as% i64
+    }
+    let a: i64 = rng_next_bits(r, 32) as i64
+    let b: i64 = rng_next_bits(r, 32) as i64
+    return (a << 32) +% b
+}
+
+fn rng_next_bool(r: *mut Rng) -> bool {
+    if !(*r).wrapped && (*r).kind == KIND_XORO {
+        return (xoroshiro.xoro_next(&(*r).x) & 1 as u64) != 0 as u64
+    }
+    return rng_next_bits(r, 1) != 0
+}
+
+#[allow_fp]
+fn rng_next_float(r: *mut Rng) -> f32 {
+    if !(*r).wrapped && (*r).kind == KIND_XORO {
+        return ((xoroshiro.xoro_next(&(*r).x) >> 40) as i32 as f32) * 0.000000059604645f
+    }
+    return (rng_next_bits(r, 24) as f32) * 0.000000059604645f
+}
+
+#[allow_fp]
+fn rng_next_double(r: *mut Rng) -> f64 {
+    if !(*r).wrapped && (*r).kind == KIND_XORO {
+        return ((xoroshiro.xoro_next(&(*r).x) >> 11) as i64 as f64) * 0.00000000000000011102230246251565
+    }
+    let a: i64 = rng_next_bits(r, 26) as i64
+    let b: i64 = rng_next_bits(r, 27) as i64
+    return (((a << 27) +% b) as f64) * 0.00000000000000011102230246251565
+}
+
+#[allow_fp]
+fn rng_next_gaussian(r: *mut Rng) -> f64 {
+    if (*r).has_gauss {
+        (*r).has_gauss = false
+        return (*r).gauss
+    }
+    var d0: f64 = 0.0
+    var d1: f64 = 0.0
+    var d2: f64 = 0.0
+    var again: bool = true
+    while again {
+        d0 = 2.0 * rng_next_double(r) - 1.0
+        d1 = 2.0 * rng_next_double(r) - 1.0
+        d2 = d0 * d0 + d1 * d1
+        again = d2 >= 1.0 || d2 == 0.0
+    }
+    let d3: f64 = math.sqrt(-2.0 * fdlibm.fd_log(d2) / d2)
+    (*r).gauss = d1 * d3
+    (*r).has_gauss = true
+    return d0 * d3
+}
+
+fn rng_consume(r: *mut Rng, count: i32) {
+    var i: i32 = 0
+    while i < count {
+        rng_next_int(r)
+        i = i + 1
+    }
+}
+
+fn rng_fork(r: *mut Rng) -> Rng {
+    if (*r).kind == KIND_LEGACY {
+        let a: i64 = rng_native_long(r)
+        return rng_legacy(a)
+    }
+    let a: u64 = xoroshiro.xoro_next(&(*r).x)
+    let b: u64 = xoroshiro.xoro_next(&(*r).x)
+    return rng_xoro_state(a, b)
+}
+
+fn rng_native_long(r: *mut Rng) -> i64 {
+    let a: i64 = mc_noise.jrandom_next_bits(&(*r).lcg, 32 as u32) as i64
+    let b: i64 = mc_noise.jrandom_next_bits(&(*r).lcg, 32 as u32) as i64
+    return (a << 32) +% b
+}
+
+fn rng_fork_positional(r: *mut Rng) -> PosFactory {
+    if (*r).kind == KIND_LEGACY {
+        let a: i64 = rng_native_long(r)
+        return PosFactory { kind: KIND_LEGACY, seed: a, lo: 0 as u64, hi: 0 as u64 }
+    }
+    let a: u64 = xoroshiro.xoro_next(&(*r).x)
+    let b: u64 = xoroshiro.xoro_next(&(*r).x)
+    return PosFactory { kind: KIND_XORO, seed: 0, lo: a, hi: b }
+}
+
+fn pos_at(f: *PosFactory, x: i32, y: i32, z: i32) -> Rng {
+    let s: i64 = mg_mth.get_seed(x, y, z)
+    if (*f).kind == KIND_LEGACY {
+        return rng_legacy(s ^ (*f).seed)
+    }
+    return rng_xoro_state((s as u64) ^ (*f).lo, (*f).hi)
+}
+
+fn pos_from_seed(f: *PosFactory, seed: i64) -> Rng {
+    if (*f).kind == KIND_LEGACY {
+        return rng_legacy(seed)
+    }
+    return rng_xoro_state((seed as u64) ^ (*f).lo, (seed as u64) ^ (*f).hi)
+}
+
+fn pos_from_hash_of(f: *PosFactory, p: u64, n: usize) -> Rng {
+    if (*f).kind == KIND_LEGACY {
+        let h: i64 = mg_mth.java_string_hash_utf8(p, n) as i64
+        return rng_legacy(h ^ (*f).seed)
+    }
+    var lo: u64 = 0
+    var hi: u64 = 0
+    seed_from_hash_of(p, n, &lo, &hi)
+    return rng_xoro_state(lo ^ (*f).lo, hi ^ (*f).hi)
+}
