@@ -1,0 +1,539 @@
+// SPDX-License-Identifier: MPL-2.0
+import fui.ds_catalog_tok
+import fui.ds_crumb
+import fui.ds_icons
+import fui.ds_icons_names
+import fui.ds_iconbtn
+import fui.ds_look
+import fui.ds_navview
+import fui.ds_tpl_files_model
+import fui.ds_tpl_run
+import fui.ds_vgrid
+import fui.editor
+import fui.kit
+import fui.kitform
+import fui.painter
+import fui.render
+import fui.screen
+import fui.style
+import plat.fuiwirt
+import std.rt
+
+export {
+    Files, files_new, files_run, paint, press, key, text, wheel, pointer, go, go_back, go_forward, go_up, open_item, select_item,
+    set_sort, toggle_view, current, history_pos, history_len, entry_count, selected_name, sort_key, sort_desc, grid_mode,
+    place_select, status_text, crumb_list, NONE,
+}
+
+const NONE: usize = 18446744073709551615
+const ID_BACK: usize = 1
+const ID_FWD: usize = 2
+const ID_UP: usize = 3
+const ID_VIEW: usize = 4
+const ID_SORT: usize = 5
+const HIST: usize = 32
+const DEPTH: usize = 16
+const F_NAV: u32 = 0
+const F_GRID: u32 = 1
+
+struct Files {
+    spec: ds_tpl_files_model.Spec,
+    nav: ds_navview.NavView,
+    grid: ds_vgrid.Grid,
+    crumb: *mut ds_crumb.Crumbs,
+    btns: *mut ds_iconbtn.Btns,
+    es: [ds_tpl_files_model.Entry; 256],
+    order: [usize; 256],
+    n: usize,
+    cur: i64,
+    hist: [i64; 32],
+    hn: usize,
+    hi: usize,
+    chain: [i64; 16],
+    chain_n: usize,
+    key: u32,
+    desc: bool,
+    grid_on: bool,
+    focus: u32,
+    sel: usize,
+    last_ms: i64,
+    last_i: usize,
+    ctx: u64,
+    cbuf: u64,
+    sbuf: u64,
+    mx: f64,
+    sx: f64,
+    hy: f64,
+    hh: f64,
+    cbn: usize,
+}
+
+fn files_new(spec: ds_tpl_files_model.Spec) -> *mut Files {
+    let f: *mut Files = rt.heap_alloc(1 << 17) as *mut Files
+    (*f).spec = spec
+    (*f).nav = ds_navview.nv_new()
+    (*f).grid = ds_vgrid.grid_new()
+    (*f).crumb = ds_crumb.crumbs_new()
+    (*f).btns = ds_iconbtn.btns_new()
+    var i: usize = 0
+    while i < ds_tpl_files_model.MAXN {
+        (*f).es[i] = ds_tpl_files_model.blank_entry()
+        (*f).order[i] = i
+        i = i + 1
+    }
+    (*f).n = 0
+    (*f).hn = 0
+    (*f).hi = 0
+    (*f).chain_n = 0
+    (*f).key = ds_tpl_files_model.SORT_NAME
+    (*f).desc = false
+    (*f).grid_on = false
+    (*f).focus = F_GRID
+    (*f).sel = NONE
+    (*f).last_ms = 0 as i64
+    (*f).last_i = NONE
+    (*f).ctx = 0
+    (*f).cbuf = rt.heap_alloc(1024)
+    (*f).sbuf = rt.heap_alloc(256)
+    (*f).mx = 0.0
+    (*f).sx = 0.0
+    (*f).hy = 0.0
+    (*f).hh = 0.0
+    (*f).cbn = 0
+    var k: usize = 0
+    while k < ds_tpl_run.count_of(spec.places) {
+        ds_navview.add(&(*f).nav, spec.place_icons[k], kitform.nth(spec.places, k))
+        k = k + 1
+    }
+    return f
+}
+
+fn current(f: *mut Files) -> i64 { return (*f).cur }
+fn history_pos(f: *mut Files) -> usize { return (*f).hi }
+fn history_len(f: *mut Files) -> usize { return (*f).hn }
+fn entry_count(f: *mut Files) -> usize { return (*f).n }
+fn sort_key(f: *mut Files) -> u32 { return (*f).key }
+fn sort_desc(f: *mut Files) -> bool { return (*f).desc }
+fn grid_mode(f: *mut Files) -> bool { return (*f).grid_on }
+
+fn entry_at(f: *mut Files, i: usize) -> *mut ds_tpl_files_model.Entry { return &(*f).es[(*f).order[i]] }
+
+fn selected_name(f: *mut Files) -> str {
+    if (*f).sel == NONE { return "" }
+    return (*entry_at(f, (*f).sel)).name
+}
+
+fn put(buf: u64, pos: usize, s: str) -> usize {
+    var i: usize = 0
+    while i < s.n && pos + i < 250 {
+        rt.st8(buf, pos + i, rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+    return pos + i
+}
+
+fn put_num(buf: u64, pos: usize, v: i64) -> usize {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    let n: usize = kit.fmt_uint(v as u64, &tmp)
+    var i: usize = 0
+    while i < n && pos + i < 250 {
+        rt.st8(buf, pos + i, tmp[i])
+        i = i + 1
+    }
+    return pos + i
+}
+
+fn size_text(buf: u64, v: i64) -> str {
+    var p: usize = 0
+    if v < 1024 as i64 {
+        p = put_num(buf, 0, v)
+        p = put(buf, p, " B")
+    } else if v < 1048576 as i64 {
+        p = put_num(buf, 0, v / 1024 as i64)
+        p = put(buf, p, " KB")
+    } else {
+        p = put_num(buf, 0, v / 1048576 as i64)
+        p = put(buf, p, " MB")
+    }
+    return str { p: buf as *mut u8, n: p }
+}
+
+fn status_text(f: *mut Files) -> str {
+    var p: usize = put_num((*f).sbuf, 0, (*f).n as i64)
+    if (*f).n == 1 { p = put((*f).sbuf, p, " item") } else { p = put((*f).sbuf, p, " items") }
+    if (*f).sel != NONE { p = put((*f).sbuf, p, "   1 item selected") }
+    return str { p: (*f).sbuf as *mut u8, n: p }
+}
+
+fn build_chain(f: *mut Files) {
+    var tmp: [i64; 16] = [0 as i64; 16]
+    var n: usize = 0
+    var node: i64 = (*f).cur
+    while node >= 0 as i64 && n < DEPTH {
+        tmp[n] = node
+        n = n + 1
+        node = ((*f).spec.parent)((*f).spec.ud, node)
+    }
+    (*f).chain_n = n
+    var i: usize = 0
+    var p: usize = 0
+    while i < n {
+        (*f).chain[i] = tmp[n - 1 - i]
+        if i > 0 { p = put((*f).cbuf, p, "|") }
+        p = put((*f).cbuf, p, ((*f).spec.name_of)((*f).spec.ud, (*f).chain[i]))
+        i = i + 1
+    }
+    rt.st8((*f).cbuf, p, 0 as u8)
+    (*f).cbn = p
+}
+
+fn crumb_list(f: *mut Files) -> str { return str { p: (*f).cbuf as *mut u8, n: (*f).cbn } }
+
+fn refresh(f: *mut Files) {
+    var n: usize = ((*f).spec.count)((*f).spec.ud, (*f).cur)
+    if n > ds_tpl_files_model.MAXN { n = ds_tpl_files_model.MAXN }
+    var i: usize = 0
+    while i < n {
+        (*f).es[i] = ds_tpl_files_model.blank_entry()
+        ((*f).spec.entry)((*f).spec.ud, (*f).cur, i, &(*f).es[i])
+        i = i + 1
+    }
+    (*f).n = n
+    ds_tpl_files_model.sort_order(&(*f).es, &(*f).order, n, (*f).key, (*f).desc)
+    (*f).sel = NONE
+    (*f).last_i = NONE
+    ds_vgrid.select(&(*f).grid, ds_vgrid.NONE)
+    ds_vgrid.set_count(&(*f).grid, n)
+    ds_vgrid.scroll_by(&(*f).grid, 0.0 - 1000000.0)
+    build_chain(f)
+    sync_nav(f)
+}
+
+fn sync_nav(f: *mut Files) {
+    var k: usize = 0
+    while k < ds_tpl_run.count_of((*f).spec.places) {
+        var j: usize = 0
+        while j < (*f).chain_n {
+            if (*f).chain[j] == (*f).spec.place_nodes[k] { ds_navview.select(&(*f).nav, k) }
+            j = j + 1
+        }
+        k = k + 1
+    }
+}
+
+fn go(f: *mut Files, node: i64, push: bool) {
+    if push {
+        if (*f).hn > 0 && (*f).hist[(*f).hi] == node { return }
+        if (*f).hn > 0 { (*f).hi = (*f).hi + 1 }
+        if (*f).hi >= HIST {
+            var k: usize = 1
+            while k < HIST {
+                (*f).hist[k - 1] = (*f).hist[k]
+                k = k + 1
+            }
+            (*f).hi = HIST - 1
+        }
+        (*f).hist[(*f).hi] = node
+        (*f).hn = (*f).hi + 1
+    }
+    (*f).cur = node
+    refresh(f)
+}
+
+fn go_back(f: *mut Files) {
+    if (*f).hi == 0 { return }
+    (*f).hi = (*f).hi - 1
+    go(f, (*f).hist[(*f).hi], false)
+}
+
+fn go_forward(f: *mut Files) {
+    if (*f).hi + 1 >= (*f).hn { return }
+    (*f).hi = (*f).hi + 1
+    go(f, (*f).hist[(*f).hi], false)
+}
+
+fn go_up(f: *mut Files) {
+    let p: i64 = ((*f).spec.parent)((*f).spec.ud, (*f).cur)
+    if p >= 0 as i64 { go(f, p, true) }
+}
+
+fn place_select(f: *mut Files, k: usize) {
+    if k >= ds_tpl_run.count_of((*f).spec.places) { return }
+    go(f, (*f).spec.place_nodes[k], true)
+}
+
+fn select_item(f: *mut Files, i: usize) {
+    if i >= (*f).n { return }
+    (*f).sel = i
+    ds_vgrid.select(&(*f).grid, i)
+}
+
+fn open_item(f: *mut Files, i: usize) {
+    if i >= (*f).n { return }
+    let e: *mut ds_tpl_files_model.Entry = entry_at(f, i)
+    if ds_tpl_files_model.is_dir(e) { go(f, (*e).id, true) }
+}
+
+fn set_sort(f: *mut Files, key: u32) {
+    if key == (*f).key { (*f).desc = !(*f).desc } else {
+        (*f).key = key
+        (*f).desc = false
+    }
+    ds_tpl_files_model.sort_order(&(*f).es, &(*f).order, (*f).n, (*f).key, (*f).desc)
+    (*f).sel = NONE
+    ds_vgrid.select(&(*f).grid, ds_vgrid.NONE)
+}
+
+fn toggle_view(f: *mut Files) {
+    (*f).grid_on = !(*f).grid_on
+    ds_vgrid.scroll_by(&(*f).grid, 0.0 - 1000000.0)
+}
+
+fn icon_of(e: *mut ds_tpl_files_model.Entry) -> i64 {
+    if (*e).icon >= 0 as i64 { return (*e).icon }
+    if ds_tpl_files_model.is_dir(e) { return ds_icons.gid(ds_icons_names.FOLDER) }
+    return ds_icons.gid(ds_icons_names.DOCUMENT)
+}
+
+fn draw_cell(c: *mut render.Ctx, i: usize, x: f64, y: f64, w: f64, h: f64, st: u32, user: u64) {
+    let f: *mut Files = user as *mut Files
+    let e: *mut ds_tpl_files_model.Entry = entry_at(f, i)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var bg: u32 = 0 as u32
+    if st & ds_vgrid.ST_SELECTED != 0 as u32 { bg = kit.with_alpha(ds_catalog_tok.accent(c), 40 as u32) } else if st & ds_vgrid.ST_HOVERED != 0 as u32 { bg = ds_look.hover_bg(c) }
+    var col: u32 = ds_catalog_tok.muted(c)
+    if ds_tpl_files_model.is_dir(e) { col = ds_catalog_tok.accent(c) }
+    if (*f).grid_on {
+        if bg != 0 as u32 { painter.round_rect(z, x, y, w, h, kit.ln(c, 8), bg) }
+        let isz: f64 = kit.ln(c, 40)
+        kit.sym(c, icon_of(e), x + (w - isz) / 2.0, y + kit.ln(c, 12), isz, col)
+        let tw: f64 = kit.text_width(c, kit.ln(c, 13), 400, (*e).name)
+        var nx: f64 = x + (w - tw) / 2.0
+        if nx < x + kit.ln(c, 4) { nx = x + kit.ln(c, 4) }
+        kit.draw_label(c, nx, y + h - kit.ln(c, 36), kit.ln(c, 24), kit.ln(c, 13), 400, ds_catalog_tok.text(c), (*e).name, w - kit.ln(c, 8))
+    } else {
+        if bg != 0 as u32 { painter.round_rect(z, x + kit.ln(c, 4), y + kit.ln(c, 2), w - kit.ln(c, 8), h - kit.ln(c, 4), kit.ln(c, 4), bg) }
+        let isz: f64 = kit.ln(c, 20)
+        kit.sym(c, icon_of(e), x + kit.ln(c, 16), y + (h - isz) / 2.0, isz, col)
+        kit.draw_label(c, x + kit.ln(c, 48), y, h, kit.ln(c, 14), 400, ds_catalog_tok.text(c), (*e).name, (*f).mx - x - kit.ln(c, 56))
+        kit.draw_label(c, (*f).mx, y, h, kit.ln(c, 14), 400, ds_catalog_tok.muted(c), (*e).modified, (*f).sx - (*f).mx - kit.ln(c, 8))
+        if !ds_tpl_files_model.is_dir(e) {
+            let t: str = size_text((*f).sbuf, (*e).size)
+            let tw: f64 = kit.text_width(c, kit.ln(c, 14), 400, t)
+            kit.draw_label(c, x + w - kit.ln(c, 24) - tw, y, h, kit.ln(c, 14), 400, ds_catalog_tok.muted(c), t, 0.0)
+        }
+    }
+}
+
+fn draw_header(f: *mut Files, c: *mut render.Ctx, x: f64, w: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let h: f64 = (*f).hh
+    let y: f64 = (*f).hy
+    var k: u32 = 0 as u32
+    while k < 3 as u32 {
+        var cx: f64 = x + kit.ln(c, 48)
+        if k == ds_tpl_files_model.SORT_DATE { cx = (*f).mx }
+        if k == ds_tpl_files_model.SORT_SIZE { cx = (*f).sx }
+        var wt: usize = 400
+        var col: u32 = ds_catalog_tok.muted(c)
+        if k == (*f).key {
+            wt = 600
+            col = ds_catalog_tok.text(c)
+        }
+        var label: str = ds_tpl_files_model.key_name(k)
+        let lw: f64 = kit.draw_label(c, cx, y, h, kit.ln(c, 12), wt, col, label, 0.0)
+        if k == (*f).key {
+            var g: i64 = ds_icons.gid(ds_icons_names.CHEVRON_UP)
+            if (*f).desc { g = ds_icons.gid(ds_icons_names.CHEVRON_DOWN) }
+            let gs: f64 = kit.ln(c, 12)
+            kit.sym(c, g, cx + lw + kit.ln(c, 4), y + (h - gs) / 2.0, gs, col)
+        }
+        k = k + 1 as u32
+    }
+    painter.surface(z, x, y + h - kit.ln(c, 1), w, kit.ln(c, 1), ds_catalog_tok.separator(c))
+}
+
+fn draw_empty(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+    let isz: f64 = kit.ln(c, 48)
+    kit.sym(c, ds_icons.gid(ds_icons_names.FOLDER_OPEN), x + (w - isz) / 2.0, y + h / 2.0 - kit.ln(c, 48), isz, ds_catalog_tok.muted(c))
+    let t: str = "This folder is empty"
+    let tw: f64 = kit.text_width(c, kit.ln(c, 16), 600, t)
+    kit.draw_label(c, x + (w - tw) / 2.0, y + h / 2.0 + kit.ln(c, 8), kit.ln(c, 24), kit.ln(c, 16), 600, ds_catalog_tok.text(c), t, 0.0)
+    let u: str = "Items you add will show up here"
+    let uw: f64 = kit.text_width(c, kit.ln(c, 14), 400, u)
+    kit.draw_label(c, x + (w - uw) / 2.0, y + h / 2.0 + kit.ln(c, 34), kit.ln(c, 20), kit.ln(c, 14), 400, ds_catalog_tok.muted(c), u, 0.0)
+}
+
+fn draw_content(f: *mut Files, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, px: f64, py: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var pad: f64 = kit.ln(c, 24)
+    if ds_navview.mode(&(*f).nav) == ds_navview.MODE_MINIMAL { pad = kit.ln(c, 16) }
+    let bs: f64 = kit.ln(c, 36)
+    let ty: f64 = y + kit.ln(c, 16)
+    ds_iconbtn.begin((*f).btns, c, px, py)
+    ds_iconbtn.add((*f).btns, c, ID_BACK, x + pad, ty, ds_icons.gid(ds_icons_names.BACK), "Back", false, (*f).hi > 0)
+    ds_iconbtn.add((*f).btns, c, ID_FWD, x + pad + bs, ty, ds_icons.gid(ds_icons_names.FORWARD), "Forward", false, (*f).hi + 1 < (*f).hn)
+    ds_iconbtn.add((*f).btns, c, ID_UP, x + pad + bs * 2.0, ty, ds_icons.gid(ds_icons_names.UP), "Up", false, ((*f).spec.parent)((*f).spec.ud, (*f).cur) >= 0 as i64)
+    var vg: i64 = ds_icons.gid(ds_icons_names.GRID)
+    var vn: str = "Grid view"
+    if (*f).grid_on {
+        vg = ds_icons.gid(ds_icons_names.LIST)
+        vn = "List view"
+    }
+    ds_iconbtn.add((*f).btns, c, ID_VIEW, x + w - pad - bs * 2.0, ty, vg, vn, false, true)
+    ds_iconbtn.add((*f).btns, c, ID_SORT, x + w - pad - bs, ty, ds_icons.gid(ds_icons_names.SORT), "Sort", false, true)
+    ds_iconbtn.end((*f).btns, c)
+    let cx: f64 = x + pad + bs * 3.0 + kit.ln(c, 8)
+    ds_crumb.begin((*f).crumb, c, cx, ty, x + w - pad - bs * 2.0 - kit.ln(c, 8) - cx, px, py)
+    ds_crumb.draw((*f).crumb, c, crumb_list(f))
+    ds_crumb.end((*f).crumb, c)
+    let sh: f64 = kit.ln(c, 28)
+    var top: f64 = ty + kit.ln(c, 32) + kit.ln(c, 12)
+    (*f).hy = top
+    (*f).hh = 0.0
+    (*f).mx = x + w - kit.ln(c, 300)
+    (*f).sx = x + w - kit.ln(c, 96)
+    if !(*f).grid_on && (*f).n > 0 {
+        (*f).hh = kit.ln(c, 32)
+        draw_header(f, c, x, w)
+        top = top + (*f).hh
+    }
+    if (*f).n == 0 {
+        draw_empty(c, x, top, w, y + h - sh - top)
+    } else {
+        if (*f).grid_on { ds_vgrid.set_cell(&(*f).grid, 112, 104, 8) } else { ds_vgrid.set_cell(&(*f).grid, 4000, 36, 0) }
+        ds_vgrid.set_pad(&(*f).grid, 0)
+        ds_vgrid.layout(&(*f).grid, c, x + pad, top, w - pad * 2.0, y + h - sh - top)
+        ds_vgrid.move(&(*f).grid, px, py)
+        ds_vgrid.draw_each(&(*f).grid, c, "Files", draw_cell, f as u64)
+    }
+    painter.surface(z, x, y + h - sh, w, sh, kit.tokc(c, style.TOK_SURFACE))
+    painter.surface(z, x, y + h - sh, w, kit.ln(c, 1), ds_catalog_tok.separator(c))
+    kit.draw_label(c, x + pad, y + h - sh, sh, kit.ln(c, 12), 400, ds_catalog_tok.muted(c), status_text(f), w - pad * 2.0)
+}
+
+fn paint(ud: u64, c: *mut render.Ctx, w: f64, h: f64, px: f64, py: f64) {
+    let f: *mut Files = ud as *mut Files
+    (*f).ctx = c as u64
+    painter.surface(render.ctx_painter(c), 0.0, 0.0, w, h, kit.tokc(c, style.TOK_BASE))
+    ds_navview.layout(&(*f).nav, c, 0.0, 0.0, w, h)
+    ds_navview.draw(&(*f).nav, c, px, py)
+    draw_content(f, c, ds_navview.content_x(&(*f).nav), ds_navview.content_y(&(*f).nav), ds_navview.content_w(&(*f).nav), ds_navview.content_h(&(*f).nav), px, py)
+    ds_navview.draw_overlay(&(*f).nav, c, px, py)
+}
+
+fn press_header(f: *mut Files, x: f64, y: f64) -> bool {
+    if (*f).hh <= 0.0 || y < (*f).hy || y >= (*f).hy + (*f).hh { return false }
+    if x >= (*f).sx { set_sort(f, ds_tpl_files_model.SORT_SIZE) } else if x >= (*f).mx { set_sort(f, ds_tpl_files_model.SORT_DATE) } else { set_sort(f, ds_tpl_files_model.SORT_NAME) }
+    return true
+}
+
+fn press_toolbar(f: *mut Files, x: f64, y: f64) -> bool {
+    let b: usize = ds_iconbtn.click((*f).btns, x, y)
+    if b == ID_BACK { go_back(f) } else if b == ID_FWD { go_forward(f) } else if b == ID_UP { go_up(f) } else if b == ID_VIEW { toggle_view(f) } else if b == ID_SORT {
+        set_sort(f, ((*f).key + 1 as u32) % 3 as u32)
+    } else { return false }
+    return true
+}
+
+fn press(ud: u64, x: f64, y: f64) {
+    let f: *mut Files = ud as *mut Files
+    let ev: u32 = ds_navview.press(&(*f).nav, x, y)
+    if ev == ds_navview.EV_SELECT {
+        let k: usize = ds_navview.selected(&(*f).nav)
+        (*f).focus = F_NAV
+        place_select(f, k)
+        return
+    }
+    if ev != ds_navview.EV_NONE || ds_navview.overlay_open(&(*f).nav) { return }
+    if press_toolbar(f, x, y) { return }
+    let seg: usize = ds_crumb.click((*f).crumb, x, y)
+    if seg != ds_crumb.NONE && seg < (*f).chain_n {
+        go(f, (*f).chain[seg], true)
+        return
+    }
+    if press_header(f, x, y) { return }
+    let i: usize = ds_vgrid.press(&(*f).grid, x, y)
+    (*f).focus = F_GRID
+    if i == ds_vgrid.NONE || i >= (*f).n {
+        if i == ds_vgrid.NONE { (*f).sel = NONE }
+        return
+    }
+    let now: i64 = ds_tpl_run.now_ms()
+    if i == (*f).last_i && now - (*f).last_ms < 500 as i64 {
+        (*f).last_i = NONE
+        open_item(f, i)
+        return
+    }
+    (*f).last_i = i
+    (*f).last_ms = now
+    select_item(f, i)
+}
+
+fn key(ud: u64, k: u32, mods: u32) -> bool {
+    let f: *mut Files = ud as *mut Files
+    if mods & editor.MOD_ALT != 0 as u32 {
+        if k == editor.KEY_LEFT { go_back(f) } else if k == editor.KEY_RIGHT { go_forward(f) } else if k == editor.KEY_UP { go_up(f) } else { return false }
+        return true
+    }
+    if k == editor.KEY_TAB {
+        if (*f).focus == F_NAV { (*f).focus = F_GRID } else { (*f).focus = F_NAV }
+        return true
+    }
+    if (*f).focus == F_NAV {
+        let ev: u32 = ds_navview.key(&(*f).nav, k, mods)
+        if ev == ds_navview.EV_SELECT {
+            place_select(f, ds_navview.selected(&(*f).nav))
+            return true
+        }
+        return ev != ds_navview.EV_NONE
+    }
+    if k == editor.KEY_BACKSPACE {
+        go_back(f)
+        return true
+    }
+    if k == editor.KEY_ENTER {
+        let s: usize = ds_vgrid.selected(&(*f).grid)
+        if s != ds_vgrid.NONE { open_item(f, s) }
+        return true
+    }
+    let r: bool = ds_vgrid.key(&(*f).grid, k, mods)
+    let s: usize = ds_vgrid.selected(&(*f).grid)
+    if s != ds_vgrid.NONE && s < (*f).n { (*f).sel = s }
+    return r
+}
+
+fn text(ud: u64, cp: u32, mods: u32) -> bool { return false }
+
+fn wheel(ud: u64, px: f64, py: f64, dx: f64, dy: f64) -> bool {
+    let f: *mut Files = ud as *mut Files
+    let c: *mut render.Ctx = (*f).ctx as *mut render.Ctx
+    ds_vgrid.scroll_by(&(*f).grid, dy * kit.ln(c, 48))
+    return true
+}
+
+fn pointer(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let f: *mut Files = ud as *mut Files
+    if kind == fuiwirt.HOOK_UP {
+        ds_vgrid.release(&(*f).grid)
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE { return ds_vgrid.drag(&(*f).grid, x, y) }
+    return false
+}
+
+fn files_run(start: u64, window_title: str, spec: ds_tpl_files_model.Spec) -> i32 {
+    let f: *mut Files = files_new(spec)
+    go(f, spec.root, true)
+    let p: i64 = ds_tpl_run.arg_num(start, "--place")
+    if p >= 0 as i64 { place_select(f, p as usize) }
+    let d: i64 = ds_tpl_run.arg_num(start, "--open")
+    if d >= 0 as i64 { open_item(f, d as usize) }
+    let s: i64 = ds_tpl_run.arg_num(start, "--select")
+    if s >= 0 as i64 { select_item(f, s as usize) }
+    let g: i64 = ds_tpl_run.arg_num(start, "--grid")
+    if g == 1 as i64 { toggle_view(f) }
+    let k: i64 = ds_tpl_run.arg_num(start, "--sort")
+    if k >= 0 as i64 { set_sort(f, k as u32) }
+    return screen.run_full(start, window_title, 1100, 700, f as u64, paint, press, key, text, wheel, pointer, ds_tpl_run.skin)
+}

@@ -9,7 +9,7 @@ trap 'rm -rf "$D"' EXIT
 . "$HERE/tpl_args.sh"
 export FIRNLIB=$ROOT/lib
 cd "$ROOT"
-for app in tpl_settings tpl_wizard; do
+for app in $(awk "{print \$7}" "$HERE/cases.txt" | sort -u); do
     "$FIRNC" --opt-level=dev -o "$D/$app" "examples/fui_apps/$app/main.fi" > "$D/$app.log" 2>&1 || { cat "$D/$app.log"; echo "FAIL build $app"; exit 1; }
 done
 bad=0
