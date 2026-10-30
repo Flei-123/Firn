@@ -67,3 +67,10 @@ Motion `M_*` (ms, easing): PRESS 50 linear, HOVER 83 linear, FOCUS 100 standard,
 ## Components
 
 (Append the public API of each component below, one line per function.)
+
+DS2c catalog components (immediate mode, colours via lib/fui/ds_catalog_tok.fi).
+
+- `ds_appcard`: `card_new`, `draw(k,c,x,y,w,h,icon,name,sub,meta,px,py)`, `preferred_h(c)`, `set_state(S_INSTALL|S_OPEN|S_UPDATE|S_INSTALLING|S_UNAVAILABLE)`, `set_progress(permille, -1 = unknown)`, `press`/`release`/`click` -> `ACT_*`, `key`/`text`, `set_focus`, `hit`, `button_rect`.
+- `ds_navview`: `nv_new`, `add`/`add_header`/`add_footer`, `set_badge`, `set_back`, `layout(v,c,x,y,w,h)` (expanded >= 1008 dp, compact >= 641, else minimal), `draw`, `draw_overlay`, `press`/`key` -> `EV_*`, `select`/`selected`, `content_x/y/w/h`, `mode`.
+- `ds_listdetail`: `ld_new`, `set_count`, `set_break`, `set_list_width`, `set_row`, `layout`, `begin_list`/`row_draw`/`finish_list`, `draw_chrome`, `press`/`key` -> `EV_*`, `open_detail`, `back`, `detail_x/y/w/h`, `stacked`.
+- `ds_vgrid`: `grid_new`, `set_count`, `set_cell(min_w_pt,h_pt,gap_pt)`, `set_pad`, `layout`, `first`/`end_index`, `cell_rect`, `index_at`, `begin`/`finish`, `move`, `press`, `drag`/`release`, `wheel`, `pan`/`fling`, `tick`, `key`, `select`, `scroll_to`.
