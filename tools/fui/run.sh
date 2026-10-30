@@ -845,6 +845,12 @@ build kitset
 "$W/kitset"
 build ds_catalog
 "$W/ds_catalog"
+build ds_iconbtn
+"$W/ds_iconbtn"
+build ds_crumb
+"$W/ds_crumb"
+build ds_settings
+"$W/ds_settings"
 build kitspec
 "$W/kitspec"
 build screenax
