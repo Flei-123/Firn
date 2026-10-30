@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_send.fi -- version neutral packet IO of the server: semantic id + value store -> wire, and named
+// field reads out of a received body. No packet id and no layout is written here; both come from the version tables.
+
+import std.rt
+import std.bytes
+import mc.mc_codec
+import mc.mc_encode
+import mc.mc_schema
+import mc.mc_version
+import mc.mc_sem
+import mc.server.sv_state
+
+export {
+    send_vals, send_kick, field_view, field_i64, field_f64, field_f32, field_bool, field_varint, field_text,
+    sem_is, json_text, push_json_escaped, push_str,
+}
+
+fn send_vals(srv: *mut sv_state.Server, s: *mut sv_state.Session, state: i32, sem: usize, vals: *mut rt.Buf) -> bool {
+    let id: i32 = (*srv).ver.sem[sem]
+    if id < 0 { return false }
+    let sch: u64 = (*srv).ver.schema_of(state, mc_version.DIR_S2C, id)
+    if sch == 0 { return false }
+    var body: bytes.Bytes = bytes.bytes_new()
+    var ok: bool = mc_encode.encode_buf(sch, vals, &body, 0 as *mut rt.Buf)
+    if ok {
+        let n: usize = mc_codec.wire_send_packet(&(*s).wire, id, &body) catch 0
+        ok = n > 0
+    }
+    bytes.bytes_free(&body)
+    return ok
+}
+
+fn push_json_escaped(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 34 as u8 || c == 92 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, c)
+        } else if c >= 32 as u8 {
+            rt.buf_push(b, c)
+        }
+        i = i + 1
+    }
+}
+
+fn push_str(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn json_text(out: *mut rt.Buf, p: u64, n: usize) {
+    push_str(out, "{\"text\":\"")
+    push_json_escaped(out, p, n)
+    push_str(out, "\"}")
+}
+
+fn send_kick(srv: *mut sv_state.Server, s: *mut sv_state.Session, text: str) {
+    var json: rt.Buf = rt.buf_new()
+    json_text(&json, text.p as u64, text.n)
+    var vals: rt.Buf = rt.buf_new()
+    mc_encode.vals_text(&vals, "reason", rt.buf_ptr(&json), rt.buf_len(&json))
+    if (*s).state == mc_version.ST_PLAY {
+        send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT, &vals)
+    } else if (*s).state == mc_version.ST_LOGIN {
+        send_vals(srv, s, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_S2C_DISCONNECT, &vals)
+    }
+    rt.buf_free(&vals)
+    rt.buf_free(&json)
+    (*s).closing = true
+}
+
+fn sem_is(srv: *mut sv_state.Server, id: i32, sem: usize) -> bool {
+    return id >= 0 && (*srv).ver.sem[sem] == id
+}
+
+fn field_view(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, v: *mut bytes.Bytes) -> bool {
+    let sch: u64 = (*srv).ver.schema_of(state, mc_version.DIR_C2S, id)
+    if sch == 0 { return false }
+    var off: usize = 0
+    var len: usize = 0
+    if !mc_schema.field_range(sch, name.p as u64, name.n, body, &off, &len) { return false }
+    *v = bytes.Bytes { data: bytes.bytes_ptr(body) + off as u64, cap: len, len: len, pos: 0, bad: false }
+    return true
+}
+
+fn field_i64(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, out: *mut i64) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) || v.len != 8 { return false }
+    *out = bytes.get_i64(&v) catch 0
+    return true
+}
+
+fn field_f64(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, out: *mut f64) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) || v.len != 8 { return false }
+    *out = bytes.get_f64(&v) catch 0.0
+    return true
+}
+
+fn field_f32(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, out: *mut f32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) || v.len != 4 { return false }
+    *out = bytes.get_f32(&v) catch 0.0f
+    return true
+}
+
+fn field_bool(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, out: *mut bool) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) || v.len != 1 { return false }
+    *out = rt.ld8(v.data, 0) != 0 as u8
+    return true
+}
+
+fn field_varint(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, out: *mut i32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) { return false }
+    *out = bytes.get_varint(&v) catch (0 - 1)
+    return true
+}
+
+fn field_text(srv: *mut sv_state.Server, state: i32, id: i32, name: str, body: *mut bytes.Bytes, p: *mut u64, n: *mut usize) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !field_view(srv, state, id, name, body, &v) { return false }
+    *p = v.data
+    *n = v.len
+    return true
+}
