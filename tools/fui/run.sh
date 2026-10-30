@@ -845,6 +845,10 @@ build kitset
 "$W/kitset"
 build ds_catalog
 "$W/ds_catalog"
+build ds_icons
+mkdir -p "$W/icons_png"
+"$W/ds_icons" "$W/icons_png"
+python3 -I tools/fui/refdiff.py compare "$W/icons_png" tools/fui/golden_icons --max 0.5
 build ds_iconbtn
 "$W/ds_iconbtn"
 build ds_crumb
