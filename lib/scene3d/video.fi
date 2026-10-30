@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.io
+import std.process
+import html.mem
+import paint.canvas
+import paint.png
+import scene3d.surface
+import scene3d.video_opts
+
+export {
+    VideoFrameFn, video_run, video_still, video_encoder_args,
+}
+
+type VideoFrameFn = fn(u64, u64, f64, *mut surface.Surface)
+
+fn dec_arg(c: *mut process.Command, v: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, v as u64)
+    process.add_arg(c, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+}
+
+fn size_arg(c: *mut process.Command, w: i32, h: i32) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, w as u64)
+    rt.buf_push(&b, 120 as u8)
+    rt.buf_push_dec_u64(&b, h as u64)
+    process.add_arg(c, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+}
+
+fn video_encoder_args(c: *mut process.Command, o: *mut video_opts.VideoOpts) {
+    process.add_arg(c, "-y")
+    process.add_arg(c, "-loglevel")
+    process.add_arg(c, "error")
+    process.add_arg(c, "-f")
+    process.add_arg(c, "rawvideo")
+    process.add_arg(c, "-pix_fmt")
+    process.add_arg(c, "rgba")
+    process.add_arg(c, "-s")
+    size_arg(c, (*o).width, (*o).height)
+    process.add_arg(c, "-r")
+    dec_arg(c, (*o).fps as i64)
+    process.add_arg(c, "-i")
+    process.add_arg(c, "-")
+    process.add_arg(c, "-vf")
+    process.add_arg(c, "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    process.add_arg(c, "-c:v")
+    process.add_arg(c, "libx264")
+    process.add_arg(c, "-pix_fmt")
+    process.add_arg(c, "yuv420p")
+    process.add_arg(c, "-crf")
+    dec_arg(c, (*o).crf as i64)
+    process.add_arg(c, "-movflags")
+    process.add_arg(c, "+faststart")
+    process.add_arg(c, (*o).out)
+}
+
+fn dead_child(failed: *mut bool) -> process.Child {
+    *failed = true
+    return process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 0, sig: 0, own: false }
+}
+
+fn video_run(o: *mut video_opts.VideoOpts, cb: VideoFrameFn, ctx: u64) -> i32 {
+    var lo: i64 = 0
+    var hi: i64 = 0
+    video_opts.video_frame_range(o, &lo, &hi)
+    var cmd: process.Command = process.command("/usr/bin/ffmpeg")
+    video_encoder_args(&cmd, o)
+    process.set_stdin(&cmd, process.STDIO_PIPE)
+    process.set_stdout(&cmd, process.STDIO_NULL)
+    var failed: bool = false
+    var ch: process.Child = process.spawn(&cmd) catch | e | dead_child(&failed)
+    process.command_free(&cmd)
+    if failed {
+        io.eprint_line("scene3d video: cannot start /usr/bin/ffmpeg")
+        return 3
+    }
+    var sf: surface.Surface = surface.surface_new((*o).width, (*o).height)
+    let bytes: usize = ((*o).width as usize) * ((*o).height as usize) * 4
+    var rc: i32 = 0
+    var i: i64 = lo
+    while i < hi {
+        let t: f64 = (i as f64) / ((*o).fps as f64)
+        cb(ctx, i as u64, t, &sf)
+        let w: i64 = process.write_in(&ch, sf.px, bytes)
+        if w != bytes as i64 {
+            io.eprint_line("scene3d video: ffmpeg closed its input")
+            rc = 4
+            break
+        }
+        i = i + 1
+    }
+    surface.surface_free(&sf)
+    process.close_in(&ch)
+    let code: i32 = process.wait(&ch)
+    process.close(&ch)
+    if rc == 0 && code != 0 {
+        io.eprint_line("scene3d video: ffmpeg failed")
+        rc = 5
+    }
+    return rc
+}
+
+fn to_argb(v: u32) -> u32 {
+    let r: u32 = v & 255 as u32
+    let g: u32 = (v >> 8 as u32) & 255 as u32
+    let b: u32 = (v >> 16 as u32) & 255 as u32
+    return 0xFF000000 as u32 | (r << 16 as u32) | (g << 8 as u32) | b
+}
+
+fn video_still(o: *mut video_opts.VideoOpts, cb: VideoFrameFn, ctx: u64) -> i32 {
+    var sf: surface.Surface = surface.surface_new((*o).width, (*o).height)
+    cb(ctx, 0 as u64, (*o).still, &sf)
+    var cv: canvas.Canvas = canvas.canvas_new()
+    canvas.canvas_init(&cv, (*o).width as usize, (*o).height as usize)
+    var y: i32 = 0
+    while y < (*o).height {
+        var x: i32 = 0
+        while x < (*o).width {
+            canvas.canvas_set_raw(&cv, x as usize, y as usize, to_argb(surface.surface_get(&sf, x, y)))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var out: mem.Buf = mem.buf_new()
+    var ok: bool = png.write_png(&cv, &out)
+    if ok {
+        var path: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&path, (*o).out.p as u64, (*o).out.n)
+        rt.buf_push(&path, 0 as u8)
+        ok = rt.write_file(rt.buf_data(&path) as u64, mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+        rt.buf_free(&path)
+    }
+    mem.buf_free(&out)
+    canvas.canvas_free(&cv)
+    surface.surface_free(&sf)
+    if !ok {
+        io.eprint_line("scene3d video: cannot write still")
+        return 6
+    }
+    return 0
+}

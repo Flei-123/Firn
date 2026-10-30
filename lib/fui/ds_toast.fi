@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.editor
+import fui.kit
+import fui.render
+import fui.screenax
+import fui.style
+import fui.widget
+import fui.ds_fbtok
+import fui.ds_fbtext
+
+export {
+    Feed, EV_NONE, EV_BODY, EV_ACTION, EV_CLOSE, EV_FOCUS, DUR_AUTO, GONE, SHOWING, CLOSING,
+    feed_new, default_ms, ms_of_us, push, dismiss, hover_at, tick, draw, frame, press, key, text,
+    focus_newest, blur, focused_id, last_id, count, state_of, live_text, live_rev, live_urgent,
+}
+
+const EV_NONE: u32 = 0
+const EV_BODY: u32 = 1
+const EV_ACTION: u32 = 2
+const EV_CLOSE: u32 = 3
+const EV_FOCUS: u32 = 4
+const DUR_AUTO: i64 = -1
+const GONE: u32 = 0
+const SHOWING: u32 = 1
+const CLOSING: u32 = 2
+
+struct Feed {
+    q: kit.Toasts,
+    last_ms: i64,
+    foc_id: u32,
+    foc_part: u32,
+    kbd: bool,
+    last: u32,
+    live: [u8; 256],
+    live_n: usize,
+    live_rev: u64,
+    urgent: bool,
+}
+
+fn feed_new() -> *mut Feed {
+    let f: *mut Feed = rt.heap_alloc(1 << 12) as *mut Feed
+    (*f).q = kit.toasts_new()
+    (*f).last_ms = 0
+    (*f).foc_id = 0 as u32
+    (*f).foc_part = 0 as u32
+    (*f).kbd = false
+    (*f).last = 0 as u32
+    var i: usize = 0
+    while i < 256 {
+        (*f).live[i] = 0 as u8
+        i = i + 1
+    }
+    (*f).live_n = 0
+    (*f).live_rev = 0
+    (*f).urgent = false
+    return f
+}
+
+fn default_ms(kind: u32) -> i64 {
+    if kind == ds_fbtok.ERROR { return 0 }
+    if kind == ds_fbtok.WARNING { return 7000 }
+    return 4000
+}
+
+fn ms_of_us(us: i64) -> i64 { return us / 1000 }
+
+fn live_text(f: *mut Feed) -> str { return str { p: ((&(*f).live[0]) as u64) as *mut u8, n: (*f).live_n } }
+fn live_rev(f: *mut Feed) -> u64 { return (*f).live_rev }
+fn live_urgent(f: *mut Feed) -> bool { return (*f).urgent }
+fn focused_id(f: *mut Feed) -> u32 { return (*f).foc_id }
+fn last_id(f: *mut Feed) -> u32 { return (*f).last }
+fn count(f: *mut Feed) -> usize { return kit.toasts_count(&(*f).q) }
+
+fn state_of(f: *mut Feed, id: u32) -> u32 {
+    var i: usize = 0
+    while i < kit.TOAST_MAX {
+        if (*f).q.t[i].alive && (*f).q.t[i].id == id {
+            if (*f).q.t[i].closing != 0 { return CLOSING }
+            return SHOWING
+        }
+        i = i + 1
+    }
+    return GONE
+}
+
+#[allow_escape]
+fn push(f: *mut Feed, kind: u32, title: str, msg: str, action: str, now_ms: i64, dur_ms: i64) -> u32 {
+    var buf: [u8; 256] = [0 as u8; 256]
+    let n: usize = ds_fbtext.join2(&buf, title, ": ", msg)
+    let body: str = str { p: ((&buf[0]) as u64) as *mut u8, n: n }
+    var dur: i64 = dur_ms
+    if dur_ms < 0 { dur = default_ms(kind) }
+    let id: u32 = kit.toast_push(&(*f).q, kind, body, action, now_ms, dur)
+    var ln: [u8; 256] = [0 as u8; 256]
+    let m: usize = ds_fbtext.join2(&ln, ds_fbtok.kind_name(kind), ": ", body)
+    var i: usize = 0
+    while i < m {
+        (*f).live[i] = ln[i]
+        i = i + 1
+    }
+    (*f).live_n = m
+    (*f).live_rev = (*f).live_rev + 1
+    (*f).urgent = kind == ds_fbtok.WARNING || kind == ds_fbtok.ERROR
+    return id
+}
+
+fn dismiss(f: *mut Feed, id: u32, now_ms: i64) {
+    kit.toast_dismiss(&(*f).q, id, now_ms)
+}
+
+fn hover_at(f: *mut Feed, c: *mut render.Ctx, win_w: f64, win_h: f64, px: f64, py: f64) -> u32 {
+    var id: u32 = 0 as u32
+    var part: u32 = 0 as u32
+    if kit.toasts_hit(c, &(*f).q, win_w, win_h, px, py, &id, &part) { return id }
+    return 0 as u32
+}
+
+fn extend(f: *mut Feed, id: u32, dt: i64) {
+    if id == 0 as u32 || dt <= 0 { return }
+    var i: usize = 0
+    while i < kit.TOAST_MAX {
+        if (*f).q.t[i].alive && (*f).q.t[i].id == id && (*f).q.t[i].closing == 0 && (*f).q.t[i].dur > 0 {
+            (*f).q.t[i].dur = (*f).q.t[i].dur + dt
+        }
+        i = i + 1
+    }
+}
+
+fn tick(f: *mut Feed, now_ms: i64, hover_id: u32) -> bool {
+    var dt: i64 = 0
+    if (*f).last_ms > 0 { dt = now_ms - (*f).last_ms }
+    extend(f, hover_id, dt)
+    if (*f).kbd { extend(f, (*f).foc_id, dt) }
+    (*f).last_ms = now_ms
+    let any: bool = kit.toasts_tick(&(*f).q, now_ms)
+    if (*f).foc_id != 0 as u32 && state_of(f, (*f).foc_id) != SHOWING { blur(f) }
+    return any
+}
+
+fn blur(f: *mut Feed) {
+    (*f).foc_id = 0 as u32
+    (*f).foc_part = 0 as u32
+    (*f).kbd = false
+}
+
+fn slot_of(f: *mut Feed, id: u32) -> usize {
+    var i: usize = 0
+    while i < kit.TOAST_MAX {
+        if (*f).q.t[i].alive && (*f).q.t[i].id == id { return i }
+        i = i + 1
+    }
+    return kit.NONE
+}
+
+fn parts_of(f: *mut Feed, c: *mut render.Ctx, win_w: f64, win_h: f64, id: u32, box: *mut [f64; 4], act: *mut [f64; 4], cls: *mut [f64; 4]) -> bool {
+    let s: usize = slot_of(f, id)
+    if s == kit.NONE { return false }
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    if !kit.toasts_geometry(c, &(*f).q, win_w, win_h, s, &x, &y, &w, &h) { return false }
+    var ax: f64 = 0.0
+    var aw: f64 = 0.0
+    var cx: f64 = 0.0
+    var cd: f64 = 0.0
+    kit.toast_parts(c, &(*f).q.t[s], x, y, w, h, &ax, &aw, &cx, &cd)
+    (*box)[0] = x
+    (*box)[1] = y
+    (*box)[2] = w
+    (*box)[3] = h
+    let bh: f64 = kit.ln(c, 30)
+    (*act)[0] = ax
+    (*act)[1] = y + (h - bh) / 2.0
+    (*act)[2] = aw
+    (*act)[3] = bh
+    (*cls)[0] = cx
+    (*cls)[1] = y + (h - cd) / 2.0
+    (*cls)[2] = cd
+    (*cls)[3] = cd
+    return true
+}
+
+fn ax_flags(f: *mut Feed, id: u32, part: u32) -> u32 {
+    if (*f).kbd && (*f).foc_id == id && (*f).foc_part == part { return screenax.F_FOCUS }
+    return 0 as u32
+}
+
+#[allow_escape]
+fn draw(f: *mut Feed, c: *mut render.Ctx, win_w: f64, win_h: f64, now_ms: i64) {
+    kit.toasts_draw(c, &(*f).q, win_w, win_h, now_ms)
+    var i: usize = 0
+    while i < kit.TOAST_MAX {
+        let t: *mut kit.Toast = &(*f).q.t[i]
+        i = i + 1
+        if !(*t).alive || (*t).closing != 0 { continue }
+        var bx: [f64; 4] = [0.0; 4]
+        var ac: [f64; 4] = [0.0; 4]
+        var cl: [f64; 4] = [0.0; 4]
+        if !parts_of(f, c, win_w, win_h, (*t).id, &bx, &ac, &cl) { continue }
+        var buf: [u8; 256] = [0 as u8; 256]
+        let n: usize = ds_fbtext.join2(&buf, ds_fbtok.kind_name((*t).kind), ": ", str { p: ((&(*t).text[0]) as u64) as *mut u8, n: (*t).n })
+        screenax.note(widget.KIND_BADGE, 0 as u32, str { p: ((&buf[0]) as u64) as *mut u8, n: n }, bx[0], bx[1], bx[2], bx[3], 0)
+        if (*t).an > 0 {
+            screenax.note(widget.KIND_BUTTON, ax_flags(f, (*t).id, kit.TOAST_PART_ACTION), str { p: ((&(*t).action[0]) as u64) as *mut u8, n: (*t).an }, ac[0], ac[1], ac[2], ac[3], 0)
+        }
+        screenax.note(widget.KIND_BUTTON, ax_flags(f, (*t).id, kit.TOAST_PART_CLOSE), "Dismiss", cl[0], cl[1], cl[2], cl[3], 0)
+        if (*f).kbd && (*f).foc_id == (*t).id {
+            if (*f).foc_part == kit.TOAST_PART_ACTION {
+                kit.focus_ring(c, ac[0], ac[1], ac[2], ac[3], kit.ln(c, 6), style.TOK_SURFACE_RAISED)
+            } else {
+                kit.focus_ring(c, cl[0], cl[1], cl[2], cl[3], kit.ln(c, 6), style.TOK_SURFACE_RAISED)
+            }
+        }
+    }
+}
+
+fn frame(f: *mut Feed, c: *mut render.Ctx, win_w: f64, win_h: f64, px: f64, py: f64, now_ms: i64) -> bool {
+    let any: bool = tick(f, now_ms, hover_at(f, c, win_w, win_h, px, py))
+    draw(f, c, win_w, win_h, now_ms)
+    return any
+}
+
+fn finish(f: *mut Feed, id: u32, ev: u32, now_ms: i64) -> u32 {
+    (*f).last = id
+    dismiss(f, id, now_ms)
+    blur(f)
+    return ev
+}
+
+fn press(f: *mut Feed, c: *mut render.Ctx, win_w: f64, win_h: f64, x: f64, y: f64, now_ms: i64) -> u32 {
+    blur(f)
+    var id: u32 = 0 as u32
+    var part: u32 = 0 as u32
+    if !kit.toasts_hit(c, &(*f).q, win_w, win_h, x, y, &id, &part) { return EV_NONE }
+    if part == kit.TOAST_PART_ACTION { return finish(f, id, EV_ACTION, now_ms) }
+    if part == kit.TOAST_PART_CLOSE { return finish(f, id, EV_CLOSE, now_ms) }
+    (*f).last = id
+    return EV_BODY
+}
+
+fn order(f: *mut Feed, ids: *mut [u32; 4]) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < kit.TOAST_MAX {
+        if (*f).q.t[i].alive && (*f).q.t[i].closing == 0 {
+            var at: usize = n
+            while at > 0 && is_older(f, (*f).q.t[i].id, (*ids)[at - 1]) == false {
+                (*ids)[at] = (*ids)[at - 1]
+                at = at - 1
+            }
+            (*ids)[at] = (*f).q.t[i].id
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn is_older(f: *mut Feed, a: u32, b: u32) -> bool {
+    let sa: usize = slot_of(f, a)
+    let sb: usize = slot_of(f, b)
+    if (*f).q.t[sa].born != (*f).q.t[sb].born { return (*f).q.t[sa].born < (*f).q.t[sb].born }
+    return a < b
+}
+
+fn has_action(f: *mut Feed, id: u32) -> bool {
+    let s: usize = slot_of(f, id)
+    return s != kit.NONE && (*f).q.t[s].an > 0
+}
+
+fn first_part(f: *mut Feed, id: u32) -> u32 {
+    if has_action(f, id) { return kit.TOAST_PART_ACTION }
+    return kit.TOAST_PART_CLOSE
+}
+
+fn focus_newest(f: *mut Feed) -> bool {
+    var ids: [u32; 4] = [0 as u32; 4]
+    let n: usize = order(f, &ids)
+    if n == 0 { return false }
+    (*f).foc_id = ids[n - 1]
+    (*f).foc_part = first_part(f, ids[n - 1])
+    (*f).kbd = true
+    return true
+}
+
+fn step(f: *mut Feed, back: bool) -> bool {
+    var ids: [u32; 4] = [0 as u32; 4]
+    let n: usize = order(f, &ids)
+    if n == 0 { return false }
+    var k: usize = 0
+    var found: bool = false
+    while k < n {
+        if ids[k] == (*f).foc_id { found = true }
+        k = k + 1
+    }
+    var seq: [u32; 8] = [0 as u32; 8]
+    var sp: [u32; 8] = [0 as u32; 8]
+    var m: usize = 0
+    k = 0
+    while k < n {
+        if has_action(f, ids[k]) {
+            seq[m] = ids[k]
+            sp[m] = kit.TOAST_PART_ACTION
+            m = m + 1
+        }
+        seq[m] = ids[k]
+        sp[m] = kit.TOAST_PART_CLOSE
+        m = m + 1
+        k = k + 1
+    }
+    var at: usize = 0
+    if !found {
+        at = 0
+        if back { at = m - 1 }
+    } else {
+        var cur: usize = 0
+        k = 0
+        while k < m {
+            if seq[k] == (*f).foc_id && sp[k] == (*f).foc_part { cur = k }
+            k = k + 1
+        }
+        if back {
+            if cur == 0 {
+                blur(f)
+                return false
+            }
+            at = cur - 1
+        } else {
+            if cur + 1 >= m {
+                blur(f)
+                return false
+            }
+            at = cur + 1
+        }
+    }
+    (*f).foc_id = seq[at]
+    (*f).foc_part = sp[at]
+    (*f).kbd = true
+    return true
+}
+
+fn activate(f: *mut Feed, now_ms: i64) -> u32 {
+    if (*f).foc_id == 0 as u32 { return EV_NONE }
+    let id: u32 = (*f).foc_id
+    if (*f).foc_part == kit.TOAST_PART_ACTION { return finish(f, id, EV_ACTION, now_ms) }
+    return finish(f, id, EV_CLOSE, now_ms)
+}
+
+fn key(f: *mut Feed, k: u32, mods: u32, now_ms: i64) -> u32 {
+    if k == editor.KEY_TAB {
+        if step(f, (mods & editor.MOD_SHIFT) != 0 as u32) { return EV_FOCUS }
+        return EV_NONE
+    }
+    if (*f).foc_id == 0 as u32 { return EV_NONE }
+    if k == editor.KEY_ENTER { return activate(f, now_ms) }
+    if k == editor.KEY_ESC {
+        (*f).foc_part = kit.TOAST_PART_CLOSE
+        return activate(f, now_ms)
+    }
+    if k == editor.KEY_RIGHT && (*f).foc_part == kit.TOAST_PART_ACTION {
+        (*f).foc_part = kit.TOAST_PART_CLOSE
+        return EV_FOCUS
+    }
+    if k == editor.KEY_LEFT && (*f).foc_part == kit.TOAST_PART_CLOSE && has_action(f, (*f).foc_id) {
+        (*f).foc_part = kit.TOAST_PART_ACTION
+        return EV_FOCUS
+    }
+    return EV_NONE
+}
+
+fn text(f: *mut Feed, cp: u32, now_ms: i64) -> u32 {
+    if cp == 32 as u32 && (*f).foc_id != 0 as u32 { return activate(f, now_ms) }
+    return EV_NONE
+}

@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import jobs.jobs
+import scene3d.vec3
+import scene3d.camera
+import scene3d.material
+import scene3d.light
+import scene3d.scene
+import scene3d.surface
+import scene3d.render_types
+import scene3d.render_setup
+import scene3d.render_raster
+import scene3d.render_resolve
+
+export {
+    Renderer, renderer_new, renderer_free, render,
+}
+
+type Renderer = render_types.Renderer
+
+fn blk0() -> render_types.Block {
+    return render_types.Block { p: 0 as u64, cap: 0 }
+}
+
+fn renderer_new(w: i32, h: i32, ss: i32, threads: i32) -> Renderer {
+    var s: i32 = ss
+    if s < 1 { s = 1 }
+    if s > 4 { s = 4 }
+    let sw: i32 = w * s
+    let sh: i32 = h * s
+    let n: usize = (sw as usize) * (sh as usize)
+    var r: Renderer = Renderer {
+        w: w, h: h, ss: s, threads: threads, sw: sw, sh: sh,
+        band_h: render_types.BAND_OUT_ROWS * s, nbands: (h + render_types.BAND_OUT_ROWS - 1) / render_types.BAND_OUT_ROWS,
+        depth: rt.heap_alloc(n * 4), tid: rt.heap_alloc(n * 4), color: rt.heap_alloc(n * 12),
+        lut_srgb: 0 as u64, lut_tex: 0 as u64,
+        lights_blk: rt.heap_alloc((render_types.MAX_LIGHTS as usize) * render_types.LIGHT_STRIDE * 8), nlights: 0,
+        pool: jobs.Jobs { blk: 0 as u64 }, use_pool: false,
+        tris: vec.vec_new[render_types.Tri](), order: vec.vec_new[render_types.SortItem](),
+        vbuf: blk0(), tmpv: blk0(), cnt: blk0(), bs_op: blk0(), bi_op: blk0(), bs_tr: blk0(), bi_tr: blk0(),
+        cam_x: 0.0, cam_y: 0.0, cam_z: 0.0, near: 0.1, far: 100.0,
+        hemi_sky: vec3.v3_zero(), hemi_ground: vec3.v3_zero(), ambient: vec3.v3_zero(),
+        bg_top: vec3.v3_zero(), bg_bottom: vec3.v3_zero(),
+        fog_on: false, fog_color: vec3.v3_zero(), fog_near: 0.0, fog_far: 1.0,
+        def_mat: material.mat_blank(), n_opaque: 0, n_transp: 0, sc: 0 as u64, out_px: 0 as u64,
+    }
+    render_resolve.build_luts(&r)
+    if threads > 0 {
+        r.pool = jobs.create(threads as u64)
+        r.use_pool = true
+    }
+    return r
+}
+
+fn renderer_free(r: *mut Renderer) {
+    if (*r).use_pool {
+        jobs.destroy(&(*r).pool)
+        (*r).use_pool = false
+    }
+    let n: usize = ((*r).sw as usize) * ((*r).sh as usize)
+    if (*r).depth != 0 as u64 { rt.heap_free((*r).depth, n * 4) }
+    if (*r).tid != 0 as u64 { rt.heap_free((*r).tid, n * 4) }
+    if (*r).color != 0 as u64 { rt.heap_free((*r).color, n * 12) }
+    if (*r).lights_blk != 0 as u64 { rt.heap_free((*r).lights_blk, (render_types.MAX_LIGHTS as usize) * render_types.LIGHT_STRIDE * 8) }
+    (*r).depth = 0 as u64
+    (*r).tid = 0 as u64
+    (*r).color = 0 as u64
+    (*r).lights_blk = 0 as u64
+    render_resolve.free_luts(r)
+    vec.vec_free[render_types.Tri](&(*r).tris)
+    vec.vec_free[render_types.SortItem](&(*r).order)
+    render_types.blk_free(&(*r).vbuf)
+    render_types.blk_free(&(*r).tmpv)
+    render_types.blk_free(&(*r).cnt)
+    render_types.blk_free(&(*r).bs_op)
+    render_types.blk_free(&(*r).bi_op)
+    render_types.blk_free(&(*r).bs_tr)
+    render_types.blk_free(&(*r).bi_tr)
+}
+
+fn load_lights(r: *mut Renderer, sc: *mut scene.Scene) {
+    var n: i32 = vec.vec_len[light.Light](&(*sc).lights) as i32
+    if n > render_types.MAX_LIGHTS { n = render_types.MAX_LIGHTS }
+    var i: i32 = 0
+    while i < n {
+        let l: *mut light.Light = vec.vec_elem_ptr[light.Light](&(*sc).lights, i as usize)
+        let o: usize = (i as usize) * render_types.LIGHT_STRIDE
+        var kind: f64 = 0.0
+        if (*l).kind == light.LIGHT_POINT { kind = 1.0 }
+        render_types.stf((*r).lights_blk, o, kind)
+        render_types.stf((*r).lights_blk, o + 1, (*l).vec.x)
+        render_types.stf((*r).lights_blk, o + 2, (*l).vec.y)
+        render_types.stf((*r).lights_blk, o + 3, (*l).vec.z)
+        render_types.stf((*r).lights_blk, o + 4, (*l).color.x * (*l).intensity)
+        render_types.stf((*r).lights_blk, o + 5, (*l).color.y * (*l).intensity)
+        render_types.stf((*r).lights_blk, o + 6, (*l).color.z * (*l).intensity)
+        render_types.stf((*r).lights_blk, o + 7, (*l).range)
+        i = i + 1
+    }
+    (*r).nlights = n
+}
+
+#[allow_escape]
+fn render(r: *mut Renderer, sc: *mut scene.Scene, cam: *mut camera.Camera, out: *mut surface.Surface) {
+    if (*out).px == 0 as u64 || (*out).w != (*r).w || (*out).h != (*r).h { return }
+    scene.scene_update(sc)
+    (*r).hemi_sky = (*sc).hemi_sky
+    (*r).hemi_ground = (*sc).hemi_ground
+    (*r).ambient = (*sc).ambient
+    (*r).bg_top = (*sc).bg_top
+    (*r).bg_bottom = (*sc).bg_bottom
+    (*r).fog_on = (*sc).fog.on
+    (*r).fog_color = (*sc).fog.color
+    (*r).fog_near = (*sc).fog.near
+    (*r).fog_far = (*sc).fog.far
+    (*r).out_px = (*out).px
+    (*r).sc = sc as u64
+    load_lights(r, sc)
+    render_setup.setup_frame(r, sc, cam)
+    if (*r).use_pool {
+        jobs.parallel_for(&(*r).pool, 0 as u64, (*r).nbands as u64, 1 as u64, render_raster.band_task, r as u64)
+    } else {
+        render_raster.band_task(r as u64, 0 as u64, (*r).nbands as u64)
+    }
+}

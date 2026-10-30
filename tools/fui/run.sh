@@ -845,12 +845,23 @@ build kitset
 "$W/kitset"
 build ds_catalog
 "$W/ds_catalog"
+build ds_icons
+mkdir -p "$W/icons_png"
+"$W/ds_icons" "$W/icons_png"
+python3 -I tools/fui/refdiff.py compare "$W/icons_png" tools/fui/golden_icons --max 0.5
+FIRNC="$FIRNC" sh tools/fui/ds_catalog_golden.sh
 build ds_iconbtn
 "$W/ds_iconbtn"
 build ds_crumb
 "$W/ds_crumb"
 build ds_settings
 "$W/ds_settings"
+build ds_feedback
+"$W/ds_feedback"
+build ds_tpl
+"$W/ds_tpl"
+echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
+FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
 build kitspec
 "$W/kitspec"
 build screenax

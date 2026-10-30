@@ -17,7 +17,8 @@ ICONS = [
     ("document", "Document"), ("document_text", "Document Text"), ("document_pdf", "Document PDF"),
     ("image", "Image"), ("video", "Video"), ("music", "Music Note 1"), ("code", "Code"),
     ("settings", "Settings"), ("hand", "Hand Right"), ("rocket", "Rocket"), ("sparkle", "Sparkle"),
-    ("wifi_1", "Wifi 1"), ("wifi_2", "Wifi 2"), ("wifi_3", "Wifi 3"), ("wifi_4", "Wifi 4"), ("wifi_off", "Wifi Off"),
+    ("wifi_1", "WiFi 1"), ("wifi_2", "WiFi 2"), ("wifi_3", "WiFi 3"), ("wifi_4", "WiFi 4"), ("wifi_off", "WiFi Off"),
+    ("wifi_warning", "WiFi Warning"), ("wifi_lock", "WiFi Lock"),
     ("bluetooth", "Bluetooth"), ("battery_0", "Battery 0"), ("battery_3", "Battery 3"), ("battery_6", "Battery 6"),
     ("battery_10", "Battery 10"), ("battery_charge", "Battery Charge"),
     ("volume_0", "Speaker 0"), ("volume_1", "Speaker 1"), ("volume_2", "Speaker 2"), ("volume_mute", "Speaker Mute"),
@@ -37,6 +38,10 @@ ICONS = [
     ("stop", "Stop"), ("mic", "Mic"), ("camera", "Camera"), ("print", "Print"), ("accessibility", "Accessibility"),
     ("language", "Local Language"), ("personalize", "Paint Brush"), ("shield", "Shield"), ("key", "Key"),
     ("notification", "Alert"), ("window", "Window"), ("book", "Book"), ("games", "Games"),
+    ("maximize", "Maximize"), ("restore", "Square Multiple"), ("terminal", "Window Console"), ("chat", "Chat"),
+    ("undo", "Arrow Undo"), ("redo", "Arrow Redo"), ("refresh", "Arrow Clockwise"), ("wallpaper", "Wallpaper"),
+    ("color", "Color"), ("eye_off", "Eye Off"), ("font", "Text Font"), ("emoji", "Emoji"), ("play_circle", "Play Circle"),
+    ("cursor", "Cursor Click"), ("apps_list", "Apps List"),
 ]
 
 TOKEN = re.compile(r"([MmLlHhVvCcSsQqTtAaZz])|(-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
