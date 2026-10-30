@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: MPL-2.0
+// expect_exit: 0
+import jobs.jobs
+import scene3d.render
+import scene3d.scene
+import scene3d.camera
+import scene3d.surface
+import scene3d.vec3
+import scene3d.material
+import scene3d.mesh
+import scene3d.geom
+import scene3d.tonemap
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn add_quad(m: *mut mesh.Mesh, p0: vec3.V3, p1: vec3.V3, p2: vec3.V3, p3: vec3.V3, n: vec3.V3) {
+    let a: u32 = mesh.mesh_add_vertex(m, p0, n, 0.0, 0.0)
+    let b: u32 = mesh.mesh_add_vertex(m, p1, n, 1.0, 0.0)
+    let c: u32 = mesh.mesh_add_vertex(m, p2, n, 1.0, 1.0)
+    let d: u32 = mesh.mesh_add_vertex(m, p3, n, 0.0, 1.0)
+    mesh.mesh_add_quad(m, a, b, c, d)
+}
+
+fn front_quad(m: *mut mesh.Mesh, z: f64, s: f64) {
+    add_quad(m, vec3.v3(0.0 - s, 0.0 - s, z), vec3.v3(s, 0.0 - s, z), vec3.v3(s, s, z), vec3.v3(0.0 - s, s, z), vec3.v3(0.0, 0.0, 1.0))
+}
+
+fn chan(p: u32, c: i32) -> i32 {
+    return ((p >> ((c * 8) as u32)) & 255 as u32) as i32
+}
+
+fn lum(p: u32) -> i32 {
+    return chan(p, 0) + chan(p, 1) + chan(p, 2)
+}
+
+fn near(a: i32, b: i32, tol: i32) -> bool {
+    return a - b <= tol && b - a <= tol
+}
+
+fn srgb8(lin: f64) -> i32 {
+    return (vec3.linear_to_srgb(vec3.clamp01(lin)) * 255.0 + 0.5) as i32
+}
+
+fn aces_ref(x: f64) -> f64 {
+    var v: f64 = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+    if v > 1.0 { v = 1.0 }
+    return v
+}
+
+fn same(a: *mut surface.Surface, b: *mut surface.Surface) -> bool {
+    var i: i32 = 0
+    while i < (*a).w * (*a).h {
+        if surface.surface_get(a, i % (*a).w, i / (*a).w) != surface.surface_get(b, i % (*a).w, i / (*a).w) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn shot(sc: *mut scene.Scene, cam: *mut camera.Camera, threads: i32) -> surface.Surface {
+    var rd: render.Renderer = render.renderer_new(64, 48, 2, threads)
+    var sf: surface.Surface = surface.surface_new(64, 48)
+    render.render(&rd, sc, cam, &sf)
+    render.renderer_free(&rd)
+    return sf
+}
+
+fn center_of(sc: *mut scene.Scene, cam: *mut camera.Camera) -> u32 {
+    var sf: surface.Surface = shot(sc, cam, 0)
+    let p: u32 = surface.surface_get(&sf, 32, 24)
+    surface.surface_free(&sf)
+    return p
+}
+
+fn flat_scene(c: f64, mode: i32, ev: f64) -> scene.Scene {
+    var sc: scene.Scene = scene.scene_new()
+    var m: mesh.Mesh = mesh.mesh_new()
+    front_quad(&m, 0.0, 1.0)
+    let mid: i32 = scene.scene_add_mesh(&sc, m)
+    let mt: i32 = scene.scene_add_material(&sc, material.mat_unlit(vec3.v3(c, c, c)))
+    scene.scene_add_mesh_node(&sc, 0 - 1, mid, mt)
+    scene.scene_set_tonemap(&sc, mode)
+    scene.scene_set_exposure_ev(&sc, ev)
+    return sc
+}
+
+fn tone_checks(cam: *mut camera.Camera) -> i32 {
+    var sc: scene.Scene = flat_scene(0.18, tonemap.TONEMAP_NONE, 0.0)
+    var code: i32 = 0
+    if near(chan(center_of(&sc, cam), 1), srgb8(0.18), 1) == false { code = 10 }
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = flat_scene(0.0, tonemap.TONEMAP_ACES, 0.0)
+    if lum(center_of(&sc, cam)) != 0 { code = 11 }
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = flat_scene(0.18, tonemap.TONEMAP_ACES, 0.0)
+    if near(chan(center_of(&sc, cam), 1), srgb8(aces_ref(0.18)), 1) == false { code = 12 }
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = flat_scene(0.18, tonemap.TONEMAP_ACES, 1.0)
+    if near(chan(center_of(&sc, cam), 1), srgb8(aces_ref(0.36)), 1) == false { code = 13 }
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = flat_scene(4.0, tonemap.TONEMAP_ACES, 0.0)
+    let hot: i32 = chan(center_of(&sc, cam), 1)
+    if hot >= 255 || hot < 235 { code = 14 }
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = flat_scene(4.0, tonemap.TONEMAP_NONE, 0.0)
+    if chan(center_of(&sc, cam), 1) != 255 { code = 15 }
+    scene.scene_free(&sc)
+    return code
+}
+
+fn monotonic(cam: *mut camera.Camera, mode: i32) -> bool {
+    var prev: i32 = 0 - 1
+    var k: i32 = 0
+    while k < 12 {
+        var sc: scene.Scene = flat_scene(0.02 * ((1 << k) as f64) / 4.0, mode, 0.0)
+        let v: i32 = chan(center_of(&sc, cam), 1)
+        scene.scene_free(&sc)
+        if v < prev { return false }
+        prev = v
+        k = k + 1
+    }
+    return true
+}
+
+fn lit_scene() -> scene.Scene {
+    var sc: scene.Scene = scene.scene_new()
+    let ball: i32 = scene.scene_add_mesh(&sc, geom.geom_sphere(1.0, 24, 16))
+    let gold: i32 = scene.scene_add_material(&sc, material.mat_standard(vec3.v3(1.0, 0.72, 0.30), 1.0, 0.15))
+    let glass: i32 = scene.scene_add_material(&sc, material.mat_glass(vec3.v3(0.9, 0.95, 1.0), 0.1))
+    let a: i32 = scene.scene_add_mesh_node(&sc, 0 - 1, ball, gold)
+    let b: i32 = scene.scene_add_mesh_node(&sc, 0 - 1, ball, glass)
+    scene.node_set_pos(scene.scene_node(&sc, a), vec3.v3(0.0 - 0.9, 0.0, 0.0))
+    scene.node_set_pos(scene.scene_node(&sc, b), vec3.v3(0.9, 0.0, 0.5))
+    sc.hemi_sky = vec3.v3(0.8, 0.85, 1.0)
+    sc.hemi_ground = vec3.v3(0.1, 0.08, 0.06)
+    sc.fog.on = true
+    sc.fog.near = 3.0
+    sc.fog.far = 14.0
+    scene.scene_set_tonemap(&sc, tonemap.TONEMAP_FILMIC)
+    scene.scene_set_exposure_ev(&sc, 0.5)
+    return sc
+}
+
+fn threads_equal(cam: *mut camera.Camera) -> bool {
+    var sc: scene.Scene = lit_scene()
+    var s0: surface.Surface = shot(&sc, cam, 0)
+    var ok: bool = true
+    var t: i32 = 1
+    while t < 8 {
+        var st: surface.Surface = shot(&sc, cam, t)
+        if same(&s0, &st) == false { ok = false }
+        surface.surface_free(&st)
+        t = t + 2
+        if t == 5 { t = 7 }
+    }
+    surface.surface_free(&s0)
+    scene.scene_free(&sc)
+    return ok
+}
+
+fn glass_check(cam: *mut camera.Camera) -> i32 {
+    var sc: scene.Scene = scene.scene_new()
+    let ball: i32 = scene.scene_add_mesh(&sc, geom.geom_sphere(1.0, 32, 24))
+    let glass: i32 = scene.scene_add_material(&sc, material.mat_glass(vec3.v3(1.0, 1.0, 1.0), 0.1))
+    scene.scene_add_mesh_node(&sc, 0 - 1, ball, glass)
+    sc.hemi_sky = vec3.v3(0.6, 0.6, 0.6)
+    sc.hemi_ground = vec3.v3(0.6, 0.6, 0.6)
+    sc.ambient = vec3.v3_zero()
+    sc.bg_top = vec3.v3_zero()
+    sc.bg_bottom = vec3.v3_zero()
+    var sf: surface.Surface = shot(&sc, cam, 0)
+    let mid: i32 = lum(surface.surface_get(&sf, 32, 24))
+    var edge: i32 = 0
+    var x: i32 = 32
+    while x < 52 {
+        let l: i32 = lum(surface.surface_get(&sf, x, 24))
+        if l > edge { edge = l }
+        x = x + 1
+    }
+    surface.surface_free(&sf)
+    scene.scene_free(&sc)
+    if edge < mid + 40 { return 30 }
+    return 0
+}
+
+fn metal_check(cam: *mut camera.Camera) -> i32 {
+    var sc: scene.Scene = scene.scene_new()
+    let ball: i32 = scene.scene_add_mesh(&sc, geom.geom_sphere(1.0, 32, 24))
+    let gold: i32 = scene.scene_add_material(&sc, material.mat_standard(vec3.v3(1.0, 0.72, 0.30), 1.0, 0.1))
+    scene.scene_add_mesh_node(&sc, 0 - 1, ball, gold)
+    sc.hemi_sky = vec3.v3(0.9, 0.9, 0.9)
+    sc.hemi_ground = vec3.v3(0.05, 0.05, 0.05)
+    sc.ambient = vec3.v3_zero()
+    var sf: surface.Surface = shot(&sc, cam, 0)
+    let top: u32 = surface.surface_get(&sf, 32, 17)
+    let bot: u32 = surface.surface_get(&sf, 32, 31)
+    surface.surface_free(&sf)
+    scene.scene_free(&sc)
+    if chan(top, 0) < chan(bot, 0) + 60 { return 40 }
+    if chan(bot, 0) < 8 { return 41 }
+    return 0
+}
+
+fn tex_scene(repeat: bool) -> scene.Scene {
+    var sc: scene.Scene = scene.scene_new()
+    var m: mesh.Mesh = mesh.mesh_new()
+    front_quad(&m, 0.0, 3.0)
+    let mid: i32 = scene.scene_add_mesh(&sc, m)
+    let tid: i32 = scene.scene_add_texture(&sc, 4, 4)
+    let t: *mut surface.Surface = scene.scene_texture(&sc, tid)
+    surface.surface_clear(t, 0xFFFF0000 as u32)
+    surface.surface_set(t, 0, 0, 0xFF0000FF as u32)
+    var mt: material.Material = material.mat_textured(tid)
+    if repeat { mt = material.mat_tiled(mt, 2.0) }
+    let mi: i32 = scene.scene_add_material(&sc, mt)
+    scene.scene_add_mesh_node(&sc, 0 - 1, mid, mi)
+    sc.bg_top = vec3.v3_zero()
+    sc.bg_bottom = vec3.v3_zero()
+    return sc
+}
+
+fn tex_check(cam: *mut camera.Camera) -> i32 {
+    var sc: scene.Scene = tex_scene(false)
+    var sf: surface.Surface = shot(&sc, cam, 0)
+    var code: i32 = 0
+    let tl: u32 = surface.surface_get(&sf, 15, 7)
+    if chan(tl, 0) < 200 || chan(tl, 2) > 60 { code = 50 }
+    let tr: u32 = surface.surface_get(&sf, 48, 7)
+    if chan(tr, 2) < 200 || chan(tr, 0) > 60 { code = 51 }
+    let bl: u32 = surface.surface_get(&sf, 15, 40)
+    if chan(bl, 2) < 200 || chan(bl, 0) > 60 { code = 52 }
+    surface.surface_free(&sf)
+    scene.scene_free(&sc)
+    if code != 0 { return code }
+    sc = tex_scene(true)
+    sf = shot(&sc, cam, 0)
+    let rep: u32 = surface.surface_get(&sf, 34, 7)
+    if chan(rep, 0) < chan(rep, 2) + 80 { code = 53 }
+    let nonrep: u32 = surface.surface_get(&sf, 25, 7)
+    if chan(nonrep, 2) < chan(nonrep, 0) + 80 { code = 54 }
+    surface.surface_free(&sf)
+    scene.scene_free(&sc)
+    return code
+}
+
+fn fog_check(cam: *mut camera.Camera) -> i32 {
+    var sc: scene.Scene = scene.scene_new()
+    var m: mesh.Mesh = mesh.mesh_new()
+    front_quad(&m, 0.0 - 30.0, 40.0)
+    let mid: i32 = scene.scene_add_mesh(&sc, m)
+    let mt: i32 = scene.scene_add_material(&sc, material.mat_unlit(vec3.v3(0.0, 1.0, 0.0)))
+    let n: i32 = scene.scene_add_mesh_node(&sc, 0 - 1, mid, mt)
+    sc.fog.on = true
+    sc.fog.color = vec3.v3(0.5, 0.25, 0.1)
+    sc.fog.near = 1.0
+    sc.fog.far = 20.0
+    var code: i32 = 0
+    var c2: camera.Camera = *cam
+    c2.target = vec3.v3(0.0, 0.0, 0.0 - 30.0)
+    let p: u32 = center_of(&sc, &c2)
+    if near(chan(p, 0), srgb8(0.5), 2) == false || near(chan(p, 1), srgb8(0.25), 2) == false || near(chan(p, 2), srgb8(0.1), 2) == false { code = 60 }
+    scene.node_set_visible(scene.scene_node(&sc, n), false)
+    let q: u32 = center_of(&sc, &c2)
+    if near(chan(q, 0), srgb8(0.5), 2) == false || near(chan(q, 1), srgb8(0.25), 2) == false { code = 61 }
+    scene.scene_free(&sc)
+    return code
+}
+
+fn main(start: u64) -> i32 {
+    var cam: camera.Camera = camera.cam_new(64, 48)
+    var code: i32 = tone_checks(&cam)
+    if code == 0 && monotonic(&cam, tonemap.TONEMAP_ACES) == false { code = 20 }
+    if code == 0 && monotonic(&cam, tonemap.TONEMAP_REINHARD) == false { code = 21 }
+    if code == 0 && monotonic(&cam, tonemap.TONEMAP_FILMIC) == false { code = 22 }
+    if code == 0 && threads_equal(&cam) == false { code = 23 }
+    if code == 0 { code = glass_check(&cam) }
+    if code == 0 { code = metal_check(&cam) }
+    if code == 0 { code = tex_check(&cam) }
+    if code == 0 { code = fog_check(&cam) }
+    return code
+}

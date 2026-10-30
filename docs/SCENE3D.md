@@ -52,3 +52,15 @@ Opaque casters (opacity*eff_opacity >= 0.999) write min depth. Translucent caste
 Lookup (render_shade.shade_sample, one line in the lights loop): factor 0..1 scales the light's diffuse and specular, never hemisphere/ambient. Receiver is moved along its normal by 1.5*texel*sin(theta), compared with bias = shadow_bias + texel*tan(theta)*(soft+0.5); PCF = box filter of half-width `soft` texels (clamped 0.5..6) with exact area weights per texel (smooth, no banding); outside the map = lit.
 Limits: the map covers the whole scene AABB (a huge ground plane lowers resolution: raise shadow_size or shrink the plane); grazing light shows texel stair-steps at long shadow ends (raise shadow_size/soft); no shadows from point lights; shadows from transparent receivers' own layers are approximate.
 Test: tests/6304_scene3d_shadow.fi (96x64, ss=1).
+
+## TONE MAPPING AND MATERIALS
+
+- **Pipeline**: linear scene color (f32) * `Scene.exposure` -> tone map -> average SSAA samples -> sRGB LUT. Tone mapping runs per SSAA sample before averaging (no aliased HDR highlights); the result is per-pixel and bit-identical for any thread count. Overlay is drawn afterwards in sRGB and is untouched.
+- **Modes** (`scene.scene_set_tonemap`, module `tonemap`): `TONEMAP_NONE` (default, identical to the old output), `TONEMAP_REINHARD` (x/(1+x)), `TONEMAP_ACES` (Narkowicz fit), `TONEMAP_FILMIC` (Hable, bias 2, white 11.2).
+- **Exposure**: `Scene.exposure` (linear factor, default 1.0), `scene.scene_set_exposure_ev(&sc, ev)` sets 2^ev.
+- **Glass** (`fresnel.glass_alpha`): opacity rises toward the rim by Schlick Fresnel plus a cubic edge term scaled by `Material.rim`; the center stays clear. Reflections are additive and not scaled by opacity.
+- **Metal / env** (`envmap`): reflection of the hemisphere with a soft horizon (width grows with roughness), roughness blends toward the hemisphere mean, F0 = base color for metal, rough Schlick, no black without lights.
+- **Textures** (`tex.sample`): texel-center bilinear filtering; `material.mat_tiled(m, uv_scale)` sets `tex_repeat` + `uv_scale` (repeat instead of clamp).
+- **Fog**: background blends toward the fog color at the horizon (`fogbg`, derived from the camera basis), so far geometry and sky meet without a seam. Only active with `fog.on`.
+- **New fields**: Scene `exposure`, `tonemap`; Renderer `exposure`, `tonemap`, `hz_c/hz_x/hz_y` (after `fog_far`); Material `tex_repeat`, `uv_scale` (after `spec`).
+- **Showcase**: `tools/scene3d/showcase.fi --still N` (0 none, 1 ACES, 2 none+fog, 3 ACES+fog), test `tests/6305_scene3d_look.fi`.
