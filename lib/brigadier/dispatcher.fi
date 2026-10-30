@@ -1,0 +1,501 @@
+// SPDX-License-Identifier: MIT
+// lib/brigadier/dispatcher.fi -- brigadier.dispatcher: CommandDispatcher (parse, execute with redirect/fork chains, usage, completion suggestions).
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.exc as ex
+import brigadier.reader as rd
+import brigadier.argtype as at
+import brigadier.node as nn
+import brigadier.context as cn
+import brigadier.suggest as sg
+
+export { Hooks, Dispatcher, Parsed, ErrEntry, SmartEntry, dispatcher_new, parse, parse_reader, execute, execute_input, all_usage, smart_usage,
+    completion_suggestions, completion_suggestions_at, can_use }
+
+struct Hooks {
+    user: u64,
+    requirement: fn(u64, i64, i32) -> bool,
+    command: fn(u64, u64, *mut ex.Exc) -> i32,
+    modifier: fn(u64, u64, i32, *mut m.Arr[i64], *mut ex.Exc) -> bool,
+    sugg: fn(u64, u64, i32, u64),
+    consumer: fn(u64, u64, bool, i32),
+    types: at.TypeHooks,
+}
+
+struct Dispatcher {
+    a: *mut m.Arena,
+    root: u64,
+    hooks: Hooks,
+}
+
+struct ErrEntry {
+    node: u64,
+    exc: ex.Exc,
+}
+
+struct Parsed {
+    ctx: u64,
+    reader: rd.Reader,
+    errs: m.Arr[ErrEntry],
+}
+
+struct SmartEntry {
+    node: u64,
+    text: tx.U16,
+}
+
+fn dispatcher_new(a: *mut m.Arena, hooks: Hooks) -> Dispatcher {
+    return Dispatcher { a: a, root: nn.node_root(a), hooks: hooks }
+}
+
+fn can_use(d: *mut Dispatcher, node: u64, source: i64) -> bool {
+    let req: i32 = (*nn.nd(node)).req
+    if req == 0 {
+        return true
+    }
+    let f: fn(u64, i64, i32) -> bool = (*d).hooks.requirement
+    return f((*d).hooks.user, source, req)
+}
+
+fn parse(d: *mut Dispatcher, input: tx.U16, source: i64) -> Parsed {
+    var r: rd.Reader = rd.reader_new((*d).a, input)
+    return parse_reader(d, &r, source)
+}
+
+fn parse_reader(d: *mut Dispatcher, r: *mut rd.Reader, source: i64) -> Parsed {
+    let ctx: u64 = cn.ctx_new((*d).a, source, (*d).root, (*r).cursor)
+    return parse_nodes(d, (*d).root, r, ctx)
+}
+
+fn cmp_parsed(x: *mut Parsed, y: *mut Parsed) -> i32 {
+    let xr: bool = rd.can_read(&(*x).reader)
+    let yr: bool = rd.can_read(&(*y).reader)
+    if !xr && yr {
+        return -1
+    }
+    if xr && !yr {
+        return 1
+    }
+    let xe: bool = m.arr_len[ErrEntry](&(*x).errs) == 0
+    let ye: bool = m.arr_len[ErrEntry](&(*y).errs) == 0
+    if xe && !ye {
+        return -1
+    }
+    if !xe && ye {
+        return 1
+    }
+    return 0
+}
+
+fn parse_nodes(d: *mut Dispatcher, node: u64, original: *mut rd.Reader, so_far: u64) -> Parsed {
+    let a: *mut m.Arena = (*d).a
+    let source: i64 = (*cn.cx(so_far)).source
+    var errs: m.Arr[ErrEntry] = m.arr_new[ErrEntry]()
+    var potentials: m.Arr[Parsed] = m.arr_new[Parsed]()
+    let cursor: usize = (*original).cursor
+    var relevant: m.Arr[u64] = m.arr_new[u64]()
+    nn.node_relevant(a, node, original, &relevant)
+    var i: usize = 0
+    while i < m.arr_len[u64](&relevant) {
+        let child: u64 = *m.arr_at[u64](&relevant, i)
+        i = i + 1
+        if !can_use(d, child, source) {
+            continue
+        }
+        let context: u64 = cn.ctx_copy(a, so_far)
+        var reader: rd.Reader = *original
+        var err: ex.Exc = ex.exc_none()
+        var ok: bool = nn.node_parse(a, child, &reader, context, &err, &(*d).hooks.types)
+        if ok && rd.can_read(&reader) && rd.peek(&reader) != 32 {
+            err = ex.exc_builtin(a, ex.EX_EXPECTED_ARG_SEPARATOR, reader.s, reader.cursor, tx.u16_empty(), tx.u16_empty())
+            ok = false
+        }
+        if !ok {
+            m.arr_push[ErrEntry](a, &errs, ErrEntry { node: child, exc: err })
+            rd.set_cursor(&reader, cursor)
+            continue
+        }
+        cn.ctx_with_command(context, (*nn.nd(child)).cmd)
+        var need: usize = 2
+        if (*nn.nd(child)).redirect != 0 {
+            need = 1
+        }
+        if rd.can_read_n(&reader, need) {
+            rd.skip(&reader)
+            if (*nn.nd(child)).redirect != 0 {
+                let child_ctx: u64 = cn.ctx_new(a, source, (*nn.nd(child)).redirect, reader.cursor)
+                let sub: Parsed = parse_nodes(d, (*nn.nd(child)).redirect, &reader, child_ctx)
+                cn.ctx_with_child(context, sub.ctx)
+                return Parsed { ctx: context, reader: sub.reader, errs: sub.errs }
+            }
+            let sub: Parsed = parse_nodes(d, child, &reader, context)
+            m.arr_push[Parsed](a, &potentials, sub)
+        } else {
+            m.arr_push[Parsed](a, &potentials, Parsed { ctx: context, reader: reader, errs: m.arr_new[ErrEntry]() })
+        }
+    }
+    let n: usize = m.arr_len[Parsed](&potentials)
+    if n > 0 {
+        var k: usize = 1
+        while k < n {
+            let pivot: Parsed = *m.arr_at[Parsed](&potentials, k)
+            var j: usize = k
+            while j > 0 && cmp_parsed(&pivot, m.arr_at[Parsed](&potentials, j - 1)) < 0 {
+                *m.arr_at[Parsed](&potentials, j) = *m.arr_at[Parsed](&potentials, j - 1)
+                j = j - 1
+            }
+            *m.arr_at[Parsed](&potentials, j) = pivot
+            k = k + 1
+        }
+        return *m.arr_at[Parsed](&potentials, 0)
+    }
+    return Parsed { ctx: so_far, reader: *original, errs: errs }
+}
+
+fn call_consumer(d: *mut Dispatcher, ctx: u64, ok: bool, result: i32) {
+    let f: fn(u64, u64, bool, i32) = (*d).hooks.consumer
+    f((*d).hooks.user, ctx, ok, result)
+}
+
+fn run_executable(d: *mut Dispatcher, exec: u64, source: i64, forked: bool, out: *mut i32, err: *mut ex.Exc) -> bool {
+    let use_ctx: u64 = cn.ctx_copy_for((*d).a, exec, source)
+    let f: fn(u64, u64, *mut ex.Exc) -> i32 = (*d).hooks.command
+    var e: ex.Exc = ex.exc_none()
+    let value: i32 = f((*d).hooks.user, use_ctx, &e)
+    if e.kind != 0 {
+        call_consumer(d, use_ctx, false, 0)
+        if forked {
+            *out = 0
+            return true
+        }
+        *err = e
+        return false
+    }
+    call_consumer(d, use_ctx, true, value)
+    if forked {
+        *out = 1
+    } else {
+        *out = value
+    }
+    return true
+}
+
+fn run_modifier(d: *mut Dispatcher, modifier: u64, source: i64, forked: bool, sources: *mut m.Arr[i64], err: *mut ex.Exc) -> bool {
+    let a: *mut m.Arena = (*d).a
+    let mod_id: i32 = (*cn.cx(modifier)).mod_id
+    if mod_id == 0 {
+        m.arr_push[i64](a, sources, source)
+        return true
+    }
+    let use_ctx: u64 = cn.ctx_copy_for(a, modifier, source)
+    let f: fn(u64, u64, i32, *mut m.Arr[i64], *mut ex.Exc) -> bool = (*d).hooks.modifier
+    var tmp: m.Arr[i64] = m.arr_new[i64]()
+    if f((*d).hooks.user, use_ctx, mod_id, &tmp, err) {
+        var i: usize = 0
+        while i < m.arr_len[i64](&tmp) {
+            m.arr_push[i64](a, sources, *m.arr_at[i64](&tmp, i))
+            i = i + 1
+        }
+        return true
+    }
+    call_consumer(d, use_ctx, false, 0)
+    if forked {
+        return true
+    }
+    return false
+}
+
+fn execute(d: *mut Dispatcher, p: *mut Parsed, out: *mut i32, err: *mut ex.Exc) -> bool {
+    let a: *mut m.Arena = (*d).a
+    if rd.can_read(&(*p).reader) {
+        if m.arr_len[ErrEntry](&(*p).errs) == 1 {
+            *err = (*m.arr_at[ErrEntry](&(*p).errs, 0)).exc
+            return false
+        }
+        var kind: i32 = ex.EX_UNKNOWN_ARGUMENT
+        if (*cn.cx((*p).ctx)).start == (*cn.cx((*p).ctx)).end {
+            kind = ex.EX_UNKNOWN_COMMAND
+        }
+        *err = ex.exc_builtin(a, kind, (*p).reader.s, (*p).reader.cursor, tx.u16_empty(), tx.u16_empty())
+        return false
+    }
+    let original: u64 = cn.ctx_build(a, (*p).ctx, (*p).reader.s)
+    var mods: m.Arr[u64] = m.arr_new[u64]()
+    var cur: u64 = original
+    var exec: u64 = 0
+    while exec == 0 {
+        let child: u64 = (*cn.cx(cur)).child
+        if child == 0 {
+            if (*cn.cx(cur)).cmd == 0 {
+                call_consumer(d, original, false, 0)
+                *err = ex.exc_builtin(a, ex.EX_UNKNOWN_COMMAND, (*p).reader.s, (*p).reader.cursor, tx.u16_empty(), tx.u16_empty())
+                return false
+            }
+            exec = cur
+        } else {
+            m.arr_push[u64](a, &mods, cur)
+            cur = child
+        }
+    }
+    let source: i64 = (*cn.cx((*p).ctx)).source
+    if m.arr_len[u64](&mods) == 0 {
+        return run_executable(d, exec, source, false, out, err)
+    }
+    var forked: bool = false
+    var current: m.Arr[i64] = m.arr_new[i64]()
+    m.arr_push[i64](a, &current, source)
+    var mi: usize = 0
+    while mi < m.arr_len[u64](&mods) {
+        let modifier: u64 = *m.arr_at[u64](&mods, mi)
+        mi = mi + 1
+        if (*cn.cx(modifier)).forks {
+            forked = true
+        }
+        var next: m.Arr[i64] = m.arr_new[i64]()
+        var si: usize = 0
+        while si < m.arr_len[i64](&current) {
+            if !run_modifier(d, modifier, *m.arr_at[i64](&current, si), forked, &next, err) {
+                return false
+            }
+            si = si + 1
+        }
+        if m.arr_len[i64](&next) == 0 {
+            *out = 0
+            return true
+        }
+        current = next
+    }
+    var total: i32 = 0
+    var ci: usize = 0
+    while ci < m.arr_len[i64](&current) {
+        var value: i32 = 0
+        if !run_executable(d, exec, *m.arr_at[i64](&current, ci), forked, &value, err) {
+            return false
+        }
+        total = total +% value
+        ci = ci + 1
+    }
+    *out = total
+    return true
+}
+
+fn execute_input(d: *mut Dispatcher, input: tx.U16, source: i64, out: *mut i32, err: *mut ex.Exc) -> bool {
+    var p: Parsed = parse(d, input, source)
+    return execute(d, &p, out, err)
+}
+
+fn join_prefix(a: *mut m.Arena, prefix: tx.U16, text: tx.U16) -> tx.U16 {
+    if prefix.n == 0 {
+        return text
+    }
+    var b: m.Arr[u16] = tx.b16_new()
+    tx.b16_text(a, &b, prefix)
+    tx.b16_char(a, &b, 32)
+    tx.b16_text(a, &b, text)
+    return tx.b16_view(&b)
+}
+
+fn redirect_text(d: *mut Dispatcher, node: u64) -> tx.U16 {
+    let a: *mut m.Arena = (*d).a
+    if (*nn.nd(node)).redirect == (*d).root {
+        return tx.u16_from_str(a, "...")
+    }
+    var b: m.Arr[u16] = tx.b16_new()
+    tx.b16_ascii(a, &b, "-> ")
+    tx.b16_text(a, &b, nn.node_usage_text(a, (*nn.nd(node)).redirect))
+    return tx.b16_view(&b)
+}
+
+fn all_usage_into(d: *mut Dispatcher, node: u64, source: i64, out: *mut m.Arr[tx.U16], prefix: tx.U16, restricted: bool) {
+    let a: *mut m.Arena = (*d).a
+    if restricted && !can_use(d, node, source) {
+        return
+    }
+    if (*nn.nd(node)).cmd != 0 {
+        m.arr_push[tx.U16](a, out, prefix)
+    }
+    if (*nn.nd(node)).redirect != 0 {
+        let red: tx.U16 = redirect_text(d, node)
+        if prefix.n == 0 {
+            m.arr_push[tx.U16](a, out, join_prefix(a, nn.node_usage_text(a, node), red))
+        } else {
+            m.arr_push[tx.U16](a, out, join_prefix(a, prefix, red))
+        }
+        return
+    }
+    var i: usize = 0
+    while i < nn.node_children_len(node) {
+        let child: u64 = nn.node_child_at(node, i)
+        all_usage_into(d, child, source, out, join_prefix(a, prefix, nn.node_usage_text(a, child)), restricted)
+        i = i + 1
+    }
+}
+
+fn all_usage(d: *mut Dispatcher, node: u64, source: i64, restricted: bool) -> m.Arr[tx.U16] {
+    var out: m.Arr[tx.U16] = m.arr_new[tx.U16]()
+    all_usage_into(d, node, source, &out, tx.u16_empty(), restricted)
+    return out
+}
+
+fn wrap(a: *mut m.Arena, open: str, text: tx.U16, close: str) -> tx.U16 {
+    var b: m.Arr[u16] = tx.b16_new()
+    tx.b16_ascii(a, &b, open)
+    tx.b16_text(a, &b, text)
+    tx.b16_ascii(a, &b, close)
+    return tx.b16_view(&b)
+}
+
+fn smart_usage_node(d: *mut Dispatcher, node: u64, source: i64, optional: bool, deep: bool, out: *mut tx.U16) -> bool {
+    let a: *mut m.Arena = (*d).a
+    if !can_use(d, node, source) {
+        return false
+    }
+    var self_text: tx.U16 = nn.node_usage_text(a, node)
+    if optional {
+        self_text = wrap(a, "[", self_text, "]")
+    }
+    let child_optional: bool = (*nn.nd(node)).cmd != 0
+    var open: str = "("
+    var close: str = ")"
+    if child_optional {
+        open = "["
+        close = "]"
+    }
+    *out = self_text
+    if deep {
+        return true
+    }
+    if (*nn.nd(node)).redirect != 0 {
+        *out = join_prefix(a, self_text, redirect_text(d, node))
+        return true
+    }
+    var usable: m.Arr[u64] = m.arr_new[u64]()
+    var i: usize = 0
+    while i < nn.node_children_len(node) {
+        let c: u64 = nn.node_child_at(node, i)
+        if can_use(d, c, source) {
+            m.arr_push[u64](a, &usable, c)
+        }
+        i = i + 1
+    }
+    let n: usize = m.arr_len[u64](&usable)
+    if n == 1 {
+        var u: tx.U16 = tx.u16_empty()
+        if smart_usage_node(d, *m.arr_at[u64](&usable, 0), source, child_optional, child_optional, &u) {
+            *out = join_prefix(a, self_text, u)
+            return true
+        }
+    } else if n > 1 {
+        var uniq: m.Arr[tx.U16] = m.arr_new[tx.U16]()
+        var k: usize = 0
+        while k < n {
+            var u: tx.U16 = tx.u16_empty()
+            if smart_usage_node(d, *m.arr_at[u64](&usable, k), source, child_optional, true, &u) {
+                var seen: bool = false
+                var q: usize = 0
+                while q < m.arr_len[tx.U16](&uniq) {
+                    if tx.u16_eq(*m.arr_at[tx.U16](&uniq, q), u) {
+                        seen = true
+                    }
+                    q = q + 1
+                }
+                if !seen {
+                    m.arr_push[tx.U16](a, &uniq, u)
+                }
+            }
+            k = k + 1
+        }
+        let un: usize = m.arr_len[tx.U16](&uniq)
+        if un == 1 {
+            var usage: tx.U16 = *m.arr_at[tx.U16](&uniq, 0)
+            if child_optional {
+                usage = wrap(a, "[", usage, "]")
+            }
+            *out = join_prefix(a, self_text, usage)
+            return true
+        }
+        if un > 1 {
+            var b: m.Arr[u16] = tx.b16_new()
+            tx.b16_ascii(a, &b, open)
+            var cnt: usize = 0
+            var z: usize = 0
+            while z < n {
+                if cnt > 0 {
+                    tx.b16_char(a, &b, 124)
+                }
+                tx.b16_text(a, &b, nn.node_usage_text(a, *m.arr_at[u64](&usable, z)))
+                cnt = cnt + 1
+                z = z + 1
+            }
+            tx.b16_ascii(a, &b, close)
+            *out = join_prefix(a, self_text, tx.b16_view(&b))
+            return true
+        }
+    }
+    return true
+}
+
+fn smart_usage(d: *mut Dispatcher, node: u64, source: i64) -> m.Arr[SmartEntry] {
+    let a: *mut m.Arena = (*d).a
+    var out: m.Arr[SmartEntry] = m.arr_new[SmartEntry]()
+    let optional: bool = (*nn.nd(node)).cmd != 0
+    var i: usize = 0
+    while i < nn.node_children_len(node) {
+        let c: u64 = nn.node_child_at(node, i)
+        var u: tx.U16 = tx.u16_empty()
+        if smart_usage_node(d, c, source, optional, false, &u) {
+            m.arr_push[SmartEntry](a, &out, SmartEntry { node: c, text: u })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn list_node_suggestions(d: *mut Dispatcher, node: u64, ctx: u64, b: *mut sg.SuggBuilder) -> sg.Suggestions {
+    let n: *mut nn.Node = nn.nd(node)
+    if (*n).kind == nn.NK_LITERAL {
+        if tx.u16_starts_with((*n).lower, sg.sb_remaining_lower(b)) {
+            sg.sb_suggest(b, (*n).name)
+        }
+        return sg.sb_build(b)
+    }
+    if (*n).kind == nn.NK_ARGUMENT {
+        if (*n).sugg != 0 {
+            let f: fn(u64, u64, i32, u64) = (*d).hooks.sugg
+            f((*d).hooks.user, ctx, (*n).sugg, b as u64)
+        } else {
+            at.at_suggest(&(*n).atype, b, &(*d).hooks.types)
+        }
+        return sg.sb_build(b)
+    }
+    return sg.suggestions_empty()
+}
+
+fn completion_suggestions_at(d: *mut Dispatcher, p: *mut Parsed, cursor: usize) -> sg.Suggestions {
+    let a: *mut m.Arena = (*d).a
+    var sc: cn.SuggCtx = cn.SuggCtx { parent: (*d).root, start: 0 }
+    if !cn.ctx_find_suggestion((*p).ctx, cursor, &sc) {
+        return sg.suggestions_empty()
+    }
+    var start: usize = sc.start
+    if cursor < start {
+        start = cursor
+    }
+    let full: tx.U16 = (*p).reader.s
+    let truncated: tx.U16 = tx.u16_sub(full, 0, cursor)
+    let truncated_lower: tx.U16 = tx.u16_lower(a, truncated)
+    let built: u64 = cn.ctx_build(a, (*p).ctx, truncated)
+    var parts: m.Arr[sg.Suggestions] = m.arr_new[sg.Suggestions]()
+    var i: usize = 0
+    while i < nn.node_children_len(sc.parent) {
+        let child: u64 = nn.node_child_at(sc.parent, i)
+        var b: sg.SuggBuilder = sg.sb_new(a, truncated, truncated_lower, start)
+        m.arr_push[sg.Suggestions](a, &parts, list_node_suggestions(d, child, built, &b))
+        i = i + 1
+    }
+    return sg.suggestions_merge(a, full, &parts)
+}
+
+fn completion_suggestions(d: *mut Dispatcher, p: *mut Parsed) -> sg.Suggestions {
+    return completion_suggestions_at(d, p, rd.total_length(&(*p).reader))
+}
