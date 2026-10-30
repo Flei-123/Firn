@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import scene3d.vec3
+import scene3d.render_types
+import scene3d.render_shade
+import scene3d.fogbg
+
+export {
+    put_color, shade_rows,
+}
+
+fn put_color(r: *mut render_types.Renderer, at: usize, cr: f64, cg: f64, cb: f64) {
+    render_types.stf32((*r).color, at * 3, cr as f32)
+    render_types.stf32((*r).color, at * 3 + 1, cg as f32)
+    render_types.stf32((*r).color, at * 3 + 2, cb as f32)
+}
+
+fn bg_pixel(r: *mut render_types.Renderer, x: i32, y: i32, at: usize, bgr: f64, bgg: f64, bgb: f64) {
+    let bgc: vec3.V3 = fogbg.bg_fogged(r, x, y, vec3.V3 { x: bgr, y: bgg, z: bgb })
+    put_color(r, at, bgc.x, bgc.y, bgc.z)
+}
+
+fn put_shaded(r: *mut render_types.Renderer, at: usize, sh: *mut render_types.Shade) {
+    let f: f64 = render_shade.fog_factor(r, 1.0 / (render_types.ldf32((*r).depth, at) as f64))
+    put_color(r, at, vec3.lerpf((*sh).dr + (*sh).sr, (*r).fog_color.x, f), vec3.lerpf((*sh).dg + (*sh).sg, (*r).fog_color.y, f), vec3.lerpf((*sh).db + (*sh).sb, (*r).fog_color.z, f))
+}
+
+fn shade_sample_at(r: *mut render_types.Renderer, id: u32, x: i32, y: i32, at: usize, sh: *mut render_types.Shade) {
+    let t: *mut render_types.Tri = vec.vec_elem_ptr[render_types.Tri](&(*r).tris, (id - 1 as u32) as usize)
+    render_shade.shade_sample(r, t, (x as f64) + 0.5, (y as f64) + 0.5, sh)
+    put_shaded(r, at, sh)
+}
+
+fn shade_rows_plain(r: *mut render_types.Renderer, y0: i32, y1: i32) {
+    var sh: render_types.Shade = render_types.Shade { dr: 0.0, dg: 0.0, db: 0.0, sr: 0.0, sg: 0.0, sb: 0.0, alpha: 1.0 }
+    var y: i32 = y0
+    while y < y1 {
+        let ty: f64 = ((y as f64) + 0.5) / ((*r).sh as f64)
+        let bgr: f64 = vec3.lerpf((*r).bg_top.x, (*r).bg_bottom.x, ty)
+        let bgg: f64 = vec3.lerpf((*r).bg_top.y, (*r).bg_bottom.y, ty)
+        let bgb: f64 = vec3.lerpf((*r).bg_top.z, (*r).bg_bottom.z, ty)
+        var x: i32 = 0
+        while x < (*r).sw {
+            let at: usize = (y as usize) * ((*r).sw as usize) + (x as usize)
+            let id: u32 = rt.ld32((*r).tid, at)
+            if id == 0 as u32 {
+                bg_pixel(r, x, y, at, bgr, bgg, bgb)
+            } else {
+                shade_sample_at(r, id, x, y, at, &sh)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn uniform_id(r: *mut render_types.Renderer, ox: i32, oy: i32) -> u32 {
+    let ss: i32 = (*r).ss
+    let sw: usize = (*r).sw as usize
+    let first: u32 = rt.ld32((*r).tid, ((oy * ss) as usize) * sw + ((ox * ss) as usize))
+    if first == 0 as u32 { return 0 as u32 }
+    if (*vec.vec_elem_ptr[render_types.Tri](&(*r).tris, (first - 1 as u32) as usize)).tex != 0 as u64 { return 0 as u32 }
+    var j: i32 = 0
+    while j < ss {
+        let rowb: usize = ((oy * ss + j) as usize) * sw + ((ox * ss) as usize)
+        var i: i32 = 0
+        while i < ss {
+            if rt.ld32((*r).tid, rowb + (i as usize)) != first { return 0 as u32 }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return first
+}
+
+fn shade_rows_shared(r: *mut render_types.Renderer, y0: i32, y1: i32) {
+    var sh: render_types.Shade = render_types.Shade { dr: 0.0, dg: 0.0, db: 0.0, sr: 0.0, sg: 0.0, sb: 0.0, alpha: 1.0 }
+    let ss: i32 = (*r).ss
+    let half: f64 = (ss as f64) * 0.5
+    var oy: i32 = y0 / ss
+    let oye: i32 = y1 / ss
+    while oy < oye {
+        var ox: i32 = 0
+        while ox < (*r).w {
+            let uid: u32 = uniform_id(r, ox, oy)
+            var j: i32 = 0
+            if uid != 0 as u32 {
+                let t: *mut render_types.Tri = vec.vec_elem_ptr[render_types.Tri](&(*r).tris, (uid - 1 as u32) as usize)
+                render_shade.shade_sample(r, t, ((ox * ss) as f64) + half, ((oy * ss) as f64) + half, &sh)
+                while j < ss {
+                    var i: i32 = 0
+                    while i < ss {
+                        put_shaded(r, ((oy * ss + j) as usize) * ((*r).sw as usize) + ((ox * ss + i) as usize), &sh)
+                        i = i + 1
+                    }
+                    j = j + 1
+                }
+            } else {
+                while j < ss {
+                    let y: i32 = oy * ss + j
+                    let ty: f64 = ((y as f64) + 0.5) / ((*r).sh as f64)
+                    let bgr: f64 = vec3.lerpf((*r).bg_top.x, (*r).bg_bottom.x, ty)
+                    let bgg: f64 = vec3.lerpf((*r).bg_top.y, (*r).bg_bottom.y, ty)
+                    let bgb: f64 = vec3.lerpf((*r).bg_top.z, (*r).bg_bottom.z, ty)
+                    var i: i32 = 0
+                    while i < ss {
+                        let x: i32 = ox * ss + i
+                        let at: usize = (y as usize) * ((*r).sw as usize) + (x as usize)
+                        let id: u32 = rt.ld32((*r).tid, at)
+                        if id == 0 as u32 {
+                            bg_pixel(r, x, y, at, bgr, bgg, bgb)
+                        } else {
+                            shade_sample_at(r, id, x, y, at, &sh)
+                        }
+                        i = i + 1
+                    }
+                    j = j + 1
+                }
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+fn shade_rows(r: *mut render_types.Renderer, y0: i32, y1: i32) {
+    if (*r).share_shading && (*r).ss > 1 {
+        shade_rows_shared(r, y0, y1)
+        return
+    }
+    shade_rows_plain(r, y0, y1)
+}
