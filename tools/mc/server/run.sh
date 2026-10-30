@@ -10,7 +10,9 @@
 #      spawn time, screenshot not empty and different between the two worlds, a missing world directory is refused
 #   H  saved world: the Firn server serves a real vanilla 1.20.1 world (cache $SAVE_CACHE/v1201, level.dat spawn, region files, palettes);
 #      per column block histograms equal the vanilla server running on a copy of the same world (random ticks off); mutated histogram is detected
-# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_WORLD=<dir with level.dat>
+#   I  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
+#      declare_commands subtree (gamemode say teleport time tp) structurally equal; mutated frame / chat line is detected
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_CMDS=1 skips I, MCS_ONLY_CMDS=1 runs only I, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -61,6 +63,7 @@ gamemode=creative
 motd=vanilla
 PROPS
 echo "eula=true" > "$W/vanilla/eula.txt"
+echo '[{"uuid":"6ade27ea-d949-3c28-97f0-896712d0dd56","name":"CmdVan","level":4,"bypassesPlayerLimit":false}]' > "$W/vanilla/ops.json"
 mkfifo "$W/vanilla/in"; exec 3<>"$W/vanilla/in"
 ( cd "$W/vanilla" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vanilla/in" > server.out 2>&1 ) &
 VPID=$!
@@ -69,6 +72,13 @@ $FIRNC --no-opt -o "$W/mcsrv_noopt" demos/mcsrv/main.fi 2>"$W/err" || { echo "  
 
 for i in $(seq 1 120); do grep -q 'Done (' "$W/vanilla/server.out" 2>/dev/null && break; sleep 1; done
 grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server did not start"; tail -5 "$W/vanilla/server.out"; exit 1; }
+
+if [ -n "${MCS_ONLY_CMDS:-}" ]; then
+    source "$TOOLS/stage_cmds.sh"
+    echo stop >&3
+    [ -f "$W/failed" ] && ERR=1
+    exit $ERR
+fi
 
 STOP_TICKS=${MCS_STOP_TICKS:-1300}
 "$W/mcsrv" --port "$FPORT" --ticks $STOP_TICKS > "$W/f1.out" 2>&1 &
@@ -124,6 +134,9 @@ for f in f1 f2; do
   tps=$(echo "$line" | sed -n 's/.*tps_x100=\([0-9]*\).*/\1/p')
   if [ -n "$tps" ] && [ "$tps" -ge 1900 ]; then echo "  ok    graceful stop ($f): $line"; else echo "  FAIL  stop/tps ($f): '$line'"; ERR=1; fi
 done
+if [ -z "${MCS_NO_CMDS:-}" ]; then
+    source "$TOOLS/stage_cmds.sh"
+fi
 echo stop >&3
 
 if [ -z "${MCS_NO_SAVE:-}" ]; then
