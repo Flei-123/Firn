@@ -851,6 +851,8 @@ build ds_crumb
 "$W/ds_crumb"
 build ds_settings
 "$W/ds_settings"
+build ds_feedback
+"$W/ds_feedback"
 build kitspec
 "$W/kitspec"
 build screenax
