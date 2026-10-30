@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
+import std.rt
 import std.vec
+import jobs.jobs
 import scene3d.render_types
 
 export {
-    item_less, stats_reset, stats_add, stats_apply,
+    item_less, sort_items, stats_reset, stats_add, stats_apply,
 }
 
 fn item_less(a: *render_types.SortItem, b: *render_types.SortItem) -> bool {
@@ -39,4 +41,91 @@ fn stats_apply(st: *mut vec.Vec[f64], it: *mut render_types.SortItem) {
     let hi: f64 = *vec.vec_elem_ptr[f64](st, ((*it).unit as usize) * 2 + 1)
     (*it).uk = (lo + hi) * 0.5
     (*it).ue = hi
+}
+
+fn less_at(base: u64, a: u32, b: u32) -> bool {
+    return item_less(render_types.elem_at[render_types.SortItem](base, a as usize), render_types.elem_at[render_types.SortItem](base, b as usize))
+}
+
+fn merge_runs(base: u64, src: u64, dst: u64, lo: usize, mid: usize, hi: usize) {
+    var i: usize = lo
+    var j: usize = mid
+    var k: usize = lo
+    while i < mid && j < hi {
+        let vi: u32 = rt.ld32(src, i)
+        let vj: u32 = rt.ld32(src, j)
+        if less_at(base, vj, vi) {
+            rt.st32(dst, k, vj)
+            j = j + 1
+        } else {
+            rt.st32(dst, k, vi)
+            i = i + 1
+        }
+        k = k + 1
+    }
+    while i < mid {
+        rt.st32(dst, k, rt.ld32(src, i))
+        i = i + 1
+        k = k + 1
+    }
+    while j < hi {
+        rt.st32(dst, k, rt.ld32(src, j))
+        j = j + 1
+        k = k + 1
+    }
+}
+
+struct MergeJob {
+    base: u64,
+    src: u64,
+    dst: u64,
+    w: usize,
+    n: usize,
+}
+
+fn merge_task(ctx: u64, lo: u64, hi: u64) {
+    let j: *mut MergeJob = ctx as *mut MergeJob
+    var p: usize = lo as usize
+    while p < (hi as usize) {
+        let a: usize = p * (*j).w * 2
+        var mid: usize = a + (*j).w
+        if mid > (*j).n { mid = (*j).n }
+        var e: usize = a + (*j).w * 2
+        if e > (*j).n { e = (*j).n }
+        merge_runs((*j).base, (*j).src, (*j).dst, a, mid, e)
+        p = p + 1
+    }
+}
+
+#[allow_escape]
+fn sort_items(r: *mut render_types.Renderer) -> u64 {
+    let n: usize = vec.vec_len[render_types.SortItem](&(*r).order)
+    vec.vec_clear[u32](&(*r).ps.perm)
+    vec.vec_clear[u32](&(*r).ps.ptmp)
+    vec.vec_reserve[u32](&(*r).ps.perm, n + 1)
+    vec.vec_reserve[u32](&(*r).ps.ptmp, n + 1)
+    var job: MergeJob = MergeJob {
+        base: vec.vec_ptr[render_types.SortItem](&(*r).order),
+        src: vec.vec_ptr[u32](&(*r).ps.perm), dst: vec.vec_ptr[u32](&(*r).ps.ptmp), w: 1, n: n,
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st32(job.src, i, i as u32)
+        i = i + 1
+    }
+    while job.w < n {
+        let pairs: usize = (n + job.w * 2 - 1) / (job.w * 2)
+        var per: usize = 8192 / (job.w * 2)
+        if per < 1 { per = 1 }
+        if (*r).use_pool && pairs > per {
+            jobs.parallel_for(&(*r).pool, 0 as u64, pairs as u64, per as u64, merge_task, (&job) as u64)
+        } else {
+            merge_task((&job) as u64, 0 as u64, pairs as u64)
+        }
+        let t: u64 = job.src
+        job.src = job.dst
+        job.dst = t
+        job.w = job.w * 2
+    }
+    return job.src
 }
