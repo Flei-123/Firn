@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/cmd/cmd_wire.fi -- serializes a commands.json tree as the body of the declare_commands packet (breadth first, like Vanilla).
+import std.rt
+import std.json as json
+import std.math
+import brigadier.mem as m
+import mc.cmd.cmd_tree as ct
+
+export { wire_declare, parser_id }
+
+const FLAG_LITERAL: u8 = 1
+const FLAG_ARGUMENT: u8 = 2
+const FLAG_EXECUTABLE: u8 = 4
+const FLAG_REDIRECT: u8 = 8
+
+fn push_varint(b: *mut rt.Buf, v: u32) {
+    var x: u32 = v
+    while x >= 128 {
+        rt.buf_push(b, ((x & 127) | 128) as u8)
+        x = x >> 7 as u32
+    }
+    rt.buf_push(b, x as u8)
+}
+
+fn push_be(b: *mut rt.Buf, v: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, ((v >> (((n - 1 - i) * 8) as u64)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+fn push_name(b: *mut rt.Buf, s: str) {
+    push_varint(b, s.n as u32)
+    ct.push_str(b, s)
+}
+
+fn parser_id(table: str, name: str) -> i32 {
+    var i: usize = 0
+    while i < table.n {
+        var j: usize = i
+        while j < table.n && rt.ld8(table.p as u64, j) != 10 as u8 {
+            j = j + 1
+        }
+        var k: usize = i
+        while k < j && rt.ld8(table.p as u64, k) != 61 as u8 {
+            k = k + 1
+        }
+        if k < j && ct.str_eq(str { p: table.p, n: k - i }, name) {
+            var v: i32 = 0
+            var q: usize = k + 1
+            while q < j {
+                v = v * 10 + (rt.ld8(table.p as u64, q) as i32 - 48)
+                q = q + 1
+            }
+            return v
+        }
+        i = j + 1
+    }
+    return 0 - 1
+}
+
+fn index_of(order: *mut m.Arr[u32], node: u32) -> i32 {
+    var i: usize = 0
+    while i < m.arr_len[u32](order) {
+        if *m.arr_at[u32](order, i) == node {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn child_obj(d: *mut json.Json, node: u32) -> u32 {
+    return ct.jfind(d, node, "children")
+}
+
+fn redirect_target(d: *mut json.Json, root: u32, node: u32) -> u32 {
+    let rd: u32 = ct.jfind(d, node, "redirect")
+    if rd == json.JSON_NONE || json.json_count(d, rd) == 0 {
+        return json.JSON_NONE
+    }
+    var cur: u32 = root
+    var c: u32 = json.json_child(d, rd)
+    while c != json.JSON_NONE {
+        let ch: u32 = child_obj(d, cur)
+        if ch == json.JSON_NONE {
+            return json.JSON_NONE
+        }
+        let name: str = ct.span_str(json.json_string(d, c))
+        cur = json.json_get(d, ch, name.p as u64, name.n)
+        if cur == json.JSON_NONE {
+            return json.JSON_NONE
+        }
+        c = json.json_next(d, c)
+    }
+    return cur
+}
+
+fn enqueue_children(a: *mut m.Arena, d: *mut json.Json, node: u32, queue: *mut m.Arr[u32]) {
+    let ch: u32 = child_obj(d, node)
+    if ch == json.JSON_NONE {
+        return
+    }
+    var c: u32 = json.json_child(d, ch)
+    while c != json.JSON_NONE {
+        m.arr_push[u32](a, queue, c)
+        c = json.json_next(d, c)
+    }
+}
+
+fn enumerate_nodes(a: *mut m.Arena, d: *mut json.Json, root: u32, order: *mut m.Arr[u32]) {
+    var queue: m.Arr[u32] = m.arr_new[u32]()
+    m.arr_push[u32](a, &queue, root)
+    var head: usize = 0
+    while head < m.arr_len[u32](&queue) {
+        let node: u32 = *m.arr_at[u32](&queue, head)
+        head = head + 1
+        if index_of(order, node) >= 0 {
+            continue
+        }
+        m.arr_push[u32](a, order, node)
+        enqueue_children(a, d, node, &queue)
+        let rt_node: u32 = redirect_target(d, root, node)
+        if rt_node != json.JSON_NONE {
+            m.arr_push[u32](a, &queue, rt_node)
+        }
+    }
+}
+
+fn push_int_bound(b: *mut rt.Buf, d: *mut json.Json, props: u32, kind: str, width: usize) {
+    var flags: u8 = 0 as u8
+    let has_min: bool = props != json.JSON_NONE && ct.jfind(d, props, "min") != json.JSON_NONE
+    let has_max: bool = props != json.JSON_NONE && ct.jfind(d, props, "max") != json.JSON_NONE
+    if has_min { flags = flags | 1 as u8 }
+    if has_max { flags = flags | 2 as u8 }
+    rt.buf_push(b, flags)
+    if has_min { push_be(b, ct.prop_i64(d, props, "min", 0) as u64, width) }
+    if has_max { push_be(b, ct.prop_i64(d, props, "max", 0) as u64, width) }
+}
+
+fn push_real_bound(b: *mut rt.Buf, d: *mut json.Json, props: u32, wide: bool) {
+    var flags: u8 = 0 as u8
+    let has_min: bool = props != json.JSON_NONE && ct.jfind(d, props, "min") != json.JSON_NONE
+    let has_max: bool = props != json.JSON_NONE && ct.jfind(d, props, "max") != json.JSON_NONE
+    if has_min { flags = flags | 1 as u8 }
+    if has_max { flags = flags | 2 as u8 }
+    rt.buf_push(b, flags)
+    if has_min { push_real(b, ct.prop_f64(d, props, "min", 0.0), wide) }
+    if has_max { push_real(b, ct.prop_f64(d, props, "max", 0.0), wide) }
+}
+
+fn push_real(b: *mut rt.Buf, v: f64, wide: bool) {
+    if wide {
+        push_be(b, math.math_bits(v), 8)
+    } else {
+        push_be(b, math.math_bits32(v as f32) as u64, 4)
+    }
+}
+
+fn prop_is(d: *mut json.Json, props: u32, key: str, want: str) -> bool {
+    var v: str = ""
+    return props != json.JSON_NONE && ct.jfind_str(d, props, key, &v) && ct.str_eq(v, want)
+}
+
+fn push_props(b: *mut rt.Buf, d: *mut json.Json, parser: str, props: u32) {
+    if ct.str_eq(parser, "brigadier:integer") {
+        push_int_bound(b, d, props, parser, 4)
+    } else if ct.str_eq(parser, "brigadier:long") {
+        push_int_bound(b, d, props, parser, 8)
+    } else if ct.str_eq(parser, "brigadier:float") {
+        push_real_bound(b, d, props, false)
+    } else if ct.str_eq(parser, "brigadier:double") {
+        push_real_bound(b, d, props, true)
+    } else if ct.str_eq(parser, "brigadier:string") {
+        var kind: u8 = 1 as u8
+        if prop_is(d, props, "type", "word") { kind = 0 as u8 }
+        if prop_is(d, props, "type", "greedy") { kind = 2 as u8 }
+        rt.buf_push(b, kind)
+    } else if ct.str_eq(parser, "minecraft:entity") {
+        var flags: u8 = 0 as u8
+        if prop_is(d, props, "amount", "single") { flags = flags | 1 as u8 }
+        if prop_is(d, props, "type", "players") { flags = flags | 2 as u8 }
+        rt.buf_push(b, flags)
+    } else if ct.str_eq(parser, "minecraft:score_holder") {
+        var flags: u8 = 0 as u8
+        if prop_is(d, props, "amount", "multiple") { flags = 1 as u8 }
+        rt.buf_push(b, flags)
+    } else if ct.str_eq(parser, "minecraft:time") {
+        push_be(b, ct.prop_i64(d, props, "min", 0) as u64, 4)
+    } else if ct.str_eq(parser, "minecraft:resource_or_tag") || ct.str_eq(parser, "minecraft:resource_or_tag_key") || ct.str_eq(parser, "minecraft:resource") || ct.str_eq(parser, "minecraft:resource_key") {
+        var reg: str = ""
+        ct.jfind_str(d, props, "registry", &reg)
+        push_name(b, reg)
+    }
+}
+
+fn push_node(b: *mut rt.Buf, d: *mut json.Json, root: u32, node: u32, key: str, order: *mut m.Arr[u32], parsers: str) -> bool {
+    var kind: str = ""
+    ct.jfind_str(d, node, "type", &kind)
+    var flags: u8 = 0 as u8
+    if ct.str_eq(kind, "literal") { flags = FLAG_LITERAL }
+    if ct.str_eq(kind, "argument") { flags = FLAG_ARGUMENT }
+    let ex: u32 = ct.jfind(d, node, "executable")
+    if ex != json.JSON_NONE && json.json_kind(d, ex) == json.JSON_TRUE { flags = flags | FLAG_EXECUTABLE }
+    let target: u32 = redirect_target(d, root, node)
+    if target != json.JSON_NONE { flags = flags | FLAG_REDIRECT }
+    rt.buf_push(b, flags)
+    let ch: u32 = child_obj(d, node)
+    if ch == json.JSON_NONE {
+        push_varint(b, 0 as u32)
+    } else {
+        push_varint(b, json.json_count(d, ch) as u32)
+        var c: u32 = json.json_child(d, ch)
+        while c != json.JSON_NONE {
+            push_varint(b, index_of(order, c) as u32)
+            c = json.json_next(d, c)
+        }
+    }
+    if target != json.JSON_NONE { push_varint(b, index_of(order, target) as u32) }
+    if (flags & 3 as u8) == 0 as u8 { return true }
+    push_name(b, key)
+    if (flags & 3 as u8) == FLAG_ARGUMENT {
+        var parser: str = ""
+        ct.jfind_str(d, node, "parser", &parser)
+        let id: i32 = parser_id(parsers, parser)
+        if id < 0 { return false }
+        push_varint(b, id as u32)
+        push_props(b, d, parser, ct.jfind(d, node, "properties"))
+    }
+    return true
+}
+
+
+fn wire_declare(json_p: u64, json_n: usize, parsers: str, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    let parsed: bool = json.json_parse(&d, json_p, json_n) catch false
+    if !parsed || !json.json_valid(&d) {
+        json.json_free(&d)
+        return false
+    }
+    var a: m.Arena = m.arena_new()
+    var order: m.Arr[u32] = m.arr_new[u32]()
+    let root: u32 = json.json_root(&d)
+    enumerate_nodes(&a, &d, root, &order)
+    push_varint(out, m.arr_len[u32](&order) as u32)
+    var ok: bool = true
+    var i: usize = 0
+    while i < m.arr_len[u32](&order) && ok {
+        let node: u32 = *m.arr_at[u32](&order, i)
+        var key: str = ""
+        if node != root { key = ct.span_str(json.json_key(&d, node)) }
+        ok = push_node(out, &d, root, node, key, &order, parsers)
+        i = i + 1
+    }
+    push_varint(out, 0 as u32)
+    m.arena_free(&a)
+    json.json_free(&d)
+    return ok
+}

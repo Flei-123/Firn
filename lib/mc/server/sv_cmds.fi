@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_cmds.fi -- server command system: tree load, declare_commands, chat_command execution through lib/brigadier.
+
+import std.rt
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.exc as ex
+import brigadier.argtype as at
+import brigadier.dispatcher as dp
+import brigadier.context as cn
+import mc.mc_sem
+import mc.mc_version
+import mc.cmd.cmd_tree as ct
+import mc.cmd.cmd_args as ca
+import mc.cmd.cmd_wire as cw
+import mc.cmd.data.cmd_data
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_cmd_state
+import mc.server.sv_cmd_impl
+
+export { cmds_send_declare, cmds_execute, cmds_free }
+
+const CONTEXT_AMOUNT: usize = 10
+
+fn hk_requirement(user: u64, source: i64, level: i32) -> bool {
+    return true
+}
+
+fn hk_command(user: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = user as *mut sv_cmd_state.Cmds
+    let idx: i32 = (*cn.cx(ctx)).cmd
+    if idx <= 0 || (idx as usize) > m.arr_len[ct.PathEnt](&(*c).tree.paths) {
+        return 0
+    }
+    let path: str = (*m.arr_at[ct.PathEnt](&(*c).tree.paths, (idx - 1) as usize)).path
+    var i: usize = 0
+    while i < m.arr_len[sv_cmd_state.Handler](&(*c).handlers) {
+        let h: *mut sv_cmd_state.Handler = m.arr_at[sv_cmd_state.Handler](&(*c).handlers, i)
+        if ct.str_eq((*h).path, path) {
+            let run: fn(u64, u64, *mut ex.Exc) -> i32 = (*h).run
+            return run(c as u64, ctx, err)
+        }
+        i = i + 1
+    }
+    *err = ex.exc_custom(&(*c).work, "This command is not implemented")
+    return 0
+}
+
+fn hk_modifier(user: u64, ctx: u64, id: i32, out: *mut m.Arr[i64], err: *mut ex.Exc) -> bool {
+    return false
+}
+
+fn hk_sugg(user: u64, ctx: u64, id: i32, b: u64) {
+}
+
+fn hk_consumer(user: u64, ctx: u64, ok: bool, res: i32) {
+}
+
+fn th_suggest(user: u64, id: i32, b: u64) {
+}
+
+fn cmds_build(srv: *mut sv_state.Server) -> u64 {
+    var json: str = ""
+    var parsers: str = ""
+    if !cmd_data.data_for((*srv).ver.protocol, &json, &parsers) {
+        return 0
+    }
+    let p: u64 = rt.heap_alloc(sv_cmd_state.cmds_size())
+    let c: *mut sv_cmd_state.Cmds = p as *mut sv_cmd_state.Cmds
+    (*c).srv = srv
+    (*c).cur = 0 as *mut sv_state.Session
+    (*c).a = m.arena_new()
+    (*c).work = m.arena_new()
+    (*c).tree = ct.tree_new(&(*c).a)
+    (*c).declare = rt.buf_new()
+    (*c).handlers = m.arr_new[sv_cmd_state.Handler]()
+    (*c).hooks = dp.Hooks { user: p, requirement: hk_requirement, command: hk_command, modifier: hk_modifier, sugg: hk_sugg,
+        consumer: hk_consumer, types: at.TypeHooks { user: ((&(*c).tree) as *mut ct.CmdTree) as u64, parse: ca.args_hook, suggest: th_suggest } }
+    ct.tree_load(&(*c).tree, json.p as u64, json.n)
+    ca.args_bind(&(*c).tree)
+    sv_cmd_impl.handlers_register(c)
+    cw.wire_declare(json.p as u64, json.n, parsers, &(*c).declare)
+    return p
+}
+
+fn cmds_get(srv: *mut sv_state.Server) -> *mut sv_cmd_state.Cmds {
+    if (*srv).cmds == 0 {
+        (*srv).cmds = cmds_build(srv)
+    }
+    return (*srv).cmds as *mut sv_cmd_state.Cmds
+}
+
+fn cmds_free(srv: *mut sv_state.Server) {
+    if (*srv).cmds == 0 {
+        return
+    }
+    let c: *mut sv_cmd_state.Cmds = (*srv).cmds as *mut sv_cmd_state.Cmds
+    rt.buf_free(&(*c).declare)
+    m.arena_free(&(*c).work)
+    m.arena_free(&(*c).a)
+    rt.heap_free((*srv).cmds, sv_cmd_state.cmds_size())
+    (*srv).cmds = 0
+}
+
+fn cmds_send_declare(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    let c: *mut sv_cmd_state.Cmds = cmds_get(srv)
+    if c as u64 == 0 || rt.buf_len(&(*c).declare) == 0 {
+        return
+    }
+    sv_send.send_raw(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_DECLARE_COMMANDS, rt.buf_ptr(&(*c).declare), rt.buf_len(&(*c).declare))
+}
+
+fn send_error_text(srv: *mut sv_state.Server, s: *mut sv_state.Session, text: str, color: str) {
+    var json: rt.Buf = rt.buf_new()
+    sv_send.push_str(&json, "{\"text\":\"")
+    sv_send.push_json_escaped(&json, text.p as u64, text.n)
+    sv_send.push_str(&json, "\",\"color\":\"")
+    sv_send.push_str(&json, color)
+    sv_send.push_str(&json, "\"}")
+    sv_send.send_chat_json(srv, s, rt.buf_ptr(&json), rt.buf_len(&json))
+    rt.buf_free(&json)
+}
+
+fn send_context(c: *mut sv_cmd_state.Cmds, e: *mut ex.Exc) {
+    if (*e).cursor < 0 {
+        return
+    }
+    var cursor: usize = (*e).cursor as usize
+    if cursor > (*e).input.n {
+        cursor = (*e).input.n
+    }
+    var from: usize = 0
+    if cursor > CONTEXT_AMOUNT {
+        from = cursor - CONTEXT_AMOUNT
+    }
+    var b: rt.Buf = rt.buf_new()
+    if cursor > CONTEXT_AMOUNT {
+        sv_send.push_str(&b, "...")
+    }
+    sv_send.push_str(&b, tx.u16_to_str(&(*c).work, tx.u16_sub((*e).input, from, cursor)))
+    sv_send.push_str(&b, tx.u16_to_str(&(*c).work, tx.u16_sub((*e).input, cursor, (*e).input.n)))
+    sv_send.push_str(&b, "<--[HERE]")
+    send_error_text((*c).srv, (*c).cur, rt.buf_str(&b), "gray")
+    rt.buf_free(&b)
+}
+
+fn cmds_execute(srv: *mut sv_state.Server, s: *mut sv_state.Session, p: u64, n: usize) {
+    let c: *mut sv_cmd_state.Cmds = cmds_get(srv)
+    if c as u64 == 0 {
+        return
+    }
+    m.arena_reset(&(*c).work)
+    (*c).cur = s
+    let input: tx.U16 = tx.u16_from_str(&(*c).work, str { p: p as *mut u8, n: n })
+    var d: dp.Dispatcher = dp.Dispatcher { a: &(*c).work, root: (*c).tree.root, hooks: (*c).hooks }
+    var res: i32 = 0
+    var e: ex.Exc = ex.exc_none()
+    if !dp.execute_input(&d, input, 0, &res, &e) {
+        var msg: str = tx.u16_to_str(&(*c).work, ex.exc_raw(&e))
+        if e.kind == ex.EX_UNKNOWN_COMMAND { msg = "Unknown or incomplete command, see below for error" }
+        if e.kind == ex.EX_UNKNOWN_ARGUMENT { msg = "Incorrect argument for command" }
+        send_error_text(srv, s, msg, "red")
+        send_context(c, &e)
+    }
+    m.arena_reset(&(*c).work)
+}

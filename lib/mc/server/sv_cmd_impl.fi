@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/server/sv_cmd_impl.fi -- the command handlers (teleport, gamemode, time, say) and their registry keyed by tree path.
+
+import std.rt
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.exc as ex
+import brigadier.argtype as at
+import brigadier.context as cn
+import mc.cmd.cmd_tree as ct
+import mc.cmd.cmd_args as ca
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_chunks
+import mc.server.sv_play
+import mc.server.sv_cmd_state
+import mc.server.v763.sv_fx_v763
+
+export { handlers_register, push_fixed6, reply_text }
+
+const DAY_TICKS: i64 = 24000
+const TIME_DAY: i64 = 1000
+const TIME_NOON: i64 = 6000
+const TIME_NIGHT: i64 = 13000
+const TIME_MIDNIGHT: i64 = 18000
+const XZ_LIMIT: f64 = 30000000.0
+const Y_LIMIT: f64 = 20000000.0
+
+fn add(c: *mut sv_cmd_state.Cmds, path: str, run: fn(u64, u64, *mut ex.Exc) -> i32) {
+    m.arr_push[sv_cmd_state.Handler](&(*c).a, &(*c).handlers, sv_cmd_state.Handler { path: path, run: run })
+}
+
+fn reply_text(c: *mut sv_cmd_state.Cmds, p: u64, n: usize) {
+    sv_send.send_system_chat((*c).srv, (*c).cur, p, n)
+}
+
+fn reply_buf(c: *mut sv_cmd_state.Cmds, b: *mut rt.Buf) {
+    reply_text(c, rt.buf_ptr(b), rt.buf_len(b))
+}
+
+fn push_name(b: *mut rt.Buf, s: *mut sv_state.Session) {
+    rt.buf_push_bytes(b, (&(*s).name[0]) as u64, (*s).name_n)
+}
+
+fn push_fixed6(b: *mut rt.Buf, v: f64) {
+    var x: f64 = v
+    if x < 0.0 {
+        rt.buf_push(b, 45 as u8)
+        x = 0.0 - x
+    }
+    let total: u64 = (x * 1000000.0 + 0.5) as u64
+    rt.buf_push_dec_u64(b, total / 1000000 as u64)
+    rt.buf_push(b, 46 as u8)
+    var div: u64 = 100000
+    while div > 0 as u64 {
+        rt.buf_push(b, (48 + ((total % 1000000 as u64) / div) % 10 as u64) as u8)
+        div = div / 10 as u64
+    }
+}
+
+fn arg_of(c: *mut sv_cmd_state.Cmds, ctx: u64, name: str) -> *mut at.Value {
+    let p: *mut cn.PArg = cn.ctx_find_arg(ctx, tx.u16_from_str(&(*c).work, name))
+    if p as u64 == 0 {
+        return 0 as *mut at.Value
+    }
+    return &(*p).v
+}
+
+fn fail(c: *mut sv_cmd_state.Cmds, err: *mut ex.Exc, text: str) -> i32 {
+    *err = ex.exc_custom(&(*c).work, text)
+    return 0
+}
+
+fn in_bounds(x: f64, y: f64, z: f64) -> bool {
+    return x == x && y == y && z == z && x > 0.0 - XZ_LIMIT && x < XZ_LIMIT && z > 0.0 - XZ_LIMIT && z < XZ_LIMIT && y > 0.0 - Y_LIMIT && y < Y_LIMIT
+}
+
+fn h_teleport_location(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    let v: *mut at.Value = arg_of(c, ctx, "location")
+    let cs: *mut ca.Coords = (*v).i as u64 as *mut ca.Coords
+    let s: *mut sv_state.Session = (*c).cur
+    if (*cs).local {
+        return fail(c, err, "Local coordinates are not supported")
+    }
+    let w: ca.V3 = ca.coords_world(cs, (*s).x, (*s).y, (*s).z)
+    if !in_bounds(w.x, w.y, w.z) {
+        return fail(c, err, "Invalid position for teleport")
+    }
+    (*s).x = w.x
+    (*s).y = w.y
+    (*s).z = w.z
+    (*s).cx = sv_chunks.chunk_of(w.x)
+    (*s).cz = sv_chunks.chunk_of(w.z)
+    sv_fx_v763.send_position((*c).srv, s)
+    sv_chunks.chunks_send_center((*c).srv, s)
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "Teleported ")
+    push_name(&b, s)
+    sv_send.push_str(&b, " to ")
+    push_fixed6(&b, w.x)
+    sv_send.push_str(&b, ", ")
+    push_fixed6(&b, w.y)
+    sv_send.push_str(&b, ", ")
+    push_fixed6(&b, w.z)
+    reply_buf(c, &b)
+    rt.buf_free(&b)
+    return 1
+}
+
+fn mode_label(mode: i32) -> str {
+    if mode == sv_fx_v763.GM_SURVIVAL { return "Survival Mode" }
+    if mode == sv_fx_v763.GM_CREATIVE { return "Creative Mode" }
+    if mode == sv_fx_v763.GM_ADVENTURE { return "Adventure Mode" }
+    return "Spectator Mode"
+}
+
+fn h_gamemode_self(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    let v: *mut at.Value = arg_of(c, ctx, "gamemode")
+    let s: *mut sv_state.Session = (*c).cur
+    (*s).gamemode = (*v).i as i32
+    sv_fx_v763.send_game_mode((*c).srv, s)
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "Set own game mode to ")
+    sv_send.push_str(&b, mode_label((*s).gamemode))
+    reply_buf(c, &b)
+    rt.buf_free(&b)
+    return 1
+}
+
+fn day_time_of(srv: *mut sv_state.Server) -> i64 {
+    return ((*srv).day_time % DAY_TICKS + DAY_TICKS) % DAY_TICKS
+}
+
+fn reply_time(c: *mut sv_cmd_state.Cmds, head: str, v: i64) {
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, head)
+    rt.buf_push_dec_i64(&b, v)
+    reply_buf(c, &b)
+    rt.buf_free(&b)
+}
+
+fn time_changed(c: *mut sv_cmd_state.Cmds) -> i32 {
+    sv_play.play_time_all((*c).srv)
+    let v: i64 = day_time_of((*c).srv)
+    reply_time(c, "Set the time to ", v)
+    return v as i32
+}
+
+fn h_time_set_value(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = (*arg_of(c, ctx, "time")).i
+    return time_changed(c)
+}
+
+fn h_time_set_day(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = TIME_DAY
+    return time_changed(c)
+}
+
+fn h_time_set_noon(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = TIME_NOON
+    return time_changed(c)
+}
+
+fn h_time_set_night(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = TIME_NIGHT
+    return time_changed(c)
+}
+
+fn h_time_set_midnight(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = TIME_MIDNIGHT
+    return time_changed(c)
+}
+
+fn h_time_add(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    (*(*c).srv).day_time = (*(*c).srv).day_time + (*arg_of(c, ctx, "time")).i
+    return time_changed(c)
+}
+
+fn query_time(c: *mut sv_cmd_state.Cmds, v: i64) -> i32 {
+    reply_time(c, "The time is ", v)
+    return v as i32
+}
+
+fn h_time_query_day(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    return query_time(c, ((*(*c).srv).day_time / DAY_TICKS) % 2147483647)
+}
+
+fn h_time_query_daytime(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    return query_time(c, day_time_of((*c).srv))
+}
+
+fn h_time_query_gametime(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    return query_time(c, (*(*c).srv).game_time % 2147483647)
+}
+
+fn h_say(cu: u64, ctx: u64, err: *mut ex.Exc) -> i32 {
+    let c: *mut sv_cmd_state.Cmds = cu as *mut sv_cmd_state.Cmds
+    let v: *mut at.Value = arg_of(c, ctx, "message")
+    let text: str = tx.u16_to_str(&(*c).work, (*v).s)
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push(&b, 91 as u8)
+    push_name(&b, (*c).cur)
+    sv_send.push_str(&b, "] ")
+    sv_send.push_str(&b, text)
+    sv_play.play_broadcast_chat((*c).srv, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return 1
+}
+
+fn handlers_register(c: *mut sv_cmd_state.Cmds) {
+    add(c, "teleport location", h_teleport_location)
+    add(c, "gamemode gamemode", h_gamemode_self)
+    add(c, "time set time", h_time_set_value)
+    add(c, "time set day", h_time_set_day)
+    add(c, "time set noon", h_time_set_noon)
+    add(c, "time set night", h_time_set_night)
+    add(c, "time set midnight", h_time_set_midnight)
+    add(c, "time add time", h_time_add)
+    add(c, "time query day", h_time_query_day)
+    add(c, "time query daytime", h_time_query_daytime)
+    add(c, "time query gametime", h_time_query_gametime)
+    add(c, "say message", h_say)
+}
