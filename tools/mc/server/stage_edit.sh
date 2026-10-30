@@ -54,6 +54,6 @@ fs.writeFileSync(process.argv[2], lines.join("\n") + "\n")
     echo stop >&5
     wait $VEPID
     exec 5>&-
-    bad=$(grep -E 'WARN|ERROR|Exception' "$W/vedit/server.out" | grep -viE "Can't keep up|Ambiguity|has been deprecated" | head -5)
+    bad=$(grep -E 'WARN|ERROR|Exception' "$W/vedit/server.out" | grep -viE "Can't keep up|Ambiguity|has been deprecated|OFFLINE/INSECURE|no attempt to authenticate|While this makes|To change this" | head -5)
     if [ -z "$bad" ]; then echo "  ok    vanilla loaded the saved copy without chunk warnings"; else echo "  FAIL  vanilla warnings:"; echo "$bad"; ERR=1; fi
 fi

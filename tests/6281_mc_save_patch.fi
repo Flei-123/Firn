@@ -1,0 +1,196 @@
+// expect_exit: 0
+// tests/6281_mc_save_patch.fi -- save_patch: patched chunk NBT read back through save_chunk equals the edited column.
+import std.rt
+import std.bytes
+import std.nbt
+import mc.mc_nbt
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.save.save_chunk
+import mc.save.save_patch
+
+const MIN_Y: i32 = 0 - 64
+const COLUMN_CELLS: usize = 98304
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn hook_edited(ctx: u64, x: i32, y: i32, z: i32) -> bool {
+    return x == 1 && y == 5 && z == 2
+}
+
+fn lookup(r: *mut mc_registry.Registry, text: str) -> i32 {
+    return mc_registry.reg_state_by_text(r, text.p as u64, text.n)
+}
+
+fn put_block_entity(b: *mut bytes.Bytes, x: i32, y: i32, z: i32) {
+    nbt.nbt_int(b, "x".p as u64, 1, x)
+    nbt.nbt_int(b, "y".p as u64, 1, y)
+    nbt.nbt_int(b, "z".p as u64, 1, z)
+    nbt.nbt_string(b, "id".p as u64, 2, "minecraft:chest".p as u64, 15)
+    nbt.nbt_end(b)
+}
+
+fn put_section(b: *mut bytes.Bytes, y: i32) {
+    nbt.nbt_byte(b, "Y".p as u64, 1, y as i8)
+    var idx: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&idx, 8192)
+    idx.len = 8192
+    var i: usize = 0
+    while i < 4096 {
+        rt.st16(idx.ptr, i, ((i / 61) % 3) as u16)
+        i = i + 1
+    }
+    save_chunk.write_block_states(b, "minecraft:air\nminecraft:stone\nminecraft:dirt", 3, idx.ptr)
+    var bio: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&bio, 128)
+    bio.len = 128
+    i = 0
+    while i < 64 {
+        rt.st16(bio.ptr, i, (i % 2) as u16)
+        i = i + 1
+    }
+    save_chunk.write_biomes(b, "minecraft:plains\nminecraft:desert", 2, bio.ptr)
+    nbt.nbt_end(b)
+    rt.buf_free(&idx)
+    rt.buf_free(&bio)
+}
+
+fn build_source(nb: *mut bytes.Bytes) {
+    nbt.nbt_root_begin(nb, "".p as u64, 0)
+    nbt.nbt_int(nb, "DataVersion".p as u64, 11, 3465)
+    nbt.nbt_int(nb, "xPos".p as u64, 4, 0)
+    nbt.nbt_int(nb, "zPos".p as u64, 4, 0)
+    nbt.nbt_string(nb, "Status".p as u64, 6, "minecraft:full".p as u64, 14)
+    nbt.nbt_long(nb, "InhabitedTime".p as u64, 13, 77)
+    nbt.nbt_compound_begin(nb, "Heightmaps".p as u64, 10)
+    nbt.nbt_end(nb)
+    nbt.nbt_list_open(nb, "sections".p as u64, 8, 10 as u8, 2)
+    put_section(nb, 0)
+    put_section(nb, 2)
+    nbt.nbt_list_open(nb, "block_entities".p as u64, 14, 10 as u8, 2)
+    put_block_entity(nb, 1, 5, 2)
+    put_block_entity(nb, 3, 40, 4)
+    nbt.nbt_byte(nb, "isLightOn".p as u64, 9, 1 as i8)
+    nbt.nbt_end(nb)
+}
+
+fn fill_column(col: u64, ids: u64, sy: i32, salt: usize) {
+    let base: usize = ((sy * 16 - MIN_Y) as usize) * 256
+    var j: usize = 0
+    while j < 4096 {
+        rt.st16(col, base + j, rt.ld32(ids, (j * 7 + salt) % 5) as u16)
+        j = j + 1
+    }
+}
+
+fn section_matches(ch: *mut save_chunk.Chunk, sec: u32, reg: *mut mc_registry.Registry, col: u64, sy: i32) -> bool {
+    var idx: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&idx, 8192)
+    idx.len = 8192
+    if !(save_chunk.section_blocks(ch, sec, idx.ptr) catch false) {
+        rt.buf_free(&idx)
+        return false
+    }
+    let base: usize = ((sy * 16 - MIN_Y) as usize) * 256
+    var text: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    var j: usize = 0
+    while j < 4096 && ok {
+        save_chunk.section_block_text(ch, sec, rt.ld16(idx.ptr, j) as u32, &text)
+        if mc_registry.reg_state_by_text(reg, rt.buf_ptr(&text), rt.buf_len(&text)) != (rt.ld16(col, base + j) as i32) {
+            ok = false
+        }
+        j = j + 1
+    }
+    rt.buf_free(&idx)
+    rt.buf_free(&text)
+    return ok
+}
+
+fn sections_equal(a: *mut save_chunk.Chunk, sa: u32, b: *mut save_chunk.Chunk, sb: u32) -> bool {
+    var ia: rt.Buf = rt.buf_new()
+    var ib: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&ia, 8192)
+    rt.buf_reserve(&ib, 8192)
+    ia.len = 8192
+    ib.len = 8192
+    let ok: bool = (save_chunk.section_blocks(a, sa, ia.ptr) catch false) && (save_chunk.section_blocks(b, sb, ib.ptr) catch false)
+    let same: bool = ok && rt.mem_eq(ia.ptr, ib.ptr, 8192)
+    rt.buf_free(&ia)
+    rt.buf_free(&ib)
+    return same
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    check(mc_versions.version_by_protocol(763, &v), 1)
+    var reg: mc_registry.Registry = v.registry_of()
+    let ids: u64 = rt.heap_alloc(20)
+    rt.st32(ids, 0, lookup(&reg, "minecraft:air") as u32)
+    rt.st32(ids, 1, lookup(&reg, "minecraft:stone") as u32)
+    rt.st32(ids, 2, lookup(&reg, "minecraft:grass_block[snowy=true]") as u32)
+    rt.st32(ids, 3, lookup(&reg, "minecraft:oak_stairs[facing=east,half=top,shape=straight,waterlogged=false]") as u32)
+    rt.st32(ids, 4, lookup(&reg, "minecraft:water[level=3]") as u32)
+    var k: usize = 0
+    while k < 5 {
+        check((rt.ld32(ids, k) as i32) >= 0, 2)
+        k = k + 1
+    }
+
+    var nb: bytes.Bytes = bytes.bytes_new()
+    build_source(&nb)
+    var src: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    check(save_chunk.chunk_open(&src, bytes.bytes_ptr(&nb), bytes.bytes_len(&nb)) catch false, 3)
+    check(save_chunk.chunk_is_full(&src), 4)
+
+    let col: u64 = rt.heap_alloc(COLUMN_CELLS * 2)
+    rt.mem_set(col, 0 as u8, COLUMN_CELLS * 2)
+    fill_column(col, ids, 0, 1)
+    fill_column(col, ids, 1, 3)
+
+    let mask: u64 = (1 as u64) << 8 | (1 as u64) << 9
+    let hooks: save_patch.PatchHooks = save_patch.PatchHooks { ctx: 0, edited: hook_edited }
+    var out: bytes.Bytes = bytes.bytes_new()
+    check(save_patch.patch_chunk(&src, &reg, col, mask, hooks, &out), 5)
+
+    var dst: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    check(save_chunk.chunk_open(&dst, bytes.bytes_ptr(&out), bytes.bytes_len(&out)) catch false, 6)
+    check(save_chunk.chunk_is_full(&dst), 7)
+    check(save_chunk.chunk_data_version(&dst) == 3465, 8)
+    check(save_chunk.chunk_section_count(&dst) == 3, 9)
+    let s0: u32 = save_chunk.chunk_section(&dst, 0 as u32)
+    let s1: u32 = save_chunk.chunk_section(&dst, 1 as u32)
+    let s2: u32 = save_chunk.chunk_section(&dst, 2 as u32)
+    check(save_chunk.chunk_section_y(&dst, s0) == 0 && save_chunk.chunk_section_y(&dst, s1) == 1 && save_chunk.chunk_section_y(&dst, s2) == 2, 10)
+    check(section_matches(&dst, s0, &reg, col, 0), 11)
+    check(section_matches(&dst, s1, &reg, col, 1), 12)
+    check(sections_equal(&src, save_chunk.chunk_section(&src, 1 as u32), &dst, s2), 13)
+    check(save_chunk.chunk_block_entity_count(&dst) == 1, 14)
+    check(mc_nbt.nbt_get(&dst.doc, dst.level, "Heightmaps".p as u64, 10) == 0 as u32, 15)
+    let lit: u32 = mc_nbt.nbt_get(&dst.doc, dst.level, "isLightOn".p as u64, 9)
+    check(lit != 0 as u32 && mc_nbt.nbt_i64(&dst.doc, lit) == 0, 16)
+    let inh: u32 = mc_nbt.nbt_get(&dst.doc, dst.level, "InhabitedTime".p as u64, 13)
+    check(inh != 0 as u32 && mc_nbt.nbt_i64(&dst.doc, inh) == 77, 17)
+
+    var out2: bytes.Bytes = bytes.bytes_new()
+    check(save_patch.patch_chunk(&src, &reg, col, 0 as u64, hooks, &out2), 18)
+    var same: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
+    check(save_chunk.chunk_open(&same, bytes.bytes_ptr(&out2), bytes.bytes_len(&out2)) catch false, 19)
+    check(save_chunk.chunk_section_count(&same) == 2, 20)
+    check(sections_equal(&src, save_chunk.chunk_section(&src, 0 as u32), &same, save_chunk.chunk_section(&same, 0 as u32)), 21)
+
+    save_chunk.chunk_close(&same)
+    save_chunk.chunk_close(&dst)
+    save_chunk.chunk_close(&src)
+    bytes.bytes_free(&out2)
+    bytes.bytes_free(&out)
+    bytes.bytes_free(&nb)
+    rt.heap_free(col, COLUMN_CELLS * 2)
+    rt.heap_free(ids, 20)
+    return 0
+}
