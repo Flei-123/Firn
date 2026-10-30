@@ -90,6 +90,16 @@ const MAX_TRIPS: u64 = 16;
 const BUDGET: usize = 640;
 /// At most this many edges leave the loop besides the header's own exit.
 const MAX_SIDE_EXITS: usize = 4;
+const PARTIAL_MAX_TRIPS: u64 = 1 << 20;
+const PARTIAL_BUDGET: usize = 96;
+const PARTIAL_FACTORS: [u64; 3] = [8, 4, 2];
+
+fn partial_budget() -> usize {
+    std::env::var("FIRN_UNROLL_PARTIAL_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PARTIAL_BUDGET)
+}
 
 fn budget() -> usize {
     std::env::var("FIRN_UNROLL_BUDGET")
@@ -110,7 +120,7 @@ pub fn run(f: &mut Func) -> usize {
     // One loop per round: the analysis is rebuilt after every change, so
     // no stale block or value numbers are ever used.
     while n < 64 {
-        match find(f) {
+        match find(f, false) {
             Some(plan) => {
                 apply(f, &plan);
                 n += 1;
@@ -118,7 +128,20 @@ pub fn run(f: &mut Func) -> usize {
             None => break,
         }
     }
-    n
+    if std::env::var_os("FIRN_NO_UNROLL_PARTIAL").is_some() {
+        return n;
+    }
+    let mut m = 0;
+    while m < 64 {
+        match find(f, true) {
+            Some(plan) => {
+                apply_partial(f, &plan);
+                m += 1;
+            }
+            None => break,
+        }
+    }
+    n + m
 }
 
 struct Plan {
@@ -133,6 +156,7 @@ struct Plan {
     /// all loop blocks, header first, in block order after that
     blocks: Vec<usize>,
     trips: u64,
+    factor: u64,
     /// the loop has exits besides the header's (`while a && !done`)
     side: bool,
 }
@@ -151,7 +175,7 @@ fn preds_of(f: &Func) -> Vec<Vec<usize>> {
     preds
 }
 
-fn find(f: &Func) -> Option<Plan> {
+fn find(f: &Func, partial: bool) -> Option<Plan> {
     let nb = f.blocks.len();
     if nb < 2 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return None;
@@ -247,7 +271,7 @@ fn find(f: &Func) -> Option<Plan> {
                 }
             }
         }
-        if side_edges > MAX_SIDE_EXITS {
+        if side_edges > MAX_SIDE_EXITS || (partial && side_edges > 0) {
             continue 'head;
         }
         // the header: brcond on a compare of a header phi with a constant
@@ -333,9 +357,10 @@ fn find(f: &Func) -> Option<Plan> {
             None => continue,
         };
         let ty = ndef.ty;
-        if ty != cty {
+        if ty != cty || (partial && step != 1 && step != -1) {
             continue;
         }
+        let max_trips = if partial { PARTIAL_MAX_TRIPS } else { MAX_TRIPS };
         // simulate
         let mut v = ty.truncate(init);
         let mut trips: u64 = 0;
@@ -345,7 +370,7 @@ fn find(f: &Func) -> Option<Plan> {
                 break;
             }
             trips += 1;
-            if trips > MAX_TRIPS {
+            if trips > max_trips {
                 continue 'head;
             }
             let raw = v + step;
@@ -371,10 +396,26 @@ fn find(f: &Func) -> Option<Plan> {
             }
             size += 1; // the terminator
         }
-        let fits = size.saturating_mul(trips as usize) <= limit;
+        let factor = if partial {
+            let full_fits = trips <= MAX_TRIPS && size.saturating_mul(trips as usize) <= limit;
+            let pb = partial_budget();
+            if full_fits {
+                0
+            } else {
+                PARTIAL_FACTORS
+                    .iter()
+                    .copied()
+                    .find(|&u| trips % u == 0 && trips >= 2 * u && size.saturating_mul(u as usize) <= pb)
+                    .unwrap_or(0)
+            }
+        } else {
+            1
+        };
+        let fits = if partial { factor > 1 } else { size.saturating_mul(trips as usize) <= limit };
         if std::env::var_os("FIRN_UNROLL_TRACE").is_some() {
-            eprintln!("unroll {} bb{}: {} passes x {} = {} {}", f.name, h, trips, size,
-                      size * trips as usize, if fits { "UNROLLED" } else { "too big" });
+            eprintln!("unroll {} bb{}: {} passes x {} = {} {} {}", f.name, h, trips, size,
+                      size * trips as usize, if fits { "UNROLLED" } else { "too big" },
+                      if partial { format!("partial x{}", factor) } else { String::new() });
         }
         if !fits {
             continue;
@@ -406,7 +447,7 @@ fn find(f: &Func) -> Option<Plan> {
                 }
             }
         }
-        return Some(Plan { p, h, x, body, latch, blocks, trips, side: side_edges > 0 });
+        return Some(Plan { p, h, x, body, latch, blocks, trips, factor, side: side_edges > 0 });
     }
     None
 }
@@ -688,6 +729,118 @@ fn apply(f: &mut Func, pl: &Plan) {
     for &b in &pl.blocks {
         f.blocks[b].insts.clear();
         f.blocks[b].term = Term::Br(b as BlockId);
+    }
+}
+
+fn apply_partial(f: &mut Func, pl: &Plan) {
+    let h = pl.h;
+    let u = pl.factor as usize;
+    let mut hphis: Vec<(Val, Val)> = Vec::new();
+    for i in &f.blocks[h].insts {
+        if let Op::Phi { incoming } = &i.op {
+            let d = i.dst.expect("phi without a result");
+            let from_l = incoming.iter().find(|(q, _)| *q as usize == pl.latch).map(|(_, v)| *v).unwrap();
+            hphis.push((d, from_l));
+        }
+    }
+    let mut bmap: Vec<HashMap<usize, BlockId>> = Vec::with_capacity(u);
+    bmap.push(pl.blocks.iter().map(|&b| (b, b as BlockId)).collect());
+    for _ in 1..u {
+        let mut m = HashMap::default();
+        for &b in &pl.blocks {
+            m.insert(b, f.add_block());
+        }
+        bmap.push(m);
+    }
+    let resolve = |m: &HashMap<Val, Val>, v: Val| -> Val { m.get(&v).copied().unwrap_or(v) };
+    let mut prev: HashMap<Val, Val> = HashMap::default();
+    for j in 1..u {
+        let mut vm: HashMap<Val, Val> = HashMap::default();
+        for &(d, from_l) in &hphis {
+            vm.insert(d, resolve(&prev, from_l));
+        }
+        for &b in &pl.blocks {
+            let skip = if b == h { f.blocks[b].phi_count() } else { 0 };
+            let dsts: Vec<(Val, FTy)> = f.blocks[b].insts[skip..]
+                .iter()
+                .filter_map(|i| i.dst.map(|d| (d, f.val_ty(d))))
+                .collect();
+            for (d, t) in dsts {
+                let nvv = f.new_val_pub(t);
+                if f.no_coalesce.contains(&d) {
+                    f.no_coalesce.insert(nvv);
+                }
+                vm.insert(d, nvv);
+            }
+        }
+        for &b in &pl.blocks {
+            let nbid = bmap[j][&b];
+            let skip = if b == h { f.blocks[b].phi_count() } else { 0 };
+            let mut insts: Vec<Inst> = Vec::with_capacity(f.blocks[b].insts.len());
+            for i in &f.blocks[b].insts[skip..] {
+                let mut ni = i.clone();
+                if let Some(d) = ni.dst {
+                    ni.dst = Some(vm[&d]);
+                }
+                if let Op::Phi { incoming } = &mut ni.op {
+                    for (q, v) in incoming.iter_mut() {
+                        *q = bmap[j][&(*q as usize)];
+                        *v = resolve(&vm, *v);
+                    }
+                    incoming.sort_by_key(|(q, _)| *q);
+                } else {
+                    map_all(&mut ni.op, &vm);
+                }
+                insts.push(ni);
+            }
+            let tb = |s: BlockId| -> BlockId {
+                let s = s as usize;
+                if s == h {
+                    if j + 1 < u { bmap[j + 1][&h] } else { h as BlockId }
+                } else if let Some(&n) = bmap[j].get(&s) {
+                    n
+                } else {
+                    s as BlockId
+                }
+            };
+            let term = if b == h {
+                Term::Br(bmap[j][&pl.body])
+            } else {
+                match &f.blocks[b].term {
+                    Term::Br(s) => Term::Br(tb(*s)),
+                    Term::BrCond { cond, then_bb, else_bb } => Term::BrCond {
+                        cond: resolve(&vm, *cond),
+                        then_bb: tb(*then_bb),
+                        else_bb: tb(*else_bb),
+                    },
+                    Term::Switch { val, ty, cases, default } => Term::Switch {
+                        val: resolve(&vm, *val),
+                        ty: *ty,
+                        cases: cases.iter().map(|(c, s)| (*c, tb(*s))).collect(),
+                        default: tb(*default),
+                    },
+                    Term::Ret(v) => Term::Ret(v.map(|v| resolve(&vm, v))),
+                    Term::Unset => Term::Unset,
+                }
+            };
+            let blk = &mut f.blocks[nbid as usize];
+            blk.insts = insts;
+            blk.term = term;
+        }
+        prev = vm;
+    }
+    retarget(&mut f.blocks[pl.latch].term, h as BlockId, bmap[1][&h]);
+    let last_latch = bmap[u - 1][&pl.latch];
+    for i in f.blocks[h].insts.iter_mut() {
+        if let Op::Phi { incoming } = &mut i.op {
+            for (q, v) in incoming.iter_mut() {
+                if *q as usize == pl.latch {
+                    *q = last_latch;
+                    *v = resolve(&prev, *v);
+                }
+            }
+            incoming.sort_by_key(|(q, _)| *q);
+        }
     }
 }
 

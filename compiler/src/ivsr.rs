@@ -277,6 +277,7 @@ fn reduce_loop(
     let lat_id = latch as u32;
     let pre_id = pre as u32;
     let mut def_inst: HashMap<Val, (usize, usize)> = HashMap::default();
+    let mut chained: Vec<(Val, Val, i128)> = Vec::new();
     for &bi in body.iter() {
         for (ii, i) in f.blocks[bi].insts.iter().enumerate() {
             if let Some(d) = i.dst {
@@ -300,31 +301,10 @@ fn reduce_loop(
             Some((_, v)) => *v,
             None => continue,
         };
-        let (nb, ni) = match def_inst.get(&next) {
-            Some(x) => *x,
-            None => continue,
-        };
-        let ni = &f.blocks[nb].insts[ni];
-        let step = match &ni.op {
-            Op::Bin(BinOp::Add, a, b)
-            | Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Add, a, b } => {
-                if *a == d {
-                    inv_of(*b)
-                } else if *b == d {
-                    inv_of(*a)
-                } else {
-                    None
-                }
+        if let Some((s, links)) = chain_step(f, &def_inst, &inv_of, d, next, i.ty) {
+            if let (true, Inv::C(c)) = (links > 1, &s) {
+                chained.push((d, next, *c));
             }
-            Op::Bin(BinOp::Sub, a, b)
-            | Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Sub, a, b }
-                if *a == d =>
-            {
-                inv_of(*b).map(|s| sub(Inv::C(0), s))
-            }
-            _ => None,
-        };
-        if let (Some(s), true) = (step, ni.ty == i.ty) {
             ivs.insert(d, (init, s, next));
         }
     }
@@ -529,18 +509,37 @@ fn reduce_loop(
             }
         }
     }
-    let mut roots: Vec<Val> = used_outside
+    let mut cands: Vec<Val> = used_outside
         .into_iter()
         .filter(|v| {
-            let x = &aff[v];
-            worth(f, *v, x) && !ivs.contains_key(v) && !no_root.contains(v) && !ivs.values().any(|(_, _, n)| n == v)
+            !ivs.contains_key(v) && !no_root.contains(v) && !ivs.values().any(|(_, _, n)| n == v)
                 // a value used after the loop keeps its old definition (the
                 // phi would hold the value of the NEXT pass there)
                 && !used_after_loop(f, *v, body)
         })
         .collect();
-    roots.sort();
-    if roots.is_empty() {
+    cands.sort();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut ivlist: Vec<Val> = ivs.keys().copied().collect();
+    ivlist.sort();
+    for p in ivlist {
+        let (key, off) = group_key(f, p, &aff[&p]);
+        groups.push(Group { key, members: vec![(p, off)], worth: false, phi: Some(p) });
+    }
+    for r in cands {
+        let x = &aff[&r];
+        let (key, off) = group_key(f, r, x);
+        let w = worth(f, r, x);
+        match groups.iter_mut().find(|g| g.key == key) {
+            Some(g) => {
+                g.members.push((r, off));
+                g.worth |= w;
+            }
+            None => groups.push(Group { key, members: vec![(r, off)], worth: w, phi: None }),
+        }
+    }
+    groups.retain(|g| g.worth);
+    if groups.is_empty() {
         return 0;
     }
 
@@ -552,16 +551,27 @@ fn reduce_loop(
     let mut new_pre: Vec<Inst> = Vec::new();
     let mut new_latch: Vec<Inst> = Vec::new();
     let mut new_phis: Vec<Inst> = Vec::new();
-    for r in roots {
-        let x = aff[&r].clone();
-        let key = format!("{:?}", (x.iv, &x.a, &x.b, x.base, f.val_ty(r)));
-        if let Some((_, q)) = made.iter().find(|(k, _)| *k == key) {
-            map.insert(r, *q);
+    let mut rewrites: Vec<(Val, Val, Val)> = Vec::new();
+    for g in groups {
+        if let Some(p) = g.phi {
+            let pty = f.val_ty(p);
+            for &(m, off) in &g.members[1..] {
+                if off == 0 {
+                    map.insert(m, p);
+                } else {
+                    let c = f.new_val_pub(pty);
+                    new_pre.push(Inst::like(Some(c), pty, Op::Const(pty.truncate(off)), pre_loc));
+                    rewrites.push((m, p, c));
+                }
+            }
             continue;
         }
         if made.len() >= MAX_NEW_PHIS {
             break;
         }
+        let (r, off0) = g.members[0];
+        let x = aff[&r].clone();
+        let key = g.key.clone();
         let ity = f.val_ty(x.iv);
         let rty = f.val_ty(r);
         let (init, step, _) = ivs[&x.iv].clone();
@@ -594,10 +604,25 @@ fn reduce_loop(
                 f.name, r, q, x.iv, x.a, x.b, x.base);
         }
         made.push((key, q));
-        map.insert(r, q);
+        for &(m, off) in &g.members {
+            let d = off.wrapping_sub(off0);
+            if d == 0 {
+                map.insert(m, q);
+            } else {
+                let c = f.new_val_pub(ity);
+                new_pre.push(Inst::like(Some(c), ity, Op::Const(ity.truncate(d)), pre_loc));
+                rewrites.push((m, q, c));
+            }
+        }
     }
-    if map.is_empty() {
+    if map.is_empty() && rewrites.is_empty() {
         return 0;
+    }
+    for &(p, next, step) in &chained {
+        let pty = f.val_ty(p);
+        let c = f.new_val_pub(pty);
+        new_pre.push(Inst::like(Some(c), pty, Op::Const(pty.truncate(step)), pre_loc));
+        rewrites.push((next, p, c));
     }
     TOUCHED.with(|t| {
         t.borrow_mut().insert(f.name.clone());
@@ -606,6 +631,16 @@ fn reduce_loop(
     // never contain the terminator), the phis at the top of the header, the
     // steps at the end of the latch
     f.blocks[pre].insts.extend(new_pre);
+    for &(m, q, c) in &rewrites {
+        if let Some(&(bi, ii)) = def_inst.get(&m) {
+            let ins = &mut f.blocks[bi].insts[ii];
+            ins.op = if matches!(ins.ty, FTy::Ptr) {
+                Op::PtrAdd { base: q, off: c }
+            } else {
+                Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Add, a: q, b: c }
+            };
+        }
+    }
     let hp = f.blocks[h].phi_count();
     for (k, p) in new_phis.into_iter().enumerate() {
         f.blocks[h].insts.insert(hp + k, p);
@@ -613,7 +648,100 @@ fn reduce_loop(
     f.blocks[latch].insts.extend(new_latch);
     // rewrite the uses of the roots, but not inside the new step code
     crate::mem2reg::replace_uses(f, &map);
-    map.len()
+    map.len() + rewrites.len()
+}
+
+struct Group {
+    key: String,
+    members: Vec<(Val, i128)>,
+    worth: bool,
+    phi: Option<Val>,
+}
+
+type Poly = std::collections::BTreeMap<Vec<Val>, i128>;
+
+fn poly(e: &Inv) -> Poly {
+    let mut out = Poly::new();
+    match e {
+        Inv::C(c) => {
+            out.insert(Vec::new(), *c);
+        }
+        Inv::V(v) => {
+            out.insert(vec![*v], 1);
+        }
+        Inv::Add(a, b) | Inv::Sub(a, b) => {
+            let neg = matches!(e, Inv::Sub(..));
+            out = poly(a);
+            for (m, c) in poly(b) {
+                let c = if neg { c.wrapping_neg() } else { c };
+                let t = out.entry(m).or_insert(0);
+                *t = t.wrapping_add(c);
+            }
+        }
+        Inv::Mul(a, b) => {
+            let (pa, pb) = (poly(a), poly(b));
+            for (ma, ca) in &pa {
+                for (mb, cb) in &pb {
+                    let mut m = ma.clone();
+                    m.extend(mb.iter().copied());
+                    m.sort();
+                    let t = out.entry(m).or_insert(0);
+                    *t = t.wrapping_add(ca.wrapping_mul(*cb));
+                }
+            }
+        }
+    }
+    out.retain(|_, c| *c != 0);
+    out
+}
+
+fn group_key(f: &Func, r: Val, x: &Aff) -> (String, i128) {
+    let ty = f.val_ty(r);
+    let mut pb = poly(&x.b);
+    let off = pb.remove(&Vec::new()).unwrap_or(0);
+    let pa: Poly = poly(&x.a).into_iter().map(|(m, c)| (m, ty.truncate(c))).filter(|(_, c)| *c != 0).collect();
+    let pb: Poly = pb.into_iter().map(|(m, c)| (m, ty.truncate(c))).filter(|(_, c)| *c != 0).collect();
+    (format!("{:?}", (x.iv, pa, pb, x.base, ty)), ty.truncate(off))
+}
+
+fn chain_step(
+    f: &Func,
+    def_inst: &HashMap<Val, (usize, usize)>,
+    inv_of: &dyn Fn(Val) -> Option<Inv>,
+    phi: Val,
+    next: Val,
+    ty: FTy,
+) -> Option<(Inv, usize)> {
+    let mut cur = next;
+    let mut acc = Inv::C(0);
+    for links in 1..64 {
+        let &(nb, ni) = def_inst.get(&cur)?;
+        let ins = &f.blocks[nb].insts[ni];
+        if ins.ty != ty {
+            return None;
+        }
+        let (prev, s) = match &ins.op {
+            Op::Bin(BinOp::Add, a, b)
+            | Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Add, a, b } => {
+                match (inv_of(*b), inv_of(*a)) {
+                    (Some(s), _) => (*a, s),
+                    (None, Some(s)) => (*b, s),
+                    _ => return None,
+                }
+            }
+            Op::Bin(BinOp::Sub, a, b)
+            | Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Sub, a, b } => {
+                (*a, sub(Inv::C(0), inv_of(*b)?))
+            }
+            _ => return None,
+        };
+        acc = add(acc, s);
+        if prev == phi {
+            return Some((acc, links));
+        }
+        cur = prev;
+    }
+    None
 }
 
 /// Does replacing the chain by one `add` per pass save anything? The chain
