@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.ds_tokens
+import fui.editor
+import fui.kit
+import fui.kitcolor
+import fui.kitform
+import fui.painter
+import fui.render
+import fui.screen
+import fui.screenax
+import fui.style
+import fui.theme
+import fui.widget
+import plat.fuiwirt
+
+const NONE: usize = 18446744073709551615
+const MAX_STEPS: usize = 12
+const BTN_BACK: usize = 0
+const BTN_NEXT: usize = 1
+
+struct Step {
+    title: str,
+    lines: str,
+    icon: i64,
+    welcome: bool,
+}
+
+struct Wiz {
+    steps: [Step; 12],
+    n: usize,
+    cur: usize,
+    title: str,
+    back_label: str,
+    next_label: str,
+    finish_label: str,
+    start_label: str,
+    r: [f64; 8],
+    hover: usize,
+    down: usize,
+    foc: usize,
+    done: bool,
+    ctx: u64,
+    draw: fn(u64, *mut render.Ctx, usize, f64, f64, f64, f64, f64, f64),
+    press: fn(u64, usize, f64, f64) -> bool,
+    key: fn(u64, usize, u32, u32) -> bool,
+    text: fn(u64, usize, u32, u32) -> bool,
+    can_next: fn(u64, usize) -> bool,
+    finish: fn(u64),
+    ud: u64,
+}
+
+fn wp(ud: u64) -> *mut Wiz { return ud as *mut Wiz }
+
+fn no_draw(ud: u64, c: *mut render.Ctx, step: usize, x: f64, y: f64, w: f64, h: f64, px: f64, py: f64) {}
+fn no_press(ud: u64, step: usize, x: f64, y: f64) -> bool { return false }
+fn no_key(ud: u64, step: usize, k: u32, mods: u32) -> bool { return false }
+fn always(ud: u64, step: usize) -> bool { return true }
+fn no_finish(ud: u64) {}
+
+fn new(title: str, draw: fn(u64, *mut render.Ctx, usize, f64, f64, f64, f64, f64, f64), can_next: fn(u64, usize) -> bool,
+    finish: fn(u64), ud: u64) -> *mut Wiz {
+    let w: *mut Wiz = rt.heap_alloc(1 << 13) as *mut Wiz
+    var i: usize = 0
+    while i < MAX_STEPS {
+        (*w).steps[i] = Step { title: "", lines: "", icon: 0 - 1, welcome: false }
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        (*w).r[i] = 0.0
+        i = i + 1
+    }
+    (*w).n = 0
+    (*w).cur = 0
+    (*w).title = title
+    (*w).back_label = "Back"
+    (*w).next_label = "Next"
+    (*w).finish_label = "Finish"
+    (*w).start_label = "Get started"
+    (*w).hover = NONE
+    (*w).down = NONE
+    (*w).foc = NONE
+    (*w).done = false
+    (*w).ctx = 0
+    (*w).draw = draw
+    (*w).press = no_press
+    (*w).key = no_key
+    (*w).text = no_key
+    (*w).can_next = can_next
+    (*w).finish = finish
+    (*w).ud = ud
+    return w
+}
+
+fn on_input(w: *mut Wiz, press: fn(u64, usize, f64, f64) -> bool, key: fn(u64, usize, u32, u32) -> bool, text: fn(u64, usize, u32, u32) -> bool) {
+    (*w).press = press
+    (*w).key = key
+    (*w).text = text
+}
+
+fn set_labels(w: *mut Wiz, back: str, next: str, finish: str, start: str) {
+    (*w).back_label = back
+    (*w).next_label = next
+    (*w).finish_label = finish
+    (*w).start_label = start
+}
+
+fn push(w: *mut Wiz, title: str, lines: str, icon: i64, welcome: bool) -> usize {
+    if (*w).n >= MAX_STEPS { return (*w).n - 1 }
+    (*w).steps[(*w).n] = Step { title: title, lines: lines, icon: icon, welcome: welcome }
+    (*w).n = (*w).n + 1
+    return (*w).n - 1
+}
+
+fn welcome(w: *mut Wiz, icon: i64, title: str, lines: str) -> usize { return push(w, title, lines, icon, true) }
+fn step(w: *mut Wiz, title: str, lines: str) -> usize { return push(w, title, lines, 0 - 1, false) }
+
+fn current(w: *mut Wiz) -> usize { return (*w).cur }
+fn finished(w: *mut Wiz) -> bool { return (*w).done }
+fn ctx(w: *mut Wiz) -> *mut render.Ctx { return (*w).ctx as *mut render.Ctx }
+
+fn is_welcome(w: *mut Wiz) -> bool { return (*w).steps[(*w).cur].welcome }
+fn is_last(w: *mut Wiz) -> bool { return (*w).cur + 1 >= (*w).n }
+
+fn allowed(w: *mut Wiz) -> bool {
+    let f: fn(u64, usize) -> bool = (*w).can_next
+    return f((*w).ud, (*w).cur)
+}
+
+fn go_next(w: *mut Wiz) {
+    if !allowed(w) { return }
+    if is_last(w) {
+        if (*w).done { return }
+        (*w).done = true
+        let f: fn(u64) = (*w).finish
+        f((*w).ud)
+        return
+    }
+    (*w).cur = (*w).cur + 1
+    (*w).foc = NONE
+}
+
+fn go_back(w: *mut Wiz) -> bool {
+    if (*w).cur == 0 { return false }
+    (*w).cur = (*w).cur - 1
+    (*w).foc = NONE
+    return true
+}
+
+fn next_label(w: *mut Wiz) -> str {
+    if is_last(w) { return (*w).finish_label }
+    if is_welcome(w) { return (*w).start_label }
+    return (*w).next_label
+}
+
+fn btn_width(c: *mut render.Ctx, label: str) -> f64 {
+    var bw: f64 = kit.button_width(c, label, 0 - 1)
+    if bw < kit.ln(c, 96) { bw = kit.ln(c, 96) }
+    return bw
+}
+
+fn put_rect(w: *mut Wiz, i: usize, x: f64, y: f64, bw: f64, bh: f64) {
+    (*w).r[i * 4] = x
+    (*w).r[i * 4 + 1] = y
+    (*w).r[i * 4 + 2] = bw
+    (*w).r[i * 4 + 3] = bh
+}
+
+fn inside(w: *mut Wiz, i: usize, x: f64, y: f64) -> bool {
+    let rx: f64 = (*w).r[i * 4]
+    let ry: f64 = (*w).r[i * 4 + 1]
+    return x >= rx && x < rx + (*w).r[i * 4 + 2] && y >= ry && y < ry + (*w).r[i * 4 + 3] && (*w).r[i * 4 + 2] > 0.0
+}
+
+fn which(w: *mut Wiz, x: f64, y: f64) -> usize {
+    if inside(w, BTN_NEXT, x, y) { return BTN_NEXT }
+    if inside(w, BTN_BACK, x, y) { return BTN_BACK }
+    return NONE
+}
+
+fn btn_state(w: *mut Wiz, i: usize, enabled: bool) -> u32 {
+    var st: u32 = 0 as u32
+    if !enabled { return kit.ST_DISABLED }
+    if (*w).down == i { st = kit.ST_ACTIVE } else if (*w).hover == i { st = kit.ST_HOVER }
+    if (*w).foc == i { st = st | kit.ST_FOCUS }
+    return st
+}
+
+fn draw_lines(c: *mut render.Ctx, x: f64, y: f64, w: f64, lines: str, big: bool, centered: bool) -> f64 {
+    var size: f64 = kit.ln(c, 14)
+    var lh: f64 = kit.ln(c, 20)
+    if big {
+        size = kit.ln(c, 18)
+        lh = kit.ln(c, 24)
+    }
+    var k: usize = 0
+    var yy: f64 = y
+    while kitform.nth(lines, k).n > 0 {
+        let s: str = kitform.nth(lines, k)
+        var xx: f64 = x
+        if centered { xx = x + (w - kit.text_width(c, size, 400, s)) / 2.0 }
+        kit.draw_label(c, xx, yy, lh, size, 400, kit.tokc(c, style.TOK_TEXT_MUTED), s, 0.0)
+        yy = yy + lh
+        k = k + 1
+    }
+    return yy - y
+}
+
+fn dots(w: *mut Wiz, c: *mut render.Ctx, cx: f64, y: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let d: f64 = kit.ln(c, 8)
+    let gap: f64 = kit.ln(c, 8)
+    let total: f64 = (*w).n as f64 * d + ((*w).n as f64 - 1.0) * gap + kit.ln(c, 16)
+    var x: f64 = cx - total / 2.0
+    var i: usize = 0
+    while i < (*w).n {
+        if i == (*w).cur {
+            painter.round_rect(z, x, y, d + kit.ln(c, 16), d, d / 2.0, kit.accent_gfx(c, style.TOK_BASE))
+            x = x + d + kit.ln(c, 16) + gap
+        } else {
+            painter.round_rect(z, x, y, d, d, d / 2.0, kit.tokc(c, style.TOK_TEXT_DISABLED))
+            x = x + d + gap
+        }
+        i = i + 1
+    }
+}
+
+fn draw_welcome(w: *mut Wiz, c: *mut render.Ctx, cw: f64, ch: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let st: *mut Step = &(*w).steps[(*w).cur]
+    let logo: f64 = kit.ln(c, 96)
+    let title_h: f64 = kit.ln(c, 52)
+    let lines_h: f64 = kit.ln(c, 24) * 2.0
+    let btn_h: f64 = kit.button_height(c)
+    var block: f64 = logo + kit.ln(c, 32) + title_h + kit.ln(c, 8) + lines_h + kit.ln(c, 40) + btn_h
+    var y: f64 = (ch - kit.ln(c, 96) - block) / 2.0
+    if y < kit.ln(c, 24) { y = kit.ln(c, 24) }
+    let lx: f64 = (cw - logo) / 2.0
+    painter.round_rect(z, lx, y, logo, logo, kit.ln(c, 24), kit.accent_gfx(c, style.TOK_BASE))
+    kit.sym(c, (*st).icon, lx + kit.ln(c, 24), y + kit.ln(c, 24), kit.ln(c, 48), kit.tokc(c, style.TOK_TEXT_ON_ACCENT))
+    y = y + logo + kit.ln(c, 32)
+    let ts: f64 = kit.ln(c, 40)
+    let tw: f64 = kit.text_width(c, ts, 600, (*st).title)
+    kit.draw_label(c, (cw - tw) / 2.0, y, title_h, ts, 600, kit.tokc(c, style.TOK_TEXT), (*st).title, 0.0)
+    y = y + title_h + kit.ln(c, 8)
+    draw_lines(c, 0.0, y, cw, (*st).lines, true, true)
+    y = y + lines_h + kit.ln(c, 40)
+    let label: str = next_label(w)
+    let bw: f64 = btn_width(c, label) + kit.ln(c, 32)
+    put_rect(w, BTN_NEXT, (cw - bw) / 2.0, y, bw, btn_h)
+    put_rect(w, BTN_BACK, 0.0, 0.0, 0.0, 0.0)
+    kit.button_draw(c, (cw - bw) / 2.0, y, bw, btn_h, label, 0 - 1, kit.BTN_PRIMARY, btn_state(w, BTN_NEXT, allowed(w)))
+}
+
+fn draw_page(w: *mut Wiz, c: *mut render.Ctx, cw: f64, ch: f64, px: f64, py: f64) {
+    let st: *mut Step = &(*w).steps[(*w).cur]
+    var colw: f64 = cw - kit.ln(c, 48)
+    if colw > kit.ln(c, 560) { colw = kit.ln(c, 560) }
+    let x: f64 = (cw - colw) / 2.0
+    var y: f64 = kit.ln(c, 72)
+    if cw < kit.ln(c, 641) { y = kit.ln(c, 40) }
+    kit.draw_label(c, x, y, kit.ln(c, 36), kit.ln(c, 28), 600, kit.tokc(c, style.TOK_TEXT), (*st).title, 0.0)
+    y = y + kit.ln(c, 44)
+    y = y + draw_lines(c, x, y, colw, (*st).lines, false, false) + kit.ln(c, 24)
+    let foot: f64 = kit.ln(c, 88)
+    let draw: fn(u64, *mut render.Ctx, usize, f64, f64, f64, f64, f64, f64) = (*w).draw
+    draw((*w).ud, c, (*w).cur, x, y, colw, ch - foot - y, px, py)
+    let btn_h: f64 = kit.button_height(c)
+    let by: f64 = ch - kit.ln(c, 32) - btn_h
+    let label: str = next_label(w)
+    let nw: f64 = btn_width(c, label)
+    let bk: f64 = btn_width(c, (*w).back_label)
+    put_rect(w, BTN_NEXT, x + colw - nw, by, nw, btn_h)
+    kit.button_draw(c, x + colw - nw, by, nw, btn_h, label, 0 - 1, kit.BTN_PRIMARY, btn_state(w, BTN_NEXT, allowed(w)))
+    put_rect(w, BTN_BACK, x, by, bk, btn_h)
+    kit.button_draw(c, x, by, bk, btn_h, (*w).back_label, 0 - 1, kit.BTN_SECONDARY, btn_state(w, BTN_BACK, true))
+}
+
+fn paint(ud: u64, c: *mut render.Ctx, cw: f64, ch: f64, px: f64, py: f64) {
+    let w: *mut Wiz = wp(ud)
+    (*w).ctx = c as u64
+    painter.surface(render.ctx_painter(c), 0.0, 0.0, cw, ch, kit.tokc(c, style.TOK_BASE))
+    (*w).hover = which(w, px, py)
+    if is_welcome(w) {
+        draw_welcome(w, c, cw, ch)
+        dots(w, c, cw / 2.0, ch - kit.ln(c, 40))
+        return
+    }
+    draw_page(w, c, cw, ch, px, py)
+    dots(w, c, cw / 2.0, ch - kit.ln(c, 32) - kit.button_height(c) / 2.0 - kit.ln(c, 4))
+}
+
+fn press(ud: u64, x: f64, y: f64) {
+    let w: *mut Wiz = wp(ud)
+    (*w).foc = NONE
+    let b: usize = which(w, x, y)
+    if b != NONE {
+        (*w).down = b
+        return
+    }
+    let f: fn(u64, usize, f64, f64) -> bool = (*w).press
+    f((*w).ud, (*w).cur, x, y)
+}
+
+fn pointer(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let w: *mut Wiz = wp(ud)
+    if kind != fuiwirt.HOOK_UP { return false }
+    let d: usize = (*w).down
+    (*w).down = NONE
+    if d == NONE || which(w, x, y) != d { return false }
+    if d == BTN_NEXT { go_next(w) }
+    if d == BTN_BACK { go_back(w) }
+    return true
+}
+
+fn key(ud: u64, k: u32, mods: u32) -> bool {
+    let w: *mut Wiz = wp(ud)
+    let f: fn(u64, usize, u32, u32) -> bool = (*w).key
+    if f((*w).ud, (*w).cur, k, mods) { return true }
+    if k == editor.KEY_TAB {
+        if (*w).foc == NONE || (*w).foc == BTN_NEXT { (*w).foc = BTN_BACK } else { (*w).foc = BTN_NEXT }
+        if (*w).cur == 0 { (*w).foc = BTN_NEXT }
+        return true
+    }
+    if k == editor.KEY_ENTER {
+        if (*w).foc == BTN_BACK { go_back(w) } else { go_next(w) }
+        return true
+    }
+    if k == editor.KEY_ESC { return go_back(w) }
+    return false
+}
+
+fn text(ud: u64, cp: u32, mods: u32) -> bool {
+    let w: *mut Wiz = wp(ud)
+    let f: fn(u64, usize, u32, u32) -> bool = (*w).text
+    return f((*w).ud, (*w).cur, cp, mods)
+}
+
+fn skin(m: *mut theme.Theme, dark: bool) {
+    ds_tokens.apply(m, dark, 0)
+    ds_tokens.set_accent(m, 0)
+    kitcolor.set_accent(ds_tokens.accent_color(0, dark))
+}
+
+fn run(start: u64, w: *mut Wiz, width: usize, height: usize) -> i32 {
+    if screen.has_arg(start, "--step") != 0 {
+        let a: u64 = screen.arg_after(start, "--step")
+        (*w).cur = (rt.ld8(a, 0) - 48 as u8) as usize
+    }
+    return screen.run_full(start, (*w).title, width, height, w as u64, paint, press, key, text, screen.no_wheel, pointer, skin)
+}

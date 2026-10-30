@@ -858,6 +858,8 @@ build ds_settings
 "$W/ds_settings"
 build ds_feedback
 "$W/ds_feedback"
+echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
+FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
 build kitspec
 "$W/kitspec"
 build screenax
