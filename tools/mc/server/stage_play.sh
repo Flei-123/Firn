@@ -35,7 +35,10 @@ check_play() {
 }
 play_once sp_flat "$W/sp_flat.png"
 check_play sp_flat "$W/sp_flat.png"
-play_once sp_save "$W/sp_save.png" "$WORLD"
+mkdir -p "$W/spworld"
+cp -r "$WORLD" "$W/spworld/world"
+rm -f "$W/spworld/world/session.lock"
+play_once sp_save "$W/sp_save.png" "$W/spworld/world"
 check_play sp_save "$W/sp_save.png"
 if [ -f "$W/sp_flat.png" ] && [ -f "$W/sp_save.png" ] && ! cmp -s "$W/sp_flat.png" "$W/sp_save.png"; then echo "  ok    flat and saved world give different pictures"; else echo "  FAIL  flat and saved world pictures are identical"; touch "$W/failed"; fi
 play_once sp_missing "$W/sp_missing.png" "$W/no_such_world"

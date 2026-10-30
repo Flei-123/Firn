@@ -7,6 +7,8 @@ else
     SVPORT=$(free_port); SFPORT=$(free_port)
     mkdir -p "$W/vsave"
     cp -r "$WORLD" "$W/vsave/world"
+    cp -r "$WORLD" "$W/vsave/fworld"
+    rm -f "$W/vsave/fworld/session.lock"
     rm -f "$W/vsave/world/session.lock"
     node "$TOOLS/patch_level.cjs" "$W/vsave/world/level.dat" randomTickSpeed=0 doFireTick=false doMobSpawning=false doWeatherCycle=false doDaylightCycle=false
     printf 'online-mode=false\nserver-port=%s\nlevel-name=world\nview-distance=8\nsimulation-distance=4\nenforce-secure-profile=false\nspawn-monsters=false\nspawn-animals=false\nspawn-npcs=false\nmax-tick-time=-1\n' "$SVPORT" > "$W/vsave/server.properties"
@@ -14,7 +16,7 @@ else
     mkfifo "$W/vsave/in"; exec 4<>"$W/vsave/in"
     ( cd "$W/vsave" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vsave/in" > server.out 2>&1 ) &
     SVPID=$!
-    "$W/mcsrv" --port "$SFPORT" --world "$WORLD" --ticks 900 > "$W/fs.out" 2>&1 &
+    "$W/mcsrv" --port "$SFPORT" --world "$W/vsave/fworld" --ticks 900 > "$W/fs.out" 2>&1 &
     for i in $(seq 1 120); do grep -q 'Done (' "$W/vsave/server.out" 2>/dev/null && break; sleep 1; done
     grep -q 'Done (' "$W/vsave/server.out" || { echo "  FAIL  vanilla save server did not start"; ERR=1; }
     BOT_HISTS=1 BOT_SECONDS=10 $BOT 127.0.0.1 $SVPORT join VSave > "$W/sv.json" &
