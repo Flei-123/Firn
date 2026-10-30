@@ -22,3 +22,15 @@ anim: `camkeys_new/free/add(k,t,pos,target,fov)/camkeys_at(k,t,&cam)` (smoothste
 video: `video_opts_default()`, `video_parse_args(&opts, start)`, `video_run(&opts, frame_cb: fn(u64 ctx, u64 frame, f64 t, *mut Surface), ctx)`: frames t=i/fps for i in from..to, piped as raw RGBA into ffmpeg (libx264 yuv420p crf 21 faststart, no frame files on disk); `--still <t>` writes one PNG. CLI: --out --fps --duration --width --height --threads --ss --still --from --to.
 
 Video notes: frames are piped to ffmpeg (no frame files, 1280x720x48 s would be 3+ GB on disk); odd sizes are scaled to even; threads/ss are read by the program's own renderer from VideoOpts. Mini demo: tools/scene3d/mini.fi (gate program).
+
+## TONE MAPPING AND MATERIALS
+
+- **Pipeline**: linear scene color (f32) * `Scene.exposure` -> tone map -> average SSAA samples -> sRGB LUT. Tone mapping runs per SSAA sample before averaging (no aliased HDR highlights); the result is per-pixel and bit-identical for any thread count. Overlay is drawn afterwards in sRGB and is untouched.
+- **Modes** (`scene.scene_set_tonemap`, module `tonemap`): `TONEMAP_NONE` (default, identical to the old output), `TONEMAP_REINHARD` (x/(1+x)), `TONEMAP_ACES` (Narkowicz fit), `TONEMAP_FILMIC` (Hable, bias 2, white 11.2).
+- **Exposure**: `Scene.exposure` (linear factor, default 1.0), `scene.scene_set_exposure_ev(&sc, ev)` sets 2^ev.
+- **Glass** (`fresnel.glass_alpha`): opacity rises toward the rim by Schlick Fresnel plus a cubic edge term scaled by `Material.rim`; the center stays clear. Reflections are additive and not scaled by opacity.
+- **Metal / env** (`envmap`): reflection of the hemisphere with a soft horizon (width grows with roughness), roughness blends toward the hemisphere mean, F0 = base color for metal, rough Schlick, no black without lights.
+- **Textures** (`tex.sample`): texel-center bilinear filtering; `material.mat_tiled(m, uv_scale)` sets `tex_repeat` + `uv_scale` (repeat instead of clamp).
+- **Fog**: background blends toward the fog color at the horizon (`fogbg`, derived from the camera basis), so far geometry and sky meet without a seam. Only active with `fog.on`.
+- **New fields**: Scene `exposure`, `tonemap`; Renderer `exposure`, `tonemap`, `hz_c/hz_x/hz_y` (after `fog_far`); Material `tex_repeat`, `uv_scale` (after `spec`).
+- **Showcase**: `tools/scene3d/showcase.fi --still N` (0 none, 1 ACES, 2 none+fog, 3 ACES+fog), test `tests/6305_scene3d_look.fi`.
