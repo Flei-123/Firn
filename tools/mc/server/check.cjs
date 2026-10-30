@@ -55,7 +55,43 @@ function checkWorld(label, f, v) {
   return lines
 }
 
+function checkExtras(label, f, v) {
+  const lines = []
+  const add = (ok, msg) => lines.push((ok ? '  ok    ' : '  FAIL  ') + label + ': ' + msg)
+  const common = Object.keys(f.extras).filter((k) => v.extras[k] && f.hists[k] && v.hists[k] && total(f.hists[k]) > 0 && total(v.hists[k]) > 0)
+  const eq = (k, get) => JSON.stringify(get(f.extras[k])) === JSON.stringify(get(v.extras[k]))
+  const bad = (get) => common.filter((k) => !eq(k, get))
+  const kinds = [['biome cells', (x) => x.biomes], ['light masks', (x) => x.masks], ['sky light arrays', (x) => x.sky], ['block light arrays', (x) => x.blk], ['block entity list', (x) => x.bes]]
+  add(common.length >= 100, common.length + ' saved columns with extras present in both')
+  for (const [name, get] of kinds) {
+    const b = bad(get)
+    add(b.length === 0, name + ' equal to vanilla in ' + (common.length - b.length) + '/' + common.length + ' columns' + (b.length ? ' (first ' + b.slice(0, 3).join(' ') + ')' : ''))
+  }
+  const withBe = common.filter((k) => v.extras[k].bes.length > 0).length
+  const withBiomes = common.filter((k) => new Set(v.extras[k].biomes).size > 1).length
+  add(withBe >= 10, withBe + ' columns carry block entities')
+  add(withBiomes >= 10, withBiomes + ' columns carry more than one biome')
+  return lines
+}
+
 function same_h(a, b) { return JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort()) }
+
+if (process.argv[2] === 'extras' || process.argv[2] === 'extras-mutate') {
+  const f = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))
+  const v = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'))
+  if (process.argv[2] === 'extras-mutate') {
+    for (const k of Object.keys(f.extras)) {
+      const b = f.extras[k].biomes
+      f.extras[k].biomes = (b.charAt(0) === '0' ? '1' : '0') + b.slice(1)
+      f.extras[k].bes.push('0|0|0|0|null')
+    }
+    const lines = checkExtras('counter-check', f, v)
+    process.exit(lines.some((l) => l.indexOf('FAIL') !== -1) ? 0 : 1)
+  }
+  const lines = checkExtras(process.argv[5], f, v)
+  console.log(lines.join('\n'))
+  process.exit(lines.some((l) => l.indexOf('FAIL') !== -1) ? 1 : 0)
+}
 
 if (process.argv[2] === 'world' || process.argv[2] === 'world-mutate') {
   const f = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))

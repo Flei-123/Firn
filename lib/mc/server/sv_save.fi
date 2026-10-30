@@ -11,6 +11,7 @@ import mc.mc_nbt
 import mc.save.save_world
 import mc.save.save_chunk
 import mc.server.sv_world
+import mc.server.sv_be
 
 export { save_source_open }
 
@@ -19,6 +20,10 @@ const HEIGHT: i32 = 384
 const REGION_SLOTS: usize = 4
 const SECTION_CELLS: usize = 4096
 const NAME_BUDGET: usize = 4096
+const SECTION_BIOMES: usize = 64
+const BIOME_BUDGET: usize = 64
+const LIGHT_BYTES: usize = 2048
+const PLAINS_ID: u16 = 39
 
 struct RegionSlot {
     rx: i32,
@@ -36,6 +41,8 @@ struct SaveCtx {
     text: rt.Buf,
     index: u64,
     table: u64,
+    bindex: u64,
+    btable: u64,
 }
 
 fn slot_empty() -> RegionSlot {
@@ -75,10 +82,43 @@ fn load_region(c: *mut SaveCtx, rx: i32, rz: i32) -> *mut RegionSlot {
     return &(*c).slots[victim]
 }
 
-fn copy_section(c: *mut SaveCtx, ck: *mut save_chunk.Chunk, sec: u32, blocks: u64) {
-    let sy: i32 = save_chunk.chunk_section_y(ck, sec)
-    let y0: i32 = sy * 16
-    if y0 < MIN_Y || y0 >= MIN_Y + HEIGHT { return }
+fn biome_id_of(c: *mut SaveCtx, text: *mut rt.Buf) -> u16 {
+    var len: usize = 0
+    var at: usize = 0
+    if (*text).len >= 10 && rt.mem_eq((*text).ptr, "minecraft:".p as u64, 10) { at = 10 }
+    let n: i32 = mc_registry.reg_biome_count(&(*c).reg)
+    var i: i32 = 0
+    while i < n {
+        let p: u64 = mc_registry.reg_biome_name(&(*c).reg, i, &len)
+        var pat: usize = 0
+        if len >= 10 && rt.mem_eq(p, "minecraft:".p as u64, 10) { pat = 10 }
+        if len - pat == (*text).len - at && rt.mem_eq(p + pat as u64, (*text).ptr + at as u64, len - pat) {
+            return mc_registry.reg_biome_id(&(*c).reg, i) as u16
+        }
+        i = i + 1
+    }
+    return PLAINS_ID
+}
+
+fn copy_biomes(c: *mut SaveCtx, ck: *mut save_chunk.Chunk, sec: u32, s: usize, col: *mut sv_world.Column) {
+    let np: u32 = save_chunk.section_biome_palette_size(ck, sec)
+    if np == 0 as u32 { return }
+    let ok: bool = save_chunk.section_biomes(ck, sec, (*c).bindex) catch false
+    if !ok { return }
+    var k: u32 = 0
+    while k < np && (k as usize) < BIOME_BUDGET {
+        save_chunk.section_biome_text(ck, sec, k, &(*c).text)
+        rt.st16((*c).btable, k as usize, biome_id_of(c, &(*c).text))
+        k = k + 1
+    }
+    var j: usize = 0
+    while j < SECTION_BIOMES {
+        rt.st16((*col).biomes, s * SECTION_BIOMES + j, rt.ld16((*c).btable, rt.ld16((*c).bindex, j) as usize))
+        j = j + 1
+    }
+}
+
+fn copy_blocks(c: *mut SaveCtx, ck: *mut save_chunk.Chunk, sec: u32, y0: i32, blocks: u64) {
     let ok: bool = save_chunk.section_blocks(ck, sec, (*c).index) catch false
     if !ok { return }
     let np: u32 = save_chunk.section_block_palette_size(ck, sec)
@@ -99,7 +139,53 @@ fn copy_section(c: *mut SaveCtx, ck: *mut save_chunk.Chunk, sec: u32, blocks: u6
     }
 }
 
-fn fill_chunk(c: *mut SaveCtx, raw_len: usize, blocks: u64) {
+fn any_set(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != 0 as u8 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn copy_light_layer(ck: *mut save_chunk.Chunk, sec: u32, name: str, sky: bool, idx: usize, col: *mut sv_world.Column) {
+    var len: usize = 0
+    let p: u64 = save_chunk.section_light_array(ck, sec, name, &len)
+    if p == 0 || len != LIGHT_BYTES { return }
+    rt.mem_copy(sv_world.column_light_slot(col, sky, idx), p, LIGHT_BYTES)
+    let bit: u64 = (1 as u64) << (idx as u64)
+    let set: bool = any_set(p, LIGHT_BYTES)
+    if sky {
+        if set { (*col).sky_mask = (*col).sky_mask | bit } else { (*col).sky_empty = (*col).sky_empty | bit }
+    } else {
+        if set { (*col).blk_mask = (*col).blk_mask | bit } else { (*col).blk_empty = (*col).blk_empty | bit }
+    }
+}
+
+fn copy_section(c: *mut SaveCtx, ck: *mut save_chunk.Chunk, sec: u32, col: *mut sv_world.Column) {
+    let sy: i32 = save_chunk.chunk_section_y(ck, sec)
+    let y0: i32 = sy * 16
+    if y0 >= MIN_Y && y0 < MIN_Y + HEIGHT {
+        copy_blocks(c, ck, sec, y0, (*col).blocks)
+        copy_biomes(c, ck, sec, ((y0 - MIN_Y) / 16) as usize, col)
+    }
+    let li: i32 = sy - MIN_Y / 16 + 1
+    if li >= 0 && li < (HEIGHT / 16 + 2) {
+        copy_light_layer(ck, sec, "SkyLight", true, li as usize, col)
+        copy_light_layer(ck, sec, "BlockLight", false, li as usize, col)
+    }
+}
+
+fn copy_block_entities(ck: *mut save_chunk.Chunk, col: *mut sv_world.Column) {
+    let n: u32 = save_chunk.chunk_block_entity_count(ck)
+    var i: u32 = 0
+    while i < n {
+        sv_be.be_add_from_nbt(col, &(*ck).doc, save_chunk.chunk_block_entity(ck, i))
+        i = i + 1
+    }
+}
+
+fn fill_chunk(c: *mut SaveCtx, raw_len: usize, col: *mut sv_world.Column) {
     var ck: save_chunk.Chunk = save_chunk.Chunk { doc: mc_nbt.doc_new(), level: 0 as u32, legacy: false }
     let ok: bool = save_chunk.chunk_open(&ck, (*c).raw.ptr, raw_len) catch false
     if !ok { return }
@@ -110,15 +196,17 @@ fn fill_chunk(c: *mut SaveCtx, raw_len: usize, blocks: u64) {
     let ns: u32 = save_chunk.chunk_section_count(&ck)
     var i: u32 = 0
     while i < ns {
-        copy_section(c, &ck, save_chunk.chunk_section(&ck, i), blocks)
+        copy_section(c, &ck, save_chunk.chunk_section(&ck, i), col)
         i = i + 1
     }
+    (*col).has_light = save_chunk.chunk_light_on(&ck)
+    copy_block_entities(&ck, col)
     save_chunk.chunk_close(&ck)
 }
 
-fn save_fill(ctx: u64, cx: i32, cz: i32, blocks: u64) -> bool {
+fn save_fill(ctx: u64, cx: i32, cz: i32, col: *mut sv_world.Column) -> bool {
     let c: *mut SaveCtx = ctx_ptr(ctx)
-    rt.mem_set(blocks, 0 as u8, (HEIGHT as usize) * 512)
+    rt.mem_set((*col).blocks, 0 as u8, (HEIGHT as usize) * 512)
     let rx: i32 = cx >> 5
     let rz: i32 = cz >> 5
     let slot: *mut RegionSlot = load_region(c, rx, rz)
@@ -127,7 +215,7 @@ fn save_fill(ctx: u64, cx: i32, cz: i32, blocks: u64) -> bool {
     rt.buf_clear(&(*c).raw)
     let got: usize = save_world.world_read_chunk(region_dir(c), rx, rz, &(*slot).region, cx & 31, cz & 31, &(*c).raw) catch 99999999999
     if got == 99999999999 { return true }
-    fill_chunk(c, got, blocks)
+    fill_chunk(c, got, col)
     return true
 }
 
@@ -143,6 +231,8 @@ fn save_release(ctx: u64) {
     rt.buf_free(&(*c).text)
     rt.heap_free((*c).index, SECTION_CELLS * 2)
     rt.heap_free((*c).table, NAME_BUDGET * 2)
+    rt.heap_free((*c).bindex, SECTION_BIOMES * 2)
+    rt.heap_free((*c).btable, BIOME_BUDGET * 2)
     var a: [SaveCtx; 2] = [*c; 2]
     rt.heap_free(ctx, ((&a[1]) as u64 - (&a[0]) as u64) as usize)
 }
@@ -192,7 +282,8 @@ fn dir_readable(path: str) -> bool {
 fn save_source_open(ver: *mut mc_version.Version, root: str, biome: i32, out: *mut sv_world.WorldSource) -> bool {
     if !dir_readable(root) { return false }
     var ctx: SaveCtx = SaveCtx { dir: rt.buf_new(), reg: (*ver).registry_of(), slots: [slot_empty(); 4], next: 0,
-        raw: rt.buf_new(), text: rt.buf_new(), index: rt.heap_alloc(SECTION_CELLS * 2), table: rt.heap_alloc(NAME_BUDGET * 2) }
+        raw: rt.buf_new(), text: rt.buf_new(), index: rt.heap_alloc(SECTION_CELLS * 2), table: rt.heap_alloc(NAME_BUDGET * 2),
+        bindex: rt.heap_alloc(SECTION_BIOMES * 2), btable: rt.heap_alloc(BIOME_BUDGET * 2) }
     rt.buf_push_bytes(&ctx.dir, root.p as u64, root.n)
     rt.buf_push_bytes(&ctx.dir, "/region".p as u64, 7)
     var a: [SaveCtx; 2] = [ctx; 2]
