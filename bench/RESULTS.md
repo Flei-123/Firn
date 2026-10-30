@@ -1,5 +1,78 @@
 # Benchmark results (really measured)
 
+## Rust suite: Firn against `rustc -O`, 37 pairs (30.10.2026, firn main e314dc53f)
+
+Instrument for the block "A: Schneller als Rust". Run `/root/jarvis/bin/heavy bash bench/rust_suite.sh`; options are in the header of `bench/rust_suite.py`.
+
+* default: instructions (callgrind, exact) AND wall clock (CPU time, median 5, interleaved); JSON to `bench/.work/rust_suite.json`
+* `MODE=instr JOBS=6` instructions only (main instrument, about 6 min); `MODE=wall JOBS=1` clock only; `ONLY=a,b` subset; `FIRNC_BIN=<path>` other compiler; `NO_SAFE=1` skip release-safe
+* Rust instruction counts are cached in `bench/.work/rust_cache.json` (key = source hash + flags): an A/B run of a new compiler only recounts Firn. `NO_CACHE=1` forces a recount
+* A/B: `python3 bench/rust_suite_cmp.py old.json new.json [fast_instr|safe_instr|fast_wall]`; committed baseline: `bench/rust_suite_baseline.json`
+* every pair prints one value (the vec* pairs only the exit code); Firn release-fast, release-safe and Rust must agree, otherwise the pair is marked MISMATCH and gets no factor
+* pairs: 11 old (bitmap branchy bubblesort bytecount fib jsonscan matmul memstride sieve statemachine xxhash), new vec_sort, sqrt, vecsum, vecstore, vecsub, vecforeign, plus 20 from `bench/firn_vs_c` (Firn sources reused, new Rust twins; `fib40`, `matmul700`, `jsonscan28` are the firn_vs_c variants of fib/matmul/jsonscan)
+* Rust twins from 30.10.: idiomatic safe Rust (bounds checks ON, Vec/slices, wrapping ops, `black_box` on sizes and result); the 11 older twins use unchecked pointers
+* rustc 1.100.0-nightly (a36d05efa 2026-09-09), flags `-O`; CPU AMD EPYC 7571; instruction counts include process start (static Firn vs dynamic Rust, < 0.1 %)
+* wall clock was measured at host load 22-23 (shared server): informational only; instructions are the metric
+
+* instructions release-fast / rustc -O: median **1.251x**, geomean 1.351x, max **6.02x** (vecforeign)
+* instructions release-safe / rustc -O: median **1.464x**, geomean 1.689x, max **6.55x** (vecforeign)
+* wall release-fast / rustc -O (load 22): median **1.119x**, geomean 1.296x, max **6.91x** (vecforeign)
+* wall release-safe / rustc -O (load 22): median **1.264x**, geomean 1.393x, max **6.71x** (vecforeign)
+
+Pairs above 1.2x (instructions, release-fast): vecforeign 6.02, vecsub 4.09, vecsum 3.60, matmul 2.18, memstride 2.15, vecstore 2.12, jsonscan 2.08, fannkuch 2.06, memcpy_loops 1.93, fnv_hash 1.59, vec_sort 1.57, nbody 1.55, xxhash 1.48, crc32 1.43, mandelbrot 1.38, qsort 1.35, wordcount 1.29, sqrt 1.25, bitmap 1.25, floatloop 1.24.
+
+| pair | Firn fast (instr) | Firn safe (instr) | Rust (instr) | fast/rust | safe/rust | wall fast/rust | wall safe/rust |
+|---|---|---|---|---|---|---|---|
+| bitmap | 525074173 | 577671392 | 419868196 | **1.25x** | 1.38x | 1.73x | 1.62x |
+| branchy | 1320000486 | 1380000639 | 1215291614 | **1.09x** | 1.14x | 1.12x | 1.06x |
+| bubblesort | 216598297 | 414908537 | 198901466 | **1.09x** | 2.09x | 1.80x | 1.94x |
+| bytecount | 1595439993 | 1596509579 | 1476693241 | **1.08x** | 1.08x | 1.07x | 1.06x |
+| fib | 101623667 | 148032497 | 155374694 | **0.65x** | 0.95x | 0.58x | 0.72x |
+| jsonscan | 697000305 | 997500449 | 335300258 | **2.08x** | 2.97x | 1.66x | 1.70x |
+| matmul | 376774823 | 584596459 | 173046211 | **2.18x** | 3.38x | 1.64x | 2.48x |
+| memstride | 203907997 | 204424346 | 94637790 | **2.15x** | 2.16x | 1.04x | 1.05x |
+| sieve | 179580915 | 212002523 | 186013976 | **0.97x** | 1.14x | 0.89x | 0.84x |
+| statemachine | 600624598 | 607335600 | 607635450 | **0.99x** | 1.00x | 1.57x | 1.36x |
+| xxhash | 981468052 | 1249903743 | 662994073 | **1.48x** | 1.89x | 1.03x | 1.08x |
+| vec_sort | 334060013 | 583119626 | 212150735 | **1.57x** | 2.75x | 1.28x | 1.22x |
+| sqrt | 48044265 | 84024400 | 38337384 | **1.25x** | 2.19x | 0.90x | 1.30x |
+| vecsum | 86596075 | 96604512 | 24033159 | **3.60x** | 4.02x | 2.19x | 2.02x |
+| vecstore | 106596505 | 116605166 | 50281555 | **2.12x** | 2.32x | 3.17x | 3.30x |
+| vecsub | 65595317 | 71603684 | 16033370 | **4.09x** | 4.47x | 2.90x | 2.90x |
+| vecforeign | 112965830 | 122974807 | 18768544 | **6.02x** | 6.55x | 6.91x | 6.71x |
+| binary_trees | 1805216767 | 2815310523 | 2450124770 | **0.74x** | 1.15x | 1.25x | 1.68x |
+| bitops | 8800000434 | 10800000664 | 8200293303 | **1.07x** | 1.32x | 0.96x | 1.08x |
+| crc32 | 2415932323 | 2415932463 | 1694792958 | **1.43x** | 1.43x | 0.99x | 1.00x |
+| fannkuch | 1676291235 | 2305383943 | 815053736 | **2.06x** | 2.83x | 1.42x | 1.79x |
+| floatloop | 2100000227 | 2100000351 | 1700288746 | **1.24x** | 1.24x | 1.00x | 0.99x |
+| hashmap | 159208945 | 181209165 | 155938325 | **1.02x** | 1.16x | 1.09x | 1.25x |
+| mandelbrot | 1150275460 | 1154115576 | 836473566 | **1.38x** | 1.38x | 1.05x | 1.07x |
+| memcpy_loops | 975213385 | 975213615 | 505470176 | **1.93x** | 1.93x | 1.53x | 1.43x |
+| nbody | 3700000819 | 3700000965 | 2380298227 | **1.55x** | 1.55x | 1.09x | 1.12x |
+| primes | 308931260 | 355559710 | 526459780 | **0.59x** | 0.68x | 1.00x | 1.01x |
+| qsort | 554922693 | 1044858127 | 410395597 | **1.35x** | 2.55x | 1.13x | 1.23x |
+| sha256 | 1308889851 | 1786518266 | 1256754411 | **1.04x** | 1.42x | 1.22x | 1.39x |
+| soa_access | 803000828 | 803001068 | 1048295632 | **0.77x** | 0.77x | 1.04x | 1.00x |
+| spectral_norm | 1350563318 | 2250923457 | 1171107475 | **1.15x** | 1.92x | 1.06x | 1.38x |
+| strbuild | 824354841 | 1241412647 | 936479712 | **0.88x** | 1.33x | 1.46x | 1.56x |
+| wordcount | 1414141998 | 1602821040 | 1094828467 | **1.29x** | 1.46x | 1.24x | 1.26x |
+| fnv_hash | 2214592947 | 2214593163 | 1392804752 | **1.59x** | 1.59x | 1.01x | 0.99x |
+| fib40 | 2450317037 | 3642763411 | 3248650124 | **0.75x** | 1.12x | 0.82x | 1.00x |
+| matmul700 | 3112004439 | 4829454669 | 2968553110 | **1.05x** | 1.63x | 1.05x | 1.58x |
+| jsonscan28 | 1804879864 | 2447598109 | 1760774531 | **1.03x** | 1.39x | 1.35x | 1.48x |
+
+Worst offenders and first suspicions (asm read with `firnc --emit=asm`):
+
+* vecforeign 6.0x, vecsub 4.1x, vecsum 3.6x, vecstore 2.1x: LLVM vectorises the Vec loops (`paddq` on xmm); Firn emits one scalar element per iteration and reloads the Vec header (len, ptr) in every iteration
+* matmul 2.2x: the k loop is 8 instructions per element (index `lea` recomputed, no strength reduction of the row pointer, no unrolling, no vectorisation)
+* memstride 2.15x, jsonscan 2.1x: extra address `lea`/moves in loop bodies; scanner loops branch per byte without unrolling
+* fannkuch 2.06x: `static` arrays stay in memory (every access a load/store); Rust keeps the 10-element arrays in registers/stack after unrolling the short copy loops
+* memcpy_loops 1.9x: Rust turns the byte/word copy loops into memcpy/memset (loop idiom recognition), Firn copies element-wise
+* fnv_hash 1.6x, crc32 1.4x: no general loop unrolling (lea/cmp/jb overhead per byte) and a leftover copy `mov` in the fill loop (coalescing)
+* vec_sort 1.57x: generic introsort in Firn against the pdqsort-style `sort_unstable` of Rust
+* nbody 1.55x: positions/velocities in `static` arrays (memory traffic); Rust scalarises them into xmm registers
+
+
 Produced by `bench/run.sh` (`bench/bench.py`), 9 runs per program, **median**.
 Every benchmark exists twice -- `bench/firn/<name>.fi` and `bench/rust/<name>.rs` -- and both print their result; the outputs have to match, otherwise the measurement stops.
 The Rust side uses `std::hint::black_box` and the same unchecked pointer accesses as the Firn side, so that the same work is measured.
