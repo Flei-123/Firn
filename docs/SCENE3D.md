@@ -22,3 +22,14 @@ anim: `camkeys_new/free/add(k,t,pos,target,fov)/camkeys_at(k,t,&cam)` (smoothste
 video: `video_opts_default()`, `video_parse_args(&opts, start)`, `video_run(&opts, frame_cb: fn(u64 ctx, u64 frame, f64 t, *mut Surface), ctx)`: frames t=i/fps for i in from..to, piped as raw RGBA into ffmpeg (libx264 yuv420p crf 21 faststart, no frame files on disk); `--still <t>` writes one PNG. CLI: --out --fps --duration --width --height --threads --ss --still --from --to.
 
 Video notes: frames are piped to ffmpeg (no frame files, 1280x720x48 s would be 3+ GB on disk); odd sizes are scaled to even; threads/ss are read by the program's own renderer from VideoOpts. Mini demo: tools/scene3d/mini.fi (gate program).
+
+## TRANSPARENCY SORTING AND PARALLEL SETUP
+
+- **Sort unit**: a node, or all nodes with the same `sort_group >= 0` (`scene.node_set_sort_group(n, g)`, default -1). Concentric or nested glass needs ONE group: no unit order can be right for shells that surround each other.
+- **Order**: `render_order` ascending (`scene.node_set_render_order(n, i)`, default 0), then unit far to near, then back faces before front faces, then triangle depth far to near, then triangle id.
+- **Unit depth**: centre of the view-depth range (min and max triangle key of the unit), so it does not depend on tessellation density. Ties: larger max depth first, then unit id (the first node index of the unit).
+- **Tri fields**: `Tri.group` (unit id), `Tri.order`; `SortItem` carries the unit depth.
+- **Parallel setup** (`render_setup`, `render_vertex`, `render_tri`, `render_bins`, `setup_state`): jobs per visible node; phases run on the pool as `parallel_for` over chunks: vertex transform (2048 vertices/chunk), triangle count pass (dry run of clip/cull, 1024 tris/chunk), prefix sum, triangle fill into one array at fixed offsets, per-chunk band counts (4096 tris/chunk), prefix per band and chunk, parallel bin fill and sort item emit, parallel merge sort of the transparent items (index permutation).
+- **Determinism**: every phase writes to fixed offsets in node/triangle order, so the image is bit-identical for any thread count (0, 1, 3, 7).
+- **Texture alpha**: `Material.tex_alpha` (default false; `material.mat_textured_alpha(tex)`). Texels are 0xAABBGGRR straight alpha; bilinear filtering runs on premultiplied colour (`render_texa`), alpha multiplies the shade alpha, such triangles go to the transparent pass.
+- **Bench**: `tools/scene3d/bench.fi` (`--threads N --fps 1 --duration FRAMES`) prints best frame and best setup time in microseconds.
