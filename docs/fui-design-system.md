@@ -85,12 +85,15 @@ Every text/background pair of these tokens is checked at 4.5:1 for light and dar
 
 (Append the public API of each component below, one line per function.)
 
-DS2c catalog components (immediate mode, colours via lib/fui/ds_catalog_tok.fi).
+DS2c catalog components (immediate mode, colours and sizes via lib/fui/ds_catalog_tok.fi, which reads ds_tokens / ds_tokens_comp card, nav, row from the live theme).
 
 - `ds_appcard`: `card_new`, `draw(k,c,x,y,w,h,icon,name,sub,meta,px,py)`, `preferred_h(c)`, `set_state(S_INSTALL|S_OPEN|S_UPDATE|S_INSTALLING|S_UNAVAILABLE)`, `set_progress(permille, -1 = unknown)`, `press`/`release`/`click` -> `ACT_*`, `key`/`text`, `set_focus`, `hit`, `button_rect`.
 - `ds_navview`: `nv_new`, `add`/`add_header`/`add_footer`, `set_badge`, `set_back`, `layout(v,c,x,y,w,h)` (expanded >= 1008 dp, compact >= 641, else minimal), `draw`, `draw_overlay`, `press`/`key` -> `EV_*`, `select`/`selected`, `content_x/y/w/h`, `mode`.
 - `ds_listdetail`: `ld_new`, `set_count`, `set_break`, `set_list_width`, `set_row`, `layout`, `begin_list`/`row_draw`/`finish_list`, `draw_chrome`, `press`/`key` -> `EV_*`, `open_detail`, `back`, `detail_x/y/w/h`, `stacked`.
 - `ds_vgrid`: `grid_new`, `set_count`, `set_cell(min_w_pt,h_pt,gap_pt)`, `set_pad`, `layout`, `first`/`end_index`, `cell_rect`, `index_at`, `begin`/`finish`, `move`, `press`, `drag`/`release`, `wheel`, `pan`/`fling`, `tick`, `key`, `select`, `scroll_to`.
+- `ds_vgrid` OrientOS store API: `set_count(n)` (5000+ is cheap, only visible rows are drawn); `set_cell(min_w_pt,h_pt,gap_pt)` (columns fit to the width, 1 on phones); `draw_each(g,c,name,cb,user)` with `cb(c,index,x,y,w,h,state,user)` per visible cell, `state` = `ST_SELECTED|ST_HOVERED|ST_KEYFOCUS`; hit index via `index_at(x,y)` / `press(x,y)` (`NONE` for gaps, bars, misses); `scroll_to(i)`; `key(code,mods)` (arrows, Home/End, PgUp/PgDn); `select`/`selected`; `stop` ends a running fling.
+- `ds_vgrid_touch`: `touch_new`, `touch_down(t,g,x,y,us)`, `touch_move(t,g,c,y,us)` (8 dp slop, then 1:1 pan with overscroll), `touch_up(t,g,us)` -> tapped index or `NONE`; starts a fling when the finger was still moving (`FLING_MIN_PER_MS`, none after 80 ms rest). Timestamps in microseconds come from the caller (host event time; tests pass a virtual clock).
+- Goldens: `tools/fui/ds_catalog_golden.sh` paints appcard (install/open/update/progress), navview (expanded/compact/minimal/overlay), listdetail (split/stacked/detail), vgrid (360/800/1240), light and dark, and diffs them against `tools/fui/golden_ds/` (limit 0.5 %).
 
 DS2a settings, icon button, breadcrumb (immediate mode, colours/sizes via the adapter lib/fui/ds_look.fi; switch to ds_tokens there).
 
