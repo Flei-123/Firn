@@ -53,5 +53,27 @@ for m in msgs:
 angs = ["0", "90", "-90", "~", "~5", "180.5", "x", "", "~-1", "1e2", "360", "-0", "5.", ".5", "~.5", "NaN"]
 for _ in range(60):
     add("rotation", " ".join(rnd.choice(angs) for _ in range(rnd.choice([1, 2, 2, 2, 3]))))
+import os
+cases = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entity_cases.txt")
+for line in open(cases, encoding="utf-8").read().split("\n"):
+    if line:
+        out.append(line)
+
+opts = ["name=Steve", "name=!Steve", "name=\"a b\"", "distance=..5", "distance=1..", "distance=2", "distance=-1", "distance=1.5..3.5", "level=1", "level=..3", "level=-2",
+    "x=1", "y=~", "z=2.5", "dx=1", "dy=-2", "dz=0.5", "x_rotation=-90..90", "y_rotation=45", "limit=1", "limit=3", "limit=0", "sort=nearest", "sort=random", "sort=bad",
+    "gamemode=creative", "gamemode=!survival", "gamemode=x", "team=red", "team=!blue", "team=", "type=zombie", "type=!zombie", "type=#minecraft:skeletons", "type=player", "type=bad",
+    "tag=a", "tag=!b", "tag=", "nbt={a:1b}", "nbt={a:{b:[1,2]}}", "predicate=minecraft:x", "predicate=!a:b", "scores={a=1}", "scores={a=1..2,b=..3}", "scores={a=}", "advancements={a:b=true}",
+    "advancements={a={c=false}}", "unknown=1", "name", "limit=", " x = 1 ", "\"x\"=1"]
+letters = ["@e", "@a", "@p", "@r", "@s", "@n", "@e", "@e", "@a"]
+specs = ["entity:multiple:entities", "entity:multiple:players", "entity:single:entities", "entity:single:players", "game_profile"]
+for _ in range(1400):
+    k = rnd.choice([0, 1, 1, 2, 2, 3, 4])
+    body = rnd.choice([",", ", ", ","]).join(rnd.choice(opts) for _ in range(k))
+    tail = rnd.choice(["]", "]", "]", "]", "", " ]", "]x", "] rest"])
+    add(rnd.choice(specs), rnd.choice(letters) + "[" + body + tail)
+names = ["Steve", "Alex_1", "a", "abcdefghijklmnop", "abcdefghijklmnopq", "\"a b\"", "'x'", "x y", "1-1-1-1-1", "-1-1-1-1-1", "+f-+f-+f-+f-+f", "g-1-1-1-1", "1-1-1-1", "1-1-1-1-1-1", "ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000000", "ffffffffffffffffff-1-1-1-1", "-8000000000000000-1-1-1-1", "8000000000000000-1-1-1-1", "\"unterminated", "@", "@@", "@e", "@x", "@E", "~", "", " ", "name,x"]
+for n in names:
+    for sp in specs:
+        add(sp, n)
 sys.stderr.write(str(len(out)))
 open(sys.argv[1], "w", encoding="utf-8").write("\n".join(out) + "\n")

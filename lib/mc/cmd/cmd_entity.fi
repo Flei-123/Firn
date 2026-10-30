@@ -1,0 +1,1034 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/cmd/cmd_entity.fi -- entity selector and game profile argument parsers (names, UUIDs, @p/@a/@r/@s/@e/@n with options).
+import std.rt
+import brigadier.mem as m
+import brigadier.text as tx
+import brigadier.exc as ex
+import brigadier.reader as rd
+import brigadier.argtype as at
+import brigadier.javanum as jn
+import mc.cmd.cmd_fail as cf
+import mc.cmd.cmd_id as cid
+import mc.cmd.cmd_range as cr
+import mc.cmd.cmd_snbt as sn
+
+export { Sel, Filter, SK_NAME, SK_UUID, SK_SELECTOR, OR_ARBITRARY, OR_NEAREST, OR_FURTHEST, OR_RANDOM,
+    F_NAME, F_GAMEMODE, F_TEAM, F_TYPE, F_TYPE_TAG, F_TAG, F_NBT, F_SCORES, F_ADVANCEMENTS, F_PREDICATE,
+    ENT_SINGLE, ENT_PLAYERS, EntityCtx, entity_parse, profile_parse, sel_describe, sel_filter_count, sel_filter_at, types_has, uuid_parse }
+
+const SK_NAME: i32 = 0
+const SK_UUID: i32 = 1
+const SK_SELECTOR: i32 = 2
+
+const OR_ARBITRARY: i32 = 0
+const OR_NEAREST: i32 = 1
+const OR_FURTHEST: i32 = 2
+const OR_RANDOM: i32 = 3
+
+const F_NAME: i32 = 1
+const F_GAMEMODE: i32 = 2
+const F_TEAM: i32 = 3
+const F_TYPE: i32 = 4
+const F_TYPE_TAG: i32 = 5
+const F_TAG: i32 = 6
+const F_NBT: i32 = 7
+const F_SCORES: i32 = 8
+const F_ADVANCEMENTS: i32 = 9
+const F_PREDICATE: i32 = 10
+
+const ENT_SINGLE: i32 = 1
+const ENT_PLAYERS: i32 = 2
+
+const OPT_NAME: i32 = 1
+const OPT_DISTANCE: i32 = 2
+const OPT_LEVEL: i32 = 3
+const OPT_X: i32 = 4
+const OPT_Y: i32 = 5
+const OPT_Z: i32 = 6
+const OPT_DX: i32 = 7
+const OPT_DY: i32 = 8
+const OPT_DZ: i32 = 9
+const OPT_X_ROTATION: i32 = 10
+const OPT_Y_ROTATION: i32 = 11
+const OPT_LIMIT: i32 = 12
+const OPT_SORT: i32 = 13
+const OPT_GAMEMODE: i32 = 14
+const OPT_TEAM: i32 = 15
+const OPT_TYPE: i32 = 16
+const OPT_TAG: i32 = 17
+const OPT_NBT: i32 = 18
+const OPT_SCORES: i32 = 19
+const OPT_ADVANCEMENTS: i32 = 20
+const OPT_PREDICATE: i32 = 21
+
+const QUIRK_NO_AT_N: i32 = 2
+const MAX_RESULTS: i32 = 2147483647
+const CH_AT: u32 = 64
+const CH_BANG: u32 = 33
+const CH_HASH: u32 = 35
+const CH_OPEN_BRACKET: u32 = 91
+const CH_CLOSE_BRACKET: u32 = 93
+const CH_COMMA: u32 = 44
+const CH_EQUALS: u32 = 61
+const CH_OPEN_BRACE: u32 = 123
+const CH_CLOSE_BRACE: u32 = 125
+const CH_DASH: u32 = 45
+
+struct Filter {
+    kind: i32,
+    inverted: bool,
+    text: tx.U16,
+    num: i32,
+}
+
+struct EntityCtx {
+    types: str,
+    quirks: i32,
+    flags: i32,
+}
+
+struct Sel {
+    kind: i32,
+    max_results: i32,
+    includes_entities: bool,
+    world_limited: bool,
+    current_entity: bool,
+    limited: bool,
+    sorted: bool,
+    uses_selectors: bool,
+    order: i32,
+    distance: cr.Range,
+    level: cr.Range,
+    rot_x: cr.Range,
+    rot_y: cr.Range,
+    has_x: bool,
+    has_y: bool,
+    has_z: bool,
+    has_dx: bool,
+    has_dy: bool,
+    has_dz: bool,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    has_name: bool,
+    player_name: tx.U16,
+    uuid_hi: i64,
+    uuid_lo: i64,
+    name_eq: bool,
+    name_ne: bool,
+    gm_eq: bool,
+    gm_ne: bool,
+    team_eq: bool,
+    team_ne: bool,
+    type_inverse: bool,
+    has_scores: bool,
+    has_advancements: bool,
+    has_type: bool,
+    type_id: tx.U16,
+    predicates: i32,
+    filters: m.Arr[Filter],
+}
+
+fn range_any(kind: i32) -> cr.Range {
+    return cr.Range { kind: kind, has_min: false, has_max: false, min: 0.0, max: 0.0 }
+}
+
+fn range_is_any(g: *mut cr.Range) -> bool {
+    return !(*g).has_min && !(*g).has_max
+}
+
+fn sel_new(a: *mut m.Arena) -> *mut Sel {
+    let s: *mut Sel = m.arena_obj[Sel](a) as *mut Sel
+    *s = Sel {
+        kind: SK_SELECTOR, max_results: 0, includes_entities: false, world_limited: false, current_entity: false, limited: false, sorted: false, uses_selectors: false,
+        order: OR_ARBITRARY, distance: range_any(cr.RK_DOUBLE), level: range_any(cr.RK_INT), rot_x: range_any(cr.RK_FLOAT), rot_y: range_any(cr.RK_FLOAT),
+        has_x: false, has_y: false, has_z: false, has_dx: false, has_dy: false, has_dz: false, x: 0.0, y: 0.0, z: 0.0, dx: 0.0, dy: 0.0, dz: 0.0,
+        has_name: false, player_name: tx.u16_empty(), uuid_hi: 0, uuid_lo: 0, name_eq: false, name_ne: false, gm_eq: false, gm_ne: false, team_eq: false, team_ne: false,
+        type_inverse: false, has_scores: false, has_advancements: false, has_type: false, type_id: tx.u16_empty(), predicates: 0, filters: m.arr_new[Filter]()
+    }
+    return s
+}
+
+fn sel_filter_count(s: *mut Sel) -> usize {
+    return m.arr_len[Filter](&(*s).filters)
+}
+
+fn sel_filter_at(s: *mut Sel, i: usize) -> *mut Filter {
+    return m.arr_at[Filter](&(*s).filters, i)
+}
+
+fn add_filter(a: *mut m.Arena, s: *mut Sel, kind: i32, inverted: bool, text: tx.U16, num: i32) {
+    m.arr_push[Filter](a, &(*s).filters, Filter { kind: kind, inverted: inverted, text: text, num: num })
+    (*s).predicates = (*s).predicates + 1
+}
+
+fn types_has(list: str, id: tx.U16) -> bool {
+    var i: usize = 0
+    while i < list.n {
+        var j: usize = i
+        while j < list.n && rt.ld8(list.p as u64, j) != 10 as u8 {
+            j = j + 1
+        }
+        if j - i == id.n {
+            var k: usize = 0
+            var same: bool = true
+            while k < id.n {
+                if tx.u16_at(id, k) != rt.ld8(list.p as u64, i + k) as u32 {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                return true
+            }
+        }
+        i = j + 1
+    }
+    return false
+}
+
+fn fail_quoted(r: *mut rd.Reader, err: *mut ex.Exc, head: str, name: tx.U16, tail: str) {
+    var b: m.Arr[u16] = tx.b16_new()
+    tx.b16_ascii((*r).a, &b, head)
+    tx.b16_text((*r).a, &b, name)
+    tx.b16_ascii((*r).a, &b, tail)
+    cf.fail_text(r, err, tx.b16_view(&b))
+}
+
+fn fail_inapplicable(r: *mut rd.Reader, err: *mut ex.Exc, name: str) {
+    fail_quoted(r, err, "Option '", tx.u16_from_str((*r).a, name), "' isn't applicable here")
+}
+
+fn invert_value(r: *mut rd.Reader) -> bool {
+    rd.skip_whitespace(r)
+    if rd.can_read(r) && rd.peek(r) == CH_BANG {
+        rd.skip(r)
+        rd.skip_whitespace(r)
+        return true
+    }
+    return false
+}
+
+fn hex_digit(c: u32) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 97) as i32 + 10
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 65) as i32 + 10
+    }
+    return 0 - 1
+}
+
+fn long_hex(t: tx.U16, from: usize, to: usize, out: *mut u64) -> bool {
+    var i: usize = from
+    var neg: bool = false
+    if i < to && (tx.u16_at(t, i) == 45 || tx.u16_at(t, i) == 43) {
+        neg = tx.u16_at(t, i) == 45
+        i = i + 1
+    }
+    if i >= to {
+        return false
+    }
+    var acc: u64 = 0
+    while i < to {
+        let d: i32 = hex_digit(tx.u16_at(t, i))
+        if d < 0 || acc > 576460752303423487 {
+            return false
+        }
+        acc = acc * 16 + (d as u64)
+        i = i + 1
+    }
+    var limit: u64 = 9223372036854775807
+    if neg {
+        limit = 9223372036854775808
+    }
+    if acc > limit {
+        return false
+    }
+    if neg {
+        *out = 0 - acc
+    } else {
+        *out = acc
+    }
+    return true
+}
+
+fn dash_from(t: tx.U16, from: usize) -> usize {
+    var i: usize = from
+    while i < t.n {
+        if tx.u16_at(t, i) == CH_DASH {
+            return i
+        }
+        i = i + 1
+    }
+    return t.n
+}
+
+fn uuid_parse(t: tx.U16, hi: *mut i64, lo: *mut i64) -> bool {
+    if t.n > 36 {
+        return false
+    }
+    let d1: usize = dash_from(t, 0)
+    if d1 >= t.n { return false }
+    let d2: usize = dash_from(t, d1 + 1)
+    if d2 >= t.n { return false }
+    let d3: usize = dash_from(t, d2 + 1)
+    if d3 >= t.n { return false }
+    let d4: usize = dash_from(t, d3 + 1)
+    if d4 >= t.n { return false }
+    if dash_from(t, d4 + 1) < t.n { return false }
+    var a: u64 = 0
+    var b: u64 = 0
+    var c: u64 = 0
+    var d: u64 = 0
+    var e: u64 = 0
+    if !long_hex(t, 0, d1, &a) { return false }
+    if !long_hex(t, d1 + 1, d2, &b) { return false }
+    if !long_hex(t, d2 + 1, d3, &c) { return false }
+    if !long_hex(t, d3 + 1, d4, &d) { return false }
+    if !long_hex(t, d4 + 1, t.n, &e) { return false }
+    var most: u64 = a & 4294967295
+    most = (most << 16) | (b & 65535)
+    most = (most << 16) | (c & 65535)
+    var least: u64 = d & 65535
+    least = (least << 48) | (e & 281474976710655)
+    *hi = most as i64
+    *lo = least as i64
+    return true
+}
+
+fn parse_name_or_uuid(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    let start: usize = (*r).cursor
+    var t: tx.U16 = tx.u16_empty()
+    if !rd.read_string(r, &t, err) {
+        return false
+    }
+    if uuid_parse(t, &(*s).uuid_hi, &(*s).uuid_lo) {
+        (*s).kind = SK_UUID
+        (*s).includes_entities = true
+    } else {
+        if t.n == 0 || t.n > 16 {
+            (*r).cursor = start
+            cf.fail_str(r, err, "Invalid name or UUID")
+            return false
+        }
+        (*s).kind = SK_NAME
+        (*s).includes_entities = false
+        (*s).has_name = true
+        (*s).player_name = t
+    }
+    (*s).max_results = 1
+    return true
+}
+
+fn opt_id(name: tx.U16) -> i32 {
+    if cf.is_ascii_eq(name, "name") { return OPT_NAME }
+    if cf.is_ascii_eq(name, "distance") { return OPT_DISTANCE }
+    if cf.is_ascii_eq(name, "level") { return OPT_LEVEL }
+    if cf.is_ascii_eq(name, "x") { return OPT_X }
+    if cf.is_ascii_eq(name, "y") { return OPT_Y }
+    if cf.is_ascii_eq(name, "z") { return OPT_Z }
+    if cf.is_ascii_eq(name, "dx") { return OPT_DX }
+    if cf.is_ascii_eq(name, "dy") { return OPT_DY }
+    if cf.is_ascii_eq(name, "dz") { return OPT_DZ }
+    if cf.is_ascii_eq(name, "x_rotation") { return OPT_X_ROTATION }
+    if cf.is_ascii_eq(name, "y_rotation") { return OPT_Y_ROTATION }
+    if cf.is_ascii_eq(name, "limit") { return OPT_LIMIT }
+    if cf.is_ascii_eq(name, "sort") { return OPT_SORT }
+    if cf.is_ascii_eq(name, "gamemode") { return OPT_GAMEMODE }
+    if cf.is_ascii_eq(name, "team") { return OPT_TEAM }
+    if cf.is_ascii_eq(name, "type") { return OPT_TYPE }
+    if cf.is_ascii_eq(name, "tag") { return OPT_TAG }
+    if cf.is_ascii_eq(name, "nbt") { return OPT_NBT }
+    if cf.is_ascii_eq(name, "scores") { return OPT_SCORES }
+    if cf.is_ascii_eq(name, "advancements") { return OPT_ADVANCEMENTS }
+    if cf.is_ascii_eq(name, "predicate") { return OPT_PREDICATE }
+    return 0
+}
+
+fn opt_usable(s: *mut Sel, id: i32) -> bool {
+    if id == OPT_NAME { return !(*s).name_eq }
+    if id == OPT_DISTANCE { return range_is_any(&(*s).distance) }
+    if id == OPT_LEVEL { return range_is_any(&(*s).level) }
+    if id == OPT_X { return !(*s).has_x }
+    if id == OPT_Y { return !(*s).has_y }
+    if id == OPT_Z { return !(*s).has_z }
+    if id == OPT_DX { return !(*s).has_dx }
+    if id == OPT_DY { return !(*s).has_dy }
+    if id == OPT_DZ { return !(*s).has_dz }
+    if id == OPT_X_ROTATION { return range_is_any(&(*s).rot_x) }
+    if id == OPT_Y_ROTATION { return range_is_any(&(*s).rot_y) }
+    if id == OPT_LIMIT { return !(*s).current_entity && !(*s).limited }
+    if id == OPT_SORT { return !(*s).current_entity && !(*s).sorted }
+    if id == OPT_GAMEMODE { return !(*s).gm_eq }
+    if id == OPT_TEAM { return !(*s).team_eq }
+    if id == OPT_TYPE { return !(*s).has_type }
+    if id == OPT_SCORES { return !(*s).has_scores }
+    if id == OPT_ADVANCEMENTS { return !(*s).has_advancements }
+    return true
+}
+
+fn handle_range(r: *mut rd.Reader, s: *mut Sel, id: i32, err: *mut ex.Exc) -> bool {
+    let cur: usize = (*r).cursor
+    var kind: i32 = cr.RK_DOUBLE
+    if id == OPT_LEVEL { kind = cr.RK_INT }
+    if id == OPT_X_ROTATION || id == OPT_Y_ROTATION { kind = cr.RK_FLOAT }
+    var g: cr.Range = range_any(kind)
+    if !cr.range_parse(r, kind, &g, err) {
+        return false
+    }
+    if id == OPT_DISTANCE {
+        if cr.range_negative(&g) {
+            (*r).cursor = cur
+            cf.fail_str(r, err, "Distance cannot be negative")
+            return false
+        }
+        (*s).distance = g
+        (*s).world_limited = true
+    } else if id == OPT_LEVEL {
+        if cr.range_negative(&g) {
+            (*r).cursor = cur
+            cf.fail_str(r, err, "Level shouldn't be negative")
+            return false
+        }
+        (*s).level = g
+        (*s).includes_entities = false
+    } else if id == OPT_X_ROTATION {
+        (*s).rot_x = g
+    } else {
+        (*s).rot_y = g
+    }
+    return true
+}
+
+fn handle_coord(r: *mut rd.Reader, s: *mut Sel, id: i32, err: *mut ex.Exc) -> bool {
+    var v: f64 = 0.0
+    if !rd.read_double(r, &v, err) {
+        return false
+    }
+    if id == OPT_X { (*s).x = v
+        (*s).has_x = true }
+    if id == OPT_Y { (*s).y = v
+        (*s).has_y = true }
+    if id == OPT_Z { (*s).z = v
+        (*s).has_z = true }
+    if id == OPT_DX { (*s).dx = v
+        (*s).has_dx = true }
+    if id == OPT_DY { (*s).dy = v
+        (*s).has_dy = true }
+    if id == OPT_DZ { (*s).dz = v
+        (*s).has_dz = true }
+    (*s).world_limited = true
+    return true
+}
+
+fn handle_limit(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    let cur: usize = (*r).cursor
+    var v: i32 = 0
+    if !rd.read_int(r, &v, err) {
+        return false
+    }
+    if v < 1 {
+        (*r).cursor = cur
+        cf.fail_str(r, err, "Limit must be at least 1")
+        return false
+    }
+    (*s).max_results = v
+    (*s).limited = true
+    return true
+}
+
+fn handle_sort(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    let cur: usize = (*r).cursor
+    let t: tx.U16 = rd.read_unquoted(r)
+    var order: i32 = 0 - 1
+    if cf.is_ascii_eq(t, "nearest") { order = OR_NEAREST }
+    if cf.is_ascii_eq(t, "furthest") { order = OR_FURTHEST }
+    if cf.is_ascii_eq(t, "random") { order = OR_RANDOM }
+    if cf.is_ascii_eq(t, "arbitrary") { order = OR_ARBITRARY }
+    if order < 0 {
+        (*r).cursor = cur
+        fail_quoted(r, err, "Invalid or unknown sort type '", t, "'")
+        return false
+    }
+    (*s).order = order
+    (*s).sorted = true
+    return true
+}
+
+fn gamemode_of(t: tx.U16) -> i32 {
+    if cf.is_ascii_eq(t, "survival") { return 0 }
+    if cf.is_ascii_eq(t, "creative") { return 1 }
+    if cf.is_ascii_eq(t, "adventure") { return 2 }
+    if cf.is_ascii_eq(t, "spectator") { return 3 }
+    return 0 - 1
+}
+
+fn handle_gamemode(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    let cur: usize = (*r).cursor
+    let inv: bool = invert_value(r)
+    if (*s).gm_ne && !inv {
+        (*r).cursor = cur
+        fail_inapplicable(r, err, "gamemode")
+        return false
+    }
+    let t: tx.U16 = rd.read_unquoted(r)
+    let mode: i32 = gamemode_of(t)
+    if mode < 0 {
+        (*r).cursor = cur
+        fail_quoted(r, err, "Invalid or unknown game mode '", t, "'")
+        return false
+    }
+    (*s).includes_entities = false
+    add_filter((*r).a, s, F_GAMEMODE, inv, t, mode)
+    if inv {
+        (*s).gm_ne = true
+    } else {
+        (*s).gm_eq = true
+    }
+    return true
+}
+
+fn handle_type(r: *mut rd.Reader, s: *mut Sel, ctx: *mut EntityCtx, err: *mut ex.Exc) -> bool {
+    let cur: usize = (*r).cursor
+    let inv: bool = invert_value(r)
+    if (*s).type_inverse && !inv {
+        (*r).cursor = cur
+        fail_inapplicable(r, err, "type")
+        return false
+    }
+    if inv {
+        (*s).type_inverse = true
+    }
+    var v: at.Value = at.Value { kind: 0, i: 0, f: 0.0, s: tx.u16_empty() }
+    if rd.can_read(r) && rd.peek(r) == CH_HASH {
+        rd.skip(r)
+        if !cid.parse_identifier(r, &v, err) {
+            return false
+        }
+        add_filter((*r).a, s, F_TYPE_TAG, inv, v.s, 0)
+        return true
+    }
+    if !cid.parse_identifier(r, &v, err) {
+        return false
+    }
+    if !types_has((*ctx).types, v.s) {
+        (*r).cursor = cur
+        fail_quoted(r, err, "Invalid or unknown entity type '", v.s, "'")
+        return false
+    }
+    if cf.is_ascii_eq(v.s, "minecraft:player") && !inv {
+        (*s).includes_entities = false
+    }
+    add_filter((*r).a, s, F_TYPE, inv, v.s, 0)
+    if !inv {
+        (*s).has_type = true
+        (*s).type_id = v.s
+    }
+    return true
+}
+
+fn skip_ws_comma(r: *mut rd.Reader) {
+    rd.skip_whitespace(r)
+    if rd.can_read(r) && rd.peek(r) == CH_COMMA {
+        rd.skip(r)
+    }
+}
+
+fn handle_scores(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    if !rd.expect_char(r, CH_OPEN_BRACE, err) {
+        return false
+    }
+    rd.skip_whitespace(r)
+    var entries: i32 = 0
+    while rd.can_read(r) && rd.peek(r) != CH_CLOSE_BRACE {
+        rd.skip_whitespace(r)
+        let name: tx.U16 = rd.read_unquoted(r)
+        rd.skip_whitespace(r)
+        if !rd.expect_char(r, CH_EQUALS, err) {
+            return false
+        }
+        rd.skip_whitespace(r)
+        entries = entries + 1
+        var g: cr.Range = range_any(cr.RK_INT)
+        if !cr.range_parse(r, cr.RK_INT, &g, err) {
+            return false
+        }
+        skip_ws_comma(r)
+    }
+    if !rd.expect_char(r, CH_CLOSE_BRACE, err) {
+        return false
+    }
+    if entries > 0 {
+        add_filter((*r).a, s, F_SCORES, false, tx.u16_empty(), 0)
+    }
+    (*s).has_scores = true
+    return true
+}
+
+fn read_bool_mc(r: *mut rd.Reader, err: *mut ex.Exc) -> bool {
+    let start: usize = (*r).cursor
+    if !rd.can_read(r) {
+        cf.fail_str(r, err, "Expected boolean")
+        return false
+    }
+    let t: tx.U16 = rd.read_unquoted(r)
+    if t.n == 0 {
+        cf.fail_str(r, err, "Expected boolean")
+        return false
+    }
+    if cf.is_ascii_eq(t, "true") || cf.is_ascii_eq(t, "false") {
+        return true
+    }
+    (*r).cursor = start
+    fail_quoted(r, err, "Invalid boolean: expected 'true' or 'false' but found '", t, "'")
+    return false
+}
+
+fn handle_criteria(r: *mut rd.Reader, err: *mut ex.Exc) -> bool {
+    rd.skip_whitespace(r)
+    rd.skip(r)
+    rd.skip_whitespace(r)
+    while rd.can_read(r) && rd.peek(r) != CH_CLOSE_BRACE {
+        rd.skip_whitespace(r)
+        let name: tx.U16 = rd.read_unquoted(r)
+        rd.skip_whitespace(r)
+        if !rd.expect_char(r, CH_EQUALS, err) {
+            return false
+        }
+        rd.skip_whitespace(r)
+        if !read_bool_mc(r, err) {
+            return false
+        }
+        skip_ws_comma(r)
+        rd.skip_whitespace(r)
+    }
+    return rd.expect_char(r, CH_CLOSE_BRACE, err)
+}
+
+fn handle_advancements(r: *mut rd.Reader, s: *mut Sel, err: *mut ex.Exc) -> bool {
+    if !rd.expect_char(r, CH_OPEN_BRACE, err) {
+        return false
+    }
+    rd.skip_whitespace(r)
+    var entries: i32 = 0
+    while rd.can_read(r) && rd.peek(r) != CH_CLOSE_BRACE {
+        rd.skip_whitespace(r)
+        entries = entries + 1
+        var v: at.Value = at.Value { kind: 0, i: 0, f: 0.0, s: tx.u16_empty() }
+        if !cid.parse_identifier(r, &v, err) {
+            return false
+        }
+        rd.skip_whitespace(r)
+        if !rd.expect_char(r, CH_EQUALS, err) {
+            return false
+        }
+        rd.skip_whitespace(r)
+        if rd.can_read(r) && rd.peek(r) == CH_OPEN_BRACE {
+            if !handle_criteria(r, err) {
+                return false
+            }
+        } else {
+            if !read_bool_mc(r, err) {
+                return false
+            }
+        }
+        skip_ws_comma(r)
+    }
+    if !rd.expect_char(r, CH_CLOSE_BRACE, err) {
+        return false
+    }
+    if entries > 0 {
+        (*s).includes_entities = false
+        add_filter((*r).a, s, F_ADVANCEMENTS, false, tx.u16_empty(), 0)
+    }
+    (*s).has_advancements = true
+    return true
+}
+
+fn handle_option(r: *mut rd.Reader, s: *mut Sel, ctx: *mut EntityCtx, id: i32, err: *mut ex.Exc) -> bool {
+    if id == OPT_NAME {
+        let cur: usize = (*r).cursor
+        let inv: bool = invert_value(r)
+        var t: tx.U16 = tx.u16_empty()
+        if !rd.read_string(r, &t, err) {
+            return false
+        }
+        if (*s).name_ne && !inv {
+            (*r).cursor = cur
+            fail_inapplicable(r, err, "name")
+            return false
+        }
+        if inv {
+            (*s).name_ne = true
+        } else {
+            (*s).name_eq = true
+        }
+        add_filter((*r).a, s, F_NAME, inv, t, 0)
+        return true
+    }
+    if id == OPT_DISTANCE || id == OPT_LEVEL || id == OPT_X_ROTATION || id == OPT_Y_ROTATION { return handle_range(r, s, id, err) }
+    if id >= OPT_X && id <= OPT_DZ { return handle_coord(r, s, id, err) }
+    if id == OPT_LIMIT { return handle_limit(r, s, err) }
+    if id == OPT_SORT { return handle_sort(r, s, err) }
+    if id == OPT_GAMEMODE { return handle_gamemode(r, s, err) }
+    if id == OPT_TYPE { return handle_type(r, s, ctx, err) }
+    if id == OPT_SCORES { return handle_scores(r, s, err) }
+    if id == OPT_ADVANCEMENTS { return handle_advancements(r, s, err) }
+    let inv: bool = invert_value(r)
+    if id == OPT_TEAM {
+        let t: tx.U16 = rd.read_unquoted(r)
+        add_filter((*r).a, s, F_TEAM, inv, t, 0)
+        if inv {
+            (*s).team_ne = true
+        } else {
+            (*s).team_eq = true
+        }
+        return true
+    }
+    if id == OPT_TAG {
+        let t: tx.U16 = rd.read_unquoted(r)
+        add_filter((*r).a, s, F_TAG, inv, t, 0)
+        return true
+    }
+    if id == OPT_NBT {
+        let from: usize = (*r).cursor
+        if !sn.snbt_skip_compound(r, err) {
+            return false
+        }
+        add_filter((*r).a, s, F_NBT, inv, tx.u16_sub((*r).s, from, (*r).cursor), 0)
+        return true
+    }
+    var v: at.Value = at.Value { kind: 0, i: 0, f: 0.0, s: tx.u16_empty() }
+    if !cid.parse_identifier(r, &v, err) {
+        return false
+    }
+    add_filter((*r).a, s, F_PREDICATE, inv, v.s, 0)
+    return true
+}
+
+fn parse_options(r: *mut rd.Reader, s: *mut Sel, ctx: *mut EntityCtx, err: *mut ex.Exc) -> bool {
+    rd.skip_whitespace(r)
+    while rd.can_read(r) && rd.peek(r) != CH_CLOSE_BRACKET {
+        rd.skip_whitespace(r)
+        let start: usize = (*r).cursor
+        var name: tx.U16 = tx.u16_empty()
+        if !rd.read_string(r, &name, err) {
+            return false
+        }
+        let id: i32 = opt_id(name)
+        if id == 0 {
+            (*r).cursor = start
+            fail_quoted(r, err, "Unknown option '", name, "'")
+            return false
+        }
+        if !opt_usable(s, id) {
+            fail_quoted(r, err, "Option '", name, "' isn't applicable here")
+            return false
+        }
+        rd.skip_whitespace(r)
+        if !rd.can_read(r) || rd.peek(r) != CH_EQUALS {
+            (*r).cursor = start
+            fail_quoted(r, err, "Expected value for option '", name, "'")
+            return false
+        }
+        rd.skip(r)
+        rd.skip_whitespace(r)
+        if !handle_option(r, s, ctx, id, err) {
+            return false
+        }
+        rd.skip_whitespace(r)
+        if !rd.can_read(r) {
+            continue
+        }
+        if rd.peek(r) == CH_COMMA {
+            rd.skip(r)
+            continue
+        }
+        if rd.peek(r) != CH_CLOSE_BRACKET {
+            cf.fail_str(r, err, "Expected end of options")
+            return false
+        }
+        break
+    }
+    if !rd.can_read(r) {
+        cf.fail_str(r, err, "Expected end of options")
+        return false
+    }
+    rd.skip(r)
+    return true
+}
+
+fn limit_to_player(s: *mut Sel) {
+    (*s).has_type = true
+    (*s).type_id = tx.u16_empty()
+}
+
+fn parse_selector(r: *mut rd.Reader, s: *mut Sel, ctx: *mut EntityCtx, err: *mut ex.Exc) -> bool {
+    if !rd.can_read(r) {
+        cf.fail_str(r, err, "Missing selector type")
+        return false
+    }
+    let start: usize = (*r).cursor
+    let c: u32 = rd.read_char(r)
+    (*s).kind = SK_SELECTOR
+    (*s).uses_selectors = true
+    if c == 112 {
+        (*s).max_results = 1
+        (*s).includes_entities = false
+        (*s).order = OR_NEAREST
+        limit_to_player(s)
+    } else if c == 97 {
+        (*s).max_results = MAX_RESULTS
+        (*s).includes_entities = false
+        (*s).order = OR_ARBITRARY
+        limit_to_player(s)
+    } else if c == 114 {
+        (*s).max_results = 1
+        (*s).includes_entities = false
+        (*s).order = OR_RANDOM
+        limit_to_player(s)
+    } else if c == 115 {
+        (*s).max_results = 1
+        (*s).includes_entities = true
+        (*s).current_entity = true
+    } else if c == 101 {
+        (*s).max_results = MAX_RESULTS
+        (*s).includes_entities = true
+        (*s).order = OR_ARBITRARY
+        (*s).predicates = 1
+    } else if c == 110 && ((*ctx).quirks & QUIRK_NO_AT_N) == 0 {
+        (*s).max_results = 1
+        (*s).includes_entities = true
+        (*s).order = OR_NEAREST
+        (*s).predicates = 1
+    } else {
+        (*r).cursor = start
+        var one: m.Arr[u16] = tx.b16_new()
+        tx.b16_char((*r).a, &one, c)
+        fail_quoted(r, err, "Unknown selector type '@", tx.b16_view(&one), "'")
+        return false
+    }
+    if rd.can_read(r) && rd.peek(r) == CH_OPEN_BRACKET {
+        rd.skip(r)
+        if !parse_options(r, s, ctx, err) {
+            return false
+        }
+    }
+    return true
+}
+
+fn selector_parse(r: *mut rd.Reader, ctx: *mut EntityCtx, out: *mut *mut Sel, err: *mut ex.Exc) -> bool {
+    let s: *mut Sel = sel_new((*r).a)
+    var ok: bool = false
+    if rd.can_read(r) && rd.peek(r) == CH_AT {
+        rd.skip(r)
+        ok = parse_selector(r, s, ctx, err)
+    } else {
+        ok = parse_name_or_uuid(r, s, err)
+    }
+    if !ok {
+        return false
+    }
+    if !range_is_any(&(*s).rot_x) { (*s).predicates = (*s).predicates + 1 }
+    if !range_is_any(&(*s).rot_y) { (*s).predicates = (*s).predicates + 1 }
+    if !range_is_any(&(*s).level) { (*s).predicates = (*s).predicates + 1 }
+    *out = s
+    return true
+}
+
+fn entity_parse(r: *mut rd.Reader, ctx: *mut EntityCtx, out: *mut at.Value, err: *mut ex.Exc) -> bool {
+    var s: *mut Sel = 0 as *mut Sel
+    if !selector_parse(r, ctx, &s, err) {
+        return false
+    }
+    let single: bool = ((*ctx).flags & ENT_SINGLE) != 0
+    let players: bool = ((*ctx).flags & ENT_PLAYERS) != 0
+    if (*s).max_results > 1 && single {
+        (*r).cursor = 0
+        if players {
+            cf.fail_str(r, err, "Only one player is allowed, but the provided selector allows more than one")
+        } else {
+            cf.fail_str(r, err, "Only one entity is allowed, but the provided selector allows more than one")
+        }
+        return false
+    }
+    if (*s).includes_entities && players && !(*s).current_entity {
+        (*r).cursor = 0
+        cf.fail_str(r, err, "Only players may be affected by this command, but the provided selector includes entities")
+        return false
+    }
+    *out = at.Value { kind: at.VK_CUSTOM, i: s as u64 as i64, f: 0.0, s: tx.u16_empty() }
+    return true
+}
+
+fn profile_parse(r: *mut rd.Reader, ctx: *mut EntityCtx, out: *mut at.Value, err: *mut ex.Exc) -> bool {
+    if rd.can_read(r) && rd.peek(r) == CH_AT {
+        var s: *mut Sel = 0 as *mut Sel
+        if !selector_parse(r, ctx, &s, err) {
+            return false
+        }
+        if (*s).includes_entities {
+            cf.fail_str(r, err, "Only players may be affected by this command, but the provided selector includes entities")
+            return false
+        }
+        *out = at.Value { kind: at.VK_CUSTOM, i: s as u64 as i64, f: 0.0, s: tx.u16_empty() }
+        return true
+    }
+    let from: usize = (*r).cursor
+    while rd.can_read(r) && rd.peek(r) != 32 {
+        rd.skip(r)
+    }
+    let s: *mut Sel = sel_new((*r).a)
+    (*s).kind = SK_NAME
+    (*s).has_name = true
+    (*s).player_name = tx.u16_sub((*r).s, from, (*r).cursor)
+    *out = at.Value { kind: at.VK_CUSTOM, i: s as u64 as i64, f: 0.0, s: tx.u16_empty() }
+    return true
+}
+
+fn push_text(out: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        rt.buf_push(out, rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+}
+
+fn push_bool(out: *mut rt.Buf, b: bool) {
+    if b {
+        push_text(out, "true")
+    } else {
+        push_text(out, "false")
+    }
+}
+
+fn push_field(out: *mut rt.Buf, name: str) {
+    push_text(out, name)
+    rt.buf_push(out, 61 as u8)
+}
+
+fn push_opt_double(a: *mut m.Arena, out: *mut rt.Buf, present: bool, v: f64) {
+    if !present {
+        push_text(out, "null")
+        return
+    }
+    var b: m.Arr[u16] = tx.b16_new()
+    jn.put_double(a, &b, v)
+    push_text(out, tx.u16_to_str(a, tx.b16_view(&b)))
+}
+
+fn push_range(a: *mut m.Arena, out: *mut rt.Buf, g: *mut cr.Range) {
+    if range_is_any(g) {
+        push_text(out, "null")
+    } else {
+        cr.range_describe(a, out, g)
+    }
+}
+
+fn push_hex(out: *mut rt.Buf, v: u64, digits: usize) {
+    var i: usize = digits
+    while i > 0 {
+        i = i - 1
+        let d: u64 = (v >> ((i as u64) * 4)) & 15
+        if d < 10 {
+            rt.buf_push(out, (48 + d) as u8)
+        } else {
+            rt.buf_push(out, (87 + d) as u8)
+        }
+    }
+}
+
+fn push_flag(out: *mut rt.Buf, name: str, b: bool) {
+    push_field(out, name)
+    push_bool(out, b)
+    rt.buf_push(out, 32 as u8)
+}
+
+fn order_name(o: i32) -> str {
+    if o == OR_NEAREST { return "NEAREST" }
+    if o == OR_FURTHEST { return "FURTHEST" }
+    if o == OR_RANDOM { return "RANDOM" }
+    return "ARBITRARY"
+}
+
+fn sel_describe(a: *mut m.Arena, s: *mut Sel, out: *mut rt.Buf) {
+    push_flag(out, "currentEntity", (*s).current_entity)
+    push_field(out, "deltaX")
+    push_opt_double(a, out, (*s).has_dx, (*s).dx)
+    push_text(out, " deltaY=")
+    push_opt_double(a, out, (*s).has_dy, (*s).dy)
+    push_text(out, " deltaZ=")
+    push_opt_double(a, out, (*s).has_dz, (*s).dz)
+    push_text(out, " distance=")
+    push_range(a, out, &(*s).distance)
+    push_text(out, " entityUUID=")
+    if (*s).kind == SK_UUID {
+        push_hex(out, ((*s).uuid_hi as u64) >> 32, 8)
+        rt.buf_push(out, 45 as u8)
+        push_hex(out, ((*s).uuid_hi as u64) >> 16, 4)
+        rt.buf_push(out, 45 as u8)
+        push_hex(out, (*s).uuid_hi as u64, 4)
+        rt.buf_push(out, 45 as u8)
+        push_hex(out, ((*s).uuid_lo as u64) >> 48, 4)
+        rt.buf_push(out, 45 as u8)
+        push_hex(out, (*s).uuid_lo as u64, 12)
+    } else {
+        push_text(out, "null")
+    }
+    rt.buf_push(out, 32 as u8)
+    push_flag(out, "hasAdvancements", (*s).has_advancements)
+    push_flag(out, "hasGamemodeEquals", (*s).gm_eq)
+    push_flag(out, "hasGamemodeNotEquals", (*s).gm_ne)
+    push_flag(out, "hasNameEquals", (*s).name_eq)
+    push_flag(out, "hasNameNotEquals", (*s).name_ne)
+    push_flag(out, "hasScores", (*s).has_scores)
+    push_flag(out, "hasTeamEquals", (*s).team_eq)
+    push_flag(out, "hasTeamNotEquals", (*s).team_ne)
+    push_flag(out, "includesEntities", (*s).includes_entities)
+    push_flag(out, "isLimited", (*s).limited)
+    push_flag(out, "isSorted", (*s).sorted)
+    push_field(out, "level")
+    push_range(a, out, &(*s).level)
+    push_text(out, " maxResults=")
+    rt.buf_push_dec_i64(out, (*s).max_results as i64)
+    push_text(out, " order=")
+    push_text(out, order_name((*s).order))
+    push_text(out, " playerName=")
+    if (*s).has_name && (*s).kind == SK_NAME {
+        push_text(out, tx.u16_to_str(a, (*s).player_name))
+    } else {
+        push_text(out, "null")
+    }
+    push_text(out, " predicates=")
+    rt.buf_push_dec_i64(out, (*s).predicates as i64)
+    push_text(out, " rotX=")
+    push_range(a, out, &(*s).rot_x)
+    push_text(out, " rotY=")
+    push_range(a, out, &(*s).rot_y)
+    push_text(out, " type=")
+    if (*s).has_type && (*s).type_id.n > 0 {
+        push_text(out, tx.u16_to_str(a, (*s).type_id))
+    } else if (*s).has_type {
+        push_text(out, "minecraft:player")
+    } else {
+        push_text(out, "null")
+    }
+    rt.buf_push(out, 32 as u8)
+    push_flag(out, "typeInverse", (*s).type_inverse)
+    push_flag(out, "usesSelectors", (*s).uses_selectors)
+    push_flag(out, "worldLimited", (*s).world_limited)
+    push_field(out, "x")
+    push_opt_double(a, out, (*s).has_x, (*s).x)
+    push_text(out, " y=")
+    push_opt_double(a, out, (*s).has_y, (*s).y)
+    push_text(out, " z=")
+    push_opt_double(a, out, (*s).has_z, (*s).z)
+}
