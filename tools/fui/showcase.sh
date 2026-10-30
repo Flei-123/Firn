@@ -107,6 +107,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/mobile" tools/fui/mobile_main.fi
 "$T/mobile" "$T/img" > /dev/null
 
+# DESIGN SYSTEM FEEDBACK (ds_infobar / ds_swatch / ds_combo / ds_toast): four info bars, swatch grid, open combo, toast stack -- light, dark
+"$FIRNC" --opt-level=dev -o "$T/ds_feedback_shot" tools/fui/ds_feedback_shot_main.fi
+"$T/ds_feedback_shot" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
