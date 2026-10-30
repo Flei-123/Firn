@@ -30,7 +30,12 @@ def load_grade(g):
     import re
     src = open(os.path.join(LIB, "ds_icons_data%d.fi" % g)).read()
     reg = src[src.index("fn regular"):src.index("fn filled")]
-    return {int(i): d for i, d in re.findall(r'if id == (\d+) \{\s*return "([^"]*)"', reg)}
+    out = {int(i): d for i, d in re.findall(r'if id == (\d+) \{\s*return "([^"]*)"', reg)}
+    core = open(os.path.join(LIB, "ds_icons_core.fi")).read()
+    a = core.index("fn regular%d" % g)
+    b = core.index("fn filled%d" % g)
+    out.update({int(i): d for i, d in re.findall(r'if id == (\d+) \{\s*return "([^"]*)"', core[a:b])})
+    return out
 
 
 def icon(name, x, y, size, color):
