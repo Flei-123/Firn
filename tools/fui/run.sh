@@ -111,6 +111,11 @@ build contrast
 "$W/contrast"
 
 echo
+echo "== 2a. DESIGN SYSTEM TOKENS (lib/fui/ds_tokens*.fi) =="
+build ds_tokens
+"$W/ds_tokens"
+
+echo
 echo "== 2b. THE THEME FILE (lib/fui/themefile.fi) =="
 # A theme from a text file is applied only if it keeps the same
 # promise: the cases, then every theme shipped with fUi.
