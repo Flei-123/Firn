@@ -3,6 +3,7 @@ import java.io.PrintStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.function.Function;
 import com.mojang.serialization.Lifecycle;
 import net.minecraft.SharedConstants;
@@ -46,39 +47,45 @@ public class WgSurfaceOracle {
         return NoiseGeneratorSettings.OVERWORLD;
     }
 
-    public static void main(String[] a) throws Exception {
-        PrintStream out = new PrintStream(new java.io.FileOutputStream(a[0]));
-        String dim = a[1];
-        SharedConstants.tryDetectVersion();
-        Bootstrap.bootStrap();
-        HolderLookup.Provider prov = VanillaRegistries.createLookup();
-        ResourceKey<NoiseGeneratorSettings> key = keyOf(dim);
-        Holder.Reference<NoiseGeneratorSettings> ngsHolder = prov.lookupOrThrow(Registries.NOISE_SETTINGS).getOrThrow(key);
-        NoiseGeneratorSettings ngs = ngsHolder.value();
-        Class<?> pc = Class.forName("net.minecraft.world.level.biome.MultiNoiseBiomeSourceParameterList$Preset");
-        Object preset = pc.getField(dim.equals("nether") ? "NETHER" : "OVERWORLD").get(null);
-        Method pm = pc.getDeclaredMethod("provider");
-        pm.setAccessible(true);
-        Object provider = pm.invoke(preset);
-        Method ap = Class.forName("net.minecraft.world.level.biome.MultiNoiseBiomeSourceParameterList$Preset$SourceProvider").getDeclaredMethod("apply", Function.class);
-        ap.setAccessible(true);
+    static class Built {
+        ProtoChunk chunk;
+        HashMap<String, ResourceKey<Biome>> memo;
+        NoiseChunk nc;
+    }
+
+    static class Env {
+        HolderLookup.Provider prov;
+        NoiseGeneratorSettings ngs;
+        Holder.Reference<NoiseGeneratorSettings> ngsHolder;
+        Method ap;
+        Object provider;
+        Climate.ParameterList<ResourceKey<Biome>> list;
+        MappedRegistry<Biome> biomeReg;
+        Holder<Biome> plains;
+        long seed;
+        RandomState rs;
+        Climate.Sampler sampler;
+        Climate.ParameterList<ResourceKey<Biome>> chunkList;
+        boolean carve;
+
         @SuppressWarnings("unchecked")
-        Climate.ParameterList<ResourceKey<Biome>> list = (Climate.ParameterList<ResourceKey<Biome>>) ap.invoke(provider, Function.identity());
-        Holder<Biome> plains = prov.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS);
-        MappedRegistry<Biome> biomeReg = new MappedRegistry<>(Registries.BIOME, Lifecycle.stable());
-        biomeReg.register(Biomes.PLAINS, plains.value(), Lifecycle.stable());
-        for (int i = 2; i < a.length; i++) {
-            String[] p = a[i].split(":");
-            long seed = Long.parseLong(p[0]);
-            int cx = Integer.parseInt(p[1]);
-            int cz = Integer.parseInt(p[2]);
-            @SuppressWarnings("unchecked")
+        void reset(long s) throws Exception {
+            seed = s;
             HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise.NoiseParameters> noises = (HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise.NoiseParameters>) (Object) prov.lookupOrThrow(Registries.NOISE);
-            RandomState rs = RandomState.create(ngs, noises, seed);
-            Climate.Sampler sampler = rs.sampler();
-            @SuppressWarnings("unchecked")
-            Climate.ParameterList<ResourceKey<Biome>> chunkList = (Climate.ParameterList<ResourceKey<Biome>>) ap.invoke(provider, Function.identity());
-            java.util.HashMap<String, ResourceKey<Biome>> memo = new java.util.HashMap<>();
+            rs = RandomState.create(ngs, noises, seed);
+            sampler = rs.sampler();
+            chunkList = (Climate.ParameterList<ResourceKey<Biome>>) ap.invoke(provider, Function.identity());
+        }
+
+        Holder<Biome> biomeOf(ResourceKey<Biome> k) {
+            return prov.lookupOrThrow(Registries.BIOME).getOrThrow(k);
+        }
+
+        Built build(int cx, int cz) throws Exception {
+            Built b = new Built();
+            b.memo = new HashMap<>();
+            HashMap<String, ResourceKey<Biome>> memo = b.memo;
+            resetLast(chunkList);
             int fillMinY = ngs.noiseSettings().minY() >> 2;
             int fillMaxY = fillMinY + (ngs.noiseSettings().height() >> 2);
             for (int fy = fillMinY; fy < fillMaxY; fy++)
@@ -94,7 +101,7 @@ public class WgSurfaceOracle {
                     resetLast(list);
                     k = list.findValue(sampler.sample(qx, qy, qz));
                 }
-                return prov.lookupOrThrow(Registries.BIOME).getOrThrow(k);
+                return biomeOf(k);
             };
             BiomeManager bm = new BiomeManager(src, BiomeManager.obfuscateSeed(seed));
             int minY = ngs.noiseSettings().minY();
@@ -116,8 +123,51 @@ public class WgSurfaceOracle {
             fill(chunk, nc, ngs, cx, cz);
             chunk.setStatus(ChunkStatus.NOISE);
             rs.surfaceSystem().buildSurface(rs, bm, null, ngs.useLegacyRandomSource(), wgc, chunk, nc, ngs.surfaceRule());
-            if (System.getProperty("wg.carve") != null) WgCarve.run(prov, rs, seed, chunk, nc, gen, ngs, lha, bm, sampler, list, biomeReg, cx, cz);
-            dump(out, chunk, seed, cx, cz, minY, height);
+            if (carve) WgCarve.run(prov, rs, seed, chunk, nc, gen, ngs, lha, bm, sampler, list, biomeReg, cx, cz);
+            b.chunk = chunk;
+            b.nc = nc;
+            return b;
+        }
+    }
+
+    public static void main(String[] a) throws Exception {
+        PrintStream out = new PrintStream(new java.io.FileOutputStream(a[0]));
+        String dim = a[1];
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        Env e = new Env();
+        e.prov = VanillaRegistries.createLookup();
+        HolderLookup.Provider prov = e.prov;
+        ResourceKey<NoiseGeneratorSettings> key = keyOf(dim);
+        e.ngsHolder = prov.lookupOrThrow(Registries.NOISE_SETTINGS).getOrThrow(key);
+        NoiseGeneratorSettings ngs = e.ngsHolder.value();
+        e.ngs = ngs;
+        Class<?> pc = Class.forName("net.minecraft.world.level.biome.MultiNoiseBiomeSourceParameterList$Preset");
+        Object preset = pc.getField(dim.equals("nether") ? "NETHER" : "OVERWORLD").get(null);
+        Method pm = pc.getDeclaredMethod("provider");
+        pm.setAccessible(true);
+        e.provider = pm.invoke(preset);
+        e.ap = Class.forName("net.minecraft.world.level.biome.MultiNoiseBiomeSourceParameterList$Preset$SourceProvider").getDeclaredMethod("apply", Function.class);
+        e.ap.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Climate.ParameterList<ResourceKey<Biome>> list = (Climate.ParameterList<ResourceKey<Biome>>) e.ap.invoke(e.provider, Function.identity());
+        e.list = list;
+        e.plains = prov.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS);
+        e.biomeReg = new MappedRegistry<>(Registries.BIOME, Lifecycle.stable());
+        e.biomeReg.register(Biomes.PLAINS, e.plains.value(), Lifecycle.stable());
+        e.carve = System.getProperty("wg.carve") != null || System.getProperty("wg.features") != null;
+        String features = System.getProperty("wg.features");
+        for (int i = 2; i < a.length; i++) {
+            String[] p = a[i].split(":");
+            long seed = Long.parseLong(p[0]);
+            int cx = Integer.parseInt(p[1]);
+            int cz = Integer.parseInt(p[2]);
+            e.reset(seed);
+            if (features != null) {
+                WgFeatures.run(e, out, dim, features, cx, cz);
+            } else {
+                dump(out, e.build(cx, cz).chunk, seed, cx, cz, ngs.noiseSettings().minY(), ngs.noiseSettings().height());
+            }
         }
         out.close();
     }
