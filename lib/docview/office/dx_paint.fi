@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import docview.office.opc
+import docview.office.dx_model
+import docview.office.dx_fonts
+import docview.office.dx_prim
+import docview.office.dx_lay
+import docview.office.dx_utf8
+import docview.office.dx_page
+import docview.office.dx_view
+import docview.resample
+import fui.uiimage
+import fui.uiimagedec
+
+export { render_page, MAX_PIXELS }
+
+const MAX_PIXELS: u64 = 50000000
+const IMG_PART_MAX: usize = 33554432
+
+fn clampi(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn fill_rect(dst: u64, dw: i32, dh: i32, x: f64, y: f64, w: f64, h: f64, col: u32) {
+    var x0: i64 = (x + 0.5) as i64
+    var y0: i64 = (y + 0.5) as i64
+    var x1: i64 = (x + w + 0.5) as i64
+    var y1: i64 = (y + h + 0.5) as i64
+    if x1 <= x0 { x1 = x0 + 1 }
+    if y1 <= y0 { y1 = y0 + 1 }
+    x0 = clampi(x0, 0, dw as i64)
+    x1 = clampi(x1, 0, dw as i64)
+    y0 = clampi(y0, 0, dh as i64)
+    y1 = clampi(y1, 0, dh as i64)
+    var yy: i64 = y0
+    while yy < y1 {
+        var xx: i64 = x0
+        while xx < x1 {
+            rt.st32(dst, (yy as usize) * (dw as usize) + (xx as usize), col)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+fn load_image(v: *mut dx_view.DocView, idx: usize) -> *mut dx_view.ImgSlot {
+    while vec_len[dx_view.ImgSlot](&(*v).imgs) <= idx {
+        vec_push[dx_view.ImgSlot](&(*v).imgs, dx_view.ImgSlot { state: dx_view.IMG_NEW, px: rt.buf_new(), w: 0, h: 0 })
+    }
+    let slot: *mut dx_view.ImgSlot = vec_elem_ptr[dx_view.ImgSlot](&(*v).imgs, idx)
+    if (*slot).state != dx_view.IMG_NEW {
+        return slot
+    }
+    (*slot).state = dx_view.IMG_BAD
+    if idx >= vec_len[dx_model.Image](&(*v).d.images) {
+        return slot
+    }
+    let im: *mut dx_model.Image = dx_model.image_at(&(*v).d, idx as u32)
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    if !opc.pkg_read(&(*v).pk, dx_model.pool_str(&(*v).d, (*im).name_off, (*im).name_n), &raw, IMG_PART_MAX) {
+        return slot
+    }
+    var dec: uiimagedec.Decoded = uiimagedec.decoded_new()
+    defer uiimagedec.decoded_free(&dec)
+    var view: uiimage.Image = uiimage.image_new()
+    if !uiimagedec.image_from_bytes(rt.buf_ptr(&raw), rt.buf_len(&raw), &dec, &view) {
+        return slot
+    }
+    if view.w == 0 || view.h == 0 || view.px == 0 {
+        return slot
+    }
+    var stride: usize = view.stride
+    if stride == 0 {
+        stride = view.w * 4
+    }
+    let n: usize = view.w * view.h * 4
+    rt.buf_reserve(&(*slot).px, n)
+    rt.buf_set_len(&(*slot).px, n)
+    let dp: u64 = rt.buf_ptr(&(*slot).px)
+    var y: usize = 0
+    while y < view.h {
+        var x: usize = 0
+        while x < view.w {
+            let p: u32 = rt.ld32(view.px + ((y * stride) as u64), x)
+            let r: u32 = (p >> 16 as u32) & 255 as u32
+            let g: u32 = (p >> 8 as u32) & 255 as u32
+            let b: u32 = p & 255 as u32
+            let a: u32 = p >> 24 as u32
+            rt.st32(dp, y * view.w + x, (a << 24 as u32) | (b << 16 as u32) | (g << 8 as u32) | r)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*slot).w = view.w
+    (*slot).h = view.h
+    (*slot).state = dx_view.IMG_OK
+    return slot
+}
+
+fn blend_px(dst: u64, at: usize, s: u32) {
+    let a: u32 = s >> 24 as u32
+    if a == 0 as u32 {
+        return
+    }
+    if a == 255 as u32 {
+        rt.st32(dst, at, s)
+        return
+    }
+    let d: u32 = rt.ld32(dst, at)
+    let ia: u32 = 255 as u32 - a
+    let r: u32 = ((s & 255 as u32) * a + (d & 255 as u32) * ia) / 255 as u32
+    let g: u32 = (((s >> 8 as u32) & 255 as u32) * a + ((d >> 8 as u32) & 255 as u32) * ia) / 255 as u32
+    let b: u32 = (((s >> 16 as u32) & 255 as u32) * a + ((d >> 16 as u32) & 255 as u32) * ia) / 255 as u32
+    rt.st32(dst, at, 0xFF000000 as u32 | (b << 16 as u32) | (g << 8 as u32) | r)
+}
+
+fn draw_image(v: *mut dx_view.DocView, p: *mut dx_prim.Prim, scale: f64, dst: u64, dw: i32, dh: i32) {
+    let x0: i64 = (((*p).x as f64) * scale + 0.5) as i64
+    let y0: i64 = (((*p).y as f64) * scale + 0.5) as i64
+    var w: i64 = (((*p).w as f64) * scale + 0.5) as i64
+    var h: i64 = (((*p).h as f64) * scale + 0.5) as i64
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    if w > 8192 || h > 8192 || (*p).a < 0 {
+        return
+    }
+    if x0 + w <= 0 || y0 + h <= 0 || x0 >= (dw as i64) || y0 >= (dh as i64) {
+        return
+    }
+    let slot: *mut dx_view.ImgSlot = load_image(v, (*p).a as usize)
+    if (*slot).state != dx_view.IMG_OK {
+        fill_rect(dst, dw, dh, x0 as f64, y0 as f64, w as f64, h as f64, 0xFFE0E0E0 as u32)
+        return
+    }
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    if !resample.resample_rgba(rt.buf_ptr(&(*slot).px), (*slot).w, (*slot).h, &out, w as usize, h as usize) {
+        return
+    }
+    let op: u64 = rt.buf_ptr(&out)
+    var yy: i64 = 0
+    while yy < h {
+        let ty: i64 = y0 + yy
+        if ty >= 0 && ty < (dh as i64) {
+            var xx: i64 = 0
+            while xx < w {
+                let tx: i64 = x0 + xx
+                if tx >= 0 && tx < (dw as i64) {
+                    blend_px(dst, (ty as usize) * (dw as usize) + (tx as usize), rt.ld32(op, (yy as usize) * (w as usize) + (xx as usize)))
+                }
+                xx = xx + 1
+            }
+        }
+        yy = yy + 1
+    }
+}
+
+fn draw_text(v: *mut dx_view.DocView, p: *mut dx_prim.Prim, scale: f64, dst: u64, dw: i32, dh: i32, ptr: u64, n: usize) {
+    var tp: u64 = ptr
+    var tn: usize = n
+    if ((*p).flags & dx_prim.F_CAPS) != 0 as u32 {
+        rt.buf_clear(&(*v).tbuf)
+        dx_utf8.push_upper(&(*v).tbuf, ptr, n)
+        tp = rt.buf_ptr(&(*v).tbuf)
+        tn = rt.buf_len(&(*v).tbuf)
+    }
+    dx_fonts.paint_text(&(*v).fonts, (*p).face as usize, tp, tn, ((*p).size as f64) * scale, ((*p).x as f64) * scale,
+        ((*p).y as f64) * scale, (*p).color, dst, dw, dh)
+}
+
+fn draw_field(v: *mut dx_view.DocView, p: *mut dx_prim.Prim, pi: usize, scale: f64, dst: u64, dw: i32, dh: i32) {
+    var num: i64 = (pi as i64) + 1
+    if (*p).a == (dx_model.FLD_NUMPAGES as i32) {
+        num = vec_len[dx_view.PageRec](&(*v).pages) as i64
+    }
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    rt.buf_push_dec_i64(&tmp, num)
+    dx_fonts.paint_text(&(*v).fonts, (*p).face as usize, rt.buf_ptr(&tmp), rt.buf_len(&tmp), ((*p).size as f64) * scale,
+        ((*p).x as f64) * scale, ((*p).y as f64) * scale, (*p).color, dst, dw, dh)
+}
+
+fn paint_prim(v: *mut dx_view.DocView, p: *mut dx_prim.Prim, pi: usize, scale: f64, dst: u64, dw: i32, dh: i32) {
+    if (*p).kind == dx_prim.P_RECT {
+        fill_rect(dst, dw, dh, ((*p).x as f64) * scale, ((*p).y as f64) * scale, ((*p).w as f64) * scale, ((*p).h as f64) * scale, (*p).color)
+    } else if (*p).kind == dx_prim.P_TEXT {
+        draw_text(v, p, scale, dst, dw, dh, rt.buf_ptr(&(*v).d.pool) + ((*p).off as u64), (*p).n as usize)
+    } else if (*p).kind == dx_prim.P_FIELD {
+        draw_field(v, p, pi, scale, dst, dw, dh)
+    } else if (*p).kind == dx_prim.P_IMAGE {
+        draw_image(v, p, scale, dst, dw, dh)
+    }
+}
+
+fn render_page(v: *mut dx_view.DocView, pi: usize, scale0: f64, out: *mut rt.Buf, wo: *mut i32, ho: *mut i32) -> bool {
+    if pi >= vec_len[dx_view.PageRec](&(*v).pages) {
+        return false
+    }
+    let rec: *mut dx_view.PageRec = dx_view.page_at(v, pi)
+    var scale: f64 = scale0
+    if scale < 0.05 { scale = 0.05 }
+    if scale > 16.0 { scale = 16.0 }
+    var w: i64 = ((*rec).w * scale + 0.5) as i64
+    var h: i64 = ((*rec).h * scale + 0.5) as i64
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    while ((w * h) as u64) > MAX_PIXELS {
+        scale = scale * 0.8
+        w = ((*rec).w * scale + 0.5) as i64
+        h = ((*rec).h * scale + 0.5) as i64
+        if w < 1 { w = 1 }
+        if h < 1 { h = 1 }
+    }
+    let n: usize = (w as usize) * (h as usize) * 4
+    rt.buf_clear(out)
+    rt.buf_reserve(out, n)
+    rt.buf_set_len(out, n)
+    let dst: u64 = rt.buf_ptr(out)
+    var i: usize = 0
+    while i < (w as usize) * (h as usize) {
+        rt.st32(dst, i, 0xFFFFFFFF as u32)
+        i = i + 1
+    }
+    var k: u32 = (*rec).first
+    let end: u32 = (*rec).first + (*rec).count
+    while k < end {
+        paint_prim(v, vec_elem_ptr[dx_prim.Prim](&(*v).prims, k as usize), pi, scale, dst, w as i32, h as i32)
+        k = k + (1 as u32)
+    }
+    var hf: Vec[dx_prim.Prim] = vec_new[dx_prim.Prim]()
+    defer vec_free[dx_prim.Prim](&hf)
+    dx_page.hf_prims(v, pi, &hf)
+    var j: usize = 0
+    while j < vec_len[dx_prim.Prim](&hf) {
+        paint_prim(v, vec_elem_ptr[dx_prim.Prim](&hf, j), pi, scale, dst, w as i32, h as i32)
+        j = j + 1
+    }
+    *wo = w as i32
+    *ho = h as i32
+    return true
+}

@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_fonts
+import docview.office.dx_utf8
+import docview.office.dx_lay
+
+export { build_atoms, base_style }
+
+struct Builder {
+    prev_word: bool,
+    prev_cjk: bool,
+    prev_space: bool,
+}
+
+fn base_style(l: *mut dx_lay.Lay, pa: *mut dx_model.Para, out: *mut dx_lay.RStyle) {
+    var rp: dx_props.RunProps = (*pa).base_rp
+    dx_props.rp_finish(&rp)
+    dx_lay.run_style(l, &rp, out)
+}
+
+fn new_atom(kind: u32, run: u32, off: u32, n: u32, flags: u32, w: f64, st: dx_lay.RStyle) -> dx_lay.Atom {
+    return dx_lay.Atom { kind: kind, run: run, off: off, n: n, flags: flags, w: w, h: 0.0, img: -1, st: st }
+}
+
+fn space_width(l: *mut dx_lay.Lay, st: *mut dx_lay.RStyle) -> f64 {
+    let sp: [u8; 1] = " "
+    return dx_lay.measure(l, (*st).face, (*st).px, false, (&sp[0]) as u64, 1)
+}
+
+fn text_atoms(l: *mut dx_lay.Lay, b: *mut Builder, ri: u32, r: *mut dx_model.Run) {
+    var st: dx_lay.RStyle = dx_lay.RStyle { face: 0, px: 0.0, shift: 0.0, asc: 0.0, desc: 0.0, lead: 0.0, color: 0 as u32,
+        shade: 0 as u32, ul: 0, strike: false, caps: false }
+    dx_lay.run_style(l, &(*r).rp, &st)
+    let base: u64 = dx_lay.pool_ptr(l, (*r).toff)
+    let n: usize = (*r).tn as usize
+    let sw: f64 = space_width(l, &st)
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(base, i)
+        if c <= (32 as u8) {
+            var j: usize = i
+            while j < n && rt.ld8(base, j) <= (32 as u8) {
+                j = j + 1
+            }
+            vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_SPACE, ri, (*r).toff + (i as u32), (j - i) as u32, 0 as u32,
+                sw * ((j - i) as f64), st))
+            (*b).prev_space = true
+            (*b).prev_word = false
+            i = j
+        } else {
+            var j2: usize = i
+            var len: usize = 0
+            var cjk: bool = false
+            while j2 < n && rt.ld8(base, j2) > (32 as u8) {
+                let cp: u32 = dx_utf8.next_cp(base, n, j2, &len)
+                if dx_utf8.is_cjk_cp(cp) {
+                    if j2 == i {
+                        cjk = true
+                        j2 = j2 + len
+                    }
+                    break
+                }
+                j2 = j2 + len
+            }
+            if j2 == i {
+                j2 = i + 1
+            }
+            var flags: u32 = 0 as u32
+            if (*b).prev_space {
+                flags = dx_lay.AF_SPACE_BEFORE
+            } else if (*b).prev_word {
+                flags = dx_lay.AF_JOIN
+                if !cjk && !(*b).prev_cjk {
+                    flags = flags | dx_lay.AF_GLUE
+                }
+            }
+            let w: f64 = dx_lay.measure(l, st.face, st.px, st.caps, base + (i as u64), j2 - i)
+            vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_WORD, ri, (*r).toff + (i as u32), (j2 - i) as u32, flags, w, st))
+            (*b).prev_space = false
+            (*b).prev_word = true
+            (*b).prev_cjk = cjk
+            i = j2
+        }
+    }
+}
+
+fn run_atom(l: *mut dx_lay.Lay, b: *mut Builder, ri: u32, r: *mut dx_model.Run) {
+    if (*r).kind == dx_model.R_TEXT {
+        text_atoms(l, b, ri, r)
+        return
+    }
+    var st: dx_lay.RStyle = dx_lay.RStyle { face: 0, px: 0.0, shift: 0.0, asc: 0.0, desc: 0.0, lead: 0.0, color: 0 as u32,
+        shade: 0 as u32, ul: 0, strike: false, caps: false }
+    dx_lay.run_style(l, &(*r).rp, &st)
+    if (*r).kind == dx_model.R_TAB {
+        vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_TAB, ri, 0 as u32, 0 as u32, 0 as u32, 0.0, st))
+        (*b).prev_space = true
+        (*b).prev_word = false
+    } else if (*r).kind == dx_model.R_BREAK {
+        var k: u32 = dx_lay.A_BREAK
+        if (*r).a == dx_model.BR_PAGE {
+            k = dx_lay.A_PBREAK
+        }
+        vec_push[dx_lay.Atom](&(*l).atoms, new_atom(k, ri, 0 as u32, 0 as u32, 0 as u32, 0.0, st))
+        (*b).prev_space = true
+        (*b).prev_word = false
+    } else if (*r).kind == dx_model.R_IMAGE {
+        if (*r).a >= 0 {
+            st.asc = (*r).h
+            st.desc = 0.0
+            st.lead = (*r).h
+            st.shift = 0.0
+            var a: dx_lay.Atom = new_atom(dx_lay.A_IMAGE, ri, 0 as u32, 0 as u32, 0 as u32, (*r).w, st)
+            a.h = (*r).h
+            a.img = (*r).a as i32
+            vec_push[dx_lay.Atom](&(*l).atoms, a)
+            (*b).prev_word = false
+            (*b).prev_space = false
+        }
+    } else if (*r).kind == dx_model.R_FIELD {
+        let w: f64 = dx_lay.field_width(l, (*r).a, st.face, st.px)
+        vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_FIELD, ri, (*r).a as u32, 0 as u32, 0 as u32, w, st))
+        (*b).prev_word = true
+        (*b).prev_cjk = false
+        (*b).prev_space = false
+    }
+}
+
+fn build_atoms(l: *mut dx_lay.Lay, pi: u32) {
+    let d: *mut dx_model.Docx = (*l).d
+    vec_clear[dx_lay.Atom](&(*l).atoms)
+    let pa: *mut dx_model.Para = dx_model.para_at(d, pi)
+    var b: Builder = Builder { prev_word: false, prev_cjk: false, prev_space: false }
+    if (*pa).has_label {
+        var st: dx_lay.RStyle = dx_lay.RStyle { face: 0, px: 0.0, shift: 0.0, asc: 0.0, desc: 0.0, lead: 0.0, color: 0 as u32,
+            shade: 0 as u32, ul: 0, strike: false, caps: false }
+        base_style(l, pa, &st)
+        let w: f64 = dx_lay.measure(l, st.face, st.px, false, dx_lay.pool_ptr(l, (*pa).lab_off), (*pa).lab_n as usize)
+        vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_WORD, dx_model.NIL, (*pa).lab_off, (*pa).lab_n, dx_lay.AF_LABEL, w, st))
+        vec_push[dx_lay.Atom](&(*l).atoms, new_atom(dx_lay.A_TAB, dx_model.NIL, 0 as u32, 0 as u32, dx_lay.AF_LABEL_TAB, 0.0, st))
+    }
+    var k: u32 = 0
+    while k < (*pa).rcount {
+        let ri: u32 = (*pa).rfirst + k
+        run_atom(l, &b, ri, dx_model.run_at(d, ri))
+        k = k + 1
+    }
+}

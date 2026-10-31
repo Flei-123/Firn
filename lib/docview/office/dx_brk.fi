@@ -1,0 +1,433 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_utf8
+import docview.office.dx_lay
+import docview.office.dx_atoms
+
+export { break_lines }
+
+const DEFAULT_TAB_PX: f64 = 48.0
+
+struct Brk {
+    l: *mut dx_lay.Lay,
+    pp: *mut dx_props.ParaProps,
+    base: dx_lay.RStyle,
+    width: f64,
+    left: f64,
+    first_x: f64,
+    avail_end: f64,
+    cx: f64,
+    y: f64,
+    i0: usize,
+    trail: usize,
+    in_space: bool,
+    has_word: bool,
+    has_tab: bool,
+    after_hard: bool,
+    last_pb: bool,
+    nlines: usize,
+}
+
+fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn atom_at(b: *mut Brk, i: usize) -> *mut dx_lay.Atom {
+    return vec_elem_ptr[dx_lay.Atom](&(*(*b).l).atoms, i)
+}
+
+fn item_at(b: *mut Brk, i: usize) -> *mut dx_lay.Item {
+    return vec_elem_ptr[dx_lay.Item](&(*(*b).l).items, i)
+}
+
+fn items_len(b: *mut Brk) -> usize {
+    return vec_len[dx_lay.Item](&(*(*b).l).items)
+}
+
+fn start_x(b: *mut Brk) -> f64 {
+    if (*b).nlines == 0 {
+        return (*b).first_x
+    }
+    return (*b).left
+}
+
+fn begin_line(b: *mut Brk) {
+    (*b).cx = start_x(b)
+    (*b).i0 = items_len(b)
+    (*b).trail = (*b).i0
+    (*b).in_space = false
+    (*b).has_word = false
+    (*b).has_tab = false
+}
+
+fn strip_trailing(b: *mut Brk) {
+    let n: usize = items_len(b)
+    if (*b).trail < n && (*b).trail >= (*b).i0 {
+        vec_shorten[dx_lay.Item](&(*(*b).l).items, (*b).trail)
+    }
+    let m: usize = items_len(b)
+    if m > (*b).i0 {
+        let it: *mut dx_lay.Item = item_at(b, m - 1)
+        (*b).cx = (*it).x + (*it).w
+    } else {
+        (*b).cx = start_x(b)
+    }
+}
+
+fn shift_items(b: *mut Brk, from: usize, dx: f64) {
+    var i: usize = from
+    let n: usize = items_len(b)
+    while i < n {
+        let it: *mut dx_lay.Item = item_at(b, i)
+        (*it).x = (*it).x + dx
+        i = i + 1
+    }
+}
+
+fn justify(b: *mut Brk, extra: f64) {
+    let n: usize = items_len(b)
+    var nsp: usize = 0
+    var seen: bool = false
+    var i: usize = (*b).i0
+    while i < n {
+        let it: *mut dx_lay.Item = item_at(b, i)
+        let k: u32 = (*atom_at(b, (*it).atom as usize)).kind
+        if k == dx_lay.A_SPACE {
+            if seen {
+                nsp = nsp + 1
+            }
+        } else {
+            seen = true
+        }
+        i = i + 1
+    }
+    if nsp == 0 {
+        return
+    }
+    let per: f64 = extra / (nsp as f64)
+    var off: f64 = 0.0
+    seen = false
+    i = (*b).i0
+    while i < n {
+        let it2: *mut dx_lay.Item = item_at(b, i)
+        (*it2).x = (*it2).x + off
+        if (*atom_at(b, (*it2).atom as usize)).kind == dx_lay.A_SPACE {
+            if seen {
+                (*it2).w = (*it2).w + per
+                off = off + per
+            }
+        } else {
+            seen = true
+        }
+        i = i + 1
+    }
+}
+
+fn line_height(b: *mut Brk, asc: f64, desc: f64, lead: f64) -> f64 {
+    var nat: f64 = lead
+    if asc + desc > nat {
+        nat = asc + desc
+    }
+    let rule: i32 = (*(*b).pp).rule
+    var line: f64 = ((*(*b).pp).line as f64)
+    if line < 1.0 {
+        line = 240.0
+    }
+    if rule == dx_props.RULE_EXACT {
+        return clampf(line / 15.0, 1.0, 5000.0)
+    }
+    if rule == dx_props.RULE_ATLEAST {
+        let m: f64 = line / 15.0
+        if m > nat {
+            return clampf(m, 1.0, 5000.0)
+        }
+        return nat
+    }
+    return nat * clampf(line / 240.0, 0.1, 20.0)
+}
+
+fn finish_line(b: *mut Brk, hard: bool, pbreak: bool) {
+    strip_trailing(b)
+    var asc: f64 = 0.0
+    var desc: f64 = 0.0
+    var lead: f64 = 0.0
+    let n: usize = items_len(b)
+    var i: usize = (*b).i0
+    while i < n {
+        let st: *mut dx_lay.RStyle = &(*atom_at(b, (*item_at(b, i)).atom as usize)).st
+        if (*st).asc > asc { asc = (*st).asc }
+        if (*st).desc > desc { desc = (*st).desc }
+        if (*st).lead > lead { lead = (*st).lead }
+        i = i + 1
+    }
+    if n == (*b).i0 {
+        asc = (*b).base.asc
+        desc = (*b).base.desc
+        lead = (*b).base.lead
+    }
+    let h: f64 = line_height(b, asc, desc, lead)
+    let extra: f64 = (*b).avail_end - (*b).cx
+    let al: i32 = (*(*b).pp).align
+    if !(*b).has_tab && n > (*b).i0 && extra > 0.5 {
+        if al == dx_props.ALIGN_CENTER {
+            shift_items(b, (*b).i0, extra / 2.0)
+        } else if al == dx_props.ALIGN_RIGHT {
+            shift_items(b, (*b).i0, extra)
+        } else if al == dx_props.ALIGN_JUSTIFY && !hard {
+            justify(b, extra)
+        }
+    }
+    var base: f64 = h - desc
+    if base < asc && (*(*b).pp).rule == dx_props.RULE_AUTO {
+        base = asc
+    }
+    vec_push[dx_lay.LineRec](&(*(*b).l).lines, dx_lay.LineRec { i0: (*b).i0 as u32, i1: n as u32, y: (*b).y, h: h,
+        base: base, pbreak: pbreak })
+    (*b).y = (*b).y + h
+    (*b).nlines = (*b).nlines + 1
+    begin_line(b)
+}
+
+fn push_item(b: *mut Brk, ai: usize, off: u32, n: u32, flags: u32, w: f64) {
+    vec_push[dx_lay.Item](&(*(*b).l).items, dx_lay.Item { atom: ai as u32, off: off, n: n, flags: flags, w: w, x: (*b).cx })
+    (*b).cx = (*b).cx + w
+}
+
+fn lookahead(b: *mut Brk, ai: usize) -> f64 {
+    var w: f64 = 0.0
+    let n: usize = vec_len[dx_lay.Atom](&(*(*b).l).atoms)
+    var j: usize = ai + 1
+    while j < n {
+        let a: *mut dx_lay.Atom = atom_at(b, j)
+        if (*a).kind == dx_lay.A_TAB || (*a).kind == dx_lay.A_BREAK || (*a).kind == dx_lay.A_PBREAK {
+            break
+        }
+        w = w + (*a).w
+        j = j + 1
+    }
+    return w
+}
+
+fn tab_target(b: *mut Brk, ai: usize) -> f64 {
+    let a: *mut dx_lay.Atom = atom_at(b, ai)
+    if ((*a).flags & dx_lay.AF_LABEL_TAB) != 0 as u32 {
+        if (*b).cx < (*b).left {
+            return (*b).left
+        }
+        return (*b).cx + (*b).base.px * 0.3
+    }
+    var best: f64 = 1000000.0
+    var kind: i32 = dx_props.TAB_LEFT
+    var i: i32 = 0
+    while i < (*(*b).pp).ntabs && (i as usize) < dx_props.MAX_TABS {
+        let ts: dx_props.TabStop = (*(*b).pp).tabs[i as usize]
+        let pos: f64 = (ts.pos as f64) / 15.0
+        if pos > (*b).cx + 0.5 && pos < best {
+            best = pos
+            kind = ts.kind
+        }
+        i = i + 1
+    }
+    if best >= 1000000.0 {
+        var t: f64 = DEFAULT_TAB_PX
+        while t <= (*b).cx + 1.0 {
+            t = t + DEFAULT_TAB_PX
+        }
+        return t
+    }
+    if kind == dx_props.TAB_CENTER {
+        let t2: f64 = best - lookahead(b, ai) / 2.0
+        if t2 < (*b).cx {
+            return (*b).cx
+        }
+        return t2
+    }
+    if kind == dx_props.TAB_RIGHT {
+        let t3: f64 = best - lookahead(b, ai)
+        if t3 < (*b).cx {
+            return (*b).cx
+        }
+        return t3
+    }
+    return best
+}
+
+fn do_tab(b: *mut Brk, ai: usize) {
+    var t: f64 = tab_target(b, ai)
+    if t > (*b).avail_end {
+        t = (*b).avail_end
+    }
+    if t < (*b).cx {
+        t = (*b).cx
+    }
+    let a: *mut dx_lay.Atom = atom_at(b, ai)
+    push_item(b, ai, 0 as u32, 0 as u32, (*a).flags, t - (*b).cx)
+    (*b).has_tab = true
+    (*b).has_word = true
+    (*b).in_space = false
+    (*b).trail = items_len(b)
+    (*b).after_hard = false
+}
+
+fn place_atom(b: *mut Brk, ai: usize) {
+    let a: *mut dx_lay.Atom = atom_at(b, ai)
+    push_item(b, ai, (*a).off, (*a).n, (*a).flags, (*a).w)
+    (*b).has_word = true
+    (*b).in_space = false
+    (*b).trail = items_len(b)
+    (*b).after_hard = false
+}
+
+fn place_chunks(b: *mut Brk, ai: usize) {
+    let a: *mut dx_lay.Atom = atom_at(b, ai)
+    let l: *mut dx_lay.Lay = (*b).l
+    let base: u64 = dx_lay.pool_ptr(l, (*a).off)
+    let n: usize = (*a).n as usize
+    var i: usize = 0
+    var cs: usize = 0
+    var acc: f64 = 0.0
+    var flags: u32 = (*a).flags
+    var len: usize = 0
+    while i < n {
+        let cp: u32 = dx_utf8.next_cp(base, n, i, &len)
+        let cw: f64 = dx_lay.measure(l, (*a).st.face, (*a).st.px, (*a).st.caps, base + (i as u64), len)
+        if (*b).cx + acc + cw > (*b).avail_end && i > cs {
+            push_item(b, ai, (*a).off + (cs as u32), (i - cs) as u32, flags, acc)
+            (*b).has_word = true
+            finish_line(b, false, false)
+            flags = dx_lay.AF_JOIN
+            cs = i
+            acc = 0.0
+        }
+        acc = acc + cw
+        i = i + len
+    }
+    if n > cs {
+        push_item(b, ai, (*a).off + (cs as u32), (n - cs) as u32, flags, acc)
+        (*b).has_word = true
+        (*b).in_space = false
+        (*b).trail = items_len(b)
+    }
+    (*b).after_hard = false
+}
+
+fn place_unit(b: *mut Brk, i: usize, j: usize, wsum: f64) -> bool {
+    if (*b).cx + wsum <= (*b).avail_end + 0.01 {
+        var k: usize = i
+        while k <= j {
+            place_atom(b, k)
+            k = k + 1
+        }
+        return true
+    }
+    if (*b).has_word {
+        finish_line(b, false, false)
+        return false
+    }
+    if j > i {
+        place_atom(b, i)
+        return true
+    }
+    let a: *mut dx_lay.Atom = atom_at(b, i)
+    if (*a).kind == dx_lay.A_IMAGE {
+        let room: f64 = (*b).avail_end - (*b).cx
+        if room >= 4.0 && (*a).w > room {
+            let sc: f64 = room / (*a).w
+            (*a).w = (*a).w * sc
+            (*a).h = (*a).h * sc
+            (*a).st.asc = (*a).h
+            (*a).st.lead = (*a).h
+        }
+        place_atom(b, i)
+        return true
+    }
+    if (*a).kind == dx_lay.A_WORD {
+        place_chunks(b, i)
+        return true
+    }
+    place_atom(b, i)
+    return true
+}
+
+fn break_lines(l: *mut dx_lay.Lay, pi: u32, width: f64) {
+    let d: *mut dx_model.Docx = (*l).d
+    let pa: *mut dx_model.Para = dx_model.para_at(d, pi)
+    dx_atoms.build_atoms(l, pi)
+    vec_clear[dx_lay.Item](&(*l).items)
+    vec_clear[dx_lay.LineRec](&(*l).lines)
+    let pp: *mut dx_props.ParaProps = &(*pa).pp
+    var b: Brk = Brk { l: l, pp: pp, base: dx_lay.RStyle { face: 0, px: 0.0, shift: 0.0, asc: 0.0, desc: 0.0, lead: 0.0,
+        color: 0 as u32, shade: 0 as u32, ul: 0, strike: false, caps: false }, width: width, left: 0.0, first_x: 0.0,
+        avail_end: width, cx: 0.0, y: 0.0, i0: 0, trail: 0, in_space: false, has_word: false, has_tab: false,
+        after_hard: true, last_pb: false, nlines: 0 }
+    dx_atoms.base_style(l, pa, &b.base)
+    let w: f64 = clampf(width, 16.0, 1000000.0)
+    b.left = clampf(((*pp).left as f64) / 15.0, 0.0, w - 12.0)
+    b.first_x = clampf(((*pp).left as f64 + (*pp).first as f64) / 15.0, 0.0, w - 12.0)
+    var ae: f64 = w - clampf(((*pp).right as f64) / 15.0, 0.0, w)
+    var floor: f64 = b.left
+    if b.first_x > floor {
+        floor = b.first_x
+    }
+    if ae < floor + 12.0 {
+        ae = floor + 12.0
+    }
+    b.avail_end = ae
+    begin_line(&b)
+    let na: usize = vec_len[dx_lay.Atom](&(*l).atoms)
+    var i: usize = 0
+    while i < na {
+        let a: *mut dx_lay.Atom = atom_at(&b, i)
+        let kind: u32 = (*a).kind
+        if kind == dx_lay.A_SPACE {
+            if items_len(&b) == b.i0 && b.nlines > 0 && !b.after_hard {
+                i = i + 1
+            } else {
+                if !b.in_space {
+                    b.trail = items_len(&b)
+                    b.in_space = true
+                }
+                push_item(&b, i, (*a).off, (*a).n, (*a).flags, (*a).w)
+                i = i + 1
+            }
+        } else if kind == dx_lay.A_TAB {
+            do_tab(&b, i)
+            i = i + 1
+        } else if kind == dx_lay.A_BREAK {
+            finish_line(&b, true, false)
+            b.after_hard = true
+            b.last_pb = false
+            i = i + 1
+        } else if kind == dx_lay.A_PBREAK {
+            finish_line(&b, true, true)
+            b.after_hard = true
+            b.last_pb = true
+            i = i + 1
+        } else {
+            var j: usize = i
+            var wsum: f64 = (*a).w
+            while j + 1 < na && ((*atom_at(&b, j + 1)).flags & dx_lay.AF_GLUE) != 0 as u32 {
+                j = j + 1
+                wsum = wsum + (*atom_at(&b, j)).w
+            }
+            b.last_pb = false
+            if place_unit(&b, i, j, wsum) {
+                i = j + 1
+            }
+        }
+    }
+    if items_len(&b) > b.i0 || b.nlines == 0 || !b.last_pb {
+        finish_line(&b, true, false)
+    }
+    (*l).para_h = b.y
+    (*l).pbreak_last = b.last_pb
+}
