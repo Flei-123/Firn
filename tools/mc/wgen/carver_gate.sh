@@ -34,6 +34,6 @@ EXTRA_DEFAULT="1:-100:-100 11:-65:-135 7:-150:-110 3:-70:-95 12:50:70 22:-55:-45
 if [ -z "${CARVE_SKIP_EXTRA:-}" ]; then
     run_dim overworld ${CARVE_EXTRA:-$EXTRA_DEFAULT}
 fi
-run_dim nether ${CARVE_NETHER:-7:0:0 7:3:-2 12:-5:4}
+run_dim nether ${CARVE_NETHER:-7:0:0 7:3:-2 12:-5:4 15520:131:64}
 [ $ERR = 0 ] && echo "mc/wgen carve: all ok" || echo "mc/wgen carve: FAILED"
 exit $ERR

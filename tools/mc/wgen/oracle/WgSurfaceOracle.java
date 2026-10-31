@@ -254,7 +254,7 @@ public class WgSurfaceOracle {
                 String last = null;
                 int run = 0;
                 for (int y = minY + height - 1; y >= minY; y--) {
-                    BlockState st = chunk.getBlockState(pos.set(cx * 16 + lx, y, cz * 16 + lz));
+                    BlockState st = chunk.getSection(chunk.getSectionIndex(y)).getBlockState(lx, y & 15, lz);
                     String n = BuiltInRegistries.BLOCK.getKey(st.getBlock()).getPath();
                     if (n.equals("bee_nest")) n = "air";
                     boolean waterlogged = st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED) && st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED);
