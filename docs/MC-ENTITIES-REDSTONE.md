@@ -26,7 +26,7 @@ Stages: 1 table + tracking + players as entities + item drop/pickup (done here).
 - Components are a registry (`rs_comp`): one entry per block name with `neighbor_changed`, `tick`, `signal(dir)`, `direct_signal(dir)`; wire, lever, lamp, torch, repeater now; button/plate/comparator/piston/observer/door/dropper later as new entries.
 - Per version: block names + property names bound in `v763/sv_rs_v763` (`rs_bind`); behaviour is shared (1.20.1 and 26.x differ only in wire update order, handled by a flag in the binding).
 
-Stages: 1 lever, wire, lamp, torch, repeater (done here). 2 buttons, plates, comparator, observer, target, daylight. 3 piston + sticky (block events, moving blocks). 4 dispenser/dropper/hopper (need containers + entities). 5 wire update-order options (26.x experimental order).
+Stages: 1 lever, wire, lamp, torch, repeater (done here). 2 buttons (stone/wood), observer, comparator (no container input), redstone block (done: shape-update hook `Comp.shape`, aux table for comparator output, `rs_alias` for shared kinds, gate `rs_run.sh stage2` vs vanilla); open: pressure plates (need entity-inside query), target, daylight sensor, weighted plates, comparator container/analog inputs. 3 piston + sticky (block events, moving blocks). 4 dispenser/dropper/hopper (need containers + entities). 5 wire update-order options (26.x experimental order).
 
 ## Verification
 - Unit tests on a plain grid world (tests 6500+).
