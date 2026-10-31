@@ -42,6 +42,7 @@ ROLE = {
     "entityId": "E", "objectUUID": "U", "entityUUID": "U", "playerUUID": "U", "type": "T",
     "x": "X", "y": "Y", "z": "Z", "yaw": "W", "pitch": "P", "onGround": "G",
 }
+VARIABLE_LAYOUT_PACKETS = ("rel_entity_move", "entity_move_look", "sync_entity_position")
 ROLE_REL = {"dX": "x", "dY": "y", "dZ": "z"}
 TYPE = {"varint": "v", "i8": "b", "u8": "B", "i16": "s", "i32": "i", "f64": "d", "f32": "f",
         "UUID": "u", "bool": "o", "vec3i16": "V", "lpVec3": "L"}
@@ -83,6 +84,8 @@ def layout_of(proto, names, move):
         out = []
         for role, ty, fn, ft in toks[: last + 1]:
             if ty is None:
+                if n in VARIABLE_LAYOUT_PACKETS:
+                    return ""
                 raise SystemExit("gen_entity: %s.%s has type %s before the last wanted field" % (n, fn, json.dumps(ft)))
             out.append(role + ty)
         return "".join(out)

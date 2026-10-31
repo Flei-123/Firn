@@ -20,10 +20,12 @@ FIRNC=${1:-${FIRNC:-$ROOT/compiler/target/release/firnc}}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 ONLY=${2:-}
 NM=${MC_NODE_MODULES:-/root/firn/tools/mcserver/node_modules}
-MCDATA=$NM/minecraft-data/minecraft-data/data
+MCDATA_BASE=$NM/minecraft-data/minecraft-data/data
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 rc=0
+python3 "$ROOT/tools/mcgen/overlay_data.py" "$MCDATA_BASE" "$ROOT/tools/mcgen/data_extra" "$D/data" || { echo "FAIL overlay"; exit 1; }
+MCDATA=$D/data
 python3 "$ROOT/tools/mcgen/gen_protocol.py" --all "$MCDATA" "$D/gen" all 2>"$D/gen.log" || { cat "$D/gen.log"; echo "FAIL generator"; exit 1; }
 for f in mc_sem.fi mc_versions.fi $(cd "$D/gen" && ls v*/mc_proto_v*.fi); do
     if cmp -s "$D/gen/$f" "$ROOT/lib/mc/$f"; then :; else echo "FAIL: lib/mc/$f differs from the generator output"; rc=1; fi
@@ -38,7 +40,7 @@ fi
 python3 - "$ROOT/tools/mcgen/versions.json" > "$D/versions.txt" <<'PY'
 import json, sys
 for k, v in json.load(open(sys.argv[1]))["versions"].items():
-    print(k, v.get("nmp", v["data"]), v["protocol"])
+    print(k, v.get("nmp", v["data"]), v["protocol"], v.get("fixture_data", "-"))
 PY
 # the check program does not depend on the game version: compile it once per build stage
 MODES=("" "--no-opt" "--opt-level=dev-fast" "--opt-level=release-safe")
@@ -47,9 +49,13 @@ for mode in "${MODES[@]}"; do
     FIRNLIB=$ROOT/lib "$FIRNC" $mode -o "$D/sc$mi" "$ROOT/tools/mc/schema/check.fi" >"$D/cc$mi.log" 2>&1 || { cat "$D/cc$mi.log"; echo "FAIL compile check [$mode]"; rc=1; }
     mi=$((mi + 1))
 done
-while read -r key nmpv proto; do
+while read -r key nmpv proto fxdata; do
     [ -n "$ONLY" ] && [ "$ONLY" != "$proto" ] && continue
-    NODE_PATH=$NM node "$ROOT/tools/mcgen/gen_fixtures.cjs" "$D/fx$proto" "$nmpv" 4 >"$D/fx.log" 2>&1 || { cat "$D/fx.log"; echo "FAIL fixtures $key"; rc=1; continue; }
+    fxenv=()
+    if [ "$fxdata" != "-" ]; then
+        fxenv=(MC_DATA_VERSION="$fxdata" MC_PROTOCOL_JSON="$MCDATA/pc/$nmpv/protocol.json")
+    fi
+    env "${fxenv[@]}" NODE_PATH=$NM node "$ROOT/tools/mcgen/gen_fixtures.cjs" "$D/fx$proto" "$nmpv" 4 >"$D/fx.log" 2>&1 || { cat "$D/fx.log"; echo "FAIL fixtures $key"; rc=1; continue; }
     tail -1 "$D/fx.log" | sed "s/^/  [$key] /"
     mi=0
     for mode in "${MODES[@]}"; do
