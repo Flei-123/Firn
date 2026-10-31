@@ -70,7 +70,7 @@ Division with `lib/cast/h264dec.fi` (244 lines): the cast decoder is the tiny ba
 
 Lifted from Certus `lib/media/h264.fi` (9.2k lines): the helper threads (deblock/recon, futex), the breath hook and `thr.*` were removed (single thread, no platform dependency), so it builds for `wasm32-browser`; comments stripped; code tables in `h264/tables.fi`.
 
-Checks: `tools/media_video/run_h264.sh` (10 x264 clips vs `ffmpeg -f rawvideo`, bit exact), `run_demux.sh` (packets/pts/flags vs ffprobe), `fuzz.py` (mutated/truncated MP4/WebM/H.264), tests `6410_media_video_demux`, `6411_media_video_source`.
+Checks: `tools/media_video/run_h264.sh` (10 x264 clips vs `ffmpeg -f rawvideo`, bit exact), `run_demux.sh` (packets/pts/flags vs ffprobe), `fuzz.py` (mutated/truncated MP4/WebM/H.264), tests `6410_media_video_demux`, `6411_media_video_source`. Fuzz: 30000 tool runs (seeds 21,42,77,901-903 x 2500), 0 panics, 0 hangs; use `+%`/`-%`/`*%` and clamped `ebml_u32`/`ebml_i64` for untrusted sizes.
 Numbers: 720p high-profile decode 79.8 M instructions/frame (callgrind, release-fast); wasm32-browser VideoSource+demux+h264: 221 KB release-fast, 795 KB release-safe.
 ## G2 PDF viewer (lib/docview/pdf)
 - Base: Certus lib/pdf renderer (chosen by measurement vs OrientOS pdfread, 36 comparable corpus files, pdftoppm -r 72 page 1: median MAD 5.36 vs 6.66, PSNR 19.9 vs 18.4). Fixed horizontal-edge bug in prast: mean MAD 12.89 -> 12.48, mean PSNR 20.25 -> 21.31 (OrientOS 16.77 / 19.42).
