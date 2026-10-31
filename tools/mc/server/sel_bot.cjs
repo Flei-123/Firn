@@ -17,7 +17,8 @@ const current = () => {
   return i >= 0 && i < events.length ? events[i] : null
 }
 const c = mc.createClient({ host, port: parseInt(port, 10), username: name, auth: 'offline', version: '1.20.1', hideErrors: true })
-c.on('system_chat', (p) => { const s = current(); if (s) s.chat.push(flat(p.content)) })
+const presence = /^\S+ (joined|left) the game$/
+c.on('system_chat', (p) => { const s = current(); const t = flat(p.content); if (s && !presence.test(t)) s.chat.push(t) })
 c.on('player_chat', (p) => { const s = current(); if (s) s.chat.push('[' + flat(p.networkName) + '] ' + (p.plainMessage || '')) })
 c.on('position', (p) => { const s = current(); if (s) s.pos.push([p.x, p.y, p.z, p.yaw, p.pitch, p.flags]); c.write('teleport_confirm', { teleportId: p.teleportId }) })
 c.on('game_state_change', (p) => { const s = current(); if (s && p.reason === 3) s.modes.push(p.gameMode) })
