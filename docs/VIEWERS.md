@@ -54,3 +54,12 @@ All libs: no native-only calls in model layers, must build for `wasm32-browser`,
 * Audio: `ffmpeg -f f32le` PCM vs ours (max abs diff / SNR), duration vs `ffprobe`.
 * Video: `ffmpeg -f rawvideo` frames vs ours (bit exact for H.264).
 * Fuzz: mutated/truncated files must never crash or hang (error code only).
+
+## G2 PDF viewer (lib/docview/pdf)
+- Base: Certus lib/pdf renderer (chosen by measurement vs OrientOS pdfread, 36 comparable corpus files, pdftoppm -r 72 page 1: median MAD 5.36 vs 6.66, PSNR 19.9 vs 18.4). Fixed horizontal-edge bug in prast: mean MAD 12.89 -> 12.48, mean PSNR 20.25 -> 21.31 (OrientOS 16.77 / 19.42).
+- Modules (flat unique names, module name = last path segment): pobj, pdoc (parser/model), filter, prast, pfont, ppage (render+text), pannot, pform, textfold, pdf (facade), opener (docview registry).
+- API (pdf.fi): pdf_new, pdf_open, pdf_free, pdf_error, pdf_pages, pdf_page_size, pdf_render (+pdf_pixels/width/height, RGBA opaque), pdf_text (UTF-8), pdf_find (count + u32 codepoint offsets), pdf_links (rects in page space, origin top-left, URI).
+- Registry: `opener.pdf_install_lazy()` registers kind KIND_PDF as "pdf.native" (lazy). Not part of install_builtin on purpose: static font data (364 KB) is only linked by apps that call it.
+- Checks: tests/docview_pdf_basic.fi, tests/docview_pdf_registry.fi; tools/docview/pdf_compare.py (pdftoppm), pdf_textcmp.py (pdftotext word match page 1: 97.56 % over 27 files, 8291 words), pdf_fuzz.py (2400 mutated/truncated runs, 0 crashes, 0 hangs).
+- Size: wasm32-browser probe 1 096 010 B, of which 364 KB built-in font data (11 substitute faces). Lazy font loading needs a font hook (open).
+- Gaps: embedded fonts (FontFile2/CIDToGIDMap; cr-artikel text match 22 %), encryption (RC4/AES, empty user password), SMask in ExtGState, CCITTFax, glyph boxes for search highlight, /Rotate in links, named destinations.
