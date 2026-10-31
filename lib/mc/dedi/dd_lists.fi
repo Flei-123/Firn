@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/dedi/dd_lists.fi -- ops.json and whitelist.json in the vanilla format, held in memory as "Name:level,..." and "name,..." texts.
+
+import std.rt
+import std.io
+import std.md5
+import mc.dedi.dd_text as tx
+import mc.dedi.dd_state
+
+export { lists_load, lists_save_ops, lists_save_whitelist, ops_set, ops_remove, whitelist_add, whitelist_remove, ops_contains, whitelist_has }
+
+const HEX: str = "0123456789abcdef"
+
+fn json_string(obj: str, key: str, out: *mut str) -> bool {
+    var needle: rt.Buf = rt.buf_new()
+    rt.buf_push(&needle, 34 as u8)
+    rt.buf_push_bytes(&needle, key.p as u64, key.n)
+    rt.buf_push(&needle, 34 as u8)
+    let nd: str = rt.buf_str(&needle)
+    var i: usize = 0
+    var found: bool = false
+    while i + nd.n <= obj.n && !found {
+        if tx.eq(tx.sub(obj, i, i + nd.n), nd) { found = true } else { i = i + 1 }
+    }
+    rt.buf_free(&needle)
+    if !found { return false }
+    i = i + nd.n
+    while i < obj.n && rt.ld8(obj.p as u64, i) != 58 as u8 { i = i + 1 }
+    i = i + 1
+    while i < obj.n && (rt.ld8(obj.p as u64, i) == 32 as u8 || rt.ld8(obj.p as u64, i) == 10 as u8 || rt.ld8(obj.p as u64, i) == 13 as u8) { i = i + 1 }
+    if i >= obj.n { return false }
+    if rt.ld8(obj.p as u64, i) == 34 as u8 {
+        var j: usize = i + 1
+        while j < obj.n && rt.ld8(obj.p as u64, j) != 34 as u8 { j = j + 1 }
+        *out = tx.sub(obj, i + 1, j)
+        return true
+    }
+    var j: usize = i
+    while j < obj.n && rt.ld8(obj.p as u64, j) != 44 as u8 && rt.ld8(obj.p as u64, j) != 125 as u8 && rt.ld8(obj.p as u64, j) != 10 as u8 { j = j + 1 }
+    *out = tx.trim(tx.sub(obj, i, j))
+    return true
+}
+
+fn each_object(text: str, from: usize, obj: *mut str) -> usize {
+    var a: usize = from
+    while a < text.n && rt.ld8(text.p as u64, a) != 123 as u8 { a = a + 1 }
+    if a >= text.n { return text.n + 1 }
+    var b: usize = a
+    while b < text.n && rt.ld8(text.p as u64, b) != 125 as u8 { b = b + 1 }
+    *obj = tx.sub(text, a, b)
+    return b + 1
+}
+
+fn push_entry(b: *mut rt.Buf, name: str, level: i64, with_level: bool) {
+    if rt.buf_len(b) > 0 { rt.buf_push(b, 44 as u8) }
+    rt.buf_push_bytes(b, name.p as u64, name.n)
+    if with_level {
+        rt.buf_push(b, 58 as u8)
+        rt.buf_push_dec_i64(b, level)
+    }
+}
+
+fn list_from_file(path_c: u64, out: *mut rt.Buf, with_level: bool, default_level: i64) {
+    rt.buf_clear(out)
+    var raw: rt.Buf = rt.buf_new()
+    if io.read_file(path_c, &raw) {
+        let text: str = rt.buf_str(&raw)
+        var pos: usize = 0
+        while pos <= text.n {
+            var obj: str = ""
+            pos = each_object(text, pos, &obj)
+            if pos > text.n { break }
+            var name: str = ""
+            var lv: str = ""
+            if json_string(obj, "name", &name) && name.n > 0 {
+                var level: i64 = default_level
+                if with_level && json_string(obj, "level", &lv) { level = tx.parse_int(lv, default_level) }
+                push_entry(out, name, level, with_level)
+            }
+        }
+    }
+    rt.buf_free(&raw)
+}
+
+fn lists_load() {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var path: rt.Buf = rt.buf_new()
+    dd_state.dedi_path(d, &path, "ops.json")
+    list_from_file(rt.buf_ptr(&path), &(*d).ops, true, (*d).op_level as i64)
+    dd_state.dedi_path(d, &path, "whitelist.json")
+    list_from_file(rt.buf_ptr(&path), &(*d).whitelist, false, 0)
+    rt.buf_free(&path)
+}
+
+fn push_hex(b: *mut rt.Buf, v: u64, digits: usize) {
+    var i: usize = 0
+    while i < digits {
+        let shift: u64 = ((digits - 1 - i) * 4) as u64
+        rt.buf_push(b, rt.ld8(HEX.p as u64, ((v >> shift) & 15 as u64) as usize))
+        i = i + 1
+    }
+}
+
+fn push_uuid(b: *mut rt.Buf, name: str) {
+    var hi: u64 = 0
+    var lo: u64 = 0
+    md5.md5_offline_uuid(name.p as u64, name.n, &hi, &lo)
+    push_hex(b, hi >> 32 as u64, 8)
+    rt.buf_push(b, 45 as u8)
+    push_hex(b, (hi >> 16 as u64) & 65535 as u64, 4)
+    rt.buf_push(b, 45 as u8)
+    push_hex(b, hi & 65535 as u64, 4)
+    rt.buf_push(b, 45 as u8)
+    push_hex(b, lo >> 48 as u64, 4)
+    rt.buf_push(b, 45 as u8)
+    push_hex(b, lo & 281474976710655 as u64, 12)
+}
+
+fn push_text(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn save_list(path_c: u64, list: str, with_level: bool) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    push_text(&out, "[")
+    var i: usize = 0
+    var first: bool = true
+    while i < list.n {
+        var e: usize = i
+        while e < list.n && rt.ld8(list.p as u64, e) != 44 as u8 { e = e + 1 }
+        var c: usize = i
+        while c < e && rt.ld8(list.p as u64, c) != 58 as u8 { c = c + 1 }
+        let name: str = tx.sub(list, i, c)
+        if !first { push_text(&out, ",") }
+        first = false
+        push_text(&out, "\n  {\n    \"uuid\": \"")
+        push_uuid(&out, name)
+        push_text(&out, "\",\n    \"name\": \"")
+        push_text(&out, name)
+        if with_level {
+            push_text(&out, "\",\n    \"level\": ")
+            push_text(&out, tx.sub(list, c + 1, e))
+            push_text(&out, ",\n    \"bypassesPlayerLimit\": false\n  }")
+        } else {
+            push_text(&out, "\",\n    \"created\": \"\",\n    \"source\": \"Server\",\n    \"expires\": \"forever\",\n    \"reason\": \"\"\n  }")
+        }
+        i = e + 1
+    }
+    push_text(&out, "\n]\n")
+    let ok: bool = io.write_file(path_c, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    return ok
+}
+
+fn lists_save_ops() -> bool {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var path: rt.Buf = rt.buf_new()
+    dd_state.dedi_path(d, &path, "ops.json")
+    let ok: bool = save_list(rt.buf_ptr(&path), rt.buf_str(&(*d).ops), true)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn lists_save_whitelist() -> bool {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var path: rt.Buf = rt.buf_new()
+    dd_state.dedi_path(d, &path, "whitelist.json")
+    let ok: bool = save_list(rt.buf_ptr(&path), rt.buf_str(&(*d).whitelist), false)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn without(list: str, name: str, ci: bool, out: *mut rt.Buf) -> bool {
+    var removed: bool = false
+    var i: usize = 0
+    while i < list.n {
+        var e: usize = i
+        while e < list.n && rt.ld8(list.p as u64, e) != 44 as u8 { e = e + 1 }
+        var c: usize = i
+        while c < e && rt.ld8(list.p as u64, c) != 58 as u8 { c = c + 1 }
+        let entry_name: str = tx.sub(list, i, c)
+        var same: bool = false
+        if ci { same = tx.eq_ci(entry_name, name) } else { same = tx.eq(entry_name, name) }
+        if same {
+            removed = true
+        } else {
+            if rt.buf_len(out) > 0 { rt.buf_push(out, 44 as u8) }
+            push_text(out, tx.sub(list, i, e))
+        }
+        i = e + 1
+    }
+    return removed
+}
+
+fn replace_buf(dst: *mut rt.Buf, src: *mut rt.Buf) {
+    rt.buf_clear(dst)
+    rt.buf_push_bytes(dst, rt.buf_ptr(src), rt.buf_len(src))
+    rt.buf_free(src)
+}
+
+fn ops_contains(name: str) -> bool {
+    var scratch: rt.Buf = rt.buf_new()
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    let had: bool = without(rt.buf_str(&(*d).ops), name, true, &scratch)
+    rt.buf_free(&scratch)
+    return had
+}
+
+fn ops_set(name: str, level: i64) {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var next: rt.Buf = rt.buf_new()
+    without(rt.buf_str(&(*d).ops), name, true, &next)
+    push_entry(&next, name, level, true)
+    replace_buf(&(*d).ops, &next)
+}
+
+fn ops_remove(name: str) -> bool {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var next: rt.Buf = rt.buf_new()
+    let had: bool = without(rt.buf_str(&(*d).ops), name, true, &next)
+    replace_buf(&(*d).ops, &next)
+    return had
+}
+
+fn whitelist_has(name: str) -> bool {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var scratch: rt.Buf = rt.buf_new()
+    let had: bool = without(rt.buf_str(&(*d).whitelist), name, true, &scratch)
+    rt.buf_free(&scratch)
+    return had
+}
+
+fn whitelist_add(name: str) -> bool {
+    if whitelist_has(name) { return false }
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    push_entry(&(*d).whitelist, name, 0, false)
+    return true
+}
+
+fn whitelist_remove(name: str) -> bool {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    var next: rt.Buf = rt.buf_new()
+    let had: bool = without(rt.buf_str(&(*d).whitelist), name, true, &next)
+    replace_buf(&(*d).whitelist, &next)
+    return had
+}

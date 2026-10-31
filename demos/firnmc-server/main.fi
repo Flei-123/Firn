@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: MPL-2.0
+// demos/firnmc-server/main.fi -- Firn Minecraft dedicated server (1.20.1): server.properties, stdin console, signals, vanilla style log.
+
+import std.io
+import std.rt
+import std.time
+import mc.server.sv_host
+import mc.server.sv_state
+import mc.dedi.dd_text as tx
+import mc.dedi.dd_props as pr
+import mc.dedi.dd_defaults
+import mc.dedi.dd_state
+import mc.dedi.dd_lists
+import mc.dedi.dd_cfg
+import mc.dedi.dd_log
+import mc.dedi.dd_queue
+import mc.dedi.dd_signal
+import mc.dedi.dd_console
+import mc.dedi.dd_phase
+
+const USAGE: str = "usage: firnmc-server [nogui] [--dir DIR] [--port N] [--world DIR]\n"
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == sv_host.SERVER_KIND { return sv_host.server_main(arg) }
+    if kind == dd_console.CONSOLE_KIND { return dd_console.console_main(arg) }
+    return 0
+}
+
+fn arg_at(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn push_text(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn load_properties(d: *mut dd_state.Dedi, props: *mut pr.Props) {
+    var path: rt.Buf = rt.buf_new()
+    dd_state.dedi_path(d, &path, "server.properties")
+    var changed: bool = false
+    if pr.props_load(props, rt.buf_ptr(&path)) {
+        dd_log.log_info("Loading properties")
+        changed = pr.props_merge(props, dd_defaults.DEFAULTS)
+    } else {
+        dd_log.log_info("No server.properties found: generating a new one")
+        pr.props_set_text(props, dd_defaults.HEADER)
+        pr.props_merge(props, dd_defaults.DEFAULTS)
+        changed = true
+    }
+    if changed && !pr.props_save(props, rt.buf_ptr(&path)) { dd_log.log_warn("Could not write server.properties") }
+    rt.buf_free(&path)
+}
+
+fn elapsed_text(t0: u64, out: *mut rt.Buf) {
+    let ms: u64 = (time.monotonic_ns() - t0) / 1000000 as u64
+    rt.buf_push_dec_u64(out, ms / 1000 as u64)
+    rt.buf_push(out, 46 as u8)
+    let frac: u64 = ms % 1000 as u64
+    rt.buf_push(out, (48 + frac / 100 as u64) as u8)
+    rt.buf_push(out, (48 + (frac / 10 as u64) % 10 as u64) as u8)
+    rt.buf_push(out, (48 + frac % 10 as u64) as u8)
+}
+
+fn log_done(t0: u64) {
+    var b: rt.Buf = rt.buf_new()
+    push_text(&b, "Done (")
+    elapsed_text(t0, &b)
+    push_text(&b, "s)! For help, type \"help\"")
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn log_binding(cfg: *mut sv_state.Config, port: u16) {
+    var b: rt.Buf = rt.buf_new()
+    push_text(&b, "Starting Minecraft server on ")
+    if (*cfg).bind_addr == 0 as u32 { rt.buf_push(&b, 42 as u8) } else { push_text(&b, "bound address") }
+    rt.buf_push(&b, 58 as u8)
+    rt.buf_push_dec_u64(&b, port as u64)
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn main(start: u64) -> i32 {
+    let t0: u64 = time.monotonic_ns()
+    var root: str = ""
+    var port_override: i64 = 0 - 1
+    var world_override: str = ""
+    let argc: usize = rt.arg_count(start)
+    var i: usize = 1
+    while i < argc {
+        let a: str = arg_at(start, i)
+        if tx.eq(a, "--dir") && i + 1 < argc {
+            root = arg_at(start, i + 1)
+            i = i + 2
+        } else if tx.eq(a, "--port") && i + 1 < argc {
+            port_override = tx.parse_int(arg_at(start, i + 1), 0 - 1)
+            i = i + 2
+        } else if tx.eq(a, "--world") && i + 1 < argc {
+            world_override = arg_at(start, i + 1)
+            i = i + 2
+        } else if tx.eq(a, "nogui") || tx.eq(a, "--nogui") {
+            i = i + 1
+        } else {
+            io.print(USAGE)
+            return 2
+        }
+    }
+    dd_log.log_open(root)
+    let sig: i64 = dd_signal.signal_open()
+    let queue: u64 = dd_queue.queue_new()
+    let d: *mut dd_state.Dedi = dd_state.dedi_new(queue)
+    push_text(&(*d).root, root)
+    dd_log.log_info("Starting Firn Minecraft server version 1.20.1")
+    var props: pr.Props = pr.props_new()
+    load_properties(d, &props)
+    var cfg: sv_state.Config = sv_state.config_default()
+    var port: u16 = 25565 as u16
+    var level: str = "world"
+    dd_cfg.config_from_props(&props, &cfg, &port, &level)
+    if port_override >= 0 { port = port_override as u16 }
+    dd_lists.lists_load()
+    var world: rt.Buf = rt.buf_new()
+    var level_dat: rt.Buf = rt.buf_new()
+    if world_override.n > 0 { push_text(&world, world_override) } else {
+        if root.n > 0 {
+            push_text(&world, root)
+            rt.buf_push(&world, 47 as u8)
+        }
+        push_text(&world, level)
+    }
+    push_text(&level_dat, rt.buf_str(&world))
+    push_text(&level_dat, "/level.dat")
+    rt.buf_push(&level_dat, 0 as u8)
+    var world_dir: str = rt.buf_str(&world)
+    if !io.file_exists(rt.buf_ptr(&level_dat)) {
+        dd_log.log_warn("World not found: running a non-persistent superflat world (world creation is not implemented yet)")
+        world_dir = ""
+    }
+    log_binding(&cfg, port)
+    var host: sv_host.Host = sv_host.host_new()
+    if !sv_host.host_start_cfg(&host, port, cfg, world_dir, dd_phase.dedi_setup) {
+        dd_log.log_error("Failed to start the server (port in use or world unreadable)")
+        return 1
+    }
+    let console: u64 = thread_start(dd_console.CONSOLE_KIND, queue)
+    log_done(t0)
+    var code: i32 = 0
+    while true {
+        time.sleep_ms(20 as u64)
+        if dd_queue.stop_requested(queue) { break }
+        if dd_signal.signal_pending(sig) {
+            dd_log.log_info("Received stop signal")
+            break
+        }
+        if sv_host.host_failed(&host) {
+            dd_log.log_error("The server thread failed")
+            code = 1
+            break
+        }
+    }
+    dd_log.log_info("Stopping server")
+    sv_host.host_stop(&host)
+    dd_log.log_info("Saved and stopped")
+    dd_log.log_close()
+    rt.finish(code as i64)
+    return code
+}
