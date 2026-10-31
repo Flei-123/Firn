@@ -743,6 +743,19 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
         clk.add("promote", t);
         stage.mark("promote");
     }
+    if cfg.runs("unroll") {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            let k = crate::unroll::run_partial(f);
+            if k > 0 {
+                phi_check(f, "unroll");
+                optimize_func(f, &mut st, cfg, &mut clk);
+            }
+            n += k;
+        }
+        clk.add2("unroll", t, n > 0);
+    }
     // r837: 32-bit rotate recognition. After the fixpoint and the inliner (the shift counts are
     // constants by now), before `fuse-checks`; the five operations of the old expression die in `dce`.
     // x86-64: `ror r32` also covers the plain `u32` form (`rotate::run_u32`), so the pass runs there too.

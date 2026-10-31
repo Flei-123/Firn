@@ -131,6 +131,7 @@ mod cachemanifest;
 mod keyhash;
 mod objcache;
 mod chainsink;
+mod idxsink;
 mod usecount;
 mod promote;
 mod rangecheck;

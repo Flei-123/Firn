@@ -35,7 +35,9 @@ use crate::fx::HashMap;
 
 /// The copy with sunk addresses, or `None` when there is nothing to sink.
 pub fn sink(f: &Func) -> Option<Func> {
-    let c = crate::chainsink::sink(f);
+    let x = crate::idxsink::sink(f);
+    let x_ref: &Func = x.as_ref().unwrap_or(f);
+    let c = crate::chainsink::sink(x_ref).or(x);
     let c_ref: &Func = c.as_ref().unwrap_or(f);
     let a = sink_consts(c_ref);
     let base: &Func = a.as_ref().or(c.as_ref()).unwrap_or(f);

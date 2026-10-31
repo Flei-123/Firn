@@ -15,7 +15,7 @@
 use crate::fir::{BinOp, Func, Inst, Op, Val};
 use crate::fx::{HashMap, HashSet};
 
-fn scaled_index(op: &Op, consts: &HashMap<Val, i128>) -> Option<Val> {
+pub(crate) fn scaled_index(op: &Op, consts: &HashMap<Val, i128>) -> Option<Val> {
     match op {
         Op::Bin(BinOp::Shl, x, k) => match consts.get(k) {
             Some(c) if (0..=3).contains(c) => Some(*x),
@@ -29,7 +29,7 @@ fn scaled_index(op: &Op, consts: &HashMap<Val, i128>) -> Option<Val> {
     }
 }
 
-fn offset_base(op: &Op, consts: &HashMap<Val, i128>) -> Option<Val> {
+pub(crate) fn offset_base(op: &Op, consts: &HashMap<Val, i128>) -> Option<Val> {
     match op {
         Op::Bin(BinOp::Add | BinOp::Sub, y, c) if consts.contains_key(c) && !consts.contains_key(y) => Some(*y),
         _ => None,

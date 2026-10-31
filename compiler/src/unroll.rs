@@ -128,9 +128,17 @@ pub fn run(f: &mut Func) -> usize {
             None => break,
         }
     }
-    if std::env::var_os("FIRN_NO_UNROLL_PARTIAL").is_some() {
-        return n;
+    n
+}
+
+pub fn run_partial(f: &mut Func) -> usize {
+    if std::env::var_os("FIRN_NO_UNROLL").is_some() || std::env::var_os("FIRN_NO_UNROLL_PARTIAL").is_some() {
+        return 0;
     }
+    if f.constant_time || !f.secret.is_empty() || !f.has_phi() {
+        return 0;
+    }
+    let n = 0;
     let mut m = 0;
     while m < 64 {
         match find(f, true) {
@@ -364,7 +372,11 @@ fn find(f: &Func, partial: bool) -> Option<Plan> {
         // simulate
         let mut v = ty.truncate(init);
         let mut trips: u64 = 0;
-        loop {
+        let closed = if partial { closed_trips(op, stay_if, cty, ty.truncate(init), ty.truncate(lim), step) } else { None };
+        if let Some(t) = closed {
+            trips = t;
+        }
+        while closed.is_none() {
             let c = compare(op, cty, v, ty.truncate(lim));
             if c != stay_if {
                 break;
@@ -450,6 +462,40 @@ fn find(f: &Func, partial: bool) -> Option<Plan> {
         return Some(Plan { p, h, x, body, latch, blocks, trips, factor, side: side_edges > 0 });
     }
     None
+}
+
+fn negate(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Ge,
+        CmpOp::Le => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Le,
+        CmpOp::Ge => CmpOp::Lt,
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+    }
+}
+
+fn closed_trips(op: CmpOp, stay_if: bool, ty: FTy, init: i128, lim: i128, step: i128) -> Option<u64> {
+    let bits = ty.bits();
+    if bits == 0 || bits > 64 || ty.is_float() {
+        return None;
+    }
+    let (min, max): (i128, i128) = if ty.signed() {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    };
+    let eff = if stay_if { op } else { negate(op) };
+    let n: i128 = match (step, eff) {
+        (1, CmpOp::Lt) => (lim - init).max(0),
+        (1, CmpOp::Le) if lim != max => (lim - init + 1).max(0),
+        (1, CmpOp::Ne) if init <= lim => lim - init,
+        (-1, CmpOp::Gt) => (init - lim).max(0),
+        (-1, CmpOp::Ge) if lim != min => (init - lim + 1).max(0),
+        (-1, CmpOp::Ne) if init >= lim => init - lim,
+        _ => return None,
+    };
+    u64::try_from(n).ok()
 }
 
 fn swap(op: CmpOp) -> CmpOp {
