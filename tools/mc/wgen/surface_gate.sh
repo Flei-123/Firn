@@ -27,11 +27,16 @@ run_dim() {
     fi
 }
 
-run_dim overworld ${SURFACE_OVERWORLD:-11:0:0 11:-3:5 42:20:-17}
-run_dim amplified ${SURFACE_AMPLIFIED:-3:2:2}
-run_dim large_biomes ${SURFACE_LARGE:-3:2:2}
-run_dim nether ${SURFACE_NETHER:-7:0:0}
-run_dim end ${SURFACE_END:-7:0:0}
-[ -n "${SURFACE_EXTRA:-}" ] && run_dim overworld $SURFACE_EXTRA
+EXTRA_DEFAULT="11:-65:-135 7:-150:-110 3:-70:-95 12:50:70 22:-55:-45 2:-10:-100 4:-40:45 2:10:-105 4:-5:25 1:-120:-30 1:-5:-120 1:20:-85 2:-30:115 3:5:-60 3:-10:-80 2:5:110 3:-120:20 1:-60:120 3:-60:-80"
+if [ -z "${SURFACE_ONLY_EXTRA:-}" ]; then
+    run_dim overworld ${SURFACE_OVERWORLD:-11:0:0 11:-3:5 42:20:-17}
+    run_dim amplified ${SURFACE_AMPLIFIED:-3:2:2}
+    run_dim large_biomes ${SURFACE_LARGE:-3:2:2}
+    run_dim nether ${SURFACE_NETHER:-7:0:0}
+    run_dim end ${SURFACE_END:-7:0:0}
+fi
+if [ -z "${SURFACE_SKIP_EXTRA:-}" ]; then
+    run_dim overworld ${SURFACE_EXTRA:-$EXTRA_DEFAULT}
+fi
 [ $ERR = 0 ] && echo "mc/wgen surface: all ok" || echo "mc/wgen surface: FAILED"
 exit $ERR
