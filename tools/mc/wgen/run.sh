@@ -63,5 +63,10 @@ for spec in "${SPEC_LIST[@]}"; do
     compare "$ver $dim density" "$W/ref_${ver}_$dim.txt" "$W/got_${ver}_$dim.txt"
 done
 
+if [ -z "${WG_NO_GEN:-}" ]; then
+    bash tools/mc/wgen/gen_gate.sh || ERR=1
+    bash tools/mc/wgen/gen_join.sh || ERR=1
+fi
+
 [ $ERR = 0 ] && echo "mc/wgen: all ok" || echo "mc/wgen: FAILED"
 exit $ERR

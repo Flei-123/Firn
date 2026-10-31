@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.cpus
+import jobs.jobs
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_load
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fill
+import mc.gen.wgdf_pscache
+import mc.gen.wgdf_memo
+
+export { WgGen, gen_thread_work, gen_open, gen_chunk, gen_close, gen_default_block, gen_min_y, gen_height }
+
+const MAX_THREADS: usize = 8
+const CACHE_SIDE: i32 = 8
+const CACHE_SLOTS: usize = 64
+const TILE_W: i32 = 2
+
+struct WgGen {
+    job: TileCtx,
+    g: *mut wgdf_graph.WgGraph,
+    ns: [u64; 8],
+    threads: usize,
+    root: i32,
+    chunk_bytes: usize,
+    cache: u64,
+    tag_x: [i32; 64],
+    tag_z: [i32; 64],
+    tag_ok: [bool; 64],
+    pool: jobs.Jobs,
+}
+
+struct TileCtx {
+    gen: *mut WgGen,
+    tx: i32,
+    tz: i32,
+}
+
+fn gen_bytes() -> usize {
+    return wgdf_graph.wg_size_of[WgGen]()
+}
+
+fn gen_open(data_root: str, dim: str, seed: i64) -> *mut WgGen {
+    let g: *mut wgdf_graph.WgGraph = rt.heap_alloc(wgdf_graph.graph_bytes()) as *mut wgdf_graph.WgGraph
+    *g = wgdf_graph.graph_new()
+    if !wgdf_load.load_settings(g, data_root, dim) {
+        rt.heap_free(g as u64, wgdf_graph.graph_bytes())
+        return 0 as *mut WgGen
+    }
+    let root: i32 = wgdf_graph.router_find(g, "final_density")
+    if root < 0 {
+        rt.heap_free(g as u64, wgdf_graph.graph_bytes())
+        return 0 as *mut WgGen
+    }
+    let gen: *mut WgGen = rt.heap_alloc(gen_bytes()) as *mut WgGen
+    (*gen).g = g
+    (*gen).root = root
+    var n: usize = cpus.cpu_count() as usize
+    if n > MAX_THREADS { n = MAX_THREADS }
+    var threads: usize = 1
+    while threads * 2 <= n { threads = threads * 2 }
+    if threads < 2 { threads = 2 }
+    (*gen).threads = threads
+    (*gen).chunk_bytes = ((*g).height as usize) * 256
+    (*gen).cache = rt.heap_alloc((*gen).chunk_bytes * CACHE_SLOTS)
+    var i: usize = 0
+    while i < CACHE_SLOTS {
+        (*gen).tag_ok[i] = false
+        i = i + 1
+    }
+    i = 0
+    while i < threads {
+        let ns: *mut wgdf_eval.WgNoises = wgdf_eval.noises_alloc()
+        wgdf_eval.noises_build(g, ns, seed)
+        (*gen).ns[i] = ns as u64
+        i = i + 1
+    }
+    (*gen).pool = jobs.create((threads - 1) as u64)
+    return gen
+}
+
+fn slot_of(cx: i32, cz: i32) -> usize {
+    return ((cz & (CACHE_SIDE - 1)) * CACHE_SIDE + (cx & (CACHE_SIDE - 1))) as usize
+}
+
+fn tile_body(ctx: u64, lo: u64, hi: u64) {
+    let tc: *mut TileCtx = ctx as *mut TileCtx
+    let gen: *mut WgGen = (*tc).gen
+    var i: u64 = lo
+    while i < hi {
+        let cx: i32 = (*tc).tx + (i as i32) % TILE_W
+        let cz: i32 = (*tc).tz + (i as i32) / TILE_W
+        let slot: usize = slot_of(cx, cz)
+        let dst: u64 = (*gen).cache + ((slot * (*gen).chunk_bytes) as u64)
+        wgdf_fill.fill_chunk((*gen).g, (*gen).ns[i as usize] as *mut wgdf_eval.WgNoises, (*gen).root, cx, cz, true, dst as *mut u8)
+        (*gen).tag_x[slot] = cx
+        (*gen).tag_z[slot] = cz
+        (*gen).tag_ok[slot] = true
+        i = i + 1
+    }
+}
+
+fn gen_chunk(gen: *mut WgGen, cx: i32, cz: i32, out: *mut u8) {
+    let slot: usize = slot_of(cx, cz)
+    if !((*gen).tag_ok[slot] && (*gen).tag_x[slot] == cx && (*gen).tag_z[slot] == cz) {
+        let rows: i32 = ((*gen).threads as i32) / TILE_W
+        (*gen).job = TileCtx { gen: gen, tx: wgdf_eval.floor_div(cx, TILE_W) * TILE_W, tz: wgdf_eval.floor_div(cz, rows) * rows }
+        jobs.parallel_for(&(*gen).pool, 0 as u64, (*gen).threads as u64, 1 as u64, tile_body, (&(*gen).job) as u64)
+    }
+    rt.mem_copy(out as u64, (*gen).cache + ((slot * (*gen).chunk_bytes) as u64), (*gen).chunk_bytes)
+}
+
+fn gen_min_y(gen: *mut WgGen) -> i32 { return (*(*gen).g).min_y }
+
+fn gen_height(gen: *mut WgGen) -> i32 { return (*(*gen).g).height }
+
+fn gen_default_block(gen: *mut WgGen) -> str {
+    return str { p: &(*(*gen).g).default_block[0], n: (*(*gen).g).default_block_len }
+}
+
+fn gen_close(gen: *mut WgGen) {
+    jobs.destroy(&(*gen).pool)
+    var i: usize = 0
+    while i < (*gen).threads {
+        wgdf_memo.memo_release(&(*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).memo)
+        wgdf_pscache.ps_release(&(*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).ps)
+        rt.heap_free((*gen).ns[i], wgdf_eval.NOISES_BYTES)
+        i = i + 1
+    }
+    rt.heap_free((*gen).cache, (*gen).chunk_bytes * CACHE_SLOTS)
+    rt.heap_free((*gen).g as u64, wgdf_graph.graph_bytes())
+    rt.heap_free(gen as u64, gen_bytes())
+}
+
+fn gen_thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
