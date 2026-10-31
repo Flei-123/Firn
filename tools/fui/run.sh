@@ -862,6 +862,8 @@ build ds_tpl
 "$W/ds_tpl"
 build ds_tpl_logic
 "$W/ds_tpl_logic"
+build ds_store_touch
+"$W/ds_store_touch"
 echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
 FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
 echo "== DS4 GALLERY (r577): every page light + dark vs goldens, design lint clean =="
