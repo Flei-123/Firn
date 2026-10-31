@@ -7,6 +7,7 @@ const OWN_VERIFY_EVERY: u64 = 1024
 static mut OWN_FREED: u64 = 0
 static mut OWN_DEFERRED: u64 = 0
 static mut OWN_POISONED: u64 = 0
+static mut OWN_DROPS: u64 = 0
 
 fn __own_fail(code: u64, tid: u64) {
     var m: [u8; 62] = "firn-own: use after free detected (ownership=check), code 0x?\n"
@@ -76,10 +77,10 @@ fn __gc_free_block(p: *mut u8) {
     OWN_FREED = OWN_FREED + 1
 }
 
-fn __gc_poison_block(p: *mut u8) {
+fn __own_poison_quiet(p: *mut u8) -> u64 {
     let b: u64 = __own_block(p as u64)
     if b == 0 {
-        return
+        return 0
     }
     let tid: u64 = (*((b) as *mut u32)) as u64
     let zw: u32 = (*((b + 4) as *mut u32))
@@ -90,11 +91,11 @@ fn __gc_poison_block(p: *mut u8) {
         __own_fail(2, tid)
     }
     if (zw & M_WITHOUT_MARK) != 0 {
-        return
+        return 0
     }
     let c: u64 = __gc_chunk_of(b)
     if c == 0 {
-        return
+        return 0
     }
     let block: u64 = (*((c + 16) as *mut u64))
     var i: u64 = HEADER
@@ -104,7 +105,14 @@ fn __gc_poison_block(p: *mut u8) {
     }
     *((b + 4) as *mut u32) = zw | OWN_POISON
     OWN_POISONED = OWN_POISONED + 1
-    let n: u64 = OWN_POISONED
+    return OWN_POISONED
+}
+
+fn __gc_poison_block(p: *mut u8) {
+    let n: u64 = __own_poison_quiet(p)
+    if n == 0 {
+        return
+    }
     if (n & (n - 1)) == 0 || (n % OWN_VERIFY_EVERY) == 0 {
         gc_own_verify()
     }
@@ -261,4 +269,143 @@ fn __str_concat4_tail_check(t: str, b: str, c: str, d: str) -> str {
         __gc_poison_block(t.p)
     }
     return r
+}
+
+const OWN_STACK_CAP: u64 = 1024
+
+static mut OWN_STACK: [u64; 1024] = [0; 1024]
+
+fn __own_cx_enter(cx: u64, a: u64) -> bool {
+    let c: u64 = __gc_chunk_of(a - HEADER)
+    if c == 0 {
+        return false
+    }
+    let class: u64 = (*((c + 40) as *mut u64))
+    let step: u64 = (*((c + 16) as *mut u64))
+    let lo: u64 = c + CHUNK_HEADER
+    *((cx + 16) as *mut u64) = lo
+    *((cx + 24) as *mut u64) = lo + step * (*((c + 24) as *mut u64))
+    *((cx + 40) as *mut u64) = step
+    if class >= CLASSES {
+        *((cx + 32) as *mut u64) = 0
+    } else {
+        *((cx + 32) as *mut u64) = (*((cx) as *mut u64)) + S_FREE + class * 8
+    }
+    return true
+}
+
+fn __own_drop_loop(root: u64, t: u64, offs: u64, n: u64, cx: u64, check: u64) {
+    let stk: u64 = (&OWN_STACK) as u64
+    *((stk) as *mut u64) = root
+    var sp: u64 = 1
+    var lo: u64 = 0
+    var hi: u64 = 0
+    var hdr: u64 = 0
+    var step: u64 = 0
+    var count: u64 = 0
+    while sp > 0 {
+        sp = sp - 1
+        let a: u64 = (*((stk + sp * 8) as *mut u64))
+        let b: u64 = a - HEADER
+        if b < lo || b >= hi {
+            if !__own_cx_enter(cx, a) {
+                continue
+            }
+            lo = (*((cx + 16) as *mut u64))
+            hi = (*((cx + 24) as *mut u64))
+            hdr = (*((cx + 32) as *mut u64))
+            step = (*((cx + 40) as *mut u64))
+        }
+        if ((*((b) as *mut u32)) as u64) != t {
+            continue
+        }
+        let zw: u32 = (*((b + 4) as *mut u32))
+        if check != 0 && (zw & OWN_POISON) != 0 {
+            __own_fail(2, t)
+        }
+        if (zw & M_WITHOUT_MARK) != 0 {
+            continue
+        }
+        var i: u64 = 0
+        while i < n {
+            let child: u64 = (*((a + (*((offs + i * 8) as *mut u64))) as *mut u64))
+            if child != 0 && sp < OWN_STACK_CAP {
+                *((stk + sp * 8) as *mut u64) = child
+                sp = sp + 1
+            }
+            i = i + 1
+        }
+        if check != 0 {
+            __own_poison_quiet(a as *mut u8)
+        } else {
+            if hdr != 0 {
+                *((b) as *mut u64) = 0
+                *((b + 8) as *mut u64) = 0
+                *((b + HEADER) as *mut u64) = (*((hdr) as *mut u64))
+                *((hdr) as *mut u64) = b
+                count = count + 1
+            }
+        }
+    }
+    *((cx + 48) as *mut u64) = count
+    *((cx + 56) as *mut u64) = count * step
+}
+
+fn __own_drop_run(p: u64, check: u64) {
+    if p == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    if (*((st + S_INIT) as *mut u64)) != 1 {
+        return
+    }
+    let tab: u64 = (*((st + S_TABLE) as *mut u64))
+    if tab == 0 {
+        return
+    }
+    if check == 0 {
+        if (*((st + S_PHASE) as *mut u64)) != 0 {
+            return
+        }
+        if (*((st + S_MULTI) as *mut u64)) != 0 {
+            return
+        }
+    }
+    let b: u64 = __own_block(p)
+    if b == 0 {
+        return
+    }
+    let t: u64 = (*((b) as *mut u32)) as u64
+    if t == 0 || t > (*((tab) as *mut u64)) {
+        return
+    }
+    let entry: u64 = tab + 8 + (t - 1) * 64
+    var cx: [u64; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let at: u64 = (&cx) as u64
+    *((at) as *mut u64) = st
+    __own_drop_loop(p, t, (*((entry + 24) as *mut u64)), (*((entry + 16) as *mut u64)), at, check)
+    let freed: u64 = (*((at + 48) as *mut u64))
+    if freed != 0 {
+        OWN_FREED = OWN_FREED + freed
+        let bytes: u64 = (*((at + 56) as *mut u64))
+        let since: u64 = (*((st + S_SINCE) as *mut u64))
+        if since >= bytes {
+            *((st + S_SINCE) as *mut u64) = since - bytes
+        } else {
+            *((st + S_SINCE) as *mut u64) = 0
+        }
+    }
+}
+
+fn __own_drop_tree(p: u64) {
+    __own_drop_run(p, 0)
+}
+
+fn __own_drop_tree_check(p: u64) {
+    __own_drop_run(p, 1)
+    OWN_DROPS = OWN_DROPS + 1
+    let n: u64 = OWN_DROPS
+    if (n & (n - 1)) == 0 {
+        gc_own_verify()
+    }
 }

@@ -1,6 +1,11 @@
 //! Automatic ownership (docs/OWNERSHIP.md): mode switch and runtime text.
 
+pub(crate) mod borrow;
 pub(crate) mod concat;
+pub(crate) mod fresh;
+pub(crate) mod reuse;
+pub(crate) mod shape;
+pub(crate) mod walk;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
