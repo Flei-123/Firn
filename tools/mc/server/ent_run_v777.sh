@@ -22,7 +22,7 @@ mkfifo "$W/in"; exec 3<>"$W/in"
 if [ "${SERVER:-firn}" = vanilla ]; then
     JDK=${JDK25:-/root/tools/jdk25}
     JAR=${VANILLA_JAR:-/root/.w5/jars/server-26.3.jar}
-    printf 'online-mode=false\nserver-port=%s\nlevel-type=minecraft\\:flat\nview-distance=%s\nsimulation-distance=4\nspawn-protection=0\nenforce-secure-profile=false\nspawn-monsters=false\nspawn-animals=false\nspawn-npcs=false\ngenerate-structures=false\ngamemode=survival\nforce-gamemode=true\n' "$PORT" "$VIEW" > "$W/srv/server.properties"
+    printf 'online-mode=false\nwhite-list=false\nenforce-whitelist=false\nserver-port=%s\nlevel-type=minecraft\\:flat\nview-distance=%s\nsimulation-distance=4\nspawn-protection=0\nenforce-secure-profile=false\nspawn-monsters=false\nspawn-animals=false\nspawn-npcs=false\ngenerate-structures=false\ngamemode=survival\nforce-gamemode=true\n' "$PORT" "$VIEW" > "$W/srv/server.properties"
     echo "eula=true" > "$W/srv/eula.txt"
     ( cd "$W/srv" && exec "$JDK/bin/java" -Xmx1G -jar "$JAR" --nogui < "$W/in" > "$W/server.log" 2>&1 ) &
 else
