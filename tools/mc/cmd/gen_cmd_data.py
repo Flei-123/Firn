@@ -23,6 +23,23 @@ def entity_types(report_dir):
     return sorted(registries["minecraft:entity_type"]["entries"])
 
 
+ASK_SERVER = "minecraft:ask_server"
+
+
+def needs_ask_server(node, name):
+    parser = node.get("parser")
+    if parser == "minecraft:resource_location" and name == "timemarker":
+        return True
+    return parser == "minecraft:resource" and node.get("properties", {}).get("registry") == "minecraft:timeline"
+
+
+def mark_suggestions(node, name):
+    if node.get("type") == "argument" and needs_ask_server(node, name):
+        node["suggestions"] = ASK_SERVER
+    for key, child in node.get("children", {}).items():
+        mark_suggestions(child, key)
+
+
 def subset(report_dir, names):
     commands = json.load(open(os.path.join(report_dir, "commands.json")))
     registries = json.load(open(os.path.join(report_dir, "registries.json")))
@@ -30,6 +47,7 @@ def subset(report_dir, names):
     root = {"type": "root", "children": {}}
     for n in names:
         root["children"][n] = commands["children"][n]
+        mark_suggestions(root["children"][n], n)
     table = sorted(("%s=%d" % (k, v["protocol_id"])) for k, v in parsers.items())
     return root, table
 
