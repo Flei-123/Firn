@@ -12,40 +12,26 @@ ERR=0
 "$FIRNC" -o "$W/fill_probe" tools/mc/wgen/fill_probe.fi 2>"$W/err" || { echo "  FAIL  compile fill_probe"; head -8 "$W/err"; exit 1; }
 
 run_dim() {
-    local dim=$1 mode=$2; shift 2
+    local dim=$1; shift
     bash tools/mc/wgen/fill_oracle.sh "$W/ref_$dim.txt" "$dim" "$@" 2>&1 | grep -v WARNING
     : > "$W/got_$dim.txt"
     for t in "$@"; do
         IFS=: read -r sd cx cz <<< "$t"
         "$W/fill_probe" "$DATA" "$dim" "$sd" "$cx" "$cz" >> "$W/got_$dim.txt" || { echo "  FAIL  run $dim $t"; ERR=1; }
     done
-    if [ "$mode" = exact ]; then
-        if cmp -s "$W/ref_$dim.txt" "$W/got_$dim.txt"; then
-            echo "  ok    fill $dim: $(wc -l < "$W/ref_$dim.txt") rows identical"
-        else
-            echo "  FAIL  fill $dim: $(diff "$W/ref_$dim.txt" "$W/got_$dim.txt" | grep -c '^<') rows differ"; ERR=1
-        fi
+    if cmp -s "$W/ref_$dim.txt" "$W/got_$dim.txt"; then
+        echo "  ok    fill $dim: $(wc -l < "$W/ref_$dim.txt") rows identical"
     else
-        python3 -I - "$W/ref_$dim.txt" "$W/got_$dim.txt" <<'PY' || ERR=1
-import sys
-tr = str.maketrans('SOAWL', '##...')
-bad = soft = total = 0
-for a, b in zip(open(sys.argv[1]), open(sys.argv[2])):
-    ra, rb = a.split()[4].translate(tr), b.split()[4].translate(tr)
-    for x, y in zip(ra, rb):
-        total += 1
-        if x != y:
-            if x == '#':
-                soft += 1
-            else:
-                bad += 1
-print(f"  {'ok  ' if bad == 0 and soft * 1000 <= total else 'FAIL'}  fill overworld solid mask: {total} blocks, {bad} wrong, {soft} barrier-only (aquifer, not built)")
-sys.exit(0 if bad == 0 and soft * 1000 <= total else 1)
-PY
+        echo "  FAIL  fill $dim: $(diff "$W/ref_$dim.txt" "$W/got_$dim.txt" | grep -c '^<') rows differ"; ERR=1
     fi
 }
 
-run_dim nether exact 7:0:0 7:-3:5 99:12:-9
-run_dim overworld mask 11:0:0 11:-3:5 42:20:-17
+run_dim nether 7:0:0 7:-3:5 99:12:-9
+run_dim overworld 11:0:0 11:-3:5 42:20:-17 5:-40:31 1234:7:-60
+run_dim amplified 3:2:2 77:-9:14
+run_dim large_biomes 3:2:2
+run_dim caves 21:1:1
+run_dim floating_islands 21:1:1
+run_dim end 5:0:0 5:30:-44 9:-20:12
 [ $ERR = 0 ] && echo "mc/wgen fill: all ok" || echo "mc/wgen fill: FAILED"
 exit $ERR
