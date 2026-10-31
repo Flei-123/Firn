@@ -32,7 +32,7 @@ if [ -z "${SURFACE_ONLY_EXTRA:-}" ]; then
     run_dim overworld ${SURFACE_OVERWORLD:-11:0:0 11:-3:5 42:20:-17}
     run_dim amplified ${SURFACE_AMPLIFIED:-3:2:2}
     run_dim large_biomes ${SURFACE_LARGE:-3:2:2}
-    run_dim nether ${SURFACE_NETHER:-7:0:0}
+    run_dim nether ${SURFACE_NETHER:-7:0:0 23226:-170:66}
     run_dim end ${SURFACE_END:-7:0:0}
 fi
 if [ -z "${SURFACE_SKIP_EXTRA:-}" ]; then
