@@ -32,5 +32,6 @@ run_dim amplified 3:2:2 77:-9:14
 run_dim large_biomes 3:2:2
 run_dim caves 21:1:1
 run_dim floating_islands 21:1:1
+run_dim end 5:0:0 5:30:-44 9:-20:12
 [ $ERR = 0 ] && echo "mc/wgen fill: all ok" || echo "mc/wgen fill: FAILED"
 exit $ERR
