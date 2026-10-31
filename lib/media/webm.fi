@@ -1,0 +1,660 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.ebml
+
+export {
+    Webm, webm_new, webm_free, webm_parse, webm_chunk, webm_sniff, webm_ntracks, webm_find,
+    webm_count, webm_off, webm_pts, webm_size, webm_sync, webm_timescale, webm_kind, webm_codec,
+    webm_cfg, webm_cfg_len, webm_hz, webm_channels, webm_width, webm_height, webm_number,
+    webm_delay_ns, webm_preroll_ns, webm_duration, webm_init_seen, webm_clear_samples, webm_default_ns,
+    KIND_AUDIO, KIND_VIDEO, CODEC_VP8, CODEC_VP9, CODEC_AV1, CODEC_OPUS, CODEC_VORBIS, CODEC_OTHER,
+}
+
+const KIND_AUDIO: u32 = 1
+const KIND_VIDEO: u32 = 2
+
+const CODEC_NONE: u32 = 0
+const CODEC_VP8: u32 = 1
+const CODEC_VP9: u32 = 2
+const CODEC_AV1: u32 = 3
+const CODEC_OPUS: u32 = 4
+const CODEC_VORBIS: u32 = 5
+const CODEC_OTHER: u32 = 15
+
+const ID_EBML: u32 = 0x1A45DFA3
+const ID_SEGMENT: u32 = 0x18538067
+const ID_INFO: u32 = 0x1549A966
+const ID_TIMECODE_SCALE: u32 = 0x2AD7B1
+const ID_DURATION: u32 = 0x4489
+const ID_TRACKS: u32 = 0x1654AE6B
+const ID_TRACK_ENTRY: u32 = 0xAE
+const ID_TRACK_NUMBER: u32 = 0xD7
+const ID_TRACK_TYPE: u32 = 0x83
+const ID_CODEC_ID: u32 = 0x86
+const ID_CODEC_PRIVATE: u32 = 0x63A2
+const ID_CODEC_DELAY: u32 = 0x56AA
+const ID_SEEK_PREROLL: u32 = 0x56BB
+const ID_DEFAULT_DURATION: u32 = 0x23E383
+const ID_VIDEO: u32 = 0xE0
+const ID_PIXEL_WIDTH: u32 = 0xB0
+const ID_PIXEL_HEIGHT: u32 = 0xBA
+const ID_AUDIO: u32 = 0xE1
+const ID_SAMPLING_FREQ: u32 = 0xB5
+const ID_CHANNELS: u32 = 0x9F
+const ID_CLUSTER: u32 = 0x1F43B675
+const ID_CLUSTER_TIMECODE: u32 = 0xE7
+const ID_SIMPLE_BLOCK: u32 = 0xA3
+const ID_BLOCK_GROUP: u32 = 0xA0
+const ID_BLOCK: u32 = 0xA1
+const ID_BLOCK_DURATION: u32 = 0x9B
+const ID_REFERENCE_BLOCK: u32 = 0xFB
+
+const MAXT: usize = 4
+const REC: usize = 32
+const MAX_CARRY: usize = 134217728
+
+struct WTrack {
+    used: i32,
+    number: u32,
+    kind: u32,
+    codec: u32,
+    ch: u32,
+    hz: u32,
+    w: u32,
+    h: u32,
+    cfg: u64,
+    cfg_len: usize,
+    delay_ns: u64,
+    preroll_ns: u64,
+    default_ns: u64,
+    samples: rt.Buf,
+    nsamples: usize,
+}
+
+struct Webm {
+    nt: usize,
+    t: [WTrack; 4],
+    tcs: u64,
+    duration: f64,
+    cluster_tc: i64,
+    skip_left: u64,
+    carry: rt.Buf,
+    init_seen: i32,
+    seen: i32,
+}
+
+fn wtrack_new() -> WTrack {
+    return WTrack {
+        used: 0, number: 0, kind: 0, codec: CODEC_NONE, ch: 1, hz: 8000, w: 0, h: 0,
+        cfg: 0, cfg_len: 0, delay_ns: 0, preroll_ns: 0, default_ns: 0,
+        samples: rt.buf_new(), nsamples: 0,
+    }
+}
+
+fn webm_new() -> Webm {
+    return Webm {
+        nt: 0, t: [wtrack_new(); 4], tcs: 1000000, duration: 0.0, cluster_tc: 0,
+        skip_left: 0, carry: rt.buf_new(), init_seen: 0, seen: 0,
+    }
+}
+
+fn track_release(t: *mut WTrack) {
+    if (*t).cfg != 0 {
+        rt.heap_free((*t).cfg, (*t).cfg_len + 16)
+    }
+    (*t).cfg = 0
+    (*t).cfg_len = 0
+    rt.buf_free(&(*t).samples)
+    (*t).nsamples = 0
+}
+
+fn webm_free(w: *mut Webm) {
+    var i: usize = 0
+    while i < MAXT {
+        track_release(&(*w).t[i])
+        i = i + 1
+    }
+    rt.buf_free(&(*w).carry)
+}
+
+fn webm_sniff(d: u64, n: usize) -> i32 {
+    if n < 4 {
+        return 0
+    }
+    if ebml.ebml_byte(d, 0) == 0x1A && ebml.ebml_byte(d, 1) == 0x45 && ebml.ebml_byte(d, 2) == 0xDF && ebml.ebml_byte(d, 3) == 0xA3 {
+        return 1
+    }
+    return 0
+}
+
+fn bytes_eq(d: u64, pos: usize, n: usize, s: str) -> bool {
+    if n != s.n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(d, pos + i) != rt.ld8(s.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn codec_of(d: u64, pos: usize, n: usize) -> u32 {
+    if bytes_eq(d, pos, n, "V_VP8") { return CODEC_VP8 }
+    if bytes_eq(d, pos, n, "V_VP9") { return CODEC_VP9 }
+    if bytes_eq(d, pos, n, "V_AV1") { return CODEC_AV1 }
+    if bytes_eq(d, pos, n, "A_OPUS") { return CODEC_OPUS }
+    if bytes_eq(d, pos, n, "A_VORBIS") { return CODEC_VORBIS }
+    return CODEC_OTHER
+}
+
+fn child(d: u64, pos: usize, end: usize, id: *mut u32, hdr: *mut usize, size: *mut usize) -> i32 {
+    var idl: usize = 0
+    var szl: usize = 0
+    var sz: u64 = 0
+    if ebml.ebml_id(d, pos, end, id, &idl) != 1 {
+        return 0
+    }
+    if ebml.ebml_size(d, pos + idl, end, &sz, &szl) != 1 {
+        return 0
+    }
+    if sz == ebml.SIZE_UNKNOWN || sz > ((end - pos - idl - szl) as u64) {
+        sz = (end - pos - idl - szl) as u64
+    }
+    *hdr = idl + szl
+    *size = sz as usize
+    return 1
+}
+
+fn parse_video(t: *mut WTrack, d: u64, start: usize, end: usize) {
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        if id == ID_PIXEL_WIDTH {
+            (*t).w = ebml.ebml_uint(d, pos + hdr, size) as u32
+        }
+        if id == ID_PIXEL_HEIGHT {
+            (*t).h = ebml.ebml_uint(d, pos + hdr, size) as u32
+        }
+        pos = pos + hdr + size
+    }
+}
+
+fn parse_audio(t: *mut WTrack, d: u64, start: usize, end: usize) {
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        if id == ID_SAMPLING_FREQ {
+            (*t).hz = ebml.ebml_float(d, pos + hdr, size) as u32
+        }
+        if id == ID_CHANNELS {
+            (*t).ch = ebml.ebml_uint(d, pos + hdr, size) as u32
+        }
+        pos = pos + hdr + size
+    }
+}
+
+fn parse_entry(w: *mut Webm, d: u64, start: usize, end: usize) {
+    if (*w).nt >= MAXT {
+        return
+    }
+    let t: *mut WTrack = &(*w).t[(*w).nt]
+    *t = wtrack_new()
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        let body: usize = pos + hdr
+        if id == ID_TRACK_NUMBER {
+            (*t).number = ebml.ebml_uint(d, body, size) as u32
+        }
+        if id == ID_TRACK_TYPE {
+            let ty: u64 = ebml.ebml_uint(d, body, size)
+            if ty == 1 as u64 {
+                (*t).kind = KIND_VIDEO
+            }
+            if ty == 2 as u64 {
+                (*t).kind = KIND_AUDIO
+            }
+        }
+        if id == ID_CODEC_ID {
+            (*t).codec = codec_of(d, body, size)
+        }
+        if id == ID_CODEC_PRIVATE && size > 0 {
+            (*t).cfg = rt.heap_alloc(size + 16)
+            rt.mem_copy((*t).cfg, d + body as u64, size)
+            (*t).cfg_len = size
+        }
+        if id == ID_CODEC_DELAY {
+            (*t).delay_ns = ebml.ebml_uint(d, body, size)
+        }
+        if id == ID_SEEK_PREROLL {
+            (*t).preroll_ns = ebml.ebml_uint(d, body, size)
+        }
+        if id == ID_DEFAULT_DURATION {
+            (*t).default_ns = ebml.ebml_uint(d, body, size)
+        }
+        if id == ID_VIDEO {
+            parse_video(t, d, body, body + size)
+        }
+        if id == ID_AUDIO {
+            parse_audio(t, d, body, body + size)
+        }
+        pos = body + size
+    }
+    if (*t).kind == 0 || (*t).number == 0 as u32 {
+        track_release(t)
+        return
+    }
+    (*t).used = 1
+    (*w).nt = (*w).nt + 1
+}
+
+fn parse_tracks(w: *mut Webm, d: u64, start: usize, end: usize) {
+    var i: usize = 0
+    while i < MAXT {
+        track_release(&(*w).t[i])
+        (*w).t[i] = wtrack_new()
+        i = i + 1
+    }
+    (*w).nt = 0
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        if id == ID_TRACK_ENTRY {
+            parse_entry(w, d, pos + hdr, pos + hdr + size)
+        }
+        pos = pos + hdr + size
+    }
+    (*w).init_seen = 1
+}
+
+fn parse_info(w: *mut Webm, d: u64, start: usize, end: usize) {
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        if id == ID_TIMECODE_SCALE {
+            let v: u64 = ebml.ebml_uint(d, pos + hdr, size)
+            if v > 0 as u64 {
+                (*w).tcs = v
+            }
+        }
+        if id == ID_DURATION {
+            (*w).duration = ebml.ebml_float(d, pos + hdr, size)
+        }
+        pos = pos + hdr + size
+    }
+}
+
+fn track_index(w: *mut Webm, number: u64) -> i32 {
+    var i: usize = 0
+    while i < (*w).nt {
+        if ((*w).t[i].number as u64) == number {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn add_sample(t: *mut WTrack, off: u64, pts: i64, size: usize, key: u32) {
+    var r: [u8; 32] = [0 as u8; 32]
+    let p: u64 = (&r[0]) as u64
+    *(p as *mut u64) = off
+    *((p + 8) as *mut i64) = pts
+    *((p + 16) as *mut u32) = size as u32
+    *((p + 24) as *mut u32) = key
+    rt.buf_push_bytes(&(*t).samples, p, REC)
+    (*t).nsamples = (*t).nsamples + 1
+}
+
+fn frame_step(w: *mut Webm, t: *mut WTrack) -> i64 {
+    return ((*t).default_ns / (*w).tcs) as i64
+}
+
+fn add_block(w: *mut Webm, d: u64, start: usize, size: usize, abs: u64, key_flag: i32) {
+    if size < 4 {
+        return
+    }
+    let l: usize = ebml.ebml_vint_len(ebml.ebml_byte(d, start))
+    if l == 0 || l + 3 > size {
+        return
+    }
+    let num: u64 = ebml.ebml_vint_value(d, start, l)
+    let ti: i32 = track_index(w, num)
+    if ti < 0 {
+        return
+    }
+    let t: *mut WTrack = &(*w).t[ti as usize]
+    let rel: i32 = ebml.ebml_sint16(d, start + l)
+    let flags: u32 = ebml.ebml_byte(d, start + l + 2)
+    var key: u32 = 0
+    if key_flag < 0 {
+        if (flags & 0x80) != 0 {
+            key = 1
+        }
+    } else {
+        key = key_flag as u32
+    }
+    if (*t).kind == KIND_AUDIO {
+        key = 1
+    }
+    let pts0: i64 = (*w).cluster_tc + (rel as i64)
+    var pos: usize = start + l + 3
+    let end: usize = start + size
+    let lacing: u32 = (flags >> 1) & 3
+    if lacing == 0 {
+        add_sample(t, abs + pos as u64, pts0, end - pos, key)
+        return
+    }
+    if pos >= end {
+        return
+    }
+    let n: usize = (ebml.ebml_byte(d, pos) as usize) + 1
+    pos = pos + 1
+    var sizes: [usize; 256] = [0 as usize; 256]
+    var used: usize = 0
+    var i: usize = 0
+    if lacing == 1 {
+        while i + 1 < n {
+            var s: usize = 0
+            var more: bool = true
+            while more && pos < end {
+                let b: u32 = ebml.ebml_byte(d, pos)
+                pos = pos + 1
+                s = s + (b as usize)
+                if b != 255 {
+                    more = false
+                }
+            }
+            sizes[i] = s
+            used = used + s
+            i = i + 1
+        }
+    }
+    if lacing == 3 {
+        var prev: i64 = 0
+        while i + 1 < n {
+            if pos >= end {
+                return
+            }
+            let vl: usize = ebml.ebml_vint_len(ebml.ebml_byte(d, pos))
+            if vl == 0 || pos + vl > end {
+                return
+            }
+            let raw: u64 = ebml.ebml_vint_value(d, pos, vl)
+            if i == 0 {
+                prev = raw as i64
+            } else {
+                prev = prev + ebml.ebml_signed_delta(raw, vl)
+            }
+            pos = pos + vl
+            if prev < 0 {
+                return
+            }
+            sizes[i] = prev as usize
+            used = used + (prev as usize)
+            i = i + 1
+        }
+    }
+    if lacing == 2 {
+        let each: usize = (end - pos) / n
+        while i + 1 < n {
+            sizes[i] = each
+            used = used + each
+            i = i + 1
+        }
+    }
+    if pos + used > end {
+        return
+    }
+    sizes[n - 1] = end - pos - used
+    let step: i64 = frame_step(w, t)
+    i = 0
+    while i < n {
+        add_sample(t, abs + pos as u64, pts0 + (i as i64) * step, sizes[i], key)
+        pos = pos + sizes[i]
+        i = i + 1
+    }
+}
+
+fn parse_group(w: *mut Webm, d: u64, start: usize, end: usize, abs: u64) {
+    var pos: usize = start
+    var id: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    var block: usize = 0
+    var block_len: usize = 0
+    var has_ref: bool = false
+    while child(d, pos, end, &id, &hdr, &size) != 0 {
+        if id == ID_BLOCK {
+            block = pos + hdr
+            block_len = size
+        }
+        if id == ID_REFERENCE_BLOCK {
+            has_ref = true
+        }
+        pos = pos + hdr + size
+    }
+    if block_len > 0 {
+        var key: i32 = 1
+        if has_ref {
+            key = 0
+        }
+        add_block(w, d, block, block_len, abs, key)
+    }
+}
+
+fn carry_take(w: *mut Webm, d: u64, from: usize, to: usize) {
+    var keep: rt.Buf = rt.buf_new()
+    if to > from {
+        rt.buf_push_bytes(&keep, d + from as u64, to - from)
+    }
+    rt.buf_free(&(*w).carry)
+    (*w).carry = keep
+}
+
+fn scan(w: *mut Webm, d: u64, total: usize, abs: u64) -> i32 {
+    var pos: usize = 0
+    var progress: i32 = 0
+    while pos < total {
+        if (*w).skip_left > 0 as u64 {
+            var n: u64 = (total - pos) as u64
+            if n > (*w).skip_left {
+                n = (*w).skip_left
+            }
+            pos = pos + n as usize
+            (*w).skip_left = (*w).skip_left - n
+            progress = 1
+        } else {
+            var id: u32 = 0
+            var idl: usize = 0
+            var sz: u64 = 0
+            var szl: usize = 0
+            let ri: i32 = ebml.ebml_id(d, pos, total, &id, &idl)
+            if ri < 0 {
+                pos = pos + 1
+            } else {
+                if ri == 0 {
+                    break
+                }
+                let rs: i32 = ebml.ebml_size(d, pos + idl, total, &sz, &szl)
+                if rs < 0 {
+                    pos = pos + 1
+                } else {
+                    if rs == 0 {
+                        break
+                    }
+                    let hdr: usize = idl + szl
+                    let avail: u64 = (total - pos - hdr) as u64
+                    progress = 1
+                    if id == ID_SEGMENT || id == ID_CLUSTER {
+                        if id == ID_CLUSTER {
+                            (*w).cluster_tc = 0
+                        }
+                        (*w).seen = 1
+                        pos = pos + hdr
+                    } else {
+                        if sz == ebml.SIZE_UNKNOWN {
+                            pos = pos + hdr
+                        } else {
+                            let need: bool = id == ID_EBML || id == ID_INFO || id == ID_TRACKS || id == ID_CLUSTER_TIMECODE
+                                || id == ID_SIMPLE_BLOCK || id == ID_BLOCK_GROUP
+                            if sz > avail {
+                                if need {
+                                    break
+                                }
+                                (*w).skip_left = sz - avail
+                                pos = total
+                            } else {
+                                let body: usize = pos + hdr
+                                let blen: usize = sz as usize
+                                if id == ID_INFO {
+                                    parse_info(w, d, body, body + blen)
+                                }
+                                if id == ID_TRACKS {
+                                    parse_tracks(w, d, body, body + blen)
+                                    (*w).seen = 1
+                                }
+                                if id == ID_CLUSTER_TIMECODE {
+                                    (*w).cluster_tc = ebml.ebml_uint(d, body, blen) as i64
+                                }
+                                if id == ID_SIMPLE_BLOCK {
+                                    add_block(w, d, body, blen, abs, -1)
+                                }
+                                if id == ID_BLOCK_GROUP {
+                                    parse_group(w, d, body, body + blen, abs)
+                                }
+                                pos = body + blen
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if pos < total {
+        if total - pos > MAX_CARRY {
+            return -1
+        }
+        carry_take(w, d, pos, total)
+    } else {
+        carry_take(w, d, 0, 0)
+    }
+    return progress
+}
+
+fn webm_chunk(w: *mut Webm, d: u64, len: usize, base: u64) -> i32 {
+    let lo: usize = rt.buf_len(&(*w).carry)
+    var rc: i32 = 0
+    if lo == 0 {
+        rc = scan(w, d, len, base)
+    } else {
+        var joined: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&joined, rt.buf_ptr(&(*w).carry), lo)
+        rt.buf_push_bytes(&joined, d, len)
+        rc = scan(w, rt.buf_ptr(&joined), lo + len, base - (lo as u64))
+        rt.buf_free(&joined)
+    }
+    if rc < 0 {
+        return 2
+    }
+    if rc == 0 && (*w).seen == 0 && rt.buf_len(&(*w).carry) == 0 {
+        return 2
+    }
+    return 0
+}
+
+fn webm_parse(w: *mut Webm, d: u64, len: usize) -> i32 {
+    if webm_sniff(d, len) == 0 {
+        return 1
+    }
+    let rc: i32 = webm_chunk(w, d, len, 0)
+    if rc != 0 || (*w).nt == 0 {
+        return 2
+    }
+    return 0
+}
+
+fn webm_ntracks(w: *mut Webm) -> i32 { return (*w).nt as i32 }
+
+fn webm_find(w: *mut Webm, kind: u32) -> i32 {
+    var i: usize = 0
+    while i < (*w).nt {
+        if (*w).t[i].kind == kind && (*w).t[i].nsamples > 0 {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn rec(w: *mut Webm, t: i32, i: usize) -> u64 {
+    return rt.buf_ptr(&(*w).t[t as usize].samples) + (i * REC) as u64
+}
+
+fn webm_count(w: *mut Webm, t: i32) -> usize { return (*w).t[t as usize].nsamples }
+fn webm_off(w: *mut Webm, t: i32, i: usize) -> u64 { return *(rec(w, t, i) as *mut u64) }
+fn webm_pts(w: *mut Webm, t: i32, i: usize) -> i64 { return *((rec(w, t, i) + 8) as *mut i64) }
+fn webm_size(w: *mut Webm, t: i32, i: usize) -> u32 { return *((rec(w, t, i) + 16) as *mut u32) }
+fn webm_sync(w: *mut Webm, t: i32, i: usize) -> u32 { return *((rec(w, t, i) + 24) as *mut u32) }
+
+fn webm_timescale(w: *mut Webm, t: i32) -> u32 {
+    let v: u64 = 1000000000 / (*w).tcs
+    if v == 0 as u64 {
+        return 1
+    }
+    return v as u32
+}
+
+fn webm_kind(w: *mut Webm, t: i32) -> u32 {
+    if t < 0 || (t as usize) >= (*w).nt {
+        return 0
+    }
+    return (*w).t[t as usize].kind
+}
+
+fn webm_codec(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].codec }
+fn webm_cfg(w: *mut Webm, t: i32) -> u64 { return (*w).t[t as usize].cfg }
+fn webm_cfg_len(w: *mut Webm, t: i32) -> usize { return (*w).t[t as usize].cfg_len }
+fn webm_hz(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].hz }
+fn webm_channels(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].ch }
+fn webm_width(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].w }
+fn webm_height(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].h }
+fn webm_number(w: *mut Webm, t: i32) -> u32 { return (*w).t[t as usize].number }
+fn webm_delay_ns(w: *mut Webm, t: i32) -> u64 { return (*w).t[t as usize].delay_ns }
+fn webm_preroll_ns(w: *mut Webm, t: i32) -> u64 { return (*w).t[t as usize].preroll_ns }
+fn webm_default_ns(w: *mut Webm, t: i32) -> u64 { return (*w).t[t as usize].default_ns }
+
+fn webm_duration(w: *mut Webm) -> u64 {
+    if (*w).duration <= 0.0 {
+        return 0
+    }
+    return (*w).duration as u64
+}
+
+fn webm_init_seen(w: *mut Webm) -> i32 {
+    let v: i32 = (*w).init_seen
+    (*w).init_seen = 0
+    return v
+}
+
+fn webm_clear_samples(w: *mut Webm) {
+    var i: usize = 0
+    while i < MAXT {
+        rt.buf_clear(&(*w).t[i].samples)
+        (*w).t[i].nsamples = 0
+        i = i + 1
+    }
+}
