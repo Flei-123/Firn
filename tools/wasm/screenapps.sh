@@ -12,6 +12,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
+export FIRN_PRUNE_FIR=1
 FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 APPS=("$@")

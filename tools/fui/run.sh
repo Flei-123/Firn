@@ -864,6 +864,7 @@ build ds_tpl_logic
 "$W/ds_tpl_logic"
 build ds_store_touch
 "$W/ds_store_touch"
+python3 -I tools/fui/ds_icons_set.py --check examples/fui_apps/tpl_settings examples/fui_apps/tpl_wizard examples/fui_apps/tpl_store examples/fui_apps/tpl_files
 echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
 FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
 echo "== DS4 GALLERY (r577): every page light + dark vs goldens, design lint clean =="

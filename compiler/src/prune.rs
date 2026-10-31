@@ -89,12 +89,14 @@ pub fn root_names() -> Vec<String> {
     named
 }
 
-/// Is the pruning allowed for this compilation? (hosted x86-64 Linux exe)
+/// Is the pruning allowed for this compilation? (hosted x86-64 Linux exe or wasm32-browser)
 pub fn applicable(only_object: bool, exe: bool) -> bool {
-    enabled()
-        && matches!(crate::target::active(), crate::target::Target::X86_64)
+    let hosted_x86 = matches!(crate::target::active(), crate::target::Target::X86_64)
         && !crate::target::windows()
-        && !crate::target::shared()
+        && !crate::target::shared();
+    let wasm = crate::target::active() == crate::target::Target::Wasm32Browser;
+    enabled()
+        && (hosted_x86 || wasm)
         && !crate::prof::is_kernel()
         && !only_object
         && exe
