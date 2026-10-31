@@ -784,6 +784,9 @@ impl<'a> Lower<'a> {
             // HOOK str: `a + b` on `str` — the result comes from the
             // collector (strtype.rs, round 70).
             ExprKind::Binary(ast::BinOp::Add, a, b) if crate::strtype::is_str_like(&t) => {
+                if crate::own::concat::wants(self, e) {
+                    return crate::own::concat::lower_into(self, e, addr);
+                }
                 let a = (**a).clone();
                 let b = (**b).clone();
                 self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), e.span)?;
@@ -2195,9 +2198,13 @@ impl<'a> Lower<'a> {
                 // does not compute its address a second time.
                 if crate::strtype::is_str_like(&t) {
                     self.pinned.insert(target.id, addr);
-                    let a = target.clone();
-                    let b = value.clone();
-                    let r = self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), *span);
+                    let r = if crate::own::concat::wants_assign(self, value) {
+                        crate::own::concat::lower_assign(self, target, value, addr, *span).map(|_| None)
+                    } else {
+                        let a = target.clone();
+                        let b = value.clone();
+                        self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), *span)
+                    };
                     self.pinned.remove(&target.id);
                     r?;
                     return crate::gc_lower::hook_assign(self, target, addr);
