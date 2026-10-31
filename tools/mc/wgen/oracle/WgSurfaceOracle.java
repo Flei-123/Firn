@@ -253,6 +253,11 @@ public class WgSurfaceOracle {
                 for (int y = minY + height - 1; y >= minY; y--) {
                     BlockState st = chunk.getBlockState(pos.set(cx * 16 + lx, y, cz * 16 + lz));
                     String n = BuiltInRegistries.BLOCK.getKey(st.getBlock()).getPath();
+                    if (st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE)) {
+                        n += "[distance=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE) + "]";
+                    } else if (st.is(net.minecraft.tags.BlockTags.LOGS) && st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS)) {
+                        n += "[axis=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).getSerializedName() + "]";
+                    }
                     if (n.equals(last)) {
                         run++;
                     } else {
