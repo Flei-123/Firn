@@ -43,6 +43,14 @@ public class WgFeatures {
         int minY;
         int height;
         BiomeManager bm;
+        BiomeManager.NoiseBiomeSource nbs;
+        RandomSource rnd = new XoroshiroRandomSource(0L);
+
+        void set(BlockPos p, BlockState st) {
+            ChunkAccess c = chunk(p.getX() >> 4, p.getZ() >> 4);
+            c.setBlockState(p, st, false);
+            for (java.util.Map.Entry<Heightmap.Types, Heightmap> en : c.getHeightmaps()) en.getValue().update(p.getX() & 15, p.getY(), p.getZ() & 15, st);
+        }
 
         ChunkAccess chunk(int x, int z) {
             WgSurfaceOracle.Built b = grid.get(key(x, z));
@@ -82,9 +90,37 @@ public class WgFeatures {
                 case "setBlock": {
                     BlockPos p = (BlockPos) args[0];
                     if (!r.canWrite(p)) return false;
-                    r.chunk(p.getX() >> 4, p.getZ() >> 4).setBlockState(p, (BlockState) args[1], false);
+                    r.set(p, (BlockState) args[1]);
                     return true;
                 }
+                case "destroyBlock": {
+                    BlockPos p = (BlockPos) args[0];
+                    BlockState bs = r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p);
+                    if (bs.isAir()) return false;
+                    if (!r.canWrite(p)) return false;
+                    r.set(p, bs.getFluidState().createLegacyBlock());
+                    return true;
+                }
+                case "getFluidState": {
+                    BlockPos p = (BlockPos) args[0];
+                    return r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p).getFluidState();
+                }
+                case "getBlockEntity": return null;
+                case "scheduleTick": return null;
+                case "blockUpdated": return null;
+                case "levelEvent": return null;
+                case "gameEvent": return null;
+                case "setCurrentlyGenerating": return null;
+                case "getLevel": return null;
+                case "getRandom": return r.rnd;
+                case "getBrightness": return 0;
+                case "getRawBrightness": return 0;
+                case "hasChunk": return r.grid.containsKey(key((Integer) args[0], (Integer) args[1]));
+                case "hasChunkAt": {
+                    if (args[0] instanceof BlockPos p) return r.grid.containsKey(key(p.getX() >> 4, p.getZ() >> 4));
+                    return r.grid.containsKey(key(((Integer) args[0]) >> 4, ((Integer) args[1]) >> 4));
+                }
+                case "getNoiseBiome": return r.nbs.getNoiseBiome((Integer) args[0], (Integer) args[1], (Integer) args[2]);
                 case "getChunk":
                     if (args[0] instanceof BlockPos p) return r.chunk(p.getX() >> 4, p.getZ() >> 4);
                     return r.chunk((Integer) args[0], (Integer) args[1]);
@@ -138,9 +174,20 @@ public class WgFeatures {
             if (b == null) throw new IllegalStateException("biome outside grid");
             return e.biomeOf(b.memo.get(qx + "," + cy + "," + qz));
         };
+        r.nbs = nbs;
         r.bm = new BiomeManager(nbs, BiomeManager.obfuscateSeed(e.seed));
         WorldGenLevel level = level(r);
         boolean oresOnly = filter.equals("ore");
+        boolean dirOnly = filter.equals("dir");
+        Set<String> allowed = new java.util.HashSet<>();
+        if (dirOnly) {
+            String d = System.getProperty("wg.ftdir");
+            String[] fl = new java.io.File(d).list();
+            if (fl != null) for (String f : fl) if (f.endsWith(".json")) allowed.add(f.substring(0, f.length() - 5));
+        }
+        Map<PlacedFeature, String> pfNames = new java.util.IdentityHashMap<>();
+        e.prov.lookupOrThrow(Registries.PLACED_FEATURE).listElements().forEach(h -> pfNames.put(h.value(), h.key().location().getPath()));
+        java.util.Set<String> failed = new java.util.TreeSet<>();
         WorldgenRandom rnd = new WorldgenRandom(new XoroshiroRandomSource(0L));
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
@@ -169,12 +216,19 @@ public class WgFeatures {
                             Object f = pf.feature().value().feature();
                             if (!(f instanceof OreFeature) && !(f instanceof ScatteredOreFeature)) continue;
                         }
+                        if (dirOnly && !allowed.contains(pfNames.get(pf))) continue;
                         rnd.setFeatureSeed(l, n, j);
-                        pf.placeWithBiomeCheck(level, gen, rnd, origin);
+                        try {
+                            pf.placeWithBiomeCheck(level, gen, rnd, origin);
+                        } catch (RuntimeException ex) {
+                            if (dirOnly) throw ex;
+                            failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
+                        }
                     }
                 }
             }
         }
+        for (String f : failed) System.err.println("FAILED " + f);
         WgSurfaceOracle.dump(out, r.grid.get(key(cx, cz)).chunk, e.seed, cx, cz, minY, height);
     }
 }

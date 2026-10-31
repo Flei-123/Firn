@@ -13,7 +13,7 @@ ERR=0
 
 run_dim() {
     local dim=$1; shift
-    FEATURES=ore bash tools/mc/wgen/feature_oracle.sh "$W/ref_$dim.txt" "$dim" "$@" 2>&1 | grep -v WARNING
+    FEATURES=dir bash tools/mc/wgen/feature_oracle.sh "$W/ref_$dim.txt" "$dim" "$@" 2>&1 | grep -v WARNING
     : > "$W/got_$dim.txt"
     for t in "$@"; do
         IFS=: read -r sd cx cz <<< "$t"
