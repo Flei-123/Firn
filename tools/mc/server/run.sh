@@ -14,7 +14,7 @@
 #      execute if block per edit, player position and hotbar restored on rejoin, no warnings; wrong expectation is detected
 #   J  chat commands (tp, gamemode, time, say, error cases) sent to vanilla (op) and Firn: chat text, position, game_state, update_time equal;
 #      declare_commands subtree (gamemode say teleport time tp) structurally equal; mutated frame / chat line is detected
-# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_ONLY_CMDS=1 runs only J, MCS_ONLY_SEL=1 only the two-bot part of J, MCS_NO_SEL=1 skips it, MCS_KEEP=<dir> copies bot json and server logs there, MCS_ONLY_SAVE=1 runs only H, MCS_WORLD=<dir with level.dat>
+# Env: MCS_NO_PLAY=1 skips G, MCS_NO_SAVE=1 skips H, MCS_NO_EDIT=1 skips I, MCS_NO_CMDS=1 skips J, MCS_NO_ENT=1 skips K, MCS_NO_RS=1 skips L, MCS_ONLY_CMDS=1 runs only J, MCS_ONLY_SEL=1 only the two-bot part of J, MCS_NO_SEL=1 skips it, MCS_KEEP=<dir> copies bot json and server logs there, MCS_ONLY_SAVE=1 runs only H, MCS_WORLD=<dir with level.dat>
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -174,5 +174,6 @@ fi
 if [ -z "${MCS_NO_PLAY:-}" ]; then
     source "$TOOLS/stage_play.sh"
 fi
+source "$TOOLS/stage_ent_rs.sh"
 [ -f "$W/failed" ] && ERR=1
 exit $ERR

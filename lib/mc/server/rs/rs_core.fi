@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import std.rt
+import mc.mc_registry
+import mc.server.rs.rs_dir
+
+export {
+    Rs, Comp, SchedEntry, TAG_NONE, TAG_WIRE, TAG_LEVER, TAG_TORCH, TAG_LAMP, TAG_REPEATER,
+    PRIO_EXTREMELY_HIGH, PRIO_VERY_HIGH, PRIO_HIGH, PRIO_NORMAL,
+    comp_default, rs_new, rs_free, rs_register, rs_kind_of_state, rs_tag_of_state, rs_get, rs_set,
+    rs_update_at, rs_update_except, rs_notify, rs_is_conductor, rs_schedule, rs_pending, rs_will_tick_this_tick,
+    rs_run_ticks, rs_signal, rs_direct_signal, rs_direct_signal_to, rs_best_neighbor_signal, rs_has_neighbor_signal,
+    rs_comp_at, rs_use, rs_place_state, rs_same_block, block_default_state,
+}
+
+const TAG_NONE: i32 = 0
+const TAG_WIRE: i32 = 1
+const TAG_LEVER: i32 = 2
+const TAG_TORCH: i32 = 3
+const TAG_LAMP: i32 = 4
+const TAG_REPEATER: i32 = 5
+
+const PRIO_EXTREMELY_HIGH: i32 = 0 - 3
+const PRIO_VERY_HIGH: i32 = 0 - 2
+const PRIO_HIGH: i32 = 0 - 1
+const PRIO_NORMAL: i32 = 0
+
+const MAX_COMPS: usize = 12
+const MAX_SCHED: usize = 512
+
+struct Comp {
+    tag: i32,
+    conductor: bool,
+    source: bool,
+    neighbor_changed: fn(*mut Rs, i32, i32, i32, i32),
+    tick: fn(*mut Rs, i32, i32, i32, i32),
+    signal: fn(*mut Rs, i32, i32, i32, i32, i32) -> i32,
+    direct: fn(*mut Rs, i32, i32, i32, i32, i32) -> i32,
+    use_block: fn(*mut Rs, i32, i32, i32, i32) -> bool,
+    placed: fn(*mut Rs, i32, i32, i32, i32),
+    removed: fn(*mut Rs, i32, i32, i32, i32),
+    place_state: fn(*mut Rs, i32, i32, i32, i32, i32, i32) -> i32,
+}
+
+struct SchedEntry {
+    due: i64,
+    prio: i32,
+    seq: u64,
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: i32,
+}
+
+struct Rs {
+    enabled: bool,
+    reg: mc_registry.Registry,
+    ctx: u64,
+    world_get: fn(u64, i32, i32, i32) -> i32,
+    world_set: fn(u64, i32, i32, i32, i32),
+    shapes: fn(*mut Rs, i32, i32, i32),
+    kind_of: u64,
+    nblocks: usize,
+    comps: [Comp; 12],
+    ncomp: usize,
+    wires_give_power: bool,
+    now: i64,
+    prev: i32,
+    seq: u64,
+    sched: [SchedEntry; 512],
+    nsched: usize,
+}
+
+fn nop_cb(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32) {}
+fn nop_sig(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32, d: i32) -> i32 { return 0 }
+fn nop_use(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32) -> bool { return false }
+fn nop_place(rs: *mut Rs, s: i32, face: i32, hdir: i32, x: i32, y: i32, z: i32) -> i32 { return s }
+fn nop_shapes(rs: *mut Rs, x: i32, y: i32, z: i32) {}
+fn nop_get(ctx: u64, x: i32, y: i32, z: i32) -> i32 { return 0 }
+fn nop_set(ctx: u64, x: i32, y: i32, z: i32, s: i32) {}
+
+fn comp_default(tag: i32) -> Comp {
+    return Comp { tag: tag, conductor: false, source: false, neighbor_changed: nop_cb, tick: nop_cb, signal: nop_sig, direct: nop_sig,
+        use_block: nop_use, placed: nop_cb, removed: nop_cb, place_state: nop_place }
+}
+
+fn rs_new(reg: mc_registry.Registry) -> Rs {
+    var nb: usize = mc_registry.reg_block_count(&reg) as usize
+    let ko: u64 = rt.heap_alloc(nb + 1)
+    var i: usize = 0
+    while i < nb {
+        rt.st8(ko, i, 0 as u8)
+        i = i + 1
+    }
+    let e: SchedEntry = SchedEntry { due: 0, prio: 0, seq: 0, x: 0, y: 0, z: 0, kind: 0 }
+    return Rs { enabled: false, reg: reg, ctx: 0, world_get: nop_get, world_set: nop_set, shapes: nop_shapes, kind_of: ko, nblocks: nb,
+        comps: [comp_default(0); 12], ncomp: 0, wires_give_power: true, now: 0, prev: 0, seq: 0, sched: [e; 512], nsched: 0 }
+}
+
+fn rs_free(rs: *mut Rs) {
+    rt.heap_free((*rs).kind_of, (*rs).nblocks + 1)
+}
+
+fn rs_register(rs: *mut Rs, name: str, c: Comp) -> bool {
+    let b: i32 = mc_registry.reg_block_by_name(&(*rs).reg, name.p as u64, name.n)
+    if b < 0 || (*rs).ncomp >= MAX_COMPS { return false }
+    (*rs).comps[(*rs).ncomp] = c
+    rt.st8((*rs).kind_of, b as usize, ((*rs).ncomp + 1) as u8)
+    (*rs).ncomp = (*rs).ncomp + 1
+    (*rs).enabled = true
+    return true
+}
+
+fn rs_kind_of_state(rs: *mut Rs, state: i32) -> i32 {
+    if state <= 0 { return 0 - 1 }
+    let b: i32 = mc_registry.reg_block_of_state(&(*rs).reg, state)
+    if b < 0 { return 0 - 1 }
+    return (rt.ld8((*rs).kind_of, b as usize) as i32) - 1
+}
+
+fn rs_tag_of_state(rs: *mut Rs, state: i32) -> i32 {
+    let k: i32 = rs_kind_of_state(rs, state)
+    if k < 0 { return TAG_NONE }
+    return (*rs).comps[k as usize].tag
+}
+
+fn rs_comp_at(rs: *mut Rs, k: i32) -> *mut Comp {
+    return &(*rs).comps[k as usize]
+}
+
+fn rs_get(rs: *mut Rs, x: i32, y: i32, z: i32) -> i32 {
+    let s: i32 = (*rs).world_get((*rs).ctx, x, y, z)
+    if s < 0 { return 0 }
+    return s
+}
+
+fn rs_is_conductor(rs: *mut Rs, state: i32) -> bool {
+    if state <= 0 { return false }
+    let k: i32 = rs_kind_of_state(rs, state)
+    if k >= 0 { return (*rs).comps[k as usize].conductor }
+    let b: i32 = mc_registry.reg_block_of_state(&(*rs).reg, state)
+    let f: u32 = mc_registry.reg_block_flags(&(*rs).reg, b)
+    return (f & mc_registry.RF_SOLID) != 0 as u32 && (f & mc_registry.RF_TRANSPARENT) == 0 as u32
+}
+
+fn rs_notify(rs: *mut Rs, x: i32, y: i32, z: i32) {
+    let s: i32 = rs_get(rs, x, y, z)
+    let k: i32 = rs_kind_of_state(rs, s)
+    if k < 0 { return }
+    let f: fn(*mut Rs, i32, i32, i32, i32) = (*rs).comps[k as usize].neighbor_changed
+    f(rs, x, y, z, s)
+}
+
+fn rs_update_except(rs: *mut Rs, x: i32, y: i32, z: i32, skip: i32) {
+    var i: i32 = 0
+    while i < 6 {
+        let d: i32 = rs_dir.neighbor_order(i)
+        if d != skip { rs_notify(rs, x + rs_dir.dir_dx(d), y + rs_dir.dir_dy(d), z + rs_dir.dir_dz(d)) }
+        i = i + 1
+    }
+}
+
+fn rs_update_at(rs: *mut Rs, x: i32, y: i32, z: i32) {
+    rs_update_except(rs, x, y, z, 0 - 1)
+}
+
+fn rs_set(rs: *mut Rs, x: i32, y: i32, z: i32, state: i32, flags: i32) -> bool {
+    let old: i32 = rs_get(rs, x, y, z)
+    if old == state { return false }
+    (*rs).world_set((*rs).ctx, x, y, z, state)
+    (*rs).prev = old
+    let ok: i32 = rs_kind_of_state(rs, old)
+    let nk: i32 = rs_kind_of_state(rs, state)
+    if ok >= 0 {
+        let f: fn(*mut Rs, i32, i32, i32, i32) = (*rs).comps[ok as usize].removed
+        f(rs, x, y, z, old)
+    }
+    if nk >= 0 {
+        (*rs).prev = old
+        let g: fn(*mut Rs, i32, i32, i32, i32) = (*rs).comps[nk as usize].placed
+        g(rs, x, y, z, state)
+    }
+    if (flags & 1) != 0 { rs_update_at(rs, x, y, z) }
+    if (flags & 16) == 0 { (*rs).shapes(rs, x, y, z) }
+    return true
+}
+
+fn find_pending(rs: *mut Rs, x: i32, y: i32, z: i32, kind: i32) -> i32 {
+    var i: usize = 0
+    while i < (*rs).nsched {
+        let e: *mut SchedEntry = &(*rs).sched[i]
+        if (*e).x == x && (*e).y == y && (*e).z == z && (*e).kind == kind { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn rs_pending(rs: *mut Rs, x: i32, y: i32, z: i32, kind: i32) -> bool {
+    return find_pending(rs, x, y, z, kind) >= 0
+}
+
+fn rs_will_tick_this_tick(rs: *mut Rs, x: i32, y: i32, z: i32, kind: i32) -> bool {
+    let i: i32 = find_pending(rs, x, y, z, kind)
+    if i < 0 { return false }
+    return (*rs).sched[i as usize].due <= (*rs).now
+}
+
+fn rs_schedule(rs: *mut Rs, x: i32, y: i32, z: i32, kind: i32, delay: i32, prio: i32) {
+    if find_pending(rs, x, y, z, kind) >= 0 || (*rs).nsched >= MAX_SCHED { return }
+    (*rs).sched[(*rs).nsched] = SchedEntry { due: (*rs).now + delay as i64, prio: prio, seq: (*rs).seq, x: x, y: y, z: z, kind: kind }
+    (*rs).seq = (*rs).seq + 1
+    (*rs).nsched = (*rs).nsched + 1
+}
+
+fn next_due(rs: *mut Rs) -> i32 {
+    var best: i32 = 0 - 1
+    var i: usize = 0
+    while i < (*rs).nsched {
+        let e: *mut SchedEntry = &(*rs).sched[i]
+        if (*e).due <= (*rs).now {
+            if best < 0 {
+                best = i as i32
+            } else {
+                let b: *mut SchedEntry = &(*rs).sched[best as usize]
+                if (*e).due < (*b).due || ((*e).due == (*b).due && ((*e).prio < (*b).prio || ((*e).prio == (*b).prio && (*e).seq < (*b).seq))) { best = i as i32 }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn rs_run_ticks(rs: *mut Rs) {
+    (*rs).now = (*rs).now + 1
+    var budget: i32 = 65536
+    while budget > 0 {
+        let i: i32 = next_due(rs)
+        if i < 0 { return }
+        let e: SchedEntry = (*rs).sched[i as usize]
+        (*rs).nsched = (*rs).nsched - 1
+        (*rs).sched[i as usize] = (*rs).sched[(*rs).nsched]
+        let s: i32 = rs_get(rs, e.x, e.y, e.z)
+        if rs_kind_of_state(rs, s) == e.kind {
+            let f: fn(*mut Rs, i32, i32, i32, i32) = (*rs).comps[e.kind as usize].tick
+            f(rs, e.x, e.y, e.z, s)
+        }
+        budget = budget - 1
+    }
+}
+
+fn rs_direct_signal(rs: *mut Rs, x: i32, y: i32, z: i32, dir: i32) -> i32 {
+    let s: i32 = rs_get(rs, x, y, z)
+    let k: i32 = rs_kind_of_state(rs, s)
+    if k < 0 { return 0 }
+    let f: fn(*mut Rs, i32, i32, i32, i32, i32) -> i32 = (*rs).comps[k as usize].direct
+    return f(rs, x, y, z, s, dir)
+}
+
+fn rs_direct_signal_to(rs: *mut Rs, x: i32, y: i32, z: i32) -> i32 {
+    var m: i32 = 0
+    var d: i32 = 0
+    while d < 6 && m < 15 {
+        let v: i32 = rs_direct_signal(rs, x + rs_dir.dir_dx(d), y + rs_dir.dir_dy(d), z + rs_dir.dir_dz(d), d)
+        if v > m { m = v }
+        d = d + 1
+    }
+    return m
+}
+
+fn rs_signal(rs: *mut Rs, x: i32, y: i32, z: i32, dir: i32) -> i32 {
+    let s: i32 = rs_get(rs, x, y, z)
+    let k: i32 = rs_kind_of_state(rs, s)
+    var i: i32 = 0
+    if k >= 0 {
+        let f: fn(*mut Rs, i32, i32, i32, i32, i32) -> i32 = (*rs).comps[k as usize].signal
+        i = f(rs, x, y, z, s, dir)
+    }
+    if rs_is_conductor(rs, s) {
+        let j: i32 = rs_direct_signal_to(rs, x, y, z)
+        if j > i { i = j }
+    }
+    return i
+}
+
+fn rs_best_neighbor_signal(rs: *mut Rs, x: i32, y: i32, z: i32) -> i32 {
+    var m: i32 = 0
+    var d: i32 = 0
+    while d < 6 {
+        let v: i32 = rs_signal(rs, x + rs_dir.dir_dx(d), y + rs_dir.dir_dy(d), z + rs_dir.dir_dz(d), d)
+        if v >= 15 { return 15 }
+        if v > m { m = v }
+        d = d + 1
+    }
+    return m
+}
+
+fn rs_has_neighbor_signal(rs: *mut Rs, x: i32, y: i32, z: i32) -> bool {
+    var d: i32 = 0
+    while d < 6 {
+        if rs_signal(rs, x + rs_dir.dir_dx(d), y + rs_dir.dir_dy(d), z + rs_dir.dir_dz(d), d) > 0 { return true }
+        d = d + 1
+    }
+    return false
+}
+
+fn rs_use(rs: *mut Rs, x: i32, y: i32, z: i32) -> bool {
+    let s: i32 = rs_get(rs, x, y, z)
+    let k: i32 = rs_kind_of_state(rs, s)
+    if k < 0 { return false }
+    let f: fn(*mut Rs, i32, i32, i32, i32) -> bool = (*rs).comps[k as usize].use_block
+    return f(rs, x, y, z, s)
+}
+
+fn rs_place_state(rs: *mut Rs, state: i32, face: i32, hdir: i32, x: i32, y: i32, z: i32) -> i32 {
+    let k: i32 = rs_kind_of_state(rs, state)
+    if k < 0 { return state }
+    let f: fn(*mut Rs, i32, i32, i32, i32, i32, i32) -> i32 = (*rs).comps[k as usize].place_state
+    return f(rs, state, face, hdir, x, y, z)
+}
+
+fn rs_same_block(rs: *mut Rs, a: i32, b: i32) -> bool {
+    return mc_registry.reg_block_of_state(&(*rs).reg, a) == mc_registry.reg_block_of_state(&(*rs).reg, b)
+}
+
+fn block_default_state(rs: *mut Rs, b: i32) -> i32 {
+    return mc_registry.reg_block_default_state(&(*rs).reg, b)
+}
