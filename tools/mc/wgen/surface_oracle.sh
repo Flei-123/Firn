@@ -22,5 +22,5 @@ trap 'rm -rf "$W"' EXIT
 unzip -qo "$JARS/server-1.20.1.jar" 'META-INF/libraries/*' -d "$W/j"
 LIBS=$(find "$W/j/META-INF/libraries" -name '*.jar' | tr '\n' ':')
 mkdir -p "$W/c"
-"$JDK25/bin/javac" --release 17 -nowarn -cp "$MOJ:$LIBS" -d "$W/c" "$WG/oracle/WgSurfaceOracle.java" 2>&1 | grep -v '^Note' || true
-"$JDK25/bin/java" -XX:+UnlockDiagnosticVMOptions -XX:-UseLibmIntrinsic -cp "$W/c:$MOJ:$LIBS" net.minecraft.world.level.levelgen.WgSurfaceOracle "$OUT" "$DIM" "$@" 2>&1 >/dev/null | grep -v WARN | head -10 || true
+"$JDK25/bin/javac" --release 17 -nowarn -cp "$MOJ:$LIBS" -d "$W/c" "$WG/oracle/WgSurfaceOracle.java" "$WG/oracle/WgCarve.java" 2>&1 | grep -v '^Note' || true
+"$JDK25/bin/java" -XX:+UnlockDiagnosticVMOptions -XX:-UseLibmIntrinsic ${CARVE:+-Dwg.carve=1} -Dwg.tags=$WG/../../mcgen/worldgen/1.20.1/tags/blocks -cp "$W/c:$MOJ:$LIBS" net.minecraft.world.level.levelgen.WgSurfaceOracle "$OUT" "$DIM" "$@" 2>&1 >/dev/null | grep -v WARN | head -10 || true

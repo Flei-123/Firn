@@ -116,6 +116,7 @@ public class WgSurfaceOracle {
             fill(chunk, nc, ngs, cx, cz);
             chunk.setStatus(ChunkStatus.NOISE);
             rs.surfaceSystem().buildSurface(rs, bm, null, ngs.useLegacyRandomSource(), wgc, chunk, nc, ngs.surfaceRule());
+            if (System.getProperty("wg.carve") != null) WgCarve.run(prov, rs, seed, chunk, nc, gen, ngs, lha, bm, sampler, list, biomeReg, cx, cz);
             dump(out, chunk, seed, cx, cz, minY, height);
         }
         out.close();
