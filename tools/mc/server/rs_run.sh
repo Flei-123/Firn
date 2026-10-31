@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/mc/server/rs_run.sh -- redstone vs vanilla 1.20.1: creative bot builds lever+wire+lamp, repeater, torch inverter and toggles; block_change sequences and tick timing compared.
+# tools/mc/server/rs_run.sh [stage1|stage2] -- redstone vs vanilla 1.20.1: creative bot builds circuits and operates them; block_change sequences and tick timing compared. stage1: lever/wire/lamp/repeater/torch; stage2: buttons/observer/comparator/redstone block.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 REPO=$(pwd)
@@ -7,6 +7,8 @@ FIRNC=${FIRNC:-/root/firn/compiler/target/release/firnc}
 export FIRNLIB="$REPO/lib"
 JARS=${MC_JARS:-/root/.w5/jars}
 TOOLS="$REPO/tools/mc/server"
+STAGE=${1:-stage1}
+case "$STAGE" in stage1) BOT=bot_rs.cjs; CHECK=check_rs.cjs ;; stage2) BOT=bot_rs2.cjs; CHECK=check_rs2.cjs ;; *) echo "usage: rs_run.sh [stage1|stage2]"; exit 2 ;; esac
 W=$(mktemp -d)
 VPID=""; FPID=""
 cleanup() { exec 3>&- 2>/dev/null; for p in $VPID $FPID; do kill "$p" 2>/dev/null; done; sleep 1; for p in $VPID $FPID; do kill -9 "$p" 2>/dev/null; done; rm -rf "$W"; }
@@ -40,12 +42,12 @@ grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server did n
 "$W/mcsrv" --port "$FPORT" --mode 1 --ticks 3000 > "$W/f.out" 2>&1 &
 FPID=$!
 sleep 2
-node "$TOOLS/bot_rs.cjs" 127.0.0.1 "$VPORT" > "$W/vanilla.json" 2>"$W/vbot.err"
-node "$TOOLS/bot_rs.cjs" 127.0.0.1 "$FPORT" > "$W/firn.json" 2>"$W/fbot.err"
-echo "vanilla:"; node "$TOOLS/check_rs.cjs" "$W/vanilla.json" || ERR=1
-echo "firn vs vanilla:"; node "$TOOLS/check_rs.cjs" "$W/firn.json" "$W/vanilla.json" || ERR=1
+node "$TOOLS/$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla.json" 2>"$W/vbot.err"
+node "$TOOLS/$BOT" 127.0.0.1 "$FPORT" > "$W/firn.json" 2>"$W/fbot.err"
+echo "vanilla:"; node "$TOOLS/$CHECK" "$W/vanilla.json" || ERR=1
+echo "firn vs vanilla:"; node "$TOOLS/$CHECK" "$W/firn.json" "$W/vanilla.json" || ERR=1
 echo "negative control (wrong expectation must fail):"
-if node "$TOOLS/check_rs.cjs" "$W/firn.json" - wrong >/dev/null; then echo "  FAIL  wrong expectation not detected"; ERR=1; else echo "  ok    wrong expectation detected"; fi
+if node "$TOOLS/$CHECK" "$W/firn.json" - wrong >/dev/null; then echo "  FAIL  wrong expectation not detected"; ERR=1; else echo "  ok    wrong expectation detected"; fi
 echo stop >&3
 wait $VPID 2>/dev/null
 [ -n "${RS_KEEP:-}" ] && mkdir -p "$RS_KEEP" && cp "$W"/*.json "$W"/*.err "$W"/f.out "$RS_KEEP"/ 2>/dev/null

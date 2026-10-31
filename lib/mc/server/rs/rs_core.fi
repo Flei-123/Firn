@@ -5,12 +5,12 @@ import mc.mc_registry
 import mc.server.rs.rs_dir
 
 export {
-    Rs, Comp, SchedEntry, TAG_NONE, TAG_WIRE, TAG_LEVER, TAG_TORCH, TAG_LAMP, TAG_REPEATER,
+    Rs, Comp, SchedEntry, TAG_NONE, TAG_WIRE, TAG_LEVER, TAG_TORCH, TAG_LAMP, TAG_REPEATER, TAG_BUTTON, TAG_OBSERVER, TAG_COMPARATOR, TAG_BLOCK,
     PRIO_EXTREMELY_HIGH, PRIO_VERY_HIGH, PRIO_HIGH, PRIO_NORMAL,
     comp_default, rs_new, rs_free, rs_register, rs_kind_of_state, rs_tag_of_state, rs_get, rs_set,
     rs_update_at, rs_update_except, rs_notify, rs_is_conductor, rs_schedule, rs_pending, rs_will_tick_this_tick,
     rs_run_ticks, rs_signal, rs_direct_signal, rs_direct_signal_to, rs_best_neighbor_signal, rs_has_neighbor_signal,
-    rs_comp_at, rs_use, rs_place_state, rs_same_block, block_default_state,
+    rs_comp_at, rs_alias, rs_aux_get, rs_aux_set, rs_shape_update, rs_use, rs_place_state, rs_same_block, block_default_state,
 }
 
 const TAG_NONE: i32 = 0
@@ -19,13 +19,18 @@ const TAG_LEVER: i32 = 2
 const TAG_TORCH: i32 = 3
 const TAG_LAMP: i32 = 4
 const TAG_REPEATER: i32 = 5
+const TAG_BUTTON: i32 = 6
+const TAG_OBSERVER: i32 = 7
+const TAG_COMPARATOR: i32 = 8
+const TAG_BLOCK: i32 = 9
 
 const PRIO_EXTREMELY_HIGH: i32 = 0 - 3
 const PRIO_VERY_HIGH: i32 = 0 - 2
 const PRIO_HIGH: i32 = 0 - 1
 const PRIO_NORMAL: i32 = 0
 
-const MAX_COMPS: usize = 12
+const MAX_COMPS: usize = 24
+const MAX_AUX: usize = 128
 const MAX_SCHED: usize = 512
 
 struct Comp {
@@ -40,6 +45,14 @@ struct Comp {
     placed: fn(*mut Rs, i32, i32, i32, i32),
     removed: fn(*mut Rs, i32, i32, i32, i32),
     place_state: fn(*mut Rs, i32, i32, i32, i32, i32, i32) -> i32,
+    shape: fn(*mut Rs, i32, i32, i32, i32, i32),
+}
+
+struct AuxEntry {
+    x: i32,
+    y: i32,
+    z: i32,
+    val: i32,
 }
 
 struct SchedEntry {
@@ -61,27 +74,31 @@ struct Rs {
     shapes: fn(*mut Rs, i32, i32, i32),
     kind_of: u64,
     nblocks: usize,
-    comps: [Comp; 12],
+    comps: [Comp; 24],
     ncomp: usize,
     wires_give_power: bool,
     now: i64,
     prev: i32,
+    look: i32,
     seq: u64,
     sched: [SchedEntry; 512],
     nsched: usize,
+    aux: [AuxEntry; 128],
+    naux: usize,
 }
 
 fn nop_cb(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32) {}
 fn nop_sig(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32, d: i32) -> i32 { return 0 }
 fn nop_use(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32) -> bool { return false }
 fn nop_place(rs: *mut Rs, s: i32, face: i32, hdir: i32, x: i32, y: i32, z: i32) -> i32 { return s }
+fn nop_shape(rs: *mut Rs, x: i32, y: i32, z: i32, s: i32, d: i32) {}
 fn nop_shapes(rs: *mut Rs, x: i32, y: i32, z: i32) {}
 fn nop_get(ctx: u64, x: i32, y: i32, z: i32) -> i32 { return 0 }
 fn nop_set(ctx: u64, x: i32, y: i32, z: i32, s: i32) {}
 
 fn comp_default(tag: i32) -> Comp {
     return Comp { tag: tag, conductor: false, source: false, neighbor_changed: nop_cb, tick: nop_cb, signal: nop_sig, direct: nop_sig,
-        use_block: nop_use, placed: nop_cb, removed: nop_cb, place_state: nop_place }
+        use_block: nop_use, placed: nop_cb, removed: nop_cb, place_state: nop_place, shape: nop_shape }
 }
 
 fn rs_new(reg: mc_registry.Registry) -> Rs {
@@ -93,22 +110,62 @@ fn rs_new(reg: mc_registry.Registry) -> Rs {
         i = i + 1
     }
     let e: SchedEntry = SchedEntry { due: 0, prio: 0, seq: 0, x: 0, y: 0, z: 0, kind: 0 }
+    let a: AuxEntry = AuxEntry { x: 0, y: 0, z: 0, val: 0 }
     return Rs { enabled: false, reg: reg, ctx: 0, world_get: nop_get, world_set: nop_set, shapes: nop_shapes, kind_of: ko, nblocks: nb,
-        comps: [comp_default(0); 12], ncomp: 0, wires_give_power: true, now: 0, prev: 0, seq: 0, sched: [e; 512], nsched: 0 }
+        comps: [comp_default(0); 24], ncomp: 0, wires_give_power: true, now: 0, prev: 0, look: 0, seq: 0, sched: [e; 512], nsched: 0, aux: [a; 128], naux: 0 }
 }
 
 fn rs_free(rs: *mut Rs) {
     rt.heap_free((*rs).kind_of, (*rs).nblocks + 1)
 }
 
-fn rs_register(rs: *mut Rs, name: str, c: Comp) -> bool {
+fn rs_alias(rs: *mut Rs, name: str, kind: i32) -> bool {
     let b: i32 = mc_registry.reg_block_by_name(&(*rs).reg, name.p as u64, name.n)
-    if b < 0 || (*rs).ncomp >= MAX_COMPS { return false }
-    (*rs).comps[(*rs).ncomp] = c
-    rt.st8((*rs).kind_of, b as usize, ((*rs).ncomp + 1) as u8)
-    (*rs).ncomp = (*rs).ncomp + 1
+    if b < 0 || kind < 0 { return false }
+    rt.st8((*rs).kind_of, b as usize, (kind + 1) as u8)
     (*rs).enabled = true
     return true
+}
+
+fn rs_register(rs: *mut Rs, name: str, c: Comp) -> i32 {
+    if (*rs).ncomp >= MAX_COMPS { return 0 - 1 }
+    let kind: i32 = (*rs).ncomp as i32
+    if !rs_alias(rs, name, kind) { return 0 - 1 }
+    (*rs).comps[(*rs).ncomp] = c
+    (*rs).ncomp = (*rs).ncomp + 1
+    return kind
+}
+
+fn aux_find(rs: *mut Rs, x: i32, y: i32, z: i32) -> i32 {
+    var i: usize = 0
+    while i < (*rs).naux {
+        let e: *mut AuxEntry = &(*rs).aux[i]
+        if (*e).x == x && (*e).y == y && (*e).z == z { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn rs_aux_get(rs: *mut Rs, x: i32, y: i32, z: i32) -> i32 {
+    let i: i32 = aux_find(rs, x, y, z)
+    if i < 0 { return 0 }
+    return (*rs).aux[i as usize].val
+}
+
+fn rs_aux_set(rs: *mut Rs, x: i32, y: i32, z: i32, v: i32) {
+    let i: i32 = aux_find(rs, x, y, z)
+    if i >= 0 {
+        if v == 0 {
+            (*rs).naux = (*rs).naux - 1
+            (*rs).aux[i as usize] = (*rs).aux[(*rs).naux]
+        } else {
+            (*rs).aux[i as usize].val = v
+        }
+        return
+    }
+    if v == 0 || (*rs).naux >= MAX_AUX { return }
+    (*rs).aux[(*rs).naux] = AuxEntry { x: x, y: y, z: z, val: v }
+    (*rs).naux = (*rs).naux + 1
 }
 
 fn rs_kind_of_state(rs: *mut Rs, state: i32) -> i32 {
@@ -160,6 +217,29 @@ fn rs_update_except(rs: *mut Rs, x: i32, y: i32, z: i32, skip: i32) {
     }
 }
 
+fn rs_shape_update(rs: *mut Rs, x: i32, y: i32, z: i32) {
+    var i: i32 = 0
+    while i < 6 {
+        var d: i32 = 0
+        if i == 0 { d = rs_dir.WEST }
+        if i == 1 { d = rs_dir.EAST }
+        if i == 2 { d = rs_dir.NORTH }
+        if i == 3 { d = rs_dir.SOUTH }
+        if i == 4 { d = rs_dir.DOWN }
+        if i == 5 { d = rs_dir.UP }
+        let nx: i32 = x + rs_dir.dir_dx(d)
+        let ny: i32 = y + rs_dir.dir_dy(d)
+        let nz: i32 = z + rs_dir.dir_dz(d)
+        let s: i32 = rs_get(rs, nx, ny, nz)
+        let k: i32 = rs_kind_of_state(rs, s)
+        if k >= 0 {
+            let f: fn(*mut Rs, i32, i32, i32, i32, i32) = (*rs).comps[k as usize].shape
+            f(rs, nx, ny, nz, s, rs_dir.dir_opposite(d))
+        }
+        i = i + 1
+    }
+}
+
 fn rs_update_at(rs: *mut Rs, x: i32, y: i32, z: i32) {
     rs_update_except(rs, x, y, z, 0 - 1)
 }
@@ -181,7 +261,10 @@ fn rs_set(rs: *mut Rs, x: i32, y: i32, z: i32, state: i32, flags: i32) -> bool {
         g(rs, x, y, z, state)
     }
     if (flags & 1) != 0 { rs_update_at(rs, x, y, z) }
-    if (flags & 16) == 0 { (*rs).shapes(rs, x, y, z) }
+    if (flags & 16) == 0 {
+        (*rs).shapes(rs, x, y, z)
+        rs_shape_update(rs, x, y, z)
+    }
     return true
 }
 
