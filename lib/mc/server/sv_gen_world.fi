@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.fs
+import std.io
+import mc.server.sv_state
+import mc.server.sv_edits
+
+export { gen_world_prepare, gen_world_load, gen_world_save }
+
+const META_FILE: str = "firn_world.txt"
+const EDITS_FILE: str = "firn_edits.bin"
+
+fn file_path(world: str, name: str) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, world.p as u64, world.n)
+    rt.buf_push(&b, 47 as u8)
+    rt.buf_push_bytes(&b, name.p as u64, name.n)
+    rt.buf_push(&b, 0 as u8)
+    return b
+}
+
+fn parse_seed(p: u64, n: usize, end: *mut usize) -> i64 {
+    var i: usize = 0
+    var neg: bool = false
+    if n > 0 && rt.ld8(p, 0) == 45 {
+        neg = true
+        i = 1
+    }
+    var v: i64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 || c > 57 { break }
+        v = v * 10 + ((c - 48) as i64)
+        i = i + 1
+    }
+    *end = i
+    if neg { return 0 - v }
+    return v
+}
+
+fn gen_world_prepare(world: str, cfg: *mut sv_state.Config) -> bool {
+    let made: bool = fs.mkdir_all(world) catch false
+    var path: rt.Buf = file_path(world, META_FILE)
+    var raw: rt.Buf = rt.buf_new()
+    if rt.read_file(rt.buf_ptr(&path), &raw) {
+        var end: usize = 0
+        let seed: i64 = parse_seed(rt.buf_ptr(&raw), rt.buf_len(&raw), &end)
+        let total: usize = rt.buf_len(&raw)
+        if end + 1 < total {
+            (*cfg).seed = seed
+            let keep: u64 = rt.heap_alloc(total)
+            rt.mem_copy(keep, rt.buf_ptr(&raw) + ((end + 1) as u64), total - end - 1)
+            var n: usize = total - end - 1
+            if n > 0 && rt.ld8(keep, n - 1) == 10 { n = n - 1 }
+            (*cfg).level_type = str { p: keep as *mut u8, n: n }
+        }
+        rt.buf_free(&raw)
+        rt.buf_free(&path)
+        return true
+    }
+    var meta: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&meta, (*cfg).seed)
+    rt.buf_push(&meta, 10 as u8)
+    rt.buf_push_bytes(&meta, (*cfg).level_type.p as u64, (*cfg).level_type.n)
+    rt.buf_push(&meta, 10 as u8)
+    let ok: bool = rt.write_file(rt.buf_ptr(&path), rt.buf_ptr(&meta), rt.buf_len(&meta))
+    rt.buf_free(&meta)
+    rt.buf_free(&raw)
+    rt.buf_free(&path)
+    return ok && made
+}
+
+fn world_str(srv: *mut sv_state.Server) -> str {
+    return str { p: (*srv).world_dir.ptr as *mut u8, n: (*srv).world_dir.len }
+}
+
+fn gen_world_load(srv: *mut sv_state.Server) {
+    var path: rt.Buf = file_path(world_str(srv), EDITS_FILE)
+    var raw: rt.Buf = rt.buf_new()
+    if rt.read_file(rt.buf_ptr(&path), &raw) {
+        let p: u64 = rt.buf_ptr(&raw)
+        let n: usize = rt.buf_len(&raw) / 16
+        var i: usize = 0
+        while i < n {
+            sv_edits.edits_restore(&(*srv).edits, rt.ld64(p, i * 2), rt.ld64(p, i * 2 + 1))
+            i = i + 1
+        }
+        sv_edits.edits_clear_dirty(&(*srv).edits)
+    }
+    rt.buf_free(&raw)
+    rt.buf_free(&path)
+}
+
+fn gen_world_save(srv: *mut sv_state.Server) {
+    if sv_edits.edits_dirty_count(&(*srv).edits) == 0 { return }
+    let total: usize = sv_edits.edits_total(&(*srv).edits)
+    let out: u64 = rt.heap_alloc(total * 16 + 16)
+    var n: usize = 0
+    var i: usize = 0
+    while i < sv_edits.edits_slot_count(&(*srv).edits) {
+        let k: u64 = sv_edits.edits_slot_key(&(*srv).edits, i)
+        if k != 0 as u64 {
+            rt.st64(out, n * 2, k)
+            rt.st64(out, n * 2 + 1, sv_edits.edits_slot_val(&(*srv).edits, i))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    var path: rt.Buf = file_path(world_str(srv), EDITS_FILE)
+    rt.write_file(rt.buf_ptr(&path), out, n * 16)
+    rt.buf_free(&path)
+    rt.heap_free(out, total * 16 + 16)
+    sv_edits.edits_clear_dirty(&(*srv).edits)
+}
