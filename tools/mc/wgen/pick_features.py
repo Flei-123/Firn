@@ -12,6 +12,17 @@ def bare(name):
     return name.split(":", 1)[-1]
 
 
+def fix_cherry_corner_hole(dst):
+    with open(dst) as f:
+        data = json.load(f)
+    placer = data.get("config", {}).get("foliage_placer", {})
+    if placer.get("type") == "minecraft:cherry_foliage_placer":
+        placer["corner_hole_chance"] = 0.5
+        with open(dst, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+
+
 def copy_json(kind, name, sub):
     src = os.path.join(SRC, sub, kind, name + ".json")
     dst = os.path.join(DST, "tags", kind, name + ".json") if sub == "tags" else os.path.join(DST, kind, name + ".json")
@@ -19,6 +30,8 @@ def copy_json(kind, name, sub):
         raise SystemExit("missing " + src)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copyfile(src, dst)
+    if kind == "configured_feature":
+        fix_cherry_corner_hole(dst)
     return src
 
 
