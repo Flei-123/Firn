@@ -105,6 +105,14 @@ public class WgFeatures {
                     BlockPos p = (BlockPos) args[0];
                     return r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p).getFluidState();
                 }
+                case "isStateAtPosition": {
+                    BlockPos p = (BlockPos) args[0];
+                    return ((java.util.function.Predicate<net.minecraft.world.level.block.state.BlockState>) args[1]).test(r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p));
+                }
+                case "isFluidAtPosition": {
+                    BlockPos p = (BlockPos) args[0];
+                    return ((java.util.function.Predicate<net.minecraft.world.level.material.FluidState>) args[1]).test(r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p).getFluidState());
+                }
                 case "getBlockEntity": return null;
                 case "scheduleTick": return null;
                 case "blockUpdated": return null;
@@ -221,7 +229,7 @@ public class WgFeatures {
                         try {
                             pf.placeWithBiomeCheck(level, gen, rnd, origin);
                         } catch (RuntimeException ex) {
-                            if (dirOnly) throw ex;
+                            if (dirOnly) { try { ex.printStackTrace(new java.io.PrintStream(new java.io.FileOutputStream(System.getProperty("wg.errfile", "/dev/null")))); } catch (Exception io) {} throw ex; }
                             failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
                         }
                     }

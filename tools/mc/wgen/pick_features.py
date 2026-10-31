@@ -34,13 +34,40 @@ def configured_refs(node, out):
             configured_refs(v, out)
 
 
+def selector_refs(node, out):
+    if isinstance(node, dict):
+        cfg = node.get("config")
+        kind = bare(node.get("type", ""))
+        if kind == "random_selector" and isinstance(cfg, dict):
+            if isinstance(cfg.get("default"), str):
+                out.add(bare(cfg["default"]))
+            for entry in cfg.get("features", []):
+                if isinstance(entry.get("feature"), str):
+                    out.add(bare(entry["feature"]))
+        if kind == "simple_random_selector" and isinstance(cfg, dict):
+            for entry in cfg.get("features", []):
+                if isinstance(entry, str):
+                    out.add(bare(entry))
+        for v in node.values():
+            selector_refs(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            selector_refs(v, out)
+
+
 def pick_configured(name, seen):
     if name in seen:
         return
     seen.add(name)
     src = copy_json("configured_feature", name, "worldgen")
     refs = set()
-    configured_refs(json.load(open(src)), refs)
+    doc = json.load(open(src))
+    configured_refs(doc, refs)
+    placed_refs = set()
+    selector_refs(doc, placed_refs)
+    for ref in sorted(placed_refs):
+        if os.path.exists(os.path.join(SRC, "worldgen", "placed_feature", ref + ".json")):
+            pick_placed(ref, seen)
     for ref in sorted(refs):
         if os.path.exists(os.path.join(SRC, "worldgen", "configured_feature", ref + ".json")):
             pick_configured(ref, seen)

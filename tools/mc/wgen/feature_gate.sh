@@ -34,6 +34,10 @@ SPECIAL_DEFAULT="1:-100:-100 3:-4:4 3:-2:0 3:-72:-92 3:-60:-88 11:-44:-16 11:-24
 if [ -z "${FEAT_SKIP_SPECIAL:-}" ]; then
     run_dim overworld ${FEAT_SPECIAL:-$SPECIAL_DEFAULT}
 fi
+TREE_DEFAULT="8:-48:33 8:-57:-15 8:-42:-60 42:48:-60 6:-36:30 8:-55:30"
+if [ -z "${FEAT_SKIP_TREES:-}" ]; then
+    run_dim overworld ${FEAT_TREES:-$TREE_DEFAULT}
+fi
 run_dim nether ${FEAT_NETHER:-7:0:0 7:3:-2 12:-5:4}
 [ $ERR = 0 ] && echo "mc/wgen features: all ok" || echo "mc/wgen features: FAILED"
 exit $ERR
