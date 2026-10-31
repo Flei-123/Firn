@@ -18,7 +18,7 @@ compare() {
     if cmp -s "$2" "$3"; then
         echo "  ok    $1: $(wc -l < "$2") lines bit-identical"
     else
-        echo "  FAIL  $1: $(diff "$2" "$3" | grep -c '^<') lines differ"; diff "$2" "$3" | head -6 | cut -c1-200; ERR=1
+        echo "  FAIL  $1: $(diff "$2" "$3" | grep -c "^<") lines differ ($(diff "$2" "$3" | grep "^<" | grep -c final_density) final_density)"; diff "$2" "$3" | grep final_density | head -4 | cut -c1-200; ERR=1
     fi
 }
 
@@ -52,7 +52,9 @@ run_oracle() {
     [ -s "$out" ] || { echo "  FAIL  oracle $ver produced nothing"; head -5 "$W/jerr_$ver"; return 1; }
 }
 
-for spec in "1.20.1 overworld" "1.20.1 amplified" "1.20.1 large_biomes" "26.1 overworld"; do
+SPECS=${WG_SPECS:-"1.20.1 overworld|1.20.1 amplified|1.20.1 large_biomes|26.1 overworld"}
+IFS="|" read -ra SPEC_LIST <<< "$SPECS"
+for spec in "${SPEC_LIST[@]}"; do
     set -- $spec
     ver=$1; dim=$2
     [ -d "$DATA/$ver" ] || { echo "  SKIP  $ver (no data)"; continue; }
