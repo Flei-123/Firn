@@ -7,7 +7,7 @@ worktrees (`/root/certus-*`, branch names in the last column). Tempo only where 
 
 | Codec | Supported | Decode | Encode | Tempo | Evidence | Where |
 |---|---|---|---|---|---|---|
-| PNG | all colour types, 1..16 bit, tRNS, Adam7 | yes | yes (`write_png`, `png_encode`) | - | 185 generated + 307 Modrinth PNGs identical to Pillow (`docs/IMAGE_DECODERS.md`) | Firn `lib/paint/png.fi`, `lib/pack/icons.fi` |
+| PNG | all colour types, 1..16 bit, tRNS, Adam7 | yes | yes (`write_png`, `png_encode`) | - | 185 generated + 307 Modrinth PNGs identical to Pillow (`docs/IMAGE_DECODERS.md`) | Firn `lib/paint/png.fi`, `lib/pack/packicons.fi` |
 | JPEG | baseline + progressive | yes | yes (`lib/photo/jpegenc.fi`, baseline) | decode: -, bench main exists in Certus (`jpeg_bench_main.fi`) | `tools/libmvp` checks | Firn `lib/jpeg/jpeg.fi`; Certus `lib/paint/jpeg.fi` |
 | WebP | lossy VP8, lossless VP8L, ALPH, animation | yes | no | - | 991 files octet-identical to libwebp via Pillow, 40 muxed animations | Firn `lib/webp/webp.fi`; Certus `lib/paint/webp.fi` |
 | GIF | 87a / 89a, animation | yes | no | - | compared with Pillow, browser rules where they differ | Firn `lib/gif/gif.fi` |
@@ -15,7 +15,7 @@ worktrees (`/root/certus-*`, branch names in the last column). Tempo only where 
 | AVIF (Firn `lib/av1`) | HEIF container, AV1 intra frame: 8 and 10 bit (16-bit LE planes for 10 bit), 4:4:4 / 4:2:0 / 4:0:0, lossless + lossy, deblock, CDEF, loop restoration; quantizer matrices (all 15 levels, `av1qm*.fi`) and delta_q per superblock palette (`av1pal.fi`) and multiple tiles (uniform and explicit grids, per-tile CDF/context/LR reset) supported; refused: 12 bit, 4:2:2, sb128, delta_lf, segmentation, intrabc | yes (`av1.still`, planar YUV out) | no | - | 124 fixtures bit-exact (18 at 10 bit, `tools/av1/mk_10bit_fixtures.sh`) vs ffmpeg/dav1d (`tools/av1/check_still.sh`), test 5460, bitflip fuzz | `lib/av1/*.fi` |
 | JPEG XL | header, frame header + TOC (jxl_bits, jxl_container, jxl_header, jxl_frame, jxl.jxl_info, jxl.jxl_frame_info) | planned: Modular lossless, VarDCT | no | - | - | Firn `lib/jxl` (entropy modules jxl_huff/jxl_ans/jxl_code compile but are untested) |
 | HEIC / HEIF (HEVC) | none | no | no | - | - | - |
-| BMP, ICO, TGA, TIFF | none (ICO / ICNS are only written by `pack.icons`) | no | partly | - | - | - |
+| BMP, ICO, TGA, TIFF | none (ICO / ICNS are only written by `pack.packicons`) | no | partly | - | - | - |
 
 Picture limit in the Firn decoders: 16,777,216 pixels by default, checked before memory is requested.
 

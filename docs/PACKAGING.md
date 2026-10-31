@@ -58,7 +58,7 @@ manifest.json                    store-add.sh
 (`win-installer`, `deb`, `appimage`, ... -- `pack.sh --help`). `pack.ini` (key=value):
 `id name vendor summary description url license category icon icon_bg android_id depends`.
 
-## 2. Icons: one SVG or PNG, every size (`tools/pack/icons.fi`, `lib/pack/icons.fi`)
+## 2. Icons: one SVG or PNG, every size (`tools/pack/icons.fi`, `lib/pack/packicons.fi`)
 
 An SVG is drawn once per size with `lib/svg` (sharp everywhere); a PNG is resampled
 (premultiplied tent filter: no halo, a flat colour stays flat). Written: `png/ID-<n>.png`
