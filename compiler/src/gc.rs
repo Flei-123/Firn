@@ -162,6 +162,17 @@ pub(crate) fn is_class(name: &str) -> bool {
     index_of(name).is_some()
 }
 
+pub(crate) fn class_shape(name: &str) -> Option<Vec<(String, TypeExpr)>> {
+    REG.with(|r| {
+        let r = r.borrow();
+        let c = r.classes.iter().find(|k| k.name == name)?;
+        if c.base.is_some() || r.classes.iter().any(|k| k.base.as_ref().map(|b| b.0.as_str()) == Some(name)) {
+            return None;
+        }
+        Some(c.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect())
+    })
+}
+
 /// Is there any `gc class` at all in this compilation?
 pub(crate) fn has_classes() -> bool {
     REG.with(|r| !r.borrow().classes.is_empty())
