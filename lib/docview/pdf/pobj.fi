@@ -1,0 +1,1211 @@
+// SPDX-License-Identifier: MPL-2.0
+// the PDF object model: arena, lexer and parser for objects and content streams.
+import html.mem
+
+export {
+    Obj, Arena, Lex,
+    T_NULL, T_BOOL, T_INT, T_REAL, T_STR, T_NAME, T_ARR, T_DICT,
+    T_STREAM, T_REF, T_OP,
+    arena_new, arena_init, arena_free, arena_count, arena_over,
+    arena_reset,
+    lex_new, lex_at, lex_set, lex_end,
+    parse_obj, skip_ws, tok_start,
+    o_kind, o_int, o_num, o_bool, o_is_num,
+    o_str_ptr, o_str_len, o_name_eq, o_name_eq_lit,
+    o_arr_len, o_arr_at, o_dict_len, o_dict_key, o_dict_val,
+    dict_get, dict_has,
+    o_stream_at, o_stream_len, o_stream_dict,
+    a_new_int, a_new_real, a_new_name, a_new_null, a_new_arr, a_new_dict,
+    a_new_str, a_new_bool, a_new_ref,
+    a_arr_push, a_dict_put, a_dict_set, o_set_stream,
+    MAX_DEPTH, MAX_OBJS,
+}
+
+const T_NULL: u32 = 0
+const T_BOOL: u32 = 1
+const T_INT: u32 = 2
+const T_REAL: u32 = 3
+const T_STR: u32 = 4
+const T_NAME: u32 = 5
+const T_ARR: u32 = 6
+const T_DICT: u32 = 7
+const T_STREAM: u32 = 8
+const T_REF: u32 = 9
+const T_OP: u32 = 10
+
+const MAX_DEPTH: usize = 48
+const MAX_OBJS: usize = 4000000
+const MAX_KIDS: usize = 16000000
+const MAX_POOL: usize = 256000000
+
+struct Obj {
+    a: u64,
+    b: u64,
+    f: f64,
+    n: u32,
+    kind: u32,
+    c: u32,
+    d: u32,
+}
+
+struct Arena {
+    o: *mut Obj,
+    no: usize,
+    cap: usize,
+    kids: *mut u32,
+    nk: usize,
+    kcap: usize,
+    pool: *mut u8,
+    np: usize,
+    pcap: usize,
+    bs: *mut u32,
+    nbs: usize,
+    bscap: usize,
+    over: u32,
+}
+
+struct Lex {
+    p: u64,
+    n: usize,
+    i: usize,
+}
+
+#[no_gc]
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn arena_new() -> Arena {
+    return Arena { o: 0 as *mut Obj, no: 0, cap: 0,
+        kids: 0 as *mut u32, nk: 0, kcap: 0,
+        pool: 0 as *mut u8, np: 0, pcap: 0,
+        bs: 0 as *mut u32, nbs: 0, bscap: 0, over: 0 }
+}
+
+#[no_gc]
+fn arena_init(ar: *mut Arena) -> bool {
+    (*ar).cap = 256
+    (*ar).o = mem.heap_alloc((*ar).cap * 48) as *mut Obj
+    (*ar).kcap = 512
+    (*ar).kids = mem.heap_alloc((*ar).kcap * 4) as *mut u32
+    (*ar).pcap = 4096
+    (*ar).pool = mem.heap_alloc((*ar).pcap)
+    (*ar).bscap = 1024
+    (*ar).bs = mem.heap_alloc((*ar).bscap * 4) as *mut u32
+    (*ar).nbs = 0
+    (*ar).no = 0
+    (*ar).nk = 0
+    (*ar).np = 0
+    (*ar).over = 0
+    if (*ar).o as usize == 0 || (*ar).kids as usize == 0 ||
+    (*ar).pool as usize == 0 || (*ar).bs as usize == 0 {
+        return false
+    }
+    a_new_null(ar)
+    return true
+}
+
+#[no_gc]
+fn arena_free(ar: *mut Arena) {
+    mem.heap_free((*ar).o as *mut u8, (*ar).cap * 48)
+    mem.heap_free((*ar).kids as *mut u8, (*ar).kcap * 4)
+    mem.heap_free((*ar).pool, (*ar).pcap)
+    mem.heap_free((*ar).bs as *mut u8, (*ar).bscap * 4)
+    (*ar).bs = 0 as *mut u32
+    (*ar).bscap = 0
+    (*ar).nbs = 0
+    (*ar).o = 0 as *mut Obj
+    (*ar).kids = 0 as *mut u32
+    (*ar).pool = 0 as *mut u8
+    (*ar).cap = 0
+    (*ar).kcap = 0
+    (*ar).pcap = 0
+    (*ar).no = 0
+}
+
+#[no_gc]
+fn arena_reset(ar: *mut Arena) {
+    (*ar).no = 1
+    (*ar).nk = 0
+    (*ar).np = 0
+    (*ar).nbs = 0
+    (*ar).over = 0
+}
+
+#[no_gc]
+fn arena_count(ar: *mut Arena) -> usize {
+    return (*ar).no
+}
+
+#[no_gc]
+fn arena_over(ar: *mut Arena) -> bool {
+    return (*ar).over != 0 as u32
+}
+
+#[no_gc]
+fn grow_objs(ar: *mut Arena) -> bool {
+    if (*ar).no + 1 <= (*ar).cap {
+        return true
+    }
+    if (*ar).cap >= MAX_OBJS {
+        (*ar).over = 1
+        return false
+    }
+    let nc: usize = (*ar).cap * 2
+    let np: *mut u8 = mem.heap_alloc(nc * 48)
+    if np as usize == 0 {
+        (*ar).over = 1
+        return false
+    }
+    mem.mem_copy(np, (*ar).o as *mut u8, (*ar).no * 48)
+    mem.heap_free((*ar).o as *mut u8, (*ar).cap * 48)
+    (*ar).o = np as *mut Obj
+    (*ar).cap = nc
+    return true
+}
+
+#[no_gc]
+fn grow_kids(ar: *mut Arena, need: usize) -> bool {
+    if (*ar).nk + need <= (*ar).kcap {
+        return true
+    }
+    if (*ar).kcap >= MAX_KIDS {
+        (*ar).over = 1
+        return false
+    }
+    var nc: usize = (*ar).kcap * 2
+    while nc < (*ar).nk + need {
+        nc = nc * 2
+    }
+    let np: *mut u8 = mem.heap_alloc(nc * 4)
+    if np as usize == 0 {
+        (*ar).over = 1
+        return false
+    }
+    mem.mem_copy(np, (*ar).kids as *mut u8, (*ar).nk * 4)
+    mem.heap_free((*ar).kids as *mut u8, (*ar).kcap * 4)
+    (*ar).kids = np as *mut u32
+    (*ar).kcap = nc
+    return true
+}
+
+#[no_gc]
+fn grow_pool(ar: *mut Arena, need: usize) -> bool {
+    if (*ar).np + need <= (*ar).pcap {
+        return true
+    }
+    if (*ar).pcap >= MAX_POOL {
+        (*ar).over = 1
+        return false
+    }
+    var nc: usize = (*ar).pcap * 2
+    while nc < (*ar).np + need {
+        nc = nc * 2
+    }
+    let np: *mut u8 = mem.heap_alloc(nc)
+    if np as usize == 0 {
+        (*ar).over = 1
+        return false
+    }
+    mem.mem_copy(np, (*ar).pool, (*ar).np)
+    mem.heap_free((*ar).pool, (*ar).pcap)
+    (*ar).pool = np
+    (*ar).pcap = nc
+    return true
+}
+
+#[no_gc]
+fn grow_bs(ar: *mut Arena, need: usize) -> bool {
+    if (*ar).nbs + need <= (*ar).bscap {
+        return true
+    }
+    if (*ar).bscap >= MAX_KIDS {
+        (*ar).over = 1
+        return false
+    }
+    var nc: usize = (*ar).bscap * 2
+    while nc < (*ar).nbs + need {
+        nc = nc * 2
+    }
+    let np: *mut u8 = mem.heap_alloc(nc * 4)
+    if np as usize == 0 {
+        (*ar).over = 1
+        return false
+    }
+    mem.mem_copy(np, (*ar).bs as *mut u8, (*ar).nbs * 4)
+    mem.heap_free((*ar).bs as *mut u8, (*ar).bscap * 4)
+    (*ar).bs = np as *mut u32
+    (*ar).bscap = nc
+    return true
+}
+
+#[no_gc]
+fn bs_push(ar: *mut Arena, v: u32) -> bool {
+    if !grow_bs(ar, 1) {
+        return false
+    }
+    *(((*ar).bs as u64 + ((*ar).nbs * 4) as u64) as *mut u32) = v
+    (*ar).nbs = (*ar).nbs + 1
+    return true
+}
+
+#[no_gc]
+fn obj_at(ar: *mut Arena, h: u32) -> *mut Obj {
+    var i: usize = h as usize
+    if i >= (*ar).no {
+        i = 0
+    }
+    return ((*ar).o as u64 + (i * 48) as u64) as *mut Obj
+}
+
+#[no_gc]
+fn a_alloc(ar: *mut Arena, kind: u32) -> u32 {
+    if !grow_objs(ar) {
+        return 0
+    }
+    let h: usize = (*ar).no
+    (*ar).no = h + 1
+    let o: *mut Obj = ((*ar).o as u64 + (h * 48) as u64) as *mut Obj
+    (*o).a = 0
+    (*o).b = 0
+    (*o).f = 0.0
+    (*o).n = 0
+    (*o).c = 0
+    (*o).d = 0
+    (*o).kind = kind
+    return h as u32
+}
+
+#[no_gc]
+fn a_new_null(ar: *mut Arena) -> u32 {
+    return a_alloc(ar, T_NULL)
+}
+
+#[no_gc]
+fn a_new_int(ar: *mut Arena, v: i64) -> u32 {
+    let h: u32 = a_alloc(ar, T_INT)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = v as u64
+    (*o).f = v as f64
+    return h
+}
+
+#[no_gc]
+fn a_new_real(ar: *mut Arena, v: f64) -> u32 {
+    let h: u32 = a_alloc(ar, T_REAL)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).f = v
+    return h
+}
+
+#[no_gc]
+fn a_new_bytes(ar: *mut Arena, kind: u32, src: u64, n: usize) -> u32 {
+    if !grow_pool(ar, n) {
+        return 0
+    }
+    let at: usize = (*ar).np
+    var i: usize = 0
+    while i < n {
+        *(((*ar).pool as u64 + (at + i) as u64) as *mut u8) = ld8(src, i)
+        i = i + 1
+    }
+    (*ar).np = at + n
+    let h: u32 = a_alloc(ar, kind)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = at as u64
+    (*o).n = n as u32
+    return h
+}
+
+#[no_gc]
+fn a_new_name(ar: *mut Arena, src: u64, n: usize) -> u32 {
+    return a_new_bytes(ar, T_NAME, src, n)
+}
+
+#[no_gc]
+fn a_new_str(ar: *mut Arena, src: u64, n: usize) -> u32 {
+    return a_new_bytes(ar, T_STR, src, n)
+}
+
+#[no_gc]
+fn a_new_bool(ar: *mut Arena, v: bool) -> u32 {
+    let h: u32 = a_alloc(ar, T_BOOL)
+    if h == 0 as u32 {
+        return 0 as u32
+    }
+    let o: *mut Obj = obj_at(ar, h)
+    if v {
+        (*o).a = 1
+    } else {
+        (*o).a = 0
+    }
+    return h
+}
+
+#[no_gc]
+fn a_new_ref(ar: *mut Arena, num: u32) -> u32 {
+    let h: u32 = a_alloc(ar, T_REF)
+    if h == 0 as u32 {
+        return 0 as u32
+    }
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = num as u64
+    (*o).c = 0
+    return h
+}
+
+#[no_gc]
+fn a_new_arr(ar: *mut Arena, items: u64, n: usize) -> u32 {
+    if !grow_kids(ar, n) {
+        return 0
+    }
+    let at: usize = (*ar).nk
+    var i: usize = 0
+    while i < n {
+        *(((*ar).kids as u64 + ((at + i) * 4) as u64) as *mut u32) =
+        *((items + (i * 4) as u64) as *mut u32)
+        i = i + 1
+    }
+    (*ar).nk = at + n
+    let h: u32 = a_alloc(ar, T_ARR)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = at as u64
+    (*o).n = n as u32
+    return h
+}
+
+#[no_gc]
+fn a_new_dict(ar: *mut Arena, pairs: u64, n: usize) -> u32 {
+    if !grow_kids(ar, n * 2) {
+        return 0
+    }
+    let at: usize = (*ar).nk
+    var i: usize = 0
+    while i < n * 2 {
+        *(((*ar).kids as u64 + ((at + i) * 4) as u64) as *mut u32) =
+        *((pairs + (i * 4) as u64) as *mut u32)
+        i = i + 1
+    }
+    (*ar).nk = at + n * 2
+    let h: u32 = a_alloc(ar, T_DICT)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = at as u64
+    (*o).n = n as u32
+    return h
+}
+
+#[no_gc]
+fn a_arr_push(ar: *mut Arena, h: u32, v: u32) -> bool {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_ARR {
+        return false
+    }
+    if (*o).a as usize + (*o).n as usize != (*ar).nk {
+        return false
+    }
+    if !grow_kids(ar, 1) {
+        return false
+    }
+    *(((*ar).kids as u64 + ((*ar).nk * 4) as u64) as *mut u32) = v
+    (*ar).nk = (*ar).nk + 1
+    (*o).n = (*o).n + 1 as u32
+    return true
+}
+
+#[no_gc]
+fn a_dict_put(ar: *mut Arena, h: u32, k: u32, v: u32) -> bool {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_DICT && (*o).kind != T_STREAM {
+        return false
+    }
+    if (*o).a as usize + ((*o).n as usize) * 2 != (*ar).nk {
+        let cnt: usize = ((*o).n as usize) * 2
+        if !grow_kids(ar, cnt + 2) {
+            return false
+        }
+        let from: usize = (*o).a as usize
+        let to: usize = (*ar).nk
+        var q: usize = 0
+        while q < cnt {
+            *(((*ar).kids as u64 + ((to + q) * 4) as u64) as *mut u32) =
+            *(((*ar).kids as u64 + ((from + q) * 4) as u64) as *mut u32)
+            q = q + 1
+        }
+        (*o).a = to as u64
+        (*ar).nk = to + cnt
+    }
+    if !grow_kids(ar, 2) {
+        return false
+    }
+    *(((*ar).kids as u64 + ((*ar).nk * 4) as u64) as *mut u32) = k
+    *(((*ar).kids as u64 + (((*ar).nk + 1) * 4) as u64) as *mut u32) = v
+    (*ar).nk = (*ar).nk + 2
+    (*o).n = (*o).n + 1 as u32
+    return true
+}
+
+#[no_gc]
+fn a_dict_set(ar: *mut Arena, h: u32, k: u32, v: u32) -> bool {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_DICT && (*o).kind != T_STREAM {
+        return false
+    }
+    let kp: u64 = (*ar).pool as u64 + (*obj_at(ar, k)).a
+    let kn: usize = (*obj_at(ar, k)).n as usize
+    var i: usize = 0
+    let cnt: usize = (*o).n as usize
+    while i < cnt {
+        let kk: u32 = *(((*ar).kids as u64 +
+            (((*o).a as usize + i * 2) * 4) as u64) as *mut u32)
+        if o_name_eq(ar, kk, kp, kn) {
+            *(((*ar).kids as u64 +
+                (((*o).a as usize + i * 2 + 1) * 4) as u64) as *mut u32) = v
+            return true
+        }
+        i = i + 1
+    }
+    return a_dict_put(ar, h, k, v)
+}
+
+#[no_gc]
+fn o_set_stream(ar: *mut Arena, h: u32, at: u64, len: usize) {
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).kind = T_STREAM
+    (*o).b = at
+    (*o).c = len as u32
+}
+
+#[no_gc]
+fn o_kind(ar: *mut Arena, h: u32) -> u32 {
+    return (*obj_at(ar, h)).kind
+}
+
+#[no_gc]
+fn o_int(ar: *mut Arena, h: u32) -> i64 {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind == T_INT {
+        return (*o).a as i64
+    }
+    if (*o).kind == T_REAL {
+        return (*o).f as i64
+    }
+    if (*o).kind == T_REF {
+        return (*o).a as i64
+    }
+    return 0
+}
+
+#[no_gc]
+fn o_num(ar: *mut Arena, h: u32) -> f64 {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind == T_INT {
+        return ((*o).a as i64) as f64
+    }
+    if (*o).kind == T_REAL {
+        return (*o).f
+    }
+    return 0.0
+}
+
+#[no_gc]
+fn o_is_num(ar: *mut Arena, h: u32) -> bool {
+    let k: u32 = (*obj_at(ar, h)).kind
+    return k == T_INT || k == T_REAL
+}
+
+#[no_gc]
+fn o_bool(ar: *mut Arena, h: u32) -> bool {
+    let o: *mut Obj = obj_at(ar, h)
+    return (*o).kind == T_BOOL && (*o).a != 0
+}
+
+#[no_gc]
+fn o_str_ptr(ar: *mut Arena, h: u32) -> u64 {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_STR && (*o).kind != T_NAME && (*o).kind != T_OP {
+        return 0
+    }
+    return (*ar).pool as u64 + (*o).a
+}
+
+#[no_gc]
+fn o_str_len(ar: *mut Arena, h: u32) -> usize {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_STR && (*o).kind != T_NAME && (*o).kind != T_OP {
+        return 0
+    }
+    return (*o).n as usize
+}
+
+#[no_gc]
+fn o_name_eq(ar: *mut Arena, h: u32, lit: u64, n: usize) -> bool {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_NAME && (*o).kind != T_OP {
+        return false
+    }
+    if (*o).n as usize != n {
+        return false
+    }
+    let p: u64 = (*ar).pool as u64 + (*o).a
+    var i: usize = 0
+    while i < n {
+        if ld8(p, i) != ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+#[no_gc]
+fn o_name_eq_lit(ar: *mut Arena, h: u32, lit: *mut u8, n: usize) -> bool {
+    return o_name_eq(ar, h, lit as u64, n)
+}
+
+#[no_gc]
+fn o_arr_len(ar: *mut Arena, h: u32) -> usize {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_ARR {
+        return 0
+    }
+    return (*o).n as usize
+}
+
+#[no_gc]
+fn o_arr_at(ar: *mut Arena, h: u32, i: usize) -> u32 {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_ARR || i >= (*o).n as usize {
+        return 0
+    }
+    return *(((*ar).kids as u64 + (((*o).a as usize + i) * 4) as u64)
+        as *mut u32)
+}
+
+#[no_gc]
+fn o_dict_len(ar: *mut Arena, h: u32) -> usize {
+    let o: *mut Obj = obj_at(ar, h)
+    if (*o).kind != T_DICT && (*o).kind != T_STREAM {
+        return 0
+    }
+    return (*o).n as usize
+}
+
+#[no_gc]
+fn o_dict_key(ar: *mut Arena, h: u32, i: usize) -> u32 {
+    let o: *mut Obj = obj_at(ar, h)
+    if ((*o).kind != T_DICT && (*o).kind != T_STREAM) ||
+    i >= (*o).n as usize {
+        return 0
+    }
+    return *(((*ar).kids as u64 + (((*o).a as usize + i * 2) * 4) as u64)
+        as *mut u32)
+}
+
+#[no_gc]
+fn o_dict_val(ar: *mut Arena, h: u32, i: usize) -> u32 {
+    let o: *mut Obj = obj_at(ar, h)
+    if ((*o).kind != T_DICT && (*o).kind != T_STREAM) ||
+    i >= (*o).n as usize {
+        return 0
+    }
+    return *(((*ar).kids as u64 + (((*o).a as usize + i * 2 + 1) * 4)
+        as u64) as *mut u32)
+}
+
+#[no_gc]
+fn dict_get(ar: *mut Arena, h: u32, name: u64, n: usize) -> u32 {
+    let cnt: usize = o_dict_len(ar, h)
+    var i: usize = 0
+    while i < cnt {
+        if o_name_eq(ar, o_dict_key(ar, h, i), name, n) {
+            return o_dict_val(ar, h, i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn dict_has(ar: *mut Arena, h: u32, name: u64, n: usize) -> bool {
+    return dict_get(ar, h, name, n) != 0 as u32
+}
+
+#[no_gc]
+fn o_stream_at(ar: *mut Arena, h: u32) -> u64 {
+    return (*obj_at(ar, h)).b
+}
+
+#[no_gc]
+fn o_stream_len(ar: *mut Arena, h: u32) -> usize {
+    return (*obj_at(ar, h)).c as usize
+}
+
+#[no_gc]
+fn o_stream_dict(ar: *mut Arena, h: u32) -> u32 {
+    return h
+}
+
+#[no_gc]
+fn lex_new(p: u64, n: usize) -> Lex {
+    return Lex { p: p, n: n, i: 0 }
+}
+
+#[no_gc]
+fn lex_at(lx: *mut Lex) -> usize {
+    return (*lx).i
+}
+
+#[no_gc]
+fn lex_set(lx: *mut Lex, i: usize) {
+    (*lx).i = i
+}
+
+#[no_gc]
+fn lex_end(lx: *mut Lex) -> bool {
+    return (*lx).i >= (*lx).n
+}
+
+#[no_gc]
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 10 as u8 || c == 13 as u8 ||
+    c == 9 as u8 || c == 12 as u8 || c == 0 as u8
+}
+
+#[no_gc]
+fn is_delim(c: u8) -> bool {
+    return c == 40 as u8 || c == 41 as u8 || c == 60 as u8 ||
+    c == 62 as u8 || c == 91 as u8 || c == 93 as u8 || c == 123 as u8 ||
+    c == 125 as u8 || c == 47 as u8 || c == 37 as u8
+}
+
+#[no_gc]
+fn is_reg(c: u8) -> bool {
+    return !is_ws(c) && !is_delim(c)
+}
+
+#[no_gc]
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+#[no_gc]
+fn skip_ws(lx: *mut Lex) {
+    var run: usize = 0
+    while (*lx).i < (*lx).n && run < 100000000 {
+        let c: u8 = ld8((*lx).p, (*lx).i)
+        if is_ws(c) {
+            (*lx).i = (*lx).i + 1
+        } else if c == 37 as u8 {
+            while (*lx).i < (*lx).n && ld8((*lx).p, (*lx).i) != 10 as u8 &&
+            ld8((*lx).p, (*lx).i) != 13 as u8 {
+                (*lx).i = (*lx).i + 1
+            }
+        } else {
+            return
+        }
+        run = run + 1
+    }
+}
+
+#[no_gc]
+fn tok_start(lx: *mut Lex) -> usize {
+    skip_ws(lx)
+    return (*lx).i
+}
+
+#[no_gc]
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c as i32) - 48
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c as i32) - 87
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c as i32) - 55
+    }
+    return -1
+}
+
+#[no_gc]
+fn read_number(lx: *mut Lex, isreal: *mut bool) -> f64 {
+    var neg: bool = false
+    var seen: bool = false
+    *isreal = false
+    while (*lx).i < (*lx).n {
+        let c: u8 = ld8((*lx).p, (*lx).i)
+        if c == 43 as u8 {
+            (*lx).i = (*lx).i + 1
+        } else if c == 45 as u8 {
+            neg = !neg
+            (*lx).i = (*lx).i + 1
+        } else {
+            break
+        }
+    }
+    var whole: f64 = 0.0
+    while (*lx).i < (*lx).n && is_digit(ld8((*lx).p, (*lx).i)) {
+        whole = whole * 10.0 + ((ld8((*lx).p, (*lx).i) as u32) - 48) as f64
+        (*lx).i = (*lx).i + 1
+        seen = true
+    }
+    if (*lx).i < (*lx).n && ld8((*lx).p, (*lx).i) == 46 as u8 {
+        *isreal = true
+        (*lx).i = (*lx).i + 1
+        var scale: f64 = 0.1
+        while (*lx).i < (*lx).n && is_digit(ld8((*lx).p, (*lx).i)) {
+            whole = whole + scale *
+            (((ld8((*lx).p, (*lx).i) as u32) - 48) as f64)
+            scale = scale * 0.1
+            (*lx).i = (*lx).i + 1
+            seen = true
+        }
+    }
+    if (*lx).i + 1 < (*lx).n && (ld8((*lx).p, (*lx).i) == 101 as u8 ||
+    ld8((*lx).p, (*lx).i) == 69 as u8) {
+        let save: usize = (*lx).i
+        (*lx).i = (*lx).i + 1
+        var eneg: bool = false
+        if (*lx).i < (*lx).n && (ld8((*lx).p, (*lx).i) == 45 as u8 ||
+        ld8((*lx).p, (*lx).i) == 43 as u8) {
+            eneg = ld8((*lx).p, (*lx).i) == 45 as u8
+            (*lx).i = (*lx).i + 1
+        }
+        var ev: i32 = 0
+        var edig: bool = false
+        while (*lx).i < (*lx).n && is_digit(ld8((*lx).p, (*lx).i)) &&
+        ev < 400 {
+            ev = ev * 10 + ((ld8((*lx).p, (*lx).i) as u32) - 48) as i32
+            (*lx).i = (*lx).i + 1
+            edig = true
+        }
+        if edig {
+            *isreal = true
+            var k: i32 = 0
+            while k < ev && k < 400 {
+                if eneg {
+                    whole = whole * 0.1
+                } else {
+                    whole = whole * 10.0
+                }
+                k = k + 1
+            }
+        } else {
+            (*lx).i = save
+        }
+    }
+    if !seen {
+        return 0.0
+    }
+    if neg {
+        return 0.0 - whole
+    }
+    return whole
+}
+
+#[no_gc]
+fn read_name(ar: *mut Arena, lx: *mut Lex) -> u32 {
+    (*lx).i = (*lx).i + 1
+    var buf: [u8; 512] = [0 as u8; 512]
+    var w: usize = 0
+    while (*lx).i < (*lx).n && is_reg(ld8((*lx).p, (*lx).i)) {
+        var c: u8 = ld8((*lx).p, (*lx).i)
+        if c == 35 as u8 && (*lx).i + 2 < (*lx).n {
+            let h: i32 = hexv(ld8((*lx).p, (*lx).i + 1))
+            let l: i32 = hexv(ld8((*lx).p, (*lx).i + 2))
+            if h >= 0 && l >= 0 {
+                c = ((h * 16 + l) as u32) as u8
+                (*lx).i = (*lx).i + 2
+            }
+        }
+        if w < 512 {
+            buf[w] = c
+            w = w + 1
+        }
+        (*lx).i = (*lx).i + 1
+    }
+    return a_new_name(ar, (&buf[0]) as u64, w)
+}
+
+#[no_gc]
+fn read_string(ar: *mut Arena, lx: *mut Lex) -> u32 {
+    (*lx).i = (*lx).i + 1
+    let start: usize = (*lx).i
+    var depth: i32 = 1
+    var j: usize = start
+    var count: usize = 0
+    while j < (*lx).n && depth > 0 {
+        let c: u8 = ld8((*lx).p, j)
+        if c == 92 as u8 {
+            j = j + 1
+            if j >= (*lx).n {
+                break
+            }
+            let e: u8 = ld8((*lx).p, j)
+            if e >= 48 as u8 && e <= 55 as u8 {
+                var k: usize = 0
+                while k < 2 && j + 1 < (*lx).n &&
+                ld8((*lx).p, j + 1) >= 48 as u8 &&
+                ld8((*lx).p, j + 1) <= 55 as u8 {
+                    j = j + 1
+                    k = k + 1
+                }
+                count = count + 1
+            } else if e == 10 as u8 {
+            } else if e == 13 as u8 {
+                if j + 1 < (*lx).n && ld8((*lx).p, j + 1) == 10 as u8 {
+                    j = j + 1
+                }
+            } else {
+                count = count + 1
+            }
+            j = j + 1
+        } else if c == 40 as u8 {
+            depth = depth + 1
+            count = count + 1
+            j = j + 1
+        } else if c == 41 as u8 {
+            depth = depth - 1
+            if depth > 0 {
+                count = count + 1
+            }
+            j = j + 1
+        } else {
+            count = count + 1
+            j = j + 1
+        }
+    }
+    if !grow_pool(ar, count) {
+        return 0
+    }
+    let at: usize = (*ar).np
+    var w: usize = at
+    depth = 1
+    j = start
+    while j < (*lx).n && depth > 0 {
+        let c: u8 = ld8((*lx).p, j)
+        if c == 92 as u8 {
+            j = j + 1
+            if j >= (*lx).n {
+                break
+            }
+            let e: u8 = ld8((*lx).p, j)
+            if e >= 48 as u8 && e <= 55 as u8 {
+                var v: u32 = ((e as u32) - 48)
+                var k: usize = 0
+                while k < 2 && j + 1 < (*lx).n &&
+                ld8((*lx).p, j + 1) >= 48 as u8 &&
+                ld8((*lx).p, j + 1) <= 55 as u8 {
+                    j = j + 1
+                    v = v * 8 + ((ld8((*lx).p, j) as u32) - 48)
+                    k = k + 1
+                }
+                *(((*ar).pool as u64 + w as u64) as *mut u8) = (v & 255 as u32) as u8
+                w = w + 1
+            } else if e == 10 as u8 {
+            } else if e == 13 as u8 {
+                if j + 1 < (*lx).n && ld8((*lx).p, j + 1) == 10 as u8 {
+                    j = j + 1
+                }
+            } else {
+                var o: u8 = e
+                if e == 110 as u8 {
+                    o = 10 as u8
+                } else if e == 114 as u8 {
+                    o = 13 as u8
+                } else if e == 116 as u8 {
+                    o = 9 as u8
+                } else if e == 98 as u8 {
+                    o = 8 as u8
+                } else if e == 102 as u8 {
+                    o = 12 as u8
+                }
+                *(((*ar).pool as u64 + w as u64) as *mut u8) = o
+                w = w + 1
+            }
+            j = j + 1
+        } else if c == 40 as u8 {
+            depth = depth + 1
+            *(((*ar).pool as u64 + w as u64) as *mut u8) = c
+            w = w + 1
+            j = j + 1
+        } else if c == 41 as u8 {
+            depth = depth - 1
+            if depth > 0 {
+                *(((*ar).pool as u64 + w as u64) as *mut u8) = c
+                w = w + 1
+            }
+            j = j + 1
+        } else {
+            *(((*ar).pool as u64 + w as u64) as *mut u8) = c
+            w = w + 1
+            j = j + 1
+        }
+    }
+    (*ar).np = w
+    (*lx).i = j
+    let h: u32 = a_alloc(ar, T_STR)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = at as u64
+    (*o).n = (w - at) as u32
+    return h
+}
+
+#[no_gc]
+fn read_hexstring(ar: *mut Arena, lx: *mut Lex) -> u32 {
+    (*lx).i = (*lx).i + 1
+    let start: usize = (*lx).i
+    var j: usize = start
+    var digits: usize = 0
+    while j < (*lx).n && ld8((*lx).p, j) != 62 as u8 {
+        if hexv(ld8((*lx).p, j)) >= 0 {
+            digits = digits + 1
+        }
+        j = j + 1
+    }
+    let count: usize = (digits + 1) / 2
+    if !grow_pool(ar, count) {
+        return 0
+    }
+    let at: usize = (*ar).np
+    var w: usize = at
+    var half: i32 = -1
+    j = start
+    while j < (*lx).n && ld8((*lx).p, j) != 62 as u8 {
+        let v: i32 = hexv(ld8((*lx).p, j))
+        if v >= 0 {
+            if half < 0 {
+                half = v
+            } else {
+                *(((*ar).pool as u64 + w as u64) as *mut u8) =
+                ((half * 16 + v) as u32) as u8
+                w = w + 1
+                half = -1
+            }
+        }
+        j = j + 1
+    }
+    if half >= 0 {
+        *(((*ar).pool as u64 + w as u64) as *mut u8) =
+        ((half * 16) as u32) as u8
+        w = w + 1
+    }
+    (*ar).np = w
+    if j < (*lx).n {
+        j = j + 1
+    }
+    (*lx).i = j
+    let h: u32 = a_alloc(ar, T_STR)
+    let o: *mut Obj = obj_at(ar, h)
+    (*o).a = at as u64
+    (*o).n = (w - at) as u32
+    return h
+}
+
+#[no_gc]
+fn read_keyword(ar: *mut Arena, lx: *mut Lex) -> u32 {
+    var buf: [u8; 64] = [0 as u8; 64]
+    var w: usize = 0
+    while (*lx).i < (*lx).n && is_reg(ld8((*lx).p, (*lx).i)) {
+        if w < 64 {
+            buf[w] = ld8((*lx).p, (*lx).i)
+            w = w + 1
+        }
+        (*lx).i = (*lx).i + 1
+    }
+    if w == 0 {
+        (*lx).i = (*lx).i + 1
+        return a_new_null(ar)
+    }
+    var t: [u8; 4] = "true"
+    var f: [u8; 5] = "false"
+    var nl: [u8; 4] = "null"
+    if w == 4 && buf[0] == t[0] && buf[1] == t[1] && buf[2] == t[2] &&
+    buf[3] == t[3] {
+        let h: u32 = a_alloc(ar, T_BOOL)
+        (*obj_at(ar, h)).a = 1
+        return h
+    }
+    if w == 5 && buf[0] == f[0] && buf[1] == f[1] && buf[2] == f[2] &&
+    buf[3] == f[3] && buf[4] == f[4] {
+        let h: u32 = a_alloc(ar, T_BOOL)
+        (*obj_at(ar, h)).a = 0
+        return h
+    }
+    if w == 4 && buf[0] == nl[0] && buf[1] == nl[1] && buf[2] == nl[2] &&
+    buf[3] == nl[3] {
+        return a_new_null(ar)
+    }
+    return a_new_bytes(ar, T_OP, (&buf[0]) as u64, w)
+}
+
+#[no_gc]
+fn parse_obj(ar: *mut Arena, lx: *mut Lex, depth: usize) -> u32 {
+    if depth > MAX_DEPTH {
+        (*ar).over = 1
+        return 0
+    }
+    skip_ws(lx)
+    if (*lx).i >= (*lx).n {
+        return 0
+    }
+    let c: u8 = ld8((*lx).p, (*lx).i)
+    if c == 47 as u8 {
+        return read_name(ar, lx)
+    }
+    if c == 40 as u8 {
+        return read_string(ar, lx)
+    }
+    if c == 60 as u8 {
+        if (*lx).i + 1 < (*lx).n && ld8((*lx).p, (*lx).i + 1) == 60 as u8 {
+            return read_dict(ar, lx, depth)
+        }
+        return read_hexstring(ar, lx)
+    }
+    if c == 91 as u8 {
+        return read_array(ar, lx, depth)
+    }
+    if c == 93 as u8 || c == 62 as u8 || c == 41 as u8 || c == 125 as u8 ||
+    c == 123 as u8 {
+        (*lx).i = (*lx).i + 1
+        return 0
+    }
+    if is_digit(c) || c == 43 as u8 || c == 45 as u8 || c == 46 as u8 {
+        let save: usize = (*lx).i
+        var isreal: bool = false
+        let v: f64 = read_number(lx, &isreal)
+        if !isreal && v >= 0.0 && v < 4000000000.0 {
+            let save2: usize = (*lx).i
+            skip_ws(lx)
+            if (*lx).i < (*lx).n && is_digit(ld8((*lx).p, (*lx).i)) {
+                var isr2: bool = false
+                let g: f64 = read_number(lx, &isr2)
+                skip_ws(lx)
+                if !isr2 && (*lx).i < (*lx).n &&
+                ld8((*lx).p, (*lx).i) == 82 as u8 &&
+                ((*lx).i + 1 >= (*lx).n || !is_reg(ld8((*lx).p, (*lx).i + 1))) {
+                    (*lx).i = (*lx).i + 1
+                    let h: u32 = a_alloc(ar, T_REF)
+                    let o: *mut Obj = obj_at(ar, h)
+                    (*o).a = v as u64
+                    (*o).c = g as u32
+                    return h
+                }
+            }
+            (*lx).i = save2
+        }
+        if isreal {
+            return a_new_real(ar, v)
+        }
+        return a_new_int(ar, v as i64)
+    }
+    return read_keyword(ar, lx)
+}
+
+#[no_gc]
+fn read_array(ar: *mut Arena, lx: *mut Lex, depth: usize) -> u32 {
+    (*lx).i = (*lx).i + 1
+    let mark: usize = (*ar).nbs
+    var guard: usize = 0
+    while (*lx).i < (*lx).n && guard < 10000000 {
+        skip_ws(lx)
+        if (*lx).i >= (*lx).n {
+            break
+        }
+        if ld8((*lx).p, (*lx).i) == 93 as u8 {
+            (*lx).i = (*lx).i + 1
+            break
+        }
+        let before: usize = (*lx).i
+        let v: u32 = parse_obj(ar, lx, depth + 1)
+        if (*lx).i == before {
+            (*lx).i = (*lx).i + 1
+        }
+        if (*ar).over != 0 as u32 {
+            break
+        }
+        if !bs_push(ar, v) {
+            break
+        }
+        guard = guard + 1
+    }
+    let n: usize = (*ar).nbs - mark
+    let h: u32 = a_new_arr(ar, (*ar).bs as u64 + (mark * 4) as u64, n)
+    (*ar).nbs = mark
+    return h
+}
+
+#[no_gc]
+fn read_dict(ar: *mut Arena, lx: *mut Lex, depth: usize) -> u32 {
+    (*lx).i = (*lx).i + 2
+    let mark: usize = (*ar).nbs
+    var guard: usize = 0
+    while (*lx).i < (*lx).n && guard < 10000000 {
+        skip_ws(lx)
+        if (*lx).i + 1 < (*lx).n && ld8((*lx).p, (*lx).i) == 62 as u8 &&
+        ld8((*lx).p, (*lx).i + 1) == 62 as u8 {
+            (*lx).i = (*lx).i + 2
+            break
+        }
+        if (*lx).i >= (*lx).n {
+            break
+        }
+        if ld8((*lx).p, (*lx).i) != 47 as u8 {
+            let before: usize = (*lx).i
+            parse_obj(ar, lx, depth + 1)
+            if (*lx).i == before {
+                (*lx).i = (*lx).i + 1
+            }
+            guard = guard + 1
+            continue
+        }
+        let k: u32 = read_name(ar, lx)
+        let before2: usize = (*lx).i
+        let v: u32 = parse_obj(ar, lx, depth + 1)
+        if (*lx).i == before2 {
+            (*lx).i = (*lx).i + 1
+        }
+        if (*ar).over != 0 as u32 {
+            break
+        }
+        if !bs_push(ar, k) || !bs_push(ar, v) {
+            break
+        }
+        guard = guard + 1
+    }
+    let np: usize = ((*ar).nbs - mark) / 2
+    let h: u32 = a_new_dict(ar, (*ar).bs as u64 + (mark * 4) as u64, np)
+    (*ar).nbs = mark
+    let save: usize = (*lx).i
+    skip_ws(lx)
+    var kw: [u8; 6] = "stream"
+    if (*lx).i + 6 <= (*lx).n && match_at(lx, (&kw[0]) as u64, 6) {
+        (*lx).i = (*lx).i + 6
+        if (*lx).i < (*lx).n && ld8((*lx).p, (*lx).i) == 13 as u8 {
+            (*lx).i = (*lx).i + 1
+        }
+        if (*lx).i < (*lx).n && ld8((*lx).p, (*lx).i) == 10 as u8 {
+            (*lx).i = (*lx).i + 1
+        }
+        o_set_stream(ar, h, (*lx).i as u64, 0)
+    } else {
+        (*lx).i = save
+    }
+    return h
+}
+
+#[no_gc]
+fn match_at(lx: *mut Lex, lit: u64, n: usize) -> bool {
+    if (*lx).i + n > (*lx).n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if ld8((*lx).p, (*lx).i + i) != ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

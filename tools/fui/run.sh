@@ -1322,7 +1322,7 @@ for f in lib/fui/*.fi; do
         # std.vec is used through its GENERIC names (`Vec[T]`, `vec_push[T]`):
         # Firn cannot qualify a generic with its module, so no "vec." can stand
         if [ "$mod" = "vec" ] && grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
-            | grep -q 'Vec\['; then
+            | grep -qE 'Vec\[|vec_[a-z_]+\['; then
             continue
         fi
         # std.str is used through METHOD syntax (`s.length()`, `s.chars(i)`), which
