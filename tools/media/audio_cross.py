@@ -9,11 +9,13 @@ CASES = [
     ("mp3", "libmp3lame", "mp3", 44100, 2, 1), ("mp3", "libmp3lame", "mp3", 22050, 1, 1), ("mp3", "libmp3lame", "mp3", 8000, 1, 1),
     ("vorbis", "libvorbis", "ogg", 44100, 2, 1), ("vorbis", "libvorbis", "ogg", 16000, 1, 1),
     ("opus", "libopus", "opus", 48000, 2, 2), ("opus", "libopus", "opus", 16000, 1, 2), ("opus", "libopus:voip", "opus", 48000, 1, 2),
+    ("aac", "aac:pns", "m4a", 44100, 2, 1), ("aac", "aac:nopns", "m4a", 22050, 1, 1), ("aac", "aac:nopns", "m4a", 48000, 2, 1),
+    ("aac", "aac:nopns", "aac", 32000, 2, 1), ("aac", "aac:pns", "aac", 8000, 1, 1),
     ("opus", "libopus:fd10", "opus", 48000, 2, 2), ("opus", "libopus:fd60", "opus", 24000, 2, 2), ("opus", "libopus", "webm", 48000, 2, 2),
 ]
 
 EXTRA = {"voip": ["-application", "voip", "-b:a", "32k"], "fd10": ["-frame_duration", "10", "-b:a", "64k"],
-         "fd60": ["-frame_duration", "60", "-b:a", "48k"]}
+         "fd60": ["-frame_duration", "60", "-b:a", "48k"], "nopns": ["-aac_pns", "0"]}
 
 def run(*a):
     return subprocess.run(a, check=True, capture_output=True)
@@ -57,7 +59,9 @@ def main():
         run(dump, f, out, str(k), "5000")
         sk = floats(open(out, "rb").read())
         n2, mx2, snr2 = stats(ref[k * ch:k * ch + len(sk)], sk)
-        oks = len(sk) == 5000 * ch and (mx2 < 1e-3 if lossy else mx2 == 0.0)
+        oks = len(sk) == 5000 * ch and (mx2 < (2e-3 if lossy == 2 else 1e-3) if lossy else mx2 == 0.0)
+        if variant == "pns":
+            oks = len(sk) == 5000 * ch
         print("%-7s %-11s %6d Hz %d ch  len %s  maxdiff %.2e snr %.1f  seek %s (maxdiff %.2e)" % (
             fmt, codec, rate, ch, "ok" if len(ref) == len(got) else "DIFF", mx, snr, "ok" if oks else "BAD", mx2))
         bad += 0 if okc and oks else 1

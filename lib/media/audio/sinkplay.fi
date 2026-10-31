@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import audio.sink
+import media.clock
+import media.audio.source
+import media.audio.open
+import media.audio.all
+
+export {
+    SinkPlay, sp_new, sp_open, sp_start, sp_attach, sp_pump, sp_pause, sp_resume, sp_seek_ms, sp_position_ms, sp_duration_ms,
+    sp_set_volume, sp_volume, sp_state, sp_is_finished, sp_info, sp_clock, sp_close, sp_run_to_end,
+    SP_IDLE, SP_PLAYING, SP_PAUSED, SP_ENDED,
+}
+
+const SP_IDLE: u32 = 0
+const SP_PLAYING: u32 = 1
+const SP_PAUSED: u32 = 2
+const SP_ENDED: u32 = 3
+const CHUNK: usize = 2048
+const MAX_CH: usize = 16
+
+struct SinkPlay {
+    reg: source.Registry,
+    src: source.AudioSource,
+    snk: sink.Sink,
+    clk: clock.Clock,
+    data: rt.Buf,
+    fbuf: u64,
+    pbuf: u64,
+    in_ch: u32,
+    out_ch: u32,
+    rate: u32,
+    state: u32,
+    has_src: bool,
+    has_sink: bool,
+    cap: usize,
+    eof: bool,
+    volume: u32,
+}
+
+fn sp_new() -> SinkPlay {
+    var p: SinkPlay = SinkPlay { reg: source.registry_new(), src: source.source_new(), snk: sink.sink_none(),
+        clk: clock.clock_new(44100 as u32), data: rt.buf_new(), fbuf: 0 as u64, pbuf: 0 as u64, in_ch: 0 as u32, out_ch: 0 as u32,
+        rate: 0 as u32, state: SP_IDLE, has_src: false, has_sink: false, cap: 0, eof: false, volume: 100 as u32 }
+    return p
+}
+
+fn sp_open(p: *mut SinkPlay, data: u64, n: usize) -> bool {
+    sp_close(p)
+    rt.buf_clear(&(*p).data)
+    rt.buf_push_bytes(&(*p).data, data, n)
+    (*p).reg = source.registry_new()
+    all.register_all(&(*p).reg)
+    (*p).src = source.source_new()
+    if !open.open_bytes(&(*p).reg, rt.buf_ptr(&(*p).data), rt.buf_len(&(*p).data), &(*p).src) {
+        return false
+    }
+    let inf: source.AudioInfo = source.source_info(&(*p).src)
+    if inf.channels == 0 as u32 || inf.channels as usize > MAX_CH || inf.rate == 0 as u32 {
+        source.source_close(&(*p).src)
+        return false
+    }
+    (*p).in_ch = inf.channels
+    (*p).out_ch = if_stereo(inf.channels)
+    (*p).rate = inf.rate
+    (*p).fbuf = rt.heap_alloc(CHUNK * (inf.channels as usize) * 4)
+    (*p).pbuf = rt.heap_alloc(CHUNK * 2 * 2)
+    (*p).clk = clock.clock_new(inf.rate)
+    (*p).has_src = true
+    (*p).eof = false
+    (*p).state = SP_IDLE
+    return true
+}
+
+fn if_stereo(ch: u32) -> u32 {
+    if ch == 1 as u32 {
+        return 1 as u32
+    }
+    return 2 as u32
+}
+
+fn sp_start(p: *mut SinkPlay, app: str) -> bool {
+    if !(*p).has_src {
+        return false
+    }
+    return sp_attach(p, sink.sink_open(app, (*p).rate, (*p).out_ch))
+}
+
+fn sp_attach(p: *mut SinkPlay, snk: sink.Sink) -> bool {
+    if !(*p).has_src || (*p).has_sink {
+        return false
+    }
+    (*p).snk = snk
+    if !sink.sink_is_open(&(*p).snk) {
+        sink.sink_close(&(*p).snk)
+        return false
+    }
+    sink.sink_set_volume(&(*p).snk, (*p).volume)
+    (*p).has_sink = true
+    (*p).cap = sink.sink_writable(&(*p).snk)
+    (*p).state = SP_PLAYING
+    return true
+}
+
+fn clip16(v: f32) -> i32 {
+    var x: f32 = v * 32768.0
+    if x > 32767.0 {
+        x = 32767.0
+    }
+    if x < -32768.0 {
+        x = -32768.0
+    }
+    if x >= 0.0 {
+        return (x + 0.5) as i32
+    }
+    return (x - 0.5) as i32
+}
+
+fn convert(p: *mut SinkPlay, frames: usize) {
+    let ic: usize = (*p).in_ch as usize
+    let oc: usize = (*p).out_ch as usize
+    var i: usize = 0
+    while i < frames {
+        var k: usize = 0
+        while k < oc {
+            let v: f32 = *(((*p).fbuf + ((i * ic + k) * 4) as u64) as *mut f32)
+            rt.st16((*p).pbuf, i * oc + k, clip16(v) as% u16)
+            k = k + 1
+        }
+        i = i + 1
+    }
+}
+
+fn update_latency(p: *mut SinkPlay) {
+    if (*p).cap == 0 {
+        return
+    }
+    let w: usize = sink.sink_writable(&(*p).snk)
+    if w > (*p).cap {
+        (*p).cap = w
+    }
+    clock.clock_set_latency(&(*p).clk, ((*p).cap - w) as u64)
+}
+
+fn sp_pump(p: *mut SinkPlay) -> bool {
+    if !(*p).has_sink || (*p).state != SP_PLAYING {
+        return (*p).state != SP_ENDED
+    }
+    var rounds: i32 = 0
+    while rounds < 8 && !(*p).eof && sink.sink_writable(&(*p).snk) >= CHUNK {
+        let got: i64 = source.source_read_f32(&(*p).src, (*p).fbuf, CHUNK)
+        if got <= 0 {
+            (*p).eof = true
+            break
+        }
+        convert(p, got as usize)
+        if !sink.sink_write(&(*p).snk, (*p).pbuf, got as usize) {
+            (*p).eof = true
+            break
+        }
+        clock.clock_advance(&(*p).clk, got as u64)
+        rounds = rounds + 1
+    }
+    update_latency(p)
+    if (*p).eof && sink.sink_writable(&(*p).snk) >= (*p).cap {
+        sink.sink_drain(&(*p).snk)
+        (*p).state = SP_ENDED
+        return false
+    }
+    return true
+}
+
+fn sp_run_to_end(p: *mut SinkPlay) {
+    var guard: i32 = 0
+    while sp_pump(p) && guard < 100000000 {
+        guard = guard + 1
+    }
+}
+
+fn sp_pause(p: *mut SinkPlay) {
+    if (*p).state != SP_PLAYING {
+        return
+    }
+    sink.sink_pause(&(*p).snk, true)
+    clock.clock_pause(&(*p).clk)
+    (*p).state = SP_PAUSED
+}
+
+fn sp_resume(p: *mut SinkPlay) {
+    if (*p).state != SP_PAUSED {
+        return
+    }
+    sink.sink_pause(&(*p).snk, false)
+    clock.clock_resume(&(*p).clk)
+    (*p).state = SP_PLAYING
+}
+
+fn sp_seek_ms(p: *mut SinkPlay, ms: u64) -> bool {
+    if !(*p).has_src {
+        return false
+    }
+    let frame: u64 = ms * ((*p).rate as u64) / 1000 as u64
+    if !source.source_seek(&(*p).src, frame) {
+        return false
+    }
+    if (*p).has_sink {
+        sink.sink_flush(&(*p).snk)
+    }
+    clock.clock_reset(&(*p).clk, frame)
+    clock.clock_set_latency(&(*p).clk, 0 as u64)
+    (*p).eof = false
+    if (*p).state == SP_ENDED {
+        (*p).state = SP_PLAYING
+    }
+    return true
+}
+
+fn sp_position_ms(p: *mut SinkPlay) -> u64 {
+    if !(*p).has_src {
+        return 0 as u64
+    }
+    if (*p).state == SP_ENDED {
+        return sp_duration_ms(p)
+    }
+    return clock.clock_millis(&(*p).clk)
+}
+
+fn sp_duration_ms(p: *mut SinkPlay) -> u64 {
+    if !(*p).has_src || (*p).rate == 0 as u32 {
+        return 0 as u64
+    }
+    return source.source_info(&(*p).src).frames * 1000 as u64 / ((*p).rate as u64)
+}
+
+fn sp_set_volume(p: *mut SinkPlay, percent: u32) {
+    var v: u32 = percent
+    if v > 100 as u32 {
+        v = 100 as u32
+    }
+    (*p).volume = v
+    if (*p).has_sink {
+        sink.sink_set_volume(&(*p).snk, v)
+    }
+}
+
+fn sp_volume(p: *mut SinkPlay) -> u32 {
+    return (*p).volume
+}
+
+fn sp_state(p: *mut SinkPlay) -> u32 {
+    return (*p).state
+}
+
+fn sp_is_finished(p: *mut SinkPlay) -> bool {
+    return (*p).state == SP_ENDED
+}
+
+fn sp_info(p: *mut SinkPlay) -> source.AudioInfo {
+    return source.source_info(&(*p).src)
+}
+
+fn sp_clock(p: *mut SinkPlay) -> *mut clock.Clock {
+    return &(*p).clk
+}
+
+fn sp_close(p: *mut SinkPlay) {
+    if (*p).has_sink {
+        sink.sink_close(&(*p).snk)
+        (*p).has_sink = false
+    }
+    if (*p).has_src {
+        source.source_close(&(*p).src)
+        (*p).has_src = false
+    }
+    if (*p).fbuf != 0 as u64 {
+        rt.heap_free((*p).fbuf, CHUNK * ((*p).in_ch as usize) * 4)
+        (*p).fbuf = 0 as u64
+    }
+    if (*p).pbuf != 0 as u64 {
+        rt.heap_free((*p).pbuf, CHUNK * 2 * 2)
+        (*p).pbuf = 0 as u64
+    }
+    (*p).state = SP_IDLE
+}
