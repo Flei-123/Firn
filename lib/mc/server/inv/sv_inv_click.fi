@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import std.rt
+import std.bytes
+import std.math
+import mc.mc_sem
+import mc.mc_version
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.ent.ent_table
+import mc.server.ent.ent_item
+import mc.server.inv.sv_inv
+import mc.server.inv.sv_inv_sync
+
+export { click_handle, apply_click }
+
+const MODE_PICKUP: i32 = 0
+const MODE_QUICK_MOVE: i32 = 1
+const MODE_SWAP: i32 = 2
+const MODE_CLONE: i32 = 3
+const MODE_THROW: i32 = 4
+const MODE_DRAG: i32 = 5
+const MODE_PICKUP_ALL: i32 = 6
+const OUTSIDE: i32 = 0 - 999
+const MIN_EDITABLE: i32 = 9
+const OFFHAND_KEY: i32 = 40
+const THROW_SPEED: f64 = 0.3
+const THROW_DELAY: i32 = 40
+const EYE_HEIGHT: f64 = 1.5
+const DEG: f64 = 0.017453292519943295
+
+fn throw_item(srv: *mut sv_state.Server, s: *mut sv_state.Session, item: i32, n: i32) {
+    if item <= 0 || n <= 0 { return }
+    let t: *mut ent_table.Table = &(*srv).ents
+    let eid: i32 = (*srv).next_eid
+    (*srv).next_eid = eid + 1
+    let e: *mut ent_table.Entity = ent_item.item_spawn(t, eid, (*s).x, (*s).y + EYE_HEIGHT - 0.3, (*s).z, item, n)
+    if e as u64 == 0 as u64 { return }
+    let yr: f64 = ((*s).yaw as f64) * DEG
+    let pr: f64 = ((*s).pitch as f64) * DEG
+    (*e).vx = (0.0 - math.sin(yr)) * math.cos(pr) * THROW_SPEED
+    (*e).vz = math.cos(yr) * math.cos(pr) * THROW_SPEED
+    (*e).vy = (0.0 - math.sin(pr)) * THROW_SPEED + 0.1
+    (*e).pickup_delay = THROW_DELAY
+}
+
+fn pickup(srv: *mut sv_state.Server, s: *mut sv_state.Session, k: i32, right: bool) {
+    let si: i32 = sv_inv.slot_item(s, k)
+    let sn: i32 = sv_inv.slot_count(s, k)
+    let ci: i32 = (*s).cur
+    let cn: i32 = (*s).cur_n
+    if cn <= 0 {
+        if sn <= 0 { return }
+        var take: i32 = sn
+        if right { take = (sn + 1) / 2 }
+        sv_inv.cursor_set(s, si, take)
+        sv_inv.slot_set(s, k, si, sn - take)
+        return
+    }
+    if k < MIN_EDITABLE { return }
+    let mx: i32 = sv_inv.stack_max(srv, ci)
+    if sn <= 0 {
+        var put: i32 = cn
+        if right { put = 1 }
+        if put > mx { put = mx }
+        sv_inv.slot_set(s, k, ci, put)
+        sv_inv.cursor_set(s, ci, cn - put)
+        return
+    }
+    if si != ci {
+        if cn > mx { return }
+        sv_inv.slot_set(s, k, ci, cn)
+        sv_inv.cursor_set(s, si, sn)
+        return
+    }
+    var mv: i32 = cn
+    if right { mv = 1 }
+    if mv > mx - sn { mv = mx - sn }
+    if mv <= 0 { return }
+    sv_inv.slot_set(s, k, si, sn + mv)
+    sv_inv.cursor_set(s, ci, cn - mv)
+}
+
+fn quick_move(srv: *mut sv_state.Server, s: *mut sv_state.Session, k: i32, changed: *mut u64) {
+    let item: i32 = sv_inv.slot_item(s, k)
+    let n: i32 = sv_inv.slot_count(s, k)
+    if item <= 0 { return }
+    var first: i32 = sv_inv.MAIN_FIRST
+    var end: i32 = sv_inv.HOTBAR_FIRST + sv_inv.HOTBAR_COUNT
+    if k >= sv_inv.HOTBAR_FIRST && k < sv_inv.HOTBAR_FIRST + sv_inv.HOTBAR_COUNT {
+        end = sv_inv.MAIN_END
+    } else if k >= sv_inv.MAIN_FIRST && k < sv_inv.MAIN_END {
+        first = sv_inv.HOTBAR_FIRST
+    }
+    let left: i32 = sv_inv.merge_range(srv, s, item, n, first, end, changed)
+    sv_inv.slot_set(s, k, item, left)
+}
+
+fn swap_hotbar(s: *mut sv_state.Session, k: i32, button: i32) {
+    var target: i32 = 0 - 1
+    if button >= 0 && button < sv_inv.HOTBAR_COUNT { target = sv_inv.HOTBAR_FIRST + button }
+    if button == OFFHAND_KEY { target = sv_inv.OFFHAND }
+    if target < 0 || target == k || k < MIN_EDITABLE { return }
+    let ai: i32 = sv_inv.slot_item(s, k)
+    let an: i32 = sv_inv.slot_count(s, k)
+    sv_inv.slot_set(s, k, sv_inv.slot_item(s, target), sv_inv.slot_count(s, target))
+    sv_inv.slot_set(s, target, ai, an)
+}
+
+fn throw_slot(srv: *mut sv_state.Server, s: *mut sv_state.Session, k: i32, all: bool) {
+    let item: i32 = sv_inv.slot_item(s, k)
+    let n: i32 = sv_inv.slot_count(s, k)
+    if item <= 0 || k < MIN_EDITABLE { return }
+    var out: i32 = 1
+    if all { out = n }
+    sv_inv.slot_set(s, k, item, n - out)
+    throw_item(srv, s, item, out)
+}
+
+fn clone_slot(srv: *mut sv_state.Server, s: *mut sv_state.Session, k: i32) {
+    if (*s).gamemode != 1 || (*s).cur_n > 0 { return }
+    let item: i32 = sv_inv.slot_item(s, k)
+    if item <= 0 { return }
+    sv_inv.cursor_set(s, item, sv_inv.stack_max(srv, item))
+}
+
+fn drag_add(s: *mut sv_state.Session, k: i32) {
+    if (*s).drag_kind < 0 || k < MIN_EDITABLE || k >= sv_inv.SLOTS || (*s).cur_n <= 0 { return }
+    let item: i32 = sv_inv.slot_item(s, k)
+    if item != sv_inv.EMPTY && item != (*s).cur { return }
+    (*s).drag_mask = (*s).drag_mask | sv_inv.bit(k)
+}
+
+fn drag_end(srv: *mut sv_state.Server, s: *mut sv_state.Session, changed: *mut u64) {
+    if (*s).drag_kind < 0 || (*s).cur_n <= 0 { (*s).drag_kind = 0 - 1; return }
+    var slots: i32 = 0
+    var k: i32 = 0
+    while k < sv_inv.SLOTS {
+        if sv_inv.has((*s).drag_mask, k) { slots = slots + 1 }
+        k = k + 1
+    }
+    let item: i32 = (*s).cur
+    let mx: i32 = sv_inv.stack_max(srv, item)
+    var per: i32 = 1
+    if (*s).drag_kind == 0 && slots > 0 { per = (*s).cur_n / slots }
+    if (*s).drag_kind == 2 { per = mx }
+    if (*s).drag_kind == 2 && (*s).gamemode != 1 { slots = 0 }
+    k = 0
+    while k < sv_inv.SLOTS && slots > 0 {
+        if sv_inv.has((*s).drag_mask, k) && (*s).cur_n > 0 {
+            var have: i32 = 0
+            if sv_inv.slot_item(s, k) == item { have = sv_inv.slot_count(s, k) }
+            var put: i32 = per
+            if put > mx - have { put = mx - have }
+            if (*s).drag_kind != 2 && put > (*s).cur_n { put = (*s).cur_n }
+            if put > 0 {
+                sv_inv.slot_set(s, k, item, have + put)
+                if (*s).drag_kind != 2 { sv_inv.cursor_set(s, item, (*s).cur_n - put) }
+                *changed = *changed | sv_inv.bit(k)
+            }
+        }
+        k = k + 1
+    }
+    (*s).drag_kind = 0 - 1
+    (*s).drag_mask = 0 as u64
+}
+
+fn pickup_all(srv: *mut sv_state.Server, s: *mut sv_state.Session, changed: *mut u64) {
+    if (*s).cur_n <= 0 { return }
+    let item: i32 = (*s).cur
+    let mx: i32 = sv_inv.stack_max(srv, item)
+    var pass: i32 = 0
+    while pass < 2 {
+        var k: i32 = sv_inv.MAIN_FIRST
+        while k < sv_inv.SLOTS && (*s).cur_n < mx {
+            let n: i32 = sv_inv.slot_count(s, k)
+            if sv_inv.slot_item(s, k) == item && ((pass == 0 && n < mx) || (pass == 1 && n == mx)) {
+                var take: i32 = mx - (*s).cur_n
+                if take > n { take = n }
+                sv_inv.cursor_set(s, item, (*s).cur_n + take)
+                sv_inv.slot_set(s, k, item, n - take)
+                *changed = *changed | sv_inv.bit(k)
+            }
+            k = k + 1
+        }
+        pass = pass + 1
+    }
+}
+
+fn apply_click(srv: *mut sv_state.Server, s: *mut sv_state.Session, slot: i32, button: i32, mode: i32) {
+    var changed: u64 = 0 as u64
+    let valid: bool = slot >= 0 && slot < sv_inv.SLOTS
+    if mode == MODE_PICKUP {
+        if valid {
+            pickup(srv, s, slot, button == 1)
+            changed = sv_inv.bit(slot)
+        } else if slot == OUTSIDE && (*s).cur_n > 0 {
+            var out: i32 = (*s).cur_n
+            if button == 1 { out = 1 }
+            let item: i32 = (*s).cur
+            sv_inv.cursor_set(s, item, (*s).cur_n - out)
+            throw_item(srv, s, item, out)
+        }
+    } else if mode == MODE_QUICK_MOVE && valid {
+        quick_move(srv, s, slot, &changed)
+        changed = changed | sv_inv.bit(slot)
+    } else if mode == MODE_SWAP && valid {
+        swap_hotbar(s, slot, button)
+        changed = sv_inv.bit(slot)
+        if button >= 0 && button < sv_inv.HOTBAR_COUNT { changed = changed | sv_inv.bit(sv_inv.HOTBAR_FIRST + button) }
+        if button == OFFHAND_KEY { changed = changed | sv_inv.bit(sv_inv.OFFHAND) }
+    } else if mode == MODE_CLONE && valid {
+        clone_slot(srv, s, slot)
+    } else if mode == MODE_THROW && valid {
+        throw_slot(srv, s, slot, button == 1)
+        changed = sv_inv.bit(slot)
+    } else if mode == MODE_DRAG {
+        let stage: i32 = button & 3
+        if stage == 0 {
+            (*s).drag_kind = (button >> 2) & 3
+            (*s).drag_mask = 0 as u64
+        } else if stage == 1 {
+            drag_add(s, slot)
+        } else if stage == 2 {
+            drag_end(srv, s, &changed)
+        }
+    } else if mode == MODE_PICKUP_ALL && valid {
+        pickup_all(srv, s, &changed)
+        changed = changed | sv_inv.bit(slot)
+    }
+    sv_inv_sync.push_all(srv, s)
+}
+
+fn byte_at(v: *mut bytes.Bytes, i: usize) -> i32 {
+    return rt.ld8((*v).data, i) as i32
+}
+
+fn click_handle(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) -> bool {
+    if !sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_WINDOW_CLICK) { return false }
+    var slot: i32 = 0
+    var button: i32 = 0
+    var mode: i32 = 0
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !sv_send.field_view(srv, mc_version.ST_PLAY, id, "slot", body, &v) || v.len != 2 { return true }
+    slot = (byte_at(&v, 0) << 8) | byte_at(&v, 1)
+    if slot >= 32768 { slot = slot - 65536 }
+    if !sv_send.field_view(srv, mc_version.ST_PLAY, id, "mouseButton", body, &v) || v.len != 1 { return true }
+    button = byte_at(&v, 0)
+    if button >= 128 { button = button - 256 }
+    if !sv_send.field_varint(srv, mc_version.ST_PLAY, id, "mode", body, &mode) { return true }
+    apply_click(srv, s, slot, button, mode)
+    return true
+}
