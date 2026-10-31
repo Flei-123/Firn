@@ -88,6 +88,8 @@ export {
     // W34: a bound list as a TABLE (rows = `row`, the cells of a row = virtual `cell` children)
     a11y_set_vtable, a11y_vtable, a11y_vmulti, a11y_set_vcell_col, a11y_vrow_role, a11y_vcol_count, a11y_vcell_name, a11y_vhead_count, a11y_vhead_name, a11y_vhead_rect,
     a11y_vcell_state, a11y_vcell_rect,
+    LIVE_UNSET, LIVE_OFF, LIVE_POLITE, LIVE_ASSERTIVE, a11y_set_live, a11y_live, a11y_live_explicit, a11y_live_name,
+    a11y_announce, a11y_announce_seq, a11y_announce_get, a11y_live_sync,
 }
 
 import fui.widget
@@ -96,6 +98,8 @@ import fui.wave2
 import fui.control
 import fui.viewport
 import fui.vlist
+import fui.announce
+import std.hash
 import std.rt
 
 // ======================================================= THE SIZE
@@ -209,6 +213,9 @@ struct Ann {
     // aria-hidden: 1 = this node and everything under it is NOT in the
     // accessibility tree (a scene node hidden by `node_set_hidden` counts too).
     hid: u32,
+    live: u32,
+    lh: u32,
+    ls: u32,
 }
 
 fn vsrc_none(ud: u64, i: usize, r: *mut vlist.VRow) {}
@@ -217,7 +224,8 @@ fn ann_blank() -> Ann {
     return Ann { role: ROLE_NONE, np: 0, nn: 0, has_name: 0 as u32,
         lby: 0 as u32, exp: 0 as u32, ro: 0 as u32, toggle: 0 as u32,
         level: 0 as u32, dp: 0, dn: 0, dby: 0 as u32,
-        vl: 0, vsrc: vsrc_none, vud: 0, vt: 0 as u32, vcc: 0 as u32, hid: 0 as u32 }
+        vl: 0, vsrc: vsrc_none, vud: 0, vt: 0 as u32, vcc: 0 as u32, hid: 0 as u32,
+        live: 0 as u32, lh: 0 as u32, ls: 0 as u32 }
 }
 
 struct A11y {
@@ -232,10 +240,11 @@ struct A11y {
     // the focus.
     ord: u64,
     nord: usize,
+    q: u64,
 }
 
 fn a11y_new() -> A11y {
-    return A11y { a: 0, asz: 0, ahi: 0, ord: 0, nord: 0 }
+    return A11y { a: 0, asz: 0, ahi: 0, ord: 0, nord: 0, q: 0 }
 }
 
 // One block holds the tab order (A11Y_MAX numbers) and the annotations
@@ -293,6 +302,8 @@ fn a11y_free(ax: *mut A11y) {
     (*ax).ord = 0
     (*ax).ahi = 0
     (*ax).nord = 0
+    announce.ring_free((*ax).q)
+    (*ax).q = 0
 }
 
 // Does the number of statements fit the number of nodes? See A11Y_MAX.
@@ -1497,6 +1508,10 @@ fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
         put_lit(o, " level=")
         put_dec(o, (*an(ax, i)).level as i64)
     }
+    if slot_ok(i) && (*an(ax, i)).live != LIVE_UNSET {
+        put_lit(o, " live=")
+        put_lit(o, a11y_live_name((*an(ax, i)).live))
+    }
     let dvor: usize = (*o).n
     put_lit(o, " desc=\"")
     (*o).esc = 1 as u32
@@ -2119,6 +2134,11 @@ fn json_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out, depth: 
         put_lit(o, ",\"level\":")
         put_dec(o, (*an(ax, i)).level as i64)
     }
+    if slot_ok(i) && (*an(ax, i)).live != LIVE_UNSET {
+        put_lit(o, ",\"live\":\"")
+        put_lit(o, a11y_live_name((*an(ax, i)).live))
+        put(o, 34 as u8)
+    }
     let dvor: usize = (*o).n
     put_lit(o, ",\"desc\":\"")
     (*o).esc = 1 as u32
@@ -2239,4 +2259,110 @@ fn dump_vcells(sc: *mut scene.Scene, ax: *mut A11y, i: usize, row: usize, o: *mu
         put(o, 10 as u8)
         col = col + 1
     }
+}
+
+const LIVE_UNSET: u32 = 0
+const LIVE_OFF: u32 = 1
+const LIVE_POLITE: u32 = 2
+const LIVE_ASSERTIVE: u32 = 3
+
+fn a11y_set_live(ax: *mut A11y, i: usize, mode: u32) {
+    if !slot_ok(i) || mode > LIVE_ASSERTIVE {
+        return
+    }
+    (*an(ax, i)).live = mode
+    (*an(ax, i)).ls = 0 as u32
+}
+
+fn a11y_live(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    if i >= scene.scene_count(sc) || !slot_ok(i) {
+        return LIVE_OFF
+    }
+    var m: u32 = LIVE_UNSET
+    if (*ax).a != 0 && i < (*ax).ahi {
+        m = (*an(ax, i)).live
+    }
+    if m != LIVE_UNSET {
+        return m
+    }
+    if a11y_role(sc, ax, i) == ROLE_STATUS {
+        return LIVE_POLITE
+    }
+    return LIVE_OFF
+}
+
+fn a11y_live_explicit(ax: *mut A11y, i: usize) -> u32 {
+    if !slot_ok(i) || (*ax).a == 0 || i >= (*ax).ahi {
+        return LIVE_UNSET
+    }
+    return (*an(ax, i)).live
+}
+
+fn a11y_live_name(mode: u32) -> str {
+    if mode == LIVE_POLITE { return "polite" }
+    if mode == LIVE_ASSERTIVE { return "assertive" }
+    return "off"
+}
+
+fn announce_mode(mode: u32) -> u32 {
+    if mode == LIVE_ASSERTIVE { return announce.MODE_ASSERTIVE }
+    if mode == LIVE_POLITE { return announce.MODE_POLITE }
+    return announce.MODE_NONE
+}
+
+fn a11y_announce(ax: *mut A11y, text: str, mode: u32) -> bool {
+    let m: u32 = announce_mode(mode)
+    if m == announce.MODE_NONE || text.n == 0 {
+        return false
+    }
+    if (*ax).q == 0 {
+        (*ax).q = announce.ring_alloc()
+    }
+    return announce.ring_push((*ax).q, text, m)
+}
+
+fn a11y_announce_seq(ax: *mut A11y) -> u64 {
+    return announce.ring_seq((*ax).q)
+}
+
+fn a11y_announce_get(ax: *mut A11y, seq: u64, p: u64, cap: usize, mode: *mut u32) -> usize {
+    var m: u32 = 0 as u32
+    let n: usize = announce.ring_get((*ax).q, seq, p, cap, &m)
+    if n == 0 {
+        return 0
+    }
+    *mode = LIVE_POLITE
+    if m == announce.MODE_ASSERTIVE {
+        *mode = LIVE_ASSERTIVE
+    }
+    return n
+}
+
+fn a11y_live_sync(sc: *mut scene.Scene, ax: *mut A11y) -> usize {
+    var sent: usize = 0
+    var buf: [u8; 160] = [0 as u8; 160]
+    var n: usize = scene.scene_count(sc)
+    if n > A11Y_MAX {
+        n = A11Y_MAX
+    }
+    var i: usize = 0
+    while i < n {
+        let mode: u32 = a11y_live(sc, ax, i)
+        if mode == LIVE_OFF || a11y_hidden(sc, ax, i) {
+            i = i + 1
+            continue
+        }
+        let k: usize = a11y_name(sc, ax, i, (&buf[0]) as u64, 160)
+        let h: u32 = hash.fnv1a32((&buf[0]) as u64, k)
+        let a: *mut Ann = an(ax, i)
+        if (*a).ls != 0 as u32 && (*a).lh != h && k > 0 {
+            if a11y_announce(ax, str { p: ((&buf[0]) as u64) as *mut u8, n: k }, mode) {
+                sent = sent + 1
+            }
+        }
+        (*a).lh = h
+        (*a).ls = 1 as u32
+        i = i + 1
+    }
+    return sent
 }

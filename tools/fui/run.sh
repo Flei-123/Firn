@@ -1021,6 +1021,10 @@ build appdark
 build a11yhide
 "$W/a11yhide" | tail -n 3 | grep -q "A11YHIDE PASSED"
 
+# a11ylive: live regions (announcement ring, node live modes, screen tree forwarding, toast titles)
+build a11ylive
+"$W/a11ylive" | tail -n 3 | grep -q "A11YLIVE PASSED"
+
 # apptb: toolbar overflow (items fold behind "...", panel with copies, widening unfolds, a11y)
 build apptb
 "$W/apptb" | tail -n 3 | grep -q "APPTB PASSED"
