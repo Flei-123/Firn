@@ -30,7 +30,7 @@ run_dim() {
 run_dim overworld ${FEAT_OVERWORLD:-5:0:0 5:-3:2 11:0:0 11:2:4 42:-2:-2 3:-2:2 6:85:44}
 run_dim amplified ${FEAT_AMPLIFIED:-3:2:2}
 run_dim large_biomes ${FEAT_LARGE:-3:2:2}
-SPECIAL_DEFAULT="3:-72:-92 3:-60:-88 11:-44:-16 11:-24:0 3:-120:24 2:-100:-88 1:-4:-120 3:4:-104 3:-120:16 5:9:-117 7:75:6 3:-120:15 6:-78:-39"
+SPECIAL_DEFAULT="3:-4:4 3:-2:0 3:-72:-92 3:-60:-88 11:-44:-16 11:-24:0 3:-120:24 2:-100:-88 1:-4:-120 3:4:-104 3:-120:16 5:9:-117 7:75:6 3:-120:15 6:-78:-39"
 if [ -z "${FEAT_SKIP_SPECIAL:-}" ]; then
     run_dim overworld ${FEAT_SPECIAL:-$SPECIAL_DEFAULT}
 fi
