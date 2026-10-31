@@ -197,6 +197,7 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
     // r481 -- split the critical edges whose copies would destroy a value the
     // other edge still needs; see `split_hazard_edges`.
     split_hazard_edges(f);
+    crate::phi_exit::split_loop_exit_edges(f);
 
     let nb = f.blocks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
