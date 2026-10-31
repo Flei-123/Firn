@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.h264.interpred
+import media.video.h264.mbhelp
+import media.video.h264.params
+import media.video.h264.raw
+import media.video.h264.transform
+import media.video.h264.types
+
+export {
+    add_residual_inter, build_implicit_weights, mc_inter_mb, weight_mode,
+}
+
+fn weight_mode(d: *mut params.H264) -> i32 {
+    let sh: *mut types.Sh = &(*d).sh
+    let pp: *mut types.Pps = &(*d).pps[(*sh).pps_id as usize]
+    if (*sh).slice_type == types.ST_P {
+        if (*pp).weighted != 0 && (*sh).wp_def == 0 {
+            return 1
+        }
+        return 0
+    }
+    if (*pp).weighted_bi == 1 {
+        if (*sh).wp_def != 0 {
+            return 0
+        }
+        return 1
+    }
+    if (*pp).weighted_bi == 2 {
+        return 2
+    }
+    return 0
+}
+
+fn build_implicit_weights(d: *mut params.H264) {
+    let cur_poc: i32 = (*d).poc
+    var r0: i32 = 0
+    while r0 < (*d).ref_n[0] {
+        var r1: i32 = 0
+        while r1 < (*d).ref_n[1] {
+            var w1: i32 = 32
+            let poc0: i32 = (*d).ref_poc[r0 as usize]
+            let poc1: i32 = (*d).ref_poc[(32 + r1) as usize]
+            let tb: i32 = raw.clip3(-128, 127, cur_poc - poc0)
+            let td: i32 = raw.clip3(-128, 127, poc1 - poc0)
+            if td != 0 && (*d).ref_long[r0 as usize] == 0 && (*d).ref_long[(32 + r1) as usize] == 0 {
+                let tx: i32 = (16384 + raw.iabs(td / 2)) / td
+                let dsf: i32 = raw.clip3(-1024, 1023, (tb * tx + 32) >> 6)
+                let w: i32 = dsf >> 2
+                if w >= -64 && w <= 128 {
+                    w1 = w
+                }
+            }
+            raw.sti16((*d).wt_implicit, (r0 * 32 + r1) as usize, w1)
+            r1 = r1 + 1
+        }
+        r0 = r0 + 1
+    }
+}
+
+fn avg_block(dst: u64, ds: usize, a: u64, a_s: usize, b: u64, b_s: usize, w: i32, h: i32) {
+    var y: usize = 0
+    if w >= 8 {
+        while y < (h as usize) {
+            let dr: u64 = dst + (y * ds) as u64
+            let ar: u64 = a + (y * a_s) as u64
+            let br: u64 = b + (y * b_s) as u64
+            var x: usize = 0
+            while x < (w as usize) {
+                interpred.st64u(dr + x as u64, interpred.sw_avg8(interpred.ld64u(ar + x as u64), interpred.ld64u(br + x as u64)))
+                x = x + 8
+            }
+            y = y + 1
+        }
+        return
+    }
+    while y < (h as usize) {
+        let dr: u64 = dst + (y * ds) as u64
+        let ar: u64 = a + (y * a_s) as u64
+        let br: u64 = b + (y * b_s) as u64
+        var x: usize = 0
+        while x < (w as usize) {
+            *((dr + x as u64) as *mut u8) = ((raw.ldu8(ar, x) + raw.ldu8(br, x) + 1) >> 1) as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn wavg_block(dst: u64, ds: usize, a: u64, a_s: usize, b: u64, b_s: usize, w: i32, h: i32, w1: i32) {
+    let w0: i32 = 64 - w1
+    var y: usize = 0
+    if w >= 8 && w1 >= 0 && w1 <= 64 {
+        let u0: u64 = w0 as u64
+        let u1: u64 = w1 as u64
+        while y < (h as usize) {
+            let dr: u64 = dst + (y * ds) as u64
+            let ar: u64 = a + (y * a_s) as u64
+            let br: u64 = b + (y * b_s) as u64
+            var x: usize = 0
+            while x < (w as usize) {
+                let wa: u64 = interpred.ld64u(ar + x as u64)
+                let wb: u64 = interpred.ld64u(br + x as u64)
+                let ve: u64 = ((((wa & interpred.SW_M16) * u0 + (wb & interpred.SW_M16) * u1 + interpred.SW_32) >> 6) & interpred.SW_M16)
+                let vo: u64 = (((((wa >> 8) & interpred.SW_M16) * u0 + ((wb >> 8) & interpred.SW_M16) * u1 + interpred.SW_32) >> 6) & interpred.SW_M16)
+                interpred.st64u(dr + x as u64, ve | (vo << 8))
+                x = x + 8
+            }
+            y = y + 1
+        }
+        return
+    }
+    while y < (h as usize) {
+        let dr: u64 = dst + (y * ds) as u64
+        let ar: u64 = a + (y * a_s) as u64
+        let br: u64 = b + (y * b_s) as u64
+        var x: usize = 0
+        while x < (w as usize) {
+            *((dr + x as u64) as *mut u8) = raw.clip255((raw.ldu8(ar, x) * w0 + raw.ldu8(br, x) * w1 + 32) >> 6) as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn mc_list(d: *mut params.H264, mb: i32, list: i32, rfi: i32, x: i32, y: i32, w: i32, h: i32,
+    dy: u64, dys: usize, du: u64, dv: u64, dcs: usize) {
+    let cur: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    let pi: i32 = (*d).ref_pic[(list * 32 + rfi) as usize]
+    let rp: *mut types.Pic = &(*d).dpb[pi as usize]
+    let bx: i32 = x >> 2
+    let by: i32 = y >> 2
+    let o: usize = (((list * (*d).mbs + mb) * 16 + by * 4 + bx) * 2) as usize
+    let mvx: i32 = raw.ldi16((*cur).mv, o)
+    let mvy: i32 = raw.ldi16((*cur).mv, o + 1)
+    let pw: i32 = (*d).mb_w * 16
+    let ph: i32 = (*d).mb_h * 16
+    let sy: usize = (*d).stride_y as usize
+    let sc: usize = (*d).stride_c as usize
+    let mbx: i32 = (*d).mb_x
+    let mby: i32 = (*d).mb_y
+    interpred.mc_luma(d, dy, dys, (*rp).y, sy, pw, ph, mbx * 16 + x + (mvx >> 2), mby * 16 + y + (mvy >> 2), mvx & 3, mvy & 3, w, h)
+    interpred.mc_chroma(d, du, dcs, (*rp).u, sc, pw >> 1, ph >> 1, mbx * 8 + (x >> 1) + (mvx >> 3), mby * 8 + (y >> 1) + (mvy >> 3), mvx & 7, mvy & 7, w >> 1, h >> 1)
+    interpred.mc_chroma(d, dv, dcs, (*rp).v, sc, pw >> 1, ph >> 1, mbx * 8 + (x >> 1) + (mvx >> 3), mby * 8 + (y >> 1) + (mvy >> 3), mvx & 7, mvy & 7, w >> 1, h >> 1)
+}
+
+fn mc_rect(d: *mut params.H264, mb: i32, x: i32, y: i32, w: i32, h: i32) {
+    let cur: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    let mbx: i32 = (*d).mb_x
+    let mby: i32 = (*d).mb_y
+    let bx: i32 = x >> 2
+    let by: i32 = y >> 2
+    let b8: i32 = (by >> 1) * 2 + (bx >> 1)
+    let sy: usize = (*d).stride_y as usize
+    let sc: usize = (*d).stride_c as usize
+    var rf: [i32; 2] = [-1; 2]
+    var list: i32 = 0
+    while list < 2 {
+        rf[list as usize] = raw.ldi8((*d).refidx, (mb * 8 + list * 4 + b8) as usize)
+        if rf[list as usize] >= 0 && (*d).ref_pic[(list * 32 + rf[list as usize]) as usize] < 0 {
+            rf[list as usize] = -1
+        }
+        list = list + 1
+    }
+    var wm: i32 = weight_mode(d)
+    let sh: *mut types.Sh = &(*d).sh
+    let r0: i32 = rf[0]
+    let r1: i32 = rf[1]
+    if wm == 1 {
+        var plain: bool = true
+        if r0 >= 0 && (*sh).pw_flag[r0 as usize] != 0 {
+            plain = false
+        }
+        if r1 >= 0 && (*sh).pw_flag[(32 + r1) as usize] != 0 {
+            plain = false
+        }
+        if plain {
+            wm = 0
+        }
+    }
+    let dyp: u64 = (*cur).y + ((mby * 16 + y) as usize * sy + (mbx * 16 + x) as usize) as u64
+    let dup: u64 = (*cur).u + ((mby * 8 + (y >> 1)) as usize * sc + (mbx * 8 + (x >> 1)) as usize) as u64
+    let dvp: u64 = (*cur).v + ((mby * 8 + (y >> 1)) as usize * sc + (mbx * 8 + (x >> 1)) as usize) as u64
+    if r0 < 0 && r1 < 0 {
+        return
+    }
+    if (r0 < 0 || r1 < 0) && wm != 1 {
+        var l: i32 = 0
+        var r: i32 = r0
+        if r0 < 0 {
+            l = 1
+            r = r1
+        }
+        mc_list(d, mb, l, r, x, y, w, h, dyp, sy, dup, dvp, sc)
+        return
+    }
+    let pb0: u64 = (*d).pred + interpred.PR_L0 as u64
+    let pb1: u64 = (*d).pred + interpred.PR_L1 as u64
+    let loff: usize = (y * 16 + x) as usize
+    let coff: usize = (((y >> 1) * 8 + (x >> 1)) as usize)
+    if r0 >= 0 {
+        mc_list(d, mb, 0, r0, x, y, w, h, pb0 + loff as u64, 16, pb0 + (256 + coff) as u64, pb0 + (320 + coff) as u64, 8)
+    }
+    if r1 >= 0 {
+        mc_list(d, mb, 1, r1, x, y, w, h, pb1 + loff as u64, 16, pb1 + (256 + coff) as u64, pb1 + (320 + coff) as u64, 8)
+    }
+    if r0 >= 0 && r1 >= 0 && wm != 1 {
+        if wm == 0 {
+            avg_block(dyp, sy, pb0 + loff as u64, 16, pb1 + loff as u64, 16, w, h)
+            avg_block(dup, sc, pb0 + (256 + coff) as u64, 8, pb1 + (256 + coff) as u64, 8, w >> 1, h >> 1)
+            avg_block(dvp, sc, pb0 + (320 + coff) as u64, 8, pb1 + (320 + coff) as u64, 8, w >> 1, h >> 1)
+        } else {
+            let w1: i32 = raw.ldi16((*d).wt_implicit, (r0 * 32 + r1) as usize)
+            wavg_block(dyp, sy, pb0 + loff as u64, 16, pb1 + loff as u64, 16, w, h, w1)
+            wavg_block(dup, sc, pb0 + (256 + coff) as u64, 8, pb1 + (256 + coff) as u64, 8, w >> 1, h >> 1, w1)
+            wavg_block(dvp, sc, pb0 + (320 + coff) as u64, 8, pb1 + (320 + coff) as u64, 8, w >> 1, h >> 1, w1)
+        }
+        return
+    }
+    var comp: i32 = 0
+    while comp < 3 {
+        var dst: u64 = dyp
+        var ds: usize = sy
+        var cw: i32 = w
+        var chh: i32 = h
+        var poff: usize = loff
+        var pstride: usize = 16
+        if comp > 0 {
+            cw = w >> 1
+            chh = h >> 1
+            ds = sc
+            poff = ((256 + (comp - 1) * 64) as usize) + coff
+            pstride = 8
+            if comp == 1 {
+                dst = dup
+            } else {
+                dst = dvp
+            }
+        }
+        let p0: u64 = (*d).pred + (interpred.PR_L0 + poff) as u64
+        let p1: u64 = (*d).pred + (interpred.PR_L1 + poff) as u64
+        var lwd: i32 = (*sh).luma_log2_wd
+        if comp > 0 {
+            lwd = (*sh).chroma_log2_wd
+        }
+        var bw0: i32 = 0
+        var bw1: i32 = 0
+        var bo0: i32 = 0
+        var bo1: i32 = 0
+        var two: bool = false
+        var usep1: bool = false
+        if r0 >= 0 && r1 >= 0 {
+            two = true
+            let i0: usize = ((r0 * 3 + comp) as usize)
+            let i1: usize = (((32 + r1) * 3 + comp) as usize)
+            bw0 = (*sh).pw[i0]
+            bw1 = (*sh).pw[i1]
+            bo0 = (*sh).pw[192 + i0]
+            bo1 = (*sh).pw[192 + i1]
+        } else {
+            var rr: i32 = r0
+            var ll: i32 = 0
+            if r0 < 0 {
+                rr = r1
+                ll = 1
+                usep1 = true
+            }
+            let i2: usize = (((ll * 32 + rr) * 3 + comp) as usize)
+            bw0 = (*sh).pw[i2]
+            bo0 = (*sh).pw[192 + i2]
+        }
+        let rnd2: i32 = 1 << (lwd as u32)
+        let sh2: u32 = (lwd + 1) as u32
+        let ob: i32 = (bo0 + bo1 + 1) >> 1
+        var yy: i32 = 0
+        while yy < chh {
+            var xx: i32 = 0
+            while xx < cw {
+                let o: usize = (yy as usize) * pstride + xx as usize
+                var v: i32 = 0
+                if two {
+                    v = raw.clip255(((raw.ldu8(p0, o) * bw0 + raw.ldu8(p1, o) * bw1 + rnd2) >> sh2) + ob)
+                } else {
+                    var a2: i32 = raw.ldu8(p0, o)
+                    if usep1 {
+                        a2 = raw.ldu8(p1, o)
+                    }
+                    if lwd >= 1 {
+                        v = raw.clip255(((a2 * bw0 + (1 << ((lwd - 1) as u32))) >> (lwd as u32)) + bo0)
+                    } else {
+                        v = raw.clip255(a2 * bw0 + bo0)
+                    }
+                }
+                raw.stb(dst, (yy as usize) * ds + xx as usize, v)
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        comp = comp + 1
+    }
+}
+
+fn mc_inter_mb(d: *mut params.H264, mb: i32) {
+    let pm: i32 = (*d).pmode
+    if pm == 0 {
+        mc_rect(d, mb, 0, 0, 16, 16)
+        return
+    }
+    if pm == 1 {
+        mc_rect(d, mb, 0, 0, 16, 8)
+        mc_rect(d, mb, 0, 8, 16, 8)
+        return
+    }
+    if pm == 2 {
+        mc_rect(d, mb, 0, 0, 8, 16)
+        mc_rect(d, mb, 8, 0, 8, 16)
+        return
+    }
+    var q: i32 = 0
+    while q < 4 {
+        let qx: i32 = (q & 1) * 8
+        let qy: i32 = (q >> 1) * 8
+        let sp: i32 = (*d).sub_shape[q as usize]
+        if sp == 0 {
+            mc_rect(d, mb, qx, qy, 8, 8)
+        }
+        if sp == 1 {
+            mc_rect(d, mb, qx, qy, 8, 4)
+            mc_rect(d, mb, qx, qy + 4, 8, 4)
+        }
+        if sp == 2 {
+            mc_rect(d, mb, qx, qy, 4, 8)
+            mc_rect(d, mb, qx + 4, qy, 4, 8)
+        }
+        if sp == 3 {
+            mc_rect(d, mb, qx, qy, 4, 4)
+            mc_rect(d, mb, qx + 4, qy, 4, 4)
+            mc_rect(d, mb, qx, qy + 4, 4, 4)
+            mc_rect(d, mb, qx + 4, qy + 4, 4, 4)
+        }
+        q = q + 1
+    }
+}
+
+fn add_residual_inter(d: *mut params.H264, mb: i32, t8: i32, cbp: i32) {
+    let sy: usize = (*d).stride_y as usize
+    let sc: usize = (*d).stride_c as usize
+    let base: u64 = mbhelp.mb_luma_ptr(d)
+    if (cbp & 15) != 0 {
+        if t8 != 0 {
+            var q: i32 = 0
+            while q < 4 {
+                if (cbp & (1 << (q as u32))) != 0 {
+                    let dst: u64 = base + (((q >> 1) * 8) as usize * sy + ((q & 1) * 8) as usize) as u64
+                    transform.idct8_add(dst, sy, (*d).coef + ((q * 64) as usize * 4) as u64)
+                }
+                q = q + 1
+            }
+        } else {
+            var bi: i32 = 0
+            while bi < 16 {
+                if raw.ldu8((*d).nnz, (mb * 24 + bi) as usize) != 0 {
+                    let dst: u64 = base + (((bi >> 2) * 4) as usize * sy + ((bi & 3) * 4) as usize) as u64
+                    transform.idct4_add(dst, sy, (*d).coef + ((bi * 16) as usize * 4) as u64)
+                }
+                bi = bi + 1
+            }
+        }
+    }
+    if (cbp >> 4) != 0 {
+        var comp: i32 = 0
+        while comp < 2 {
+            var dst2: u64 = mbhelp.mb_cb_ptr(d)
+            if comp == 1 {
+                dst2 = mbhelp.mb_cr_ptr(d)
+            }
+            var b: i32 = 0
+            while b < 4 {
+                let blk: u64 = dst2 + (((b >> 1) * 4) as usize * sc + ((b & 1) * 4) as usize) as u64
+                let cp: u64 = (*d).coef + ((256 + comp * 64 + b * 16) as usize * 4) as u64
+                if raw.ldu8((*d).nnz, (mb * 24 + 16 + comp * 4 + b) as usize) != 0 {
+                    transform.idct4_add(blk, sc, cp)
+                } else {
+                    let dc: i32 = raw.ldi32(cp, 0)
+                    if dc != 0 {
+                        transform.idct4_dc_add(blk, sc, dc)
+                    }
+                }
+                b = b + 1
+            }
+            comp = comp + 1
+        }
+    }
+}

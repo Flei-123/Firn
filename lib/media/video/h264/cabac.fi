@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.h264.tables as h264_tables
+import media.video.h264.bits as h264_bits
+import media.video.h264.params
+import media.video.h264.raw
+import media.video.h264.types
+
+export {
+    cabac_bypass, cabac_decision, cabac_egk, cabac_init_contexts, cabac_start, cabac_terminate,
+}
+
+fn cab_bit(d: *mut params.H264) -> i32 {
+    let pos: i32 = (*d).br.pos
+    (*d).br.pos = pos + 1
+    if pos >= (*d).br.end {
+        return 0
+    }
+    return (raw.ldu8((*d).br.buf, (pos >> 3) as usize) >> (7 - (pos & 7))) & 1
+}
+
+fn cab_bits(d: *mut params.H264, n: i32) -> i32 {
+    let pos: i32 = (*d).br.pos
+    if pos + n + 16 <= (*d).br.end {
+        (*d).br.pos = pos + n
+        let bi: usize = (pos >> 3) as usize
+        let w: i32 = (raw.ldu8((*d).br.buf, bi) << 8) | raw.ldu8((*d).br.buf, bi + 1)
+        return (w >> ((16 - (pos & 7) - n) as u32)) & ((1 << (n as u32)) - 1)
+    }
+    var r: i32 = 0
+    var k: i32 = 0
+    while k < n {
+        r = (r << 1) | cab_bit(d)
+        k = k + 1
+    }
+    return r
+}
+
+fn cabac_init_contexts(d: *mut params.H264) {
+    let sh: *mut types.Sh = &(*d).sh
+    let qp: i32 = raw.clip3(0, 51, (*sh).qp)
+    var i: usize = 0
+    while i < 1024 {
+        var m: i32 = 0
+        var n: i32 = 0
+        if (*sh).slice_type == types.ST_I {
+            m = h264_tables.h264_cabac_init_i(i * 2) as i32
+            n = h264_tables.h264_cabac_init_i(i * 2 + 1) as i32
+        } else {
+            let o: usize = ((*sh).cabac_init_idc as usize) * 2048 + i * 2
+            m = h264_tables.h264_cabac_init_pb(o) as i32
+            n = h264_tables.h264_cabac_init_pb(o + 1) as i32
+        }
+        var pre: i32 = raw.clip3(1, 126, ((m * qp) >> 4) + n)
+        if pre <= 63 {
+            (*d).cab_state[i] = ((63 - pre) << 1) as u8
+        } else {
+            (*d).cab_state[i] = (((pre - 64) << 1) | 1) as u8
+        }
+        i = i + 1
+    }
+}
+
+fn cabac_start(d: *mut params.H264) {
+    (*d).cab_range = 510
+    (*d).cab_off = h264_bits.br_bits(&(*d).br, 9)
+    (*d).cab_k = 0
+}
+
+fn cab_refill(d: *mut params.H264) {
+    let pos: i32 = (*d).br.pos
+    var bits: i32 = 0
+    if pos + 32 <= (*d).br.end {
+        let bi: usize = (pos >> 3) as usize
+        let w: i32 = (raw.ldu8((*d).br.buf, bi) << 16) | (raw.ldu8((*d).br.buf, bi + 1) << 8) | raw.ldu8((*d).br.buf, bi + 2)
+        bits = (w >> ((8 - (pos & 7)) as u32)) & 0xFFFF
+        (*d).br.pos = pos + 16
+    } else {
+        var i: i32 = 0
+        while i < 16 {
+            bits = (bits << 1) | cab_bit(d)
+            i = i + 1
+        }
+    }
+    (*d).cab_off = ((*d).cab_off << 16) | bits
+    (*d).cab_k = (*d).cab_k + 16
+}
+
+fn cabac_decision(d: *mut params.H264, ctx: usize) -> i32 {
+    if (*d).cab_k < 6 {
+        cab_refill(d)
+    }
+    let k: u32 = (*d).cab_k as u32
+    let st: i32 = (*d).cab_state[ctx] as i32
+    var p: i32 = st >> 1
+    var mps: i32 = st & 1
+    var range: i32 = (*d).cab_range
+    let rlps: i32 = h264_tables.h264_range_lps((p * 4 + ((range >> 6) & 3)) as usize) as i32
+    let rmps: i32 = range - rlps
+    var v: i32 = (*d).cab_off
+    var bin: i32 = 0
+    if v >= (rmps << k) {
+        bin = 1 - mps
+        v = v - (rmps << k)
+        range = rlps
+        if p == 0 {
+            mps = 1 - mps
+        }
+        p = h264_tables.h264_trans_lps(p as usize) as i32
+        var nsh: i32 = 0
+        while range < 256 {
+            range = range << 1
+            nsh = nsh + 1
+        }
+        (*d).cab_k = (*d).cab_k - nsh
+    } else {
+        bin = mps
+        if p < 62 {
+            p = p + 1
+        }
+        range = rmps
+        if range < 256 {
+            range = range << 1
+            (*d).cab_k = (*d).cab_k - 1
+        }
+    }
+    (*d).cab_state[ctx] = ((p << 1) | mps) as u8
+    (*d).cab_range = range
+    (*d).cab_off = v
+    return bin
+}
+
+fn cabac_bypass(d: *mut params.H264) -> i32 {
+    if (*d).cab_k < 6 {
+        cab_refill(d)
+    }
+    let k: u32 = ((*d).cab_k - 1) as u32
+    (*d).cab_k = (*d).cab_k - 1
+    let rs: i32 = (*d).cab_range << k
+    if (*d).cab_off >= rs {
+        (*d).cab_off = (*d).cab_off - rs
+        return 1
+    }
+    return 0
+}
+
+fn cabac_terminate(d: *mut params.H264) -> i32 {
+    if (*d).cab_k < 6 {
+        cab_refill(d)
+    }
+    var range: i32 = (*d).cab_range - 2
+    if (*d).cab_off >= (range << ((*d).cab_k as u32)) {
+        (*d).cab_range = range
+        (*d).br.pos = (*d).br.pos - (*d).cab_k
+        (*d).cab_off = (*d).cab_off >> ((*d).cab_k as u32)
+        (*d).cab_k = 0
+        return 1
+    }
+    if range < 256 {
+        range = range << 1
+        (*d).cab_k = (*d).cab_k - 1
+    }
+    (*d).cab_range = range
+    return 0
+}
+
+fn cabac_egk(d: *mut params.H264, k0: i32) -> i32 {
+    var k: i32 = k0
+    var v: i32 = 0
+    var guard: i32 = 0
+    while cabac_bypass(d) != 0 && guard < 24 {
+        v = v + (1 << (k as u32))
+        k = k + 1
+        guard = guard + 1
+    }
+    while k > 0 {
+        k = k - 1
+        v = v + (cabac_bypass(d) << (k as u32))
+    }
+    return v
+}

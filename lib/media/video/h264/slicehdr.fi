@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.h264.bits as h264_bits
+import media.video.h264.params
+import media.video.h264.raw
+import media.video.h264.types
+
+export {
+    compute_poc, parse_slice_header,
+}
+
+fn parse_slice_header(d: *mut params.H264, nal_type: i32, ref_idc: i32) -> i32 {
+    let b: *mut types.Br = &(*d).br
+    var sh: types.Sh = types.sh_new()
+    sh.nal_ref_idc = ref_idc
+    sh.idr = 0
+    if nal_type == 5 {
+        sh.idr = 1
+    }
+    sh.first_mb = h264_bits.br_ue(b)
+    let st: i32 = h264_bits.br_ue(b)
+    if st > 9 || st < 0 {
+        return 2
+    }
+    sh.slice_type = st % 5
+    if sh.slice_type > 2 {
+        return 1
+    }
+    sh.pps_id = h264_bits.br_ue(b)
+    if sh.pps_id < 0 || sh.pps_id >= 32 {
+        return 2
+    }
+    let pp: *mut types.Pps = &(*d).pps[sh.pps_id as usize]
+    if (*pp).valid == 0 {
+        return 3
+    }
+    let sp: *mut types.Sps = &(*d).sps[(*pp).sps_id as usize]
+    if (*sp).valid == 0 {
+        return 3
+    }
+    sh.frame_num = h264_bits.br_bits(b, (*sp).log2_max_fn)
+    if (*sp).frame_mbs_only == 0 {
+        return 1
+    }
+    if sh.idr != 0 {
+        sh.idr_pic_id = h264_bits.br_ue(b)
+    }
+    if (*sp).poc_type == 0 {
+        sh.poc_lsb = h264_bits.br_bits(b, (*sp).log2_max_poc)
+        if (*pp).bottom_poc != 0 {
+            sh.delta_poc_bottom = h264_bits.br_se(b)
+        }
+    }
+    if (*sp).poc_type == 1 && (*sp).delta_pic_always_zero == 0 {
+        sh.delta_poc0 = h264_bits.br_se(b)
+        if (*pp).bottom_poc != 0 {
+            sh.delta_poc1 = h264_bits.br_se(b)
+        }
+    }
+    if (*pp).redundant_pic != 0 {
+        sh.redundant = h264_bits.br_ue(b)
+    }
+    if sh.slice_type == types.ST_B {
+        sh.direct_spatial = h264_bits.br_get1(b)
+    }
+    sh.num_ref0 = 0
+    sh.num_ref1 = 0
+    if sh.slice_type != types.ST_I {
+        sh.num_ref0 = (*pp).num_ref0
+        sh.num_ref1 = (*pp).num_ref1
+        if h264_bits.br_get1(b) != 0 {
+            sh.num_ref0 = h264_bits.br_ue(b) + 1
+            if sh.slice_type == types.ST_B {
+                sh.num_ref1 = h264_bits.br_ue(b) + 1
+            }
+        }
+        if sh.slice_type != types.ST_B {
+            sh.num_ref1 = 0
+        }
+        if sh.num_ref0 > 32 || sh.num_ref1 > 32 {
+            return 2
+        }
+    }
+    if sh.slice_type != types.ST_I {
+        var l: i32 = 0
+        var nl: i32 = 1
+        if sh.slice_type == types.ST_B {
+            nl = 2
+        }
+        while l < nl {
+            if h264_bits.br_get1(b) != 0 {
+                var n: i32 = 0
+                var go: i32 = 1
+                while go != 0 {
+                    let idc: i32 = h264_bits.br_ue(b)
+                    if idc == 3 || idc > 5 || h264_bits.br_left(b) <= 0 {
+                        go = 0
+                    } else {
+                        if n >= 33 {
+                            return 2
+                        }
+                        sh.rplm_idc[(l * 33 + n) as usize] = idc
+                        sh.rplm_val[(l * 33 + n) as usize] = h264_bits.br_ue(b)
+                        n = n + 1
+                    }
+                }
+                sh.rplm_n[l as usize] = n
+            }
+            l = l + 1
+        }
+    }
+    if ((*pp).weighted != 0 && sh.slice_type == types.ST_P) || ((*pp).weighted_bi == 1 && sh.slice_type == types.ST_B) {
+        sh.luma_log2_wd = h264_bits.br_ue(b)
+        sh.chroma_log2_wd = h264_bits.br_ue(b)
+        if sh.luma_log2_wd > 7 || sh.chroma_log2_wd > 7 {
+            return 2
+        }
+        sh.wp_def = 1
+        var l2: i32 = 0
+        var nl2: i32 = 1
+        if sh.slice_type == types.ST_B {
+            nl2 = 2
+        }
+        while l2 < nl2 {
+            var n2: i32 = sh.num_ref0
+            if l2 == 1 {
+                n2 = sh.num_ref1
+            }
+            var i: i32 = 0
+            while i < n2 {
+                let o: usize = ((l2 * 32 + i) * 3) as usize
+                sh.pw[o] = 1 << (sh.luma_log2_wd as u32)
+                sh.pw[o + 1] = 1 << (sh.chroma_log2_wd as u32)
+                sh.pw[o + 2] = 1 << (sh.chroma_log2_wd as u32)
+                sh.pw[192 + o] = 0
+                sh.pw[192 + o + 1] = 0
+                sh.pw[192 + o + 2] = 0
+                if h264_bits.br_get1(b) != 0 {
+                    sh.pw_flag[(l2 * 32 + i) as usize] = 1
+                    sh.wp_def = 0
+                    sh.pw[o] = h264_bits.br_se(b)
+                    sh.pw[192 + o] = h264_bits.br_se(b)
+                }
+                if h264_bits.br_get1(b) != 0 {
+                    sh.pw_flag[(l2 * 32 + i) as usize] = sh.pw_flag[(l2 * 32 + i) as usize] | 2
+                    sh.wp_def = 0
+                    sh.pw[o + 1] = h264_bits.br_se(b)
+                    sh.pw[192 + o + 1] = h264_bits.br_se(b)
+                    sh.pw[o + 2] = h264_bits.br_se(b)
+                    sh.pw[192 + o + 2] = h264_bits.br_se(b)
+                }
+                i = i + 1
+            }
+            l2 = l2 + 1
+        }
+    }
+    if ref_idc != 0 {
+        if sh.idr != 0 {
+            sh.no_output_prior = h264_bits.br_get1(b)
+            sh.long_term_ref = h264_bits.br_get1(b)
+        } else {
+            sh.adaptive = h264_bits.br_get1(b)
+            if sh.adaptive != 0 {
+                var n3: i32 = 0
+                var go3: i32 = 1
+                while go3 != 0 {
+                    let op: i32 = h264_bits.br_ue(b)
+                    if op == 0 || op > 6 || h264_bits.br_left(b) <= 0 {
+                        go3 = 0
+                    } else {
+                        if n3 >= 66 {
+                            return 2
+                        }
+                        sh.mmco_op[n3 as usize] = op
+                        sh.mmco_a[n3 as usize] = 0
+                        sh.mmco_b[n3 as usize] = 0
+                        if op == 1 || op == 3 {
+                            sh.mmco_a[n3 as usize] = h264_bits.br_ue(b)
+                        }
+                        if op == 2 {
+                            sh.mmco_a[n3 as usize] = h264_bits.br_ue(b)
+                        }
+                        if op == 3 || op == 6 {
+                            sh.mmco_b[n3 as usize] = h264_bits.br_ue(b)
+                        }
+                        if op == 4 {
+                            sh.mmco_a[n3 as usize] = h264_bits.br_ue(b)
+                        }
+                        n3 = n3 + 1
+                    }
+                }
+                sh.mmco_n = n3
+            }
+        }
+    }
+    if (*pp).cabac != 0 && sh.slice_type != types.ST_I {
+        sh.cabac_init_idc = h264_bits.br_ue(b)
+        if sh.cabac_init_idc > 2 {
+            return 2
+        }
+    }
+    sh.qp = (*pp).init_qp + h264_bits.br_se(b)
+    if sh.qp < 0 || sh.qp > 51 {
+        return 2
+    }
+    if (*pp).deblock_ctrl != 0 {
+        sh.disable_deblock = h264_bits.br_ue(b)
+        if sh.disable_deblock > 2 {
+            return 2
+        }
+        if sh.disable_deblock != 1 {
+            sh.alpha_off = h264_bits.br_se(b) * 2
+            sh.beta_off = h264_bits.br_se(b) * 2
+            if sh.alpha_off < -12 || sh.alpha_off > 12 || sh.beta_off < -12 || sh.beta_off > 12 {
+                return 2
+            }
+        }
+    }
+    if h264_bits.br_left(b) < 0 {
+        return 2
+    }
+    (*d).sh = sh
+    return 0
+}
+
+fn compute_poc(d: *mut params.H264) {
+    let sh: *mut types.Sh = &(*d).sh
+    let sp: *mut types.Sps = &(*d).sps[(*d).active as usize]
+    let pp: *mut types.Pps = &(*d).pps[(*sh).pps_id as usize]
+    let max_fn: i32 = 1 << ((*sp).log2_max_fn as u32)
+    var top: i32 = 0
+    var bottom: i32 = 0
+    if (*sp).poc_type == 0 {
+        if (*sh).idr != 0 {
+            (*d).prev_poc_msb = 0
+            (*d).prev_poc_lsb = 0
+        }
+        let max_lsb: i32 = 1 << ((*sp).log2_max_poc as u32)
+        var msb: i32 = (*d).prev_poc_msb
+        let lsb: i32 = (*sh).poc_lsb
+        if lsb < (*d).prev_poc_lsb && ((*d).prev_poc_lsb - lsb) >= max_lsb / 2 {
+            msb = (*d).prev_poc_msb + max_lsb
+        } else {
+            if lsb > (*d).prev_poc_lsb && (lsb - (*d).prev_poc_lsb) > max_lsb / 2 {
+                msb = (*d).prev_poc_msb - max_lsb
+            }
+        }
+        top = msb + lsb
+        bottom = top + (*sh).delta_poc_bottom
+        if (*sh).nal_ref_idc != 0 {
+            (*d).prev_poc_msb = msb
+            (*d).prev_poc_lsb = lsb
+        }
+    } else {
+        var fn_offset: i32 = 0
+        if (*sh).idr == 0 {
+            if (*d).prev_frame_num > (*sh).frame_num {
+                fn_offset = (*d).prev_fn_offset + max_fn
+            } else {
+                fn_offset = (*d).prev_fn_offset
+            }
+        }
+        if (*sp).poc_type == 1 {
+            var abs_fn: i32 = 0
+            if (*sp).n_ref_cycle != 0 {
+                abs_fn = fn_offset + (*sh).frame_num
+            }
+            if (*sh).nal_ref_idc == 0 && abs_fn > 0 {
+                abs_fn = abs_fn - 1
+            }
+            var expected: i32 = 0
+            if abs_fn > 0 {
+                let cycle_cnt: i32 = (abs_fn - 1) / (*sp).n_ref_cycle
+                let in_cycle: i32 = (abs_fn - 1) % (*sp).n_ref_cycle
+                var per_cycle: i32 = 0
+                var i: i32 = 0
+                while i < (*sp).n_ref_cycle {
+                    per_cycle = per_cycle + (*sp).offset_ref[i as usize]
+                    i = i + 1
+                }
+                expected = cycle_cnt * per_cycle
+                i = 0
+                while i <= in_cycle {
+                    expected = expected + (*sp).offset_ref[i as usize]
+                    i = i + 1
+                }
+            }
+            if (*sh).nal_ref_idc == 0 {
+                expected = expected + (*sp).offset_non_ref
+            }
+            top = expected + (*sh).delta_poc0
+            bottom = top + (*sp).offset_tb + (*sh).delta_poc1
+        } else {
+            var temp: i32 = 0
+            if (*sh).idr == 0 {
+                temp = 2 * (fn_offset + (*sh).frame_num)
+                if (*sh).nal_ref_idc == 0 {
+                    temp = temp - 1
+                }
+            }
+            top = temp
+            bottom = temp
+        }
+        (*d).prev_fn_offset = fn_offset
+    }
+    (*d).prev_frame_num = (*sh).frame_num
+    (*d).poc_top = top
+    (*d).poc_bottom = bottom
+    (*d).poc = raw.imin(top, bottom)
+}

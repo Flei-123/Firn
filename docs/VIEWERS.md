@@ -54,3 +54,21 @@ All libs: no native-only calls in model layers, must build for `wasm32-browser`,
 * Audio: `ffmpeg -f f32le` PCM vs ours (max abs diff / SNR), duration vs `ffprobe`.
 * Video: `ffmpeg -f rawvideo` frames vs ours (bit exact for H.264).
 * Fuzz: mutated/truncated files must never crash or hang (error code only).
+
+## G5 Video (2026-10-31)
+
+| Module | Role |
+|---|---|
+| `lib/media/mp4.fi`, `webm.fi`, `ebml.fi` | container parsers (classic + fragmented MP4, WebM/Matroska) lifted from Certus, MPL-2.0 |
+| `lib/media/demux.fi` | one track API over both: `demux_open`, `demux_find_track`, `demux_track_*`, `demux_nsamples/off/size/pts_us/dts_us/sync`, `demux_seek_sync`, `demux_track_skip_us`; pts in microseconds, ffmpeg-style (edit list / Opus delay applied, audio may start negative); sample ranges outside the file read as size 0 |
+| `lib/media/video/source.fi` | `VideoSource`: `vs_open`, `vs_width/height/fps_milli/duration_us/codec`, `vs_next_frame(out_rgba, &pts)`, `vs_seek` (keyframe), `vs_close`; unsupported codecs open with `VS_ERR_UNSUPPORTED` but still probe |
+| `lib/media/video/convert.fi` | scalar YUV420 -> RGBA (BT.601 / BT.709 by stream matrix) |
+| `lib/media/video/sync.fi` | pure model `sync_decide(frame_pts, clock_us, early, late)` -> SHOW / WAIT / DROP, driven by the audio clock (`lib/media/clock.fi`) |
+| `lib/media/video/h264/*.fi` | H.264 decoder (CAVLC+CABAC, I/P/B, 8x8, weighted, direct, multi-slice, cropping; no interlace) split into 28 modules; public API in `params` (`H264`, `h264_new`), `nal` (`h264_config_avcc/decode/flush/output/reset`), `pics` (`h264_free`), `types` (`Frame`) |
+
+Division with `lib/cast/h264dec.fi` (244 lines): the cast decoder is the tiny baseline-only decoder paired with `cast/h264enc` (RTP/RTSP round trip tests). It stays; real files (any profile, B-frames) go through `media.video.source`. Pointing cast at the lifted decoder is a roadmap item.
+
+Lifted from Certus `lib/media/h264.fi` (9.2k lines): the helper threads (deblock/recon, futex), the breath hook and `thr.*` were removed (single thread, no platform dependency), so it builds for `wasm32-browser`; comments stripped; code tables in `h264/tables.fi`.
+
+Checks: `tools/media_video/run_h264.sh` (10 x264 clips vs `ffmpeg -f rawvideo`, bit exact), `run_demux.sh` (packets/pts/flags vs ffprobe), `fuzz.py` (mutated/truncated MP4/WebM/H.264), tests `6410_media_video_demux`, `6411_media_video_source`.
+Numbers: 720p high-profile decode 79.8 M instructions/frame (callgrind, release-fast); wasm32-browser VideoSource+demux+h264: 221 KB release-fast, 795 KB release-safe.

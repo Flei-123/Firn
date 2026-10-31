@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.demux
+import media.video.convert
+import media.video.h264.nal
+import media.video.h264.params
+import media.video.h264.pics
+import media.video.h264.types
+
+export {
+    VideoSource, vs_new, vs_open, vs_close, vs_codec, vs_width, vs_height, vs_fps_milli, vs_duration_us,
+    vs_next_frame, vs_seek, vs_rgba_bytes,
+    VS_OK, VS_ERR_FORMAT, VS_ERR_UNSUPPORTED, VS_ERR_DECODE, VS_END,
+}
+
+const VS_OK: i32 = 0
+const VS_ERR_FORMAT: i32 = -1
+const VS_ERR_UNSUPPORTED: i32 = -2
+const VS_ERR_DECODE: i32 = -3
+const VS_END: i32 = 0
+
+struct VideoSource {
+    dm: demux.Demux,
+    dec: params.H264,
+    track: i32,
+    codec: i32,
+    data: u64,
+    next: usize,
+    count: usize,
+    flushed: bool,
+    open: bool,
+}
+
+fn vs_new() -> VideoSource {
+    return VideoSource { dm: demux.demux_new(), dec: params.h264_new(), track: -1, codec: demux.CODEC_UNKNOWN, data: 0, next: 0, count: 0, flushed: false, open: false }
+}
+
+fn vs_open(vs: *mut VideoSource, data: u64, len: usize) -> i32 {
+    if demux.demux_open(&(*vs).dm, data, len) != 0 {
+        return VS_ERR_FORMAT
+    }
+    let t: i32 = demux.demux_find_track(&(*vs).dm, demux.TK_VIDEO)
+    if t < 0 {
+        return VS_ERR_FORMAT
+    }
+    (*vs).track = t
+    (*vs).codec = demux.demux_track_codec(&(*vs).dm, t)
+    (*vs).data = data
+    (*vs).count = demux.demux_nsamples(&(*vs).dm, t)
+    if (*vs).codec != demux.CODEC_H264 {
+        return VS_ERR_UNSUPPORTED
+    }
+    if nal.h264_config_avcc(&(*vs).dec, demux.demux_track_cfg(&(*vs).dm, t), demux.demux_track_cfg_len(&(*vs).dm, t)) != 0 {
+        return VS_ERR_DECODE
+    }
+    (*vs).open = true
+    return VS_OK
+}
+
+fn vs_close(vs: *mut VideoSource) {
+    if (*vs).open {
+        pics.h264_free(&(*vs).dec)
+    }
+    demux.demux_free(&(*vs).dm)
+    (*vs).open = false
+}
+
+fn vs_codec(vs: *mut VideoSource) -> i32 {
+    return (*vs).codec
+}
+
+fn vs_width(vs: *mut VideoSource) -> u32 {
+    return demux.demux_track_width(&(*vs).dm, (*vs).track)
+}
+
+fn vs_height(vs: *mut VideoSource) -> u32 {
+    return demux.demux_track_height(&(*vs).dm, (*vs).track)
+}
+
+fn vs_rgba_bytes(vs: *mut VideoSource) -> usize {
+    return (vs_width(vs) as usize) * (vs_height(vs) as usize) * 4
+}
+
+fn vs_duration_us(vs: *mut VideoSource) -> i64 {
+    return demux.demux_track_duration_us(&(*vs).dm, (*vs).track)
+}
+
+fn vs_fps_milli(vs: *mut VideoSource) -> u32 {
+    let dur: i64 = vs_duration_us(vs)
+    if dur <= 0 || (*vs).count == 0 {
+        return 0
+    }
+    return (((*vs).count as i64) * 1000000000 / dur) as u32
+}
+
+fn take_frame(vs: *mut VideoSource, out: u64, pts: *mut i64) -> i32 {
+    var f: types.Frame = types.Frame { y: 0, u: 0, v: 0, w: 0, h: 0, stride_y: 0, stride_c: 0, poc: 0 }
+    if nal.h264_output(&(*vs).dec, &f) == 0 {
+        return 0
+    }
+    if f.w != (vs_width(vs) as i32) || f.h != (vs_height(vs) as i32) {
+        return VS_ERR_DECODE
+    }
+    convert.yuv420_to_rgba(f.y, f.u, f.v, f.stride_y as usize, f.stride_c as usize, f.w as usize, f.h as usize, params.h264_matrix(&(*vs).dec), out)
+    *pts = nal.h264_out_pts(&(*vs).dec)
+    return 1
+}
+
+fn vs_next_frame(vs: *mut VideoSource, out: u64, pts: *mut i64) -> i32 {
+    if !(*vs).open {
+        return VS_ERR_UNSUPPORTED
+    }
+    while true {
+        let r: i32 = take_frame(vs, out, pts)
+        if r != 0 {
+            return r
+        }
+        if (*vs).next >= (*vs).count {
+            if (*vs).flushed {
+                return VS_END
+            }
+            nal.h264_flush(&(*vs).dec)
+            (*vs).flushed = true
+        } else {
+            let i: usize = (*vs).next
+            (*vs).next = i + 1
+            nal.h264_set_in_pts(&(*vs).dec, demux.demux_sample_pts_us(&(*vs).dm, (*vs).track, i))
+            let rc: i32 = nal.h264_decode(&(*vs).dec, (*vs).data + demux.demux_sample_off(&(*vs).dm, (*vs).track, i), demux.demux_sample_size(&(*vs).dm, (*vs).track, i) as usize)
+            if rc < 0 {
+                return VS_ERR_DECODE
+            }
+        }
+    }
+    return VS_END
+}
+
+fn vs_seek(vs: *mut VideoSource, target_us: i64) -> i64 {
+    let k: usize = demux.demux_seek_sync(&(*vs).dm, (*vs).track, target_us)
+    nal.h264_reset(&(*vs).dec)
+    (*vs).next = k
+    (*vs).flushed = false
+    return demux.demux_sample_pts_us(&(*vs).dm, (*vs).track, k)
+}

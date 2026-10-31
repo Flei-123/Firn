@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.h264.cavlc
+import media.video.h264.intra as h264_intra
+import media.video.h264.params
+import media.video.h264.raw
+import media.video.h264.transform
+import media.video.h264.types
+
+export {
+    intra_ok, mb_cb_ptr, mb_cr_ptr, mb_is_intra, mb_luma_ptr, recon_chroma, recon_i4, recon_i8,
+}
+
+fn mb_is_intra(t: i32) -> i32 {
+    if t >= types.MB_I4 && t <= types.MB_PCM {
+        return 1
+    }
+    return 0
+}
+
+fn intra_ok(d: *mut params.H264, addr: i32, avail: i32) -> i32 {
+    if avail == 0 {
+        return 0
+    }
+    if (*d).pps[(*d).sh.pps_id as usize].constrained_intra != 0 {
+        return mb_is_intra(raw.ldu8((*d).mbt, addr as usize))
+    }
+    return 1
+}
+
+fn mb_luma_ptr(d: *mut params.H264) -> u64 {
+    let p: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    return (*p).y + ((*d).mb_y * 16 * (*d).stride_y + (*d).mb_x * 16) as u64
+}
+
+fn mb_cb_ptr(d: *mut params.H264) -> u64 {
+    let p: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    return (*p).u + ((*d).mb_y * 8 * (*d).stride_c + (*d).mb_x * 8) as u64
+}
+
+fn mb_cr_ptr(d: *mut params.H264) -> u64 {
+    let p: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    return (*p).v + ((*d).mb_y * 8 * (*d).stride_c + (*d).mb_x * 8) as u64
+}
+
+fn tr_avail4(bx: i32, by: i32, ia_b: i32, ia_c: i32) -> i32 {
+    if by == 0 {
+        if bx < 3 {
+            return ia_b
+        }
+        return ia_c
+    }
+    if bx == 3 {
+        return 0
+    }
+    if bx == 1 && (by == 1 || by == 3) {
+        return 0
+    }
+    return 1
+}
+
+fn recon_i4(d: *mut params.H264, ia_a: i32, ia_b: i32, ia_c: i32, ia_d: i32, mb: i32) {
+    let stride: usize = (*d).stride_y as usize
+    let base: u64 = mb_luma_ptr(d)
+    var blk: i32 = 0
+    while blk < 16 {
+        let bx: i32 = cavlc.blk_x(blk)
+        let by: i32 = cavlc.blk_y(blk)
+        let dst: u64 = base + ((by * 4) as usize * stride + (bx * 4) as usize) as u64
+        var has_l: i32 = 1
+        if bx == 0 {
+            has_l = ia_a
+        }
+        var has_t: i32 = 1
+        if by == 0 {
+            has_t = ia_b
+        }
+        var has_tl: i32 = 1
+        if bx == 0 && by == 0 {
+            has_tl = ia_d
+        } else {
+            if bx == 0 {
+                has_tl = ia_a
+            } else {
+                if by == 0 {
+                    has_tl = ia_b
+                }
+            }
+        }
+        let has_tr: i32 = tr_avail4(bx, by, ia_b, ia_c)
+        h264_intra.pred4x4(dst, stride, raw.ldi8((*d).ipm, (mb * 16 + by * 4 + bx) as usize), has_l, has_t, has_tr, has_tl)
+        let nz: i32 = raw.ldu8((*d).nnz, (mb * 24 + by * 4 + bx) as usize)
+        let cb: u64 = (*d).coef + ((by * 4 + bx) * 16 * 4) as u64
+        if nz != 0 {
+            transform.idct4_add(dst, stride, cb)
+        }
+        blk = blk + 1
+    }
+}
+
+fn recon_i8(d: *mut params.H264, ia_a: i32, ia_b: i32, ia_c: i32, ia_d: i32, mb: i32) {
+    let stride: usize = (*d).stride_y as usize
+    let base: u64 = mb_luma_ptr(d)
+    var q: i32 = 0
+    while q < 4 {
+        let bx: i32 = (q & 1) * 2
+        let by: i32 = (q >> 1) * 2
+        let dst: u64 = base + ((by * 4) as usize * stride + (bx * 4) as usize) as u64
+        var has_l: i32 = 1
+        if (q & 1) == 0 {
+            has_l = ia_a
+        }
+        var has_t: i32 = 1
+        if q < 2 {
+            has_t = ia_b
+        }
+        var has_tl: i32 = 1
+        var has_tr: i32 = 0
+        if q == 0 {
+            has_tl = ia_d
+            has_tr = ia_b
+        }
+        if q == 1 {
+            has_tl = ia_b
+            has_tr = ia_c
+        }
+        if q == 2 {
+            has_tl = ia_a
+            has_tr = 1
+        }
+        h264_intra.pred8x8(dst, stride, raw.ldi8((*d).ipm, (mb * 16 + by * 4 + bx) as usize), has_l, has_t, has_tr, has_tl)
+        if (raw.ldu8((*d).mbcbp, mb as usize) & (1 << (q as u32))) != 0 {
+            transform.idct8_add(dst, stride, (*d).coef + ((q * 64) * 4) as u64)
+        }
+        q = q + 1
+    }
+}
+
+fn recon_chroma(d: *mut params.H264, mb: i32, mode: i32, ia_a: i32, ia_b: i32) {
+    let sc: usize = (*d).stride_c as usize
+    var comp: i32 = 0
+    while comp < 2 {
+        var dst: u64 = mb_cb_ptr(d)
+        if comp == 1 {
+            dst = mb_cr_ptr(d)
+        }
+        h264_intra.pred_chroma(dst, sc, mode, ia_a, ia_b)
+        var b: i32 = 0
+        while b < 4 {
+            let bx: i32 = b & 1
+            let by: i32 = b >> 1
+            let blk: u64 = dst + ((by * 4) as usize * sc + (bx * 4) as usize) as u64
+            let cp: u64 = (*d).coef + ((256 + comp * 64 + b * 16) * 4) as u64
+            let nz: i32 = raw.ldu8((*d).nnz, (mb * 24 + 16 + comp * 4 + b) as usize)
+            if nz != 0 {
+                transform.idct4_add(blk, sc, cp)
+            } else {
+                let dc: i32 = raw.ldi32(cp, 0)
+                if dc != 0 {
+                    transform.idct4_dc_add(blk, sc, dc)
+                }
+            }
+            b = b + 1
+        }
+        comp = comp + 1
+    }
+}
