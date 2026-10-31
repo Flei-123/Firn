@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import std.math
+import mc.server.sv_state
+import mc.server.ent.ent_table
+
+export { track_update, track_viewer_clear, track_release, track_collect, track_range_blocks, enc_pos, enc_angle }
+
+const RANGE_ITEM_CHUNKS: i32 = 6
+const RANGE_PLAYER_CHUNKS: i32 = 32
+const INTERVAL_ITEM: i32 = 20
+const INTERVAL_PLAYER: i32 = 2
+const POS_SCALE: f64 = 4096.0
+const MOVE_LIMIT: i64 = 32767
+
+fn enc_pos(v: f64) -> i64 { return math.floor(v * POS_SCALE + 0.5) as i64 }
+
+fn enc_angle(v: f32) -> i32 { return (math.floor((v as f64) * 256.0 / 360.0) as i64 & 255 as i64) as i32 }
+
+fn track_range_blocks(srv: *mut sv_state.Server, s: *mut sv_state.Session, kind: i32) -> f64 {
+    var chunks: i32 = RANGE_ITEM_CHUNKS
+    if kind == ent_table.KIND_PLAYER { chunks = RANGE_PLAYER_CHUNKS }
+    var cap: i32 = ((*s).view - 1) * 16
+    if cap < 16 { cap = 16 }
+    var r: i32 = chunks * 16
+    if cap < r { r = cap }
+    return r as f64
+}
+
+fn interval_of(kind: i32) -> i32 {
+    if kind == ent_table.KIND_PLAYER { return INTERVAL_PLAYER }
+    return INTERVAL_ITEM
+}
+
+fn in_range(srv: *mut sv_state.Server, s: *mut sv_state.Session, e: *mut ent_table.Entity) -> bool {
+    let r: f64 = track_range_blocks(srv, s, (*e).kind)
+    return math.fabs((*s).x - (*e).x) <= r && math.fabs((*s).z - (*e).z) <= r
+}
+
+fn bit_of(slot: usize) -> u32 { return (1 as u32) << (slot as u32) }
+
+fn viewer_ok(s: *mut sv_state.Session) -> bool {
+    return (*s).used && (*s).joined && !(*s).closing
+}
+
+fn send_destroy(srv: *mut sv_state.Server, s: *mut sv_state.Session, e: *mut ent_table.Entity) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    let d: fn(u64, u64, i32) = (*t).ops.destroy
+    d(srv as u64, s as u64, (*e).eid)
+    if (*e).kind == ent_table.KIND_PLAYER {
+        let r: fn(u64, u64, *mut ent_table.Entity) = (*t).ops.player_remove
+        r(srv as u64, s as u64, e)
+    }
+}
+
+fn send_spawn(srv: *mut sv_state.Server, s: *mut sv_state.Session, e: *mut ent_table.Entity) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    if (*e).kind == ent_table.KIND_PLAYER {
+        let pa: fn(u64, u64, u64, *mut ent_table.Entity) = (*t).ops.player_add
+        pa(srv as u64, s as u64, sv_state.session_at(srv, (*e).owner as usize) as u64, e)
+    }
+    let sp: fn(u64, u64, *mut ent_table.Entity) = (*t).ops.spawn
+    sp(srv as u64, s as u64, e)
+    if (*e).kind == ent_table.KIND_ITEM {
+        let md: fn(u64, u64, *mut ent_table.Entity) = (*t).ops.metadata
+        md(srv as u64, s as u64, e)
+    }
+}
+
+fn send_motion(srv: *mut sv_state.Server, e: *mut ent_table.Entity, dx: i32, dy: i32, dz: i32, moved: bool, turned: bool, forced: bool) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if viewer_ok(s) && ((*e).track & bit_of(i)) != 0 as u32 {
+            if forced {
+                let f: fn(u64, u64, *mut ent_table.Entity) = (*t).ops.teleport
+                f(srv as u64, s as u64, e)
+            } else if moved && turned {
+                let f: fn(u64, u64, *mut ent_table.Entity, i32, i32, i32) = (*t).ops.rel_move_look
+                f(srv as u64, s as u64, e, dx, dy, dz)
+            } else if moved {
+                let f: fn(u64, u64, *mut ent_table.Entity, i32, i32, i32) = (*t).ops.rel_move
+                f(srv as u64, s as u64, e, dx, dy, dz)
+            } else if turned {
+                let f: fn(u64, u64, *mut ent_table.Entity, i32, i32, i32) = (*t).ops.rel_move_look
+                f(srv as u64, s as u64, e, 0, 0, 0)
+            }
+            if turned && (*e).kind == ent_table.KIND_PLAYER {
+                let h: fn(u64, u64, *mut ent_table.Entity) = (*t).ops.head
+                h(srv as u64, s as u64, e)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn sync_motion(srv: *mut sv_state.Server, e: *mut ent_table.Entity) {
+    let landed: bool = (*e).on_ground != (*e).sent_ground && (*e).kind == ent_table.KIND_ITEM
+    if ((*e).age + (*e).eid) % interval_of((*e).kind) != 0 && !landed { return }
+    (*e).sent_ground = (*e).on_ground
+    let nx: i64 = enc_pos((*e).x)
+    let ny: i64 = enc_pos((*e).y)
+    let nz: i64 = enc_pos((*e).z)
+    let ox: i64 = enc_pos((*e).sent_x)
+    let oy: i64 = enc_pos((*e).sent_y)
+    let oz: i64 = enc_pos((*e).sent_z)
+    let dx: i64 = nx - ox
+    let dy: i64 = ny - oy
+    let dz: i64 = nz - oz
+    let moved: bool = dx != 0 || dy != 0 || dz != 0
+    let turned: bool = enc_angle((*e).yaw) != enc_angle((*e).sent_yaw) || enc_angle((*e).pitch) != enc_angle((*e).sent_pitch)
+    let big: bool = math.abs(dx) > MOVE_LIMIT || math.abs(dy) > MOVE_LIMIT || math.abs(dz) > MOVE_LIMIT
+    if !moved && !turned { return }
+    send_motion(srv, e, dx as i32, dy as i32, dz as i32, moved, turned, big)
+    if moved {
+        (*e).sent_x = (*e).x
+        (*e).sent_y = (*e).y
+        (*e).sent_z = (*e).z
+    }
+    if turned {
+        (*e).sent_yaw = (*e).yaw
+        (*e).sent_pitch = (*e).pitch
+    }
+}
+
+fn track_viewer_clear(srv: *mut sv_state.Server, slot: usize) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    var i: usize = 0
+    while i < ent_table.TABLE_CAP {
+        let e: *mut ent_table.Entity = ent_table.table_at(t, i)
+        if (*e).used { (*e).track = (*e).track & (bit_of(slot) ^ 4294967295 as u32) }
+        i = i + 1
+    }
+}
+
+fn track_update(srv: *mut sv_state.Server) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    var i: usize = 0
+    while i < ent_table.TABLE_CAP {
+        let e: *mut ent_table.Entity = ent_table.table_at(t, i)
+        if (*e).used && (*e).kind != ent_table.KIND_NONE {
+            var j: usize = 0
+            while j < sv_state.MAX_SESSIONS {
+                let s: *mut sv_state.Session = sv_state.session_at(srv, j)
+                let has: bool = ((*e).track & bit_of(j)) != 0 as u32
+                if viewer_ok(s) && (*e).owner != j as i32 {
+                    let near: bool = in_range(srv, s, e) && !(*e).dead
+                    if near && !has {
+                        send_spawn(srv, s, e)
+                        (*e).track = (*e).track | bit_of(j)
+                    } else if !near && has {
+                        send_destroy(srv, s, e)
+                        (*e).track = (*e).track & (bit_of(j) ^ 4294967295 as u32)
+                    }
+                } else if has && !viewer_ok(s) {
+                    (*e).track = (*e).track & (bit_of(j) ^ 4294967295 as u32)
+                }
+                j = j + 1
+            }
+            if !(*e).dead { sync_motion(srv, e) }
+        }
+        i = i + 1
+    }
+}
+
+fn track_release(srv: *mut sv_state.Server, e: *mut ent_table.Entity) {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if viewer_ok(s) && ((*e).track & bit_of(i)) != 0 as u32 { send_destroy(srv, s, e) }
+        i = i + 1
+    }
+    ent_table.table_release(&(*srv).ents, e)
+}
+
+fn track_collect(srv: *mut sv_state.Server, e: *mut ent_table.Entity, collector: *mut sv_state.Session, n: i32) {
+    let t: *mut ent_table.Table = &(*srv).ents
+    let f: fn(u64, u64, i32, i32, i32) = (*t).ops.collect
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if viewer_ok(s) && (((*e).track & bit_of(i)) != 0 as u32 || s as u64 == collector as u64) {
+            f(srv as u64, s as u64, (*e).eid, (*collector).eid, n)
+        }
+        i = i + 1
+    }
+}
