@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/wgdf_aquifer.fi -- NoiseBasedAquifer of the noise fill (fluid level grid 16x12x16, barrier, pressure), bit identical to Java.
+import std.mem
+import std.math
+import noise.interp
+import mc.gen.mg_random
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fluid
+
+export { Aquifer, AQUIFER_BYTES, aquifer_new, aquifer_free, aquifer_substance }
+
+const CAP: usize = 512
+const PS_DIM: i32 = 48
+const PS_CAP: usize = 2304
+const WAY_BELOW_MIN_Y: i32 = -32512
+const INT_MAX: i32 = 2147483647
+const AQUIFER_BYTES: usize = 70000
+
+struct Aquifer {
+    pf: mg_random.PosFactory,
+    min_gx: i32,
+    min_gy: i32,
+    min_gz: i32,
+    size_x: i32,
+    size_y: i32,
+    size_z: i32,
+    n_barrier: i32,
+    n_flood: i32,
+    n_spread: i32,
+    n_lava: i32,
+    n_erosion: i32,
+    n_depth: i32,
+    n_initial: i32,
+    ps_base_x: i32,
+    ps_base_z: i32,
+    loc_set: [u8; 512],
+    loc_x: [i32; 512],
+    loc_y: [i32; 512],
+    loc_z: [i32; 512],
+    st_set: [u8; 512],
+    st_level: [i32; 512],
+    st_ty: [u8; 512],
+    ps_set: [u8; 2304],
+    ps_val: [i32; 2304],
+}
+
+struct Barrier {
+    has: bool,
+    value: f64,
+}
+
+fn aquifer_new(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, min_x: i32, min_z: i32) -> *mut Aquifer {
+    let aq: *mut Aquifer = mem.alloc(AQUIFER_BYTES) as *mut Aquifer
+    var r0: mg_random.Rng = mg_random.rng_xoro((*ns).seed)
+    if (*g).legacy_random {
+        r0 = mg_random.rng_legacy((*ns).seed)
+    }
+    let root: mg_random.PosFactory = mg_random.rng_fork_positional(&r0)
+    let name: str = "minecraft:aquifer"
+    var ar: mg_random.Rng = mg_random.pos_from_hash_of(&root, name.p as u64, name.n)
+    (*aq).pf = mg_random.rng_fork_positional(&ar)
+    (*aq).min_gx = wgdf_eval.floor_div(min_x, 16) - 1
+    (*aq).size_x = wgdf_eval.floor_div(min_x + 15, 16) + 1 - (*aq).min_gx + 1
+    (*aq).min_gy = wgdf_eval.floor_div((*g).min_y, 12) - 1
+    (*aq).size_y = wgdf_eval.floor_div((*g).min_y + (*g).height, 12) + 1 - (*aq).min_gy + 1
+    (*aq).min_gz = wgdf_eval.floor_div(min_z, 16) - 1
+    (*aq).size_z = wgdf_eval.floor_div(min_z + 15, 16) + 1 - (*aq).min_gz + 1
+    (*aq).n_barrier = wgdf_graph.router_find(g, "barrier")
+    (*aq).n_flood = wgdf_graph.router_find(g, "fluid_level_floodedness")
+    (*aq).n_spread = wgdf_graph.router_find(g, "fluid_level_spread")
+    (*aq).n_lava = wgdf_graph.router_find(g, "lava")
+    (*aq).n_erosion = wgdf_graph.router_find(g, "erosion")
+    (*aq).n_depth = wgdf_graph.router_find(g, "depth")
+    (*aq).n_initial = wgdf_graph.router_find(g, "initial_density_without_jaggedness")
+    (*aq).ps_base_x = wgdf_eval.floor_div(min_x, 4) - 20
+    (*aq).ps_base_z = wgdf_eval.floor_div(min_z, 4) - 20
+    var i: usize = 0
+    while i < CAP {
+        (*aq).loc_set[i] = 0
+        (*aq).st_set[i] = 0
+        i = i + 1
+    }
+    i = 0
+    while i < PS_CAP {
+        (*aq).ps_set[i] = 0
+        i = i + 1
+    }
+    return aq
+}
+
+fn aquifer_free(aq: *mut Aquifer) {
+    mem.free(aq as u64, AQUIFER_BYTES)
+}
+
+fn grid_index(aq: *Aquifer, gx: i32, gy: i32, gz: i32) -> usize {
+    let a: i32 = gx - (*aq).min_gx
+    let b: i32 = gy - (*aq).min_gy
+    let c: i32 = gz - (*aq).min_gz
+    return (((b * (*aq).size_z + c) * (*aq).size_x) + a) as usize
+}
+
+#[allow_fp]
+fn similarity(a: i32, b: i32) -> f64 {
+    var d: i32 = b - a
+    if d < 0 { d = 0 - d }
+    return 1.0 - (d as f64) / 25.0
+}
+
+fn abs_i32(a: i32) -> i32 {
+    if a < 0 { return 0 - a }
+    return a
+}
+
+fn preliminary_surface(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *mut Aquifer, x: i32, z: i32) -> i32 {
+    let qx: i32 = wgdf_eval.floor_div(x, 4)
+    let qz: i32 = wgdf_eval.floor_div(z, 4)
+    let ix: i32 = qx - (*aq).ps_base_x
+    let iz: i32 = qz - (*aq).ps_base_z
+    var slot: usize = 0
+    var cached: bool = false
+    if ix >= 0 && iz >= 0 && ix < PS_DIM && iz < PS_DIM {
+        slot = (iz * PS_DIM + ix) as usize
+        cached = true
+        if (*aq).ps_set[slot] != 0 {
+            return (*aq).ps_val[slot]
+        }
+    }
+    var result: i32 = INT_MAX
+    let cell_h: i32 = (*g).size_v * 4
+    var y: i32 = (*g).min_y + (*g).height
+    while y >= (*g).min_y {
+        if surface_density(g, ns, aq, qx * 4, y, qz * 4) > 0.390625 {
+            result = y
+            y = (*g).min_y - 1
+        } else {
+            y = y - cell_h
+        }
+    }
+    if cached {
+        (*aq).ps_set[slot] = 1
+        (*aq).ps_val[slot] = result
+    }
+    return result
+}
+
+#[allow_fp]
+fn surface_density(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *Aquifer, x: i32, y: i32, z: i32) -> f64 {
+    return wgdf_eval.eval_direct(g, ns, (*aq).n_initial, x, y, z)
+}
+
+#[allow_fp]
+fn lerp_map(x: f64, a: f64, b: f64, c: f64, d: f64) -> f64 {
+    return interp.lerp(interp.inverse_lerp(x, a, b), c, d)
+}
+
+#[allow_fp]
+fn floor_i32(v: f64) -> i32 {
+    let i: i32 = v as i32
+    if v < (i as f64) { return i - 1 }
+    return i
+}
+
+#[allow_fp]
+fn surface_level(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *Aquifer, x: i32, y: i32, z: i32, global: *wgdf_fluid.Fluid, min_surface: i32, near_surface: bool) -> i32 {
+    var below: f64 = 0.0 - 1.0
+    var above: f64 = 0.0 - 1.0
+    let erosion: f64 = wgdf_eval.eval_direct(g, ns, (*aq).n_erosion, x, y, z)
+    let ero_lim: f32 = -0.225f
+    var deep_dark: bool = false
+    if erosion < (ero_lim as f64) {
+        let depth: f64 = wgdf_eval.eval_direct(g, ns, (*aq).n_depth, x, y, z)
+        let dep_lim: f32 = 0.9f
+        if depth > (dep_lim as f64) {
+            deep_dark = true
+        }
+    }
+    if !deep_dark {
+        let diff: i32 = (min_surface +% 8) +% (0 - y)
+        var shallow: f64 = 0.0
+        if near_surface {
+            shallow = interp.clamped_map(diff as f64, 0.0, 64.0, 1.0, 0.0)
+        }
+        var flood: f64 = wgdf_eval.eval_direct(g, ns, (*aq).n_flood, x, y, z)
+        if flood < 0.0 - 1.0 {
+            flood = 0.0 - 1.0
+        } else if flood > 1.0 {
+            flood = 1.0
+        }
+        let t1: f64 = lerp_map(shallow, 1.0, 0.0, 0.0 - 0.3, 0.8)
+        let t2: f64 = lerp_map(shallow, 1.0, 0.0, 0.0 - 0.8, 0.4)
+        below = flood - t2
+        above = flood - t1
+    }
+    if above > 0.0 {
+        return (*global).level
+    }
+    if below > 0.0 {
+        return randomized_level(g, ns, aq, x, y, z, min_surface)
+    }
+    return WAY_BELOW_MIN_Y
+}
+
+#[allow_fp]
+fn randomized_level(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *Aquifer, x: i32, y: i32, z: i32, min_surface: i32) -> i32 {
+    let gx: i32 = wgdf_eval.floor_div(x, 16)
+    let gy: i32 = wgdf_eval.floor_div(y, 40)
+    let gz: i32 = wgdf_eval.floor_div(z, 16)
+    let center: i32 = gy * 40 + 20
+    let spread: f64 = wgdf_eval.eval_direct(g, ns, (*aq).n_spread, gx, gy, gz) * 10.0
+    let q: i32 = floor_i32(spread / 3.0) * 3
+    let level: i32 = center + q
+    if min_surface < level {
+        return min_surface
+    }
+    return level
+}
+
+#[allow_fp]
+fn fluid_type(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *Aquifer, x: i32, y: i32, z: i32, global: *wgdf_fluid.Fluid, level: i32) -> u8 {
+    var ty: u8 = (*global).ty
+    if level <= 0 - 10 && level != WAY_BELOW_MIN_Y && (*global).ty != wgdf_fluid.STATE_LAVA {
+        let gx: i32 = wgdf_eval.floor_div(x, 64)
+        let gy: i32 = wgdf_eval.floor_div(y, 40)
+        let gz: i32 = wgdf_eval.floor_div(z, 64)
+        let v: f64 = wgdf_eval.eval_direct(g, ns, (*aq).n_lava, gx, gy, gz)
+        if math.fabs(v) > 0.3 {
+            ty = wgdf_fluid.STATE_LAVA
+        }
+    }
+    return ty
+}
+
+fn compute_fluid(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *mut Aquifer, x: i32, y: i32, z: i32) -> wgdf_fluid.Fluid {
+    let global: wgdf_fluid.Fluid = wgdf_fluid.fluid_global(g, y)
+    let ox: [i32; 13] = [0, -2, -1, 0, 1, -3, -2, -1, 1, -2, -1, 0, 1]
+    let oz: [i32; 13] = [0, -1, -1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1]
+    var min_surface: i32 = INT_MAX
+    let y_high: i32 = y + 12
+    let y_low: i32 = y - 12
+    var near_surface: bool = false
+    var i: usize = 0
+    while i < 13 {
+        let px: i32 = x + ox[i] * 16
+        let pz: i32 = z + oz[i] * 16
+        let level: i32 = preliminary_surface(g, ns, aq, px, pz)
+        let probe_y: i32 = level +% 8
+        let center: bool = ox[i] == 0 && oz[i] == 0
+        if center && y_low > probe_y {
+            return global
+        }
+        let above: bool = y_high > probe_y
+        if above || center {
+            let gs: wgdf_fluid.Fluid = wgdf_fluid.fluid_global(g, probe_y)
+            if wgdf_fluid.fluid_at(&gs, probe_y) != wgdf_fluid.STATE_AIR {
+                if center {
+                    near_surface = true
+                }
+                if above {
+                    return gs
+                }
+            }
+        }
+        if level < min_surface {
+            min_surface = level
+        }
+        i = i + 1
+    }
+    let lvl: i32 = surface_level(g, ns, aq, x, y, z, &global, min_surface, near_surface)
+    let ty: u8 = fluid_type(g, ns, aq, x, y, z, &global, lvl)
+    return wgdf_fluid.Fluid { level: lvl, ty: ty }
+}
+
+fn status_at(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *mut Aquifer, lx: i32, ly: i32, lz: i32) -> wgdf_fluid.Fluid {
+    let idx: usize = grid_index(aq, wgdf_eval.floor_div(lx, 16), wgdf_eval.floor_div(ly, 12), wgdf_eval.floor_div(lz, 16))
+    if (*aq).st_set[idx] != 0 {
+        return wgdf_fluid.Fluid { level: (*aq).st_level[idx], ty: (*aq).st_ty[idx] }
+    }
+    let f: wgdf_fluid.Fluid = compute_fluid(g, ns, aq, lx, ly, lz)
+    (*aq).st_set[idx] = 1
+    (*aq).st_level[idx] = f.level
+    (*aq).st_ty[idx] = f.ty
+    return f
+}
+
+#[allow_fp]
+fn pressure(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *Aquifer, bc: *mut Barrier, x: i32, y: i32, z: i32, a: *wgdf_fluid.Fluid, b: *wgdf_fluid.Fluid) -> f64 {
+    let sa: u8 = wgdf_fluid.fluid_at(a, y)
+    let sb: u8 = wgdf_fluid.fluid_at(b, y)
+    let lava: u8 = wgdf_fluid.STATE_LAVA
+    let water: u8 = wgdf_fluid.STATE_WATER
+    if (sa == lava && sb == water) || (sa == water && sb == lava) {
+        return 2.0
+    }
+    let dl: i32 = abs_i32((*a).level - (*b).level)
+    if dl == 0 {
+        return 0.0
+    }
+    let mid: f64 = 0.5 * (((*a).level + (*b).level) as f64)
+    let rel: f64 = (y as f64) + 0.5 - mid
+    let half: f64 = (dl as f64) / 2.0
+    var arel: f64 = rel
+    if arel < 0.0 { arel = 0.0 - arel }
+    let margin: f64 = half - arel
+    var scaled: f64 = 0.0
+    if rel > 0.0 {
+        let v: f64 = 0.0 + margin
+        if v > 0.0 {
+            scaled = v / 1.5
+        } else {
+            scaled = v / 2.5
+        }
+    } else {
+        let v: f64 = 3.0 + margin
+        if v > 0.0 {
+            scaled = v / 3.0
+        } else {
+            scaled = v / 10.0
+        }
+    }
+    var noise: f64 = 0.0
+    if !(scaled < 0.0 - 2.0) && !(scaled > 2.0) {
+        if !(*bc).has {
+            (*bc).value = wgdf_eval.eval(g, ns, (*aq).n_barrier, x, y, z)
+            (*bc).has = true
+        }
+        noise = (*bc).value
+    }
+    return 2.0 * (noise + scaled)
+}
+
+#[allow_fp]
+fn aquifer_substance(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, aq: *mut Aquifer, x: i32, y: i32, z: i32, density: f64) -> u8 {
+    if density > 0.0 {
+        return 0
+    }
+    let global: wgdf_fluid.Fluid = wgdf_fluid.fluid_global(g, y)
+    if wgdf_fluid.fluid_at(&global, y) == wgdf_fluid.STATE_LAVA {
+        return wgdf_fluid.STATE_LAVA
+    }
+    let gx0: i32 = wgdf_eval.floor_div(x - 5, 16)
+    let gy0: i32 = wgdf_eval.floor_div(y + 1, 12)
+    let gz0: i32 = wgdf_eval.floor_div(z - 5, 16)
+    var dist: [i32; 3] = [INT_MAX, INT_MAX, INT_MAX]
+    var px: [i32; 3] = [0, 0, 0]
+    var py: [i32; 3] = [0, 0, 0]
+    var pz: [i32; 3] = [0, 0, 0]
+    var dx: i32 = 0
+    while dx <= 1 {
+        var dy: i32 = -1
+        while dy <= 1 {
+            var dz: i32 = 0
+            while dz <= 1 {
+                let gx: i32 = gx0 + dx
+                let gy: i32 = gy0 + dy
+                let gz: i32 = gz0 + dz
+                let idx: usize = grid_index(aq, gx, gy, gz)
+                if (*aq).loc_set[idx] == 0 {
+                    var r: mg_random.Rng = mg_random.pos_at(&(*aq).pf, gx, gy, gz)
+                    let ax: i32 = gx * 16 + mg_random.rng_next_int_bound(&r, 10)
+                    let ay: i32 = gy * 12 + mg_random.rng_next_int_bound(&r, 9)
+                    let az: i32 = gz * 16 + mg_random.rng_next_int_bound(&r, 10)
+                    (*aq).loc_x[idx] = ax
+                    (*aq).loc_y[idx] = ay
+                    (*aq).loc_z[idx] = az
+                    (*aq).loc_set[idx] = 1
+                }
+                let lx: i32 = (*aq).loc_x[idx]
+                let ly: i32 = (*aq).loc_y[idx]
+                let lz: i32 = (*aq).loc_z[idx]
+                let ex: i32 = lx - x
+                let ey: i32 = ly - y
+                let ez: i32 = lz - z
+                let d: i32 = ex * ex + ey * ey + ez * ez
+                if dist[0] >= d {
+                    px[2] = px[1]
+                    py[2] = py[1]
+                    pz[2] = pz[1]
+                    dist[2] = dist[1]
+                    px[1] = px[0]
+                    py[1] = py[0]
+                    pz[1] = pz[0]
+                    dist[1] = dist[0]
+                    px[0] = lx
+                    py[0] = ly
+                    pz[0] = lz
+                    dist[0] = d
+                } else if dist[1] >= d {
+                    px[2] = px[1]
+                    py[2] = py[1]
+                    pz[2] = pz[1]
+                    dist[2] = dist[1]
+                    px[1] = lx
+                    py[1] = ly
+                    pz[1] = lz
+                    dist[1] = d
+                } else if dist[2] >= d {
+                    px[2] = lx
+                    py[2] = ly
+                    pz[2] = lz
+                    dist[2] = d
+                }
+                dz = dz + 1
+            }
+            dy = dy + 1
+        }
+        dx = dx + 1
+    }
+    let s0: wgdf_fluid.Fluid = status_at(g, ns, aq, px[0], py[0], pz[0])
+    let sim01: f64 = similarity(dist[0], dist[1])
+    let state: u8 = wgdf_fluid.fluid_at(&s0, y)
+    if sim01 <= 0.0 {
+        return state
+    }
+    if state == wgdf_fluid.STATE_WATER {
+        let below: wgdf_fluid.Fluid = wgdf_fluid.fluid_global(g, y - 1)
+        if wgdf_fluid.fluid_at(&below, y - 1) == wgdf_fluid.STATE_LAVA {
+            return state
+        }
+    }
+    var bc: Barrier = Barrier { has: false, value: 0.0 }
+    let s1: wgdf_fluid.Fluid = status_at(g, ns, aq, px[1], py[1], pz[1])
+    let p01: f64 = sim01 * pressure(g, ns, aq, &bc, x, y, z, &s0, &s1)
+    if density + p01 > 0.0 {
+        return 0
+    }
+    let s2: wgdf_fluid.Fluid = status_at(g, ns, aq, px[2], py[2], pz[2])
+    let sim02: f64 = similarity(dist[0], dist[2])
+    if sim02 > 0.0 {
+        let p02: f64 = sim01 * sim02 * pressure(g, ns, aq, &bc, x, y, z, &s0, &s2)
+        if density + p02 > 0.0 {
+            return 0
+        }
+    }
+    let sim12: f64 = similarity(dist[1], dist[2])
+    if sim12 > 0.0 {
+        let p12: f64 = sim01 * sim12 * pressure(g, ns, aq, &bc, x, y, z, &s1, &s2)
+        if density + p12 > 0.0 {
+            return 0
+        }
+    }
+    return state
+}

@@ -52,7 +52,7 @@ run_oracle() {
     [ -s "$out" ] || { echo "  FAIL  oracle $ver produced nothing"; head -5 "$W/jerr_$ver"; return 1; }
 }
 
-SPECS=${WG_SPECS:-"1.20.1 overworld|1.20.1 amplified|1.20.1 large_biomes|26.1 overworld"}
+SPECS=${WG_SPECS:-"1.20.1 overworld|1.20.1 amplified|1.20.1 large_biomes|26.1 overworld|1.20.1 nether|1.20.1 end"}
 IFS="|" read -ra SPEC_LIST <<< "$SPECS"
 for spec in "${SPEC_LIST[@]}"; do
     set -- $spec
