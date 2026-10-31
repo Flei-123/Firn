@@ -2021,7 +2021,6 @@ pub fn allocate(f: &Func) -> Alloc {
                         if !i.ty.is_float()
                             && !from.is_float()
                             && i.ty != FTy::Bool
-                            && *from != FTy::Bool
                             && i.ty != FTy::V128
                             && *from != FTy::V128
                             && !alloc.imms.contains_key(src)
@@ -4748,7 +4747,12 @@ fn drop_redundant_zext(asm: &str) -> String {
                         let pt = prev.trim();
                         if let Some(pr) = pt.strip_prefix("movzx ") {
                             if let Some((pd, ps)) = pr.split_once(", ") {
-                                if pd == d && (ps.starts_with("byte ptr") || ps == s) {
+                                let byte_reg = matches!(ps, "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl")
+                                    || (ps.len() >= 3
+                                        && ps.starts_with('r')
+                                        && ps.ends_with('b')
+                                        && ps[1..ps.len() - 1].chars().all(|c| c.is_ascii_digit()));
+                                if pd == d && (ps.starts_with("byte ptr") || ps == s || byte_reg) {
                                     drop = true;
                                 }
                             }
