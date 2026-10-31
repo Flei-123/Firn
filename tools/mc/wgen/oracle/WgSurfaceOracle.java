@@ -256,6 +256,8 @@ public class WgSurfaceOracle {
                     if (n.equals("bee_nest")) n = "air";
                     if (st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE)) {
                         n += "[distance=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE) + "]";
+                    } else if (st.getBlock() instanceof net.minecraft.world.level.block.HugeMushroomBlock) {
+                        n += "[" + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOWN) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.EAST) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.NORTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.SOUTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.UP) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WEST) ? "1" : "0") + "]";
                     } else if (st.is(net.minecraft.tags.BlockTags.LOGS) && st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS)) {
                         n += "[axis=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).getSerializedName() + "]";
                     }
