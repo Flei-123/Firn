@@ -76,7 +76,16 @@ function waitFor(cond, ms, next) {
   }, 100)
 }
 
-waitFor(() => res.obs.pos && res.dig.pos, 20000, () => {
+function itemSettled() {
+  const o = res.obs
+  const sp = o.spawns[0]
+  if (!sp || !res.target) return false
+  let y = sp.y
+  for (const m of o.moves.filter((m) => m.eid === sp.eid)) y = m.ty !== undefined ? m.ty : y + m.dy
+  return Math.abs(y - res.target.y) < 0.06
+}
+const seesDigger = () => res.obs.named.some((n) => n.eid === res.dig.eid) && res.obs.infos >= 1
+waitFor(() => res.obs.pos && res.dig.pos && res.dig.eid !== null && seesDigger(), 20000, () => {
   setTimeout(() => {
     const p = res.dig.pos
     const bx = Math.floor(p.x) + 1
@@ -86,10 +95,12 @@ waitFor(() => res.obs.pos && res.dig.pos, 20000, () => {
     dig.write('block_dig', { status: 0, location: { x: bx, y: by, z: bz }, face: 1, sequence: 1 })
     setTimeout(() => {
       dig.write('block_dig', { status: 2, location: { x: bx, y: by, z: bz }, face: 1, sequence: 2 })
-      setTimeout(() => {
-        dig.write('position_look', { x: bx + 0.5, y: by, z: bz + 0.5, yaw: 0, pitch: 0, onGround: true })
-        setTimeout(finish, 2500)
-      }, 2500)
+      waitFor(itemSettled, 12000, () => {
+        setTimeout(() => {
+          dig.write('position_look', { x: bx + 0.5, y: by, z: bz + 0.5, yaw: 0, pitch: 0, onGround: true })
+          setTimeout(finish, 2500)
+        }, 500)
+      })
     }, 1600)
   }, 2500)
 })

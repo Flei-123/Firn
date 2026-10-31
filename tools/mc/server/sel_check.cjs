@@ -29,6 +29,7 @@ function compareBot(f, v) {
     }
     if (p.length) problems.push(`${v.name} '${ve.who}|${ve.kind}|${ve.text}': ${p.join('; ')}`)
   })
+  if (JSON.stringify(f.presence) !== JSON.stringify(v.presence)) problems.push(`${v.name} presence firn=${JSON.stringify(f.presence)} vanilla=${JSON.stringify(v.presence)}`)
   return problems
 }
 
