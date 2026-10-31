@@ -8,7 +8,7 @@ Everything is built as reusable Firn libs first; Orbit integration comes after.
 
 | Layer | Dir | Rule |
 |---|---|---|
-| Sniff + registry | `lib/docview/kind.fi`, `lib/docview/registry.fi` | magic/extension -> `Kind`; one registry of openers, no special cases in callers |
+| Sniff + registry | `lib/docview/kind.fi` (+ `kinds`, `magic`, `container`, `dvbytes`), `lib/docview/registry.fi` | magic/extension -> `Kind`; one registry of openers, no special cases in callers |
 | Document model | `lib/docview/<format>/` | parse only, no UI; `Doc` handle: `doc_open(bytes) -> Doc`, `doc_pages`, `doc_page_size`, `doc_render(page, scale, out_rgba)`, `doc_text(page)`, `doc_free` |
 | Media model | `lib/media/` | `AudioSource`: `probe`, `read_f32(frames)`, `seek`, `duration`; `VideoSource`: `probe`, `next_frame -> yuv/rgba + pts`, `seek`; A/V clock in `lib/media/clock.fi` |
 | Widgets | `lib/fui/kitdoc*.fi`, `lib/fui/kitplayer*.fi`, `lib/fui/kitcode*.fi` | fUi widgets over the models only (page strip, zoom, search, seek bar, volume) |
@@ -54,3 +54,30 @@ All libs: no native-only calls in model layers, must build for `wasm32-browser`,
 * Audio: `ffmpeg -f f32le` PCM vs ours (max abs diff / SNR), duration vs `ffprobe`.
 * Video: `ffmpeg -f rawvideo` frames vs ours (bit exact for H.264).
 * Fuzz: mutated/truncated files must never crash or hang (error code only).
+
+## Status G1 + G6 (2026-10-31)
+
+Module names are unique on purpose: Firn resolves a module by its LAST path segment, so `docview.dvdoc` (not `doc`, clashes with `markdown.doc`), `dvbytes` (`std.bytes`), `dvinstall` (`pack.install`), `dvstrip` (`fui.layout`).
+`image.picture` and `fui.*` cannot be imported into one program (both pull a module named `icons`); the image opener therefore uses `fui.uiimagedec` and `docview.resample`.
+
+### Core (`lib/docview`)
+
+| Module | Role |
+|---|---|
+| `kinds` | `KIND_*` constants (pdf, docx, xlsx, pptx, odt, zip, png, jpeg, webp, gif, jxl, avif, svg, mp3, ogg, opus, flac, wav, m4a, mp4, webm, markdown, text, code), `kind_name`, `kind_family` |
+| `kind` | `sniff(p, n, name) -> Kind` (magic first, zip entries for Office/ODT, svg, then text by extension: markdown / code via `highlight.hl_language` / text), `code_language(name)` |
+| `registry` | `register(name, kind, DocOps) -> bool` (same name replaces), `unregister`, `find_by_kind` (last registration wins), `find_by_name`, `has_kind`, `registry_reset`; `DocOps` = `open(p, n) -> handle`, `pages`, `page_size`, `render`, `text`, `free` (start from `ops_empty()`) |
+| `lazy` | `lazy_register(name, kind, init)`, `lazy_ensure_kind`, `lazy_ensure_name`; the init function calls `registry.register` on first use only |
+| `dvdoc` | `Doc`, `doc_open(p, n)`, `doc_open_named(p, n, name)`, `doc_open_kind`, `doc_pages`, `doc_page_size(page, &w, &h)`, `doc_render(page, scale, &Buf rgba, &w, &h)`, `doc_text(page, &Buf)`, `doc_free`, `doc_is_flow` |
+| `dvinstall` | `install_builtin()` registers lazy openers: text, code, markdown (flow docs, 1 page, text = source) and png/jpeg/webp/gif (1 page, bilinear scaled RGBA) |
+| `dvstrip`, `search`, `pagecache` | page strip layout (zoom, fit width, visible range), text search over `doc_text`, LRU render cache |
+
+Opener contract for other workers: `registry.register("pdf.main", kinds.KIND_PDF, ops)` from an init function and `lazy.lazy_register("pdf.main", kinds.KIND_PDF, init)`; `doc_render` writes straight RGBA (`uiimage` pixel layout) into the Buf; failures return `false`/0, never crash.
+
+### Widgets (`lib/fui`)
+
+* `kitdoc`: `DocView` page strip (wheel, zoom in/out/set, fit width, next/prev/goto page, search with hit marker bar, status text, lazy visible-page render through the cache).
+* `kitcode`: `CodeView` highlighted text with line numbers (visible lines only, mono face from font slot 1).
+* `kitview`: `View` dispatcher bytes + name -> pages (kitdoc), code/text (kitcode), markdown (`fui.markdownview`), media placeholder, unsupported placeholder.
+
+Tests: `tests/6400`-`6403_docview_*.fi`; `wasm32-browser` builds of `kitview` and the core pass.
