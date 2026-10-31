@@ -25,4 +25,4 @@ python3 "$ROOT/tools/mcgen/overlay_data.py" "$BASE" "$ROOT/tools/mcgen/data_extr
 python3 "$ROOT/tools/mcgen/gen_protocol.py" --all "$D/data" "$D/gen" all >/dev/null
 mkdir -p "$ROOT/lib/mc/v777"
 cp "$D/gen/v777/"*.fi "$ROOT/lib/mc/v777/"
-cp "$D/gen/mc_versions.fi" "$D/gen/mc_sem.fi" "$ROOT/lib/mc/"
+cp "$D/gen/mc_versions.fi" "$D/gen/mc_sem.fi" "$D/gen/mc_entity_layout.fi" "$ROOT/lib/mc/"
