@@ -76,7 +76,26 @@ public class WgSurfaceOracle {
             HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise.NoiseParameters> noises = (HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise.NoiseParameters>) (Object) prov.lookupOrThrow(Registries.NOISE);
             RandomState rs = RandomState.create(ngs, noises, seed);
             Climate.Sampler sampler = rs.sampler();
-            BiomeManager.NoiseBiomeSource src = (qx, qy, qz) -> prov.lookupOrThrow(Registries.BIOME).getOrThrow(list.findValue(sampler.sample(qx, qy, qz)));
+            @SuppressWarnings("unchecked")
+            Climate.ParameterList<ResourceKey<Biome>> chunkList = (Climate.ParameterList<ResourceKey<Biome>>) ap.invoke(provider, Function.identity());
+            java.util.HashMap<String, ResourceKey<Biome>> memo = new java.util.HashMap<>();
+            int fillMinY = ngs.noiseSettings().minY() >> 2;
+            int fillMaxY = fillMinY + (ngs.noiseSettings().height() >> 2);
+            for (int fy = fillMinY; fy < fillMaxY; fy++)
+                for (int fz = 0; fz < 4; fz++)
+                    for (int fx = 0; fx < 4; fx++) {
+                        int gx = cx * 4 + fx;
+                        int gz = cz * 4 + fz;
+                        memo.put(gx + "," + fy + "," + gz, chunkList.findValue(sampler.sample(gx, fy, gz)));
+                    }
+            BiomeManager.NoiseBiomeSource src = (qx, qy, qz) -> {
+                ResourceKey<Biome> k = memo.get(qx + "," + qy + "," + qz);
+                if (k == null) {
+                    resetLast(list);
+                    k = list.findValue(sampler.sample(qx, qy, qz));
+                }
+                return prov.lookupOrThrow(Registries.BIOME).getOrThrow(k);
+            };
             BiomeManager bm = new BiomeManager(src, BiomeManager.obfuscateSeed(seed));
             int minY = ngs.noiseSettings().minY();
             int height = ngs.noiseSettings().height();
@@ -100,6 +119,26 @@ public class WgSurfaceOracle {
             dump(out, chunk, seed, cx, cz, minY, height);
         }
         out.close();
+    }
+
+    static void resetLast(Object list) {
+        try {
+            for (java.lang.reflect.Field f : list.getClass().getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                Object tree = f.get(list);
+                if (tree == null) continue;
+                for (java.lang.reflect.Field g : tree.getClass().getDeclaredFields()) {
+                    if (g.getType() == ThreadLocal.class) {
+                        g.setAccessible(true);
+                        ((ThreadLocal<?>) g.get(tree)).set(null);
+                        return;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     static void fill(ProtoChunk chunk, NoiseChunk nc, NoiseGeneratorSettings ngs, int cx, int cz) {
