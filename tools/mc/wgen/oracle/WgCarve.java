@@ -51,6 +51,10 @@ public class WgCarve {
             }
         }
         net.minecraft.core.registries.BuiltInRegistries.BLOCK.bindTags(map);
+        java.util.Map<net.minecraft.tags.TagKey<net.minecraft.world.level.material.Fluid>, List<Holder<net.minecraft.world.level.material.Fluid>>> fluids = new java.util.HashMap<>();
+        fluids.put(net.minecraft.tags.FluidTags.WATER, List.of(net.minecraft.world.level.material.Fluids.WATER.builtInRegistryHolder(), net.minecraft.world.level.material.Fluids.FLOWING_WATER.builtInRegistryHolder()));
+        fluids.put(net.minecraft.tags.FluidTags.LAVA, List.of(net.minecraft.world.level.material.Fluids.LAVA.builtInRegistryHolder(), net.minecraft.world.level.material.Fluids.FLOWING_LAVA.builtInRegistryHolder()));
+        net.minecraft.core.registries.BuiltInRegistries.FLUID.bindTags(fluids);
     }
 
     public static void run(HolderLookup.Provider prov, RandomState rs, long seed, ProtoChunk chunk, NoiseChunk nc, NoiseBasedChunkGenerator gen,
