@@ -2,7 +2,6 @@
 // lib/mc/server/sv_chunks.fi -- chunk streaming: per player window of sent columns, nearest first, rate limited.
 
 import std.rt
-import std.bytes
 import mc.mc_encode
 import mc.mc_sem
 import mc.mc_version
@@ -10,7 +9,7 @@ import mc.server.sv_state
 import mc.server.sv_send
 import mc.server.sv_edits
 import mc.server.sv_world
-import mc.server.sv_chunk_enc
+import mc.server.sv_ver
 import mc.server.sv_be
 
 export { chunks_init, chunks_stream, chunks_send_center, chunks_sent_count, chunk_of }
@@ -64,18 +63,8 @@ fn chunks_send_center(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
 }
 
 fn build_tail(srv: *mut sv_state.Server, col: *mut sv_world.Column) {
-    let nsec: usize = sv_world.world_sections(&(*srv).world)
-    var hm: bytes.Bytes = bytes.bytes_new()
-    sv_chunk_enc.chunk_enc_heightmap(&(*srv).enc, (*col).blocks, nsec, &hm)
-    var data: bytes.Bytes = bytes.bytes_new()
-    sv_chunk_enc.chunk_enc_data(&(*srv).enc, col, nsec, &data)
-    rt.buf_clear(&(*srv).tail)
-    mc_encode.vals_hex(&(*srv).tail, "heightmaps", bytes.bytes_ptr(&hm), bytes.bytes_len(&hm))
-    mc_encode.vals_hex(&(*srv).tail, "chunkData", bytes.bytes_ptr(&data), bytes.bytes_len(&data))
-    sv_chunk_enc.chunk_enc_block_entities(col, &(*srv).tail)
-    sv_chunk_enc.chunk_enc_light(&(*srv).enc, col, nsec, &(*srv).tail)
-    bytes.bytes_free(&hm)
-    bytes.bytes_free(&data)
+    let build: fn(*mut sv_state.Server, *mut sv_world.Column) = (*sv_ver.adapter_of(srv)).chunk_tail
+    build(srv, col)
 }
 
 fn send_column(srv: *mut sv_state.Server, s: *mut sv_state.Session, cx: i32, cz: i32) -> bool {
@@ -124,9 +113,25 @@ fn unload_outside(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
     }
 }
 
+fn send_batch_start(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    var v: rt.Buf = rt.buf_new()
+    sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_START, &v)
+    rt.buf_free(&v)
+}
+
+fn send_batch_finished(srv: *mut sv_state.Server, s: *mut sv_state.Session, count: u64) {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "batchSize", count as i64)
+    sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_FINISHED, &v)
+    rt.buf_free(&v)
+}
+
 fn chunks_stream(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
     if !(*s).joined || (*s).chunks == 0 { return }
     unload_outside(srv, s)
+    let batches: bool = mc_version.version_has(&(*srv).ver, mc_version.FLAG_CHUNK_BATCHES)
+    let sent_before: u64 = (*s).sent_chunks
+    var batch_open: bool = false
     var budget: i32 = (*srv).cfg.chunks_per_tick
     var d: i32 = 0
     while d <= (*s).view && budget > 0 {
@@ -143,6 +148,10 @@ fn chunks_stream(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
                     let cz: i32 = (*s).cz + dz
                     let slot: usize = slot_of(s, cx, cz)
                     if rt.ld64((*s).chunks, slot) != key_of(cx, cz) {
+                        if batches && !batch_open {
+                            send_batch_start(srv, s)
+                            batch_open = true
+                        }
                         if send_column(srv, s, cx, cz) {
                             rt.st64((*s).chunks, slot, key_of(cx, cz))
                             (*s).sent_chunks = (*s).sent_chunks + 1
@@ -156,4 +165,5 @@ fn chunks_stream(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
         }
         d = d + 1
     }
+    if batch_open { send_batch_finished(srv, s, (*s).sent_chunks - sent_before) }
 }
