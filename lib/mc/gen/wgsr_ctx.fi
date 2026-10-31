@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import noise.perlin
+import noise.interp
+import noise.jnum
+import mc.gen.mg_random
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fluid
+import mc.gen.wgdf_prelim
+import mc.gen.wgbio_source
+import mc.gen.wgsr_def
+import mc.gen.wgsr_bio
+
+export {
+    noise_val, SrCtx, ctx_bytes, ctx_new, ctx_free, ctx_column, ctx_get, ctx_set, ctx_hm, ctx_xz_begin, ctx_y_begin,
+    ctx_noise, ctx_secondary, ctx_min_surface, ctx_biome, ctx_biome_at, ctx_cold, ctx_steep,
+}
+
+const AIR: u8 = 65
+
+struct SrCtx {
+    def: *wgsr_def.SrDef,
+    g: *wgdf_graph.WgGraph,
+    ns: *wgdf_eval.WgNoises,
+    buf: u64,
+    min_y: i32,
+    max_y: i32,
+    cx: i32,
+    cz: i32,
+    hm: [i32; 256],
+    zoom: wgsr_bio.Zoom,
+    x: i32,
+    z: i32,
+    lx: i32,
+    lz: i32,
+    xz: i32,
+    yid: i32,
+    depth_s: i32,
+    sec_id: i32,
+    sec_val: f64,
+    msl_id: i32,
+    msl_val: i32,
+    nz_id: [i32; 96],
+    nz_val: [f64; 96],
+    st_id: i32,
+    st_val: bool,
+    y: i32,
+    water_h: i32,
+    d_below: i32,
+    d_above: i32,
+    bio_id: i32,
+    bio_val: i32,
+    cold_id: i32,
+    cold_val: bool,
+    pc_cx: i32,
+    pc_cz: i32,
+    pc_ok: bool,
+    pc: [i32; 4],
+}
+
+fn ctx_bytes() -> usize {
+    return wgdf_graph.wg_size_of[SrCtx]()
+}
+
+fn ctx_new(d: *wgsr_def.SrDef, g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, bs: *mut wgbio_source.BioSource, cx: i32, cz: i32, buf: u64, bio_buf: u64) -> *mut SrCtx {
+    let c: *mut SrCtx = rt.heap_alloc(ctx_bytes()) as *mut SrCtx
+    rt.mem_set(c as u64, 0 as u8, ctx_bytes())
+    (*c).def = d
+    (*c).g = g
+    (*c).ns = ns
+    (*c).buf = buf
+    (*c).min_y = (*g).min_y
+    (*c).max_y = (*g).min_y + (*g).height
+    (*c).cx = cx
+    (*c).cz = cz
+    (*c).xz = 1
+    (*c).yid = 1
+    if bs != (0 as *mut wgbio_source.BioSource) {
+        wgsr_bio.zoom_init(&(*c).zoom, d, bs, g, ns, cx, cz, bio_buf)
+    }
+    var i: i32 = 0
+    while i < 256 {
+        var y: i32 = (*c).max_y - 1
+        while y >= (*c).min_y && rt.ld8(buf, ((y - (*c).min_y) * 256 + i) as usize) == AIR {
+            y = y - 1
+        }
+        (*c).hm[i as usize] = y + 1
+        i = i + 1
+    }
+    return c
+}
+
+fn ctx_free(c: *mut SrCtx) {
+    rt.heap_free(c as u64, ctx_bytes())
+}
+
+fn ctx_column(c: *mut SrCtx, x: i32, z: i32) {
+    (*c).x = x
+    (*c).z = z
+    (*c).lx = x & 15
+    (*c).lz = z & 15
+}
+
+fn ctx_hm(c: *SrCtx, lx: i32, lz: i32) -> i32 {
+    return (*c).hm[(lz * 16 + lx) as usize]
+}
+
+fn ctx_get(c: *SrCtx, y: i32) -> u8 {
+    if y < (*c).min_y || y >= (*c).max_y { return AIR }
+    return rt.ld8((*c).buf, ((y - (*c).min_y) * 256 + (*c).lz * 16 + (*c).lx) as usize)
+}
+
+fn hm_update(c: *mut SrCtx, y: i32, code: u8) {
+    let at: usize = ((*c).lz * 16 + (*c).lx) as usize
+    let first: i32 = (*c).hm[at]
+    if y <= first - 2 { return }
+    if code != AIR {
+        if y >= first { (*c).hm[at] = y + 1 }
+        return
+    }
+    if first - 1 == y {
+        var k: i32 = y - 1
+        while k >= (*c).min_y {
+            if ctx_get(c, k) != AIR {
+                (*c).hm[at] = k + 1
+                return
+            }
+            k = k - 1
+        }
+        (*c).hm[at] = (*c).min_y
+    }
+}
+
+fn ctx_set(c: *mut SrCtx, y: i32, code: u8) {
+    if y < (*c).min_y || y >= (*c).max_y { return }
+    let p: *mut u8 = ((*c).buf + (((y - (*c).min_y) * 256 + (*c).lz * 16 + (*c).lx) as u64)) as *mut u8
+    *p = code
+    hm_update(c, y, code)
+}
+
+fn noise_val(ns: *wgdf_eval.WgNoises, slot: i32, x: f64, y: f64, z: f64) -> f64 {
+    return perlin.normal_value(&(*ns).normal[slot as usize], x, y, z)
+}
+
+#[allow_fp]
+fn ctx_xz_begin(c: *mut SrCtx) {
+    (*c).xz = (*c).xz + 1
+    (*c).yid = (*c).yid + 1
+    let d: *wgsr_def.SrDef = (*c).def
+    let n: f64 = noise_val((*c).ns, (*d).s_surface, (*c).x as f64, 0.0, (*c).z as f64)
+    var rr: mg_random.Rng = mg_random.pos_at(&(*d).root_pf, (*c).x, 0, (*c).z)
+    let u: f64 = mg_random.rng_next_double(&rr)
+    (*c).depth_s = jnum.d2i(n * 2.75 + 3.0 + u * 0.25)
+}
+
+fn ctx_y_begin(c: *mut SrCtx, above: i32, below: i32, water: i32, y: i32) {
+    (*c).yid = (*c).yid + 1
+    (*c).d_above = above
+    (*c).d_below = below
+    (*c).water_h = water
+    (*c).y = y
+}
+
+#[allow_fp]
+fn ctx_noise(c: *mut SrCtx, slot: i32) -> f64 {
+    let i: usize = slot as usize
+    if (*c).nz_id[i] == (*c).xz { return (*c).nz_val[i] }
+    let v: f64 = noise_val((*c).ns, slot, (*c).x as f64, 0.0, (*c).z as f64)
+    (*c).nz_id[i] = (*c).xz
+    (*c).nz_val[i] = v
+    return v
+}
+
+fn ctx_secondary(c: *mut SrCtx) -> f64 {
+    if (*c).sec_id != (*c).xz {
+        (*c).sec_id = (*c).xz
+        (*c).sec_val = noise_val((*c).ns, (*(*c).def).s_secondary, (*c).x as f64, 0.0, (*c).z as f64)
+    }
+    return (*c).sec_val
+}
+
+fn prelim_corner(c: *mut SrCtx, bx: i32, bz: i32) -> i32 {
+    return wgdf_prelim.prelim_level((*c).g, (*c).ns, (*(*c).def).n_initial, bx, bz)
+}
+
+#[allow_fp]
+fn ctx_min_surface(c: *mut SrCtx) -> i32 {
+    if (*c).msl_id == (*c).xz { return (*c).msl_val }
+    (*c).msl_id = (*c).xz
+    let cellx: i32 = (*c).x >> 4
+    let cellz: i32 = (*c).z >> 4
+    if !(*c).pc_ok || (*c).pc_cx != cellx || (*c).pc_cz != cellz {
+        (*c).pc_ok = true
+        (*c).pc_cx = cellx
+        (*c).pc_cz = cellz
+        (*c).pc[0] = prelim_corner(c, cellx << 4, cellz << 4)
+        (*c).pc[1] = prelim_corner(c, (cellx + 1) << 4, cellz << 4)
+        (*c).pc[2] = prelim_corner(c, cellx << 4, (cellz + 1) << 4)
+        (*c).pc[3] = prelim_corner(c, (cellx + 1) << 4, (cellz + 1) << 4)
+    }
+    let sixteen: f32 = 16.0
+    let fx: f32 = ((*c).lx as f32) / sixteen
+    let fz: f32 = ((*c).lz as f32) / sixteen
+    let v: f64 = interp.lerp2(fx as f64, fz as f64, (*c).pc[0] as f64, (*c).pc[1] as f64, (*c).pc[2] as f64, (*c).pc[3] as f64)
+    (*c).msl_val = jnum.floor_i32(v) +% (*c).depth_s -% 8
+    return (*c).msl_val
+}
+
+fn ctx_biome_at(c: *mut SrCtx, x: i32, y: i32, z: i32) -> i32 {
+    return wgsr_bio.zoom_biome(&(*c).zoom, x, y, z)
+}
+
+fn ctx_biome(c: *mut SrCtx) -> i32 {
+    if (*c).bio_id != (*c).yid {
+        (*c).bio_id = (*c).yid
+        (*c).bio_val = wgsr_bio.zoom_biome(&(*c).zoom, (*c).x, (*c).y, (*c).z)
+    }
+    return (*c).bio_val
+}
+
+fn ctx_cold(c: *mut SrCtx) -> bool {
+    if (*c).cold_id != (*c).yid {
+        (*c).cold_id = (*c).yid
+        let b: i32 = ctx_biome(c)
+        let t: f32 = wgsr_bio.temperature_at((*c).def, b, (*c).x, (*c).y, (*c).z)
+        let lim: f32 = 0.15
+        (*c).cold_val = !(t >= lim)
+    }
+    return (*c).cold_val
+}
+
+fn ctx_steep(c: *mut SrCtx) -> bool {
+    if (*c).st_id == (*c).xz { return (*c).st_val }
+    (*c).st_id = (*c).xz
+    let lx: i32 = (*c).lx
+    let lz: i32 = (*c).lz
+    var zlo: i32 = lz - 1
+    if zlo < 0 { zlo = 0 }
+    var zhi: i32 = lz + 1
+    if zhi > 15 { zhi = 15 }
+    let h_lo: i32 = ctx_hm(c, lx, zlo)
+    let h_hi: i32 = ctx_hm(c, lx, zhi)
+    if h_hi >= h_lo + 4 {
+        (*c).st_val = true
+        return true
+    }
+    var xlo: i32 = lx - 1
+    if xlo < 0 { xlo = 0 }
+    var xhi: i32 = lx + 1
+    if xhi > 15 { xhi = 15 }
+    (*c).st_val = ctx_hm(c, xlo, lz) >= ctx_hm(c, xhi, lz) + 4
+    return (*c).st_val
+}
