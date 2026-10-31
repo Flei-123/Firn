@@ -1408,7 +1408,7 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 // integer and gets NO `ok` here.
                 Op::Simd { kind, .. } => {
                     v128_ra_kind(*kind)
-                        || matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16)
+                        || matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16 | crate::simd::SimdKind::GetU64)
                 }
                 _ => false,
             };
@@ -5285,7 +5285,7 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 match &i.op {
                     Op::Simd { kind, .. } => {
                         if !v128_ra_kind(*kind)
-                            && !matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16)
+                            && !matches!(kind, crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16 | crate::simd::SimdKind::GetU64)
                         {
                             return Some("vector instruction outside the narrow set".into());
                         }
@@ -5349,6 +5349,7 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                             | crate::simd::SimdKind::CpuFeatures
                             | crate::simd::SimdKind::GetU32
                             | crate::simd::SimdKind::GetU16
+                            | crate::simd::SimdKind::GetU64
                     ) && !v128_ra_kind(*kind)
                     {
                         return Some("vector instruction".into());
@@ -7114,6 +7115,26 @@ fn emit_inst(
             // behind a `pshufd` (`movd`) and 16-bit lanes (`pextrw`), both
             // SSE2; lanes 1-3 of `get_u32` are `pextrd` (SSE4.1), as on the
             // base path. Straight into the target register when it has one.
+            crate::simd::SimdKind::GetU64 => {
+                let d = i.dst.ok_or("internal error: get_u64 without target")?;
+                let q = ra.v_reg(e, args[0], "xmm0");
+                let imm = match &i.op {
+                    Op::Simd { imm, .. } => *imm,
+                    _ => 0,
+                };
+                let t = match ra.a.loc(d) {
+                    Loc::Reg(r) => r,
+                    Loc::Slot(_) => "rax",
+                };
+                if imm == 0 {
+                    e.line(&format!("movq {}, {}", t, q));
+                } else {
+                    e.line(&format!("pextrq {}, {}, {}", t, q, imm));
+                }
+                if t == "rax" {
+                    ra.store_dst(e, d, "rax");
+                }
+            }
             crate::simd::SimdKind::GetU32 | crate::simd::SimdKind::GetU16 => {
                 let d = i.dst.ok_or("internal error: get_u32 without target")?;
                 let q = ra.v_reg(e, args[0], "xmm0");
