@@ -1,16 +1,29 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.mem
+import jobs.jobs
 import mc.gen.wgdf_graph
 import mc.gen.wgdf_load
 import mc.gen.wgdf_eval
 import mc.gen.wgdf_fill
 
-export { WgGen, gen_open, gen_chunk, gen_close, gen_default_block, gen_min_y, gen_height }
+export { WgGen, gen_thread_work, gen_open, gen_chunk, gen_close, gen_default_block, gen_min_y, gen_height }
+
+const PARTS: usize = 4
+const PART_SPAN: i32 = 8
 
 struct WgGen {
+    job: PartCtx,
     g: *mut wgdf_graph.WgGraph,
-    ns: *mut wgdf_eval.WgNoises,
+    ns: [u64; 4],
     root: i32,
+    pool: jobs.Jobs,
+}
+
+struct PartCtx {
+    gen: *mut WgGen,
+    cx: i32,
+    cz: i32,
+    out: *mut u8,
 }
 
 fn gen_bytes() -> usize {
@@ -29,17 +42,35 @@ fn gen_open(data_root: str, dim: str, seed: i64) -> *mut WgGen {
         mem.free(g as u64, wgdf_graph.graph_bytes())
         return 0 as *mut WgGen
     }
-    let ns: *mut wgdf_eval.WgNoises = wgdf_eval.noises_alloc()
-    wgdf_eval.noises_build(g, ns, seed)
     let gen: *mut WgGen = mem.alloc(gen_bytes()) as *mut WgGen
     (*gen).g = g
-    (*gen).ns = ns
     (*gen).root = root
+    var i: usize = 0
+    while i < PARTS {
+        let ns: *mut wgdf_eval.WgNoises = wgdf_eval.noises_alloc()
+        wgdf_eval.noises_build(g, ns, seed)
+        (*gen).ns[i] = ns as u64
+        i = i + 1
+    }
+    (*gen).pool = jobs.create((PARTS - 1) as u64)
     return gen
 }
 
+fn part_body(ctx: u64, lo: u64, hi: u64) {
+    let pc: *mut PartCtx = ctx as *mut PartCtx
+    var i: u64 = lo
+    while i < hi {
+        let gen: *mut WgGen = (*pc).gen
+        let ox: i32 = ((i as i32) % 2) * PART_SPAN
+        let oz: i32 = ((i as i32) / 2) * PART_SPAN
+        wgdf_fill.fill_part((*gen).g, (*gen).ns[i as usize] as *mut wgdf_eval.WgNoises, (*gen).root, (*pc).cx, (*pc).cz, ox, oz, PART_SPAN, true, (*pc).out)
+        i = i + 1
+    }
+}
+
 fn gen_chunk(gen: *mut WgGen, cx: i32, cz: i32, out: *mut u8) {
-    wgdf_fill.fill_chunk((*gen).g, (*gen).ns, (*gen).root, cx, cz, true, out)
+    (*gen).job = PartCtx { gen: gen, cx: cx, cz: cz, out: out }
+    jobs.parallel_for(&(*gen).pool, 0 as u64, PARTS as u64, 1 as u64, part_body, (&(*gen).job) as u64)
 }
 
 fn gen_min_y(gen: *mut WgGen) -> i32 { return (*(*gen).g).min_y }
@@ -51,7 +82,17 @@ fn gen_default_block(gen: *mut WgGen) -> str {
 }
 
 fn gen_close(gen: *mut WgGen) {
-    mem.free((*gen).ns as u64, wgdf_eval.NOISES_BYTES)
+    jobs.destroy(&(*gen).pool)
+    var i: usize = 0
+    while i < PARTS {
+        mem.free((*gen).ns[i], wgdf_eval.NOISES_BYTES)
+        i = i + 1
+    }
     mem.free((*gen).g as u64, wgdf_graph.graph_bytes())
     mem.free(gen as u64, gen_bytes())
+}
+
+fn gen_thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
 }
