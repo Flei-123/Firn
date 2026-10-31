@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.opc
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_pr
+
+export {
+    Styles, Style, ST_PARA, ST_CHAR, ST_TABLE,
+    styles_new, styles_free, styles_load, style_find, resolve_para, resolve_char, resolve_table,
+}
+
+const ST_PARA: u32 = 0
+const ST_CHAR: u32 = 1
+const ST_TABLE: u32 = 2
+const MAX_CHAIN: usize = 24
+const MAX_STYLES: usize = 20000
+
+struct Style {
+    id_off: u32,
+    id_n: u32,
+    based_off: u32,
+    based_n: u32,
+    kind: u32,
+    is_default: bool,
+    rp: dx_props.RunProps,
+    pp: dx_props.ParaProps,
+    tp: dx_props.TblProps,
+}
+
+struct Styles {
+    pool: rt.Buf,
+    items: Vec[Style],
+    dflt_rp: dx_props.RunProps,
+    dflt_pp: dx_props.ParaProps,
+    default_para: i64,
+}
+
+fn styles_new() -> Styles {
+    return Styles { pool: rt.buf_new(), items: vec_new[Style](), dflt_rp: dx_props.rp_unset(),
+        dflt_pp: dx_props.pp_unset(), default_para: -1 }
+}
+
+fn styles_free(s: *mut Styles) {
+    rt.buf_free(&(*s).pool)
+    vec_free[Style](&(*s).items)
+}
+
+fn pool_put(s: *mut Styles, v: str) -> u32 {
+    let off: usize = rt.buf_len(&(*s).pool)
+    rt.buf_push_bytes(&(*s).pool, v.p as u64, v.n)
+    return off as u32
+}
+
+fn style_str(s: *mut Styles, off: u32, n: u32) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*s).pool) + (off as u64)), n: n as usize }
+}
+
+fn style_find(s: *mut Styles, id: str) -> i64 {
+    if id.n == 0 {
+        return -1
+    }
+    var i: usize = 0
+    let n: usize = vec_len[Style](&(*s).items)
+    while i < n {
+        let st: *mut Style = vec_elem_ptr[Style](&(*s).items, i)
+        if style_str(s, (*st).id_off, (*st).id_n) == id {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn styles_load(pk: *mut opc.Package, part: str, s: *mut Styles) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var x: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&x)
+    if !opc.pkg_read_xml(pk, part, &raw, &x) {
+        return false
+    }
+    let root: u32 = xml.root(&x)
+    let dd: u32 = ooxml.child_l(&x, root, "docDefaults")
+    if dd != xml.NONE {
+        let rd: u32 = ooxml.child_l(&x, dd, "rPrDefault")
+        if rd != xml.NONE {
+            dx_pr.read_rpr(&x, ooxml.child_l(&x, rd, "rPr"), &(*s).dflt_rp)
+        }
+        let pd: u32 = ooxml.child_l(&x, dd, "pPrDefault")
+        if pd != xml.NONE {
+            dx_pr.read_ppr(&x, ooxml.child_l(&x, pd, "pPr"), &(*s).dflt_pp)
+        }
+    }
+    var c: u32 = ooxml.first_el(&x, root)
+    while c != xml.NONE {
+        if ooxml.is_el(&x, c, "style") && vec_len[Style](&(*s).items) < MAX_STYLES {
+            let ty: str = ooxml.attr_l(&x, c, "type")
+            var kind: u32 = ST_PARA
+            if ty == "character" {
+                kind = ST_CHAR
+            } else if ty == "table" {
+                kind = ST_TABLE
+            } else if ty != "paragraph" {
+                kind = 99 as u32
+            }
+            if kind != 99 as u32 {
+                let id: str = ooxml.attr_l(&x, c, "styleId")
+                let bo: u32 = ooxml.child_l(&x, c, "basedOn")
+                var based: str = ""
+                if bo != xml.NONE {
+                    based = ooxml.attr_l(&x, bo, "val")
+                }
+                var st: Style = Style { id_off: pool_put(s, id), id_n: id.n as u32, based_off: pool_put(s, based),
+                    based_n: based.n as u32, kind: kind, is_default: ooxml.attr_l(&x, c, "default") == "1",
+                    rp: dx_props.rp_unset(), pp: dx_props.pp_unset(), tp: dx_props.tbl_unset() }
+                dx_pr.read_rpr(&x, ooxml.child_l(&x, c, "rPr"), &st.rp)
+                dx_pr.read_ppr(&x, ooxml.child_l(&x, c, "pPr"), &st.pp)
+                dx_pr.read_tblpr(&x, ooxml.child_l(&x, c, "tblPr"), &st.tp)
+                if kind == ST_PARA && st.is_default && (*s).default_para < 0 {
+                    (*s).default_para = vec_len[Style](&(*s).items) as i64
+                }
+                vec_push[Style](&(*s).items, st)
+            }
+        }
+        c = ooxml.next_el(&x, c)
+    }
+    return true
+}
+
+fn chain_of(s: *mut Styles, start: i64, out: *mut [i64; 24]) -> usize {
+    var n: usize = 0
+    var cur: i64 = start
+    while cur >= 0 && n < MAX_CHAIN {
+        var seen: bool = false
+        var k: usize = 0
+        while k < n {
+            if (*out)[k] == cur {
+                seen = true
+            }
+            k = k + 1
+        }
+        if seen {
+            break
+        }
+        (*out)[n] = cur
+        n = n + 1
+        let st: *mut Style = vec_elem_ptr[Style](&(*s).items, cur as usize)
+        cur = style_find(s, style_str(s, (*st).based_off, (*st).based_n))
+    }
+    return n
+}
+
+fn resolve_para(s: *mut Styles, id: str, rp: *mut dx_props.RunProps, pp: *mut dx_props.ParaProps) {
+    var start: i64 = style_find(s, id)
+    if start < 0 {
+        start = (*s).default_para
+    }
+    dx_props.rp_apply(rp, &(*s).dflt_rp)
+    dx_props.pp_apply(pp, &(*s).dflt_pp)
+    var chain: [i64; 24] = [0 as i64; 24]
+    let n: usize = chain_of(s, start, &chain)
+    var k: usize = n
+    while k > 0 {
+        k = k - 1
+        let st: *mut Style = vec_elem_ptr[Style](&(*s).items, chain[k] as usize)
+        dx_props.rp_apply(rp, &(*st).rp)
+        dx_props.pp_apply(pp, &(*st).pp)
+    }
+}
+
+fn resolve_char(s: *mut Styles, id: str, rp: *mut dx_props.RunProps) {
+    let start: i64 = style_find(s, id)
+    if start < 0 {
+        return
+    }
+    var chain: [i64; 24] = [0 as i64; 24]
+    let n: usize = chain_of(s, start, &chain)
+    var k: usize = n
+    while k > 0 {
+        k = k - 1
+        let st: *mut Style = vec_elem_ptr[Style](&(*s).items, chain[k] as usize)
+        dx_props.rp_apply(rp, &(*st).rp)
+    }
+}
+
+fn resolve_table(s: *mut Styles, id: str, tp: *mut dx_props.TblProps) {
+    let start: i64 = style_find(s, id)
+    if start < 0 {
+        return
+    }
+    var chain: [i64; 24] = [0 as i64; 24]
+    let n: usize = chain_of(s, start, &chain)
+    var k: usize = n
+    while k > 0 {
+        k = k - 1
+        let st: *mut Style = vec_elem_ptr[Style](&(*s).items, chain[k] as usize)
+        dx_props.tbl_apply(tp, &(*st).tp)
+    }
+}
