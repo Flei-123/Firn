@@ -61,12 +61,12 @@ All libs: no native-only calls in model layers, must build for `wasm32-browser`,
 |---|---|
 | `lib/media/mp4.fi`, `webm.fi`, `ebml.fi` | container parsers (classic + fragmented MP4, WebM/Matroska) lifted from Certus, MPL-2.0 |
 | `lib/media/demux.fi` | one track API over both: `demux_open`, `demux_find_track`, `demux_track_*`, `demux_nsamples/off/size/pts_us/dts_us/sync`, `demux_seek_sync`, `demux_track_skip_us`; pts in microseconds, ffmpeg-style (edit list / Opus delay applied, audio may start negative); sample ranges outside the file read as size 0 |
-| `lib/media/video/source.fi` | `VideoSource`: `vs_open`, `vs_width/height/fps_milli/duration_us/codec`, `vs_next_frame(out_rgba, &pts)`, `vs_seek` (keyframe), `vs_close`; unsupported codecs open with `VS_ERR_UNSUPPORTED` but still probe |
+| `lib/media/video/vidsource.fi` | `VideoSource`: `vs_open`, `vs_width/height/fps_milli/duration_us/codec`, `vs_next_frame(out_rgba, &pts)`, `vs_seek` (keyframe), `vs_close`; unsupported codecs open with `VS_ERR_UNSUPPORTED` but still probe |
 | `lib/media/video/convert.fi` | scalar YUV420 -> RGBA (BT.601 / BT.709 by stream matrix) |
 | `lib/media/video/sync.fi` | pure model `sync_decide(frame_pts, clock_us, early, late)` -> SHOW / WAIT / DROP, driven by the audio clock (`lib/media/clock.fi`) |
 | `lib/media/video/h264/*.fi` | H.264 decoder (CAVLC+CABAC, I/P/B, 8x8, weighted, direct, multi-slice, cropping; no interlace) split into 28 modules; public API in `params` (`H264`, `h264_new`), `nal` (`h264_config_avcc/decode/flush/output/reset`), `pics` (`h264_free`), `types` (`Frame`) |
 
-Division with `lib/cast/h264dec.fi` (244 lines): the cast decoder is the tiny baseline-only decoder paired with `cast/h264enc` (RTP/RTSP round trip tests). It stays; real files (any profile, B-frames) go through `media.video.source`. Pointing cast at the lifted decoder is a roadmap item.
+Division with `lib/cast/h264dec.fi` (244 lines): the cast decoder is the tiny baseline-only decoder paired with `cast/h264enc` (RTP/RTSP round trip tests). It stays; real files (any profile, B-frames) go through `media.video.vidsource`. Pointing cast at the lifted decoder is a roadmap item.
 
 Lifted from Certus `lib/media/h264.fi` (9.2k lines): the helper threads (deblock/recon, futex), the breath hook and `thr.*` were removed (single thread, no platform dependency), so it builds for `wasm32-browser`; comments stripped; code tables in `h264/tables.fi`.
 
