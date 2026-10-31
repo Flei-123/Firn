@@ -1,61 +1,59 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.rt
+import media.audio.pktplay
 import media.audio.opus.opus
 import media.audio.opus.opus_dec
 
-export {
-    OpusPlay, play_new, play_free, play_alloc, play_set_packet, play_start, play_start_trim, play_channels, play_total, play_known,
-    play_read_f32, play_seek, OPUS_RATE,
-}
+export { OpusPlay, play_new, play_open, play_free, play_set_packet, play_start, play_start_trim, OPUS_RATE }
 
 const OPUS_RATE: u32 = 48000 as u32
 const MAX_FRAME: i32 = 5760
-const PREROLL: i64 = 9600
+const PREROLL: u64 = 9600 as u64
 
 struct OpusPlay {
     head: opus.Opus,
     dec: opus_dec.OpusDec,
-    n: usize,
-    ptrs: u64,
-    lens: u64,
-    starts: u64,
+    pp: pktplay.PktPlay,
     sum: u64,
-    total: u64,
-    known: bool,
-    cur: usize,
-    pcm: u64,
-    pend: i32,
-    pend_off: i32,
-    skip: i32,
-    pos: u64,
-    ready: bool,
+    ptrs: u64,
 }
 
 fn play_new() -> OpusPlay {
-    return OpusPlay { head: opus.opus_new(), dec: opus_dec.opus_dec_new(1), n: 0, ptrs: 0 as u64, lens: 0 as u64,
-        starts: 0 as u64, sum: 0 as u64, total: 0 as u64, known: false, cur: 0, pcm: 0 as u64, pend: 0, pend_off: 0,
-        skip: 0, pos: 0 as u64, ready: false }
+    return OpusPlay { head: opus.opus_new(), dec: opus_dec.opus_dec_new(1), pp: pktplay.pp_new(), sum: 0 as u64, ptrs: 0 as u64 }
+}
+
+fn new_decoder(p: *mut OpusPlay) {
+    (*p).dec = opus_dec.opus_dec_new((*p).head.channels)
+    opus_dec.opus_dec_set_gain(&(*p).dec, (*p).head.gain_q8)
 }
 
 fn play_free(p: *mut OpusPlay) {
     opus_dec.opus_dec_free(&(*p).dec)
-    if !(*p).ready {
-        return
-    }
-    rt.heap_free((*p).ptrs, (*p).n * 8 + 8)
-    rt.heap_free((*p).lens, (*p).n * 8 + 8)
-    rt.heap_free((*p).starts, (*p).n * 8 + 8)
-    rt.heap_free((*p).pcm, ((MAX_FRAME * (*p).head.channels) * 2 + 64) as usize)
-    (*p).ready = false
+    pktplay.pp_free(&(*p).pp)
 }
 
-fn play_channels(p: *mut OpusPlay) -> u32 { return (*p).head.channels as u32 }
-fn play_total(p: *mut OpusPlay) -> u64 { return (*p).total }
-fn play_known(p: *mut OpusPlay) -> bool { return (*p).known }
+fn do_decode(c: u64, ptr: u64, n: usize, pcm: u64, cap: i32) -> i32 {
+    let p: *mut OpusPlay = c as *mut OpusPlay
+    return opus_dec.opus_decode(&(*p).dec, ptr, n as i32, pcm, cap)
+}
+
+fn do_reset(c: u64) {
+    let p: *mut OpusPlay = c as *mut OpusPlay
+    opus_dec.opus_dec_free(&(*p).dec)
+    new_decoder(p)
+}
+
+fn play_open(p: *mut OpusPlay, head: u64, head_len: usize, count: usize) -> bool {
+    if opus.opus_head_parse(&(*p).head, head, head_len) != 0 {
+        return false
+    }
+    opus_dec.opus_dec_free(&(*p).dec)
+    new_decoder(p)
+    return pktplay.pp_alloc(&(*p).pp, count, (*p).head.channels, MAX_FRAME, p as u64, do_decode, do_reset, PREROLL)
+}
 
 fn play_set_packet(p: *mut OpusPlay, i: usize, ptr: u64, len: usize) {
-    rt.st64((*p).ptrs, i, ptr)
-    rt.st64((*p).lens, i, len as u64)
+    pktplay.pp_set(&(*p).pp, i, ptr, len, 0 as u64)
 }
 
 fn packet_samples(ptr: u64, len: usize) -> u64 {
@@ -69,42 +67,26 @@ fn packet_samples(ptr: u64, len: usize) -> u64 {
     return ((pk.frame_samples * pk.n) as u64)
 }
 
-fn play_alloc(p: *mut OpusPlay, head: u64, head_len: usize, count: usize) -> i32 {
-    if opus.opus_head_parse(&(*p).head, head, head_len) != 0 {
-        return 1
-    }
-    opus_dec.opus_dec_free(&(*p).dec)
-    (*p).n = count
-    (*p).ptrs = rt.heap_alloc(count * 8 + 8)
-    (*p).lens = rt.heap_alloc(count * 8 + 8)
-    (*p).starts = rt.heap_alloc(count * 8 + 8)
-    (*p).pcm = rt.heap_alloc(((MAX_FRAME * (*p).head.channels) * 2 + 64) as usize)
-    (*p).dec = opus_dec.opus_dec_new((*p).head.channels)
-    opus_dec.opus_dec_set_gain(&(*p).dec, (*p).head.gain_q8)
-    (*p).ready = true
-    return 0
-}
-
 fn play_start(p: *mut OpusPlay, last_granule: i64) {
     var acc: u64 = 0 as u64
     var i: usize = 0
-    while i < (*p).n {
-        rt.st64((*p).starts, i, acc)
-        acc = acc + packet_samples(rt.ld64((*p).ptrs, i), rt.ld64((*p).lens, i) as usize)
+    while i < (*p).pp.n {
+        let ptr: u64 = rt.ld64((*p).pp.ptrs, i)
+        let len: usize = rt.ld64((*p).pp.lens, i) as usize
+        pktplay.pp_set(&(*p).pp, i, ptr, len, acc)
+        acc = acc + packet_samples(ptr, len)
         i = i + 1
     }
-    (*p).sum = acc
     let skip: u64 = (*p).head.pre_skip as u64
     var end: u64 = acc
     if last_granule > 0 && (last_granule as u64) <= acc {
         end = last_granule as u64
     }
+    var total: u64 = 0 as u64
     if end > skip {
-        (*p).total = end - skip
+        total = end - skip
     }
-    (*p).known = true
-    (*p).skip = (*p).head.pre_skip
-    (*p).cur = 0
+    pktplay.pp_finish(&(*p).pp, skip, total)
 }
 
 fn play_start_trim(p: *mut OpusPlay, discard_ns: i64) {
@@ -113,99 +95,7 @@ fn play_start_trim(p: *mut OpusPlay, discard_ns: i64) {
         return
     }
     let cut: u64 = (discard_ns as u64) * 48 as u64 / 1000000 as u64
-    if cut < (*p).total {
-        (*p).total = (*p).total - cut
+    if cut < (*p).pp.total {
+        (*p).pp.total = (*p).pp.total - cut
     }
-}
-
-fn decode_next(p: *mut OpusPlay) {
-    let i: usize = (*p).cur
-    (*p).cur = i + 1
-    let len: usize = rt.ld64((*p).lens, i) as usize
-    if len < 1 {
-        return
-    }
-    let r: i32 = opus_dec.opus_decode(&(*p).dec, rt.ld64((*p).ptrs, i), len as i32, (*p).pcm, MAX_FRAME)
-    if r <= 0 {
-        return
-    }
-    var drop: i32 = (*p).skip
-    if drop > r {
-        drop = r
-    }
-    (*p).skip = (*p).skip - drop
-    (*p).pend = r - drop
-    (*p).pend_off = drop
-}
-
-fn play_read_f32(p: *mut OpusPlay, dst: u64, frames: usize) -> i64 {
-    let ch: usize = (*p).head.channels as usize
-    var out: usize = 0
-    while out < frames {
-        if (*p).pos >= (*p).total {
-            break
-        }
-        if (*p).pend <= 0 {
-            if (*p).cur >= (*p).n {
-                break
-            }
-            decode_next(p)
-            continue
-        }
-        var take: usize = (*p).pend as usize
-        if take > frames - out {
-            take = frames - out
-        }
-        let left: u64 = (*p).total - (*p).pos
-        if (take as u64) > left {
-            take = left as usize
-        }
-        var k: usize = 0
-        let base: usize = ((*p).pend_off as usize) * ch
-        while k < take * ch {
-            let v: i32 = (rt.ld16((*p).pcm, base + k) as% i16) as i32
-            *((dst + (((out * ch) + k) * 4) as u64) as *mut f32) = (v as f32) / 32768.0
-            k = k + 1
-        }
-        (*p).pend = (*p).pend - (take as i32)
-        (*p).pend_off = (*p).pend_off + (take as i32)
-        (*p).pos = (*p).pos + (take as u64)
-        out = out + take
-    }
-    return out as i64
-}
-
-fn find_packet(p: *mut OpusPlay, target: u64) -> usize {
-    var lo: usize = 0
-    var hi: usize = (*p).n
-    while hi - lo > 1 {
-        let mid: usize = (lo + hi) / 2
-        if rt.ld64((*p).starts, mid) <= target {
-            lo = mid
-        } else {
-            hi = mid
-        }
-    }
-    return lo
-}
-
-fn play_seek(p: *mut OpusPlay, frame: u64) -> bool {
-    if frame > (*p).total || (*p).n == 0 {
-        return false
-    }
-    let target: u64 = frame + ((*p).head.pre_skip as u64)
-    var from: u64 = 0 as u64
-    if target > (PREROLL as u64) {
-        from = target - (PREROLL as u64)
-    }
-    let idx: usize = find_packet(p, from)
-    opus_dec.opus_dec_free(&(*p).dec)
-    (*p).dec = opus_dec.opus_dec_new((*p).head.channels)
-    opus_dec.opus_dec_set_gain(&(*p).dec, (*p).head.gain_q8)
-    (*p).cur = idx
-    (*p).pend = 0
-    (*p).pend_off = 0
-    (*p).skip = (target - rt.ld64((*p).starts, idx)) as i32
-    (*p).pos = frame
-    return true
 }

@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    PktPlay, pp_new, pp_alloc, pp_free, pp_set, pp_finish, pp_read_f32, pp_seek, pp_total, pp_known,
+}
+
+struct PktPlay {
+    n: usize,
+    ptrs: u64,
+    lens: u64,
+    starts: u64,
+    ch: i32,
+    cap: i32,
+    pcm: u64,
+    ctx: u64,
+    decode: fn(u64, u64, usize, u64, i32) -> i32,
+    reset: fn(u64),
+    preroll: u64,
+    lead: u64,
+    total: u64,
+    known: bool,
+    cur: usize,
+    pend: i32,
+    pend_off: i32,
+    skip: i32,
+    pos: u64,
+    ready: bool,
+}
+
+fn no_decode(c: u64, p: u64, n: usize, pcm: u64, cap: i32) -> i32 { return 0 - 1 }
+fn no_reset(c: u64) { }
+
+fn pp_new() -> PktPlay {
+    return PktPlay { n: 0, ptrs: 0 as u64, lens: 0 as u64, starts: 0 as u64, ch: 1, cap: 0, pcm: 0 as u64, ctx: 0 as u64,
+        decode: no_decode, reset: no_reset, preroll: 0 as u64, lead: 0 as u64, total: 0 as u64, known: false, cur: 0,
+        pend: 0, pend_off: 0, skip: 0, pos: 0 as u64, ready: false }
+}
+
+fn pp_alloc(p: *mut PktPlay, count: usize, ch: i32, cap: i32, ctx: u64, decode: fn(u64, u64, usize, u64, i32) -> i32,
+    reset: fn(u64), preroll: u64) -> bool {
+    (*p).ptrs = rt.heap_alloc(count * 8 + 8)
+    (*p).lens = rt.heap_alloc(count * 8 + 8)
+    (*p).starts = rt.heap_alloc(count * 8 + 8)
+    (*p).pcm = rt.heap_alloc(((cap * ch) * 2 + 64) as usize)
+    if (*p).ptrs == 0 as u64 || (*p).lens == 0 as u64 || (*p).starts == 0 as u64 || (*p).pcm == 0 as u64 {
+        return false
+    }
+    (*p).n = count
+    (*p).ch = ch
+    (*p).cap = cap
+    (*p).ctx = ctx
+    (*p).decode = decode
+    (*p).reset = reset
+    (*p).preroll = preroll
+    (*p).ready = true
+    return true
+}
+
+fn pp_free(p: *mut PktPlay) {
+    if !(*p).ready {
+        return
+    }
+    rt.heap_free((*p).ptrs, (*p).n * 8 + 8)
+    rt.heap_free((*p).lens, (*p).n * 8 + 8)
+    rt.heap_free((*p).starts, (*p).n * 8 + 8)
+    rt.heap_free((*p).pcm, (((*p).cap * (*p).ch) * 2 + 64) as usize)
+    (*p).ready = false
+}
+
+fn pp_total(p: *mut PktPlay) -> u64 { return (*p).total }
+fn pp_known(p: *mut PktPlay) -> bool { return (*p).known }
+
+fn pp_set(p: *mut PktPlay, i: usize, ptr: u64, len: usize, start: u64) {
+    rt.st64((*p).ptrs, i, ptr)
+    rt.st64((*p).lens, i, len as u64)
+    rt.st64((*p).starts, i, start)
+}
+
+fn pp_finish(p: *mut PktPlay, lead: u64, total: u64) {
+    (*p).lead = lead
+    (*p).total = total
+    (*p).known = true
+    (*p).skip = lead as% i32
+    (*p).cur = 0
+    (*p).pend = 0
+    (*p).pos = 0 as u64
+}
+
+fn decode_next(p: *mut PktPlay) {
+    let i: usize = (*p).cur
+    (*p).cur = i + 1
+    let len: usize = rt.ld64((*p).lens, i) as usize
+    if len < 1 {
+        return
+    }
+    let f: fn(u64, u64, usize, u64, i32) -> i32 = (*p).decode
+    let r: i32 = f((*p).ctx, rt.ld64((*p).ptrs, i), len, (*p).pcm, (*p).cap)
+    if r <= 0 {
+        return
+    }
+    var drop: i32 = (*p).skip
+    if drop > r {
+        drop = r
+    }
+    (*p).skip = (*p).skip - drop
+    (*p).pend = r - drop
+    (*p).pend_off = drop
+}
+
+fn pp_read_f32(p: *mut PktPlay, dst: u64, frames: usize) -> i64 {
+    let ch: usize = (*p).ch as usize
+    var out: usize = 0
+    while out < frames {
+        if (*p).pos >= (*p).total {
+            break
+        }
+        if (*p).pend <= 0 {
+            if (*p).cur >= (*p).n {
+                break
+            }
+            decode_next(p)
+            continue
+        }
+        var take: usize = (*p).pend as usize
+        if take > frames - out {
+            take = frames - out
+        }
+        let left: u64 = (*p).total - (*p).pos
+        if (take as u64) > left {
+            take = left as usize
+        }
+        var k: usize = 0
+        let base: usize = ((*p).pend_off as usize) * ch
+        while k < take * ch {
+            let v: i32 = (rt.ld16((*p).pcm, base + k) as% i16) as i32
+            *((dst + (((out * ch) + k) * 4) as u64) as *mut f32) = (v as f32) / 32768.0
+            k = k + 1
+        }
+        (*p).pend = (*p).pend - (take as i32)
+        (*p).pend_off = (*p).pend_off + (take as i32)
+        (*p).pos = (*p).pos + (take as u64)
+        out = out + take
+    }
+    return out as i64
+}
+
+fn find_packet(p: *mut PktPlay, target: u64) -> usize {
+    var lo: usize = 0
+    var hi: usize = (*p).n
+    while hi - lo > 1 {
+        let mid: usize = (lo + hi) / 2
+        if rt.ld64((*p).starts, mid) <= target {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+fn pp_seek(p: *mut PktPlay, frame: u64) -> bool {
+    if frame > (*p).total || (*p).n == 0 {
+        return false
+    }
+    let target: u64 = frame + (*p).lead
+    var from: u64 = 0 as u64
+    if target > (*p).preroll {
+        from = target - (*p).preroll
+    }
+    let idx: usize = find_packet(p, from)
+    let f: fn(u64) = (*p).reset
+    f((*p).ctx)
+    (*p).cur = idx
+    (*p).pend = 0
+    (*p).pend_off = 0
+    (*p).skip = (target - rt.ld64((*p).starts, idx)) as% i32
+    (*p).pos = frame
+    return true
+}

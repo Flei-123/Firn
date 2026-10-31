@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.demux
+import media.audio.source
+import media.audio.pktplay
+import media.audio.aac.aac
+
+export { register, AacSrc }
+
+const FRAME: u64 = 1024 as u64
+const PREROLL: u64 = 2048 as u64
+
+struct AacSrc {
+    dec: aac.Aac,
+    pp: pktplay.PktPlay,
+    dm: demux.Demux,
+    is_adts: bool,
+}
+
+fn do_decode(c: u64, ptr: u64, n: usize, pcm: u64, cap: i32) -> i32 {
+    let s: *mut AacSrc = c as *mut AacSrc
+    aac.aac_decode(&(*s).dec, ptr, n, pcm)
+    return 1024
+}
+
+fn do_reset(c: u64) {
+    let s: *mut AacSrc = c as *mut AacSrc
+    aac.aac_reset(&(*s).dec)
+}
+
+fn open_m4a(s: *mut AacSrc, d: u64, n: usize) -> bool {
+    if demux.demux_open(&(*s).dm, d, n) != 0 {
+        return false
+    }
+    let t: i32 = demux.demux_find_track(&(*s).dm, demux.TK_AUDIO)
+    if t < 0 || demux.demux_track_codec(&(*s).dm, t) != demux.CODEC_AAC {
+        return false
+    }
+    let cnt: usize = demux.demux_nsamples(&(*s).dm, t)
+    if cnt == 0 {
+        return false
+    }
+    if aac.aac_config(&(*s).dec, demux.demux_track_cfg(&(*s).dm, t), demux.demux_track_cfg_len(&(*s).dm, t)) != 0 {
+        return false
+    }
+    let ch: i32 = aac.aac_channels(&(*s).dec) as i32
+    if !pktplay.pp_alloc(&(*s).pp, cnt, ch, 1024, s as u64, do_decode, do_reset, PREROLL) {
+        return false
+    }
+    var i: usize = 0
+    while i < cnt {
+        let off: u64 = demux.demux_sample_off(&(*s).dm, t, i)
+        let sz: usize = demux.demux_sample_size(&(*s).dm, t, i) as usize
+        if off == 0 as u64 || off + (sz as u64) > (n as u64) {
+            pktplay.pp_set(&(*s).pp, i, d, 0, (i as u64) * FRAME)
+        } else {
+            pktplay.pp_set(&(*s).pp, i, d + off, sz, (i as u64) * FRAME)
+        }
+        i = i + 1
+    }
+    let hz: u64 = aac.aac_hz(&(*s).dec) as u64
+    var lead: u64 = 0 as u64
+    let skip_us: i64 = demux.demux_track_skip_us(&(*s).dm, t)
+    if skip_us > 0 {
+        lead = (skip_us as u64) * hz / 1000000 as u64
+    }
+    var total: u64 = 0 as u64
+    if (cnt as u64) * FRAME > lead {
+        total = (cnt as u64) * FRAME - lead
+    }
+    pktplay.pp_finish(&(*s).pp, lead, total)
+    return true
+}
+
+fn adts_scan(d: u64, n: usize, fill: bool, s: *mut AacSrc) -> usize {
+    var pos: usize = 0
+    var cnt: usize = 0
+    var sr: u32 = 0
+    var cc: u32 = 0
+    var hl: usize = 0
+    while pos < n {
+        let fl: usize = aac.aac_adts_frame(d + pos as u64, n - pos, &sr, &cc, &hl)
+        if fl == 0 || pos + fl > n {
+            break
+        }
+        if fill {
+            pktplay.pp_set(&(*s).pp, cnt, d + (pos + hl) as u64, fl - hl, (cnt as u64) * FRAME)
+        }
+        cnt = cnt + 1
+        pos = pos + fl
+    }
+    return cnt
+}
+
+fn open_adts(s: *mut AacSrc, d: u64, n: usize) -> bool {
+    var sr: u32 = 0
+    var cc: u32 = 0
+    var hl: usize = 0
+    if aac.aac_adts_frame(d, n, &sr, &cc, &hl) == 0 {
+        return false
+    }
+    if aac.aac_config_adts(&(*s).dec, sr, cc) != 0 {
+        return false
+    }
+    let cnt: usize = adts_scan(d, n, false, s)
+    if cnt == 0 {
+        return false
+    }
+    let ch: i32 = aac.aac_channels(&(*s).dec) as i32
+    if !pktplay.pp_alloc(&(*s).pp, cnt, ch, 1024, s as u64, do_decode, do_reset, PREROLL) {
+        return false
+    }
+    adts_scan(d, n, true, s)
+    pktplay.pp_finish(&(*s).pp, 0 as u64, (cnt as u64) * FRAME)
+    return true
+}
+
+fn release(s: *mut AacSrc) {
+    aac.aac_free(&(*s).dec)
+    pktplay.pp_free(&(*s).pp)
+    if !(*s).is_adts {
+        demux.demux_free(&(*s).dm)
+    }
+}
+
+fn aac_open(d: u64, n: usize, adts: bool) -> u64 {
+    if n < 16 {
+        return 0 as u64
+    }
+    let h: u64 = source.obj_new[AacSrc]()
+    if h == 0 as u64 {
+        return 0 as u64
+    }
+    let s: *mut AacSrc = h as *mut AacSrc
+    (*s).dec = aac.aac_new()
+    (*s).pp = pktplay.pp_new()
+    (*s).dm = demux.demux_new()
+    (*s).is_adts = adts
+    var ok: bool = false
+    if adts {
+        ok = open_adts(s, d, n)
+    } else {
+        ok = open_m4a(s, d, n)
+    }
+    if !ok {
+        release(s)
+        source.obj_free[AacSrc](h)
+        return 0 as u64
+    }
+    return h
+}
+
+fn m4a_open(d: u64, n: usize) -> u64 {
+    return aac_open(d, n, false)
+}
+
+fn adts_open(d: u64, n: usize) -> u64 {
+    return aac_open(d, n, true)
+}
+
+fn aac_info(h: u64, i: *mut source.AudioInfo) {
+    let s: *mut AacSrc = h as *mut AacSrc
+    (*i).channels = aac.aac_channels(&(*s).dec)
+    (*i).rate = aac.aac_hz(&(*s).dec)
+    (*i).bits = 32 as u32
+    (*i).frames = pktplay.pp_total(&(*s).pp)
+    (*i).known_length = pktplay.pp_known(&(*s).pp)
+    (*i).seekable = true
+}
+
+fn aac_read(h: u64, dst: u64, frames: usize) -> i64 {
+    let s: *mut AacSrc = h as *mut AacSrc
+    return pktplay.pp_read_f32(&(*s).pp, dst, frames)
+}
+
+fn aac_seek(h: u64, frame: u64) -> bool {
+    let s: *mut AacSrc = h as *mut AacSrc
+    return pktplay.pp_seek(&(*s).pp, frame)
+}
+
+fn aac_close(h: u64) {
+    let s: *mut AacSrc = h as *mut AacSrc
+    release(s)
+    source.obj_free[AacSrc](h)
+}
+
+fn register(r: *mut source.Registry) -> bool {
+    var ok: bool = source.registry_add(r, source.Codec { id: source.FMT_AAC_M4A, open: m4a_open, info: aac_info,
+        read: aac_read, seek: aac_seek, close: aac_close })
+    if !source.registry_add(r, source.Codec { id: source.FMT_AAC_ADTS, open: adts_open, info: aac_info,
+        read: aac_read, seek: aac_seek, close: aac_close }) {
+        ok = false
+    }
+    return ok
+}
