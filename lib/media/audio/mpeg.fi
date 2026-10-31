@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.source
+import media.audio.bytes
+import media.audio.mp3_hdr
+import media.audio.sniff
+import ton.mp3
+import ton.mp3_tab
+
+export { register, Mp3Src }
+
+const PREROLL: usize = 8
+
+struct Mp3Src {
+    data: u64,
+    n: usize,
+    start: usize,
+    idx: u64,
+    count: usize,
+    first: usize,
+    hz: u32,
+    channels: u32,
+    spf: usize,
+    delay: usize,
+    padding: usize,
+    skip_from: usize,
+    total: u64,
+    cur: usize,
+    skip_left: u64,
+    remaining: u64,
+    pend: usize,
+    pend_off: usize,
+    tabs: mp3_tab.Tabs,
+    dec: mp3.Mp3Dec,
+    scr: mp3.Mp3Scratch,
+    pcm: [i16; 2304],
+}
+
+fn frame_at(m: *mut Mp3Src, i: usize) -> usize {
+    return rt.ld32((*m).idx, i) as usize
+}
+
+fn scan(m: *mut Mp3Src, fill: bool) -> usize {
+    let d: u64 = (*m).data
+    let n: usize = (*m).n
+    var p: usize = (*m).start
+    var cnt: usize = 0
+    var first_at: usize = 0
+    while p + 4 <= n {
+        let h: u64 = d + p as u64
+        let l: usize = mp3_hdr.mp3_hdr_len(h)
+        var ok: bool = l > 0 && p + l <= n
+        if ok && cnt > 0 && !mp3_hdr.mp3_hdr_same(d + first_at as u64, h) {
+            ok = false
+        }
+        if ok && p + l + 4 <= n && cnt == 0 {
+            ok = mp3_hdr.mp3_hdr_len(d + (p + l) as u64) > 0 && mp3_hdr.mp3_hdr_same(h, d + (p + l) as u64)
+        }
+        if ok {
+            if cnt == 0 {
+                first_at = p
+            }
+            if fill {
+                rt.st32((*m).idx, cnt, p as u32)
+            }
+            cnt = cnt + 1
+            p = p + l
+        } else {
+            p = p + 1
+        }
+    }
+    return cnt
+}
+
+fn xing_at(f: u64) -> usize {
+    let h1: u32 = bytes.u8_at(f, 1)
+    let h3: u32 = bytes.u8_at(f, 3)
+    let mpeg1: bool = ((h1 >> 3) & 3 as u32) == 3 as u32
+    let mono: bool = ((h3 >> 6) & 3 as u32) == 3 as u32
+    var side: usize = 32
+    if mpeg1 && mono {
+        side = 17
+    } else if !mpeg1 && mono {
+        side = 9
+    } else if !mpeg1 {
+        side = 17
+    }
+    var at: usize = 4 + side
+    if (h1 & 1 as u32) == 0 as u32 {
+        at = at + 2
+    }
+    let t: u32 = bytes.be32(f, at)
+    if t == 1483304551 as u32 || t == 1231971951 as u32 {
+        return at
+    }
+    return 0
+}
+
+fn lame_field(f: u64, tag_at: usize, frame_bytes: usize, want_delay: bool) -> usize {
+    var o: usize = tag_at + 4
+    let flags: u32 = bytes.be32(f, o) & 255 as u32
+    o = o + 4
+    if (flags & 1 as u32) != 0 as u32 { o = o + 4 }
+    if (flags & 2 as u32) != 0 as u32 { o = o + 4 }
+    if (flags & 4 as u32) != 0 as u32 { o = o + 100 }
+    if (flags & 8 as u32) != 0 as u32 { o = o + 4 }
+    if o + 24 > frame_bytes {
+        return 0
+    }
+    if rt.ld8(f, o) != 76 as u8 {
+        return 0
+    }
+    let b0: u32 = bytes.u8_at(f, o + 21)
+    let b1: u32 = bytes.u8_at(f, o + 22)
+    let b2: u32 = bytes.u8_at(f, o + 23)
+    if want_delay {
+        return ((b0 << 4) | (b1 >> 4)) as usize
+    }
+    return (((b1 & 15 as u32) << 8) | b2) as usize
+}
+
+fn mp3_free(h: u64) {
+    let m: *mut Mp3Src = h as *mut Mp3Src
+    if (*m).idx != 0 as u64 {
+        rt.heap_free((*m).idx, ((*m).count + 1) * 4)
+    }
+    source.obj_free[Mp3Src](h)
+}
+
+fn reset_decoder(m: *mut Mp3Src) {
+    (*m).dec = mp3.mp3_new()
+    (*m).pend = 0
+    (*m).pend_off = 0
+}
+
+fn mp3_open(d: u64, n: usize) -> u64 {
+    if n < 8 {
+        return 0 as u64
+    }
+    let h: u64 = source.obj_new[Mp3Src]()
+    if h == 0 as u64 {
+        return 0 as u64
+    }
+    let m: *mut Mp3Src = h as *mut Mp3Src
+    (*m).data = d
+    (*m).n = n
+    (*m).start = sniff.id3_size(d, n)
+    if (*m).start > n {
+        (*m).start = 0
+    }
+    let cnt: usize = scan(m, false)
+    if cnt == 0 {
+        source.obj_free[Mp3Src](h)
+        return 0 as u64
+    }
+    (*m).idx = rt.heap_alloc((cnt + 1) * 4)
+    if (*m).idx == 0 as u64 {
+        source.obj_free[Mp3Src](h)
+        return 0 as u64
+    }
+    (*m).count = scan(m, true)
+    let f0: u64 = d + frame_at(m, 0) as u64
+    (*m).hz = mp3_hdr.mp3_hdr_hz(f0)
+    (*m).channels = mp3_hdr.mp3_hdr_channels(f0)
+    (*m).spf = mp3_hdr.mp3_hdr_samples(f0) as usize
+    (*m).first = 0
+    let tag: usize = xing_at(f0)
+    if tag != 0 {
+        (*m).first = 1
+        let fb: usize = mp3_hdr.mp3_hdr_len(f0)
+        (*m).delay = lame_field(f0, tag, fb, true)
+        (*m).padding = lame_field(f0, tag, fb, false)
+    }
+    let audio: usize = (*m).count - (*m).first
+    if audio == 0 {
+        mp3_free(h)
+        return 0 as u64
+    }
+    let all: usize = audio * (*m).spf
+    var from: usize = 0
+    var upto: usize = all
+    if (*m).delay > 0 || (*m).padding > 0 {
+        from = (*m).delay + 529
+        if (*m).padding > 529 && (*m).padding - 529 < all {
+            upto = all - ((*m).padding - 529)
+        }
+    }
+    if from >= upto {
+        from = 0
+        upto = all
+    }
+    (*m).skip_from = from
+    (*m).total = (upto - from) as u64
+    (*m).tabs = mp3_tab.tabs_new()
+    (*m).dec = mp3.mp3_new()
+    (*m).scr = mp3.mp3_scratch_new()
+    (*m).cur = (*m).first
+    (*m).skip_left = from as u64
+    (*m).remaining = (*m).total
+    return h
+}
+
+fn mp3_info(h: u64, i: *mut source.AudioInfo) {
+    let m: *mut Mp3Src = h as *mut Mp3Src
+    (*i).channels = (*m).channels
+    (*i).rate = (*m).hz
+    (*i).bits = 16 as u32
+    (*i).frames = (*m).total
+    (*i).known_length = true
+    (*i).seekable = true
+}
+
+fn decode_next(m: *mut Mp3Src) -> bool {
+    if (*m).cur >= (*m).count {
+        return false
+    }
+    let off: usize = frame_at(m, (*m).cur)
+    (*m).cur = (*m).cur + 1
+    var info: mp3.Mp3Info = mp3.Mp3Info { frame_bytes: 0, frame_offset: 0, channels: 0, hz: 0, layer: 0, bitrate_kbps: 0 }
+    let got: i32 = mp3.mp3_decode_frame(&(*m).tabs, &(*m).dec, &(*m).scr, (*m).data + off as u64, ((*m).n - off) as i32,
+        (&(*m).pcm[0]) as u64, &info)
+    var cnt: usize = got as usize
+    if got <= 0 || info.channels != (*m).channels as i32 {
+        cnt = (*m).spf
+        rt.mem_set((&(*m).pcm[0]) as u64, 0 as u8, 2304 * 2)
+    }
+    var drop: usize = cnt
+    if (*m).skip_left < (cnt as u64) {
+        drop = (*m).skip_left as usize
+    }
+    (*m).skip_left = (*m).skip_left - (drop as u64)
+    (*m).pend = cnt - drop
+    (*m).pend_off = drop
+    return true
+}
+
+fn mp3_read(h: u64, dst: u64, frames: usize) -> i64 {
+    let m: *mut Mp3Src = h as *mut Mp3Src
+    let ch: usize = (*m).channels as usize
+    var out: usize = 0
+    while out < frames && (*m).remaining > 0 as u64 {
+        if (*m).pend == 0 {
+            if !decode_next(m) {
+                (*m).remaining = 0 as u64
+                break
+            }
+            continue
+        }
+        var k: usize = (*m).pend
+        if k > frames - out {
+            k = frames - out
+        }
+        if (k as u64) > (*m).remaining {
+            k = (*m).remaining as usize
+        }
+        var i: usize = 0
+        while i < k * ch {
+            *((dst + ((out * ch + i) * 4) as u64) as *mut f32) = ((*m).pcm[(*m).pend_off * ch + i] as f32) / 32768.0
+            i = i + 1
+        }
+        (*m).pend = (*m).pend - k
+        (*m).pend_off = (*m).pend_off + k
+        (*m).remaining = (*m).remaining - (k as u64)
+        out = out + k
+    }
+    return out as i64
+}
+
+fn mp3_seek(h: u64, frame: u64) -> bool {
+    let m: *mut Mp3Src = h as *mut Mp3Src
+    if frame > (*m).total {
+        return false
+    }
+    let pos: u64 = frame + ((*m).skip_from as u64)
+    var fi: usize = (pos / ((*m).spf as u64)) as usize
+    var from: usize = 0
+    if fi > PREROLL {
+        from = fi - PREROLL
+    }
+    reset_decoder(m)
+    (*m).cur = (*m).first + from
+    (*m).skip_left = pos - (from as u64) * ((*m).spf as u64)
+    (*m).remaining = (*m).total - frame
+    return true
+}
+
+fn register(r: *mut source.Registry) -> bool {
+    return source.registry_add(r, source.Codec { id: source.FMT_MP3, open: mp3_open, info: mp3_info, read: mp3_read,
+        seek: mp3_seek, close: mp3_free })
+}

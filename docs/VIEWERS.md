@@ -81,3 +81,11 @@ Opener contract for other workers: `registry.register("pdf.main", kinds.KIND_PDF
 * `kitview`: `View` dispatcher bytes + name -> pages (kitdoc), code/text (kitcode), markdown (`fui.markdownview`), media placeholder, unsupported placeholder.
 
 Tests: `tests/6400`-`6403_docview_*.fi`; `wasm32-browser` builds of `kitview` and the core pass.
+
+## G4 audio status (2026-10-31)
+
+API: `lib/media/audio/source.fi` (`AudioSource`: `source_open`, `source_info`, `source_read_f32`, `source_seek`, `source_seek_ms`, `source_close`), `sniff.fi` (magic-byte sniffer), `open.fi` (`open_bytes`), `all.fi` (`register_all`; apps import single codecs to keep WASM small), clock `lib/media/clock.fi`.
+Codecs done: WAV (u8/s16/s24/s32/f32/f64/A-law/mu-law), MP3 (`mpeg.fi`, gapless Xing/LAME, seek), Ogg Vorbis (`ogg_vorbis.fi`), FLAC (`flac.fi` over `flac_dec.fi`, lifted from Certus). Module names avoid the basenames `mp3`/`vorbis` (an import of `ton.mp3` resolves wrongly next to a module of the same basename).
+Cross-check: `python3 tools/media/audio_cross.py` (ffmpeg f32le: WAV/FLAC bit-exact, MP3 SNR ~79-83 dB with identical length, Vorbis maxdiff 1e-7, seek, fuzz 2000 runs without crash or hang).
+WASM (wasm32-browser, probe `tools/media/audio_wasm_probe.fi`, whole module): wav 25.7 KB, flac 45.7 KB, ogg_vorbis 122.9 KB. MP3 does NOT build for wasm32-browser yet: `ton.mp3` uses SIMD (ShufF32/MaxF32 in `l3_imdct36`, `scale_pcm4c`).
+Open: Opus (Certus celt/silk/opus_dec, needs port onto `ton.ogg`), AAC (Certus aac.fi + G5 `lib/media/mp4.fi` demux), audio.sink playback adapter with `media.clock`, MP3 scalar path for wasm.

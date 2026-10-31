@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    AudioInfo, Codec, Registry, AudioSource,
+    FMT_UNKNOWN, FMT_WAV, FMT_MP3, FMT_FLAC, FMT_VORBIS, FMT_OPUS, FMT_AAC_M4A, FMT_AAC_ADTS,
+    registry_new, registry_add, registry_find, source_open, source_open_as, source_info, source_read_f32,
+    source_seek, source_seek_ms, source_position, source_position_ms, source_close, source_eof, info_empty,
+    source_new, format_name, MAX_CODECS, obj_new, obj_free, fill_silence,
+}
+
+const FMT_UNKNOWN: u32 = 0
+const FMT_WAV: u32 = 1
+const FMT_MP3: u32 = 2
+const FMT_FLAC: u32 = 3
+const FMT_VORBIS: u32 = 4
+const FMT_OPUS: u32 = 5
+const FMT_AAC_M4A: u32 = 6
+const FMT_AAC_ADTS: u32 = 7
+const MAX_CODECS: usize = 12
+
+struct AudioInfo {
+    format: u32,
+    channels: u32,
+    rate: u32,
+    bits: u32,
+    frames: u64,
+    known_length: bool,
+    duration_ms: u64,
+    seekable: bool,
+}
+
+struct Codec {
+    id: u32,
+    open: fn(u64, usize) -> u64,
+    info: fn(u64, *mut AudioInfo),
+    read: fn(u64, u64, usize) -> i64,
+    seek: fn(u64, u64) -> bool,
+    close: fn(u64),
+}
+
+struct Registry {
+    n: usize,
+    codecs: [Codec; 12],
+}
+
+struct AudioSource {
+    codec: Codec,
+    handle: u64,
+    info: AudioInfo,
+    pos: u64,
+    ended: bool,
+}
+
+fn no_open(d: u64, n: usize) -> u64 { return 0 as u64 }
+fn no_info(h: u64, i: *mut AudioInfo) { }
+fn no_read(h: u64, d: u64, n: usize) -> i64 { return 0 - 1 }
+fn no_seek(h: u64, f: u64) -> bool { return false }
+fn no_close(h: u64) { }
+
+fn codec_none() -> Codec {
+    return Codec { id: FMT_UNKNOWN, open: no_open, info: no_info, read: no_read, seek: no_seek, close: no_close }
+}
+
+fn info_empty() -> AudioInfo {
+    return AudioInfo { format: FMT_UNKNOWN, channels: 0 as u32, rate: 0 as u32, bits: 0 as u32, frames: 0 as u64,
+        known_length: false, duration_ms: 0 as u64, seekable: false }
+}
+
+fn format_name(f: u32) -> str {
+    if f == FMT_WAV { return "wav" }
+    if f == FMT_MP3 { return "mp3" }
+    if f == FMT_FLAC { return "flac" }
+    if f == FMT_VORBIS { return "vorbis" }
+    if f == FMT_OPUS { return "opus" }
+    if f == FMT_AAC_M4A { return "aac-m4a" }
+    if f == FMT_AAC_ADTS { return "aac-adts" }
+    return "unknown"
+}
+
+fn source_new() -> AudioSource {
+    return AudioSource { codec: codec_none(), handle: 0 as u64, info: info_empty(), pos: 0 as u64, ended: false }
+}
+
+fn registry_new() -> Registry {
+    let z: Codec = codec_none()
+    return Registry { n: 0, codecs: [z, z, z, z, z, z, z, z, z, z, z, z] }
+}
+
+fn registry_add(r: *mut Registry, c: Codec) -> bool {
+    var i: usize = 0
+    while i < (*r).n {
+        if (*r).codecs[i].id == c.id {
+            (*r).codecs[i] = c
+            return true
+        }
+        i = i + 1
+    }
+    if (*r).n >= MAX_CODECS {
+        return false
+    }
+    (*r).codecs[(*r).n] = c
+    (*r).n = (*r).n + 1
+    return true
+}
+
+fn registry_find(r: *mut Registry, id: u32, out: *mut Codec) -> bool {
+    var i: usize = 0
+    while i < (*r).n {
+        if (*r).codecs[i].id == id {
+            *out = (*r).codecs[i]
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn finish_open(c: Codec, h: u64, s: *mut AudioSource) -> bool {
+    (*s).codec = c
+    (*s).handle = h
+    (*s).info = info_empty()
+    let f: fn(u64, *mut AudioInfo) = c.info
+    f(h, &(*s).info)
+    (*s).info.format = c.id
+    if (*s).info.known_length && (*s).info.rate != 0 as u32 {
+        (*s).info.duration_ms = (*s).info.frames * 1000 as u64 / ((*s).info.rate as u64)
+    }
+    (*s).pos = 0 as u64
+    (*s).ended = false
+    return (*s).info.channels > 0 as u32 && (*s).info.rate > 0 as u32
+}
+
+fn source_open_as(r: *mut Registry, id: u32, data: u64, n: usize, s: *mut AudioSource) -> bool {
+    var c: Codec = codec_none()
+    if !registry_find(r, id, &c) {
+        return false
+    }
+    let op: fn(u64, usize) -> u64 = c.open
+    let h: u64 = op(data, n)
+    if h == 0 as u64 {
+        return false
+    }
+    if !finish_open(c, h, s) {
+        let cl: fn(u64) = c.close
+        cl(h)
+        return false
+    }
+    return true
+}
+
+fn source_open(r: *mut Registry, sniffed: u32, data: u64, n: usize, s: *mut AudioSource) -> bool {
+    if sniffed != FMT_UNKNOWN && source_open_as(r, sniffed, data, n, s) {
+        return true
+    }
+    var i: usize = 0
+    while i < (*r).n {
+        let id: u32 = (*r).codecs[i].id
+        if id != sniffed && source_open_as(r, id, data, n, s) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn source_info(s: *mut AudioSource) -> AudioInfo {
+    return (*s).info
+}
+
+fn source_eof(s: *mut AudioSource) -> bool {
+    return (*s).ended
+}
+
+fn source_read_f32(s: *mut AudioSource, dst: u64, frames: usize) -> i64 {
+    if (*s).ended || frames == 0 {
+        return 0
+    }
+    let f: fn(u64, u64, usize) -> i64 = (*s).codec.read
+    let got: i64 = f((*s).handle, dst, frames)
+    if got <= 0 {
+        if got == 0 {
+            (*s).ended = true
+        }
+        return got
+    }
+    (*s).pos = (*s).pos + (got as u64)
+    return got
+}
+
+fn source_seek(s: *mut AudioSource, frame: u64) -> bool {
+    let f: fn(u64, u64) -> bool = (*s).codec.seek
+    if !f((*s).handle, frame) {
+        return false
+    }
+    (*s).pos = frame
+    (*s).ended = false
+    return true
+}
+
+fn source_seek_ms(s: *mut AudioSource, ms: u64) -> bool {
+    return source_seek(s, ms * ((*s).info.rate as u64) / 1000 as u64)
+}
+
+fn source_position(s: *mut AudioSource) -> u64 {
+    return (*s).pos
+}
+
+fn source_position_ms(s: *mut AudioSource) -> u64 {
+    if (*s).info.rate == 0 as u32 {
+        return 0 as u64
+    }
+    return (*s).pos * 1000 as u64 / ((*s).info.rate as u64)
+}
+
+fn source_close(s: *mut AudioSource) {
+    if (*s).handle != 0 as u64 {
+        let f: fn(u64) = (*s).codec.close
+        f((*s).handle)
+        (*s).handle = 0 as u64
+    }
+}
+
+fn obj_new[T: Any]() -> u64 {
+    let sz: usize = size_of[T]()
+    let p: u64 = rt.heap_alloc(sz)
+    if p != 0 as u64 {
+        rt.mem_set(p, 0 as u8, sz)
+    }
+    return p
+}
+
+fn obj_free[T: Any](p: u64) {
+    if p != 0 as u64 {
+        rt.heap_free(p, size_of[T]())
+    }
+}
+
+fn fill_silence(dst: u64, count: usize) {
+    rt.mem_set(dst, 0 as u8, count * 4)
+}

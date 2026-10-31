@@ -1,0 +1,954 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    Mp4, mp4_new, mp4_free, mp4_parse, mp4_find, mp4_ntracks,
+    mp4_count, mp4_off, mp4_size, mp4_dts, mp4_cts, mp4_sync,
+    mp4_timescale, mp4_cfg, mp4_cfg_len, mp4_hz, mp4_channels, mp4_objtype, mp4_codec,
+    mp4_width, mp4_height, mp4_skip, mp4_duration, mp4_id, mp4_chunk, mp4_clear_samples, mp4_cfg_copy, mp4_kind, mp4_init_seen,
+    KIND_AUDIO, KIND_VIDEO, CODEC_MP4A, CODEC_AVC1,
+}
+
+const KIND_NONE: u32 = 0
+const KIND_AUDIO: u32 = 1
+const KIND_VIDEO: u32 = 2
+
+const MAXT: usize = 4
+const REC: usize = 32
+
+const FCC_FTYP: u32 = 0x66747970
+const FCC_MOOV: u32 = 0x6D6F6F76
+const FCC_MOOF: u32 = 0x6D6F6F66
+const FCC_TRAK: u32 = 0x7472616B
+const FCC_TKHD: u32 = 0x746B6864
+const FCC_MDIA: u32 = 0x6D646961
+const FCC_MDHD: u32 = 0x6D646864
+const FCC_HDLR: u32 = 0x68646C72
+const FCC_MINF: u32 = 0x6D696E66
+const FCC_STBL: u32 = 0x7374626C
+const FCC_STSD: u32 = 0x73747364
+const FCC_STTS: u32 = 0x73747473
+const FCC_CTTS: u32 = 0x63747473
+const FCC_STSC: u32 = 0x73747363
+const FCC_STSZ: u32 = 0x7374737A
+const FCC_STCO: u32 = 0x7374636F
+const FCC_CO64: u32 = 0x636F3634
+const FCC_STSS: u32 = 0x73747373
+const FCC_EDTS: u32 = 0x65647473
+const FCC_ELST: u32 = 0x656C7374
+const FCC_MVEX: u32 = 0x6D766578
+const FCC_TREX: u32 = 0x74726578
+const FCC_TRAF: u32 = 0x74726166
+const FCC_TFHD: u32 = 0x74666864
+const FCC_TFDT: u32 = 0x74666474
+const FCC_TRUN: u32 = 0x7472756E
+const FCC_ESDS: u32 = 0x65736473
+const FCC_AVCC: u32 = 0x61766343
+const FCC_SOUN: u32 = 0x736F756E
+const FCC_VIDE: u32 = 0x76696465
+const CODEC_MP4A: u32 = 0x6D703461
+const CODEC_AVC1: u32 = 0x61766331
+
+struct Track {
+    used: i32,
+    id: u32,
+    kind: u32,
+    timescale: u32,
+    duration: u64,
+    codec: u32,
+    objtype: u32,
+    ch: u32,
+    hz: u32,
+    w: u32,
+    h: u32,
+    cfg: u64,
+    cfg_len: usize,
+    skip: i64,
+    stts: u64, stts_len: usize,
+    ctts: u64, ctts_len: usize,
+    stsc: u64, stsc_len: usize,
+    stsz: u64, stsz_len: usize,
+    stco: u64, stco_len: usize,
+    co64: u64, co64_len: usize,
+    stss: u64, stss_len: usize,
+    trex_dur: u32,
+    trex_size: u32,
+    trex_flags: u32,
+    next_dts: u64,
+    samples: rt.Buf,
+    nsamples: usize,
+}
+
+struct Mp4 {
+    data: u64,
+    len: usize,
+    nt: usize,
+    t: [Track; 4],
+    frag: i32,
+    init_seen: i32,
+    base_off: u64,
+}
+
+fn track_new() -> Track {
+    return Track {
+        used: 0, id: 0, kind: KIND_NONE, timescale: 0, duration: 0, codec: 0, objtype: 0,
+        ch: 0, hz: 0, w: 0, h: 0, cfg: 0, cfg_len: 0, skip: -1,
+        stts: 0, stts_len: 0, ctts: 0, ctts_len: 0, stsc: 0, stsc_len: 0, stsz: 0, stsz_len: 0,
+        stco: 0, stco_len: 0, co64: 0, co64_len: 0, stss: 0, stss_len: 0,
+        trex_dur: 0, trex_size: 0, trex_flags: 0, next_dts: 0,
+        samples: rt.buf_new(), nsamples: 0,
+    }
+}
+
+fn mp4_new() -> Mp4 {
+    return Mp4 { data: 0, len: 0, nt: 0, t: [track_new(); 4], frag: 0, init_seen: 0, base_off: 0 }
+}
+
+fn mp4_free(m: *mut Mp4) {
+    var i: usize = 0
+    while i < MAXT {
+        rt.buf_free(&(*m).t[i].samples)
+        i = i + 1
+    }
+}
+
+fn b8(p: u64, o: usize) -> u32 {
+    return (*((p + o as u64) as *mut u8)) as u32
+}
+
+fn b16(p: u64, o: usize) -> u32 {
+    return (b8(p, o) << 8) | b8(p, o + 1)
+}
+
+fn b32(p: u64, o: usize) -> u32 {
+    return (b8(p, o) << 24) | (b8(p, o + 1) << 16) | (b8(p, o + 2) << 8) | b8(p, o + 3)
+}
+
+fn b64(p: u64, o: usize) -> u64 {
+    return ((b32(p, o) as u64) << 32) | (b32(p, o + 4) as u64)
+}
+
+fn box_at(d: u64, pos: usize, end: usize, ty: *mut u32, hdr: *mut usize, size: *mut usize) -> i32 {
+    if pos + 8 > end {
+        return 0
+    }
+    var sz: u64 = b32(d, pos) as u64
+    *ty = b32(d, pos + 4)
+    var h: usize = 8
+    if sz == 1 {
+        if pos + 16 > end {
+            return 0
+        }
+        sz = b64(d, pos + 8)
+        h = 16
+    }
+    if sz == 0 {
+        sz = (end - pos) as u64
+    }
+    if sz < (h as u64) {
+        return 0
+    }
+    if sz > ((end - pos) as u64) {
+        sz = (end - pos) as u64
+    }
+    *hdr = h
+    *size = sz as usize
+    return 1
+}
+
+fn parse_esds(t: *mut Track, d: u64, start: usize, end: usize) {
+    var pos: usize = start + 4
+    if pos + 2 > end {
+        return
+    }
+    if b8(d, pos) != 3 {
+        return
+    }
+    pos = pos + 1
+    var len: u32 = 0
+    var k: u32 = 0
+    while k < 4 {
+        if pos >= end {
+            return
+        }
+        let b: u32 = b8(d, pos)
+        pos = pos + 1
+        len = (len << 7) | (b & 0x7F)
+        k = k + 1
+        if (b & 0x80) == 0 {
+            k = 4
+        }
+    }
+    if pos + 3 > end {
+        return
+    }
+    let flags: u32 = b8(d, pos + 2)
+    pos = pos + 3
+    if (flags & 0x80) != 0 {
+        pos = pos + 2
+    }
+    if (flags & 0x40) != 0 {
+        if pos >= end {
+            return
+        }
+        pos = pos + 1 + (b8(d, pos) as usize)
+    }
+    if (flags & 0x20) != 0 {
+        pos = pos + 2
+    }
+    if pos + 2 > end {
+        return
+    }
+    if b8(d, pos) != 4 {
+        return
+    }
+    pos = pos + 1
+    k = 0
+    while k < 4 {
+        if pos >= end {
+            return
+        }
+        let b2: u32 = b8(d, pos)
+        pos = pos + 1
+        k = k + 1
+        if (b2 & 0x80) == 0 {
+            k = 4
+        }
+    }
+    if pos + 13 > end {
+        return
+    }
+    (*t).objtype = b8(d, pos)
+    pos = pos + 13
+    if pos + 2 > end {
+        return
+    }
+    if b8(d, pos) != 5 {
+        return
+    }
+    pos = pos + 1
+    var dl: usize = 0
+    k = 0
+    while k < 4 {
+        if pos >= end {
+            return
+        }
+        let b3: u32 = b8(d, pos)
+        pos = pos + 1
+        dl = (dl << 7) | ((b3 & 0x7F) as usize)
+        k = k + 1
+        if (b3 & 0x80) == 0 {
+            k = 4
+        }
+    }
+    if pos + dl > end {
+        return
+    }
+    (*t).cfg = d + pos as u64
+    (*t).cfg_len = dl
+}
+
+fn parse_stsd(t: *mut Track, d: u64, start: usize, end: usize) {
+    var pos: usize = start + 8
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    if box_at(d, pos, end, &ty, &hdr, &size) == 0 {
+        return
+    }
+    let entry_end: usize = pos + size
+    (*t).codec = ty
+    let body: usize = pos + hdr
+    if (*t).kind == KIND_AUDIO {
+        if body + 28 > entry_end {
+            return
+        }
+        let ver: u32 = b16(d, body + 8)
+        (*t).ch = b16(d, body + 16)
+        (*t).hz = b16(d, body + 24)
+        var skip: usize = 28
+        if ver == 1 {
+            skip = 28 + 16
+        }
+        if ver == 2 {
+            skip = 28 + 36
+        }
+        var cp: usize = body + skip
+        while true {
+            if box_at(d, cp, entry_end, &ty, &hdr, &size) == 0 {
+                break
+            }
+            if ty == FCC_ESDS {
+                parse_esds(t, d, cp + hdr, cp + size)
+            }
+            cp = cp + size
+        }
+        return
+    }
+    if (*t).kind == KIND_VIDEO {
+        if body + 78 > entry_end {
+            return
+        }
+        (*t).w = b16(d, body + 24)
+        (*t).h = b16(d, body + 26)
+        var cp2: usize = body + 78
+        while true {
+            if box_at(d, cp2, entry_end, &ty, &hdr, &size) == 0 {
+                break
+            }
+            if ty == FCC_AVCC {
+                (*t).cfg = d + (cp2 + hdr) as u64
+                (*t).cfg_len = size - hdr
+            }
+            cp2 = cp2 + size
+        }
+    }
+}
+
+fn push_rec(t: *mut Track, off: u64, size: u32, sync: u32) {
+    var r: [u8; 32] = [0 as u8; 32]
+    let p: u64 = (&r[0]) as u64
+    *(p as *mut u64) = off
+    *((p + 16) as *mut u32) = size
+    *((p + 24) as *mut u32) = sync
+    rt.buf_push_bytes(&(*t).samples, p, REC)
+    (*t).nsamples = (*t).nsamples + 1
+}
+
+fn rec(t: *mut Track, i: usize) -> u64 {
+    return rt.buf_ptr(&(*t).samples) + (i * REC) as u64
+}
+
+fn build_classic(t: *mut Track, d: u64) {
+    if (*t).stsz == 0 || (*t).stsc == 0 {
+        return
+    }
+    if (*t).stco == 0 && (*t).co64 == 0 {
+        return
+    }
+    let sz: u64 = (*t).stsz
+    let fixed: u32 = b32(sz, 4)
+    var n: usize = b32(sz, 8) as usize
+    if fixed == 0 {
+        if 12 + n * 4 > (*t).stsz_len {
+            n = ((*t).stsz_len - 12) / 4
+        }
+    }
+    var nchunks: usize = 0
+    if (*t).stco != 0 {
+        nchunks = b32((*t).stco, 4) as usize
+        if 8 + nchunks * 4 > (*t).stco_len {
+            nchunks = ((*t).stco_len - 8) / 4
+        }
+    } else {
+        nchunks = b32((*t).co64, 4) as usize
+        if 8 + nchunks * 8 > (*t).co64_len {
+            nchunks = ((*t).co64_len - 8) / 8
+        }
+    }
+    var nent: usize = b32((*t).stsc, 4) as usize
+    if 8 + nent * 12 > (*t).stsc_len {
+        nent = ((*t).stsc_len - 8) / 12
+    }
+    if nent == 0 {
+        return
+    }
+    rt.buf_reserve(&(*t).samples, n * REC + 64)
+    var s: usize = 0
+    var e: usize = 0
+    var ci: usize = 1
+    while ci <= nchunks && s < n {
+        while e + 1 < nent && (b32((*t).stsc, 8 + (e + 1) * 12) as usize) <= ci {
+            e = e + 1
+        }
+        let spc: usize = b32((*t).stsc, 8 + e * 12 + 4) as usize
+        var off: u64 = 0
+        if (*t).stco != 0 {
+            off = b32((*t).stco, 8 + (ci - 1) * 4) as u64
+        } else {
+            off = b64((*t).co64, 8 + (ci - 1) * 8)
+        }
+        var k: usize = 0
+        while k < spc && s < n {
+            var size: u32 = fixed
+            if fixed == 0 {
+                size = b32(sz, 12 + s * 4)
+            }
+            push_rec(t, off, size, 1)
+            off = off + size as u64
+            s = s + 1
+            k = k + 1
+        }
+        ci = ci + 1
+    }
+    if (*t).stts != 0 {
+        var ne: usize = b32((*t).stts, 4) as usize
+        if 8 + ne * 8 > (*t).stts_len {
+            ne = ((*t).stts_len - 8) / 8
+        }
+        var i: usize = 0
+        var dts: u64 = 0
+        var j: usize = 0
+        while j < ne && i < (*t).nsamples {
+            let cnt: usize = b32((*t).stts, 8 + j * 8) as usize
+            let delta: u64 = b32((*t).stts, 8 + j * 8 + 4) as u64
+            var q: usize = 0
+            while q < cnt && i < (*t).nsamples {
+                *((rec(t, i) + 8) as *mut u64) = dts
+                dts = dts + delta
+                i = i + 1
+                q = q + 1
+            }
+            j = j + 1
+        }
+    }
+    if (*t).ctts != 0 {
+        var ne2: usize = b32((*t).ctts, 4) as usize
+        if 8 + ne2 * 8 > (*t).ctts_len {
+            ne2 = ((*t).ctts_len - 8) / 8
+        }
+        var i2: usize = 0
+        var j2: usize = 0
+        while j2 < ne2 && i2 < (*t).nsamples {
+            let cnt2: usize = b32((*t).ctts, 8 + j2 * 8) as usize
+            let off2: u32 = b32((*t).ctts, 8 + j2 * 8 + 4)
+            var q2: usize = 0
+            while q2 < cnt2 && i2 < (*t).nsamples {
+                *((rec(t, i2) + 20) as *mut u32) = off2
+                i2 = i2 + 1
+                q2 = q2 + 1
+            }
+            j2 = j2 + 1
+        }
+    }
+    if (*t).stss != 0 {
+        var i3: usize = 0
+        while i3 < (*t).nsamples {
+            *((rec(t, i3) + 24) as *mut u32) = 0
+            i3 = i3 + 1
+        }
+        var ne3: usize = b32((*t).stss, 4) as usize
+        if 8 + ne3 * 4 > (*t).stss_len {
+            ne3 = ((*t).stss_len - 8) / 4
+        }
+        var j3: usize = 0
+        while j3 < ne3 {
+            let sn: usize = b32((*t).stss, 8 + j3 * 4) as usize
+            if sn >= 1 && sn <= (*t).nsamples {
+                *((rec(t, sn - 1) + 24) as *mut u32) = 1
+            }
+            j3 = j3 + 1
+        }
+    }
+}
+
+fn parse_stbl(t: *mut Track, d: u64, start: usize, end: usize) {
+    var pos: usize = start
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        let bs: usize = pos + hdr
+        let bl: usize = size - hdr
+        if ty == FCC_STSD {
+            parse_stsd(t, d, bs, pos + size)
+        }
+        if ty == FCC_STTS {
+            (*t).stts = d + bs as u64
+            (*t).stts_len = bl
+        }
+        if ty == FCC_CTTS {
+            (*t).ctts = d + bs as u64
+            (*t).ctts_len = bl
+        }
+        if ty == FCC_STSC {
+            (*t).stsc = d + bs as u64
+            (*t).stsc_len = bl
+        }
+        if ty == FCC_STSZ {
+            (*t).stsz = d + bs as u64
+            (*t).stsz_len = bl
+        }
+        if ty == FCC_STCO {
+            (*t).stco = d + bs as u64
+            (*t).stco_len = bl
+        }
+        if ty == FCC_CO64 {
+            (*t).co64 = d + bs as u64
+            (*t).co64_len = bl
+        }
+        if ty == FCC_STSS {
+            (*t).stss = d + bs as u64
+            (*t).stss_len = bl
+        }
+        pos = pos + size
+    }
+}
+
+fn parse_trak(m: *mut Mp4, d: u64, start: usize, end: usize) {
+    if (*m).nt >= MAXT {
+        return
+    }
+    let t: *mut Track = &(*m).t[(*m).nt]
+    (*t).used = 1
+    var pos: usize = start
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        let bs: usize = pos + hdr
+        let be: usize = pos + size
+        if ty == FCC_TKHD {
+            if bs + 24 <= be {
+                if b8(d, bs) == 1 {
+                    (*t).id = b32(d, bs + 20)
+                } else {
+                    (*t).id = b32(d, bs + 12)
+                }
+            }
+        }
+        if ty == FCC_EDTS {
+            var ep: usize = bs
+            var ety: u32 = 0
+            var ehdr: usize = 0
+            var esz: usize = 0
+            while box_at(d, ep, be, &ety, &ehdr, &esz) != 0 {
+                if ety == FCC_ELST {
+                    let eb: usize = ep + ehdr
+                    if eb + 8 <= ep + esz {
+                        let ver: u32 = b8(d, eb)
+                        let cnt: u32 = b32(d, eb + 4)
+                        if cnt > 0 {
+                            if ver == 1 {
+                                if eb + 8 + 20 <= ep + esz {
+                                    let mt: i64 = b64(d, eb + 8 + 8) as i64
+                                    if mt >= 0 {
+                                        (*t).skip = mt
+                                    }
+                                }
+                            } else {
+                                if eb + 8 + 12 <= ep + esz {
+                                    let mt2: i32 = b32(d, eb + 8 + 4) as i32
+                                    if mt2 >= 0 {
+                                        (*t).skip = mt2 as i64
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ep = ep + esz
+            }
+        }
+        if ty == FCC_MDIA {
+            var mp: usize = bs
+            var mty: u32 = 0
+            var mhdr: usize = 0
+            var msz: usize = 0
+            while box_at(d, mp, be, &mty, &mhdr, &msz) != 0 {
+                let mbs: usize = mp + mhdr
+                if mty == FCC_MDHD {
+                    if b8(d, mbs) == 1 {
+                        (*t).timescale = b32(d, mbs + 20)
+                        (*t).duration = b64(d, mbs + 24)
+                    } else {
+                        (*t).timescale = b32(d, mbs + 12)
+                        (*t).duration = b32(d, mbs + 16) as u64
+                    }
+                }
+                if mty == FCC_HDLR {
+                    let ht: u32 = b32(d, mbs + 8)
+                    if ht == FCC_SOUN {
+                        (*t).kind = KIND_AUDIO
+                    }
+                    if ht == FCC_VIDE {
+                        (*t).kind = KIND_VIDEO
+                    }
+                }
+                if mty == FCC_MINF {
+                    var np: usize = mbs
+                    var nty: u32 = 0
+                    var nhdr: usize = 0
+                    var nsz: usize = 0
+                    while box_at(d, np, mp + msz, &nty, &nhdr, &nsz) != 0 {
+                        if nty == FCC_STBL {
+                            parse_stbl(t, d, np + nhdr, np + nsz)
+                        }
+                        np = np + nsz
+                    }
+                }
+                mp = mp + msz
+            }
+        }
+        pos = pos + size
+    }
+    if (*t).kind != KIND_NONE {
+        build_classic(t, d)
+        (*m).nt = (*m).nt + 1
+    } else {
+        (*t).used = 0
+    }
+}
+
+fn find_by_id(m: *mut Mp4, id: u32) -> i32 {
+    var i: usize = 0
+    while i < (*m).nt {
+        if (*m).t[i].id == id {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn parse_moov(m: *mut Mp4, d: u64, start: usize, end: usize) {
+    var pos: usize = start
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        if ty == FCC_TRAK {
+            parse_trak(m, d, pos + hdr, pos + size)
+        }
+        pos = pos + size
+    }
+    pos = start
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        if ty == FCC_MVEX {
+            (*m).frag = 1
+            var xp: usize = pos + hdr
+            var xty: u32 = 0
+            var xhdr: usize = 0
+            var xsz: usize = 0
+            while box_at(d, xp, pos + size, &xty, &xhdr, &xsz) != 0 {
+                if xty == FCC_TREX {
+                    let xb: usize = xp + xhdr
+                    if xb + 24 <= xp + xsz {
+                        let ti: i32 = find_by_id(m, b32(d, xb + 4))
+                        if ti >= 0 {
+                            (*m).t[ti as usize].trex_dur = b32(d, xb + 12)
+                            (*m).t[ti as usize].trex_size = b32(d, xb + 16)
+                            (*m).t[ti as usize].trex_flags = b32(d, xb + 20)
+                        }
+                    }
+                }
+                xp = xp + xsz
+            }
+        }
+        pos = pos + size
+    }
+}
+
+fn parse_traf(m: *mut Mp4, d: u64, moof_start: usize, start: usize, end: usize) {
+    var pos: usize = start
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    var ti: i32 = -1
+    var base: u64 = moof_start as u64
+    var def_dur: u32 = 0
+    var def_size: u32 = 0
+    var def_flags: u32 = 0
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        let bs: usize = pos + hdr
+        let be: usize = pos + size
+        if ty == FCC_TFHD {
+            if bs + 8 <= be {
+                let fl: u32 = b32(d, bs) & 0xFFFFFF
+                ti = find_by_id(m, b32(d, bs + 4))
+                if ti >= 0 {
+                    def_dur = (*m).t[ti as usize].trex_dur
+                    def_size = (*m).t[ti as usize].trex_size
+                    def_flags = (*m).t[ti as usize].trex_flags
+                }
+                var q: usize = bs + 8
+                if (fl & 1) != 0 {
+                    base = b64(d, q)
+                    q = q + 8
+                }
+                if (fl & 2) != 0 {
+                    q = q + 4
+                }
+                if (fl & 8) != 0 {
+                    def_dur = b32(d, q)
+                    q = q + 4
+                }
+                if (fl & 0x10) != 0 {
+                    def_size = b32(d, q)
+                    q = q + 4
+                }
+                if (fl & 0x20) != 0 {
+                    def_flags = b32(d, q)
+                    q = q + 4
+                }
+            }
+        }
+        if ty == FCC_TFDT {
+            if ti >= 0 && bs + 8 <= be {
+                if b8(d, bs) == 1 {
+                    (*m).t[ti as usize].next_dts = b64(d, bs + 4)
+                } else {
+                    (*m).t[ti as usize].next_dts = b32(d, bs + 4) as u64
+                }
+            }
+        }
+        if ty == FCC_TRUN {
+            if ti >= 0 && bs + 8 <= be {
+                let t: *mut Track = &(*m).t[ti as usize]
+                let fl2: u32 = b32(d, bs) & 0xFFFFFF
+                let ver: u32 = b8(d, bs)
+                let cnt: usize = b32(d, bs + 4) as usize
+                var q2: usize = bs + 8
+                var data_off: i64 = 0
+                if (fl2 & 1) != 0 {
+                    data_off = (b32(d, q2) as i32) as i64
+                    q2 = q2 + 4
+                }
+                var first_flags: u32 = def_flags
+                var has_first: i32 = 0
+                if (fl2 & 4) != 0 {
+                    first_flags = b32(d, q2)
+                    has_first = 1
+                    q2 = q2 + 4
+                }
+                var off: u64 = ((base as i64 + data_off) as u64) + (*m).base_off
+                var k: usize = 0
+                while k < cnt && q2 <= be {
+                    var dur: u32 = def_dur
+                    var sz: u32 = def_size
+                    var sf: u32 = def_flags
+                    var co: u32 = 0
+                    if k == 0 && has_first != 0 {
+                        sf = first_flags
+                    }
+                    if (fl2 & 0x100) != 0 {
+                        dur = b32(d, q2)
+                        q2 = q2 + 4
+                    }
+                    if (fl2 & 0x200) != 0 {
+                        sz = b32(d, q2)
+                        q2 = q2 + 4
+                    }
+                    if (fl2 & 0x400) != 0 {
+                        sf = b32(d, q2)
+                        q2 = q2 + 4
+                    }
+                    if (fl2 & 0x800) != 0 {
+                        co = b32(d, q2)
+                        q2 = q2 + 4
+                    }
+                    var sync: u32 = 1
+                    if (sf & 0x10000) != 0 {
+                        sync = 0
+                    }
+                    push_rec(t, off, sz, sync)
+                    let ri: usize = (*t).nsamples - 1
+                    *((rec(t, ri) + 8) as *mut u64) = (*t).next_dts
+                    *((rec(t, ri) + 20) as *mut u32) = co
+                    (*t).next_dts = (*t).next_dts + dur as u64
+                    off = off + sz as u64
+                    k = k + 1
+                }
+            }
+        }
+        pos = pos + size
+    }
+}
+
+fn parse_moof(m: *mut Mp4, d: u64, moof_start: usize, start: usize, end: usize) {
+    var pos: usize = start
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    while box_at(d, pos, end, &ty, &hdr, &size) != 0 {
+        if ty == FCC_TRAF {
+            parse_traf(m, d, moof_start, pos + hdr, pos + size)
+        }
+        pos = pos + size
+    }
+}
+
+fn mp4_parse(m: *mut Mp4, d: u64, len: usize) -> i32 {
+    (*m).data = d
+    (*m).len = len
+    var pos: usize = 0
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    var seen: i32 = 0
+    if box_at(d, 0, len, &ty, &hdr, &size) == 0 {
+        return 1
+    }
+    if ty != FCC_FTYP && ty != FCC_MOOV && ty != 0x73747970 && ty != 0x66726565 && ty != 0x77696465 {
+        return 1
+    }
+    while box_at(d, pos, len, &ty, &hdr, &size) != 0 {
+        if ty == FCC_MOOV {
+            parse_moov(m, d, pos + hdr, pos + size)
+            seen = 1
+        }
+        if ty == FCC_MOOF {
+            parse_moof(m, d, pos, pos + hdr, pos + size)
+        }
+        pos = pos + size
+    }
+    if seen == 0 || (*m).nt == 0 {
+        return 2
+    }
+    return 0
+}
+
+fn mp4_ntracks(m: *mut Mp4) -> i32 {
+    return (*m).nt as i32
+}
+
+fn mp4_find(m: *mut Mp4, kind: u32) -> i32 {
+    var i: usize = 0
+    while i < (*m).nt {
+        if (*m).t[i].kind == kind && (*m).t[i].nsamples > 0 {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn mp4_count(m: *mut Mp4, t: i32) -> usize {
+    return (*m).t[t as usize].nsamples
+}
+
+fn mp4_off(m: *mut Mp4, t: i32, i: usize) -> u64 {
+    return *(rec(&(*m).t[t as usize], i) as *mut u64)
+}
+
+fn mp4_dts(m: *mut Mp4, t: i32, i: usize) -> u64 {
+    return *((rec(&(*m).t[t as usize], i) + 8) as *mut u64)
+}
+
+fn mp4_size(m: *mut Mp4, t: i32, i: usize) -> u32 {
+    return *((rec(&(*m).t[t as usize], i) + 16) as *mut u32)
+}
+
+fn mp4_cts(m: *mut Mp4, t: i32, i: usize) -> i32 {
+    return *((rec(&(*m).t[t as usize], i) + 20) as *mut i32)
+}
+
+fn mp4_sync(m: *mut Mp4, t: i32, i: usize) -> u32 {
+    return *((rec(&(*m).t[t as usize], i) + 24) as *mut u32)
+}
+
+fn mp4_timescale(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].timescale
+}
+
+fn mp4_cfg(m: *mut Mp4, t: i32) -> u64 {
+    return (*m).t[t as usize].cfg
+}
+
+fn mp4_cfg_len(m: *mut Mp4, t: i32) -> usize {
+    return (*m).t[t as usize].cfg_len
+}
+
+fn mp4_hz(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].hz
+}
+
+fn mp4_channels(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].ch
+}
+
+fn mp4_objtype(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].objtype
+}
+
+fn mp4_codec(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].codec
+}
+
+fn mp4_width(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].w
+}
+
+fn mp4_height(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].h
+}
+
+fn mp4_skip(m: *mut Mp4, t: i32) -> i64 {
+    return (*m).t[t as usize].skip
+}
+
+fn mp4_duration(m: *mut Mp4, t: i32) -> u64 {
+    return (*m).t[t as usize].duration
+}
+
+fn mp4_id(m: *mut Mp4, t: i32) -> u32 {
+    return (*m).t[t as usize].id
+}
+
+fn mp4_chunk(m: *mut Mp4, d: u64, len: usize, base: u64) -> i32 {
+    (*m).data = d
+    (*m).len = len
+    (*m).base_off = base
+    var pos: usize = 0
+    var ty: u32 = 0
+    var hdr: usize = 0
+    var size: usize = 0
+    var got: i32 = 0
+    while box_at(d, pos, len, &ty, &hdr, &size) != 0 {
+        if ty == FCC_MOOV {
+            var k: usize = 0
+            while k < MAXT {
+                rt.buf_free(&(*m).t[k].samples)
+                (*m).t[k] = track_new()
+                k = k + 1
+            }
+            (*m).nt = 0
+            parse_moov(m, d, pos + hdr, pos + size)
+            (*m).init_seen = 1
+            got = 1
+        }
+        if ty == FCC_MOOF {
+            if (*m).nt > 0 {
+                parse_moof(m, d, pos, pos + hdr, pos + size)
+                got = 1
+            }
+        }
+        got = 1
+        pos = pos + size
+    }
+    if got == 0 {
+        return 2
+    }
+    return 0
+}
+
+fn mp4_clear_samples(m: *mut Mp4) {
+    var i: usize = 0
+    while i < MAXT {
+        rt.buf_clear(&(*m).t[i].samples)
+        (*m).t[i].nsamples = 0
+        i = i + 1
+    }
+}
+
+fn mp4_cfg_copy(m: *mut Mp4, t: i32, dst: u64, n: usize) -> usize {
+    var l: usize = (*m).t[t as usize].cfg_len
+    if l > n {
+        return 0
+    }
+    rt.mem_copy(dst, (*m).t[t as usize].cfg, l)
+    return l
+}
+
+fn mp4_kind(m: *mut Mp4, t: i32) -> u32 {
+    if t < 0 || (t as usize) >= (*m).nt {
+        return 0
+    }
+    return (*m).t[t as usize].kind
+}
+
+fn mp4_init_seen(m: *mut Mp4) -> i32 {
+    let v: i32 = (*m).init_seen
+    (*m).init_seen = 0
+    return v
+}
