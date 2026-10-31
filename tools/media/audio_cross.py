@@ -8,7 +8,12 @@ CASES = [
     ("wav", "pcm_f32le", "wav", 32000, 1, 0), ("flac", "flac", "flac", 44100, 2, 0), ("flac", "flac", "flac", 22050, 1, 0),
     ("mp3", "libmp3lame", "mp3", 44100, 2, 1), ("mp3", "libmp3lame", "mp3", 22050, 1, 1), ("mp3", "libmp3lame", "mp3", 8000, 1, 1),
     ("vorbis", "libvorbis", "ogg", 44100, 2, 1), ("vorbis", "libvorbis", "ogg", 16000, 1, 1),
+    ("opus", "libopus", "opus", 48000, 2, 2), ("opus", "libopus", "opus", 16000, 1, 2), ("opus", "libopus:voip", "opus", 48000, 1, 2),
+    ("opus", "libopus:fd10", "opus", 48000, 2, 2), ("opus", "libopus:fd60", "opus", 24000, 2, 2), ("opus", "libopus", "webm", 48000, 2, 2),
 ]
+
+EXTRA = {"voip": ["-application", "voip", "-b:a", "32k"], "fd10": ["-frame_duration", "10", "-b:a", "64k"],
+         "fd60": ["-frame_duration", "60", "-b:a", "48k"]}
 
 def run(*a):
     return subprocess.run(a, check=True, capture_output=True)
@@ -38,13 +43,15 @@ def main():
     for fmt, codec, ext, rate, ch, lossy in CASES:
         f = os.path.join(tmp, "t_%s_%d_%d.%s" % (codec, rate, ch, ext))
         src = "anoisesrc=d=2:r=%d:a=0.3,aecho=0.8:0.8:40:0.5" % rate
-        run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", src, "-ac", str(ch), "-c:a", codec, f)
-        ref = floats(run("ffmpeg", "-v", "error", "-i", f, "-f", "f32le", "-").stdout)
+        name, _, variant = codec.partition(":")
+        run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", src, "-ac", str(ch), "-c:a", name, *EXTRA.get(variant, []), f)
+        dec = ["-c:a", "libopus"] if name == "libopus" else []
+        ref = floats(run("ffmpeg", "-v", "error", *dec, "-i", f, "-f", "f32le", "-").stdout)
         out = os.path.join(tmp, "o.raw")
         info = run(dump, f, out).stdout.decode()
         got = floats(open(out, "rb").read())
         n, mx, snr = stats(ref, got)
-        okc = len(ref) == len(got) and (mx == 0.0 if not lossy else snr > 70)
+        okc = len(ref) == len(got) and (mx == 0.0 if not lossy else snr > (60 if lossy == 2 else 70))
         frames = len(ref) // ch
         k = frames // 3
         run(dump, f, out, str(k), "5000")

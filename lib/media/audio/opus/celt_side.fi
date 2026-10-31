@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.opus
+import media.audio.opus.celt_fix
+import media.audio.opus.celt_tables
+
+export { tf_decode, init_caps, decode_dynalloc, decode_spread, decode_trim, decode_tapset }
+
+static SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0]
+static TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0]
+static TAPSET_ICDF: [u8; 3] = [2, 1, 0]
+static TF_SELECT: [i8; 32] = [0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -2, 1, 0, 1, -1, 0, -2, 0, -3, 2, 0, 1, -1, 0, -2, 0, -3, 3, 0, 1, -1]
+
+fn eb(i: i32) -> i32 {
+    return celt_tables.celt_ebands(i as% usize) as% i32
+}
+
+fn tf_entry(lm: i32, idx: i32) -> i32 {
+    return TF_SELECT[(lm * 8 + idx) as% usize] as% i32
+}
+
+fn tf_decode(e: *mut opus.Ec, start: i32, end: i32, is_transient: i32, tf_res: u64, lm: i32) {
+    var budget: i32 = (*e).storage * 8
+    var tell: i32 = opus.ec_tell(e)
+    var logp: i32 = 4
+    if is_transient != 0 { logp = 2 }
+    var select_rsv: i32 = 0
+    if lm > 0 && tell + logp + 1 <= budget { select_rsv = 1 }
+    budget = budget - select_rsv
+    var curr: i32 = 0
+    var changed: i32 = 0
+    var i: i32 = start
+    while i < end {
+        if tell + logp <= budget {
+            curr = curr ^ opus.ec_bit_logp(e, logp)
+            tell = opus.ec_tell(e)
+            changed = changed | curr
+        }
+        celt_fix.st32(tf_res, i, curr)
+        if is_transient != 0 { logp = 4 } else { logp = 5 }
+        i = i + 1
+    }
+    var select: i32 = 0
+    if select_rsv != 0 && tf_entry(lm, 4 * is_transient + changed) != tf_entry(lm, 4 * is_transient + 2 + changed) {
+        select = opus.ec_bit_logp(e, 1)
+    }
+    i = start
+    while i < end {
+        celt_fix.st32(tf_res, i, tf_entry(lm, 4 * is_transient + 2 * select + celt_fix.ld32(tf_res, i)))
+        i = i + 1
+    }
+}
+
+fn init_caps(cap: u64, lm: i32, chans: i32) {
+    var i: i32 = 0
+    while i < 21 {
+        let n: i32 = (eb(i + 1) - eb(i)) << lm
+        let c: i32 = celt_tables.celt_ccaps((21 * (2 * lm + chans - 1) + i) as% usize) as% i32
+        celt_fix.st32(cap, i, ((c + 64) * chans * n) >> 2)
+        i = i + 1
+    }
+}
+
+fn decode_spread(e: *mut opus.Ec, total_bits: i32) -> i32 {
+    if opus.ec_tell(e) + 4 <= total_bits { return opus.ec_icdf(e, (&SPREAD_ICDF[0]) as u64, 5) }
+    return 2
+}
+
+fn decode_tapset(e: *mut opus.Ec) -> i32 {
+    return opus.ec_icdf(e, (&TAPSET_ICDF[0]) as u64, 2)
+}
+
+fn decode_trim(e: *mut opus.Ec, tell: i32, total_bits: i32) -> i32 {
+    if tell + (6 << 3) <= total_bits { return opus.ec_icdf(e, (&TRIM_ICDF[0]) as u64, 7) }
+    return 5
+}
+
+fn decode_dynalloc(e: *mut opus.Ec, start: i32, end: i32, chans: i32, lm: i32, cap: u64, offsets: u64, total_bits: *mut i32, tell_out: *mut i32) {
+    var dyn_logp: i32 = 6
+    var total: i32 = *total_bits
+    var tell: i32 = opus.ec_tell_frac(e)
+    var i: i32 = start
+    while i < end {
+        let width: i32 = (chans * (eb(i + 1) - eb(i))) << lm
+        let quanta: i32 = celt_fix.imin(width << 3, celt_fix.imax(6 << 3, width))
+        var loop_logp: i32 = dyn_logp
+        var boost: i32 = 0
+        var go: i32 = 1
+        while go != 0 && tell + (loop_logp << 3) < total && boost < celt_fix.ld32(cap, i) {
+            let flag: i32 = opus.ec_bit_logp(e, loop_logp)
+            tell = opus.ec_tell_frac(e)
+            if flag == 0 {
+                go = 0
+            } else {
+                boost = boost + quanta
+                total = total - quanta
+                loop_logp = 1
+            }
+        }
+        celt_fix.st32(offsets, i, boost)
+        if boost > 0 { dyn_logp = celt_fix.imax(2, dyn_logp - 1) }
+        i = i + 1
+    }
+    *total_bits = total
+    *tell_out = tell
+}

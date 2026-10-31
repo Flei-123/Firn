@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.opus
+import media.audio.opus.celt
+import media.audio.opus.celt_fix
+import media.audio.opus.celt_post
+import media.audio.opus.celt_bands
+import media.audio.opus.celt_synth
+import media.audio.opus.celt_tables
+import media.audio.opus.celt_side
+import media.audio.opus.celt_synth_tables
+
+export { CeltDec, celt_dec_new, celt_dec_free, celt_dec_reset, celt_dec_set_range, celt_decode_with_ec, celt_decode_buf, celt_decode_ec, CELT_ERR_ARG, CELT_ERR_LOST, CELT_ERR_INTERNAL }
+
+const CELT_ERR_ARG: i32 = 0 - 1
+const CELT_ERR_INTERNAL: i32 = 0 - 3
+const CELT_ERR_LOST: i32 = 0 - 4
+const DECODE_BUFFER: i32 = 2048
+const OVERLAP: i32 = 120
+const NBANDS: i32 = 21
+const MIN_PERIOD: i32 = 15
+const FLOOR_DB: i32 = 0 - 28672
+const PREEMPH0: i32 = 27853
+const SPREAD_NORMAL: i32 = 2
+
+struct CeltDec {
+    channels: i32,
+    stream_channels: i32,
+    start: i32,
+    end: i32,
+    rng: u32,
+    failed: i32,
+    period: i32,
+    period_old: i32,
+    gain: i32,
+    gain_old: i32,
+    tapset: i32,
+    tapset_old: i32,
+    mem: u64,
+    aux: u64,
+}
+
+fn celt_dec_new(channels: i32) -> CeltDec {
+    let mem: u64 = rt.heap_alloc((channels * (DECODE_BUFFER + OVERLAP) * 4 + 64) as% usize)
+    let aux: u64 = rt.heap_alloc(336 + 8 + 64)
+    var d: CeltDec = CeltDec { channels: channels, stream_channels: channels, start: 0, end: NBANDS, rng: 0, failed: 0, period: 0, period_old: 0,
+        gain: 0, gain_old: 0, tapset: 0, tapset_old: 0, mem: mem, aux: aux }
+    celt_dec_reset(&d)
+    return d
+}
+
+fn celt_dec_set_range(d: *mut CeltDec, start: i32, end: i32, stream_channels: i32) {
+    (*d).start = start
+    (*d).end = end
+    (*d).stream_channels = stream_channels
+}
+
+fn old_e(d: *mut CeltDec) -> u64 { return (*d).aux }
+fn old_log(d: *mut CeltDec) -> u64 { return (*d).aux + 84 }
+fn old_log2(d: *mut CeltDec) -> u64 { return (*d).aux + 168 }
+fn bg_log(d: *mut CeltDec) -> u64 { return (*d).aux + 252 }
+fn preemph_mem(d: *mut CeltDec) -> u64 { return (*d).aux + 336 }
+
+fn celt_dec_reset(d: *mut CeltDec) {
+    var i: i32 = 0
+    while i < (*d).channels * (DECODE_BUFFER + OVERLAP) {
+        celt_fix.st32((*d).mem, i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 * 42 {
+        celt_fix.st16((*d).aux, i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 2 * NBANDS {
+        celt_fix.st16(old_log(d), i, FLOOR_DB)
+        celt_fix.st16(old_log2(d), i, FLOOR_DB)
+        i = i + 1
+    }
+    (*d).rng = 0
+    (*d).failed = 0
+    (*d).period = 0
+    (*d).period_old = 0
+    (*d).gain = 0
+    (*d).gain_old = 0
+    (*d).tapset = 0
+    (*d).tapset_old = 0
+    celt_fix.st32(preemph_mem(d), 0, 0)
+    celt_fix.st32(preemph_mem(d), 1, 0)
+}
+
+fn at32(p: u64, i: i32) -> u64 { return p +% (i as% u64) *% 4 }
+fn at16(p: u64, i: i32) -> u64 { return p +% (i as% u64) *% 2 }
+
+fn apply_postfilter(d: *mut CeltDec, out: u64, n: i32, lm: i32, pitch: i32, gain: i32, tapset: i32) {
+    let window: u64 = celt_synth_tables.celt_window_addr()
+    (*d).period = celt_fix.imax((*d).period, MIN_PERIOD)
+    (*d).period_old = celt_fix.imax((*d).period_old, MIN_PERIOD)
+    celt_post.comb_filter(out, out, (*d).period_old, (*d).period, OVERLAP, (*d).gain_old, (*d).gain, (*d).tapset_old, (*d).tapset, window, OVERLAP)
+    if lm != 0 {
+        celt_post.comb_filter(at32(out, OVERLAP), at32(out, OVERLAP), (*d).period, pitch, n - OVERLAP, (*d).gain, gain, (*d).tapset, tapset, window, OVERLAP)
+    }
+}
+
+fn update_energy_history(d: *mut CeltDec, is_transient: i32, m: i32) {
+    let oe: u64 = old_e(d)
+    let ol: u64 = old_log(d)
+    let ol2: u64 = old_log2(d)
+    let bg: u64 = bg_log(d)
+    var i: i32 = 0
+    if (*d).stream_channels == 1 {
+        while i < NBANDS {
+            celt_fix.st16(oe, NBANDS + i, celt_fix.ld16(oe, i))
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < 2 * NBANDS {
+        if is_transient == 0 {
+            celt_fix.st16(ol2, i, celt_fix.ld16(ol, i))
+            celt_fix.st16(ol, i, celt_fix.ld16(oe, i))
+        } else {
+            celt_fix.st16(ol, i, celt_fix.imin(celt_fix.ld16(ol, i), celt_fix.ld16(oe, i)))
+        }
+        i = i + 1
+    }
+    let inc: i32 = celt_fix.imin(160, m)
+    i = 0
+    while i < 2 * NBANDS {
+        celt_fix.st16(bg, i, celt_fix.imin(celt_fix.ld16(bg, i) + inc, celt_fix.ld16(oe, i)))
+        i = i + 1
+    }
+    var c: i32 = 0
+    while c < 2 {
+        i = 0
+        while i < (*d).start {
+            celt_fix.st16(oe, c * NBANDS + i, 0)
+            celt_fix.st16(ol, c * NBANDS + i, FLOOR_DB)
+            celt_fix.st16(ol2, c * NBANDS + i, FLOOR_DB)
+            i = i + 1
+        }
+        i = (*d).end
+        while i < NBANDS {
+            celt_fix.st16(oe, c * NBANDS + i, 0)
+            celt_fix.st16(ol, c * NBANDS + i, FLOOR_DB)
+            celt_fix.st16(ol2, c * NBANDS + i, FLOOR_DB)
+            i = i + 1
+        }
+        c = c + 1
+    }
+}
+
+fn celt_decode_with_ec(d: *mut CeltDec, data: u64, len: i32, pcm: u64, frame_size: i32) -> i32 {
+    return celt_decode_buf(d, data, len, pcm, frame_size, 0)
+}
+
+fn celt_decode_buf(d: *mut CeltDec, data: u64, len: i32, pcm: u64, frame_size: i32, accum: i32) -> i32 {
+    if len < 0 || len > 1275 { return CELT_ERR_ARG }
+    if len <= 1 { return CELT_ERR_LOST }
+    var e: opus.Ec = opus.ec_new()
+    opus.ec_init(&e, data, len)
+    return celt_decode_ec(d, &e, len, pcm, frame_size, accum)
+}
+
+fn celt_decode_ec(d: *mut CeltDec, e: *mut opus.Ec, len: i32, pcm: u64, frame_size: i32, accum: i32) -> i32 {
+    let chans: i32 = (*d).stream_channels
+    let out_chans: i32 = (*d).channels
+    let start: i32 = (*d).start
+    let end: i32 = (*d).end
+    var lm: i32 = 0
+    while lm <= 3 && (OVERLAP << lm) != frame_size {
+        lm = lm + 1
+    }
+    if lm > 3 || len < 0 || len > 1275 || pcm == 0 || chans < 1 || chans > 2 || out_chans < 1 || out_chans > 2 { return CELT_ERR_ARG }
+    if len <= 1 { return CELT_ERR_LOST }
+    let m: i32 = 1 << lm
+    let n: i32 = OVERLAP * m
+    let oe: u64 = old_e(d)
+    var c: i32 = 0
+    var i: i32 = 0
+    if chans == 1 {
+        i = 0
+        while i < NBANDS {
+            celt_fix.st16(oe, i, celt_fix.imax(celt_fix.ld16(oe, i), celt_fix.ld16(oe, NBANDS + i)))
+            i = i + 1
+        }
+    }
+    let total_bits: i32 = len * 8
+    var tell: i32 = opus.ec_tell(e)
+    var silence: i32 = 0
+    if tell >= total_bits {
+        silence = 1
+    } else if tell == 1 {
+        silence = opus.ec_bit_logp(e, 15)
+    }
+    if silence != 0 {
+        tell = total_bits
+        (*e).nbits_total = (*e).nbits_total + (tell - opus.ec_tell(e))
+    }
+    var pf_gain: i32 = 0
+    var pf_pitch: i32 = 0
+    var pf_tapset: i32 = 0
+    if start == 0 && tell + 16 <= total_bits {
+        if opus.ec_bit_logp(e, 1) != 0 {
+            let octave: i32 = opus.ec_uint(e, 6) as% i32
+            pf_pitch = (16 << octave) + (opus.ec_bits(e, 4 + octave) as% i32) - 1
+            let qg: i32 = opus.ec_bits(e, 3) as% i32
+            if opus.ec_tell(e) + 2 <= total_bits { pf_tapset = celt_side.decode_tapset(e) }
+            pf_gain = 3072 * (qg + 1)
+        }
+        tell = opus.ec_tell(e)
+    }
+    var is_transient: i32 = 0
+    if lm > 0 && tell + 3 <= total_bits {
+        is_transient = opus.ec_bit_logp(e, 3)
+        tell = opus.ec_tell(e)
+    }
+    var short_blocks: i32 = 0
+    if is_transient != 0 { short_blocks = m }
+    var intra: i32 = 0
+    if tell + 3 <= total_bits { intra = opus.ec_bit_logp(e, 3) }
+    celt.celt_unquant_coarse(e, start, end, oe, intra, chans, lm)
+    var tf_res: [i32; 21] = [0; 21]
+    celt_side.tf_decode(e, start, end, is_transient, (&tf_res[0]) as u64, lm)
+    let spread: i32 = celt_side.decode_spread(e, total_bits)
+    var cap: [i32; 21] = [0; 21]
+    celt_side.init_caps((&cap[0]) as u64, lm, chans)
+    var offsets: [i32; 21] = [0; 21]
+    var budget: i32 = total_bits << 3
+    var tell_frac: i32 = 0
+    celt_side.decode_dynalloc(e, start, end, chans, lm, (&cap[0]) as u64, (&offsets[0]) as u64, &budget, &tell_frac)
+    let alloc_trim: i32 = celt_side.decode_trim(e, tell_frac, budget)
+    var bits: i32 = ((len * 8) << 3) - opus.ec_tell_frac(e) - 1
+    var anti_rsv: i32 = 0
+    if is_transient != 0 && lm >= 2 && bits >= ((lm + 2) << 3) { anti_rsv = 1 << 3 }
+    bits = bits - anti_rsv
+    var pulses: [i32; 21] = [0; 21]
+    var fine_quant: [i32; 21] = [0; 21]
+    var fine_priority: [i32; 21] = [0; 21]
+    var intensity: i32 = 0
+    var dual_stereo: i32 = 0
+    var balance: i32 = 0
+    let coded: i32 = celt.celt_compute_allocation(e, start, end, (&offsets[0]) as u64, (&cap[0]) as u64, alloc_trim, &intensity, &dual_stereo, bits,
+        &balance, (&pulses[0]) as u64, (&fine_quant[0]) as u64, (&fine_priority[0]) as u64, chans, lm)
+    celt.celt_unquant_fine(e, start, end, oe, (&fine_quant[0]) as u64, chans)
+    let mem_c: i32 = DECODE_BUFFER + OVERLAP
+    c = 0
+    while c < out_chans {
+        let base: u64 = at32((*d).mem, c * mem_c)
+        i = 0
+        while i < DECODE_BUFFER - n + OVERLAP {
+            celt_fix.st32(base, i, celt_fix.ld32(base, i + n))
+            i = i + 1
+        }
+        c = c + 1
+    }
+    var masks: [u8; 42] = [0; 42]
+    var x_store: [i16; 2000] = [0; 2000]
+    let x: u64 = (&x_store[0]) as u64
+    var y: u64 = 0
+    if chans == 2 { y = at16(x, n) }
+    celt_bands.quant_all_bands(start, end, x, y, (&masks[0]) as u64, (&pulses[0]) as u64, short_blocks, spread, dual_stereo, intensity,
+        (&tf_res[0]) as u64, len * (8 << 3) - anti_rsv, balance, e, lm, coded, &(*d).rng, 0)
+    var anti_on: i32 = 0
+    if anti_rsv > 0 { anti_on = opus.ec_bits(e, 1) as% i32 }
+    celt.celt_unquant_finalise(e, start, end, oe, (&fine_quant[0]) as u64, (&fine_priority[0]) as u64, len * 8 - opus.ec_tell(e), chans)
+    if anti_on != 0 {
+        celt_post.anti_collapse(x, (&masks[0]) as u64, lm, chans, n, start, end, oe, old_log(d), old_log2(d), (&pulses[0]) as u64, (*d).rng)
+    }
+    if silence != 0 {
+        i = 0
+        while i < chans * NBANDS {
+            celt_fix.st16(oe, i, FLOOR_DB)
+            i = i + 1
+        }
+    }
+    let out0: u64 = at32((*d).mem, DECODE_BUFFER - n)
+    let out1: u64 = at32((*d).mem, mem_c + DECODE_BUFFER - n)
+    celt_synth.celt_synthesis(x, out0, out1, oe, start, end, chans, out_chans, is_transient, lm, silence)
+    c = 0
+    while c < out_chans {
+        var out: u64 = out0
+        if c == 1 { out = out1 }
+        apply_postfilter(d, out, n, lm, pf_pitch, pf_gain, pf_tapset)
+        c = c + 1
+    }
+    (*d).period_old = (*d).period
+    (*d).gain_old = (*d).gain
+    (*d).tapset_old = (*d).tapset
+    (*d).period = pf_pitch
+    (*d).gain = pf_gain
+    (*d).tapset = pf_tapset
+    if lm != 0 {
+        (*d).period_old = (*d).period
+        (*d).gain_old = (*d).gain
+        (*d).tapset_old = (*d).tapset
+    }
+    update_energy_history(d, is_transient, m)
+    (*d).rng = (*e).rng
+    c = 0
+    while c < out_chans {
+        var out3: u64 = out0
+        if c == 1 { out3 = out1 }
+        celt_post.deemphasis(out3, pcm, n, out_chans, c, PREEMPH0, preemph_mem(d), accum)
+        c = c + 1
+    }
+    if opus.ec_tell(e) > 8 * len { return CELT_ERR_INTERNAL }
+    return frame_size
+}
+
+fn celt_dec_free(d: *mut CeltDec) {
+    rt.heap_free((*d).mem, ((*d).channels * (DECODE_BUFFER + OVERLAP) * 4 + 64) as% usize)
+    rt.heap_free((*d).aux, 336 + 8 + 64)
+}

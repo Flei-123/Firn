@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.opus
+import media.audio.opus.celt_fix
+import media.audio.opus.celt_dec
+import media.audio.opus.silk_stream
+import media.audio.opus.opus_fade
+import media.audio.opus.celt_math
+
+export { OpusDec, opus_dec_new, opus_dec_free, opus_dec_set_gain, opus_decode, opus_dec_final_range, OPUS_DEC_ERR_ARG, OPUS_DEC_ERR_SMALL, OPUS_DEC_ERR_INTERNAL, OPUS_DEC_ERR_PACKET, OPUS_DEC_ERR_PLC }
+
+const OPUS_DEC_ERR_ARG: i32 = 0 - 1
+const OPUS_DEC_ERR_SMALL: i32 = 0 - 2
+const OPUS_DEC_ERR_INTERNAL: i32 = 0 - 3
+const OPUS_DEC_ERR_PACKET: i32 = 0 - 4
+const OPUS_DEC_ERR_PLC: i32 = 0 - 100
+const FS: i32 = 48000
+const F20: i32 = 960
+const F5: i32 = 240
+const F2_5: i32 = 120
+const MAX_FRAME: i32 = 5760
+const SILK_END: i32 = 17
+
+struct OpusDec {
+    channels: i32,
+    stream_channels: i32,
+    mode: i32,
+    bandwidth: i32,
+    frame_size: i32,
+    prev_mode: i32,
+    prev_redundancy: i32,
+    final_range: u32,
+    gain_q8: i32,
+    celt: celt_dec.CeltDec,
+    silk: silk_stream.SilkStream,
+    red_buf: u64,
+    silence: u64,
+}
+
+fn opus_dec_new(channels: i32) -> OpusDec {
+    let silence: u64 = rt.heap_alloc(8)
+    celt_fix.stb(silence, 0, 255)
+    celt_fix.stb(silence, 1, 255)
+    return OpusDec { channels: channels, stream_channels: channels, mode: 0, bandwidth: 0, frame_size: 0, prev_mode: 0 - 1, prev_redundancy: 0,
+        final_range: 0, gain_q8: 0, celt: celt_dec.celt_dec_new(channels), silk: silk_stream.silk_stream_new(), red_buf: rt.heap_alloc((F5 * 2 * 2 + 16) as% usize), silence: silence }
+}
+
+fn opus_dec_set_gain(d: *mut OpusDec, gain_q8: i32) { (*d).gain_q8 = gain_q8 }
+
+fn apply_gain(d: *mut OpusDec, pcm: u64, count: i32) {
+    let g: i64 = celt_math.celt_exp2(celt_fix.mul16_16_p15(21771, (*d).gain_q8)) as% i64
+    var i: i32 = 0
+    while i < count {
+        var v: i64 = (((celt_fix.ld16(pcm, i) as% i64) * g) + 32768) >> 16
+        if v > 32767 { v = 32767 }
+        if v < 0 - 32767 { v = 0 - 32767 }
+        celt_fix.st16(pcm, i, v as% i32)
+        i = i + 1
+    }
+}
+
+fn opus_dec_final_range(d: *mut OpusDec) -> u32 { return (*d).final_range }
+
+fn end_band(bandwidth: i32) -> i32 {
+    if bandwidth == 0 { return 13 }
+    if bandwidth <= 2 { return 17 }
+    if bandwidth == 3 { return 19 }
+    return 21
+}
+
+fn silk_rate_khz(mode: i32, bandwidth: i32) -> i32 {
+    if mode == opus.OPUS_MODE_SILK {
+        if bandwidth == 0 { return 8 }
+        if bandwidth == 1 { return 12 }
+    }
+    return 16
+}
+
+fn decode_silk(d: *mut OpusDec, e: *mut opus.Ec, pcm: u64, audiosize: i32) {
+    let ch: i32 = (*d).channels
+    if (*d).prev_mode == opus.OPUS_MODE_CELT { silk_stream.silk_stream_reset(&(*d).silk) }
+    var payload_ms: i32 = 1000 * audiosize / FS
+    if payload_ms < 10 { payload_ms = 10 }
+    silk_stream.silk_stream_begin(&(*d).silk, payload_ms, silk_rate_khz((*d).mode, (*d).bandwidth), (*d).stream_channels, ch, FS)
+    silk_stream.silk_stream_read_header(&(*d).silk, e)
+    var done: i32 = 0
+    var guard: i32 = 0
+    while done < audiosize && guard < 8 {
+        let n: i32 = silk_stream.silk_stream_frame(&(*d).silk, e, pcm +% ((done *% ch) as% u64) *% 2)
+        done = done + n
+        guard = guard + 1
+    }
+}
+
+fn decode_redundant(d: *mut OpusDec, data: u64, bytes: i32) -> u32 {
+    celt_dec.celt_dec_set_range(&(*d).celt, 0, end_band((*d).bandwidth), (*d).stream_channels)
+    celt_dec.celt_decode_with_ec(&(*d).celt, data, bytes, (*d).red_buf, F5)
+    return (*d).celt.rng
+}
+
+fn decode_frame(d: *mut OpusDec, data: u64, len_in: i32, pcm: u64, frame_in: i32) -> i32 {
+    let ch: i32 = (*d).channels
+    let mode: i32 = (*d).mode
+    let prev: i32 = (*d).prev_mode
+    let sc: i32 = (*d).stream_channels
+    let endb: i32 = end_band((*d).bandwidth)
+    if frame_in < F2_5 { return OPUS_DEC_ERR_SMALL }
+    if len_in <= 1 { return OPUS_DEC_ERR_PLC }
+    var frame_size: i32 = frame_in
+    if frame_size > MAX_FRAME { frame_size = MAX_FRAME }
+    let audiosize: i32 = (*d).frame_size
+    var len: i32 = len_in
+    var e: opus.Ec = opus.ec_new()
+    opus.ec_init(&e, data, len)
+    var transition: i32 = 0
+    if prev >= 0 && ((mode == opus.OPUS_MODE_CELT && prev != opus.OPUS_MODE_CELT && (*d).prev_redundancy == 0) || (mode != opus.OPUS_MODE_CELT && prev == opus.OPUS_MODE_CELT)) {
+        transition = 1
+    }
+    if transition != 0 && mode == opus.OPUS_MODE_CELT { return OPUS_DEC_ERR_PLC }
+    if audiosize > frame_size { return OPUS_DEC_ERR_ARG }
+    frame_size = audiosize
+    if mode != opus.OPUS_MODE_CELT { decode_silk(d, &e, pcm, audiosize) }
+    var redundancy: i32 = 0
+    var celt_to_silk: i32 = 0
+    var red_bytes: i32 = 0
+    var red_rng: u32 = 0
+    if mode != opus.OPUS_MODE_CELT {
+        var extra: i32 = 0
+        if mode == opus.OPUS_MODE_HYBRID { extra = 20 }
+        if opus.ec_tell(&e) + 17 + extra <= 8 * len {
+            if mode == opus.OPUS_MODE_HYBRID { redundancy = opus.ec_bit_logp(&e, 12) } else { redundancy = 1 }
+            if redundancy != 0 {
+                celt_to_silk = opus.ec_bit_logp(&e, 1)
+                if mode == opus.OPUS_MODE_HYBRID {
+                    red_bytes = (opus.ec_uint(&e, 256) as% i32) + 2
+                } else {
+                    red_bytes = len - ((opus.ec_tell(&e) + 7) >> 3)
+                }
+                len = len - red_bytes
+                if len * 8 < opus.ec_tell(&e) {
+                    len = 0
+                    red_bytes = 0
+                    redundancy = 0
+                }
+                e.storage = e.storage - red_bytes
+            }
+        }
+    }
+    var start_band: i32 = 0
+    if mode != opus.OPUS_MODE_CELT { start_band = SILK_END }
+    if redundancy != 0 { transition = 0 }
+    if transition != 0 && mode != opus.OPUS_MODE_CELT { return OPUS_DEC_ERR_PLC }
+    if redundancy != 0 && celt_to_silk != 0 { red_rng = decode_redundant(d, data +% (len as% u64), red_bytes) }
+    celt_dec.celt_dec_set_range(&(*d).celt, start_band, endb, sc)
+    var celt_ret: i32 = 0
+    if mode != opus.OPUS_MODE_SILK {
+        var celt_frame: i32 = frame_size
+        if celt_frame > F20 { celt_frame = F20 }
+        if mode != prev && prev >= 0 && (*d).prev_redundancy == 0 { celt_dec.celt_dec_reset(&(*d).celt) }
+        var accum: i32 = 0
+        if mode != opus.OPUS_MODE_CELT { accum = 1 }
+        celt_ret = celt_dec.celt_decode_ec(&(*d).celt, &e, len, pcm, celt_frame, accum)
+    } else {
+        if prev == opus.OPUS_MODE_HYBRID && !(redundancy != 0 && celt_to_silk != 0 && (*d).prev_redundancy != 0) {
+            celt_dec.celt_dec_set_range(&(*d).celt, 0, endb, sc)
+            celt_dec.celt_decode_buf(&(*d).celt, (*d).silence, 2, pcm, F2_5, 1)
+        }
+    }
+    let rb: u64 = (*d).red_buf
+    if redundancy != 0 && celt_to_silk == 0 {
+        celt_dec.celt_dec_reset(&(*d).celt)
+        red_rng = decode_redundant(d, data +% (len as% u64), red_bytes)
+        let tail: u64 = pcm +% (((frame_size - F2_5) *% ch) as% u64) *% 2
+        opus_fade.smooth_fade(tail, rb +% ((F2_5 *% ch) as% u64) *% 2, tail, F2_5, ch)
+    }
+    if redundancy != 0 && celt_to_silk != 0 && (prev != opus.OPUS_MODE_SILK || (*d).prev_redundancy != 0) {
+        var i: i32 = 0
+        while i < F2_5 * ch {
+            celt_fix.st16(pcm, i, celt_fix.ld16(rb, i))
+            i = i + 1
+        }
+        let head: u64 = pcm +% ((F2_5 *% ch) as% u64) *% 2
+        opus_fade.smooth_fade(rb +% ((F2_5 *% ch) as% u64) *% 2, head, head, F2_5, ch)
+    }
+    if (*d).gain_q8 != 0 { apply_gain(d, pcm, frame_size * ch) }
+    e.rng = e.rng ^ red_rng
+    (*d).final_range = e.rng
+    (*d).prev_mode = mode
+    (*d).prev_redundancy = 0
+    if redundancy != 0 && celt_to_silk == 0 { (*d).prev_redundancy = 1 }
+    if celt_ret < 0 { return celt_ret }
+    return audiosize
+}
+
+fn opus_decode(d: *mut OpusDec, data: u64, len: i32, pcm: u64, frame_size: i32) -> i32 {
+    if frame_size <= 0 { return OPUS_DEC_ERR_ARG }
+    if len == 0 { return OPUS_DEC_ERR_PLC }
+    if len < 0 { return OPUS_DEC_ERR_ARG }
+    var pkt: opus.OpusPacket = opus.opus_packet_new()
+    let nf: i32 = opus.opus_toc(data, len as% usize, &pkt)
+    if nf < 0 { return OPUS_DEC_ERR_PACKET }
+    if nf * pkt.frame_samples > frame_size { return OPUS_DEC_ERR_SMALL }
+    (*d).mode = pkt.mode
+    (*d).bandwidth = pkt.bandwidth
+    (*d).frame_size = pkt.frame_samples
+    (*d).stream_channels = 1 + pkt.stereo
+    var total: i32 = 0
+    var f: i32 = 0
+    while f < nf {
+        let r: i32 = decode_frame(d, data +% (pkt.off[f as% usize] as% u64), pkt.len[f as% usize], pcm +% ((total *% (*d).channels) as% u64) *% 2, frame_size - total)
+        if r < 0 { return r }
+        total = total + r
+        f = f + 1
+    }
+    return total
+}
+
+fn opus_dec_free(d: *mut OpusDec) {
+    celt_dec.celt_dec_free(&(*d).celt)
+    silk_stream.silk_stream_free(&(*d).silk)
+    rt.heap_free((*d).red_buf, (F5 * 2 * 2 + 16) as% usize)
+    rt.heap_free((*d).silence, 8)
+}

@@ -1,0 +1,639 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.celt_fix
+import media.audio.opus.celt_math
+import media.audio.opus.celt_tables
+import media.audio.opus.celt_vq
+import media.audio.opus.opus
+import media.audio.opus.celt
+
+export { quant_all_bands }
+
+struct BandCtx {
+    ec: *mut opus.Ec,
+    i: i32,
+    intensity: i32,
+    spread: i32,
+    tf_change: i32,
+    remaining_bits: i32,
+    seed: u32,
+    disable_inv: i32,
+    avoid_split_noise: i32,
+}
+
+struct SplitCtx {
+    inv: i32,
+    imid: i32,
+    iside: i32,
+    delta: i32,
+    itheta: i32,
+    qalloc: i32,
+}
+
+static ORDERY: [u8; 30] = [
+    1, 0,
+    3, 0, 2, 1,
+    7, 0, 4, 3, 6, 1, 5, 2,
+    15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10, 5,
+]
+
+fn eb(i: i32) -> i32 {
+    return celt_tables.celt_ebands(i as% usize) as% i32
+}
+
+fn ep(base: u64, i: i32) -> u64 {
+    return base +% ((i as% u64) *% 2)
+}
+
+fn haar1(x: u64, n0in: i32, stride: i32) {
+    let n0: i32 = n0in >> 1
+    var i: i32 = 0
+    while i < stride {
+        var j: i32 = 0
+        while j < n0 {
+            let a: i32 = celt_fix.mul16_16(23170, celt_fix.ld16(x, stride * 2 * j + i))
+            let b: i32 = celt_fix.mul16_16(23170, celt_fix.ld16(x, stride * (2 * j + 1) + i))
+            celt_fix.st16(x, stride * 2 * j + i, celt_fix.pshr32(a +% b, 15))
+            celt_fix.st16(x, stride * (2 * j + 1) + i, celt_fix.pshr32(a -% b, 15))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn deinterleave_hadamard(x: u64, n0: i32, stride: i32, hadamard: i32) {
+    var tmp: [i16; 200] = [0; 200]
+    let t: u64 = (&tmp[0]) as u64
+    let n: i32 = n0 * stride
+    var i: i32 = 0
+    while i < stride {
+        var j: i32 = 0
+        while j < n0 {
+            var dst: i32 = i * n0 + j
+            if hadamard != 0 { dst = (ORDERY[(stride - 2 + i) as% usize] as% i32) * n0 + j }
+            celt_fix.st16(t, dst, celt_fix.ld16(x, j * stride + i))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        celt_fix.st16(x, i, celt_fix.ld16(t, i))
+        i = i + 1
+    }
+}
+
+fn interleave_hadamard(x: u64, n0: i32, stride: i32, hadamard: i32) {
+    var tmp: [i16; 200] = [0; 200]
+    let t: u64 = (&tmp[0]) as u64
+    let n: i32 = n0 * stride
+    var i: i32 = 0
+    while i < stride {
+        var j: i32 = 0
+        while j < n0 {
+            var src: i32 = i * n0 + j
+            if hadamard != 0 { src = (ORDERY[(stride - 2 + i) as% usize] as% i32) * n0 + j }
+            celt_fix.st16(t, j * stride + i, celt_fix.ld16(x, src))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        celt_fix.st16(x, i, celt_fix.ld16(t, i))
+        i = i + 1
+    }
+}
+
+fn stereo_merge(x: u64, y: u64, mid: i32, n: i32) {
+    var xp: i32 = 0
+    var side: i32 = 0
+    var j: i32 = 0
+    while j < n {
+        let yv: i32 = celt_fix.ld16(y, j)
+        xp = xp +% celt_fix.mul16_16(yv, celt_fix.ld16(x, j))
+        side = side +% celt_fix.mul16_16(yv, yv)
+        j = j + 1
+    }
+    xp = celt_fix.mul16_32_q15(mid, xp)
+    let mid2: i32 = mid >> 1
+    let m2: i32 = celt_fix.mul16_16(mid2, mid2)
+    let el: i32 = m2 +% side -% (2 *% xp)
+    let er: i32 = m2 +% side +% (2 *% xp)
+    if er < 161061 || el < 161061 {
+        j = 0
+        while j < n {
+            celt_fix.st16(y, j, celt_fix.ld16(x, j))
+            j = j + 1
+        }
+        return
+    }
+    var kl: i32 = celt_math.celt_ilog2(el) >> 1
+    var kr: i32 = celt_math.celt_ilog2(er) >> 1
+    let lgain: i32 = celt_math.celt_rsqrt_norm(celt_math.vshr32(el, (kl - 7) << 1))
+    let rgain: i32 = celt_math.celt_rsqrt_norm(celt_math.vshr32(er, (kr - 7) << 1))
+    if kl < 7 { kl = 7 }
+    if kr < 7 { kr = 7 }
+    j = 0
+    while j < n {
+        let l: i32 = celt_fix.mul16_16_p15(mid, celt_fix.ld16(x, j))
+        let r: i32 = celt_fix.ld16(y, j)
+        celt_fix.st16(x, j, celt_fix.pshr32(celt_fix.mul16_16(lgain, celt_fix.i16c(l - r)), kl + 1))
+        celt_fix.st16(y, j, celt_fix.pshr32(celt_fix.mul16_16(rgain, celt_fix.i16c(l + r)), kr + 1))
+        j = j + 1
+    }
+}
+
+fn compute_qn(n: i32, b: i32, offset: i32, pulse_cap: i32, stereo: i32) -> i32 {
+    let exp2_table8: [i32; 8] = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048]
+    var n2: i32 = 2 * n - 1
+    if stereo != 0 && n == 2 { n2 = n2 - 1 }
+    var qb: i32 = celt_fix.celt_sudiv(b + n2 * offset, n2)
+    qb = celt_fix.imin(b - pulse_cap - 32, qb)
+    qb = celt_fix.imin(64, qb)
+    if qb < 4 { return 1 }
+    var qn: i32 = exp2_table8[(qb & 7) as% usize] >> (14 - (qb >> 3))
+    qn = ((qn + 1) >> 1) << 1
+    return qn
+}
+
+fn compute_theta(ctx: *mut BandCtx, sctx: *mut SplitCtx, n: i32, b: *mut i32, bb: i32, b0: i32, lm: i32, stereo: i32, fill: *mut i32) {
+    let e: *mut opus.Ec = (*ctx).ec
+    let i: i32 = (*ctx).i
+    let pulse_cap: i32 = (celt_tables.celt_logn(i as% usize) as% i32) + lm * 8
+    var offset: i32 = (pulse_cap >> 1) - 4
+    if stereo != 0 && n == 2 { offset = (pulse_cap >> 1) - 16 }
+    var qn: i32 = compute_qn(n, *b, offset, pulse_cap, stereo)
+    if stereo != 0 && i >= (*ctx).intensity { qn = 1 }
+    var itheta: i32 = 0
+    var inv: i32 = 0
+    let tell: i32 = opus.ec_tell_frac(e)
+    if qn != 1 {
+        if stereo != 0 && n > 2 {
+            let p0: i32 = 3
+            let x0: i32 = qn / 2
+            let ft: i32 = p0 * (x0 + 1) + x0
+            let fs: i32 = opus.ec_decode(e, ft as% u32) as% i32
+            var x: i32 = 0
+            if fs < (x0 + 1) * p0 {
+                x = fs / p0
+            } else {
+                x = x0 + 1 + (fs - (x0 + 1) * p0)
+            }
+            var fl: i32 = 0
+            var fh: i32 = 0
+            if x <= x0 {
+                fl = p0 * x
+                fh = p0 * (x + 1)
+            } else {
+                fl = (x - 1 - x0) + (x0 + 1) * p0
+                fh = (x - x0) + (x0 + 1) * p0
+            }
+            opus.ec_update(e, fl as% u32, fh as% u32, ft as% u32)
+            itheta = x
+        } else if b0 > 1 || stereo != 0 {
+            itheta = opus.ec_uint(e, (qn + 1) as% u32) as% i32
+        } else {
+            let half: i32 = qn >> 1
+            let ft: i32 = (half + 1) * (half + 1)
+            let fm: i32 = opus.ec_decode(e, ft as% u32) as% i32
+            var fs: i32 = 1
+            var fl: i32 = 0
+            if fm < ((half * (half + 1)) >> 1) {
+                itheta = ((celt_fix.isqrt32((8 * fm + 1) as% u32) as% i32) - 1) >> 1
+                fs = itheta + 1
+                fl = (itheta * (itheta + 1)) >> 1
+            } else {
+                itheta = (2 * (qn + 1) - (celt_fix.isqrt32((8 * (ft - fm - 1) + 1) as% u32) as% i32)) >> 1
+                fs = qn + 1 - itheta
+                fl = ft - (((qn + 1 - itheta) * (qn + 2 - itheta)) >> 1)
+            }
+            opus.ec_update(e, fl as% u32, (fl + fs) as% u32, ft as% u32)
+        }
+        itheta = (itheta * 16384) / qn
+    } else if stereo != 0 {
+        if *b > 16 && (*ctx).remaining_bits > 16 {
+            inv = opus.ec_bit_logp(e, 2)
+        }
+        if (*ctx).disable_inv != 0 { inv = 0 }
+        itheta = 0
+    }
+    let qalloc: i32 = opus.ec_tell_frac(e) - tell
+    *b = *b - qalloc
+    var imid: i32 = 0
+    var iside: i32 = 0
+    var delta: i32 = 0
+    if itheta == 0 {
+        imid = 32767
+        iside = 0
+        *fill = *fill & ((1 << bb) - 1)
+        delta = 0 - 16384
+    } else if itheta == 16384 {
+        imid = 0
+        iside = 32767
+        *fill = *fill & (((1 << bb) - 1) << bb)
+        delta = 16384
+    } else {
+        imid = celt_math.bitexact_cos(itheta)
+        iside = celt_math.bitexact_cos(16384 - itheta)
+        delta = celt_math.frac_mul16((n - 1) << 7, celt_math.bitexact_log2tan(iside, imid))
+    }
+    (*sctx).inv = inv
+    (*sctx).imid = imid
+    (*sctx).iside = iside
+    (*sctx).delta = delta
+    (*sctx).itheta = itheta
+    (*sctx).qalloc = qalloc
+}
+
+fn quant_band_n1(ctx: *mut BandCtx, x: u64, y: u64, lowband_out: u64) -> i32 {
+    var cur: u64 = x
+    var c: i32 = 0
+    var chans: i32 = 1
+    if y != 0 { chans = 2 }
+    while c < chans {
+        var sign: i32 = 0
+        if (*ctx).remaining_bits >= 8 {
+            sign = opus.ec_bits((*ctx).ec, 1) as% i32
+            (*ctx).remaining_bits = (*ctx).remaining_bits - 8
+        }
+        if sign != 0 {
+            celt_fix.st16(cur, 0, 0 - 16384)
+        } else {
+            celt_fix.st16(cur, 0, 16384)
+        }
+        cur = y
+        c = c + 1
+    }
+    if lowband_out != 0 { celt_fix.st16(lowband_out, 0, celt_fix.ld16(x, 0) >> 4) }
+    return 1
+}
+
+fn quant_partition(ctx: *mut BandCtx, x: u64, n0: i32, b0: i32, bb0: i32, lowband: u64, lm0: i32, gain: i32, fill0: i32) -> i32 {
+    var n: i32 = n0
+    var b: i32 = b0
+    var bb: i32 = bb0
+    var lm: i32 = lm0
+    var fill: i32 = fill0
+    let i: i32 = (*ctx).i
+    let base: usize = celt_tables.celt_cindex(((lm + 1) * 21 + i) as% usize) as% usize
+    let cap: i32 = celt_tables.celt_cbits(base + (celt_tables.celt_cbits(base) as% usize)) as% i32
+    var cm: i32 = 0
+    if lm != 0 - 1 && b > cap + 12 && n > 2 {
+        let bb_orig: i32 = bb
+        n = n >> 1
+        let y: u64 = ep(x, n)
+        lm = lm - 1
+        if bb == 1 { fill = (fill & 1) | (fill << 1) }
+        bb = (bb + 1) >> 1
+        var sctx: SplitCtx = SplitCtx { inv: 0, imid: 0, iside: 0, delta: 0, itheta: 0, qalloc: 0 }
+        compute_theta(ctx, &sctx, n, &b, bb, bb_orig, lm, 0, &fill)
+        let mid: i32 = sctx.imid
+        let side: i32 = sctx.iside
+        var delta: i32 = sctx.delta
+        let itheta: i32 = sctx.itheta
+        if bb_orig > 1 && (itheta & 16383) != 0 {
+            if itheta > 8192 {
+                delta = delta - (delta >> (4 - lm))
+            } else {
+                delta = celt_fix.imin(0, delta + ((n << 3) >> (5 - lm)))
+            }
+        }
+        var mbits: i32 = celt_fix.imax(0, celt_fix.imin(b, (b - delta) / 2))
+        var sbits: i32 = b - mbits
+        (*ctx).remaining_bits = (*ctx).remaining_bits - sctx.qalloc
+        var next_lowband2: u64 = 0
+        if lowband != 0 { next_lowband2 = ep(lowband, n) }
+        var rebalance: i32 = (*ctx).remaining_bits
+        if mbits >= sbits {
+            cm = quant_partition(ctx, x, n, mbits, bb, lowband, lm, celt_fix.mul16_16_p15(gain, mid), fill)
+            rebalance = mbits - (rebalance - (*ctx).remaining_bits)
+            if rebalance > 24 && itheta != 0 { sbits = sbits + rebalance - 24 }
+            cm = cm | (quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, celt_fix.mul16_16_p15(gain, side), fill >> bb) << (bb_orig >> 1))
+        } else {
+            cm = quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, celt_fix.mul16_16_p15(gain, side), fill >> bb) << (bb_orig >> 1)
+            rebalance = sbits - (rebalance - (*ctx).remaining_bits)
+            if rebalance > 24 && itheta != 16384 { mbits = mbits + rebalance - 24 }
+            cm = cm | quant_partition(ctx, x, n, mbits, bb, lowband, lm, celt_fix.mul16_16_p15(gain, mid), fill)
+        }
+    } else {
+        var q: i32 = celt.celt_bits2pulses(i, lm, b)
+        var curr_bits: i32 = celt.celt_pulses2bits(i, lm, q)
+        (*ctx).remaining_bits = (*ctx).remaining_bits - curr_bits
+        while (*ctx).remaining_bits < 0 && q > 0 {
+            (*ctx).remaining_bits = (*ctx).remaining_bits + curr_bits
+            q = q - 1
+            curr_bits = celt.celt_pulses2bits(i, lm, q)
+            (*ctx).remaining_bits = (*ctx).remaining_bits - curr_bits
+        }
+        if q != 0 {
+            let k: i32 = celt.celt_get_pulses(q)
+            cm = celt_vq.alg_unquant(x, n, k, (*ctx).spread, bb, (*ctx).ec, gain)
+        } else {
+            let cm_mask: i32 = (1 << bb) - 1
+            fill = fill & cm_mask
+            if fill == 0 {
+                var j: i32 = 0
+                while j < n {
+                    celt_fix.st16(x, j, 0)
+                    j = j + 1
+                }
+            } else {
+                var j: i32 = 0
+                if lowband == 0 {
+                    while j < n {
+                        (*ctx).seed = celt_vq.lcg_rand((*ctx).seed)
+                        celt_fix.st16(x, j, ((*ctx).seed as% i32) >> 20)
+                        j = j + 1
+                    }
+                    cm = cm_mask
+                } else {
+                    while j < n {
+                        (*ctx).seed = celt_vq.lcg_rand((*ctx).seed)
+                        var tmp: i32 = 4
+                        if ((*ctx).seed & 32768) == 0 { tmp = 0 - 4 }
+                        celt_fix.st16(x, j, celt_fix.ld16(lowband, j) + tmp)
+                        j = j + 1
+                    }
+                    cm = fill
+                }
+                celt_vq.renormalise_vector(x, n, gain)
+            }
+        }
+    }
+    return cm
+}
+
+fn quant_band(ctx: *mut BandCtx, x: u64, n: i32, b: i32, bb: i32, lowband0: u64, lm: i32, lowband_out: u64, gain: i32, lowband_scratch: u64, fill0: i32) -> i32 {
+    var lowband: u64 = lowband0
+    var fill: i32 = fill0
+    let n0: i32 = n
+    var b0: i32 = bb
+    var bcur: i32 = bb
+    var n_b: i32 = n / bb
+    var time_divide: i32 = 0
+    var recombine: i32 = 0
+    let long_blocks: i32 = if_eq(b0, 1)
+    let tf_change0: i32 = (*ctx).tf_change
+    var tf_change: i32 = tf_change0
+    if n == 1 {
+        return quant_band_n1(ctx, x, 0, lowband_out)
+    }
+    if tf_change > 0 { recombine = tf_change }
+    if lowband_scratch != 0 && lowband != 0 && (recombine != 0 || ((n_b & 1) == 0 && tf_change < 0) || b0 > 1) {
+        var j: i32 = 0
+        while j < n {
+            celt_fix.st16(lowband_scratch, j, celt_fix.ld16(lowband, j))
+            j = j + 1
+        }
+        lowband = lowband_scratch
+    }
+    let bit_interleave: [i32; 16] = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3]
+    var k: i32 = 0
+    while k < recombine {
+        if lowband != 0 { haar1(lowband, n >> k, 1 << k) }
+        fill = bit_interleave[(fill & 15) as% usize] | (bit_interleave[(fill >> 4) as% usize] << 2)
+        k = k + 1
+    }
+    bcur = bcur >> recombine
+    n_b = n_b << recombine
+    while (n_b & 1) == 0 && tf_change < 0 {
+        if lowband != 0 { haar1(lowband, n_b, bcur) }
+        fill = fill | (fill << bcur)
+        bcur = bcur << 1
+        n_b = n_b >> 1
+        time_divide = time_divide + 1
+        tf_change = tf_change + 1
+    }
+    b0 = bcur
+    let n_b0: i32 = n_b
+    if b0 > 1 {
+        if lowband != 0 { deinterleave_hadamard(lowband, n_b >> recombine, b0 << recombine, long_blocks) }
+    }
+    var cm: i32 = quant_partition(ctx, x, n, b, bcur, lowband, lm, gain, fill)
+    if b0 > 1 {
+        interleave_hadamard(x, n_b >> recombine, b0 << recombine, long_blocks)
+    }
+    n_b = n_b0
+    bcur = b0
+    k = 0
+    while k < time_divide {
+        bcur = bcur >> 1
+        n_b = n_b << 1
+        cm = cm | (cm >> bcur)
+        haar1(x, n_b, bcur)
+        k = k + 1
+    }
+    let bit_deinterleave: [i32; 16] = [0, 3, 12, 15, 48, 51, 60, 63, 192, 195, 204, 207, 240, 243, 252, 255]
+    k = 0
+    while k < recombine {
+        cm = bit_deinterleave[(cm & 15) as% usize]
+        haar1(x, n0 >> k, 1 << k)
+        k = k + 1
+    }
+    bcur = bcur << recombine
+    if lowband_out != 0 {
+        let nn: i32 = celt_math.celt_sqrt(celt_fix.shl32(n0, 22))
+        var j: i32 = 0
+        while j < n0 {
+            celt_fix.st16(lowband_out, j, celt_fix.mul16_16_q15(nn, celt_fix.ld16(x, j)))
+            j = j + 1
+        }
+    }
+    cm = cm & ((1 << bcur) - 1)
+    return cm
+}
+
+fn if_eq(a: i32, b: i32) -> i32 {
+    if a == b { return 1 }
+    return 0
+}
+
+fn quant_band_stereo(ctx: *mut BandCtx, x: u64, y: u64, n: i32, b0: i32, bb: i32, lowband: u64, lm: i32, lowband_out: u64, lowband_scratch: u64, fill0: i32) -> i32 {
+    var b: i32 = b0
+    var fill: i32 = fill0
+    if n == 1 {
+        return quant_band_n1(ctx, x, y, lowband_out)
+    }
+    let orig_fill: i32 = fill
+    var sctx: SplitCtx = SplitCtx { inv: 0, imid: 0, iside: 0, delta: 0, itheta: 0, qalloc: 0 }
+    compute_theta(ctx, &sctx, n, &b, bb, bb, lm, 1, &fill)
+    let inv: i32 = sctx.inv
+    let mid: i32 = sctx.imid
+    let side: i32 = sctx.iside
+    let delta: i32 = sctx.delta
+    let itheta: i32 = sctx.itheta
+    let qalloc: i32 = sctx.qalloc
+    var cm: i32 = 0
+    if n == 2 {
+        var sbits: i32 = 0
+        if itheta != 0 && itheta != 16384 { sbits = 8 }
+        let mbits: i32 = b - sbits
+        var c: i32 = 0
+        if itheta > 8192 { c = 1 }
+        (*ctx).remaining_bits = (*ctx).remaining_bits - (qalloc + sbits)
+        var x2: u64 = x
+        var y2: u64 = y
+        if c != 0 {
+            x2 = y
+            y2 = x
+        }
+        var sign: i32 = 0
+        if sbits != 0 { sign = opus.ec_bits((*ctx).ec, 1) as% i32 }
+        sign = 1 - 2 * sign
+        cm = quant_band(ctx, x2, n, mbits, bb, lowband, lm, lowband_out, 32767, lowband_scratch, orig_fill)
+        celt_fix.st16(y2, 0, 0 - sign * celt_fix.ld16(x2, 1))
+        celt_fix.st16(y2, 1, sign * celt_fix.ld16(x2, 0))
+        celt_fix.st16(x, 0, celt_fix.mul16_16_q15(mid, celt_fix.ld16(x, 0)))
+        celt_fix.st16(x, 1, celt_fix.mul16_16_q15(mid, celt_fix.ld16(x, 1)))
+        celt_fix.st16(y, 0, celt_fix.mul16_16_q15(side, celt_fix.ld16(y, 0)))
+        celt_fix.st16(y, 1, celt_fix.mul16_16_q15(side, celt_fix.ld16(y, 1)))
+        var tmp: i32 = celt_fix.ld16(x, 0)
+        celt_fix.st16(x, 0, tmp - celt_fix.ld16(y, 0))
+        celt_fix.st16(y, 0, tmp + celt_fix.ld16(y, 0))
+        tmp = celt_fix.ld16(x, 1)
+        celt_fix.st16(x, 1, tmp - celt_fix.ld16(y, 1))
+        celt_fix.st16(y, 1, tmp + celt_fix.ld16(y, 1))
+    } else {
+        var mbits: i32 = celt_fix.imax(0, celt_fix.imin(b, (b - delta) / 2))
+        var sbits: i32 = b - mbits
+        (*ctx).remaining_bits = (*ctx).remaining_bits - qalloc
+        var rebalance: i32 = (*ctx).remaining_bits
+        if mbits >= sbits {
+            cm = quant_band(ctx, x, n, mbits, bb, lowband, lm, lowband_out, 32767, lowband_scratch, fill)
+            rebalance = mbits - (rebalance - (*ctx).remaining_bits)
+            if rebalance > 24 && itheta != 0 { sbits = sbits + rebalance - 24 }
+            cm = cm | quant_band(ctx, y, n, sbits, bb, 0, lm, 0, side, 0, fill >> bb)
+        } else {
+            cm = quant_band(ctx, y, n, sbits, bb, 0, lm, 0, side, 0, fill >> bb)
+            rebalance = sbits - (rebalance - (*ctx).remaining_bits)
+            if rebalance > 24 && itheta != 16384 { mbits = mbits + rebalance - 24 }
+            cm = cm | quant_band(ctx, x, n, mbits, bb, lowband, lm, lowband_out, 32767, lowband_scratch, fill)
+        }
+    }
+    if n != 2 { stereo_merge(x, y, mid, n) }
+    if inv != 0 {
+        var j: i32 = 0
+        while j < n {
+            celt_fix.st16(y, j, 0 - celt_fix.ld16(y, j))
+            j = j + 1
+        }
+    }
+    return cm
+}
+
+fn special_hybrid_folding(norm: u64, norm2: u64, start: i32, m: i32, dual_stereo: i32) {
+    let n1: i32 = m * (eb(start + 1) - eb(start))
+    let n2: i32 = m * (eb(start + 2) - eb(start + 1))
+    var j: i32 = 0
+    while j < n2 - n1 {
+        celt_fix.st16(norm, n1 + j, celt_fix.ld16(norm, 2 * n1 - n2 + j))
+        if dual_stereo != 0 { celt_fix.st16(norm2, n1 + j, celt_fix.ld16(norm2, 2 * n1 - n2 + j)) }
+        j = j + 1
+    }
+}
+
+fn quant_all_bands(start: i32, end: i32, x_: u64, y_: u64, collapse_masks: u64, pulses: u64, short_blocks: i32, spread: i32,
+        dual_stereo0: i32, intensity: i32, tf_res: u64, total_bits: i32, balance0: i32, e: *mut opus.Ec, lm: i32,
+        coded_bands: i32, seed: *mut u32, disable_inv: i32) {
+    var dual_stereo: i32 = dual_stereo0
+    var balance: i32 = balance0
+    let m: i32 = 1 << lm
+    var bb: i32 = 1
+    if short_blocks != 0 { bb = m }
+    var chans: i32 = 1
+    if y_ != 0 { chans = 2 }
+    let norm_offset: i32 = m * eb(start)
+    let norm_len: i32 = m * eb(20) - norm_offset
+    var norm_store: [i16; 1700] = [0; 1700]
+    let norm: u64 = (&norm_store[0]) as u64
+    let norm2: u64 = ep(norm, norm_len)
+    var lowband_scratch: u64 = ep(x_, m * eb(20))
+    var lowband_offset: i32 = 0
+    var update_lowband: i32 = 1
+    var ctx: BandCtx = BandCtx { ec: e, i: 0, intensity: intensity, spread: spread, tf_change: 0, remaining_bits: 0, seed: *seed,
+        disable_inv: disable_inv, avoid_split_noise: 0 }
+    if bb > 1 { ctx.avoid_split_noise = 1 }
+    var i: i32 = start
+    while i < end {
+        ctx.i = i
+        let last: i32 = if_eq(i, end - 1)
+        let x: u64 = ep(x_, m * eb(i))
+        var y: u64 = 0
+        if y_ != 0 { y = ep(y_, m * eb(i)) }
+        let n: i32 = m * eb(i + 1) - m * eb(i)
+        let tell: i32 = opus.ec_tell_frac(e)
+        if i != start { balance = balance - tell }
+        let remaining_bits: i32 = total_bits - tell - 1
+        ctx.remaining_bits = remaining_bits
+        var b: i32 = 0
+        if i <= coded_bands - 1 {
+            let curr_balance: i32 = celt_fix.celt_sudiv(balance, celt_fix.imin(3, coded_bands - i))
+            b = celt_fix.imax(0, celt_fix.imin(16383, celt_fix.imin(remaining_bits + 1, celt_fix.ld32(pulses, i) + curr_balance)))
+        }
+        if (m * eb(i) - n >= m * eb(start) || i == start + 1) && (update_lowband != 0 || lowband_offset == 0) { lowband_offset = i }
+        if i == start + 1 { special_hybrid_folding(norm, norm2, start, m, dual_stereo) }
+        let tf_change: i32 = celt_fix.ld32(tf_res, i)
+        ctx.tf_change = tf_change
+        var scratch: u64 = lowband_scratch
+        if last != 0 { scratch = 0 }
+        var effective_lowband: i32 = 0 - 1
+        var x_cm: i32 = 0
+        var y_cm: i32 = 0
+        if lowband_offset != 0 && (spread != 3 || bb > 1 || tf_change < 0) {
+            effective_lowband = celt_fix.imax(0, m * eb(lowband_offset) - norm_offset - n)
+            var fold_start: i32 = lowband_offset - 1
+            while m * eb(fold_start) > effective_lowband + norm_offset {
+                fold_start = fold_start - 1
+            }
+            var fold_end: i32 = lowband_offset
+            while fold_end < i && m * eb(fold_end) < effective_lowband + norm_offset + n {
+                fold_end = fold_end + 1
+            }
+            var fold_i: i32 = fold_start
+            while fold_i < fold_end {
+                x_cm = x_cm | celt_fix.ldb(collapse_masks, fold_i * chans)
+                y_cm = y_cm | celt_fix.ldb(collapse_masks, fold_i * chans + chans - 1)
+                fold_i = fold_i + 1
+            }
+        } else {
+            x_cm = (1 << bb) - 1
+            y_cm = x_cm
+        }
+        if dual_stereo != 0 && i == intensity {
+            dual_stereo = 0
+            var j: i32 = 0
+            while j < m * eb(i) - norm_offset {
+                celt_fix.st16(norm, j, (celt_fix.ld16(norm, j) + celt_fix.ld16(norm2, j)) >> 1)
+                j = j + 1
+            }
+        }
+        var lb: u64 = 0
+        if effective_lowband != 0 - 1 { lb = ep(norm, effective_lowband) }
+        var lb2: u64 = 0
+        if effective_lowband != 0 - 1 { lb2 = ep(norm2, effective_lowband) }
+        var lo: u64 = 0
+        var lo2: u64 = 0
+        if last == 0 {
+            lo = ep(norm, m * eb(i) - norm_offset)
+            lo2 = ep(norm2, m * eb(i) - norm_offset)
+        }
+        if dual_stereo != 0 {
+            x_cm = quant_band(&ctx, x, n, b / 2, bb, lb, lm, lo, 32767, scratch, x_cm)
+            y_cm = quant_band(&ctx, y, n, b / 2, bb, lb2, lm, lo2, 32767, scratch, y_cm)
+        } else {
+            if y != 0 {
+                x_cm = quant_band_stereo(&ctx, x, y, n, b, bb, lb, lm, lo, scratch, x_cm | y_cm)
+            } else {
+                x_cm = quant_band(&ctx, x, n, b, bb, lb, lm, lo, 32767, scratch, x_cm | y_cm)
+            }
+            y_cm = x_cm
+        }
+        celt_fix.stb(collapse_masks, i * chans, x_cm)
+        celt_fix.stb(collapse_masks, i * chans + chans - 1, y_cm)
+        balance = balance + celt_fix.ld32(pulses, i) + tell
+        if b > (n << 3) { update_lowband = 1 } else { update_lowband = 0 }
+        ctx.avoid_split_noise = 0
+        i = i + 1
+    }
+    *seed = ctx.seed
+}

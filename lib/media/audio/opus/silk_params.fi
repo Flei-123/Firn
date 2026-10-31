@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_math
+import media.audio.opus.silk_tables
+import media.audio.opus.silk_nlsf_tables
+import media.audio.opus.silk_nlsf
+import media.audio.opus.silk_lpc
+import media.audio.opus.silk_state
+
+export { silk_gains_dequant, silk_decode_pitch, silk_decode_parameters }
+
+fn silk_gains_dequant(d: *mut silk_state.SilkDec, conditional: i32) {
+    var prev: i32 = (*d).last_gain_index
+    var k: i32 = 0
+    while k < (*d).nb_subfr {
+        let ind: i32 = celt_fix.ld32((*d).gains_idx, k)
+        if k == 0 && conditional == 0 {
+            prev = celt_fix.imax(ind, prev - 16)
+        } else {
+            let ind_tmp: i32 = ind - 4
+            let thr: i32 = 8 + prev
+            if ind_tmp > thr {
+                prev = prev + ((ind_tmp << 1) - thr)
+            } else {
+                prev = prev + ind_tmp
+            }
+        }
+        prev = silk_math.limit32(prev, 0, 63)
+        let lg: i32 = celt_fix.imin(silk_math.smulwb(1907825, prev) + 2090, 3967)
+        celt_fix.st32((*d).gains_q16, k, silk_math.log2lin(lg))
+        k = k + 1
+    }
+    (*d).last_gain_index = prev
+}
+
+fn lag_entry(fs_khz: i32, nb_subfr: i32, i: i32) -> i32 {
+    if fs_khz == 8 {
+        if nb_subfr == 4 { return silk_nlsf_tables.silk_lags_stage2(i as% usize) as% i32 }
+        return silk_nlsf_tables.silk_lags_stage2_10(i as% usize) as% i32
+    }
+    if nb_subfr == 4 { return silk_nlsf_tables.silk_lags_stage3(i as% usize) as% i32 }
+    return silk_nlsf_tables.silk_lags_stage3_10(i as% usize) as% i32
+}
+
+fn silk_decode_pitch(lag_index: i32, contour: i32, pitch_l: u64, fs_khz: i32, nb_subfr: i32) {
+    var cbk_size: i32 = 34
+    if fs_khz == 8 {
+        if nb_subfr == 4 { cbk_size = 11 } else { cbk_size = 3 }
+    } else if nb_subfr != 4 {
+        cbk_size = 12
+    }
+    let min_lag: i32 = 2 * fs_khz
+    let max_lag: i32 = 18 * fs_khz
+    let lag: i32 = min_lag + lag_index
+    var k: i32 = 0
+    while k < nb_subfr {
+        let v: i32 = lag + lag_entry(fs_khz, nb_subfr, k * cbk_size + contour)
+        celt_fix.st32(pitch_l, k, silk_math.limit32(v, min_lag, max_lag))
+        k = k + 1
+    }
+}
+
+fn ltp_vq_addr(per_index: i32) -> u64 {
+    if per_index == 0 { return silk_nlsf_tables.silk_ltp_vq0_addr() }
+    if per_index == 1 { return silk_nlsf_tables.silk_ltp_vq1_addr() }
+    return silk_nlsf_tables.silk_ltp_vq2_addr()
+}
+
+fn silk_decode_parameters(d: *mut silk_state.SilkDec, cond_coding: i32) {
+    var cond: i32 = 0
+    if cond_coding == silk_state.CODE_CONDITIONALLY { cond = 1 }
+    silk_gains_dequant(d, cond)
+    let order: i32 = (*d).lpc_order
+    let row1: u64 = (*d).pred_coef + 32
+    silk_nlsf.silk_nlsf_decode(silk_state.is_wb(d), (*d).nlsf_idx, (*d).nlsf_cur)
+    silk_lpc.silk_nlsf2a(row1, (*d).nlsf_cur, order)
+    if (*d).first_frame_after_reset == 1 { (*d).nlsf_interp_coef_q2 = 4 }
+    var i: i32 = 0
+    if (*d).nlsf_interp_coef_q2 < 4 {
+        while i < order {
+            let prev: i32 = celt_fix.ld16((*d).prev_nlsf, i)
+            let cur: i32 = celt_fix.ld16((*d).nlsf_cur, i)
+            celt_fix.st16((*d).nlsf_mid, i, prev + (((*d).nlsf_interp_coef_q2 * (cur - prev)) >> 2))
+            i = i + 1
+        }
+        silk_lpc.silk_nlsf2a((*d).pred_coef, (*d).nlsf_mid, order)
+    } else {
+        while i < order {
+            celt_fix.st16((*d).pred_coef, i, celt_fix.ld16(row1, i))
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < order {
+        celt_fix.st16((*d).prev_nlsf, i, celt_fix.ld16((*d).nlsf_cur, i))
+        i = i + 1
+    }
+    var k: i32 = 0
+    if (*d).signal_type == silk_state.TYPE_VOICED {
+        silk_decode_pitch((*d).lag_index, (*d).contour_index, (*d).pitch_l, (*d).fs_khz, (*d).nb_subfr)
+        let vq: u64 = ltp_vq_addr((*d).per_index)
+        while k < (*d).nb_subfr {
+            let ix: i32 = celt_fix.ld32((*d).ltp_idx, k)
+            i = 0
+            while i < 5 {
+                let c: i32 = ((celt_fix.ldb(vq, ix * 5 + i)) as% i8) as% i32
+                celt_fix.st16((*d).ltp_coef, k * 5 + i, c << 7)
+                i = i + 1
+            }
+            k = k + 1
+        }
+        (*d).ltp_scale_q14 = silk_tables.silk_ltp_scales((*d).ltp_scale_index as% usize) as% i32
+    } else {
+        while k < (*d).nb_subfr {
+            celt_fix.st32((*d).pitch_l, k, 0)
+            i = 0
+            while i < 5 {
+                celt_fix.st16((*d).ltp_coef, k * 5 + i, 0)
+                i = i + 1
+            }
+            k = k + 1
+        }
+        (*d).per_index = 0
+        (*d).ltp_scale_q14 = 0
+    }
+}

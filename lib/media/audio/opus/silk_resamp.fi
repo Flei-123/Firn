@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_math
+import media.audio.opus.silk_tables
+
+export { Resamp, resamp_new, resamp_free, resamp_init, resamp_copy_state, resamp_run }
+
+const MODE_COPY: i32 = 0
+const MODE_UP2: i32 = 1
+const MODE_IIR_FIR: i32 = 2
+const ORDER_FIR: i32 = 8
+const BATCH_MS: i32 = 10
+const UP2_A0: i32 = 1746
+const UP2_A1: i32 = 14986
+const UP2_A2: i32 = -26453
+const UP2_B0: i32 = 6854
+const UP2_B1: i32 = 25769
+const UP2_B2: i32 = -9994
+
+struct Resamp {
+    mode: i32,
+    fs_in_khz: i32,
+    fs_out_khz: i32,
+    batch: i32,
+    input_delay: i32,
+    inv_ratio_q16: i32,
+    siir: u64,
+    sfir: u64,
+    delay_buf: u64,
+    work: u64,
+}
+
+fn delay_dec(fs_in_khz: i32, fs_out_khz: i32) -> i32 {
+    if fs_in_khz == 8 {
+        if fs_out_khz == 8 { return 4 }
+        if fs_out_khz == 16 { return 2 }
+        return 0
+    }
+    if fs_in_khz == 12 {
+        if fs_out_khz == 8 { return 0 }
+        if fs_out_khz == 12 { return 9 }
+        if fs_out_khz == 16 { return 4 }
+        if fs_out_khz == 24 { return 7 }
+        return 4
+    }
+    if fs_out_khz == 8 { return 0 }
+    if fs_out_khz == 12 { return 3 }
+    if fs_out_khz == 16 { return 12 }
+    return 7
+}
+
+fn resamp_new() -> Resamp {
+    var r: Resamp = Resamp {
+        mode: MODE_COPY, fs_in_khz: 0, fs_out_khz: 0, batch: 0, input_delay: 0, inv_ratio_q16: 0,
+        siir: rt.heap_alloc(32), sfir: rt.heap_alloc(32), delay_buf: rt.heap_alloc(64), work: rt.heap_alloc(1024) }
+    resamp_clear(&r)
+    return r
+}
+
+fn resamp_clear(r: *mut Resamp) {
+    var i: i32 = 0
+    while i < 6 {
+        celt_fix.st32((*r).siir, i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < ORDER_FIR {
+        celt_fix.st16((*r).sfir, i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 32 {
+        celt_fix.st16((*r).delay_buf, i, 0)
+        i = i + 1
+    }
+}
+
+fn resamp_init(r: *mut Resamp, fs_in_hz: i32, fs_out_hz: i32) {
+    resamp_clear(r)
+    (*r).fs_in_khz = fs_in_hz / 1000
+    (*r).fs_out_khz = fs_out_hz / 1000
+    (*r).input_delay = delay_dec((*r).fs_in_khz, (*r).fs_out_khz)
+    (*r).batch = (*r).fs_in_khz * BATCH_MS
+    var up2x: i32 = 0
+    (*r).mode = MODE_COPY
+    if fs_out_hz > fs_in_hz {
+        if fs_out_hz == fs_in_hz * 2 {
+            (*r).mode = MODE_UP2
+        } else {
+            (*r).mode = MODE_IIR_FIR
+            up2x = 1
+        }
+    }
+    var inv: i32 = ((fs_in_hz << (14 + up2x)) / fs_out_hz) << 2
+    while silk_math.smulww(inv, fs_out_hz) < (fs_in_hz << up2x) {
+        inv = inv + 1
+    }
+    (*r).inv_ratio_q16 = inv
+}
+
+fn resamp_copy_state(dst: *mut Resamp, src: *mut Resamp) {
+    (*dst).mode = (*src).mode
+    (*dst).fs_in_khz = (*src).fs_in_khz
+    (*dst).fs_out_khz = (*src).fs_out_khz
+    (*dst).batch = (*src).batch
+    (*dst).input_delay = (*src).input_delay
+    (*dst).inv_ratio_q16 = (*src).inv_ratio_q16
+    var i: i32 = 0
+    while i < 6 {
+        celt_fix.st32((*dst).siir, i, celt_fix.ld32((*src).siir, i))
+        i = i + 1
+    }
+    i = 0
+    while i < ORDER_FIR {
+        celt_fix.st16((*dst).sfir, i, celt_fix.ld16((*src).sfir, i))
+        i = i + 1
+    }
+    i = 0
+    while i < 32 {
+        celt_fix.st16((*dst).delay_buf, i, celt_fix.ld16((*src).delay_buf, i))
+        i = i + 1
+    }
+}
+
+fn allpass_section(s: u64, idx: i32, inp: i32, coef: i32) -> i32 {
+    let y: i32 = inp -% celt_fix.ld32(s, idx)
+    let x: i32 = silk_math.smulwb(y, coef)
+    let o: i32 = celt_fix.ld32(s, idx) +% x
+    celt_fix.st32(s, idx, inp +% x)
+    return o
+}
+
+fn allpass_last(s: u64, idx: i32, inp: i32, coef: i32) -> i32 {
+    let y: i32 = inp -% celt_fix.ld32(s, idx)
+    let x: i32 = silk_math.smlawb(y, y, coef)
+    let o: i32 = celt_fix.ld32(s, idx) +% x
+    celt_fix.st32(s, idx, inp +% x)
+    return o
+}
+
+fn up2_hq(s: u64, out: u64, inp: u64, len: i32) {
+    var k: i32 = 0
+    while k < len {
+        let in32: i32 = celt_fix.ld16(inp, k) << 10
+        var a: i32 = allpass_section(s, 0, in32, UP2_A0)
+        a = allpass_section(s, 1, a, UP2_A1)
+        a = allpass_last(s, 2, a, UP2_A2)
+        celt_fix.st16(out, 2 * k, silk_math.sat16(silk_math.rshift_round(a, 10)))
+        var b: i32 = allpass_section(s, 3, in32, UP2_B0)
+        b = allpass_section(s, 4, b, UP2_B1)
+        b = allpass_last(s, 5, b, UP2_B2)
+        celt_fix.st16(out, 2 * k + 1, silk_math.sat16(silk_math.rshift_round(b, 10)))
+        k = k + 1
+    }
+}
+
+fn tab(t: i32, c: i32) -> i32 {
+    return silk_tables.silk_resamp_frac_fir12((t * 4 + c) as% usize) as% i32
+}
+
+fn interpolate(out: u64, out_pos: i32, buf: u64, max_index_q16: i32, increment_q16: i32) -> i32 {
+    var o: i32 = out_pos
+    var index: i32 = 0
+    while index < max_index_q16 {
+        let t: i32 = silk_math.smulwb(index & 0xFFFF, 12)
+        let b: i32 = index >> 16
+        var res: i32 = silk_math.smulbb(celt_fix.ld16(buf, b), tab(t, 0))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 1), tab(t, 1))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 2), tab(t, 2))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 3), tab(t, 3))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 4), tab(11 - t, 3))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 5), tab(11 - t, 2))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 6), tab(11 - t, 1))
+        res = silk_math.smlabb(res, celt_fix.ld16(buf, b + 7), tab(11 - t, 0))
+        celt_fix.st16(out, o, silk_math.sat16(silk_math.rshift_round(res, 15)))
+        o = o + 1
+        index = index +% increment_q16
+    }
+    return o
+}
+
+fn iir_fir(r: *mut Resamp, out: u64, inp: u64, in_len: i32) {
+    let buf: u64 = (*r).work
+    var i: i32 = 0
+    while i < ORDER_FIR {
+        celt_fix.st16(buf, i, celt_fix.ld16((*r).sfir, i))
+        i = i + 1
+    }
+    var remaining: i32 = in_len
+    var src: u64 = inp
+    var o: i32 = 0
+    var n: i32 = 0
+    while true {
+        n = remaining
+        if n > (*r).batch { n = (*r).batch }
+        up2_hq((*r).siir, buf + (ORDER_FIR * 2) as% u64, src, n)
+        o = interpolate(out, o, buf, n << 17, (*r).inv_ratio_q16)
+        src = src + (n * 2) as% u64
+        remaining = remaining - n
+        if remaining > 0 {
+            i = 0
+            while i < ORDER_FIR {
+                celt_fix.st16(buf, i, celt_fix.ld16(buf, (n << 1) + i))
+                i = i + 1
+            }
+        } else {
+            break
+        }
+    }
+    i = 0
+    while i < ORDER_FIR {
+        celt_fix.st16((*r).sfir, i, celt_fix.ld16(buf, (n << 1) + i))
+        i = i + 1
+    }
+}
+
+fn run_mode(r: *mut Resamp, out: u64, inp: u64, len: i32) {
+    if (*r).mode == MODE_UP2 {
+        up2_hq((*r).siir, out, inp, len)
+    } else if (*r).mode == MODE_IIR_FIR {
+        iir_fir(r, out, inp, len)
+    } else {
+        var i: i32 = 0
+        while i < len {
+            celt_fix.st16(out, i, celt_fix.ld16(inp, i))
+            i = i + 1
+        }
+    }
+}
+
+fn resamp_run(r: *mut Resamp, out: u64, inp: u64, in_len: i32) {
+    let fin: i32 = (*r).fs_in_khz
+    let delay: i32 = (*r).input_delay
+    let n: i32 = fin - delay
+    var i: i32 = 0
+    while i < n {
+        celt_fix.st16((*r).delay_buf, delay + i, celt_fix.ld16(inp, i))
+        i = i + 1
+    }
+    run_mode(r, out, (*r).delay_buf, fin)
+    run_mode(r, out + ((*r).fs_out_khz * 2) as% u64, inp + (n * 2) as% u64, in_len - fin)
+    i = 0
+    while i < delay {
+        celt_fix.st16((*r).delay_buf, i, celt_fix.ld16(inp, in_len - delay + i))
+        i = i + 1
+    }
+}
+
+fn resamp_free(r: *mut Resamp) {
+    rt.heap_free((*r).siir, 32)
+    rt.heap_free((*r).sfir, 32)
+    rt.heap_free((*r).delay_buf, 64)
+    rt.heap_free((*r).work, 1024)
+}
