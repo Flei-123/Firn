@@ -326,6 +326,8 @@ def main():
     c.call(cb, ACT, "DoAction", 0)
     pump(0.8)
     check(seen(cb, "StateChanged", "checked"), "event: StateChanged 'checked' after DoAction on the check box")
+    check(any(mem == "Announcement" and int(a[1]) == 2 and str(a[3]) == "Action done" for pth, mem, a in got),
+          "event: Announcement 'Action done' (assertive) after DoAction")
     tbs = [p for k, p in paths.items() if k.startswith("textbox ")]
     check(len(tbs) == 1, "one text field in the tree")
     tb = tbs[0]
