@@ -1,0 +1,680 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    Flac, flac_new, flac_free, flac_open, flac_next, flac_seek, flac_reset, flac_chan,
+    flac_hz, flac_channels, flac_total, flac_bps, flac_last_start,
+}
+
+const MAX_BS: usize = 65536
+const MAX_CH: usize = 8
+
+struct Fbr {
+    buf: u64,
+    pos: i64,
+    end: i64,
+}
+
+struct Flac {
+    data: u64,
+    len: usize,
+    hz: u32,
+    ch: u32,
+    bps: u32,
+    total: u64,
+    min_bs: u32,
+    max_bs: u32,
+    first: usize,
+    pos: usize,
+    ready: i32,
+    pcm: u64,
+    br: Fbr,
+    f_start: u64,
+    f_bs: u32,
+    crc8: [u8; 256],
+    h_start: u64,
+    h_bs: u32,
+    h_hz: u32,
+    h_ch: u32,
+    h_bps: u32,
+    h_len: usize,
+    h_assign: u32,
+}
+
+fn flac_new() -> Flac {
+    var f: Flac = Flac {
+        data: 0, len: 0, hz: 44100, ch: 2, bps: 16, total: 0, min_bs: 0, max_bs: 0, first: 0, pos: 0, ready: 0,
+        pcm: 0, br: Fbr { buf: 0, pos: 0, end: 0 }, f_start: 0, f_bs: 0, crc8: [0 as u8; 256],
+        h_start: 0, h_bs: 0, h_hz: 0, h_ch: 0, h_bps: 0, h_len: 0, h_assign: 0,
+    }
+    var i: usize = 0
+    while i < 256 {
+        var c: u32 = i as u32
+        var k: i32 = 0
+        while k < 8 {
+            if (c & 128 as u32) != 0 as u32 {
+                c = ((c << 1) ^ 7 as u32) & 255 as u32
+            } else {
+                c = (c << 1) & 255 as u32
+            }
+            k = k + 1
+        }
+        f.crc8[i] = c as u8
+        i = i + 1
+    }
+    return f
+}
+
+fn flac_free(f: *mut Flac) {
+    if (*f).pcm != 0 {
+        rt.heap_free((*f).pcm, MAX_CH * MAX_BS * 4)
+    }
+    (*f).pcm = 0
+    (*f).ready = 0
+}
+
+fn flac_hz(f: *mut Flac) -> u32 { return (*f).hz }
+fn flac_channels(f: *mut Flac) -> u32 { return (*f).ch }
+fn flac_bps(f: *mut Flac) -> u32 { return (*f).bps }
+fn flac_total(f: *mut Flac) -> u64 { return (*f).total }
+fn flac_chan(f: *mut Flac, c: usize) -> u64 { return (*f).pcm + (c * MAX_BS * 4) as u64 }
+fn flac_last_start(f: *mut Flac) -> u64 { return (*f).f_start }
+
+fn flac_reset(f: *mut Flac) {
+    (*f).pos = (*f).first
+}
+
+fn ldb(p: u64, i: usize) -> u32 {
+    return (*((p + i as u64) as *mut u8)) as u32
+}
+
+fn ldi(p: u64, i: usize) -> i32 {
+    return *((p + (i * 4) as u64) as *mut i32)
+}
+
+fn sti(p: u64, i: usize, v: i32) {
+    *((p + (i * 4) as u64) as *mut i32) = v
+}
+
+fn br_get(b: *mut Fbr, n: i32) -> u32 {
+    if n == 0 {
+        return 0
+    }
+    let pos: i64 = (*b).pos
+    (*b).pos = pos + (n as i64)
+    if pos + (n as i64) > (*b).end {
+        return 0
+    }
+    let sh: i32 = (pos & 7) as i32
+    let p: u64 = (*b).buf + ((pos >> 3) as u64)
+    let need: i32 = sh + n
+    var v: u64 = (ldb(p, 0) as u64) << 32
+    if need > 8 {
+        v = v | ((ldb(p, 1) as u64) << 24)
+    }
+    if need > 16 {
+        v = v | ((ldb(p, 2) as u64) << 16)
+    }
+    if need > 24 {
+        v = v | ((ldb(p, 3) as u64) << 8)
+    }
+    if need > 32 {
+        v = v | (ldb(p, 4) as u64)
+    }
+    let r: u64 = (v >> ((40 - need) as u64)) & ((1 << (n as u64)) - 1)
+    return r as u32
+}
+
+fn s32_of(v: u32) -> i32 {
+    if v < 2147483648 as u32 {
+        return v as i32
+    }
+    if v == 2147483648 as u32 {
+        return (0 - 2147483647) - 1
+    }
+    return 0 - ((4294967296 as u64 - (v as u64)) as i32)
+}
+
+fn br_sget(b: *mut Fbr, n: i32) -> i32 {
+    if n == 0 {
+        return 0
+    }
+    let v: u32 = br_get(b, n)
+    if n >= 32 {
+        return s32_of(v)
+    }
+    let s: i32 = 32 - n
+    return s32_of(v << (s as u32)) >> (s as u32)
+}
+
+fn br_over(b: *mut Fbr) -> i32 {
+    if (*b).pos > (*b).end {
+        return 1
+    }
+    return 0
+}
+
+fn br_unary(b: *mut Fbr) -> i32 {
+    var n: i32 = 0
+    var go: i32 = 1
+    while go != 0 {
+        if (*b).pos >= (*b).end {
+            (*b).pos = (*b).end + 1
+            go = 0
+        } else {
+            let bit: u32 = br_get(b, 1)
+            if bit != 0 as u32 {
+                go = 0
+            } else {
+                n = n + 1
+                if n > 2000000 {
+                    go = 0
+                }
+            }
+        }
+    }
+    return n
+}
+
+fn block_size_of(code: u32) -> u32 {
+    if code == 1 as u32 { return 192 as u32 }
+    if code >= 2 as u32 && code <= 5 as u32 { return (576 as u32) << (code - 2 as u32) }
+    if code >= 8 as u32 && code <= 15 as u32 { return (256 as u32) << (code - 8 as u32) }
+    return 0 as u32
+}
+
+fn rate_of(code: u32) -> u32 {
+    if code == 1 as u32 { return 88200 as u32 }
+    if code == 2 as u32 { return 176400 as u32 }
+    if code == 3 as u32 { return 192000 as u32 }
+    if code == 4 as u32 { return 8000 as u32 }
+    if code == 5 as u32 { return 16000 as u32 }
+    if code == 6 as u32 { return 22050 as u32 }
+    if code == 7 as u32 { return 24000 as u32 }
+    if code == 8 as u32 { return 32000 as u32 }
+    if code == 9 as u32 { return 44100 as u32 }
+    if code == 10 as u32 { return 48000 as u32 }
+    if code == 11 as u32 { return 96000 as u32 }
+    return 0 as u32
+}
+
+fn bps_of(code: u32) -> u32 {
+    if code == 1 as u32 { return 8 as u32 }
+    if code == 2 as u32 { return 12 as u32 }
+    if code == 4 as u32 { return 16 as u32 }
+    if code == 5 as u32 { return 20 as u32 }
+    if code == 6 as u32 { return 24 as u32 }
+    return 0 as u32
+}
+
+fn parse_header(f: *mut Flac, off: usize) -> i32 {
+    if off + 6 > (*f).len {
+        return 0
+    }
+    let d: u64 = (*f).data
+    if ldb(d, off) != 255 as u32 || (ldb(d, off + 1) & 0xFE) != 0xF8 {
+        return 0
+    }
+    let variable: u32 = ldb(d, off + 1) & 1
+    let b2: u32 = ldb(d, off + 2)
+    let b3: u32 = ldb(d, off + 3)
+    let bs_code: u32 = b2 >> 4
+    let rate_code: u32 = b2 & 15
+    let assign: u32 = b3 >> 4
+    let bps_code: u32 = (b3 >> 1) & 7
+    if (b3 & 1) != 0 as u32 || bs_code == 0 as u32 || rate_code == 15 as u32 || assign > 10 as u32 {
+        return 0
+    }
+    if bps_code == 3 as u32 || bps_code == 7 as u32 {
+        return 0
+    }
+    var p: usize = off + 4
+    let b4: u32 = ldb(d, p)
+    var nb: i32 = 0
+    var v: u64 = 0
+    if (b4 & 0x80) == 0 as u32 {
+        nb = 1
+        v = (b4 & 0x7F) as u64
+    } else if (b4 & 0xE0) == 0xC0 {
+        nb = 2
+        v = (b4 & 0x1F) as u64
+    } else if (b4 & 0xF0) == 0xE0 {
+        nb = 3
+        v = (b4 & 0x0F) as u64
+    } else if (b4 & 0xF8) == 0xF0 {
+        nb = 4
+        v = (b4 & 0x07) as u64
+    } else if (b4 & 0xFC) == 0xF8 {
+        nb = 5
+        v = (b4 & 0x03) as u64
+    } else if (b4 & 0xFE) == 0xFC {
+        nb = 6
+        v = (b4 & 0x01) as u64
+    } else if b4 == 0xFE {
+        nb = 7
+        v = 0
+    } else {
+        return 0
+    }
+    if off + 4 + (nb as usize) + 2 > (*f).len {
+        return 0
+    }
+    var k: i32 = 1
+    while k < nb {
+        let cb: u32 = ldb(d, p + k as usize)
+        if (cb & 0xC0) != 0x80 {
+            return 0
+        }
+        v = (v << 6) | ((cb & 0x3F) as u64)
+        k = k + 1
+    }
+    p = p + (nb as usize)
+    var bs: u32 = block_size_of(bs_code)
+    if bs_code == 6 as u32 {
+        bs = ldb(d, p) + 1
+        p = p + 1
+    } else if bs_code == 7 as u32 {
+        bs = (ldb(d, p) << 8) + ldb(d, p + 1) + 1
+        p = p + 2
+    }
+    var hz: u32 = rate_of(rate_code)
+    if rate_code == 0 as u32 {
+        hz = (*f).hz
+    } else if rate_code == 12 as u32 {
+        hz = ldb(d, p) * 1000
+        p = p + 1
+    } else if rate_code == 13 as u32 {
+        hz = (ldb(d, p) << 8) + ldb(d, p + 1)
+        p = p + 2
+    } else if rate_code == 14 as u32 {
+        hz = ((ldb(d, p) << 8) + ldb(d, p + 1)) * 10
+        p = p + 2
+    }
+    if p + 1 > (*f).len {
+        return 0
+    }
+    var c: u32 = 0
+    var q: usize = off
+    while q < p {
+        c = (*f).crc8[((c ^ ldb(d, q)) & 255 as u32) as usize] as u32
+        q = q + 1
+    }
+    if c != ldb(d, p) {
+        return 0
+    }
+    var ch: u32 = assign + 1
+    if assign >= 8 as u32 {
+        ch = 2
+    }
+    var bps: u32 = bps_of(bps_code)
+    if bps_code == 0 as u32 {
+        bps = (*f).bps
+    }
+    if bps == 0 as u32 || hz == 0 as u32 || bs == 0 as u32 {
+        return 0
+    }
+    if variable != 0 as u32 {
+        (*f).h_start = v
+    } else {
+        (*f).h_start = v * ((*f).min_bs as u64)
+        if (*f).min_bs != (*f).max_bs {
+            (*f).h_start = v * ((*f).max_bs as u64)
+        }
+    }
+    (*f).h_bs = bs
+    (*f).h_hz = hz
+    (*f).h_ch = ch
+    (*f).h_bps = bps
+    (*f).h_len = p + 1 - off
+    (*f).h_assign = assign
+    return 1
+}
+
+fn flac_open(f: *mut Flac, d: u64, n: usize) -> i32 {
+    (*f).data = d
+    (*f).len = n
+    var off: usize = 0
+    if n > 10 && ldb(d, 0) == 73 as u32 && ldb(d, 1) == 68 as u32 && ldb(d, 2) == 51 as u32 {
+        let sz: usize = (((ldb(d, 6) & 127) << 21) | ((ldb(d, 7) & 127) << 14) | ((ldb(d, 8) & 127) << 7) | (ldb(d, 9) & 127)) as usize
+        off = 10 + sz
+    }
+    if off + 8 > n {
+        return 1
+    }
+    if ldb(d, off) != 102 as u32 || ldb(d, off + 1) != 76 as u32 || ldb(d, off + 2) != 97 as u32 || ldb(d, off + 3) != 67 as u32 {
+        return 1
+    }
+    off = off + 4
+    var seen: i32 = 0
+    var last: i32 = 0
+    while last == 0 {
+        if off + 4 > n {
+            return 2
+        }
+        let h: u32 = ldb(d, off)
+        let blen: usize = ((ldb(d, off + 1) << 16) | (ldb(d, off + 2) << 8) | ldb(d, off + 3)) as usize
+        if (h & 128) != 0 as u32 {
+            last = 1
+        }
+        let typ: u32 = h & 127
+        off = off + 4
+        if typ == 0 as u32 {
+            if blen < 34 || off + blen > n {
+                return 2
+            }
+            (*f).min_bs = (ldb(d, off) << 8) | ldb(d, off + 1)
+            (*f).max_bs = (ldb(d, off + 2) << 8) | ldb(d, off + 3)
+            let w: u64 = ((ldb(d, off + 10) as u64) << 56) | ((ldb(d, off + 11) as u64) << 48) | ((ldb(d, off + 12) as u64) << 40)
+                | ((ldb(d, off + 13) as u64) << 32) | ((ldb(d, off + 14) as u64) << 24) | ((ldb(d, off + 15) as u64) << 16)
+                | ((ldb(d, off + 16) as u64) << 8) | (ldb(d, off + 17) as u64)
+            (*f).hz = (w >> 44) as u32
+            (*f).ch = (((w >> 41) & 7) as u32) + 1
+            (*f).bps = (((w >> 36) & 31) as u32) + 1
+            (*f).total = w & 0xFFFFFFFFF
+            seen = 1
+        }
+        off = off + blen
+    }
+    if seen == 0 || (*f).hz == 0 as u32 || (*f).bps > 24 as u32 || (*f).ch > 8 as u32 {
+        return 2
+    }
+    if (*f).max_bs == 0 as u32 || (*f).max_bs > 65535 as u32 {
+        (*f).max_bs = 65535
+    }
+    (*f).first = off
+    (*f).pos = off
+    (*f).pcm = rt.heap_alloc(MAX_CH * MAX_BS * 4)
+    if (*f).pcm == 0 {
+        return 3
+    }
+    (*f).ready = 1
+    if (*f).total == 0 {
+        var limit: usize = (*f).first
+        if n > (*f).first + 262144 {
+            limit = n - 262144
+        }
+        var back: usize = n
+        var found: i32 = 0
+        while found == 0 && back > limit + 8 {
+            back = back - 1
+            if parse_header(f, back) != 0 {
+                (*f).total = (*f).h_start + ((*f).h_bs as u64)
+                found = 1
+            }
+        }
+    }
+    return 0
+}
+
+fn fixed_predict(order: i32, p: u64, i: usize) -> i64 {
+    if order == 0 { return 0 }
+    let a: i64 = ldi(p, i - 1) as i64
+    if order == 1 { return a }
+    let b: i64 = ldi(p, i - 2) as i64
+    if order == 2 { return 2 * a - b }
+    let c: i64 = ldi(p, i - 3) as i64
+    if order == 3 { return 3 * a - 3 * b + c }
+    let e: i64 = ldi(p, i - 4) as i64
+    return 4 * a - 6 * b + 4 * c - e
+}
+
+fn read_residual(b: *mut Fbr, p: u64, order: i32, n: i32) -> i32 {
+    let method: u32 = br_get(b, 2)
+    if method > 1 as u32 {
+        return 0
+    }
+    let porder: i32 = br_get(b, 4) as i32
+    let parts: i32 = 1 << porder
+    if (n >> porder) < order || (n & ((1 << porder) - 1)) != 0 {
+        return 0
+    }
+    var pbits: i32 = 4
+    var escape: u32 = 15 as u32
+    if method == 1 as u32 {
+        pbits = 5
+        escape = 31 as u32
+    }
+    var i: i32 = order
+    var part: i32 = 0
+    while part < parts {
+        var cnt: i32 = n >> porder
+        if part == 0 {
+            cnt = cnt - order
+        }
+        let k: u32 = br_get(b, pbits)
+        if k == escape {
+            let raw: i32 = br_get(b, 5) as i32
+            var j: i32 = 0
+            while j < cnt {
+                sti(p, i as usize, br_sget(b, raw))
+                i = i + 1
+                j = j + 1
+            }
+        } else {
+            var j2: i32 = 0
+            while j2 < cnt {
+                let q: i32 = br_unary(b)
+                var low: u32 = 0
+                if k != 0 as u32 {
+                    low = br_get(b, k as i32)
+                }
+                let u: u32 = ((q as u32) << k) | low
+                let s: i32 = ((u >> 1) as i32) ^ (0 - ((u & 1) as i32))
+                sti(p, i as usize, s)
+                i = i + 1
+                j2 = j2 + 1
+            }
+        }
+        if br_over(b) != 0 {
+            return 0
+        }
+        part = part + 1
+    }
+    return 1
+}
+
+fn read_subframe(b: *mut Fbr, p: u64, n: i32, bps: i32) -> i32 {
+    let pad: u32 = br_get(b, 1)
+    let typ: u32 = br_get(b, 6)
+    if pad != 0 as u32 {
+        return 0
+    }
+    var wasted: i32 = 0
+    if br_get(b, 1) != 0 as u32 {
+        wasted = br_unary(b) + 1
+    }
+    let sb: i32 = bps - wasted
+    if sb <= 0 || sb > 32 {
+        return 0
+    }
+    var i: i32 = 0
+    if typ == 0 as u32 {
+        let v: i32 = br_sget(b, sb)
+        while i < n {
+            sti(p, i as usize, v)
+            i = i + 1
+        }
+    } else if typ == 1 as u32 {
+        while i < n {
+            sti(p, i as usize, br_sget(b, sb))
+            i = i + 1
+        }
+    } else if typ >= 8 as u32 && typ <= 12 as u32 {
+        let order: i32 = (typ - 8 as u32) as i32
+        if order > n {
+            return 0
+        }
+        while i < order {
+            sti(p, i as usize, br_sget(b, sb))
+            i = i + 1
+        }
+        if read_residual(b, p, order, n) == 0 {
+            return 0
+        }
+        var j: i32 = order
+        while j < n {
+            let pr: i64 = fixed_predict(order, p, j as usize)
+            sti(p, j as usize, (ldi(p, j as usize) as i64 + pr) as i32)
+            j = j + 1
+        }
+    } else if typ >= 32 as u32 {
+        let order: i32 = (typ - 31 as u32) as i32
+        if order > n {
+            return 0
+        }
+        while i < order {
+            sti(p, i as usize, br_sget(b, sb))
+            i = i + 1
+        }
+        let prec: i32 = (br_get(b, 4) as i32) + 1
+        if prec == 16 {
+            return 0
+        }
+        let shift: i32 = br_sget(b, 5)
+        if shift < 0 {
+            return 0
+        }
+        var coef: [i32; 32] = [0; 32]
+        var c: i32 = 0
+        while c < order {
+            coef[c as usize] = br_sget(b, prec)
+            c = c + 1
+        }
+        if read_residual(b, p, order, n) == 0 {
+            return 0
+        }
+        var j: i32 = order
+        while j < n {
+            var sum: i64 = 0
+            var t: i32 = 0
+            while t < order {
+                sum = sum + (coef[t as usize] as i64) * (ldi(p, (j - 1 - t) as usize) as i64)
+                t = t + 1
+            }
+            sti(p, j as usize, (ldi(p, j as usize) as i64 + (sum >> (shift as u64))) as i32)
+            j = j + 1
+        }
+    } else {
+        return 0
+    }
+    if wasted != 0 {
+        var k: i32 = 0
+        while k < n {
+            sti(p, k as usize, ldi(p, k as usize) << (wasted as u32))
+            k = k + 1
+        }
+    }
+    return 1
+}
+
+fn flac_next(f: *mut Flac) -> i32 {
+    if (*f).ready == 0 {
+        return 0 - 1
+    }
+    var off: usize = (*f).pos
+    var skipped: i32 = 0
+    while off + 6 <= (*f).len && parse_header(f, off) == 0 {
+        off = off + 1
+        skipped = skipped + 1
+        if skipped > 1048576 {
+            (*f).pos = (*f).len
+            return 0 - 1
+        }
+    }
+    if off + 6 > (*f).len {
+        (*f).pos = (*f).len
+        return 0
+    }
+    let bs: i32 = (*f).h_bs as i32
+    let ch: i32 = (*f).h_ch as i32
+    let bps: i32 = (*f).h_bps as i32
+    let assign: u32 = (*f).h_assign
+    (*f).f_start = (*f).h_start
+    (*f).f_bs = (*f).h_bs
+    if bs > 65535 || ch > 8 || ch < 1 {
+        (*f).pos = off + 1
+        return 0 - 1
+    }
+    (*f).br.buf = (*f).data
+    (*f).br.pos = ((off + (*f).h_len) as i64) * 8
+    (*f).br.end = ((*f).len as i64) * 8
+    let hz_hdr: u32 = (*f).h_hz
+    var c: i32 = 0
+    var ok: i32 = 1
+    while c < ch && ok != 0 {
+        var sbps: i32 = bps
+        if (assign == 8 as u32 && c == 1) || (assign == 9 as u32 && c == 0) || (assign == 10 as u32 && c == 1) {
+            sbps = bps + 1
+        }
+        let pb: u64 = (*f).pcm + ((c as usize) * MAX_BS * 4) as u64
+        ok = read_subframe(&(*f).br, pb, bs, sbps)
+        if br_over(&(*f).br) != 0 {
+            ok = 0
+        }
+        c = c + 1
+    }
+    if ok == 0 {
+        (*f).pos = off + 1
+        return 0 - 1
+    }
+    (*f).br.pos = (((*f).br.pos + 7) >> 3) << 3
+    (*f).br.pos = (*f).br.pos + 16
+    (*f).pos = ((*f).br.pos >> 3) as usize
+    if ch == 2 && assign >= 8 as u32 {
+        let p0: u64 = (*f).pcm
+        let p1: u64 = (*f).pcm + (MAX_BS * 4) as u64
+        var i: i32 = 0
+        while i < bs {
+            var l: i32 = 0
+            var r: i32 = 0
+            if assign == 8 as u32 {
+                l = ldi(p0, i as usize)
+                r = l - ldi(p1, i as usize)
+            } else if assign == 9 as u32 {
+                r = ldi(p1, i as usize)
+                l = r + ldi(p0, i as usize)
+            } else {
+                let mid: i32 = ldi(p0, i as usize)
+                let side: i32 = ldi(p1, i as usize)
+                let m2: i32 = (mid << 1) | (side & 1)
+                l = (m2 + side) >> 1
+                r = (m2 - side) >> 1
+            }
+            sti(p0, i as usize, l)
+            sti(p1, i as usize, r)
+            i = i + 1
+        }
+    }
+    if hz_hdr != (*f).hz && (*f).hz == 0 as u32 {
+        (*f).hz = hz_hdr
+    }
+    return bs
+}
+
+fn flac_seek(f: *mut Flac, target: u64) -> u64 {
+    if (*f).ready == 0 {
+        return 0
+    }
+    var lo: usize = (*f).first
+    var lo_start: u64 = 0
+    var hi: usize = (*f).len
+    var guard: i32 = 0
+    while hi > lo + 4096 && guard < 64 {
+        guard = guard + 1
+        let mid: usize = lo + (hi - lo) / 2
+        var off: usize = mid
+        while off < hi && parse_header(f, off) == 0 {
+            off = off + 1
+        }
+        if off >= hi {
+            hi = mid
+        } else if (*f).h_start <= target {
+            lo = off
+            lo_start = (*f).h_start
+        } else {
+            hi = mid
+        }
+    }
+    (*f).pos = lo
+    return lo_start
+}
