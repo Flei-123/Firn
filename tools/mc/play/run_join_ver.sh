@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/mc/play/run_join_ver.sh <version> <protocol> -- mcplay joins a real vanilla server of that version (Xvfb, CPU raster),
 # needs chunks > 0, frames > 0, a non-trivial picture. Prints `RESULT mc-play-join <version>: ok`.
-# Env: JAR (server jar), JAVA, FIRNC, MC_VIEW (4), MCPLAY_PNG_OUT (screenshot copy), MCPLAY_GFX (default cpu raster), RUN_S (12).
+# Env: PLACE_WALLS=a,b,c,d (blocks placed as four walls around the player 6 s after the join), JAR (server jar), JAVA, FIRNC, MC_VIEW (4), MCPLAY_PNG_OUT (screenshot copy), MCPLAY_GFX (default cpu raster), RUN_S (12).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 VER=${1:?version}
@@ -62,6 +62,14 @@ from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB")
 print(len(set(im.crop((0, 60, 640, 360)).getdata())))
 PY
+if [ -n "${PLACE_WALLS:-}" ]; then
+    IFS=',' read -r -a WALLS <<< "$PLACE_WALLS"
+    ( sleep "${PLACE_DELAY_S:-6}"
+      echo "execute at Player run fill ~5 ~-1 ~-5 ~5 ~4 ~5 minecraft:${WALLS[0]}" >&3
+      echo "execute at Player run fill ~-5 ~-1 ~-5 ~-5 ~4 ~5 minecraft:${WALLS[1]:-${WALLS[0]}}" >&3
+      echo "execute at Player run fill ~-5 ~-1 ~5 ~5 ~4 ~5 minecraft:${WALLS[2]:-${WALLS[0]}}" >&3
+      echo "execute at Player run fill ~-5 ~-1 ~-5 ~5 ~4 ~-5 minecraft:${WALLS[3]:-${WALLS[0]}}" >&3 ) &
+fi
 env MCPLAY_PROTOCOL=$PROTO MCPLAY_GL=0 MCPLAY_VSYNC=0 MCPLAY_AUDIO=0 MCPLAY_RUN_S=${RUN_S:-12} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/shot.png" \
     timeout 240 "$W/mcplay" 127.0.0.1 "$PORT" Player > "$W/play.out" 2>&1
 rc=$?
