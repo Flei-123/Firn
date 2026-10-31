@@ -95,7 +95,10 @@ public class WgSurfaceOracle {
                         int gz = cz * 4 + fz;
                         memo.put(gx + "," + fy + "," + gz, chunkList.findValue(sampler.sample(gx, fy, gz)));
                     }
-            BiomeManager.NoiseBiomeSource src = (qx, qy, qz) -> {
+            final int clampLo = fillMinY;
+            final int clampHi = fillMaxY - 1;
+            BiomeManager.NoiseBiomeSource src = (qx, qy0, qz) -> {
+                int qy = Math.max(clampLo, Math.min(clampHi, qy0));
                 ResourceKey<Biome> k = memo.get(qx + "," + qy + "," + qz);
                 if (k == null) {
                     resetLast(list);
