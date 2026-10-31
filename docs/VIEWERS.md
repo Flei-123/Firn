@@ -80,6 +80,15 @@ Numbers: 720p high-profile decode 79.8 M instructions/frame (callgrind, release-
 - Checks: tests/docview_pdf_basic.fi, tests/docview_pdf_registry.fi; tools/docview/pdf_compare.py (pdftoppm), pdf_textcmp.py (pdftotext word match page 1: 97.56 % over 27 files, 8291 words), pdf_fuzz.py (2400 mutated/truncated runs, 0 crashes, 0 hangs).
 - Size: wasm32-browser probe 1 096 010 B, of which 364 KB built-in font data (11 substitute faces). Lazy font loading needs a font hook (open).
 - Gaps: embedded fonts (FontFile2/CIDToGIDMap; cr-artikel text match 22 %), encryption (RC4/AES, empty user password), SMask in ExtGState, CCITTFax, glyph boxes for search highlight, /Rotate in links, named destinations.
+## Status G3 DOCX (2026-10-31)
+
+- Modules `lib/docview/office/`: opc, ooxml, dx_load/dx_model (container + model), dx_body/dx_para/dx_inline/dx_pr/dx_props/dx_style/dx_num/dx_sect (WordprocessingML parser), dx_atoms/dx_brk/dx_emit/dx_play/dx_tlay/dx_lay/dx_prim (layout), dx_page (pagination), dx_view (handle), dx_paint (RGBA painter), dx_text, dx_open (opener).
+- Registry: `dx_open.docx_install_lazy()` registers KIND_DOCX as "docx.native" (lazy). Not part of install_builtin on purpose (font data + image decoders are linked only by apps that call it).
+- Checks: tests/6404_docview_docx.fi (zip built in the test, kind sniff, pages, size, render, text, closed doc on garbage); tools/docview/docx_fixtures.py (python-docx, 16 fixtures) + docx_textcmp.py (page text vs zipfile+ElementTree word oracle: 16/16 equal); docx_fuzz.py (XML mutation, byte mutation, deep nesting, 20-200 MB text bomb, 60k paragraphs).
+- Fixes: long words split over lines kept only the last chunk (strip_trailing cut the pushed chunks), PAGE/NUMPAGES fields without a `separate` fldChar (python-docx style) were not emitted, attribute integers are clamped to 2e9 (i32 cast panics found by fuzz).
+- Size: wasm32-browser probe `tools/docview/docx_wasm_probe.fi` 867 KB release-fast, 1.61 MB release-safe.
+- Gaps: text boxes skipped, anchored images drawn inline, vMerge only empty cells, row taller than page not split, contextualSpacing, page number restart, header/footer not in text.
+
 ## Status G1 + G6 (2026-10-31)
 
 Module names are unique on purpose: Firn resolves a module by its LAST path segment, so `docview.dvdoc` (not `doc`, clashes with `markdown.doc`), `dvbytes` (`std.bytes`), `dvinstall` (`pack.install`), `dvstrip` (`fui.layout`).
