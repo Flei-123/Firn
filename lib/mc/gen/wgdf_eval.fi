@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/wgdf_eval.fi -- seeded noise instances for a wgdf_graph.WgGraph and the direct (uncached) density function interpreter.
+import std.math
+import std.mem
+import noise.perlin
+import noise.interp
+import mc.gen.mg_random
+import mc.gen.mg_noise
+import mc.gen.wgdf_ops
+import mc.gen.wgdf_graph
+
+export { WgNoises, NOISES_BYTES, noises_alloc, noises_build, eval }
+
+const NS_LEN: usize = 10
+const MAX_BLENDED: usize = 4
+
+struct WgNoises {
+    normal: [perlin.Normal; 96],
+    blended: [perlin.Blended; 4],
+}
+
+const NOISES_BYTES: usize = 2600000
+
+fn noises_alloc() -> *mut WgNoises {
+    return mem.alloc(NOISES_BYTES) as *mut WgNoises
+}
+
+fn has_ns(g: *[u8; 96], len: usize) -> bool {
+    if len <= NS_LEN {
+        return false
+    }
+    let want: [u8; 10] = "minecraft:"
+    var i: usize = 0
+    while i < NS_LEN {
+        if (*g)[i] != want[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hashed_rng(pf: *mg_random.PosFactory, name: *[u8; 96], len: usize) -> mg_random.Rng {
+    if has_ns(name, len) {
+        return mg_random.pos_from_hash_of(pf, (&(*name)[0]) as u64, len)
+    }
+    var buf: [u8; 128] = [0; 128]
+    let want: [u8; 10] = "minecraft:"
+    var i: usize = 0
+    while i < NS_LEN {
+        buf[i] = want[i]
+        i = i + 1
+    }
+    i = 0
+    while i < len {
+        buf[NS_LEN + i] = (*name)[i]
+        i = i + 1
+    }
+    return mg_random.pos_from_hash_of(pf, (&buf[0]) as u64, len + NS_LEN)
+}
+
+fn noises_build(g: *wgdf_graph.WgGraph, ns: *mut WgNoises, seed: i64) {
+    var r0: mg_random.Rng = mg_random.rng_xoro(seed)
+    let pf: mg_random.PosFactory = mg_random.rng_fork_positional(&r0)
+    var i: i32 = 0
+    while i < (*g).n_noise {
+        var r: mg_random.Rng = hashed_rng(&pf, &(*g).nz_name[i as usize], (*g).nz_name_len[i as usize])
+        (*ns).normal[i as usize] = mg_noise.normal_create(&r, (*g).nz_first[i as usize], &(*g).nz_amp[i as usize], (*g).nz_count[i as usize], true)
+        i = i + 1
+    }
+    let terrain: [u8; 96] = [0; 96]
+    var k: i32 = 0
+    while k < (*g).n_nodes {
+        if (*g).op[k as usize] == wgdf_ops.OP_OLD_BLENDED {
+            let name: str = "minecraft:terrain"
+            var r: mg_random.Rng = mg_random.pos_from_hash_of(&pf, name.p as u64, name.n)
+            let slot: usize = (*g).a[k as usize] as usize
+            (*ns).blended[slot] = mg_noise.blended_create(
+                &r, (*g).p0[k as usize], (*g).p1[k as usize], (*g).p2[k as usize], (*g).p3[k as usize], (*g).p4[k as usize],
+            )
+        }
+        k = k + 1
+    }
+}
+
+#[allow_fp]
+fn lerp32(t: f32, a: f32, b: f32) -> f32 {
+    return a + t * (b - a)
+}
+
+#[allow_fp]
+fn linear_extend(f: f32, loc: f32, value: f32, deriv: f32) -> f32 {
+    if deriv == 0.0 {
+        return value
+    }
+    return value + deriv * (f - loc)
+}
+
+#[allow_fp]
+fn spline_eval(g: *wgdf_graph.WgGraph, ns: *WgNoises, s: i32, x: i32, y: i32, z: i32) -> f32 {
+    let su: usize = s as usize
+    let coord: i32 = (*g).spl_coord[su]
+    if coord < 0 {
+        return (*g).spl_const[su]
+    }
+    let f: f32 = eval(g, ns, coord, x, y, z) as f32
+    let first: usize = (*g).spl_first[su] as usize
+    let cnt: i32 = (*g).spl_count[su]
+    var lo: i32 = 0
+    var span: i32 = cnt
+    while span > 0 {
+        let half: i32 = span / 2
+        let k: i32 = lo + half
+        if f < (*g).pt_loc[first + (k as usize)] {
+            span = half
+        } else {
+            lo = k + 1
+            span = span - (half + 1)
+        }
+    }
+    let i: i32 = lo - 1
+    let j: i32 = cnt - 1
+    if i < 0 {
+        let v: f32 = spline_eval(g, ns, (*g).pt_val[first], x, y, z)
+        return linear_extend(f, (*g).pt_loc[first], v, (*g).pt_der[first])
+    }
+    if i == j {
+        let v: f32 = spline_eval(g, ns, (*g).pt_val[first + (j as usize)], x, y, z)
+        return linear_extend(f, (*g).pt_loc[first + (j as usize)], v, (*g).pt_der[first + (j as usize)])
+    }
+    let iu: usize = first + (i as usize)
+    let f1: f32 = (*g).pt_loc[iu]
+    let f2: f32 = (*g).pt_loc[iu + 1]
+    let f3: f32 = (f - f1) / (f2 - f1)
+    let f4: f32 = (*g).pt_der[iu]
+    let f5: f32 = (*g).pt_der[iu + 1]
+    let f6: f32 = spline_eval(g, ns, (*g).pt_val[iu], x, y, z)
+    let f7: f32 = spline_eval(g, ns, (*g).pt_val[iu + 1], x, y, z)
+    let f8: f32 = f4 * (f2 - f1) - (f7 - f6)
+    let f9: f32 = (0.0 - f5) * (f2 - f1) + (f7 - f6)
+    return lerp32(f3, f6, f7) + f3 * (1.0 - f3) * lerp32(f3, f8, f9)
+}
+
+#[allow_fp]
+fn noise_at(ns: *WgNoises, slot: i32, x: f64, y: f64, z: f64) -> f64 {
+    if slot < 0 {
+        return 0.0
+    }
+    return perlin.normal_value(&(*ns).normal[slot as usize], x, y, z)
+}
+
+#[allow_fp]
+fn weird_rarity(kind: i32, d: f64) -> f64 {
+    if kind == 2 {
+        if d < -0.75 { return 0.5 }
+        if d < -0.5 { return 0.75 }
+        if d < 0.5 { return 1.0 }
+        if d < 0.75 { return 2.0 }
+        return 3.0
+    }
+    if d < -0.5 { return 0.75 }
+    if d < 0.0 { return 1.0 }
+    if d < 0.5 { return 1.5 }
+    return 2.0
+}
+
+#[allow_fp]
+fn eval(g: *wgdf_graph.WgGraph, ns: *WgNoises, n: i32, x: i32, y: i32, z: i32) -> f64 {
+    if n < 0 {
+        return 0.0
+    }
+    let u: usize = n as usize
+    let op: i32 = (*g).op[u]
+    let xd: f64 = x as f64
+    let yd: f64 = y as f64
+    let zd: f64 = z as f64
+    if op == wgdf_ops.OP_CONST {
+        return (*g).p0[u]
+    }
+    if op == wgdf_ops.OP_ADD {
+        return eval(g, ns, (*g).a[u], x, y, z) + eval(g, ns, (*g).b[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_MUL {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a == 0.0 {
+            return 0.0
+        }
+        return a * eval(g, ns, (*g).b[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_MIN {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        let b: f64 = eval(g, ns, (*g).b[u], x, y, z)
+        if a < b { return a }
+        return b
+    }
+    if op == wgdf_ops.OP_MAX {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        let b: f64 = eval(g, ns, (*g).b[u], x, y, z)
+        if a > b { return a }
+        return b
+    }
+    if op == wgdf_ops.OP_MARKER || op == wgdf_ops.OP_BLEND_DENSITY {
+        return eval(g, ns, (*g).a[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_ABS {
+        return math.fabs(eval(g, ns, (*g).a[u], x, y, z))
+    }
+    if op == wgdf_ops.OP_SQUARE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        return a * a
+    }
+    if op == wgdf_ops.OP_CUBE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        return a * a * a
+    }
+    if op == wgdf_ops.OP_HALF_NEG {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a > 0.0 { return a }
+        return a * 0.5
+    }
+    if op == wgdf_ops.OP_QUARTER_NEG {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a > 0.0 { return a }
+        return a * 0.25
+    }
+    if op == wgdf_ops.OP_SQUEEZE {
+        var a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a < -1.0 { a = -1.0 }
+        if a > 1.0 { a = 1.0 }
+        return a / 2.0 - a * a * a / 24.0
+    }
+    if op == wgdf_ops.OP_CLAMP {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a < (*g).p0[u] { return (*g).p0[u] }
+        if a > (*g).p1[u] { return (*g).p1[u] }
+        return a
+    }
+    if op == wgdf_ops.OP_YGRAD {
+        return interp.clamped_map(yd, (*g).p0[u], (*g).p1[u], (*g).p2[u], (*g).p3[u])
+    }
+    if op == wgdf_ops.OP_NOISE {
+        return noise_at(ns, (*g).a[u], xd * (*g).p0[u], yd * (*g).p1[u], zd * (*g).p0[u])
+    }
+    if op == wgdf_ops.OP_SHIFTED_NOISE {
+        let d0: f64 = xd * (*g).p0[u] + eval(g, ns, (*g).b[u], x, y, z)
+        let d1: f64 = yd * (*g).p1[u] + eval(g, ns, (*g).c[u], x, y, z)
+        let d2: f64 = zd * (*g).p0[u] + eval(g, ns, (*g).d[u], x, y, z)
+        return noise_at(ns, (*g).a[u], d0, d1, d2)
+    }
+    if op == wgdf_ops.OP_SHIFT_A {
+        return noise_at(ns, (*g).a[u], xd * 0.25, 0.0, zd * 0.25) * 4.0
+    }
+    if op == wgdf_ops.OP_SHIFT_B {
+        return noise_at(ns, (*g).a[u], zd * 0.25, xd * 0.25, 0.0) * 4.0
+    }
+    if op == wgdf_ops.OP_SHIFT {
+        return noise_at(ns, (*g).a[u], xd * 0.25, yd * 0.25, zd * 0.25) * 4.0
+    }
+    if op == wgdf_ops.OP_RANGE_CHOICE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if (*g).p0[u] <= a && a < (*g).p1[u] {
+            return eval(g, ns, (*g).b[u], x, y, z)
+        }
+        return eval(g, ns, (*g).c[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_WEIRD {
+        let r: f64 = weird_rarity((*g).c[u], eval(g, ns, (*g).a[u], x, y, z))
+        return r * math.fabs(noise_at(ns, (*g).b[u], xd / r, yd / r, zd / r))
+    }
+    if op == wgdf_ops.OP_BLEND_ALPHA {
+        return 1.0
+    }
+    if op == wgdf_ops.OP_OLD_BLENDED {
+        return perlin.blended_value(&(*ns).blended[(*g).a[u] as usize], x, y, z)
+    }
+    if op == wgdf_ops.OP_SPLINE {
+        return spline_eval(g, ns, (*g).a[u], x, y, z) as f64
+    }
+    return 0.0
+}

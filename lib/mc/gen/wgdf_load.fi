@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/wgdf_load.fi -- loads density functions, noise parameters and a noise_settings router from a datapack directory
+// (<root>/density_function, <root>/noise, <root>/noise_settings) into a wgdf_graph.WgGraph.
+import std.rt
+import std.json
+import std.jsonstr
+import mc.gen.wgdf_ops
+import mc.gen.wgdf_graph
+
+export { load_settings, noise_slot }
+
+const NS_LEN: usize = 10
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn strip_ns(s: str) -> str {
+    if s.n > NS_LEN {
+        let probe: str = str { p: s.p, n: NS_LEN }
+        if probe == "minecraft:" {
+            return str { p: ((s.p as u64) + (NS_LEN as u64)) as *mut u8, n: s.n - NS_LEN }
+        }
+    }
+    return s
+}
+
+fn read_doc(root: str, dir: str, name: str, raw: *mut rt.Buf, d: *mut json.Json) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    push_str(&path, root)
+    rt.buf_push(&path, 47 as u8)
+    push_str(&path, dir)
+    rt.buf_push(&path, 47 as u8)
+    push_str(&path, strip_ns(name))
+    push_str(&path, ".json")
+    rt.buf_push(&path, 0 as u8)
+    let ok: bool = rt.read_file(rt.buf_ptr(&path), raw)
+    rt.buf_free(&path)
+    if !ok {
+        return false
+    }
+    let parsed: bool = json.json_parse(d, rt.buf_ptr(raw), rt.buf_len(raw)) catch false
+    return parsed
+}
+
+fn num_or(d: *mut json.Json, obj: u32, key: str, dflt: f64) -> f64 {
+    let n: u32 = jsonstr.get(d, obj, key)
+    if n == 4294967295 as u32 {
+        return dflt
+    }
+    return json.json_number(d, n)
+}
+
+fn str_or(d: *mut json.Json, obj: u32, key: str) -> str {
+    let n: u32 = jsonstr.get(d, obj, key)
+    if n == 4294967295 as u32 {
+        return ""
+    }
+    return jsonstr.string(d, n)
+}
+
+fn noise_slot(g: *mut wgdf_graph.WgGraph, root: str, name: str) -> i32 {
+    var i: i32 = 0
+    while i < (*g).n_noise {
+        if wgdf_graph.name_eq(&(*g).nz_name[i as usize], (*g).nz_name_len[i as usize], name) {
+            return i
+        }
+        i = i + 1
+    }
+    var raw: rt.Buf = rt.buf_new()
+    var d: json.Json = json.json_new()
+    if !read_doc(root, "noise", name, &raw, &d) {
+        json.json_free(&d)
+        rt.buf_free(&raw)
+        return -1
+    }
+    let slot: i32 = (*g).n_noise
+    (*g).n_noise = slot + 1
+    (*g).nz_name_len[slot as usize] = wgdf_graph.name_set(&(*g).nz_name[slot as usize], name)
+    let r: u32 = json.json_root(&d)
+    (*g).nz_first[slot as usize] = num_or(&d, r, "firstOctave", 0.0) as i32
+    let amps: u32 = jsonstr.get(&d, r, "amplitudes")
+    let cnt: usize = json.json_count(&d, amps)
+    (*g).nz_count[slot as usize] = cnt as i32
+    var k: usize = 0
+    while k < cnt && k < 32 {
+        (*g).nz_amp[slot as usize][k] = json.json_number(&d, json.json_child_at(&d, amps, k))
+        k = k + 1
+    }
+    json.json_free(&d)
+    rt.buf_free(&raw)
+    return slot
+}
+
+fn load_spline(g: *mut wgdf_graph.WgGraph, root: str, d: *mut json.Json, j: u32) -> i32 {
+    let s: i32 = wgdf_graph.new_spline(g)
+    if json.json_kind(d, j) == json.JSON_NUMBER {
+        (*g).spl_const[s as usize] = json.json_number(d, j) as f32
+        return s
+    }
+    (*g).spl_coord[s as usize] = load_node(g, root, d, jsonstr.get(d, j, "coordinate"))
+    let pts: u32 = jsonstr.get(d, j, "points")
+    let cnt: usize = json.json_count(d, pts)
+    let first: i32 = (*g).n_pts
+    (*g).n_pts = first + (cnt as i32)
+    (*g).spl_first[s as usize] = first
+    (*g).spl_count[s as usize] = cnt as i32
+    var k: usize = 0
+    while k < cnt {
+        let p: u32 = json.json_child_at(d, pts, k)
+        let slot: usize = (first as usize) + k
+        (*g).pt_loc[slot] = num_or(d, p, "location", 0.0) as f32
+        (*g).pt_der[slot] = num_or(d, p, "derivative", 0.0) as f32
+        (*g).pt_val[slot] = load_spline(g, root, d, jsonstr.get(d, p, "value"))
+        k = k + 1
+    }
+    return s
+}
+
+fn load_ref(g: *mut wgdf_graph.WgGraph, root: str, name: str) -> i32 {
+    let hit: i32 = wgdf_graph.ref_find(g, name)
+    if hit >= 0 {
+        return hit
+    }
+    var raw: rt.Buf = rt.buf_new()
+    var d: json.Json = json.json_new()
+    if !read_doc(root, "density_function", name, &raw, &d) {
+        json.json_free(&d)
+        rt.buf_free(&raw)
+        return -1
+    }
+    let n: i32 = load_node(g, root, &d, json.json_root(&d))
+    json.json_free(&d)
+    rt.buf_free(&raw)
+    let slot: i32 = (*g).n_ref
+    (*g).n_ref = slot + 1
+    (*g).ref_len[slot as usize] = wgdf_graph.name_set(&(*g).ref_name[slot as usize], name)
+    (*g).ref_node[slot as usize] = n
+    return n
+}
+
+fn arg(g: *mut wgdf_graph.WgGraph, root: str, d: *mut json.Json, j: u32, key: str) -> i32 {
+    return load_node(g, root, d, jsonstr.get(d, j, key))
+}
+
+fn load_node(g: *mut wgdf_graph.WgGraph, root: str, d: *mut json.Json, j: u32) -> i32 {
+    let kind: u8 = json.json_kind(d, j)
+    if kind == json.JSON_NUMBER {
+        let c: i32 = wgdf_graph.new_node(g, wgdf_ops.OP_CONST)
+        (*g).p0[c as usize] = json.json_number(d, j)
+        return c
+    }
+    if kind == json.JSON_STRING {
+        return load_ref(g, root, jsonstr.string(d, j))
+    }
+    let op: i32 = wgdf_ops.op_by_name(strip_ns(str_or(d, j, "type")))
+    if op == wgdf_ops.OP_UNKNOWN {
+        return -1
+    }
+    if op == wgdf_ops.OP_CONST {
+        let c: i32 = wgdf_graph.new_node(g, wgdf_ops.OP_CONST)
+        (*g).p0[c as usize] = num_or(d, j, "argument", 0.0)
+        return c
+    }
+    if op == wgdf_ops.OP_ADD || op == wgdf_ops.OP_MUL || op == wgdf_ops.OP_MIN || op == wgdf_ops.OP_MAX {
+        let a: i32 = arg(g, root, d, j, "argument1")
+        let b: i32 = arg(g, root, d, j, "argument2")
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = a
+        (*g).b[n as usize] = b
+        return n
+    }
+    if op == wgdf_ops.OP_ABS || op == wgdf_ops.OP_SQUARE || op == wgdf_ops.OP_CUBE || op == wgdf_ops.OP_HALF_NEG || op == wgdf_ops.OP_QUARTER_NEG || op == wgdf_ops.OP_SQUEEZE
+    || op == wgdf_ops.OP_MARKER || op == wgdf_ops.OP_BLEND_DENSITY {
+        let a: i32 = arg(g, root, d, j, "argument")
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = a
+        return n
+    }
+    if op == wgdf_ops.OP_CLAMP {
+        let a: i32 = arg(g, root, d, j, "input")
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = a
+        (*g).p0[n as usize] = num_or(d, j, "min", 0.0)
+        (*g).p1[n as usize] = num_or(d, j, "max", 0.0)
+        return n
+    }
+    if op == wgdf_ops.OP_YGRAD {
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).p0[n as usize] = num_or(d, j, "from_y", 0.0)
+        (*g).p1[n as usize] = num_or(d, j, "to_y", 0.0)
+        (*g).p2[n as usize] = num_or(d, j, "from_value", 0.0)
+        (*g).p3[n as usize] = num_or(d, j, "to_value", 0.0)
+        return n
+    }
+    if op == wgdf_ops.OP_NOISE {
+        let slot: i32 = noise_slot(g, root, str_or(d, j, "noise"))
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = slot
+        (*g).p0[n as usize] = num_or(d, j, "xz_scale", 1.0)
+        (*g).p1[n as usize] = num_or(d, j, "y_scale", 1.0)
+        return n
+    }
+    if op == wgdf_ops.OP_SHIFTED_NOISE {
+        let sx: i32 = arg(g, root, d, j, "shift_x")
+        let sy: i32 = arg(g, root, d, j, "shift_y")
+        let sz: i32 = arg(g, root, d, j, "shift_z")
+        let slot: i32 = noise_slot(g, root, str_or(d, j, "noise"))
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = slot
+        (*g).b[n as usize] = sx
+        (*g).c[n as usize] = sy
+        (*g).d[n as usize] = sz
+        (*g).p0[n as usize] = num_or(d, j, "xz_scale", 1.0)
+        (*g).p1[n as usize] = num_or(d, j, "y_scale", 1.0)
+        return n
+    }
+    if op == wgdf_ops.OP_SHIFT_A || op == wgdf_ops.OP_SHIFT_B || op == wgdf_ops.OP_SHIFT {
+        let slot: i32 = noise_slot(g, root, str_or(d, j, "argument"))
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = slot
+        return n
+    }
+    if op == wgdf_ops.OP_RANGE_CHOICE {
+        let a: i32 = arg(g, root, d, j, "input")
+        let b: i32 = arg(g, root, d, j, "when_in_range")
+        let c: i32 = arg(g, root, d, j, "when_out_of_range")
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = a
+        (*g).b[n as usize] = b
+        (*g).c[n as usize] = c
+        (*g).p0[n as usize] = num_or(d, j, "min_inclusive", 0.0)
+        (*g).p1[n as usize] = num_or(d, j, "max_exclusive", 0.0)
+        return n
+    }
+    if op == wgdf_ops.OP_WEIRD {
+        let a: i32 = arg(g, root, d, j, "input")
+        let slot: i32 = noise_slot(g, root, str_or(d, j, "noise"))
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = a
+        (*g).b[n as usize] = slot
+        if str_or(d, j, "rarity_value_mapper") == "type_2" {
+            (*g).c[n as usize] = 2
+        } else {
+            (*g).c[n as usize] = 1
+        }
+        return n
+    }
+    if op == wgdf_ops.OP_OLD_BLENDED {
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = (*g).n_blended
+        (*g).n_blended = (*g).n_blended + 1
+        (*g).p0[n as usize] = num_or(d, j, "xz_scale", 1.0)
+        (*g).p1[n as usize] = num_or(d, j, "y_scale", 1.0)
+        (*g).p2[n as usize] = num_or(d, j, "xz_factor", 1.0)
+        (*g).p3[n as usize] = num_or(d, j, "y_factor", 1.0)
+        (*g).p4[n as usize] = num_or(d, j, "smear_scale_multiplier", 1.0)
+        return n
+    }
+    if op == wgdf_ops.OP_SPLINE {
+        let s: i32 = load_spline(g, root, d, jsonstr.get(d, j, "spline"))
+        let n: i32 = wgdf_graph.new_node(g, op)
+        (*g).a[n as usize] = s
+        return n
+    }
+    return wgdf_graph.new_node(g, op)
+}
+
+fn router_add(g: *mut wgdf_graph.WgGraph, key: str, node: i32) {
+    let i: i32 = (*g).n_router
+    (*g).n_router = i + 1
+    var n: usize = key.n
+    if n > 31 {
+        n = 31
+    }
+    var k: usize = 0
+    while k < n {
+        (*g).router_name[i as usize][k] = *(((key.p as u64) + (k as u64)) as *u8)
+        k = k + 1
+    }
+    (*g).router_len[i as usize] = n
+    (*g).router_node[i as usize] = node
+}
+
+const ROUTER_KEY_COUNT: usize = 17
+
+fn router_key(i: usize) -> str {
+    if i == 0 { return "barrier" }
+    if i == 1 { return "fluid_level_floodedness" }
+    if i == 2 { return "fluid_level_spread" }
+    if i == 3 { return "lava" }
+    if i == 4 { return "temperature" }
+    if i == 5 { return "vegetation" }
+    if i == 6 { return "continents" }
+    if i == 7 { return "erosion" }
+    if i == 8 { return "depth" }
+    if i == 9 { return "ridges" }
+    if i == 10 { return "initial_density_without_jaggedness" }
+    if i == 11 { return "final_density" }
+    if i == 12 { return "vein_toggle" }
+    if i == 13 { return "vein_ridged" }
+    if i == 14 { return "vein_gap" }
+    if i == 15 { return "preliminary_surface_level" }
+    if i == 16 { return "chunk_surface_level" }
+    return ""
+}
+
+fn load_settings(g: *mut wgdf_graph.WgGraph, root: str, name: str) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    var d: json.Json = json.json_new()
+    if !read_doc(root, "noise_settings", name, &raw, &d) {
+        json.json_free(&d)
+        rt.buf_free(&raw)
+        return false
+    }
+    let r: u32 = json.json_root(&d)
+    let nz: u32 = jsonstr.get(&d, r, "noise")
+    (*g).min_y = num_or(&d, nz, "min_y", -64.0) as i32
+    (*g).height = num_or(&d, nz, "height", 384.0) as i32
+    (*g).size_h = num_or(&d, nz, "size_horizontal", 1.0) as i32
+    (*g).size_v = num_or(&d, nz, "size_vertical", 2.0) as i32
+    (*g).sea_level = num_or(&d, r, "sea_level", 63.0) as i32
+    (*g).legacy_random = json.json_bool(&d, jsonstr.get(&d, r, "legacy_random_source"))
+    (*g).aquifers = json.json_bool(&d, jsonstr.get(&d, r, "aquifers_enabled"))
+    (*g).ore_veins = json.json_bool(&d, jsonstr.get(&d, r, "ore_veins_enabled"))
+    let router: u32 = jsonstr.get(&d, r, "noise_router")
+    var i: usize = 0
+    while i < ROUTER_KEY_COUNT {
+        let key: str = router_key(i)
+        let jn: u32 = jsonstr.get(&d, router, key)
+        if jn != 4294967295 as u32 {
+            router_add(g, key, load_node(g, root, &d, jn))
+        }
+        i = i + 1
+    }
+    json.json_free(&d)
+    rt.buf_free(&raw)
+    return true
+}
