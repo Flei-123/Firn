@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.aac.aac_tables
+import media.audio.aac.aac_bits
+import media.audio.aac.aac_huff
+import media.audio.aac.aac_state
+
+export { read_ics_info, read_pulse, read_scale_factors, read_section_data, read_tns, swb_off }
+
+fn read_ics_info(d: *mut aac_state.Aac, c: usize) -> i32 {
+    aac_bits.br_get1(&(*d).br)
+    (*d).ics[c].seq = aac_bits.br_get(&(*d).br, 2)
+    (*d).ics[c].shape = aac_bits.br_get1(&(*d).br)
+    if (*d).ics[c].seq == aac_state.EIGHT_SHORT {
+        (*d).ics[c].max_sfb = aac_bits.br_get(&(*d).br, 4)
+        let grouping: u32 = aac_bits.br_get(&(*d).br, 7)
+        (*d).ics[c].nwin = 8
+        (*d).ics[c].nswb = aac_tables.aac_num_swb_short((*d).sr_idx as% usize) as% u32
+        (*d).ics[c].ngroups = 1
+        (*d).ics[c].glen[0] = 1
+        var i: u32 = 0
+        while i < 7 {
+            if ((grouping >> (6 - i)) & 1) == 0 {
+                (*d).ics[c].ngroups = (*d).ics[c].ngroups + 1
+                (*d).ics[c].glen[((*d).ics[c].ngroups - 1) as% usize] = 1
+            } else {
+                (*d).ics[c].glen[((*d).ics[c].ngroups - 1) as% usize] = (*d).ics[c].glen[((*d).ics[c].ngroups - 1) as% usize] + 1
+            }
+            i = i + 1
+        }
+    } else {
+        (*d).ics[c].max_sfb = aac_bits.br_get(&(*d).br, 6)
+        (*d).ics[c].nwin = 1
+        (*d).ics[c].ngroups = 1
+        (*d).ics[c].glen[0] = 1
+        (*d).ics[c].nswb = aac_tables.aac_num_swb_long((*d).sr_idx as% usize) as% u32
+        let pred: u32 = aac_bits.br_get1(&(*d).br)
+        if pred != 0 {
+            return 1
+        }
+    }
+    if (*d).ics[c].max_sfb > (*d).ics[c].nswb {
+        return 2
+    }
+    return 0
+}
+
+fn swb_off(d: *mut aac_state.Aac, c: usize, sfb: u32) -> u32 {
+    if (*d).ics[c].seq == aac_state.EIGHT_SHORT {
+        return aac_tables.aac_swb_short(((*d).sr_idx as% usize) * 16 + sfb as% usize) as% u32
+    }
+    return aac_tables.aac_swb_long(((*d).sr_idx as% usize) * 64 + sfb as% usize) as% u32
+}
+
+fn read_section_data(d: *mut aac_state.Aac, c: usize) -> i32 {
+    var bits: i32 = 5
+    if (*d).ics[c].seq == aac_state.EIGHT_SHORT {
+        bits = 3
+    }
+    let esc: u32 = (1 << (bits as% u32)) - 1
+    var g: u32 = 0
+    while g < (*d).ics[c].ngroups {
+        var k: u32 = 0
+        while k < (*d).ics[c].max_sfb {
+            let cb: u32 = aac_bits.br_get(&(*d).br, 4)
+            if cb == 12 {
+                return 1
+            }
+            var len: u32 = 0
+            var incr: u32 = aac_bits.br_get(&(*d).br, bits)
+            while incr == esc {
+                len = len + esc
+                incr = aac_bits.br_get(&(*d).br, bits)
+                if aac_bits.br_left(&(*d).br) < 0 {
+                    return 2
+                }
+            }
+            len = len + incr
+            if len == 0 || k + len > (*d).ics[c].max_sfb || aac_bits.br_left(&(*d).br) < 0 {
+                return 2
+            }
+            var s: u32 = k
+            while s < k + len {
+                (*d).ics[c].cb[(g * 64 + s) as% usize] = cb as% u8
+                s = s + 1
+            }
+            k = k + len
+        }
+        g = g + 1
+    }
+    return 0
+}
+
+fn read_scale_factors(d: *mut aac_state.Aac, c: usize) -> i32 {
+    var sf: i32 = (*d).ics[c].gain
+    var is_pos: i32 = 0
+    var noise: i32 = (*d).ics[c].gain - 90
+    var first_noise: i32 = 1
+    var g: u32 = 0
+    while g < (*d).ics[c].ngroups {
+        var s: u32 = 0
+        while s < (*d).ics[c].max_sfb {
+            let idx: usize = (g * 64 + s) as% usize
+            let cb: u32 = (*d).ics[c].cb[idx] as% u32
+            if cb == 0 {
+                (*d).ics[c].sf[idx] = 0
+            } else {
+                if cb == (aac_state.INTENSITY_HCB as% u32) || cb == (aac_state.INTENSITY_HCB2 as% u32) {
+                    let t: i32 = aac_huff.huff_sym(d, 0)
+                    if t < 0 {
+                        return 1
+                    }
+                    is_pos = is_pos + (t - 60)
+                    (*d).ics[c].sf[idx] = is_pos
+                } else {
+                    if cb == (aac_state.NOISE_HCB as% u32) {
+                        if first_noise != 0 {
+                            first_noise = 0
+                            noise = noise + ((aac_bits.br_get(&(*d).br, 9) as% i32) - 256)
+                        } else {
+                            let t2: i32 = aac_huff.huff_sym(d, 0)
+                            if t2 < 0 {
+                                return 1
+                            }
+                            noise = noise + (t2 - 60)
+                        }
+                        (*d).ics[c].sf[idx] = noise
+                    } else {
+                        let t3: i32 = aac_huff.huff_sym(d, 0)
+                        if t3 < 0 {
+                            return 1
+                        }
+                        sf = sf + (t3 - 60)
+                        if sf < 0 || sf > 255 {
+                            return 2
+                        }
+                        (*d).ics[c].sf[idx] = sf
+                    }
+                }
+            }
+            s = s + 1
+        }
+        g = g + 1
+    }
+    return 0
+}
+
+fn read_pulse(d: *mut aac_state.Aac, c: usize) -> i32 {
+    (*d).ics[c].pulse_n = aac_bits.br_get(&(*d).br, 2) + 1
+    (*d).ics[c].pulse_start = aac_bits.br_get(&(*d).br, 6)
+    var i: u32 = 0
+    while i < (*d).ics[c].pulse_n {
+        (*d).ics[c].pulse_off[i as% usize] = aac_bits.br_get(&(*d).br, 5)
+        (*d).ics[c].pulse_amp[i as% usize] = aac_bits.br_get(&(*d).br, 4)
+        i = i + 1
+    }
+    if (*d).ics[c].seq == aac_state.EIGHT_SHORT {
+        return 1
+    }
+    if (*d).ics[c].pulse_start > (*d).ics[c].nswb {
+        return 2
+    }
+    return 0
+}
+
+fn read_tns(d: *mut aac_state.Aac, c: usize) -> i32 {
+    var nbits: i32 = 2
+    var lbits: i32 = 6
+    var obits: i32 = 5
+    if (*d).ics[c].seq == aac_state.EIGHT_SHORT {
+        nbits = 1
+        lbits = 4
+        obits = 3
+    }
+    var w: u32 = 0
+    while w < (*d).ics[c].nwin {
+        (*d).ics[c].tns_n[w as% usize] = aac_bits.br_get(&(*d).br, nbits)
+        if (*d).ics[c].tns_n[w as% usize] != 0 {
+            (*d).ics[c].tns_res[w as% usize] = aac_bits.br_get1(&(*d).br)
+            var f: u32 = 0
+            while f < (*d).ics[c].tns_n[w as% usize] {
+                let fi: usize = (w * 3 + f) as% usize
+                (*d).ics[c].tns_len[fi] = aac_bits.br_get(&(*d).br, lbits)
+                (*d).ics[c].tns_ord[fi] = aac_bits.br_get(&(*d).br, obits)
+                if (*d).ics[c].tns_ord[fi] > 20 {
+                    return 1
+                }
+                if (*d).ics[c].tns_ord[fi] != 0 {
+                    (*d).ics[c].tns_dir[fi] = aac_bits.br_get1(&(*d).br)
+                    (*d).ics[c].tns_cmp[fi] = aac_bits.br_get1(&(*d).br)
+                    let cbits: i32 = 3 + ((*d).ics[c].tns_res[w as% usize] as% i32) - ((*d).ics[c].tns_cmp[fi] as% i32)
+                    var i: u32 = 0
+                    while i < (*d).ics[c].tns_ord[fi] {
+                        (*d).ics[c].tns_coef[fi * 20 + (i as% usize)] = aac_bits.br_get(&(*d).br, cbits)
+                        i = i + 1
+                    }
+                }
+                f = f + 1
+            }
+        }
+        w = w + 1
+    }
+    return 0
+}
