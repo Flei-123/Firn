@@ -6,7 +6,7 @@ PARSER_PROPS = {
     "brigadier:bool": "", "brigadier:float": "f4", "brigadier:double": "f8", "brigadier:integer": "i4",
     "brigadier:long": "i8", "brigadier:string": "v", "minecraft:entity": "b", "minecraft:score_holder": "b",
     "minecraft:range": "b", "minecraft:time": "t4", "minecraft:resource_or_tag": "s", "minecraft:resource_or_tag_key": "s",
-    "minecraft:resource": "s", "minecraft:resource_key": "s",
+    "minecraft:resource": "s", "minecraft:resource_key": "s", "minecraft:resource_selector": "s",
 }
 
 

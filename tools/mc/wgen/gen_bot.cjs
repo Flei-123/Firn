@@ -70,7 +70,10 @@ client.on('error', (e) => { console.error('error', String(e)); process.exit(1) }
 client.on('kick_disconnect', (p) => { console.error('kick', JSON.stringify(p)); process.exit(1) })
 setTimeout(() => finish(false), parseInt(process.env.GEN_BOT_TIMEOUT_MS || '120000', 10))
 
+let finished = false
 function finish(ok) {
+  if (finished) return
+  finished = true
   console.error(`chunks=${count} ms=${Date.now() - t0}`)
   if (origin) console.log(origin.join('\n'))
   client.end('bye')
