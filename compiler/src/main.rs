@@ -1187,7 +1187,7 @@ fn run(opts: &Options) -> i32 {
 
     // --- Lowering to FIR ---
     // r714: with FIR pruning on, only the reachable functions are lowered.
-    let lazy_lower = prune::applicable(opts.only_object, opts.emit == Emit::Exe);
+    let lazy_lower = prune::applicable(opts.only_object, opts.emit == Emit::Exe || (opts.emit == Emit::Asm && target::active() == target::Target::Wasm32Browser));
     let lowered = if lazy_lower {
         lower::lower_reach(&prog, &info, &mut dg)
     } else {
