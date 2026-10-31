@@ -22,6 +22,7 @@
 #   clipboard lib/window's X11 clipboard against Tk and python-xlib (Xvfb)
 #   twowin    two top-level windows of one program, window.wait_any (Xvfb)
 #   webclip   lib/plat/webclip.fi against Chromium's clipboard (Playwright)
+#   webaudio  lib/plat/webaudio.fi + demos/webdemo/webaudio.js against Chromium (Playwright)
 # std.fs has no second implementation to compare with; tests/1910_std_fs.fi
 # is its proof (against the kernel's own answers).
 set -uo pipefail
@@ -106,6 +107,14 @@ if command -v node > /dev/null && { [ -n "$PW" ] || node -e 'require("playwright
     fi
 else
     echo "  skip: node or playwright missing"
+fi
+echo "-- browser audio (Chromium)"
+if command -v node > /dev/null && { [ -n "$PW" ] || node -e 'require("playwright")' 2> /dev/null; }; then
+    if "$FIRNC" --target=wasm32-browser -o "$W/webaudio_probe.wasm" tools/libmvp/webaudio_probe.fi > "$W/webaudio.log" 2>&1; then
+        PLAYWRIGHT="${PW:-playwright}" node tools/libmvp/check_webaudio.cjs "$W/webaudio_probe.wasm" || rc=1
+    else
+        echo "  FAIL webaudio_probe does not build"; head -5 "$W/webaudio.log"; rc=1
+    fi
 fi
 if [ $rc -eq 0 ]; then echo "LIBMVP PASSED"; else echo "LIBMVP FAILED"; fi
 exit $rc

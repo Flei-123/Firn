@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.rt
-import media.video.vidsource
+import media.video.vidops
 import media.video.sync
 
 export {
-    KpVideo, kv_new, kv_open, kv_close, kv_seek, kv_update, kv_done, kv_has_frame, kv_frame, kv_width, kv_height,
+    KpVideo, kv_new, kv_set_ops, kv_fps_milli, kv_open, kv_close, kv_seek, kv_update, kv_done, kv_has_frame, kv_frame, kv_width, kv_height,
     kv_duration_ms, kv_frame_no, kv_dropped, kv_shown, kv_pending_force, kv_cur_pts,
     UP_NONE, UP_FRAME,
 }
@@ -17,7 +17,8 @@ const LATE_US: i64 = 90000
 const RESYNC_US: i64 = 1500000
 
 struct KpVideo {
-    src: vidsource.VideoSource,
+    ops: vidops.VideoOps,
+    h: u64,
     open: bool,
     cur: u64,
     nxt: u64,
@@ -35,7 +36,7 @@ struct KpVideo {
 }
 
 fn kv_new() -> KpVideo {
-    return KpVideo { src: vidsource.vs_new(), open: false, cur: 0 as u64, nxt: 0 as u64, bytes: 0, have_cur: false,
+    return KpVideo { ops: vidops.vo_none(), h: 0 as u64, open: false, cur: 0 as u64, nxt: 0 as u64, bytes: 0, have_cur: false,
         have_nxt: false, cur_pts: 0, nxt_pts: 0, ended: false, force: false, holding: false, dropped: 0 as u64,
         shown: 0 as u64, frame_no: 0 as u64 }
 }
@@ -49,7 +50,13 @@ fn kv_close(v: *mut KpVideo) {
         rt.heap_free((*v).nxt, (*v).bytes)
         (*v).nxt = 0 as u64
     }
-    vidsource.vs_close(&(*v).src)
+    if (*v).h != 0 as u64 {
+        let close: fn(u64) = (*v).ops.close
+        close((*v).h)
+        let destroy: fn(u64) = (*v).ops.destroy
+        destroy((*v).h)
+        (*v).h = 0 as u64
+    }
     (*v).open = false
     (*v).bytes = 0
     (*v).have_cur = false
@@ -59,47 +66,67 @@ fn kv_close(v: *mut KpVideo) {
     (*v).holding = false
 }
 
+fn kv_set_ops(v: *mut KpVideo, ops: vidops.VideoOps) {
+    kv_close(v)
+    (*v).ops = ops
+}
+
 fn kv_open(v: *mut KpVideo, data: u64, n: usize) -> i32 {
     kv_close(v)
-    (*v).src = vidsource.vs_new()
+    let create: fn() -> u64 = (*v).ops.create
+    (*v).h = create()
+    if (*v).h == 0 as u64 {
+        return vidops.VO_ERR_UNSUPPORTED
+    }
     (*v).dropped = 0 as u64
     (*v).shown = 0 as u64
     (*v).frame_no = 0 as u64
-    let rc: i32 = vidsource.vs_open(&(*v).src, data, n)
-    if rc != vidsource.VS_OK {
+    let open: fn(u64, u64, usize) -> i32 = (*v).ops.open
+    let rc: i32 = open((*v).h, data, n)
+    if rc != vidops.VO_OK {
+        kv_close(v)
         return rc
     }
-    let bytes: usize = vidsource.vs_rgba_bytes(&(*v).src)
+    let rgba_bytes: fn(u64) -> usize = (*v).ops.rgba_bytes
+    let bytes: usize = rgba_bytes((*v).h)
     if bytes == 0 || bytes > 1 << 30 {
-        vidsource.vs_close(&(*v).src)
-        return vidsource.VS_ERR_FORMAT
+        kv_close(v)
+        return vidops.VO_ERR_FORMAT
     }
     (*v).bytes = bytes
     (*v).cur = rt.heap_alloc(bytes)
     (*v).nxt = rt.heap_alloc(bytes)
     if (*v).cur == 0 as u64 || (*v).nxt == 0 as u64 {
         kv_close(v)
-        return vidsource.VS_ERR_DECODE
+        return vidops.VO_ERR_DECODE
     }
     rt.mem_set((*v).cur, 0 as u8, bytes)
     (*v).open = true
-    return vidsource.VS_OK
+    return vidops.VO_OK
 }
 
 fn kv_width(v: *mut KpVideo) -> u32 {
-    return vidsource.vs_width(&(*v).src)
+    let f: fn(u64) -> u32 = (*v).ops.width
+    return f((*v).h)
 }
 
 fn kv_height(v: *mut KpVideo) -> u32 {
-    return vidsource.vs_height(&(*v).src)
+    let f: fn(u64) -> u32 = (*v).ops.height
+    return f((*v).h)
 }
 
 fn kv_duration_ms(v: *mut KpVideo) -> u64 {
-    let d: i64 = vidsource.vs_duration_us(&(*v).src)
+    let f: fn(u64) -> i64 = (*v).ops.duration_us
+    let d: i64 = f((*v).h)
     if d <= 0 {
         return 0 as u64
     }
     return (d / 1000) as u64
+}
+
+fn kv_fps_milli(v: *mut KpVideo) -> u32 {
+    let f: fn(u64) -> u32 = (*v).ops.fps_milli
+    return f((*v).h)
 }
 
 fn kv_has_frame(v: *mut KpVideo) -> bool {
@@ -142,7 +169,8 @@ fn kv_seek(v: *mut KpVideo, target_us: i64) {
     if t < 0 {
         t = 0
     }
-    vidsource.vs_seek(&(*v).src, t)
+    let sk: fn(u64, i64) -> i64 = (*v).ops.seek
+    sk((*v).h, t)
     (*v).have_nxt = false
     (*v).ended = false
     (*v).force = true
@@ -164,7 +192,8 @@ fn swap_frames(v: *mut KpVideo) {
 
 fn fetch(v: *mut KpVideo) -> bool {
     var pts: i64 = 0
-    let r: i32 = vidsource.vs_next_frame(&(*v).src, (*v).nxt, &pts)
+    let nf: fn(u64, u64, *mut i64) -> i32 = (*v).ops.next_frame
+    let r: i32 = nf((*v).h, (*v).nxt, &pts)
     if r > 0 {
         (*v).have_nxt = true
         (*v).nxt_pts = pts
@@ -199,7 +228,8 @@ fn kv_update(v: *mut KpVideo, clock_us: i64) -> u32 {
         }
         if !(*v).holding && clock_us - (*v).nxt_pts > RESYNC_US {
             (*v).holding = true
-            vidsource.vs_seek(&(*v).src, clock_us)
+            let sk: fn(u64, i64) -> i64 = (*v).ops.seek
+            sk((*v).h, clock_us)
             (*v).have_nxt = false
             (*v).ended = false
             (*v).dropped = (*v).dropped + (1 as u64)
