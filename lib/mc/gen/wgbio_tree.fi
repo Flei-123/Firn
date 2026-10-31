@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mc.gen.wgbio_table
+
+export { BioTree, tree_bytes, tree_build, tree_free, tree_search }
+
+const DIMS: usize = 7
+const SPACE: usize = 14
+const FANOUT: usize = 6
+
+struct BioTree {
+    tab: *mut wgbio_table.BioTable,
+    count: usize,
+    cap: usize,
+    space: u64,
+    first: u64,
+    kids: u64,
+    nkids: u64,
+    entry: u64,
+    root: u32,
+    kid_used: usize,
+    sort_scratch: u64,
+}
+
+fn tree_bytes() -> usize {
+    return wgbio_table.bytes_of[BioTree]()
+}
+
+fn sp(t: *mut BioTree, node: u32, k: usize) -> i64 {
+    return (rt.ld32((*t).space, (node as usize) * SPACE + k) as i64) - wgbio_table.BIO_BIAS
+}
+
+fn sp_set(t: *mut BioTree, node: u32, k: usize, v: i64) {
+    rt.st32((*t).space, (node as usize) * SPACE + k, (v + wgbio_table.BIO_BIAS) as u32)
+}
+
+fn mid(t: *mut BioTree, node: u32, d: usize) -> i64 {
+    return (sp(t, node, d * 2) + sp(t, node, d * 2 + 1)) / 2
+}
+
+fn abs64(v: i64) -> i64 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+fn key_of(t: *mut BioTree, node: u32, d: usize, use_abs: bool) -> i64 {
+    let m: i64 = mid(t, node, d)
+    if use_abs { return abs64(m) }
+    return m
+}
+
+fn compare(t: *mut BioTree, a: u32, b: u32, d0: usize, use_abs: bool) -> i32 {
+    var i: usize = 0
+    while i < DIMS {
+        let d: usize = (d0 + i) % DIMS
+        let ka: i64 = key_of(t, a, d, use_abs)
+        let kb: i64 = key_of(t, b, d, use_abs)
+        if ka < kb { return 0 - 1 }
+        if ka > kb { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn sum_mid_abs(t: *mut BioTree, node: u32) -> i64 {
+    var s: i64 = 0
+    var d: usize = 0
+    while d < DIMS {
+        s = s + abs64(mid(t, node, d))
+        d = d + 1
+    }
+    return s
+}
+
+fn sort_list(t: *mut BioTree, list: u64, n: usize, d0: usize, use_abs: bool, by_sum: bool) {
+    let tmp: u64 = rt.heap_alloc(n * 4 + 4)
+    var width: usize = 1
+    var src: u64 = list
+    var dst: u64 = tmp
+    while width < n {
+        var lo: usize = 0
+        while lo < n {
+            var mid_i: usize = lo + width
+            if mid_i > n { mid_i = n }
+            var hi: usize = lo + width * 2
+            if hi > n { hi = n }
+            var a: usize = lo
+            var b: usize = mid_i
+            var o: usize = lo
+            while a < mid_i && b < hi {
+                let na: u32 = rt.ld32(src, a)
+                let nb: u32 = rt.ld32(src, b)
+                var le: bool = false
+                if by_sum {
+                    le = sum_mid_abs(t, na) <= sum_mid_abs(t, nb)
+                } else {
+                    le = compare(t, na, nb, d0, use_abs) <= 0
+                }
+                if le {
+                    rt.st32(dst, o, na)
+                    a = a + 1
+                } else {
+                    rt.st32(dst, o, nb)
+                    b = b + 1
+                }
+                o = o + 1
+            }
+            while a < mid_i {
+                rt.st32(dst, o, rt.ld32(src, a))
+                a = a + 1
+                o = o + 1
+            }
+            while b < hi {
+                rt.st32(dst, o, rt.ld32(src, b))
+                b = b + 1
+                o = o + 1
+            }
+            lo = lo + width * 2
+        }
+        let sw: u64 = src
+        src = dst
+        dst = sw
+        width = width * 2
+    }
+    if src != list { rt.mem_copy(list, src, n * 4) }
+    rt.heap_free(tmp, n * 4 + 4)
+}
+
+fn new_node(t: *mut BioTree) -> u32 {
+    let id: u32 = (*t).count as u32
+    (*t).count = (*t).count + 1
+    return id
+}
+
+fn make_subtree(t: *mut BioTree, list: u64, n: usize) -> u32 {
+    let id: u32 = new_node(t)
+    var d: usize = 0
+    while d < DIMS {
+        var lo: i64 = 0
+        var hi: i64 = 0
+        var i: usize = 0
+        while i < n {
+            let c: u32 = rt.ld32(list, i)
+            let cl: i64 = sp(t, c, d * 2)
+            let ch: i64 = sp(t, c, d * 2 + 1)
+            if i == 0 || cl < lo { lo = cl }
+            if i == 0 || ch > hi { hi = ch }
+            i = i + 1
+        }
+        sp_set(t, id, d * 2, lo)
+        sp_set(t, id, d * 2 + 1, hi)
+        d = d + 1
+    }
+    let at: usize = (*t).kid_used
+    var i: usize = 0
+    while i < n {
+        rt.st32((*t).kids, at + i, rt.ld32(list, i))
+        i = i + 1
+    }
+    (*t).kid_used = at + n
+    rt.st32((*t).first, id as usize, at as u32)
+    rt.st32((*t).nkids, id as usize, n as u32)
+    return id
+}
+
+fn bucket_size(n: usize) -> usize {
+    var s: usize = 1
+    while s * FANOUT <= n - 1 { s = s * FANOUT }
+    return s
+}
+
+fn bucketize(t: *mut BioTree, list: u64, n: usize, out: u64) -> usize {
+    let size: usize = bucket_size(n)
+    var count: usize = 0
+    var i: usize = 0
+    while i < n {
+        var m: usize = size
+        if i + m > n { m = n - i }
+        rt.st32(out, count, make_subtree(t, list + ((i * 4) as u64), m))
+        count = count + 1
+        i = i + m
+    }
+    return count
+}
+
+fn node_cost(t: *mut BioTree, node: u32) -> i64 {
+    var s: i64 = 0
+    var d: usize = 0
+    while d < DIMS {
+        s = s + abs64(sp(t, node, d * 2 + 1) - sp(t, node, d * 2))
+        d = d + 1
+    }
+    return s
+}
+
+fn build(t: *mut BioTree, list: u64, n: usize) -> u32 {
+    if n == 1 { return rt.ld32(list, 0) }
+    if n <= FANOUT {
+        sort_list(t, list, n, 0, false, true)
+        return make_subtree(t, list, n)
+    }
+    var best_cost: i64 = 0
+    var best_dim: usize = 0
+    var best_set: bool = false
+    var best_buckets: u64 = 0
+    var best_count: usize = 0
+    var d: usize = 0
+    while d < DIMS {
+        sort_list(t, list, n, d, false, false)
+        let mark_count: usize = (*t).count
+        let mark_kids: usize = (*t).kid_used
+        let buckets: u64 = rt.heap_alloc(n * 4 + 4)
+        let bc: usize = bucketize(t, list, n, buckets)
+        var cost: i64 = 0
+        var i: usize = 0
+        while i < bc {
+            cost = cost + node_cost(t, rt.ld32(buckets, i))
+            i = i + 1
+        }
+        if !best_set || best_cost > cost {
+            if best_set { rt.heap_free(best_buckets, n * 4 + 4) }
+            best_cost = cost
+            best_dim = d
+            best_set = true
+            best_buckets = buckets
+            best_count = bc
+        } else {
+            rt.heap_free(buckets, n * 4 + 4)
+            (*t).count = mark_count
+            (*t).kid_used = mark_kids
+        }
+        d = d + 1
+    }
+    sort_list(t, best_buckets, best_count, best_dim, true, false)
+    let out: u64 = rt.heap_alloc(best_count * 4 + 4)
+    var i: usize = 0
+    while i < best_count {
+        let b: u32 = rt.ld32(best_buckets, i)
+        let fk: usize = rt.ld32((*t).first, b as usize) as usize
+        let nk: usize = rt.ld32((*t).nkids, b as usize) as usize
+        let copy: u64 = rt.heap_alloc(nk * 4 + 4)
+        rt.mem_copy(copy, (*t).kids + ((fk * 4) as u64), nk * 4)
+        rt.st32(out, i, build(t, copy, nk))
+        rt.heap_free(copy, nk * 4 + 4)
+        i = i + 1
+    }
+    rt.heap_free(best_buckets, n * 4 + 4)
+    let node: u32 = make_subtree(t, out, best_count)
+    rt.heap_free(out, best_count * 4 + 4)
+    return node
+}
+
+fn tree_build(t: *mut BioTree, tab: *mut wgbio_table.BioTable) {
+    (*t).tab = tab
+    let n: usize = (*tab).n
+    (*t).cap = n * 40 + 64
+    (*t).space = rt.heap_alloc((*t).cap * SPACE * 4)
+    (*t).first = rt.heap_alloc((*t).cap * 4)
+    (*t).nkids = rt.heap_alloc((*t).cap * 4)
+    (*t).entry = rt.heap_alloc((*t).cap * 4)
+    (*t).kids = rt.heap_alloc((*t).cap * 4 * 8)
+    (*t).count = 0
+    (*t).kid_used = 0
+    let leaves: u64 = rt.heap_alloc(n * 4 + 4)
+    var e: usize = 0
+    while e < n {
+        let id: u32 = new_node(t)
+        var k: usize = 0
+        while k < 12 {
+            rt.st32((*t).space, (id as usize) * SPACE + k, rt.ld32((*tab).vals, e * wgbio_table.BIO_STRIDE + k))
+            k = k + 1
+        }
+        let off: i64 = wgbio_table.table_val(tab, e, 12)
+        sp_set(t, id, 12, off)
+        sp_set(t, id, 13, off)
+        rt.st32((*t).nkids, id as usize, 0 as u32)
+        rt.st32((*t).entry, id as usize, e as u32)
+        rt.st32(leaves, e, id)
+        e = e + 1
+    }
+    (*t).root = build(t, leaves, n)
+    rt.heap_free(leaves, n * 4 + 4)
+}
+
+fn tree_free(t: *mut BioTree) {
+    rt.heap_free((*t).space, (*t).cap * SPACE * 4)
+    rt.heap_free((*t).first, (*t).cap * 4)
+    rt.heap_free((*t).nkids, (*t).cap * 4)
+    rt.heap_free((*t).entry, (*t).cap * 4)
+    rt.heap_free((*t).kids, (*t).cap * 4 * 8)
+}
+
+fn sq(v: i64) -> i64 { return v * v }
+
+fn param_distance(lo: i64, hi: i64, v: i64) -> i64 {
+    let a: i64 = v - hi
+    let b: i64 = lo - v
+    if a > 0 { return a }
+    if b > 0 { return b }
+    return 0
+}
+
+fn node_distance(t: *mut BioTree, node: u32, target: *[i64; 7]) -> i64 {
+    var s: i64 = 0
+    var d: usize = 0
+    while d < DIMS {
+        s = s + sq(param_distance(sp(t, node, d * 2), sp(t, node, d * 2 + 1), (*target)[d]))
+        d = d + 1
+    }
+    return s
+}
+
+fn search_node(t: *mut BioTree, node: u32, target: *[i64; 7], best: i64, best_leaf: i32, out_leaf: *mut i32) -> i64 {
+    let nk: usize = rt.ld32((*t).nkids, node as usize) as usize
+    if nk == 0 {
+        *out_leaf = node as i32
+        return node_distance(t, node, target)
+    }
+    var cur: i64 = best
+    var leaf: i32 = best_leaf
+    let fk: usize = rt.ld32((*t).first, node as usize) as usize
+    var i: usize = 0
+    while i < nk {
+        let c: u32 = rt.ld32((*t).kids, fk + i)
+        let cd: i64 = node_distance(t, c, target)
+        if cur >= cd {
+            var got: i32 = 0 - 1
+            let gd: i64 = search_node(t, c, target, cur, leaf, &got)
+            if got >= 0 && (cur > gd || (cur == gd && (leaf < 0 || rt.ld32((*t).entry, got as usize) < rt.ld32((*t).entry, leaf as usize)))) {
+                cur = gd
+                leaf = got
+            }
+        }
+        i = i + 1
+    }
+    *out_leaf = leaf
+    return cur
+}
+
+fn tree_search(t: *mut BioTree, target: *[i64; 7]) -> usize {
+    var leaf: i32 = 0 - 1
+    search_node(t, (*t).root, target, 9223372036854775807, 0 - 1, &leaf)
+    return rt.ld32((*t).entry, leaf as usize) as usize
+}
