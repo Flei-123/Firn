@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.clock
+import media.audio.source
+import media.video.vidsource
+import fui.kpmodel
+import fui.kpaudio
+import fui.kpvideo
+import fui.kpfmt
+
+export {
+    Player, pl_new, pl_free, pl_close, pl_open, pl_play, pl_pause, pl_toggle, pl_seek_ms, pl_skip_ms,
+    pl_set_volume, pl_volume_step, pl_toggle_mute, pl_update, pl_state, pl_position_ms, pl_duration_ms,
+    pl_has_video, pl_has_audio, pl_error, pl_scrub_begin, pl_scrub_to, pl_scrub_end, pl_set_discard,
+    pl_set_installer, pl_animating, pl_info, pl_name, pl_volume, pl_muted, pl_permille, pl_scrubbing,
+    pl_frame, pl_frame_width, pl_frame_height, pl_frame_no, pl_has_frame, pl_dropped, pl_wall_time,
+    PE_NONE, PE_FORMAT, PE_CODEC,
+}
+
+const PE_NONE: u32 = 0
+const PE_FORMAT: u32 = 1
+const PE_CODEC: u32 = 2
+const TS_AUDIO: u32 = 0
+const TS_WALL: u32 = 1
+const WALL_RATE: u32 = 1000000
+
+struct Player {
+    tr: kpmodel.Transport,
+    audio: kpaudio.KpAudio,
+    video: kpvideo.KpVideo,
+    wall: clock.Clock,
+    data: rt.Buf,
+    name: rt.Buf,
+    info: rt.Buf,
+    has_audio: bool,
+    has_video: bool,
+    ts: u32,
+    err: u32,
+    loaded: bool,
+}
+
+fn pl_new() -> Player {
+    return Player { tr: kpmodel.tr_new(), audio: kpaudio.ka_new(), video: kpvideo.kv_new(),
+        wall: clock.clock_new(WALL_RATE), data: rt.buf_new(), name: rt.buf_new(), info: rt.buf_new(),
+        has_audio: false, has_video: false, ts: TS_WALL, err: PE_NONE, loaded: false }
+}
+
+fn pl_set_discard(p: *mut Player, on: bool) {
+    kpaudio.ka_set_discard(&(*p).audio, on)
+}
+
+fn pl_set_installer(p: *mut Player, inst: kpaudio.Installer) {
+    kpaudio.ka_set_installer(&(*p).audio, inst)
+}
+
+fn pl_close(p: *mut Player) {
+    kpaudio.ka_close(&(*p).audio)
+    kpvideo.kv_close(&(*p).video)
+    rt.buf_clear(&(*p).data)
+    rt.buf_clear(&(*p).name)
+    rt.buf_clear(&(*p).info)
+    kpmodel.tr_clear(&(*p).tr)
+    (*p).has_audio = false
+    (*p).has_video = false
+    (*p).loaded = false
+    (*p).err = PE_NONE
+    (*p).ts = TS_WALL
+}
+
+fn pl_free(p: *mut Player) {
+    pl_close(p)
+    rt.buf_free(&(*p).data)
+    rt.buf_free(&(*p).name)
+    rt.buf_free(&(*p).info)
+}
+
+fn wall_seek(p: *mut Player, ms: u64) {
+    let was: bool = clock.clock_is_paused(&(*p).wall)
+    if was {
+        clock.clock_resume(&(*p).wall)
+    }
+    clock.clock_reset(&(*p).wall, ms * (1000 as u64))
+    if was {
+        clock.clock_pause(&(*p).wall)
+    }
+}
+
+fn wall_init(p: *mut Player) {
+    (*p).wall = clock.clock_new(WALL_RATE)
+    clock.clock_use_wall(&(*p).wall, true)
+    clock.clock_reset(&(*p).wall, 0 as u64)
+    clock.clock_pause(&(*p).wall)
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn push_sep(b: *mut rt.Buf) {
+    if rt.buf_len(b) > 0 {
+        rt.buf_push(b, 32 as u8)
+        rt.buf_push(b, 194 as u8)
+        rt.buf_push(b, 183 as u8)
+        rt.buf_push(b, 32 as u8)
+    }
+}
+
+fn push_upper(b: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        var ch: u8 = rt.ld8(s.p as u64, i)
+        if ch >= 97 as u8 && ch <= 122 as u8 {
+            ch = ch - (32 as u8)
+        }
+        rt.buf_push(b, ch)
+        i = i + 1
+    }
+}
+
+fn push_rate(b: *mut rt.Buf, rate: u32) {
+    let khz: u64 = (rate as u64) / (1000 as u64)
+    let frac: u64 = ((rate as u64) % (1000 as u64)) / (100 as u64)
+    rt.buf_push_dec_u64(b, khz)
+    if frac > 0 as u64 {
+        rt.buf_push(b, 46 as u8)
+        rt.buf_push_dec_u64(b, frac)
+    }
+    push_str(b, " kHz")
+}
+
+fn build_info(p: *mut Player, vw: u32, vh: u32, fps_milli: u32) {
+    rt.buf_clear(&(*p).info)
+    if (*p).has_video || vw > 0 as u32 {
+        rt.buf_push_dec_u64(&(*p).info, vw as u64)
+        push_str(&(*p).info, "x")
+        rt.buf_push_dec_u64(&(*p).info, vh as u64)
+        if fps_milli > 0 as u32 {
+            push_str(&(*p).info, " @ ")
+            rt.buf_push_dec_u64(&(*p).info, (fps_milli as u64 + (500 as u64)) / (1000 as u64))
+            push_str(&(*p).info, " fps")
+        }
+    }
+    if (*p).has_audio {
+        let inf: source.AudioInfo = kpaudio.ka_info(&(*p).audio)
+        push_sep(&(*p).info)
+        push_upper(&(*p).info, source.format_name(inf.format))
+        push_sep(&(*p).info)
+        push_rate(&(*p).info, inf.rate)
+        push_sep(&(*p).info)
+        if inf.channels == 1 as u32 {
+            push_str(&(*p).info, "mono")
+        } else if inf.channels == 2 as u32 {
+            push_str(&(*p).info, "stereo")
+        } else {
+            rt.buf_push_dec_u64(&(*p).info, inf.channels as u64)
+            push_str(&(*p).info, " ch")
+        }
+    }
+}
+
+fn max_u64(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn pl_open(p: *mut Player, data: u64, n: usize, name: str) -> bool {
+    pl_close(p)
+    rt.buf_push_bytes(&(*p).data, data, n)
+    rt.buf_push_bytes(&(*p).name, name.p as u64, name.n)
+    let base: u64 = rt.buf_ptr(&(*p).data)
+    (*p).has_audio = kpaudio.ka_open(&(*p).audio, base, n)
+    let vrc: i32 = kpvideo.kv_open(&(*p).video, base, n)
+    (*p).has_video = vrc == vidsource.VS_OK
+    if vrc == vidsource.VS_ERR_UNSUPPORTED {
+        (*p).err = PE_CODEC
+    }
+    if !(*p).has_audio && !(*p).has_video {
+        if (*p).err == PE_NONE {
+            (*p).err = PE_FORMAT
+        }
+        kpmodel.tr_fail(&(*p).tr)
+        return false
+    }
+    (*p).err = PE_NONE
+    var dur: u64 = 0 as u64
+    if (*p).has_audio {
+        dur = kpaudio.ka_duration_ms(&(*p).audio)
+    }
+    var vw: u32 = 0 as u32
+    var vh: u32 = 0 as u32
+    var fps: u32 = 0 as u32
+    if (*p).has_video {
+        dur = max_u64(dur, kpvideo.kv_duration_ms(&(*p).video))
+        vw = kpvideo.kv_width(&(*p).video)
+        vh = kpvideo.kv_height(&(*p).video)
+        fps = vidsource.vs_fps_milli(&(*p).video.src)
+    }
+    wall_init(p)
+    (*p).ts = TS_WALL
+    if (*p).has_audio {
+        (*p).ts = TS_AUDIO
+    }
+    kpmodel.tr_load(&(*p).tr, dur)
+    kpaudio.ka_set_volume(&(*p).audio, kpmodel.tr_eff_volume(&(*p).tr))
+    build_info(p, vw, vh, fps)
+    (*p).loaded = true
+    if (*p).has_video {
+        kpvideo.kv_seek(&(*p).video, 0)
+        pl_update(p)
+    }
+    return true
+}
+
+fn time_us(p: *mut Player) -> i64 {
+    if (*p).ts == TS_AUDIO && (*p).has_audio {
+        return kpaudio.ka_clock_us(&(*p).audio)
+    }
+    return clock.clock_samples(&(*p).wall) as i64
+}
+
+fn pos_ms(p: *mut Player) -> u64 {
+    let t: i64 = time_us(p)
+    if t < 0 {
+        return 0 as u64
+    }
+    return (t / 1000) as u64
+}
+
+fn to_wall(p: *mut Player, at_ms: u64) {
+    (*p).ts = TS_WALL
+    wall_seek(p, at_ms)
+    if (*p).tr.state == kpmodel.TS_PLAYING {
+        clock.clock_resume(&(*p).wall)
+    }
+}
+
+fn start_engines(p: *mut Player) {
+    if (*p).has_audio && (*p).ts == TS_AUDIO {
+        if !kpaudio.ka_attach(&(*p).audio) {
+            to_wall(p, kpmodel.tr_display_ms(&(*p).tr))
+        } else {
+            kpaudio.ka_resume(&(*p).audio)
+        }
+    }
+    if (*p).ts == TS_WALL {
+        clock.clock_resume(&(*p).wall)
+    }
+}
+
+fn stop_engines(p: *mut Player) {
+    if (*p).has_audio {
+        kpaudio.ka_pause(&(*p).audio)
+    }
+    clock.clock_pause(&(*p).wall)
+}
+
+fn sync_engines(p: *mut Player) {
+    if !(*p).loaded {
+        return
+    }
+    kpaudio.ka_set_volume(&(*p).audio, kpmodel.tr_eff_volume(&(*p).tr))
+    if (*p).tr.state == kpmodel.TS_PLAYING {
+        start_engines(p)
+    } else {
+        stop_engines(p)
+    }
+}
+
+fn apply_seek(p: *mut Player) {
+    var ms: u64 = 0 as u64
+    if !kpmodel.tr_take_seek(&(*p).tr, &ms) {
+        return
+    }
+    if (*p).has_audio && (*p).ts == TS_AUDIO {
+        kpaudio.ka_seek_ms(&(*p).audio, ms)
+    }
+    wall_seek(p, ms)
+    if (*p).has_video {
+        kpvideo.kv_seek(&(*p).video, (ms as i64) * 1000)
+    }
+}
+
+fn pl_play(p: *mut Player) {
+    if kpmodel.tr_play(&(*p).tr) {
+        apply_seek(p)
+        sync_engines(p)
+    }
+}
+
+fn pl_pause(p: *mut Player) {
+    if kpmodel.tr_pause(&(*p).tr) {
+        sync_engines(p)
+    }
+}
+
+fn pl_toggle(p: *mut Player) {
+    if (*p).tr.state == kpmodel.TS_PLAYING {
+        pl_pause(p)
+    } else {
+        pl_play(p)
+    }
+}
+
+fn pl_seek_ms(p: *mut Player, ms: u64) {
+    if kpmodel.tr_seek(&(*p).tr, ms) {
+        apply_seek(p)
+        sync_engines(p)
+        pl_update(p)
+    }
+}
+
+fn pl_skip_ms(p: *mut Player, delta: i64) {
+    if kpmodel.tr_skip(&(*p).tr, delta) {
+        apply_seek(p)
+        sync_engines(p)
+        pl_update(p)
+    }
+}
+
+fn pl_scrub_begin(p: *mut Player, permille: i64) -> bool {
+    if kpmodel.tr_scrub_begin(&(*p).tr, permille) {
+        sync_engines(p)
+        return true
+    }
+    return false
+}
+
+fn pl_scrub_to(p: *mut Player, permille: i64) {
+    kpmodel.tr_scrub_to(&(*p).tr, permille)
+}
+
+fn pl_scrub_end(p: *mut Player) {
+    if kpmodel.tr_scrub_end(&(*p).tr) {
+        apply_seek(p)
+        sync_engines(p)
+        pl_update(p)
+    }
+}
+
+fn pl_set_volume(p: *mut Player, percent: u32) {
+    kpmodel.tr_set_volume(&(*p).tr, percent)
+    kpaudio.ka_set_volume(&(*p).audio, kpmodel.tr_eff_volume(&(*p).tr))
+}
+
+fn pl_volume_step(p: *mut Player, delta: i64) {
+    kpmodel.tr_volume_step(&(*p).tr, delta)
+    kpaudio.ka_set_volume(&(*p).audio, kpmodel.tr_eff_volume(&(*p).tr))
+}
+
+fn pl_toggle_mute(p: *mut Player) {
+    kpmodel.tr_toggle_mute(&(*p).tr)
+    kpaudio.ka_set_volume(&(*p).audio, kpmodel.tr_eff_volume(&(*p).tr))
+}
+
+fn is_finished(p: *mut Player, pos: u64) -> bool {
+    if (*p).has_audio && (*p).ts == TS_AUDIO {
+        if !kpaudio.ka_ended(&(*p).audio) {
+            return false
+        }
+        return !(*p).has_video || kpvideo.kv_done(&(*p).video)
+    }
+    if (*p).has_video {
+        return kpvideo.kv_done(&(*p).video)
+    }
+    return (*p).tr.dur_ms > 0 as u64 && pos >= (*p).tr.dur_ms
+}
+
+fn pl_update(p: *mut Player) -> bool {
+    if !(*p).loaded {
+        return false
+    }
+    let before: u32 = (*p).tr.state
+    var changed: bool = false
+    if (*p).tr.state == kpmodel.TS_PLAYING {
+        if (*p).has_audio && (*p).ts == TS_AUDIO {
+            kpaudio.ka_pump(&(*p).audio)
+            if kpaudio.ka_failed(&(*p).audio) {
+                to_wall(p, kpmodel.tr_display_ms(&(*p).tr))
+            } else if kpaudio.ka_ended(&(*p).audio) && (*p).has_video && !kpvideo.kv_done(&(*p).video) {
+                to_wall(p, kpaudio.ka_duration_ms(&(*p).audio))
+            }
+        }
+    }
+    if (*p).has_video {
+        if (*p).tr.state == kpmodel.TS_PLAYING || kpvideo.kv_pending_force(&(*p).video) {
+            if kpvideo.kv_update(&(*p).video, time_us(p)) == kpvideo.UP_FRAME {
+                changed = true
+            }
+        }
+    }
+    if (*p).tr.state == kpmodel.TS_PLAYING {
+        let pos: u64 = pos_ms(p)
+        kpmodel.tr_tick(&(*p).tr, pos, is_finished(p, pos))
+        if (*p).tr.state != kpmodel.TS_PLAYING {
+            sync_engines(p)
+        }
+    }
+    return changed || before != (*p).tr.state || (*p).tr.state == kpmodel.TS_PLAYING
+}
+
+fn pl_animating(p: *mut Player) -> bool {
+    if !(*p).loaded {
+        return false
+    }
+    return (*p).tr.state == kpmodel.TS_PLAYING || (*p).tr.scrubbing
+        || ((*p).has_video && kpvideo.kv_pending_force(&(*p).video))
+}
+
+fn pl_state(p: *mut Player) -> u32 {
+    return (*p).tr.state
+}
+
+fn pl_error(p: *mut Player) -> u32 {
+    return (*p).err
+}
+
+fn pl_position_ms(p: *mut Player) -> u64 {
+    return kpmodel.tr_display_ms(&(*p).tr)
+}
+
+fn pl_duration_ms(p: *mut Player) -> u64 {
+    return (*p).tr.dur_ms
+}
+
+fn pl_permille(p: *mut Player) -> i64 {
+    return kpmodel.tr_permille(&(*p).tr, kpmodel.tr_display_ms(&(*p).tr))
+}
+
+fn pl_scrubbing(p: *mut Player) -> bool {
+    return (*p).tr.scrubbing
+}
+
+fn pl_has_video(p: *mut Player) -> bool {
+    return (*p).has_video
+}
+
+fn pl_has_audio(p: *mut Player) -> bool {
+    return (*p).has_audio
+}
+
+fn pl_volume(p: *mut Player) -> u32 {
+    return (*p).tr.volume
+}
+
+fn pl_muted(p: *mut Player) -> bool {
+    return (*p).tr.muted
+}
+
+fn pl_info(p: *mut Player) -> str {
+    return str { p: rt.buf_ptr(&(*p).info) as *mut u8, n: rt.buf_len(&(*p).info) }
+}
+
+fn pl_name(p: *mut Player) -> str {
+    return str { p: rt.buf_ptr(&(*p).name) as *mut u8, n: rt.buf_len(&(*p).name) }
+}
+
+fn pl_frame(p: *mut Player) -> u64 {
+    return kpvideo.kv_frame(&(*p).video)
+}
+
+fn pl_frame_width(p: *mut Player) -> u32 {
+    return kpvideo.kv_width(&(*p).video)
+}
+
+fn pl_frame_height(p: *mut Player) -> u32 {
+    return kpvideo.kv_height(&(*p).video)
+}
+
+fn pl_frame_no(p: *mut Player) -> u64 {
+    return kpvideo.kv_frame_no(&(*p).video)
+}
+
+fn pl_has_frame(p: *mut Player) -> bool {
+    return (*p).has_video && kpvideo.kv_has_frame(&(*p).video)
+}
+
+fn pl_dropped(p: *mut Player) -> u64 {
+    return kpvideo.kv_dropped(&(*p).video)
+}
+
+fn pl_wall_time(p: *mut Player) -> *mut clock.Clock {
+    return &(*p).wall
+}
