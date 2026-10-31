@@ -113,7 +113,7 @@ public class WgFeatures {
                     BlockPos p = (BlockPos) args[0];
                     return ((java.util.function.Predicate<net.minecraft.world.level.material.FluidState>) args[1]).test(r.chunk(p.getX() >> 4, p.getZ() >> 4).getBlockState(p).getFluidState());
                 }
-                case "getBlockEntity": return null;
+                case "getBlockEntity": return args.length == 2 ? java.util.Optional.empty() : null;
                 case "scheduleTick": return null;
                 case "blockUpdated": return null;
                 case "levelEvent": return null;
