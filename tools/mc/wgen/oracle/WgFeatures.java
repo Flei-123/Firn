@@ -229,7 +229,7 @@ public class WgFeatures {
                         try {
                             pf.placeWithBiomeCheck(level, gen, rnd, origin);
                         } catch (RuntimeException ex) {
-                            if (dirOnly) { try { ex.printStackTrace(new java.io.PrintStream(new java.io.FileOutputStream(System.getProperty("wg.errfile", "/dev/null")))); } catch (Exception io) {} throw ex; }
+                            if (dirOnly) throw ex;
                             failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
                         }
                     }
