@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.json
+import std.jsonstr
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_load
+import mc.gen.wgbio_source
+import mc.gen.wgsr_def
+import mc.gen.wgcv_def
+import mc.gen.wgcv_prov
+
+export { cv_load }
+
+const NONE_NODE: u32 = 4294967295
+const MAX_NAMES: usize = 256
+
+struct NameSet {
+    n: usize,
+    names: [[u8; 40]; 256],
+    lens: [usize; 256],
+}
+
+struct Ld {
+    def: *mut wgcv_def.CvDef,
+    sdef: *mut wgsr_def.SrDef,
+    root: str,
+    doc: *mut json.Json,
+    ok: bool,
+}
+
+fn bare(s: str) -> str {
+    return wgdf_load.strip_ns(s)
+}
+
+fn set_has(s: *NameSet, name: str) -> bool {
+    var i: usize = 0
+    while i < (*s).n {
+        if (*s).lens[i] == name.n && rt.mem_eq((&(*s).names[i][0]) as u64, name.p as u64, name.n) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn set_add(s: *mut NameSet, name: str) {
+    if set_has(s, name) || (*s).n >= MAX_NAMES || name.n > 40 { return }
+    rt.mem_copy((&(*s).names[(*s).n][0]) as u64, name.p as u64, name.n)
+    (*s).lens[(*s).n] = name.n
+    (*s).n = (*s).n + 1
+}
+
+fn tag_collect(root: str, tag: str, out: *mut NameSet, depth: i32) {
+    if depth > 6 { return }
+    var raw: rt.Buf = rt.buf_new()
+    var doc: json.Json = json.json_new()
+    if wgdf_load.read_doc(root, "tags/blocks", tag, &raw, &doc) {
+        let vals: u32 = jsonstr.get(&doc, json.json_root(&doc), "values")
+        let cnt: usize = json.json_count(&doc, vals)
+        var k: usize = 0
+        while k < cnt {
+            let v: str = jsonstr.string(&doc, json.json_child_at(&doc, vals, k))
+            if v.n > 0 && *(v.p) == 35 {
+                tag_collect(root, bare(str { p: ((v.p as u64) + 1) as *mut u8, n: v.n - 1 }), out, depth + 1)
+            } else {
+                set_add(out, bare(v))
+            }
+            k = k + 1
+        }
+    }
+    json.json_free(&doc)
+    rt.buf_free(&raw)
+}
+
+fn code_name(sd: *wgsr_def.SrDef, code: i32) -> str {
+    if code == 83 { return str { p: &(*sd).default_name[0], n: (*sd).default_len } }
+    if code == 65 { return "air" }
+    if code == 87 { return "water" }
+    if code == 76 { return "lava" }
+    if code == 67 { return "copper_ore" }
+    if code == 99 { return "raw_copper_block" }
+    if code == 71 { return "granite" }
+    if code == 73 { return "deepslate_iron_ore" }
+    if code == 105 { return "raw_iron_block" }
+    if code == 84 { return "tuff" }
+    if code >= wgsr_def.FIRST_CODE && (code - wgsr_def.FIRST_CODE) < (wgsr_def.block_count(sd) as i32) {
+        return wgsr_def.block_name(sd, (code - wgsr_def.FIRST_CODE) as usize)
+    }
+    return ""
+}
+
+fn build_replaceable(l: *mut Ld, c: *mut wgcv_def.Carver, tag: str) {
+    let set: *mut NameSet = rt.heap_alloc(wgdf_graph.wg_size_of[NameSet]()) as *mut NameSet
+    tag_collect((*l).root, tag, set, 0)
+    var code: i32 = 0
+    while code < 256 {
+        let nm: str = code_name((*l).sdef, code)
+        (*c).repl[code as usize] = nm.n > 0 && set_has(set, nm)
+        code = code + 1
+    }
+    rt.heap_free(set as u64, wgdf_graph.wg_size_of[NameSet]())
+}
+
+fn anchor_y(l: *mut Ld, j: u32) -> i32 {
+    let d: *mut json.Json = (*l).doc
+    let def: *mut wgcv_def.CvDef = (*l).def
+    let a: u32 = jsonstr.get(d, j, "absolute")
+    if a != NONE_NODE { return json.json_number(d, a) as i32 }
+    let b: u32 = jsonstr.get(d, j, "above_bottom")
+    if b != NONE_NODE { return (*def).min_y + (json.json_number(d, b) as i32) }
+    let t: u32 = jsonstr.get(d, j, "below_top")
+    if t != NONE_NODE { return (*def).min_y + (*def).height - 1 - (json.json_number(d, t) as i32) }
+    (*l).ok = false
+    return 0
+}
+
+fn num_at(l: *mut Ld, j: u32, key: str) -> f32 {
+    let n: u32 = jsonstr.get((*l).doc, j, key)
+    if n == NONE_NODE {
+        (*l).ok = false
+        return 0.0f
+    }
+    return json.json_number((*l).doc, n) as f32
+}
+
+fn load_fp(l: *mut Ld, j: u32) -> wgcv_def.Fp {
+    let d: *mut json.Json = (*l).doc
+    if j == NONE_NODE {
+        (*l).ok = false
+        return wgcv_prov.fp_const(0.0f)
+    }
+    if json.json_kind(d, j) == json.JSON_NUMBER { return wgcv_prov.fp_const(json.json_number(d, j) as f32) }
+    let ty: str = bare(jsonstr.string(d, jsonstr.get(d, j, "type")))
+    let v: u32 = jsonstr.get(d, j, "value")
+    if ty == "uniform" { return wgcv_prov.fp_uniform(num_at(l, v, "min_inclusive"), num_at(l, v, "max_exclusive")) }
+    if ty == "trapezoid" { return wgcv_prov.fp_trapezoid(num_at(l, v, "min"), num_at(l, v, "max"), num_at(l, v, "plateau")) }
+    if ty == "constant" { return wgcv_prov.fp_const(json.json_number(d, v) as f32) }
+    (*l).ok = false
+    return wgcv_prov.fp_const(0.0f)
+}
+
+fn load_shape(l: *mut Ld, c: *mut wgcv_def.Carver, cfg: u32) {
+    let d: *mut json.Json = (*l).doc
+    let shape: u32 = jsonstr.get(d, cfg, "shape")
+    (*c).dist = load_fp(l, jsonstr.get(d, shape, "distance_factor"))
+    (*c).hrf = load_fp(l, jsonstr.get(d, shape, "horizontal_radius_factor"))
+    (*c).thick = load_fp(l, jsonstr.get(d, shape, "thickness"))
+    (*c).vrc = num_at(l, shape, "vertical_radius_center_factor")
+    (*c).vrd = num_at(l, shape, "vertical_radius_default_factor")
+    (*c).smooth = num_at(l, shape, "width_smoothness") as i32
+    (*c).vrot = load_fp(l, jsonstr.get(d, cfg, "vertical_rotation"))
+}
+
+fn load_cave_fields(l: *mut Ld, c: *mut wgcv_def.Carver, cfg: u32) {
+    let d: *mut json.Json = (*l).doc
+    (*c).hr = load_fp(l, jsonstr.get(d, cfg, "horizontal_radius_multiplier"))
+    (*c).vr = load_fp(l, jsonstr.get(d, cfg, "vertical_radius_multiplier"))
+    (*c).floor = load_fp(l, jsonstr.get(d, cfg, "floor_level"))
+}
+
+#[allow_escape]
+fn load_carver(l: *mut Ld, name: str) -> i32 {
+    let def: *mut wgcv_def.CvDef = (*l).def
+    let nm: str = bare(name)
+    let known: i32 = wgcv_def.find_carver(def, nm.p as u64, nm.n)
+    if known >= 0 { return known }
+    if (*def).n >= wgcv_def.MAX_CARVERS || nm.n > 40 {
+        (*l).ok = false
+        return 0
+    }
+    var raw: rt.Buf = rt.buf_new()
+    var doc: json.Json = json.json_new()
+    var idx: i32 = 0
+    if !wgdf_load.read_doc((*l).root, "configured_carver", nm, &raw, &doc) {
+        (*l).ok = false
+    } else {
+        let saved: *mut json.Json = (*l).doc
+        (*l).doc = &doc
+        let r: u32 = json.json_root(&doc)
+        let cfg: u32 = jsonstr.get(&doc, r, "config")
+        let ty: str = bare(jsonstr.string(&doc, jsonstr.get(&doc, r, "type")))
+        idx = (*def).n as i32
+        let c: *mut wgcv_def.Carver = &(*def).carvers[idx as usize]
+        (*def).n = (*def).n + 1
+        rt.mem_copy((&(*def).cname[idx as usize][0]) as u64, nm.p as u64, nm.n)
+        (*def).clen[idx as usize] = nm.n
+        if ty == "cave" { (*c).kind = wgcv_def.KIND_CAVE }
+        else if ty == "nether_cave" { (*c).kind = wgcv_def.KIND_NETHER }
+        else if ty == "canyon" { (*c).kind = wgcv_def.KIND_CANYON }
+        else { (*l).ok = false }
+        (*c).prob = num_at(l, cfg, "probability")
+        let y: u32 = jsonstr.get(&doc, cfg, "y")
+        (*c).y_lo = anchor_y(l, jsonstr.get(&doc, y, "min_inclusive"))
+        (*c).y_hi = anchor_y(l, jsonstr.get(&doc, y, "max_inclusive"))
+        (*c).lava = anchor_y(l, jsonstr.get(&doc, cfg, "lava_level"))
+        (*c).yscale = load_fp(l, jsonstr.get(&doc, cfg, "yScale"))
+        if (*c).kind == wgcv_def.KIND_CANYON { load_shape(l, c, cfg) } else { load_cave_fields(l, c, cfg) }
+        let tag: str = jsonstr.string(&doc, jsonstr.get(&doc, cfg, "replaceable"))
+        if tag.n > 1 && *(tag.p) == 35 {
+            build_replaceable(l, c, bare(str { p: ((tag.p as u64) + 1) as *mut u8, n: tag.n - 1 }))
+        } else {
+            (*l).ok = false
+        }
+        (*l).doc = saved
+    }
+    json.json_free(&doc)
+    rt.buf_free(&raw)
+    return idx
+}
+
+fn load_biome(l: *mut Ld, bi: usize, name: str) {
+    let def: *mut wgcv_def.CvDef = (*l).def
+    var raw: rt.Buf = rt.buf_new()
+    var bd: json.Json = json.json_new()
+    if wgdf_load.read_doc((*l).root, "biome", name, &raw, &bd) {
+        let air: u32 = jsonstr.get(&bd, jsonstr.get(&bd, json.json_root(&bd), "carvers"), "air")
+        if air != NONE_NODE {
+            if json.json_kind(&bd, air) == json.JSON_STRING {
+                (*def).bio_c[bi][0] = load_carver(l, jsonstr.string(&bd, air)) as u8
+                (*def).bio_n[bi] = 1
+            } else {
+                let cnt: usize = json.json_count(&bd, air)
+                var k: usize = 0
+                while k < cnt && k < wgcv_def.MAX_PER_BIOME {
+                    (*def).bio_c[bi][k] = load_carver(l, jsonstr.string(&bd, json.json_child_at(&bd, air, k))) as u8
+                    k = k + 1
+                }
+                (*def).bio_n[bi] = k as u8
+            }
+        }
+    } else {
+        (*l).ok = false
+    }
+    json.json_free(&bd)
+    rt.buf_free(&raw)
+}
+
+fn cv_load(root: str, sd: *mut wgsr_def.SrDef, bio: *mut wgbio_source.BioSource, min_y: i32, height: i32) -> *mut wgcv_def.CvDef {
+    let def: *mut wgcv_def.CvDef = wgcv_def.def_new(min_y, height)
+    var l: Ld = Ld { def: def, sdef: sd, root: root, doc: 0 as *mut json.Json, ok: bio != (0 as *mut wgbio_source.BioSource) }
+    if l.ok {
+        let ca: i32 = wgsr_def.block_code(sd, "cave_air".p as u64, 8)
+        if ca < 0 || ca > 255 { l.ok = false } else { (*def).code_cave_air = ca as u8 }
+        (*def).code_grass = wgsr_def.block_find(sd, "grass_block".p as u64, 11)
+        (*def).code_mycelium = wgsr_def.block_find(sd, "mycelium".p as u64, 8)
+        (*def).code_dirt = wgsr_def.block_find(sd, "dirt".p as u64, 4)
+        let nb: usize = wgbio_source.bio_name_count(bio)
+        (*def).nbio = nb
+        var i: usize = 0
+        while i < nb && i < wgcv_def.MAX_BIOMES && l.ok {
+            load_biome(&l, i, wgbio_source.bio_name(bio, i))
+            i = i + 1
+        }
+    }
+    if !l.ok {
+        wgcv_def.def_free(def)
+        return 0 as *mut wgcv_def.CvDef
+    }
+    return def
+}

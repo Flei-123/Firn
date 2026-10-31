@@ -17,7 +17,7 @@ run_dim() {
     : > "$W/got_$dim.txt"
     for t in "$@"; do
         IFS=: read -r sd cx cz <<< "$t"
-        "$W/surface_probe" "$DATA" "$dim" "$sd" "$cx" "$cz" 0 >> "$W/got_$dim.txt" || { echo "  FAIL  run $dim $t"; ERR=1; }
+        "$W/surface_probe" "$DATA" "$dim" "$sd" "$cx" "$cz" 0 0 >> "$W/got_$dim.txt" || { echo "  FAIL  run $dim $t"; ERR=1; }
     done
     if cmp -s "$W/ref_$dim.txt" "$W/got_$dim.txt"; then
         echo "  ok    surface $dim: $(wc -l < "$W/ref_$dim.txt") columns identical"

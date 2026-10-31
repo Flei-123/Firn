@@ -68,6 +68,7 @@ if [ -z "${WG_NO_GEN:-}" ]; then
     bash tools/mc/wgen/gen_join.sh || ERR=1
     bash tools/mc/wgen/biome_gate.sh || ERR=1
     bash tools/mc/wgen/surface_gate.sh || ERR=1
+    bash tools/mc/wgen/carver_gate.sh || ERR=1
     bash tools/mc/wgen/persist_gate.sh || ERR=1
 fi
 

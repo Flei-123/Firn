@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import noise.jnum
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fluid
+import mc.gen.wgdf_aquifer
+import mc.gen.wgsr_ctx
+import mc.gen.wgsr_rules
+import mc.gen.wgcv_def
+
+export { CvRun, Skip, SKIP_CAVE, SKIP_CANYON, carve_ellipsoid }
+
+const SKIP_CAVE: u8 = 0
+const SKIP_CANYON: u8 = 1
+const INT_MIN: i32 = -2147483647 - 1
+const STATE_LAVA: u8 = 76
+const TOP_CLEARANCE: i32 = 7
+
+struct CvRun {
+    def: *wgcv_def.CvDef,
+    car: *wgcv_def.Carver,
+    c: *mut wgsr_ctx.SrCtx,
+    g: *wgdf_graph.WgGraph,
+    ns: *wgdf_eval.WgNoises,
+    aq: *mut wgdf_aquifer.Aquifer,
+    mask: u64,
+    cx: i32,
+    cz: i32,
+}
+
+struct Skip {
+    kind: u8,
+    floor: f64,
+    factors: u64,
+}
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+#[allow_fp]
+fn should_skip(sk: *Skip, run: *CvRun, xs: f64, ys: f64, zs: f64, y: i32) -> bool {
+    if (*sk).kind == SKIP_CAVE {
+        if ys <= (*sk).floor { return true }
+        return xs * xs + ys * ys + zs * zs >= 1.0
+    }
+    let k: i32 = y - (*(*run).def).min_y
+    let fp: *f32 = ((*sk).factors + (((k - 1) as u64) * 4)) as *f32
+    let f: f64 = (*fp) as f64
+    return (xs * xs + zs * zs) * f + ys * ys / 6.0 >= 1.0
+}
+
+fn carve_state(run: *CvRun, x: i32, y: i32, z: i32) -> u8 {
+    if y <= (*(*run).car).lava { return STATE_LAVA }
+    if (*run).aq == (0 as *mut wgdf_aquifer.Aquifer) {
+        let f: wgdf_fluid.Fluid = wgdf_fluid.fluid_global((*run).g, y)
+        return wgdf_fluid.fluid_at(&f, y)
+    }
+    return wgdf_aquifer.aquifer_substance((*run).g, (*run).ns, (*run).aq, x, y, z, 0.0)
+}
+
+fn dirt_fix(run: *CvRun, x: i32, y: i32, z: i32, fluid: bool) {
+    let c: *mut wgsr_ctx.SrCtx = (*run).c
+    let d: *wgcv_def.CvDef = (*run).def
+    let below: i32 = y - 1
+    if wgsr_ctx.ctx_get(c, below) as i32 != (*d).code_dirt { return }
+    wgsr_ctx.ctx_xz_begin(c)
+    var water: i32 = INT_MIN
+    if fluid { water = below + 1 }
+    wgsr_ctx.ctx_y_begin(c, 1, 1, water, below)
+    let r: i32 = wgsr_rules.rule_apply(c, (*(*c).def).root)
+    if r >= 0 { wgsr_ctx.ctx_set(c, below, r as u8) }
+}
+
+fn carve_block(run: *CvRun, y: i32, x: i32, z: i32, flag: *mut bool) -> bool {
+    let c: *mut wgsr_ctx.SrCtx = (*run).c
+    let d: *wgcv_def.CvDef = (*run).def
+    let code: u8 = wgsr_ctx.ctx_get(c, y)
+    if (*(*run).car).kind == wgcv_def.KIND_NETHER {
+        if !(*(*run).car).repl[code as usize] { return false }
+        if y <= (*d).min_y + 31 {
+            wgsr_ctx.ctx_set(c, y, STATE_LAVA)
+        } else {
+            wgsr_ctx.ctx_set(c, y, (*d).code_cave_air)
+        }
+        return true
+    }
+    if (code as i32) == (*d).code_grass || (code as i32) == (*d).code_mycelium { *flag = true }
+    if !(*(*run).car).repl[code as usize] { return false }
+    let st: u8 = carve_state(run, x, y, z)
+    if st == 0 { return false }
+    wgsr_ctx.ctx_set(c, y, st)
+    if *flag { dirt_fix(run, x, y, z, st == STATE_LAVA || st == wgdf_fluid.STATE_WATER) }
+    return true
+}
+
+#[allow_fp]
+fn carve_ellipsoid(run: *CvRun, x: f64, y: f64, z: f64, hr: f64, vr: f64, sk: *Skip) -> bool {
+    let c: *mut wgsr_ctx.SrCtx = (*run).c
+    let min_x: i32 = (*run).cx * 16
+    let min_z: i32 = (*run).cz * 16
+    let lim: f64 = 16.0 + hr * 2.0
+    if fabs(x - ((min_x + 8) as f64)) > lim || fabs(z - ((min_z + 8) as f64)) > lim { return false }
+    let miny: i32 = (*(*run).def).min_y
+    var x0: i32 = jnum.floor_i32(x - hr) - min_x - 1
+    if x0 < 0 { x0 = 0 }
+    var x1: i32 = jnum.floor_i32(x + hr) - min_x
+    if x1 > 15 { x1 = 15 }
+    var y0: i32 = jnum.floor_i32(y - vr) - 1
+    if y0 < miny + 1 { y0 = miny + 1 }
+    var y1: i32 = jnum.floor_i32(y + vr) + 1
+    let ytop: i32 = miny + (*(*run).def).height - 1 - TOP_CLEARANCE
+    if y1 > ytop { y1 = ytop }
+    var z0: i32 = jnum.floor_i32(z - hr) - min_z - 1
+    if z0 < 0 { z0 = 0 }
+    var z1: i32 = jnum.floor_i32(z + hr) - min_z
+    if z1 > 15 { z1 = 15 }
+    var any: bool = false
+    var lx: i32 = x0
+    while lx <= x1 {
+        let bx: i32 = min_x + lx
+        let xs: f64 = (((bx as f64) + 0.5) - x) / hr
+        var lz: i32 = z0
+        while lz <= z1 {
+            let bz: i32 = min_z + lz
+            let zs: f64 = (((bz as f64) + 0.5) - z) / hr
+            if !(xs * xs + zs * zs >= 1.0) {
+                wgsr_ctx.ctx_column(c, bx, bz)
+                var flag: bool = false
+                var by: i32 = y1
+                while by > y0 {
+                    let ys: f64 = (((by as f64) - 0.5) - y) / vr
+                    if !should_skip(sk, run, xs, ys, zs, by) {
+                        let mi: usize = ((by - miny) * 256 + lz * 16 + lx) as usize
+                        if rt.ld8((*run).mask, mi) == 0 {
+                            rt.st8((*run).mask, mi, 1 as u8)
+                            if carve_block(run, by, bx, bz, &flag) { any = true }
+                        }
+                    }
+                    by = by - 1
+                }
+            }
+            lz = lz + 1
+        }
+        lx = lx + 1
+    }
+    return any
+}
