@@ -1,0 +1,1946 @@
+// SPDX-License-Identifier: MPL-2.0
+// one PDF page: content-stream interpreter drawing into a canvas, and text extraction.
+import html.mem
+import rt.rt
+import docview.pdf.obj
+import docview.pdf.doc
+import docview.pdf.prast
+import docview.pdf.pfont
+import docview.pdf.pannot
+import paint.canvas
+import image.picture
+import font.ttf
+import font.raster
+
+export {
+    fonthold_new, fonthold_load,
+    page_render, page_text, page_size,
+}
+
+const GSMAX: usize = 32
+const MASKMAX: usize = 24
+const OPBUDGET: usize = 500000
+const TIME_LIMIT_US: u64 = 15000000
+const FORMDEPTH: usize = 8
+const SCRATCH: usize = 1 << 20
+const RASTER_CAP: usize = 1 << 22
+
+const CS_GRAY: u32 = 1
+const CS_RGB: u32 = 3
+const CS_CMYK: u32 = 4
+const CS_INDEXED: u32 = 5
+const CS_PATTERN: u32 = 6
+
+struct GS {
+    m: [f64; 6],
+    fill: u32,
+    stroke: u32,
+    fa: f64,
+    sa: f64,
+    lw: f64,
+    clip: i32,
+    fcs: u32,
+    scs: u32,
+    fpal: u32,
+    spal: u32,
+    fbase: u32,
+    sbase: u32,
+    fslot: i32,
+    fsize: f64,
+    tc: f64,
+    tw: f64,
+    th: f64,
+    tl: f64,
+    ts: f64,
+    tr: u32,
+}
+
+struct Run {
+    d: *mut doc.Doc,
+    cv: *mut canvas.Canvas,
+    fh: *mut pfont.FontHold,
+    pr: prast.PRast,
+    tmp: prast.PRast,
+    masks: [prast.Mask; 24],
+    nmask: usize,
+    gs: [GS; 32],
+    gsp: usize,
+    tm: [f64; 6],
+    tlm: [f64; 6],
+    intext: bool,
+    t0: u64,
+    stop: bool,
+    fonts: [pfont.PFont; 6],
+    fkey: [u64; 6],
+    nfont: usize,
+    ops: usize,
+    glyphs: usize,
+    paths: usize,
+    images: usize,
+    imgfail: usize,
+    fontmiss: usize,
+    txt: u64,
+    ras: raster.Raster,
+    scratch: *mut u8,
+    racc: *mut u8,
+    lastx: f64,
+    lasty: f64,
+    lasth: f64,
+}
+
+#[no_gc]
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn micros() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000 + (ts[1] as u64) / 1000
+}
+
+#[no_gc]
+fn mmul(a: *mut f64, b: *mut f64, o: *mut f64) {
+    let a0: f64 = *((a as u64) as *mut f64)
+    let a1: f64 = *((a as u64 + 8) as *mut f64)
+    let a2: f64 = *((a as u64 + 16) as *mut f64)
+    let a3: f64 = *((a as u64 + 24) as *mut f64)
+    let a4: f64 = *((a as u64 + 32) as *mut f64)
+    let a5: f64 = *((a as u64 + 40) as *mut f64)
+    let b0: f64 = *((b as u64) as *mut f64)
+    let b1: f64 = *((b as u64 + 8) as *mut f64)
+    let b2: f64 = *((b as u64 + 16) as *mut f64)
+    let b3: f64 = *((b as u64 + 24) as *mut f64)
+    let b4: f64 = *((b as u64 + 32) as *mut f64)
+    let b5: f64 = *((b as u64 + 40) as *mut f64)
+    *((o as u64) as *mut f64) = a0 * b0 + a1 * b2
+    *((o as u64 + 8) as *mut f64) = a0 * b1 + a1 * b3
+    *((o as u64 + 16) as *mut f64) = a2 * b0 + a3 * b2
+    *((o as u64 + 24) as *mut f64) = a2 * b1 + a3 * b3
+    *((o as u64 + 32) as *mut f64) = a4 * b0 + a5 * b2 + b4
+    *((o as u64 + 40) as *mut f64) = a4 * b1 + a5 * b3 + b5
+}
+
+#[no_gc]
+fn mapx(m: *mut f64, x: f64, y: f64) -> f64 {
+    return *((m as u64) as *mut f64) * x +
+    *((m as u64 + 16) as *mut f64) * y + *((m as u64 + 32) as *mut f64)
+}
+
+#[no_gc]
+fn mapy(m: *mut f64, x: f64, y: f64) -> f64 {
+    return *((m as u64 + 8) as *mut f64) * x +
+    *((m as u64 + 24) as *mut f64) * y + *((m as u64 + 40) as *mut f64)
+}
+
+#[no_gc]
+fn mscale(m: *mut f64) -> f64 {
+    let a: f64 = *((m as u64) as *mut f64)
+    let b: f64 = *((m as u64 + 8) as *mut f64)
+    let c: f64 = *((m as u64 + 16) as *mut f64)
+    let d: f64 = *((m as u64 + 24) as *mut f64)
+    let s1: f64 = sq(a * a + b * b)
+    let s2: f64 = sq(c * c + d * d)
+    return (s1 + s2) * 0.5
+}
+
+#[no_gc]
+fn sq(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var x: f64 = v
+    var i: usize = 0
+    while i < 20 {
+        x = 0.5 * (x + v / x)
+        i = i + 1
+    }
+    return x
+}
+
+#[no_gc]
+fn gs_new() -> GS {
+    return GS { m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        fill: 4278190080, stroke: 4278190080, fa: 1.0, sa: 1.0, lw: 1.0,
+        clip: -1, fcs: CS_GRAY, scs: CS_GRAY, fpal: 0, spal: 0,
+        fbase: 1, sbase: 1,
+        fslot: -1, fsize: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, ts: 0.0,
+        tr: 0 }
+}
+
+#[no_gc]
+fn cur(r: *mut Run) -> *mut GS {
+    return &(*r).gs[(*r).gsp]
+}
+
+#[no_gc]
+fn clipmask(r: *mut Run) -> *mut prast.Mask {
+    let k: i32 = (*cur(r)).clip
+    if k < 0 {
+        return &(*r).masks[MASKMAX - 1]
+    }
+    return &(*r).masks[k as usize]
+}
+
+#[no_gc]
+fn rgb(rr: f64, gg: f64, bb: f64) -> u32 {
+    var a: f64 = rr
+    var b: f64 = gg
+    var c: f64 = bb
+    if a < 0.0 {
+        a = 0.0
+    }
+    if a > 1.0 {
+        a = 1.0
+    }
+    if b < 0.0 {
+        b = 0.0
+    }
+    if b > 1.0 {
+        b = 1.0
+    }
+    if c < 0.0 {
+        c = 0.0
+    }
+    if c > 1.0 {
+        c = 1.0
+    }
+    return canvas.color_of(255, (a * 255.0 + 0.5) as u32,
+        (b * 255.0 + 0.5) as u32, (c * 255.0 + 0.5) as u32)
+}
+
+#[no_gc]
+fn cmyk(c: f64, m: f64, y: f64, k: f64) -> u32 {
+    return rgb((1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k),
+        (1.0 - y) * (1.0 - k))
+}
+
+fn page_size(d: *mut doc.Doc, pg: usize, zoom: f64, w: *mut usize,
+    h: *mut usize, box_: *mut f64) {
+    doc.doc_page_box(d, pg, true, box_)
+    let bw: f64 = *((box_ as u64 + 16) as *mut f64) -
+    *((box_ as u64) as *mut f64)
+    let bh: f64 = *((box_ as u64 + 24) as *mut f64) -
+    *((box_ as u64 + 8) as *mut f64)
+    var rot: i32 = doc.doc_page_rotate(d, pg) % 360
+    if rot < 0 {
+        rot = rot + 360
+    }
+    var pw: f64 = bw * zoom
+    var ph: f64 = bh * zoom
+    if rot == 90 || rot == 270 {
+        pw = bh * zoom
+        ph = bw * zoom
+    }
+    var ww: usize = (pw + 0.5) as usize
+    var hh: usize = (ph + 0.5) as usize
+    if ww < 1 {
+        ww = 1
+    }
+    if hh < 1 {
+        hh = 1
+    }
+    if ww > 20000 {
+        ww = 20000
+    }
+    if hh > 20000 {
+        hh = 20000
+    }
+    *w = ww
+    *h = hh
+}
+
+#[no_gc]
+fn base_matrix(box_: *mut f64, zoom: f64, rot: i32, w: usize, h: usize,
+    m: *mut f64) {
+    let x0: f64 = *((box_ as u64) as *mut f64)
+    let y0: f64 = *((box_ as u64 + 8) as *mut f64)
+    let x1: f64 = *((box_ as u64 + 16) as *mut f64)
+    let y1: f64 = *((box_ as u64 + 24) as *mut f64)
+    if rot == 90 {
+        *((m as u64) as *mut f64) = 0.0
+        *((m as u64 + 8) as *mut f64) = zoom
+        *((m as u64 + 16) as *mut f64) = zoom
+        *((m as u64 + 24) as *mut f64) = 0.0
+        *((m as u64 + 32) as *mut f64) = 0.0 - y0 * zoom
+        *((m as u64 + 40) as *mut f64) = 0.0 - x0 * zoom
+        return
+    }
+    if rot == 180 {
+        *((m as u64) as *mut f64) = 0.0 - zoom
+        *((m as u64 + 8) as *mut f64) = 0.0
+        *((m as u64 + 16) as *mut f64) = 0.0
+        *((m as u64 + 24) as *mut f64) = zoom
+        *((m as u64 + 32) as *mut f64) = x1 * zoom
+        *((m as u64 + 40) as *mut f64) = 0.0 - y0 * zoom
+        return
+    }
+    if rot == 270 {
+        *((m as u64) as *mut f64) = 0.0
+        *((m as u64 + 8) as *mut f64) = 0.0 - zoom
+        *((m as u64 + 16) as *mut f64) = 0.0 - zoom
+        *((m as u64 + 24) as *mut f64) = 0.0
+        *((m as u64 + 32) as *mut f64) = x1 * zoom
+        *((m as u64 + 40) as *mut f64) = y1 * zoom
+        return
+    }
+    *((m as u64) as *mut f64) = zoom
+    *((m as u64 + 8) as *mut f64) = 0.0
+    *((m as u64 + 16) as *mut f64) = 0.0
+    *((m as u64 + 24) as *mut f64) = 0.0 - zoom
+    *((m as u64 + 32) as *mut f64) = 0.0 - x0 * zoom
+    *((m as u64 + 40) as *mut f64) = y1 * zoom
+}
+
+fn page_content(d: *mut doc.Doc, pg: usize, out: *mut rt.Buf) -> bool {
+    let ph: u32 = doc.doc_page(d, pg)
+    if ph == 0 as u32 {
+        return false
+    }
+    var cn: [u8; 8] = "Contents"
+    let ar: *mut obj.Arena = &(*d).ar
+    let ch: u32 = doc.doc_dict_get(d, ph, (&cn[0]) as u64, 8)
+    if obj.o_kind(ar, ch) == obj.T_STREAM {
+        return doc.doc_stream(d, ch, out)
+    }
+    if obj.o_kind(ar, ch) == obj.T_ARR {
+        let n: usize = obj.o_arr_len(ar, ch)
+        var i: usize = 0
+        while i < n {
+            let s: u32 = doc.doc_resolve(d, obj.o_arr_at(ar, ch, i))
+            if obj.o_kind(ar, s) == obj.T_STREAM {
+                doc.doc_stream(d, s, out)
+                rt.buf_push(out, 10 as u8)
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
+}
+
+fn fonthold_new() -> pfont.FontHold {
+    return pfont.fonthold_new()
+}
+
+fn fonthold_load(fh: *mut pfont.FontHold) {
+    pfont.fonthold_load_mem(fh)
+}
+
+fn run_init(r: *mut Run, d: *mut doc.Doc, cv: *mut canvas.Canvas,
+    fh: *mut pfont.FontHold, w: usize, h: usize) -> bool {
+    (*r).d = d
+    (*r).cv = cv
+    (*r).fh = fh
+    (*r).gsp = 0
+    (*r).t0 = micros()
+    (*r).stop = false
+    (*r).gs[0] = gs_new()
+    (*r).nmask = 0
+    (*r).intext = false
+    (*r).ops = 0
+    (*r).glyphs = 0
+    (*r).paths = 0
+    (*r).images = 0
+    (*r).imgfail = 0
+    (*r).fontmiss = 0
+    (*r).nfont = 0
+    var q: usize = 0
+    while q < 6 {
+        (*r).fkey[q] = 0
+        q = q + 1
+    }
+    (*r).masks[MASKMAX - 1] = prast.Mask { p: 0 as *mut u8, w: w, h: h }
+    if !prast.pr_init(&(*r).pr, w, h) {
+        return false
+    }
+    if !prast.pr_init(&(*r).tmp, w, h) {
+        return false
+    }
+    (*r).scratch = mem.heap_alloc(SCRATCH)
+    (*r).racc = mem.heap_alloc(RASTER_CAP)
+    (*r).ras = raster.raster_new()
+    raster.raster_attach(&(*r).ras, (*r).racc, RASTER_CAP)
+    return (*r).scratch as usize != 0 && (*r).racc as usize != 0
+}
+
+fn run_free(r: *mut Run) {
+    prast.pr_free(&(*r).pr)
+    prast.pr_free(&(*r).tmp)
+    var i: usize = 0
+    while i < (*r).nmask {
+        prast.mask_free(&(*r).masks[i])
+        i = i + 1
+    }
+    mem.heap_free((*r).scratch, SCRATCH)
+    mem.heap_free((*r).racc, RASTER_CAP)
+}
+
+fn cs_kind(d: *mut doc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
+    let ar: *mut obj.Arena = &(*d).ar
+    *pal = 0
+    *base = 1
+    var g1: [u8; 10] = "DeviceGray"
+    var g2: [u8; 1] = "G"
+    var r1: [u8; 9] = "DeviceRGB"
+    var r2: [u8; 3] = "RGB"
+    var c1: [u8; 10] = "DeviceCMYK"
+    var c2: [u8; 4] = "CMYK"
+    var i1: [u8; 7] = "Indexed"
+    var i2: [u8; 1] = "I"
+    var p1: [u8; 7] = "Pattern"
+    var cg: [u8; 7] = "CalGray"
+    var cr: [u8; 6] = "CalRGB"
+    var lb: [u8; 3] = "Lab"
+    var ic: [u8; 8] = "ICCBased"
+    var sp: [u8; 10] = "Separation"
+    var dn: [u8; 7] = "DeviceN"
+    if obj.o_kind(ar, h) == obj.T_NAME {
+        if obj.o_name_eq(ar, h, (&g1[0]) as u64, 10) ||
+        obj.o_name_eq(ar, h, (&g2[0]) as u64, 1) ||
+        obj.o_name_eq(ar, h, (&cg[0]) as u64, 7) {
+            return CS_GRAY
+        }
+        if obj.o_name_eq(ar, h, (&r1[0]) as u64, 9) ||
+        obj.o_name_eq(ar, h, (&r2[0]) as u64, 3) ||
+        obj.o_name_eq(ar, h, (&cr[0]) as u64, 6) {
+            return CS_RGB
+        }
+        if obj.o_name_eq(ar, h, (&c1[0]) as u64, 10) ||
+        obj.o_name_eq(ar, h, (&c2[0]) as u64, 4) {
+            return CS_CMYK
+        }
+        if obj.o_name_eq(ar, h, (&p1[0]) as u64, 7) {
+            return CS_PATTERN
+        }
+        return CS_GRAY
+    }
+    if obj.o_kind(ar, h) == obj.T_ARR && obj.o_arr_len(ar, h) > 0 {
+        let f: u32 = doc.doc_resolve(d, obj.o_arr_at(ar, h, 0))
+        if obj.o_name_eq(ar, f, (&i1[0]) as u64, 7) ||
+        obj.o_name_eq(ar, f, (&i2[0]) as u64, 1) {
+            if obj.o_arr_len(ar, h) >= 4 {
+                var bp: u32 = 0
+                var bb: u32 = 0
+                let bk: u32 = cs_kind(d,
+                    doc.doc_resolve(d, obj.o_arr_at(ar, h, 1)), &bp, &bb)
+                *base = bk
+                *pal = doc.doc_resolve(d, obj.o_arr_at(ar, h, 3))
+            }
+            return CS_INDEXED
+        }
+        if obj.o_name_eq(ar, f, (&ic[0]) as u64, 8) {
+            var nn: [u8; 1] = "N"
+            var comps: i64 = 3
+            if obj.o_arr_len(ar, h) >= 2 {
+                let s: u32 = doc.doc_resolve(d, obj.o_arr_at(ar, h, 1))
+                comps = doc.doc_int(d, s, (&nn[0]) as u64, 1, 3)
+            }
+            if comps == 1 {
+                return CS_GRAY
+            }
+            if comps == 4 {
+                return CS_CMYK
+            }
+            return CS_RGB
+        }
+        if obj.o_name_eq(ar, f, (&lb[0]) as u64, 3) {
+            return CS_RGB
+        }
+        if obj.o_name_eq(ar, f, (&sp[0]) as u64, 10) {
+            return CS_GRAY
+        }
+        if obj.o_name_eq(ar, f, (&dn[0]) as u64, 7) {
+            return CS_GRAY
+        }
+        if obj.o_name_eq(ar, f, (&p1[0]) as u64, 7) {
+            return CS_PATTERN
+        }
+        if obj.o_name_eq(ar, f, (&cg[0]) as u64, 7) {
+            return CS_GRAY
+        }
+        if obj.o_name_eq(ar, f, (&cr[0]) as u64, 6) {
+            return CS_RGB
+        }
+    }
+    return CS_GRAY
+}
+
+fn colour_of(d: *mut doc.Doc, kind: u32, pal: u32, base: u32,
+    v: *mut f64, n: usize) -> u32 {
+    if kind == CS_INDEXED {
+        if n < 1 {
+            return canvas.color_of(255, 0, 0, 0)
+        }
+        return indexed_colour(d, pal, base,
+            (*((v as u64) as *mut f64)) as i64)
+    }
+    if kind == CS_PATTERN {
+        return canvas.color_of(255, 128, 128, 128)
+    }
+    if n >= 4 && kind == CS_CMYK {
+        return cmyk(*((v as u64) as *mut f64),
+            *((v as u64 + 8) as *mut f64),
+            *((v as u64 + 16) as *mut f64),
+            *((v as u64 + 24) as *mut f64))
+    }
+    if n >= 3 {
+        return rgb(*((v as u64) as *mut f64),
+            *((v as u64 + 8) as *mut f64),
+            *((v as u64 + 16) as *mut f64))
+    }
+    if n >= 1 {
+        if kind == CS_GRAY {
+            let g: f64 = *((v as u64) as *mut f64)
+            return rgb(g, g, g)
+        }
+        let t: f64 = *((v as u64) as *mut f64)
+        return rgb(1.0 - t, 1.0 - t, 1.0 - t)
+    }
+    return canvas.color_of(255, 0, 0, 0)
+}
+
+fn indexed_colour(d: *mut doc.Doc, pal: u32, base: u32, idx: i64) -> u32 {
+    let ar: *mut obj.Arena = &(*d).ar
+    var comps: usize = 3
+    if base == CS_GRAY {
+        comps = 1
+    } else if base == CS_CMYK {
+        comps = 4
+    }
+    var p: u64 = 0
+    var n: usize = 0
+    var tmpb: rt.Buf = rt.buf_new()
+    if obj.o_kind(ar, pal) == obj.T_STR {
+        p = obj.o_str_ptr(ar, pal)
+        n = obj.o_str_len(ar, pal)
+    } else if obj.o_kind(ar, pal) == obj.T_STREAM {
+        doc.doc_stream(d, pal, &tmpb)
+        p = rt.buf_ptr(&tmpb)
+        n = rt.buf_len(&tmpb)
+    }
+    var out: u32 = canvas.color_of(255, 0, 0, 0)
+    let at: usize = (idx as usize) * comps
+    if idx >= 0 && at + comps <= n {
+        if comps == 1 {
+            let g: f64 = (ld8(p, at) as f64) / 255.0
+            out = rgb(g, g, g)
+        } else if comps == 4 {
+            out = cmyk((ld8(p, at) as f64) / 255.0,
+                (ld8(p, at + 1) as f64) / 255.0,
+                (ld8(p, at + 2) as f64) / 255.0,
+                (ld8(p, at + 3) as f64) / 255.0)
+        } else {
+            out = rgb((ld8(p, at) as f64) / 255.0,
+                (ld8(p, at + 1) as f64) / 255.0,
+                (ld8(p, at + 2) as f64) / 255.0)
+        }
+    }
+    rt.buf_free(&tmpb)
+    return out
+}
+
+fn exec_stream(r: *mut Run, p: u64, n: usize, res: u32, depth: usize) {
+    if depth > FORMDEPTH {
+        return
+    }
+    var ar: obj.Arena = obj.arena_new()
+    if !obj.arena_init(&ar) {
+        return
+    }
+    var lx: obj.Lex = obj.lex_new(p, n)
+    var st: [u32; 64] = [0 as u32; 64]
+    var ns: usize = 0
+    var guard: usize = 0
+    while !obj.lex_end(&lx) && (*r).ops < OPBUDGET && guard < 40000000 &&
+    !(*r).stop {
+        guard = guard + 1
+        if ((*r).ops & 63) == 0 && (*r).ops > 0 {
+            if micros() - (*r).t0 > TIME_LIMIT_US {
+                (*r).stop = true
+            }
+        }
+        let before: usize = obj.lex_at(&lx)
+        let h: u32 = obj.parse_obj(&ar, &lx, 0)
+        if obj.lex_at(&lx) == before {
+            obj.lex_set(&lx, before + 1)
+            continue
+        }
+        if obj.arena_over(&ar) {
+            break
+        }
+        if obj.o_kind(&ar, h) != obj.T_OP {
+            if ns < 64 {
+                st[ns] = h
+                ns = ns + 1
+            }
+            continue
+        }
+        (*r).ops = (*r).ops + 1
+        do_op(r, &ar, h, (&st[0]) as *mut u32, ns, res, depth, &lx)
+        ns = 0
+        if obj.arena_count(&ar) > 200000 {
+            obj.arena_reset(&ar)
+            ns = 0
+        }
+    }
+    obj.arena_free(&ar)
+}
+
+#[no_gc]
+fn argf(ar: *mut obj.Arena, st: *mut u32, ns: usize, i: usize) -> f64 {
+    if i >= ns {
+        return 0.0
+    }
+    return obj.o_num(ar, *((st as u64 + (i * 4) as u64) as *mut u32))
+}
+
+#[no_gc]
+fn back(ns: usize, k: usize) -> usize {
+    if ns < k {
+        return 999
+    }
+    return ns - k
+}
+
+#[no_gc]
+fn argh(st: *mut u32, ns: usize, i: usize) -> u32 {
+    if i >= ns {
+        return 0
+    }
+    return *((st as u64 + (i * 4) as u64) as *mut u32)
+}
+
+#[no_gc]
+fn op_is(ar: *mut obj.Arena, h: u32, lit: u64, n: usize) -> bool {
+    return obj.o_name_eq(ar, h, lit, n)
+}
+
+fn do_op(r: *mut Run, ar: *mut obj.Arena, h: u32, st: *mut u32, ns: usize,
+    res: u32, depth: usize, lx: *mut obj.Lex) {
+    let op: u64 = obj.o_str_ptr(ar, h)
+    let on: usize = obj.o_str_len(ar, h)
+    if on == 0 || on > 3 {
+        return
+    }
+    let c0: u8 = ld8(op, 0)
+    var c1: u8 = 0
+    if on > 1 {
+        c1 = ld8(op, 1)
+    }
+    let g: *mut GS = cur(r)
+    if on == 1 && c0 == 113 as u8 {
+        if (*r).gsp + 1 < GSMAX {
+            (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+            (*r).gsp = (*r).gsp + 1
+        }
+        return
+    }
+    if on == 1 && c0 == 81 as u8 {
+        if (*r).gsp > 0 {
+            (*r).gsp = (*r).gsp - 1
+        }
+        return
+    }
+    if on == 2 && c0 == 99 as u8 && c1 == 109 as u8 {
+        if ns >= 6 {
+            var m: [f64; 6] = [0.0; 6]
+            var i: usize = 0
+            while i < 6 {
+                m[i] = argf(ar, st, ns, back(ns, 6) + i)
+                i = i + 1
+            }
+            var o: [f64; 6] = [0.0; 6]
+            mmul((&m[0]) as *mut f64, (&(*g).m[0]) as *mut f64,
+                (&o[0]) as *mut f64)
+            i = 0
+            while i < 6 {
+                (*g).m[i] = o[i]
+                i = i + 1
+            }
+        }
+        return
+    }
+    if on == 1 && c0 == 119 as u8 {
+        (*g).lw = argf(ar, st, ns, 0)
+        return
+    }
+    if on == 2 && c0 == 103 as u8 && c1 == 115 as u8 {
+        apply_extgstate(r, ar, argh(st, ns, 0), res)
+        return
+    }
+    if on == 1 && c0 == 109 as u8 {
+        let x: f64 = argf(ar, st, ns, 0)
+        let y: f64 = argf(ar, st, ns, 1)
+        prast.pr_move(&(*r).pr, mapx((&(*g).m[0]) as *mut f64, x, y),
+            mapy((&(*g).m[0]) as *mut f64, x, y))
+        (*r).lastx = x
+        (*r).lasty = y
+        return
+    }
+    if on == 1 && c0 == 108 as u8 {
+        let x: f64 = argf(ar, st, ns, 0)
+        let y: f64 = argf(ar, st, ns, 1)
+        prast.pr_line(&(*r).pr, mapx((&(*g).m[0]) as *mut f64, x, y),
+            mapy((&(*g).m[0]) as *mut f64, x, y))
+        (*r).lastx = x
+        (*r).lasty = y
+        return
+    }
+    if on == 1 && (c0 == 99 as u8 || c0 == 118 as u8 || c0 == 121 as u8) {
+        var x1: f64 = 0.0
+        var y1: f64 = 0.0
+        var x2: f64 = 0.0
+        var y2: f64 = 0.0
+        var x3: f64 = 0.0
+        var y3: f64 = 0.0
+        if c0 == 99 as u8 {
+            x1 = argf(ar, st, ns, 0)
+            y1 = argf(ar, st, ns, 1)
+            x2 = argf(ar, st, ns, 2)
+            y2 = argf(ar, st, ns, 3)
+            x3 = argf(ar, st, ns, 4)
+            y3 = argf(ar, st, ns, 5)
+        } else if c0 == 118 as u8 {
+            x1 = (*r).lastx
+            y1 = (*r).lasty
+            x2 = argf(ar, st, ns, 0)
+            y2 = argf(ar, st, ns, 1)
+            x3 = argf(ar, st, ns, 2)
+            y3 = argf(ar, st, ns, 3)
+        } else {
+            x1 = argf(ar, st, ns, 0)
+            y1 = argf(ar, st, ns, 1)
+            x3 = argf(ar, st, ns, 2)
+            y3 = argf(ar, st, ns, 3)
+            x2 = x3
+            y2 = y3
+        }
+        prast.pr_cubic(&(*r).pr,
+            mapx((&(*g).m[0]) as *mut f64, x1, y1),
+            mapy((&(*g).m[0]) as *mut f64, x1, y1),
+            mapx((&(*g).m[0]) as *mut f64, x2, y2),
+            mapy((&(*g).m[0]) as *mut f64, x2, y2),
+            mapx((&(*g).m[0]) as *mut f64, x3, y3),
+            mapy((&(*g).m[0]) as *mut f64, x3, y3))
+        (*r).lastx = x3
+        (*r).lasty = y3
+        return
+    }
+    if on == 1 && c0 == 104 as u8 {
+        prast.pr_close(&(*r).pr)
+        return
+    }
+    if on == 2 && c0 == 114 as u8 && c1 == 101 as u8 {
+        let x: f64 = argf(ar, st, ns, back(ns, 4))
+        let y: f64 = argf(ar, st, ns, back(ns, 3))
+        let w: f64 = argf(ar, st, ns, back(ns, 2))
+        let hh: f64 = argf(ar, st, ns, back(ns, 1))
+        if ns >= 4 {
+            let mm: *mut f64 = (&(*g).m[0]) as *mut f64
+            prast.pr_move(&(*r).pr, mapx(mm, x, y), mapy(mm, x, y))
+            prast.pr_line(&(*r).pr, mapx(mm, x + w, y), mapy(mm, x + w, y))
+            prast.pr_line(&(*r).pr, mapx(mm, x + w, y + hh),
+                mapy(mm, x + w, y + hh))
+            prast.pr_line(&(*r).pr, mapx(mm, x, y + hh),
+                mapy(mm, x, y + hh))
+            prast.pr_close(&(*r).pr)
+            (*r).lastx = x
+            (*r).lasty = y
+        }
+        return
+    }
+    if on == 1 && c0 == 87 as u8 {
+        (*r).lasth = 0.0
+        pend_clip(r, prast.RULE_NZ)
+        return
+    }
+    if on == 2 && c0 == 87 as u8 && c1 == 42 as u8 {
+        pend_clip(r, prast.RULE_EO)
+        return
+    }
+    if on == 1 && (c0 == 110 as u8 || c0 == 102 as u8 || c0 == 70 as u8 ||
+    c0 == 83 as u8 || c0 == 115 as u8 || c0 == 66 as u8 || c0 == 98 as u8) {
+        paint_path(r, c0, false)
+        return
+    }
+    if on == 2 && c1 == 42 as u8 && (c0 == 102 as u8 || c0 == 66 as u8 ||
+    c0 == 98 as u8) {
+        paint_path(r, c0, true)
+        return
+    }
+    if on == 1 && (c0 == 103 as u8 || c0 == 71 as u8) {
+        let v: f64 = argf(ar, st, ns, 0)
+        if c0 == 103 as u8 {
+            (*g).fcs = CS_GRAY
+            (*g).fill = rgb(v, v, v)
+        } else {
+            (*g).scs = CS_GRAY
+            (*g).stroke = rgb(v, v, v)
+        }
+        return
+    }
+    if on == 2 && (c0 == 114 as u8 || c0 == 82 as u8) &&
+    (c1 == 103 as u8 || c1 == 71 as u8) {
+        let col: u32 = rgb(argf(ar, st, ns, 0), argf(ar, st, ns, 1),
+            argf(ar, st, ns, 2))
+        if c0 == 114 as u8 {
+            (*g).fcs = CS_RGB
+            (*g).fill = col
+        } else {
+            (*g).scs = CS_RGB
+            (*g).stroke = col
+        }
+        return
+    }
+    if on == 1 && (c0 == 107 as u8 || c0 == 75 as u8) {
+        let col: u32 = cmyk(argf(ar, st, ns, 0), argf(ar, st, ns, 1),
+            argf(ar, st, ns, 2), argf(ar, st, ns, 3))
+        if c0 == 107 as u8 {
+            (*g).fcs = CS_CMYK
+            (*g).fill = col
+        } else {
+            (*g).scs = CS_CMYK
+            (*g).stroke = col
+        }
+        return
+    }
+    if on == 2 && (c0 == 99 as u8 || c0 == 67 as u8) && c1 == 115 as u8 {
+        let nm: u32 = argh(st, ns, back(ns, 1))
+        var csh: u32 = resolve_cs(r, nm, res)
+        var pal: u32 = 0
+        var base: u32 = 1
+        let k: u32 = cs_kind((*r).d, csh, &pal, &base)
+        if c0 == 99 as u8 {
+            (*g).fcs = k
+            (*g).fpal = pal
+            (*g).fbase = base
+            (*g).fill = default_colour(k)
+        } else {
+            (*g).scs = k
+            (*g).spal = pal
+            (*g).sbase = base
+            (*g).stroke = default_colour(k)
+        }
+        return
+    }
+    if (on == 2 || on == 3) && (c0 == 115 as u8 || c0 == 83 as u8) &&
+    c1 == 99 as u8 {
+        var v: [f64; 8] = [0.0; 8]
+        var cnt: usize = 0
+        var i: usize = 0
+        while i < ns && cnt < 8 {
+            let hh: u32 = argh(st, ns, i)
+            if obj.o_kind(ar, hh) == obj.T_INT ||
+            obj.o_kind(ar, hh) == obj.T_REAL {
+                v[cnt] = obj.o_num(ar, hh)
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        if c0 == 115 as u8 {
+            (*g).fill = colour_of((*r).d, (*g).fcs, (*g).fpal, (*g).fbase,
+                (&v[0]) as *mut f64, cnt)
+        } else {
+            (*g).stroke = colour_of((*r).d, (*g).scs, (*g).spal, (*g).sbase,
+                (&v[0]) as *mut f64, cnt)
+        }
+        return
+    }
+    if on == 2 && c0 == 66 as u8 && c1 == 84 as u8 {
+        (*r).intext = true
+        ident((&(*r).tm[0]) as *mut f64)
+        ident((&(*r).tlm[0]) as *mut f64)
+        return
+    }
+    if on == 2 && c0 == 69 as u8 && c1 == 84 as u8 {
+        (*r).intext = false
+        return
+    }
+    if on == 2 && c0 == 84 as u8 {
+        do_text_op(r, ar, c1, st, ns, res)
+        return
+    }
+    if on == 1 && (c0 == 39 as u8 || c0 == 34 as u8) {
+        if c0 == 34 as u8 && ns >= 3 {
+            (*g).tw = argf(ar, st, ns, 0)
+            (*g).tc = argf(ar, st, ns, 1)
+        }
+        nl_mark(r)
+        next_line(r, 0.0, 0.0 - (*g).tl)
+        let s: u32 = argh(st, ns, back(ns, 1))
+        if obj.o_kind(ar, s) == obj.T_STR {
+            show_string(r, ar, s, res)
+        }
+        return
+    }
+    if on == 2 && c0 == 68 as u8 && c1 == 111 as u8 {
+        do_xobject(r, ar, argh(st, ns, back(ns, 1)), res, depth)
+        return
+    }
+    if on == 2 && c0 == 66 as u8 && c1 == 73 as u8 {
+        skip_inline_image(r, lx)
+        return
+    }
+}
+
+#[no_gc]
+fn default_colour(k: u32) -> u32 {
+    if k == CS_PATTERN {
+        return canvas.color_of(255, 128, 128, 128)
+    }
+    return canvas.color_of(255, 0, 0, 0)
+}
+
+fn resolve_cs(r: *mut Run, nm: u32, res: u32) -> u32 {
+    let d: *mut doc.Doc = (*r).d
+    let ar: *mut obj.Arena = &(*d).ar
+    var csn: [u8; 10] = "ColorSpace"
+    let csd: u32 = doc.doc_dict_get(d, res, (&csn[0]) as u64, 10)
+    if obj.o_kind(ar, csd) == obj.T_DICT &&
+    obj.o_kind(ar, nm) == obj.T_NAME {
+        let e: u32 = doc.doc_dict_get(d, csd, obj.o_str_ptr(ar, nm),
+            obj.o_str_len(ar, nm))
+        if e != 0 as u32 {
+            return e
+        }
+    }
+    return nm
+}
+
+fn apply_extgstate(r: *mut Run, ar: *mut obj.Arena, nm: u32, res: u32) {
+    let d: *mut doc.Doc = (*r).d
+    var en: [u8; 9] = "ExtGState"
+    let ed: u32 = doc.doc_dict_get(d, res, (&en[0]) as u64, 9)
+    if obj.o_kind(&(*d).ar, ed) != obj.T_DICT ||
+    obj.o_kind(ar, nm) != obj.T_NAME {
+        return
+    }
+    let e: u32 = doc.doc_dict_get(d, ed, obj.o_str_ptr(ar, nm),
+        obj.o_str_len(ar, nm))
+    if obj.o_kind(&(*d).ar, e) != obj.T_DICT {
+        return
+    }
+    let g: *mut GS = cur(r)
+    var can: [u8; 2] = "ca"
+    var cAn: [u8; 2] = "CA"
+    var lwn: [u8; 2] = "LW"
+    (*g).fa = doc.doc_num(d, e, (&can[0]) as u64, 2, (*g).fa)
+    (*g).sa = doc.doc_num(d, e, (&cAn[0]) as u64, 2, (*g).sa)
+    (*g).lw = doc.doc_num(d, e, (&lwn[0]) as u64, 2, (*g).lw)
+}
+
+#[no_gc]
+fn pend_clip(r: *mut Run, rule: u32) {
+    (*r).lasth = 1.0
+    if rule == prast.RULE_EO {
+        (*r).lasth = 2.0
+    }
+}
+
+fn paint_path(r: *mut Run, kind: u8, eo: bool) {
+    let g: *mut GS = cur(r)
+    var rule: u32 = prast.RULE_NZ
+    if eo {
+        rule = prast.RULE_EO
+    }
+    if kind == 98 as u8 || kind == 115 as u8 {
+        prast.pr_close(&(*r).pr)
+    }
+    if kind == 102 as u8 || kind == 70 as u8 || kind == 66 as u8 ||
+    kind == 98 as u8 {
+        prast.pr_fill(&(*r).pr, (*r).cv, (*g).fill, (*g).fa, rule,
+            clipmask(r))
+        (*r).paths = (*r).paths + 1
+    }
+    if kind == 83 as u8 || kind == 115 as u8 || kind == 66 as u8 ||
+    kind == 98 as u8 {
+        let lw: f64 = (*g).lw * mscale((&(*g).m[0]) as *mut f64)
+        prast.pr_stroke(&(*r).pr, (*r).cv, (*g).stroke, (*g).sa, lw,
+            clipmask(r), &(*r).tmp)
+        (*r).paths = (*r).paths + 1
+    }
+    if (*r).lasth > 0.5 {
+        var crule: u32 = prast.RULE_NZ
+        if (*r).lasth > 1.5 {
+            crule = prast.RULE_EO
+        }
+        if (*r).nmask < MASKMAX - 1 {
+            let k: usize = (*r).nmask
+            (*r).masks[k] = prast.mask_new((*r).pr.w, (*r).pr.h, 0 as u8)
+            prast.pr_fill_mask(&(*r).pr, &(*r).masks[k], clipmask(r), crule)
+            (*r).nmask = k + 1
+            (*g).clip = k as i32
+        }
+        (*r).lasth = 0.0
+    }
+    prast.pr_reset(&(*r).pr)
+}
+
+#[no_gc]
+fn ident(m: *mut f64) {
+    *((m as u64) as *mut f64) = 1.0
+    *((m as u64 + 8) as *mut f64) = 0.0
+    *((m as u64 + 16) as *mut f64) = 0.0
+    *((m as u64 + 24) as *mut f64) = 1.0
+    *((m as u64 + 32) as *mut f64) = 0.0
+    *((m as u64 + 40) as *mut f64) = 0.0
+}
+
+fn nl_mark(r: *mut Run) {
+    if (*r).txt != 0 {
+        mem.buf_push((*r).txt as *mut mem.Buf, 10 as u8)
+    }
+}
+
+#[no_gc]
+fn next_line(r: *mut Run, tx: f64, ty: f64) {
+    var t: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    t[4] = tx
+    t[5] = ty
+    var o: [f64; 6] = [0.0; 6]
+    mmul((&t[0]) as *mut f64, (&(*r).tlm[0]) as *mut f64,
+        (&o[0]) as *mut f64)
+    var i: usize = 0
+    while i < 6 {
+        (*r).tlm[i] = o[i]
+        (*r).tm[i] = o[i]
+        i = i + 1
+    }
+}
+
+fn do_text_op(r: *mut Run, ar: *mut obj.Arena, c1: u8, st: *mut u32,
+    ns: usize, res: u32) {
+    let g: *mut GS = cur(r)
+    if c1 == 102 as u8 {
+        (*g).fsize = argf(ar, st, ns, back(ns, 1))
+        (*g).fslot = font_slot(r, ar, argh(st, ns, back(ns, 2)), res)
+        return
+    }
+    if c1 == 100 as u8 {
+        nl_mark(r)
+        next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        return
+    }
+    if c1 == 68 as u8 {
+        (*g).tl = 0.0 - argf(ar, st, ns, 1)
+        nl_mark(r)
+        next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        return
+    }
+    if c1 == 109 as u8 {
+        if ns >= 6 {
+            nl_mark(r)
+            var i: usize = 0
+            while i < 6 {
+                (*r).tm[i] = argf(ar, st, ns, back(ns, 6) + i)
+                (*r).tlm[i] = (*r).tm[i]
+                i = i + 1
+            }
+        }
+        return
+    }
+    if c1 == 42 as u8 {
+        nl_mark(r)
+        next_line(r, 0.0, 0.0 - (*g).tl)
+        return
+    }
+    if c1 == 76 as u8 {
+        (*g).tl = argf(ar, st, ns, 0)
+        return
+    }
+    if c1 == 99 as u8 {
+        (*g).tc = argf(ar, st, ns, 0)
+        return
+    }
+    if c1 == 119 as u8 {
+        (*g).tw = argf(ar, st, ns, 0)
+        return
+    }
+    if c1 == 122 as u8 {
+        (*g).th = argf(ar, st, ns, 0) / 100.0
+        return
+    }
+    if c1 == 115 as u8 {
+        (*g).ts = argf(ar, st, ns, 0)
+        return
+    }
+    if c1 == 114 as u8 {
+        (*g).tr = argf(ar, st, ns, 0) as u32
+        return
+    }
+    if c1 == 106 as u8 {
+        let s: u32 = argh(st, ns, back(ns, 1))
+        if obj.o_kind(ar, s) == obj.T_STR {
+            show_string(r, ar, s, res)
+        }
+        return
+    }
+    if c1 == 74 as u8 {
+        let a: u32 = argh(st, ns, back(ns, 1))
+        if obj.o_kind(ar, a) != obj.T_ARR {
+            return
+        }
+        let n: usize = obj.o_arr_len(ar, a)
+        var i: usize = 0
+        while i < n {
+            let it: u32 = obj.o_arr_at(ar, a, i)
+            if obj.o_kind(ar, it) == obj.T_STR {
+                show_string(r, ar, it, res)
+            } else if obj.o_is_num(ar, it) {
+                let raw: f64 = obj.o_num(ar, it)
+                let adj: f64 = 0.0 - raw / 1000.0 * (*g).fsize * (*g).th
+                if (*r).txt != 0 && raw <= 0.0 - 180.0 {
+                    mem.buf_push((*r).txt as *mut mem.Buf, 32 as u8)
+                }
+                advance(r, adj)
+            }
+            i = i + 1
+        }
+        return
+    }
+}
+
+#[no_gc]
+fn advance(r: *mut Run, tx: f64) {
+    var t: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    t[4] = tx
+    var o: [f64; 6] = [0.0; 6]
+    mmul((&t[0]) as *mut f64, (&(*r).tm[0]) as *mut f64, (&o[0]) as *mut f64)
+    var i: usize = 0
+    while i < 6 {
+        (*r).tm[i] = o[i]
+        i = i + 1
+    }
+}
+
+fn font_slot(r: *mut Run, ar: *mut obj.Arena, nm: u32, res: u32) -> i32 {
+    if obj.o_kind(ar, nm) != obj.T_NAME {
+        return -1
+    }
+    let np: u64 = obj.o_str_ptr(ar, nm)
+    let nl: usize = obj.o_str_len(ar, nm)
+    var key: u64 = 1469598103934665603
+    var i: usize = 0
+    while i < nl {
+        key = (key ^ (ld8(np, i) as u64)) *% 1099511628211
+        i = i + 1
+    }
+    key = key ^ (res as u64)
+    if key == 0 {
+        key = 1
+    }
+    var k: usize = 0
+    while k < (*r).nfont {
+        if (*r).fkey[k] == key {
+            return k as i32
+        }
+        k = k + 1
+    }
+    if (*r).nfont >= 6 {
+        (*r).nfont = 0
+    }
+    let slot: usize = (*r).nfont
+    let d: *mut doc.Doc = (*r).d
+    var fn1: [u8; 4] = "Font"
+    let fd: u32 = doc.doc_dict_get(d, res, (&fn1[0]) as u64, 4)
+    var dict: u32 = 0
+    if obj.o_kind(&(*d).ar, fd) == obj.T_DICT {
+        dict = doc.doc_dict_get(d, fd, np, nl)
+    }
+    pfont.pfont_load(d, dict, &(*r).fonts[slot])
+    (*r).fkey[slot] = key
+    (*r).nfont = slot + 1
+    return slot as i32
+}
+
+fn show_string(r: *mut Run, ar: *mut obj.Arena, s: u32, res: u32) {
+    let g: *mut GS = cur(r)
+    let d: *mut doc.Doc = (*r).d
+    if (*g).fslot < 0 {
+        return
+    }
+    let pf: *mut pfont.PFont = &(*r).fonts[(*g).fslot as usize]
+    let p: u64 = obj.o_str_ptr(ar, s)
+    let n: usize = obj.o_str_len(ar, s)
+    let step: usize = pfont.pf_bytes(pf)
+    var i: usize = 0
+    while i + step <= n {
+        var code: u32 = ld8(p, i) as u32
+        if step == 2 {
+            code = (code << 8) | (ld8(p, i + 1) as u32)
+        }
+        let w0: f64 = pfont.pf_width(d, pf, code) / 1000.0
+        if (*r).txt != 0 {
+            emit_text(r, pf, code)
+        } else if (*g).tr != 3 as u32 && (*g).tr != 7 as u32 {
+            draw_glyph(r, pf, code)
+        }
+        var adv: f64 = w0 * (*g).fsize + (*g).tc
+        if pfont.pf_is_space(pf, code) {
+            adv = adv + (*g).tw
+        }
+        advance(r, adv * (*g).th)
+        i = i + step
+    }
+}
+
+fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
+    let b: *mut mem.Buf = (*r).txt as *mut mem.Buf
+    var u: u32 = pfont.pf_unicode(pf, code)
+    if u == 0 as u32 {
+        u = 65533
+    }
+    if u < 128 as u32 {
+        mem.buf_push(b, u as u8)
+    } else if u < 2048 as u32 {
+        mem.buf_push(b, (192 + (u >> 6)) as u8)
+        mem.buf_push(b, (128 + (u & 63 as u32)) as u8)
+    } else if u < 65536 as u32 {
+        mem.buf_push(b, (224 + (u >> 12)) as u8)
+        mem.buf_push(b, (128 + ((u >> 6) & 63 as u32)) as u8)
+        mem.buf_push(b, (128 + (u & 63 as u32)) as u8)
+    } else {
+        mem.buf_push(b, (240 + (u >> 18)) as u8)
+        mem.buf_push(b, (128 + ((u >> 12) & 63 as u32)) as u8)
+        mem.buf_push(b, (128 + ((u >> 6) & 63 as u32)) as u8)
+        mem.buf_push(b, (128 + (u & 63 as u32)) as u8)
+    }
+}
+
+fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
+    let g: *mut GS = cur(r)
+    if (*g).fsize == 0.0 {
+        return
+    }
+    let f: *mut ttf.Font = pfont.fonthold_face((*r).fh, pfont.pf_face(pf))
+    if !ttf.font_ok(f) {
+        return
+    }
+    let gid: u32 = pfont.pf_glyph((*r).fh, pf, code)
+    if gid == 0 as u32 {
+        return
+    }
+    let upem: f64 = ttf.font_upem(f) as f64
+    if upem <= 0.0 {
+        return
+    }
+    var ts: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ts[0] = (*g).fsize * (*g).th / upem
+    ts[3] = (*g).fsize / upem
+    ts[5] = (*g).ts
+    var a: [f64; 6] = [0.0; 6]
+    mmul((&ts[0]) as *mut f64, (&(*r).tm[0]) as *mut f64,
+        (&a[0]) as *mut f64)
+    var m: [f64; 6] = [0.0; 6]
+    mmul((&a[0]) as *mut f64, (&(*g).m[0]) as *mut f64, (&m[0]) as *mut f64)
+    var gx0: i32 = 0
+    var gy0: i32 = 0
+    var gx1: i32 = 0
+    var gy1: i32 = 0
+    if !ttf.font_glyph_bbox(f, gid, &gx0, &gy0, &gx1, &gy1) {
+        return
+    }
+    var minx: f64 = 1.0e30
+    var miny: f64 = 1.0e30
+    var maxx: f64 = 0.0 - 1.0e30
+    var maxy: f64 = 0.0 - 1.0e30
+    var k: usize = 0
+    while k < 4 {
+        var px: f64 = gx0 as f64
+        var py: f64 = gy0 as f64
+        if k == 1 {
+            px = gx1 as f64
+        } else if k == 2 {
+            py = gy1 as f64
+        } else if k == 3 {
+            px = gx1 as f64
+            py = gy1 as f64
+        }
+        let dx: f64 = mapx((&m[0]) as *mut f64, px, py)
+        let dy: f64 = mapy((&m[0]) as *mut f64, px, py)
+        if dx < minx {
+            minx = dx
+        }
+        if dx > maxx {
+            maxx = dx
+        }
+        if dy < miny {
+            miny = dy
+        }
+        if dy > maxy {
+            maxy = dy
+        }
+        k = k + 1
+    }
+    let cw: i64 = canvas.canvas_width((*r).cv) as i64
+    let chh: i64 = canvas.canvas_height((*r).cv) as i64
+    var ox: i64 = (minx - 2.0) as i64
+    var oy: i64 = (miny - 2.0) as i64
+    var x1: i64 = (maxx + 2.0) as i64
+    var y1: i64 = (maxy + 2.0) as i64
+    if x1 < 0 || y1 < 0 || ox > cw || oy > chh {
+        return
+    }
+    if ox < 0 {
+        ox = 0
+    }
+    if oy < 0 {
+        oy = 0
+    }
+    if x1 > cw {
+        x1 = cw
+    }
+    if y1 > chh {
+        y1 = chh
+    }
+    let ww: usize = (x1 - ox) as usize
+    let hh: usize = (y1 - oy) as usize
+    if ww == 0 || hh == 0 || ww > 4000 || hh > 4000 {
+        return
+    }
+    if raster.raster_bytes_needed(ww, hh) > RASTER_CAP {
+        return
+    }
+    if !raster.raster_begin(&(*r).ras, ox as f64, oy as f64, ww, hh) {
+        return
+    }
+    ttf.font_outline_m(f, gid, &(*r).ras, m[4], m[5], 1.0,
+        m[0], 0.0 - m[1], m[2], 0.0 - m[3], (*r).scratch, SCRATCH, 0)
+    raster.raster_finish(&(*r).ras)
+    var col: u32 = (*g).fill
+    var alpha: f64 = (*g).fa
+    if (*g).tr == 1 as u32 || (*g).tr == 5 as u32 {
+        col = (*g).stroke
+        alpha = (*g).sa
+    }
+    prast.pr_blend_raster((*r).cv, &(*r).ras, ox, oy, col, alpha,
+        clipmask(r))
+    (*r).glyphs = (*r).glyphs + 1
+}
+
+fn do_xobject(r: *mut Run, ar: *mut obj.Arena, nm: u32, res: u32,
+    depth: usize) {
+    let d: *mut doc.Doc = (*r).d
+    let dar: *mut obj.Arena = &(*d).ar
+    if obj.o_kind(ar, nm) != obj.T_NAME {
+        return
+    }
+    var xn: [u8; 7] = "XObject"
+    let xd: u32 = doc.doc_dict_get(d, res, (&xn[0]) as u64, 7)
+    if obj.o_kind(dar, xd) != obj.T_DICT {
+        return
+    }
+    let x: u32 = doc.doc_dict_get(d, xd, obj.o_str_ptr(ar, nm),
+        obj.o_str_len(ar, nm))
+    if obj.o_kind(dar, x) != obj.T_STREAM {
+        return
+    }
+    var stn: [u8; 7] = "Subtype"
+    var im: [u8; 5] = "Image"
+    var fo: [u8; 4] = "Form"
+    let st: u32 = doc.doc_dict_get(d, x, (&stn[0]) as u64, 7)
+    if obj.o_name_eq(dar, st, (&im[0]) as u64, 5) {
+        draw_image(r, x)
+        return
+    }
+    if !obj.o_name_eq(dar, st, (&fo[0]) as u64, 4) {
+        return
+    }
+    if (*r).gsp + 1 >= GSMAX {
+        return
+    }
+    (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+    (*r).gsp = (*r).gsp + 1
+    let g: *mut GS = cur(r)
+    var mn: [u8; 6] = "Matrix"
+    let mh: u32 = doc.doc_dict_get(d, x, (&mn[0]) as u64, 6)
+    if obj.o_kind(dar, mh) == obj.T_ARR && obj.o_arr_len(dar, mh) >= 6 {
+        var fm: [f64; 6] = [0.0; 6]
+        var i: usize = 0
+        while i < 6 {
+            fm[i] = obj.o_num(dar, doc.doc_resolve(d,
+                obj.o_arr_at(dar, mh, i)))
+            i = i + 1
+        }
+        var o: [f64; 6] = [0.0; 6]
+        mmul((&fm[0]) as *mut f64, (&(*g).m[0]) as *mut f64,
+            (&o[0]) as *mut f64)
+        i = 0
+        while i < 6 {
+            (*g).m[i] = o[i]
+            i = i + 1
+        }
+    }
+    var rn: [u8; 9] = "Resources"
+    var fres: u32 = doc.doc_dict_get(d, x, (&rn[0]) as u64, 9)
+    if obj.o_kind(dar, fres) != obj.T_DICT {
+        fres = res
+    }
+    var body: rt.Buf = rt.buf_new()
+    if doc.doc_stream(d, x, &body) {
+        exec_stream(r, rt.buf_ptr(&body), rt.buf_len(&body), fres,
+            depth + 1)
+    }
+    rt.buf_free(&body)
+    if (*r).gsp > 0 {
+        (*r).gsp = (*r).gsp - 1
+    }
+}
+
+fn draw_image(r: *mut Run, x: u32) {
+    let d: *mut doc.Doc = (*r).d
+    let dar: *mut obj.Arena = &(*d).ar
+    let g: *mut GS = cur(r)
+    var wn: [u8; 5] = "Width"
+    var hn: [u8; 6] = "Height"
+    var bn: [u8; 16] = "BitsPerComponent"
+    var cn: [u8; 10] = "ColorSpace"
+    var mn: [u8; 9] = "ImageMask"
+    var dcn: [u8; 6] = "Decode"
+    let iw: i64 = doc.doc_int(d, x, (&wn[0]) as u64, 5, 0)
+    let ih: i64 = doc.doc_int(d, x, (&hn[0]) as u64, 6, 0)
+    if iw <= 0 || ih <= 0 || iw > 20000 || ih > 20000 {
+        return
+    }
+    var bpc: i64 = doc.doc_int(d, x, (&bn[0]) as u64, 16, 8)
+    let mh: u32 = doc.doc_dict_get(d, x, (&mn[0]) as u64, 9)
+    let is_mask: bool = obj.o_kind(dar, mh) == obj.T_BOOL &&
+    obj.o_bool(dar, mh)
+    if is_mask {
+        bpc = 1
+    }
+    var pal: u32 = 0
+    var base: u32 = 1
+    var kind: u32 = CS_GRAY
+    if !is_mask {
+        kind = cs_kind(d, doc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
+            &pal, &base)
+    }
+    var comps: usize = 1
+    if kind == CS_RGB {
+        comps = 3
+    } else if kind == CS_CMYK {
+        comps = 4
+    }
+    var inv: bool = false
+    let dh: u32 = doc.doc_dict_get(d, x, (&dcn[0]) as u64, 6)
+    if obj.o_kind(dar, dh) == obj.T_ARR && obj.o_arr_len(dar, dh) >= 2 {
+        if obj.o_num(dar, doc.doc_resolve(d, obj.o_arr_at(dar, dh, 0)))
+        > 0.5 {
+            inv = true
+        }
+    }
+    var data: rt.Buf = rt.buf_new()
+    doc.doc_stream(d, x, &data)
+    let p: u64 = rt.buf_ptr(&data)
+    let n: usize = rt.buf_len(&data)
+    var jim: picture.Picture = picture.picture_new()
+    var have_jpeg: bool = false
+    if n >= 3 && rt.ld8(p, 0) == 255 as u8 && rt.ld8(p, 1) == 216 as u8 && rt.ld8(p, 2) == 255 as u8 {
+        jim = picture.from_bytes(p, n)
+        have_jpeg = picture.ok(&jim)
+    }
+    let rowbytes: usize = ((iw as usize) * comps * (bpc as usize) + 7) / 8
+    if !have_jpeg && n + 8 < rowbytes * (ih as usize) {
+        (*r).imgfail = (*r).imgfail + 1
+        rt.buf_free(&data)
+        picture.free(&jim)
+        return
+    }
+    let m: *mut f64 = (&(*g).m[0]) as *mut f64
+    var minx: f64 = 1.0e30
+    var miny: f64 = 1.0e30
+    var maxx: f64 = 0.0 - 1.0e30
+    var maxy: f64 = 0.0 - 1.0e30
+    var k: usize = 0
+    while k < 4 {
+        var ux: f64 = 0.0
+        var uy: f64 = 0.0
+        if k == 1 {
+            ux = 1.0
+        } else if k == 2 {
+            uy = 1.0
+        } else if k == 3 {
+            ux = 1.0
+            uy = 1.0
+        }
+        let dx: f64 = mapx(m, ux, uy)
+        let dy: f64 = mapy(m, ux, uy)
+        if dx < minx {
+            minx = dx
+        }
+        if dx > maxx {
+            maxx = dx
+        }
+        if dy < miny {
+            miny = dy
+        }
+        if dy > maxy {
+            maxy = dy
+        }
+        k = k + 1
+    }
+    let a: f64 = *((m as u64) as *mut f64)
+    let b: f64 = *((m as u64 + 8) as *mut f64)
+    let c: f64 = *((m as u64 + 16) as *mut f64)
+    let dd: f64 = *((m as u64 + 24) as *mut f64)
+    let e: f64 = *((m as u64 + 32) as *mut f64)
+    let f: f64 = *((m as u64 + 40) as *mut f64)
+    let det: f64 = a * dd - b * c
+    if det == 0.0 {
+        rt.buf_free(&data)
+        return
+    }
+    let ia: f64 = dd / det
+    let ib: f64 = 0.0 - b / det
+    let ic: f64 = 0.0 - c / det
+    let id: f64 = a / det
+    let ie: f64 = (c * f - dd * e) / det
+    let if_: f64 = (b * e - a * f) / det
+    let cw: i64 = canvas.canvas_width((*r).cv) as i64
+    let chh: i64 = canvas.canvas_height((*r).cv) as i64
+    var y0: i64 = minx as i64
+    y0 = miny as i64
+    var y1: i64 = (maxy + 1.0) as i64
+    var x0: i64 = minx as i64
+    var x1: i64 = (maxx + 1.0) as i64
+    if x0 < 0 {
+        x0 = 0
+    }
+    if y0 < 0 {
+        y0 = 0
+    }
+    if x1 > cw {
+        x1 = cw
+    }
+    if y1 > chh {
+        y1 = chh
+    }
+    var yy: i64 = y0
+    while yy < y1 {
+        var xx: i64 = x0
+        while xx < x1 {
+            let px: f64 = (xx as f64) + 0.5
+            let py: f64 = (yy as f64) + 0.5
+            let ux: f64 = ia * px + ic * py + ie
+            let uy: f64 = ib * px + id * py + if_
+            if ux >= 0.0 && ux < 1.0 && uy >= 0.0 && uy < 1.0 {
+                var sx: usize = (ux * (iw as f64)) as usize
+                var sy: usize = ((1.0 - uy) * (ih as f64)) as usize
+                if sx >= iw as usize {
+                    sx = (iw as usize) - 1
+                }
+                if sy >= ih as usize {
+                    sy = (ih as usize) - 1
+                }
+                var col: u32 = 0
+                var cov: f64 = 1.0
+                if have_jpeg {
+                    let v: u32 = picture.pixel(&jim, sx, sy)
+                    col = canvas.color_of(255, (v >> 16) & 255 as u32,
+                        (v >> 8) & 255 as u32, v & 255 as u32)
+                } else if is_mask {
+                    let bit: usize = sy * rowbytes * 8 + sx
+                    var on: bool = false
+                    if bit / 8 < n {
+                        on = ((ld8(p, bit / 8) as u32) >>
+                            (7 - (bit % 8)) as u32 & 1 as u32) == 0 as u32
+                    }
+                    if inv {
+                        on = !on
+                    }
+                    if !on {
+                        cov = 0.0
+                    }
+                    col = (*g).fill
+                } else {
+                    col = sample(p, n, rowbytes, sx, sy, comps,
+                        bpc as usize, kind, pal, base, d, inv)
+                }
+                if cov > 0.0 {
+                    canvas.canvas_blend((*r).cv, xx as usize, yy as usize,
+                        col, cov * (*g).fa *
+                        prast.mask_at(clipmask(r), xx as usize,
+                            yy as usize))
+                }
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    picture.free(&jim)
+    rt.buf_free(&data)
+    (*r).images = (*r).images + 1
+}
+
+fn sample(p: u64, n: usize, rowbytes: usize, sx: usize, sy: usize,
+    comps: usize, bpc: usize, kind: u32, pal: u32, base: u32,
+    d: *mut doc.Doc, inv: bool) -> u32 {
+    var v: [f64; 4] = [0.0; 4]
+    var raw0: i64 = 0
+    var ci: usize = 0
+    while ci < comps && ci < 4 {
+        let bitpos: usize = sy * rowbytes * 8 + (sx * comps + ci) * bpc
+        var val: u32 = 0
+        if bpc == 8 {
+            if bitpos / 8 < n {
+                val = ld8(p, bitpos / 8) as u32
+            }
+            v[ci] = (val as f64) / 255.0
+        } else if bpc == 16 {
+            if bitpos / 8 + 1 < n {
+                val = ld8(p, bitpos / 8) as u32
+            }
+            v[ci] = (val as f64) / 255.0
+        } else {
+            var b: usize = 0
+            while b < bpc {
+                let bp: usize = bitpos + b
+                var bit: u32 = 0
+                if bp / 8 < n {
+                    bit = ((ld8(p, bp / 8) as u32) >> (7 - (bp % 8)) as u32)
+                    & 1 as u32
+                }
+                val = (val << 1) | bit
+                b = b + 1
+            }
+            let maxv: u32 = (1 << bpc as u32) - 1
+            v[ci] = (val as f64) / (maxv as f64)
+        }
+        if ci == 0 {
+            raw0 = val as i64
+        }
+        if inv {
+            v[ci] = 1.0 - v[ci]
+        }
+        ci = ci + 1
+    }
+    if kind == CS_INDEXED {
+        return indexed_colour(d, pal, base, raw0)
+    }
+    if kind == CS_CMYK {
+        return cmyk(v[0], v[1], v[2], v[3])
+    }
+    if kind == CS_RGB {
+        return rgb(v[0], v[1], v[2])
+    }
+    return rgb(v[0], v[0], v[0])
+}
+
+fn skip_inline_image(r: *mut Run, lx: *mut obj.Lex) {
+    let p: u64 = (*lx).p
+    let n: usize = (*lx).n
+    var i: usize = obj.lex_at(lx)
+    while i + 1 < n {
+        if ld8(p, i) == 73 as u8 && ld8(p, i + 1) == 68 as u8 {
+            i = i + 2
+            break
+        }
+        i = i + 1
+    }
+    if i < n {
+        i = i + 1
+    }
+    while i + 1 < n {
+        if ld8(p, i) == 69 as u8 && ld8(p, i + 1) == 73 as u8 {
+            let before_ws: bool = i == 0 || ld8(p, i - 1) == 32 as u8 ||
+            ld8(p, i - 1) == 10 as u8 || ld8(p, i - 1) == 13 as u8 ||
+            ld8(p, i - 1) == 9 as u8 || ld8(p, i - 1) == 0 as u8
+            let after_ws: bool = i + 2 >= n || ld8(p, i + 2) == 32 as u8 ||
+            ld8(p, i + 2) == 10 as u8 || ld8(p, i + 2) == 13 as u8 ||
+            ld8(p, i + 2) == 9 as u8 || ld8(p, i + 2) == 47 as u8 ||
+            ld8(p, i + 2) == 91 as u8
+            if before_ws && after_ws {
+                i = i + 2
+                break
+            }
+        }
+        i = i + 1
+    }
+    obj.lex_set(lx, i)
+    (*r).images = (*r).images + 1
+}
+
+fn page_render(d: *mut doc.Doc, pg: usize, zoom: f64,
+    cv: *mut canvas.Canvas, fh: *mut pfont.FontHold,
+    stat: *mut usize) -> bool {
+    if pg >= doc.doc_page_count(d) {
+        return false
+    }
+    var box_: [f64; 4] = [0.0; 4]
+    var w: usize = 0
+    var h: usize = 0
+    page_size(d, pg, zoom, &w, &h, (&box_[0]) as *mut f64)
+    if !canvas.canvas_init(cv, w, h) {
+        return false
+    }
+    canvas.canvas_clear(cv, canvas.color_of(255, 255, 255, 255))
+    var r: Run = run_new()
+    if !run_init(&r, d, cv, fh, w, h) {
+        run_free(&r)
+        return false
+    }
+    var rot: i32 = doc.doc_page_rotate(d, pg) % 360
+    if rot < 0 {
+        rot = rot + 360
+    }
+    base_matrix((&box_[0]) as *mut f64, zoom, rot, w, h,
+        (&r.gs[0].m[0]) as *mut f64)
+    var body: rt.Buf = rt.buf_new()
+    page_content(d, pg, &body)
+    let res: u32 = doc.doc_page_res(d, pg)
+    exec_stream(&r, rt.buf_ptr(&body), rt.buf_len(&body), res, 0)
+    rt.buf_free(&body)
+    annots_paint(&r, pg)
+    *((stat as u64) as *mut usize) = r.ops
+    *((stat as u64 + 8) as *mut usize) = r.glyphs
+    *((stat as u64 + 16) as *mut usize) = r.paths
+    *((stat as u64 + 24) as *mut usize) = r.images
+    *((stat as u64 + 32) as *mut usize) = r.imgfail
+    run_free(&r)
+    return true
+}
+
+fn annots_paint(r: *mut Run, pg: usize) {
+    let d: *mut doc.Doc = (*r).d
+    let l: *mut pannot.AnnotList = pannot.an_load(d, pg)
+    if l as u64 == 0 {
+        return
+    }
+    let n: usize = pannot.an_count(l)
+    var i: usize = 0
+    while i < n {
+        let a: *mut pannot.Annot = pannot.an_at(l, i)
+        if pannot.an_visible(a) {
+            let ap: u32 = pannot.an_ap(a)
+            if ap != 0 as u32 {
+                annot_ap_paint(r, a, ap)
+            } else {
+                if pannot.an_subtype(a) == pannot.ST_HIGHLIGHT {
+                    annot_highlight_paint(r, l, a)
+                }
+            }
+        }
+        i = i + 1
+    }
+    pannot.an_free(l)
+}
+
+fn annot_ap_paint(r: *mut Run, a: *mut pannot.Annot, ap: u32) {
+    let d: *mut doc.Doc = (*r).d
+    let dar: *mut obj.Arena = &(*d).ar
+    if obj.o_kind(dar, ap) != obj.T_STREAM {
+        return
+    }
+    if (*r).gsp + 1 >= GSMAX {
+        return
+    }
+    (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+    (*r).gsp = (*r).gsp + 1
+    let g: *mut GS = cur(r)
+
+    var fm: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    var mn: [u8; 6] = "Matrix"
+    let mh: u32 = doc.doc_dict_get(d, ap, (&mn[0]) as u64, 6)
+    if obj.o_kind(dar, mh) == obj.T_ARR && obj.o_arr_len(dar, mh) >= 6 {
+        var q: usize = 0
+        while q < 6 {
+            fm[q] = obj.o_num(dar, doc.doc_resolve(d, obj.o_arr_at(dar, mh, q)))
+            q = q + 1
+        }
+    }
+    var bb: [f64; 4] = [0.0; 4]
+    var bn: [u8; 4] = "BBox"
+    let bh: u32 = doc.doc_dict_get(d, ap, (&bn[0]) as u64, 4)
+    var hat_bbox: bool = false
+    if obj.o_kind(dar, bh) == obj.T_ARR && obj.o_arr_len(dar, bh) >= 4 {
+        var q2: usize = 0
+        while q2 < 4 {
+            bb[q2] = obj.o_num(dar, doc.doc_resolve(d,
+                obj.o_arr_at(dar, bh, q2)))
+            q2 = q2 + 1
+        }
+        hat_bbox = true
+    }
+    var sx: f64 = 1.0
+    var sy: f64 = 1.0
+    var tx: f64 = 0.0
+    var ty: f64 = 0.0
+    if hat_bbox {
+        var x0: f64 = 1.0e300
+        var y0: f64 = 1.0e300
+        var x1: f64 = 0.0 - 1.0e300
+        var y1: f64 = 0.0 - 1.0e300
+        var e: usize = 0
+        while e < 4 {
+            var px: f64 = bb[0]
+            var py: f64 = bb[1]
+            if e == 1 || e == 2 {
+                px = bb[2]
+            }
+            if e >= 2 {
+                py = bb[3]
+            }
+            let qx: f64 = fm[0] * px + fm[2] * py + fm[4]
+            let qy: f64 = fm[1] * px + fm[3] * py + fm[5]
+            if qx < x0 {
+                x0 = qx
+            }
+            if qy < y0 {
+                y0 = qy
+            }
+            if qx > x1 {
+                x1 = qx
+            }
+            if qy > y1 {
+                y1 = qy
+            }
+            e = e + 1
+        }
+        let bw: f64 = x1 - x0
+        let bh2: f64 = y1 - y0
+        let rw: f64 = pannot.an_rect(a, 2) - pannot.an_rect(a, 0)
+        let rh2: f64 = pannot.an_rect(a, 3) - pannot.an_rect(a, 1)
+        if bw > 0.000001 && bh2 > 0.000001 {
+            sx = rw / bw
+            sy = rh2 / bh2
+        }
+        tx = pannot.an_rect(a, 0) - x0 * sx
+        ty = pannot.an_rect(a, 1) - y0 * sy
+    }
+    var am: [f64; 6] = [0.0; 6]
+    am[0] = fm[0] * sx
+    am[1] = fm[1] * sy
+    am[2] = fm[2] * sx
+    am[3] = fm[3] * sy
+    am[4] = fm[4] * sx + tx
+    am[5] = fm[5] * sy + ty
+    var om: [f64; 6] = [0.0; 6]
+    mmul((&am[0]) as *mut f64, (&(*g).m[0]) as *mut f64,
+        (&om[0]) as *mut f64)
+    var z: usize = 0
+    while z < 6 {
+        (*g).m[z] = om[z]
+        z = z + 1
+    }
+
+    var body: rt.Buf = rt.buf_new()
+    if doc.doc_stream(d, ap, &body) {
+        var rn2: [u8; 9] = "Resources"
+        let res2: u32 = doc.doc_dict_get(d, ap, (&rn2[0]) as u64, 9)
+        exec_stream(r, rt.buf_ptr(&body), rt.buf_len(&body), res2, 1)
+    }
+    rt.buf_free(&body)
+    (*r).gsp = (*r).gsp - 1
+}
+
+fn annot_highlight_paint(r: *mut Run, l: *mut pannot.AnnotList,
+                         a: *mut pannot.Annot) {
+    let cnt: usize = pannot.an_quad_count(l, a)
+    if cnt == 0 {
+        return
+    }
+    if pannot.an_color(a, 0, 3) < 1.0 {
+        return
+    }
+    var rr: f64 = pannot.an_color(a, 0, 0)
+    var gg: f64 = rr
+    var bb2: f64 = rr
+    if pannot.an_color(a, 0, 3) >= 3.0 {
+        gg = pannot.an_color(a, 0, 1)
+        bb2 = pannot.an_color(a, 0, 2)
+    }
+    let alpha: f64 = pannot.an_opacity(a)
+    let g: *mut GS = cur(r)
+    var q: usize = 0
+    while q < cnt {
+        let x1: f64 = pannot.an_quad_at(l, a, q, 0)
+        let y1: f64 = pannot.an_quad_at(l, a, q, 1)
+        let x2: f64 = pannot.an_quad_at(l, a, q, 2)
+        let y4: f64 = pannot.an_quad_at(l, a, q, 7)
+        var lx: f64 = x1
+        var rx: f64 = x2
+        if rx < lx {
+            let t: f64 = lx
+            lx = rx
+            rx = t
+        }
+        var oy: f64 = y1
+        var uy: f64 = y4
+        if uy > oy {
+            let t2: f64 = oy
+            oy = uy
+            uy = t2
+        }
+        fill_rect_dev(r, lx, uy, rx, oy, rr, gg, bb2, alpha)
+        q = q + 1
+    }
+}
+
+fn fill_rect_dev(r: *mut Run, x0: f64, y0: f64, x1: f64, y1: f64,
+                 cr: f64, cg: f64, cb: f64, alpha: f64) {
+    let g: *mut GS = cur(r)
+    let m: *mut f64 = (&(*g).m[0]) as *mut f64
+    prast.pr_reset(&(*r).pr)
+    prast.pr_move(&(*r).pr, mapx(m, x0, y0), mapy(m, x0, y0))
+    prast.pr_line(&(*r).pr, mapx(m, x1, y0), mapy(m, x1, y0))
+    prast.pr_line(&(*r).pr, mapx(m, x1, y1), mapy(m, x1, y1))
+    prast.pr_line(&(*r).pr, mapx(m, x0, y1), mapy(m, x0, y1))
+    prast.pr_close(&(*r).pr)
+    var ri: u32 = (cr * 255.0 + 0.5) as u32
+    var gi: u32 = (cg * 255.0 + 0.5) as u32
+    var bi: u32 = (cb * 255.0 + 0.5) as u32
+    if ri > 255 {
+        ri = 255
+    }
+    if gi > 255 {
+        gi = 255
+    }
+    if bi > 255 {
+        bi = 255
+    }
+    let col: u32 = canvas.color_of(ri, gi, bi, 255)
+    prast.pr_fill(&(*r).pr, (*r).cv, col, alpha, prast.RULE_NZ, clipmask(r))
+    (*r).paths = (*r).paths + 1
+    prast.pr_reset(&(*r).pr)
+}
+
+fn page_text(d: *mut doc.Doc, pg: usize, out: *mut mem.Buf) -> bool {
+    if pg >= doc.doc_page_count(d) {
+        return false
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    var fh: pfont.FontHold = pfont.fonthold_new()
+    var r: Run = run_new()
+    if !run_init(&r, d, &cv, &fh, 1, 1) {
+        run_free(&r)
+        return false
+    }
+    r.txt = out as u64
+    var body: rt.Buf = rt.buf_new()
+    page_content(d, pg, &body)
+    let res: u32 = doc.doc_page_res(d, pg)
+    exec_stream(&r, rt.buf_ptr(&body), rt.buf_len(&body), res, 0)
+    rt.buf_free(&body)
+    run_free(&r)
+    return true
+}
+
+fn run_new() -> Run {
+    return Run { d: 0 as *mut doc.Doc, cv: 0 as *mut canvas.Canvas,
+        fh: 0 as *mut pfont.FontHold,
+        pr: prast.pr_new(), tmp: prast.pr_new(),
+        masks: [prast.Mask { p: 0 as *mut u8, w: 0, h: 0 }; 24], nmask: 0,
+        gs: [gs_new(); 32], gsp: 0,
+        tm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        tlm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        intext: false, t0: 0, stop: false,
+        fonts: [pfont.pfont_new(); 6], fkey: [0; 6],
+        nfont: 0,
+        ops: 0, glyphs: 0, paths: 0, images: 0, imgfail: 0,
+        fontmiss: 0, txt: 0,
+        ras: raster.raster_new(), scratch: 0 as *mut u8,
+        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, lasth: 0.0 }
+}

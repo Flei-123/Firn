@@ -1,0 +1,646 @@
+// SPDX-License-Identifier: MPL-2.0
+// PDF AcroForm fields: reading names, values and widgets.
+import html.mem
+import rt.rt
+import docview.pdf.obj
+import docview.pdf.doc
+import docview.pdf.pannot
+
+export {
+    Field, Form,
+    fm_load, fm_free, fm_count, fm_at,
+    fm_needs_appearances, fm_acroform, fm_acroform_num, fm_dr,
+    fm_default_da,
+    fd_obj, fd_num, fd_kind, fd_flags, fd_maxlen, fd_quadding,
+    fd_name_ptr, fd_name_len, fd_value, fd_da, fd_widget_count,
+    fd_widget, fd_widget_num, fd_opt_count, fd_opt_at,
+    fd_readonly, fd_required, fd_multiline, fd_password, fd_radio,
+    fd_combo, fd_checkbox,
+    FT_NONE, FT_TEXT, FT_BUTTON, FT_CHOICE, FT_SIG,
+    FF_READONLY, FF_REQUIRED, FF_MULTILINE, FF_PASSWORD,
+    FF_NOTOGGLE, FF_RADIO, FF_PUSHBUTTON, FF_COMBO,
+    MAX_FIELDS, MAX_DEPTH,
+}
+
+const FT_NONE: u32 = 0
+const FT_TEXT: u32 = 1
+const FT_BUTTON: u32 = 2
+const FT_CHOICE: u32 = 3
+const FT_SIG: u32 = 4
+
+const FF_READONLY: u32 = 1
+const FF_REQUIRED: u32 = 2
+const FF_MULTILINE: u32 = 4096
+const FF_PASSWORD: u32 = 8192
+const FF_NOTOGGLE: u32 = 16384
+const FF_RADIO: u32 = 32768
+const FF_PUSHBUTTON: u32 = 65536
+const FF_COMBO: u32 = 131072
+
+const MAX_FIELDS: usize = 8192
+const MAX_DEPTH: usize = 32
+const MAX_CHAIN: usize = 64
+const MAX_WIDGETS: usize = 512
+const MAX_NAME: usize = 512
+
+#[no_gc]
+fn sz_field() -> usize {
+    var probe: [Field; 2] = [Field {
+        obj: 0, num: 0, kind: 0, flags: 0, value: 0, da: 0,
+        name_at: 0, name_len: 0, wid_at: 0, wid_n: 0,
+        maxlen: 0, quad: 0, opt: 0 }; 2]
+    return ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+}
+
+#[no_gc]
+fn sz_form() -> usize {
+    var probe: [Form; 2] = [Form {
+        d: 0 as *mut doc.Doc, acro: 0, acro_num: 0, f: 0 as *mut Field,
+        n: 0, cap: 0,
+        names: mem.buf_new(), wids: 0 as *mut u32, wn: 0, wcap: 0,
+        needapp: false }; 2]
+    return ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+}
+
+struct Field {
+    obj: u32,
+    num: u32,
+    kind: u32,
+    flags: u32,
+    value: u32,
+    da: u32,
+    name_at: usize,
+    name_len: usize,
+    wid_at: usize,
+    wid_n: usize,
+    maxlen: i64,
+    quad: i64,
+    opt: u32,
+}
+
+struct Form {
+    d: *mut doc.Doc,
+    acro: u32,
+    acro_num: u32,
+    f: *mut Field,
+    n: usize,
+    cap: usize,
+    names: mem.Buf,
+    wids: *mut u32,
+    wn: usize,
+    wcap: usize,
+    needapp: bool,
+}
+
+fn erbt(d: *mut doc.Doc, h: u32, name: u64, n: usize) -> u32 {
+    var cur: u32 = h
+    var depth: usize = 0
+    while cur != 0 as u32 && depth < MAX_CHAIN {
+        let got: u32 = doc.doc_dict_get(d, cur, name, n)
+        if got != 0 as u32 {
+            return got
+        }
+        var pn: [u8; 6] = "Parent"
+        cur = doc.doc_dict_get(d, cur, (&pn[0]) as u64, 6)
+        depth = depth + 1
+    }
+    return 0 as u32
+}
+
+fn ft_von(ar: *mut obj.Arena, h: u32) -> u32 {
+    var n1: [u8; 2] = "Tx"
+    if obj.o_name_eq(ar, h, (&n1[0]) as u64, 2) {
+        return FT_TEXT
+    }
+    var n2: [u8; 3] = "Btn"
+    if obj.o_name_eq(ar, h, (&n2[0]) as u64, 3) {
+        return FT_BUTTON
+    }
+    var n3: [u8; 2] = "Ch"
+    if obj.o_name_eq(ar, h, (&n3[0]) as u64, 2) {
+        return FT_CHOICE
+    }
+    var n4: [u8; 3] = "Sig"
+    if obj.o_name_eq(ar, h, (&n4[0]) as u64, 3) {
+        return FT_SIG
+    }
+    return FT_NONE
+}
+
+fn ist_widget(d: *mut doc.Doc, h: u32) -> bool {
+    let ar: *mut obj.Arena = &(*d).ar
+    var sn: [u8; 7] = "Subtype"
+    let st: u32 = doc.doc_dict_get(d, h, (&sn[0]) as u64, 7)
+    var wn: [u8; 6] = "Widget"
+    if st != 0 as u32 && obj.o_name_eq(ar, st, (&wn[0]) as u64, 6) {
+        return true
+    }
+    var rn: [u8; 4] = "Rect"
+    let r: u32 = doc.doc_dict_get(d, h, (&rn[0]) as u64, 4)
+    if r == 0 as u32 || obj.o_kind(ar, r) != obj.T_ARR {
+        return false
+    }
+    var an: [u8; 2] = "AP"
+    return doc.doc_dict_get(d, h, (&an[0]) as u64, 2) != 0 as u32
+}
+
+fn field_grow(fm: *mut Form) -> bool {
+    if (*fm).n < (*fm).cap {
+        return true
+    }
+    var neu: usize = (*fm).cap * 2
+    if neu < 16 {
+        neu = 16
+    }
+    if neu > MAX_FIELDS {
+        neu = MAX_FIELDS
+    }
+    if (*fm).n >= neu {
+        return false
+    }
+    let np: *mut u8 = mem.heap_alloc(neu * sz_field())
+    if np as u64 == 0 {
+        return false
+    }
+    if (*fm).f as u64 != 0 {
+        mem.mem_copy(np, (*fm).f as *mut u8, (*fm).n * sz_field())
+        mem.heap_free((*fm).f as *mut u8, (*fm).cap * sz_field())
+    }
+    (*fm).f = np as *mut Field
+    (*fm).cap = neu
+    return true
+}
+
+fn wid_grow(fm: *mut Form, br: usize) -> bool {
+    if (*fm).wn + br <= (*fm).wcap {
+        return true
+    }
+    var neu: usize = (*fm).wcap * 2
+    if neu < 32 {
+        neu = 32
+    }
+    while neu < (*fm).wn + br {
+        neu = neu * 2
+    }
+    let np: *mut u8 = mem.heap_alloc(neu * 8)
+    if np as u64 == 0 {
+        return false
+    }
+    if (*fm).wids as u64 != 0 {
+        mem.mem_copy(np, (*fm).wids as *mut u8, (*fm).wn * 8)
+        mem.heap_free((*fm).wids as *mut u8, (*fm).wcap * 8)
+    }
+    (*fm).wids = np as *mut u32
+    (*fm).wcap = neu
+    return true
+}
+
+fn node2(fm: *mut Form, h_roh: u32, pfx_at: usize, pfx_len: usize,
+          depth: usize) {
+    if depth > MAX_DEPTH || (*fm).n >= MAX_FIELDS {
+        return
+    }
+    let d: *mut doc.Doc = (*fm).d
+    let ar: *mut obj.Arena = &(*d).ar
+    var num: u32 = 0
+    var h: u32 = h_roh
+    if obj.o_kind(ar, h) == obj.T_REF {
+        num = obj.o_int(ar, h) as u32
+        h = doc.doc_resolve(d, h)
+    }
+    if h == 0 as u32 || obj.o_kind(ar, h) != obj.T_DICT {
+        return
+    }
+
+    var nat: usize = mem.buf_len(&(*fm).names)
+    var nlen: usize = 0
+    var tn: [u8; 1] = "T"
+    let t: u32 = doc.doc_dict_get(d, h, (&tn[0]) as u64, 1)
+    var hat_t: bool = false
+    if t != 0 as u32 && obj.o_kind(ar, t) == obj.T_STR {
+        hat_t = true
+    }
+    if hat_t {
+        var i: usize = 0
+        while i < pfx_len && nlen < MAX_NAME {
+            mem.buf_push(&(*fm).names, mem.buf_at(&(*fm).names, pfx_at + i))
+            nlen = nlen + 1
+            i = i + 1
+        }
+        if pfx_len > 0 && nlen < MAX_NAME {
+            mem.buf_push(&(*fm).names, 46 as u8)
+            nlen = nlen + 1
+        }
+        let p: u64 = obj.o_str_ptr(ar, t)
+        let tl: usize = obj.o_str_len(ar, t)
+        var k: usize = 0
+        while k < tl && nlen < MAX_NAME {
+            mem.buf_push(&(*fm).names, rt.ld8(p, k))
+            nlen = nlen + 1
+            k = k + 1
+        }
+    } else {
+        nat = pfx_at
+        nlen = pfx_len
+    }
+
+    var kn: [u8; 4] = "Kids"
+    let kids: u32 = doc.doc_dict_get(d, h, (&kn[0]) as u64, 4)
+    var kids_are_fields: bool = false
+    var kcnt: usize = 0
+    if kids != 0 as u32 && obj.o_kind(ar, kids) == obj.T_ARR {
+        kcnt = obj.o_arr_len(ar, kids)
+        var j: usize = 0
+        while j < kcnt {
+            let kid: u32 = doc.doc_resolve(d, obj.o_arr_at(ar, kids, j))
+            if kid != 0 as u32 && obj.o_kind(ar, kid) == obj.T_DICT {
+                var t2n: [u8; 1] = "T"
+                if doc.doc_dict_get(d, kid, (&t2n[0]) as u64, 1) != 0 as u32 {
+                    kids_are_fields = true
+                }
+                j = kcnt
+            }
+            j = j + 1
+        }
+    }
+
+    if kids_are_fields {
+        var j: usize = 0
+        while j < kcnt && j < MAX_FIELDS {
+            node2(fm, obj.o_arr_at(ar, kids, j), nat, nlen, depth + 1)
+            j = j + 1
+        }
+        return
+    }
+
+    if !field_grow(fm) {
+        return
+    }
+    let f: *mut Field = ((*fm).f as u64 + ((*fm).n * sz_field()) as u64)
+        as *mut Field
+    (*f).obj = h
+    (*f).num = num
+    var ftn: [u8; 2] = "FT"
+    (*f).kind = ft_von(ar, erbt(d, h, (&ftn[0]) as u64, 2))
+    var ffn: [u8; 2] = "Ff"
+    let ff: u32 = erbt(d, h, (&ffn[0]) as u64, 2)
+    (*f).flags = 0
+    if obj.o_is_num(ar, ff) {
+        (*f).flags = obj.o_int(ar, ff) as u32
+    }
+    var vn: [u8; 1] = "V"
+    (*f).value = erbt(d, h, (&vn[0]) as u64, 1)
+    var dan: [u8; 2] = "DA"
+    (*f).da = erbt(d, h, (&dan[0]) as u64, 2)
+    (*f).name_at = nat
+    (*f).name_len = nlen
+    var mln: [u8; 6] = "MaxLen"
+    let ml: u32 = erbt(d, h, (&mln[0]) as u64, 6)
+    (*f).maxlen = 0 - 1
+    if obj.o_is_num(ar, ml) {
+        (*f).maxlen = obj.o_int(ar, ml)
+    }
+    var qn: [u8; 1] = "Q"
+    let q: u32 = erbt(d, h, (&qn[0]) as u64, 1)
+    (*f).quad = 0
+    if obj.o_is_num(ar, q) {
+        (*f).quad = obj.o_int(ar, q)
+    }
+    var on: [u8; 3] = "Opt"
+    (*f).opt = erbt(d, h, (&on[0]) as u64, 3)
+    if obj.o_kind(ar, (*f).opt) != obj.T_ARR {
+        (*f).opt = 0 as u32
+    }
+
+    (*f).wid_at = (*fm).wn
+    (*f).wid_n = 0
+    if kcnt > 0 {
+        var j: usize = 0
+        while j < kcnt && (*f).wid_n < MAX_WIDGETS {
+            let roh: u32 = obj.o_arr_at(ar, kids, j)
+            var knum: u32 = 0
+            var kh: u32 = roh
+            if obj.o_kind(ar, kh) == obj.T_REF {
+                knum = obj.o_int(ar, kh) as u32
+                kh = doc.doc_resolve(d, kh)
+            }
+            if kh != 0 as u32 && obj.o_kind(ar, kh) == obj.T_DICT {
+                if wid_grow(fm, 2) {
+                    *(((*fm).wids as u64 + ((*fm).wn * 4) as u64) as *mut u32) = kh
+                    *(((*fm).wids as u64 + (((*fm).wn + 1) * 4) as u64)
+                        as *mut u32) = knum
+                    (*fm).wn = (*fm).wn + 2
+                    (*f).wid_n = (*f).wid_n + 1
+                }
+            }
+            j = j + 1
+        }
+    } else {
+        if ist_widget(d, h) {
+            if wid_grow(fm, 2) {
+                *(((*fm).wids as u64 + ((*fm).wn * 4) as u64) as *mut u32) = h
+                *(((*fm).wids as u64 + (((*fm).wn + 1) * 4) as u64)
+                    as *mut u32) = num
+                (*fm).wn = (*fm).wn + 2
+                (*f).wid_n = 1
+            }
+        }
+    }
+    (*fm).n = (*fm).n + 1
+}
+
+#[allow_escape]
+fn fm_load(d: *mut doc.Doc) -> *mut Form {
+    let fm: *mut Form = mem.heap_alloc(sz_form()) as *mut Form
+    if fm as u64 == 0 {
+        return 0 as *mut Form
+    }
+    (*fm).d = d
+    (*fm).acro = 0 as u32
+    (*fm).acro_num = 0 as u32
+    (*fm).f = 0 as *mut Field
+    (*fm).n = 0
+    (*fm).cap = 0
+    (*fm).names = mem.buf_new()
+    mem.buf_init(&(*fm).names)
+    (*fm).wids = 0 as *mut u32
+    (*fm).wn = 0
+    (*fm).wcap = 0
+    (*fm).needapp = false
+
+    let root: u32 = doc.doc_root(d)
+    if root == 0 as u32 {
+        return fm
+    }
+    let ar: *mut obj.Arena = &(*d).ar
+    var an: [u8; 8] = "AcroForm"
+    let acro_roh: u32 = obj.dict_get(ar, root, (&an[0]) as u64, 8)
+    if obj.o_kind(ar, acro_roh) == obj.T_REF {
+        (*fm).acro_num = obj.o_int(ar, acro_roh) as u32
+    }
+    let acro: u32 = doc.doc_dict_get(d, root, (&an[0]) as u64, 8)
+    if acro == 0 as u32 || obj.o_kind(ar, acro) != obj.T_DICT {
+        return fm
+    }
+    (*fm).acro = acro
+    var nan: [u8; 16] = "NeedAppearances\x00"
+    let na: u32 = doc.doc_dict_get(d, acro, (&nan[0]) as u64, 15)
+    if na != 0 as u32 && obj.o_kind(ar, na) == obj.T_BOOL {
+        (*fm).needapp = obj.o_bool(ar, na)
+    }
+    var fn1: [u8; 6] = "Fields"
+    let fields: u32 = doc.doc_dict_get(d, acro, (&fn1[0]) as u64, 6)
+    if fields == 0 as u32 || obj.o_kind(ar, fields) != obj.T_ARR {
+        return fm
+    }
+    var cnt: usize = obj.o_arr_len(ar, fields)
+    if cnt > MAX_FIELDS {
+        cnt = MAX_FIELDS
+    }
+    var i: usize = 0
+    while i < cnt {
+        node2(fm, obj.o_arr_at(ar, fields, i), 0, 0, 0)
+        i = i + 1
+    }
+    return fm
+}
+
+fn fm_free(fm: *mut Form) {
+    if fm as u64 == 0 {
+        return
+    }
+    if (*fm).f as u64 != 0 {
+        mem.heap_free((*fm).f as *mut u8, (*fm).cap * sz_field())
+    }
+    if (*fm).wids as u64 != 0 {
+        mem.heap_free((*fm).wids as *mut u8, (*fm).wcap * 8)
+    }
+    mem.buf_free(&(*fm).names)
+    mem.heap_free(fm as *mut u8, sz_form())
+}
+
+#[no_gc]
+fn fm_count(fm: *mut Form) -> usize {
+    if fm as u64 == 0 {
+        return 0
+    }
+    return (*fm).n
+}
+
+#[no_gc]
+fn fm_at(fm: *mut Form, i: usize) -> *mut Field {
+    if fm as u64 == 0 || i >= (*fm).n {
+        return 0 as *mut Field
+    }
+    return ((*fm).f as u64 + (i * sz_field()) as u64) as *mut Field
+}
+
+#[no_gc]
+fn fm_needs_appearances(fm: *mut Form) -> bool {
+    if fm as u64 == 0 {
+        return false
+    }
+    return (*fm).needapp
+}
+
+#[no_gc]
+fn fm_acroform_num(fm: *mut Form) -> u32 {
+    if fm as u64 == 0 {
+        return 0 as u32
+    }
+    return (*fm).acro_num
+}
+
+#[no_gc]
+fn fm_acroform(fm: *mut Form) -> u32 {
+    if fm as u64 == 0 {
+        return 0 as u32
+    }
+    return (*fm).acro
+}
+
+fn fm_dr(fm: *mut Form) -> u32 {
+    if fm as u64 == 0 || (*fm).acro == 0 as u32 {
+        return 0 as u32
+    }
+    var dn: [u8; 2] = "DR"
+    return doc.doc_dict_get((*fm).d, (*fm).acro, (&dn[0]) as u64, 2)
+}
+
+fn fm_default_da(fm: *mut Form) -> u32 {
+    if fm as u64 == 0 || (*fm).acro == 0 as u32 {
+        return 0 as u32
+    }
+    var dn: [u8; 2] = "DA"
+    return doc.doc_dict_get((*fm).d, (*fm).acro, (&dn[0]) as u64, 2)
+}
+
+#[no_gc]
+fn fd_obj(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return 0 as u32
+    }
+    return (*f).obj
+}
+
+#[no_gc]
+fn fd_num(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return 0 as u32
+    }
+    return (*f).num
+}
+
+#[no_gc]
+fn fd_kind(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return FT_NONE
+    }
+    return (*f).kind
+}
+
+#[no_gc]
+fn fd_flags(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return 0
+    }
+    return (*f).flags
+}
+
+#[no_gc]
+fn fd_maxlen(f: *mut Field) -> i64 {
+    if f as u64 == 0 {
+        return 0 - 1
+    }
+    return (*f).maxlen
+}
+
+#[no_gc]
+fn fd_quadding(f: *mut Field) -> i64 {
+    if f as u64 == 0 {
+        return 0
+    }
+    return (*f).quad
+}
+
+#[no_gc]
+fn fd_value(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return 0 as u32
+    }
+    return (*f).value
+}
+
+#[no_gc]
+fn fd_da(f: *mut Field) -> u32 {
+    if f as u64 == 0 {
+        return 0 as u32
+    }
+    return (*f).da
+}
+
+fn fd_name_ptr(fm: *mut Form, f: *mut Field) -> u64 {
+    if fm as u64 == 0 || f as u64 == 0 {
+        return 0
+    }
+    return (mem.buf_ptr(&(*fm).names) as u64) + (*f).name_at as u64
+}
+
+#[no_gc]
+fn fd_name_len(f: *mut Field) -> usize {
+    if f as u64 == 0 {
+        return 0
+    }
+    return (*f).name_len
+}
+
+#[no_gc]
+fn fd_widget_count(f: *mut Field) -> usize {
+    if f as u64 == 0 {
+        return 0
+    }
+    return (*f).wid_n
+}
+
+#[no_gc]
+fn fd_widget(fm: *mut Form, f: *mut Field, i: usize) -> u32 {
+    if fm as u64 == 0 || f as u64 == 0 || i >= (*f).wid_n {
+        return 0 as u32
+    }
+    return *(((*fm).wids as u64 + (((*f).wid_at + i * 2) * 4) as u64)
+        as *mut u32)
+}
+
+#[no_gc]
+fn fd_widget_num(fm: *mut Form, f: *mut Field, i: usize) -> u32 {
+    if fm as u64 == 0 || f as u64 == 0 || i >= (*f).wid_n {
+        return 0 as u32
+    }
+    return *(((*fm).wids as u64 + (((*f).wid_at + i * 2 + 1) * 4) as u64)
+        as *mut u32)
+}
+
+fn fd_opt_count(fm: *mut Form, f: *mut Field) -> usize {
+    if fm as u64 == 0 || f as u64 == 0 || (*f).opt == 0 as u32 {
+        return 0
+    }
+    return obj.o_arr_len(&(*(*fm).d).ar, (*f).opt)
+}
+
+fn fd_opt_at(fm: *mut Form, f: *mut Field, i: usize, display: bool) -> u32 {
+    if fm as u64 == 0 || f as u64 == 0 || (*f).opt == 0 as u32 {
+        return 0 as u32
+    }
+    let d: *mut doc.Doc = (*fm).d
+    let ar: *mut obj.Arena = &(*d).ar
+    if i >= obj.o_arr_len(ar, (*f).opt) {
+        return 0 as u32
+    }
+    let e: u32 = doc.doc_resolve(d, obj.o_arr_at(ar, (*f).opt, i))
+    if obj.o_kind(ar, e) == obj.T_ARR && obj.o_arr_len(ar, e) >= 2 {
+        var k: usize = 0
+        if display {
+            k = 1
+        }
+        return doc.doc_resolve(d, obj.o_arr_at(ar, e, k))
+    }
+    return e
+}
+
+#[no_gc]
+fn fd_readonly(f: *mut Field) -> bool {
+    return (fd_flags(f) & FF_READONLY) != 0
+}
+
+#[no_gc]
+fn fd_required(f: *mut Field) -> bool {
+    return (fd_flags(f) & FF_REQUIRED) != 0
+}
+
+#[no_gc]
+fn fd_multiline(f: *mut Field) -> bool {
+    return fd_kind(f) == FT_TEXT && (fd_flags(f) & FF_MULTILINE) != 0
+}
+
+#[no_gc]
+fn fd_password(f: *mut Field) -> bool {
+    return fd_kind(f) == FT_TEXT && (fd_flags(f) & FF_PASSWORD) != 0
+}
+
+#[no_gc]
+fn fd_radio(f: *mut Field) -> bool {
+    return fd_kind(f) == FT_BUTTON && (fd_flags(f) & FF_RADIO) != 0
+}
+
+#[no_gc]
+fn fd_combo(f: *mut Field) -> bool {
+    return fd_kind(f) == FT_CHOICE && (fd_flags(f) & FF_COMBO) != 0
+}
+
+#[no_gc]
+fn fd_checkbox(f: *mut Field) -> bool {
+    if fd_kind(f) != FT_BUTTON {
+        return false
+    }
+    return (fd_flags(f) & (FF_RADIO | FF_PUSHBUTTON)) == 0
+}

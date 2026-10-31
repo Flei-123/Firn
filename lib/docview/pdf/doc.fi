@@ -1,0 +1,1284 @@
+// SPDX-License-Identifier: MPL-2.0
+// a PDF file read from the back: xref tables and streams, object streams, recovery of broken files, page tree.
+import html.mem
+import rt.rt
+import docview.pdf.obj
+import docview.pdf.filter
+
+export {
+    Doc,
+    doc_new, doc_open, doc_free,
+    doc_get, doc_resolve, doc_dict_get,
+    doc_stream, doc_num, doc_int,
+    doc_page_count, doc_page, doc_page_res, doc_page_box, doc_page_rotate,
+    doc_encrypted, doc_recovered, doc_objects, doc_version,
+    doc_err, doc_root,
+    E_OK, E_NOHEADER, E_NOPAGES, E_ENCRYPTED, E_BROKEN,
+    MEDIA_LLX, MEDIA_LLY, MEDIA_URX, MEDIA_URY,
+}
+
+const E_OK: u32 = 0
+const E_NOHEADER: u32 = 1
+const E_NOPAGES: u32 = 2
+const E_ENCRYPTED: u32 = 3
+const E_BROKEN: u32 = 4
+
+const MEDIA_LLX: usize = 0
+const MEDIA_LLY: usize = 1
+const MEDIA_URX: usize = 2
+const MEDIA_URY: usize = 3
+
+const MAX_NUM: usize = 8000000
+const MAX_PAGES: usize = 200000
+const MAX_XREF_HOPS: usize = 64
+const MAX_TREE: usize = 64
+
+struct Doc {
+    data: u64,
+    len: usize,
+    base: usize,
+    ar: obj.Arena,
+    typ: *mut u8,
+    off: *mut u64,
+    sidx: *mut u32,
+    cache: *mut u32,
+    busy: *mut u8,
+    nobj: usize,
+    trailer: u32,
+    root: u32,
+    encrypted: u32,
+    recovered: u32,
+    err: u32,
+    major: u32,
+    minor: u32,
+    pages: *mut u32,
+    pres: *mut u32,
+    pmb: *mut u32,
+    pcb: *mut u32,
+    prot: *mut u32,
+    npages: usize,
+    pcap: usize,
+    scratch: rt.Buf,
+}
+
+#[no_gc]
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+#[no_gc]
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 10 as u8 || c == 13 as u8 ||
+    c == 9 as u8 || c == 12 as u8 || c == 0 as u8
+}
+
+#[no_gc]
+fn lit_at(d: *mut Doc, at: usize, lit: u64, n: usize) -> bool {
+    if at + n > (*d).len {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if ld8((*d).data, at + i) != ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn doc_new() -> Doc {
+    return Doc { data: 0, len: 0, base: 0, ar: obj.arena_new(),
+        typ: 0 as *mut u8, off: 0 as *mut u64, sidx: 0 as *mut u32,
+        cache: 0 as *mut u32, busy: 0 as *mut u8, nobj: 0,
+        trailer: 0, root: 0, encrypted: 0, recovered: 0, err: E_OK,
+        major: 0, minor: 0,
+        pages: 0 as *mut u32, pres: 0 as *mut u32, pmb: 0 as *mut u32,
+        pcb: 0 as *mut u32, prot: 0 as *mut u32,
+        npages: 0, pcap: 0, scratch: rt.buf_new() }
+}
+
+fn doc_free(d: *mut Doc) {
+    obj.arena_free(&(*d).ar)
+    mem.heap_free((*d).typ, (*d).nobj)
+    mem.heap_free((*d).off as *mut u8, (*d).nobj * 8)
+    mem.heap_free((*d).sidx as *mut u8, (*d).nobj * 4)
+    mem.heap_free((*d).cache as *mut u8, (*d).nobj * 4)
+    mem.heap_free((*d).busy, (*d).nobj)
+    mem.heap_free((*d).pages as *mut u8, (*d).pcap * 4)
+    mem.heap_free((*d).pres as *mut u8, (*d).pcap * 4)
+    mem.heap_free((*d).pmb as *mut u8, (*d).pcap * 4)
+    mem.heap_free((*d).pcb as *mut u8, (*d).pcap * 4)
+    mem.heap_free((*d).prot as *mut u8, (*d).pcap * 4)
+    rt.buf_free(&(*d).scratch)
+    (*d).nobj = 0
+    (*d).pcap = 0
+}
+
+#[no_gc]
+fn doc_err(d: *mut Doc) -> u32 {
+    return (*d).err
+}
+
+#[no_gc]
+fn doc_encrypted(d: *mut Doc) -> bool {
+    return (*d).encrypted != 0 as u32
+}
+
+#[no_gc]
+fn doc_recovered(d: *mut Doc) -> bool {
+    return (*d).recovered != 0 as u32
+}
+
+#[no_gc]
+fn doc_objects(d: *mut Doc) -> usize {
+    return (*d).nobj
+}
+
+#[no_gc]
+fn doc_root(d: *mut Doc) -> u32 {
+    return (*d).root
+}
+
+#[no_gc]
+fn doc_version(d: *mut Doc, minor: *mut u32) -> u32 {
+    *minor = (*d).minor
+    return (*d).major
+}
+
+#[no_gc]
+fn doc_page_count(d: *mut Doc) -> usize {
+    return (*d).npages
+}
+
+#[no_gc]
+fn doc_page(d: *mut Doc, i: usize) -> u32 {
+    if i >= (*d).npages {
+        return 0
+    }
+    return *(((*d).pages as u64 + (i * 4) as u64) as *mut u32)
+}
+
+#[no_gc]
+fn doc_page_res(d: *mut Doc, i: usize) -> u32 {
+    if i >= (*d).npages {
+        return 0
+    }
+    return *(((*d).pres as u64 + (i * 4) as u64) as *mut u32)
+}
+
+#[no_gc]
+fn doc_page_rotate(d: *mut Doc, i: usize) -> i32 {
+    if i >= (*d).npages {
+        return 0
+    }
+    return (*(((*d).prot as u64 + (i * 4) as u64) as *mut u32)) as i32
+}
+
+fn doc_resolve(d: *mut Doc, h: u32) -> u32 {
+    var cur: u32 = h
+    var hops: usize = 0
+    while obj.o_kind(&(*d).ar, cur) == obj.T_REF && hops < 32 {
+        let num: usize = obj.o_int(&(*d).ar, cur) as usize
+        cur = doc_get(d, num)
+        hops = hops + 1
+    }
+    return cur
+}
+
+fn doc_dict_get(d: *mut Doc, dict: u32, name: u64, n: usize) -> u32 {
+    return doc_resolve(d, obj.dict_get(&(*d).ar, dict, name, n))
+}
+
+fn doc_num(d: *mut Doc, dict: u32, name: u64, n: usize, dflt: f64) -> f64 {
+    let h: u32 = doc_dict_get(d, dict, name, n)
+    if !obj.o_is_num(&(*d).ar, h) {
+        return dflt
+    }
+    return obj.o_num(&(*d).ar, h)
+}
+
+fn doc_int(d: *mut Doc, dict: u32, name: u64, n: usize, dflt: i64) -> i64 {
+    let h: u32 = doc_dict_get(d, dict, name, n)
+    if !obj.o_is_num(&(*d).ar, h) {
+        return dflt
+    }
+    return obj.o_int(&(*d).ar, h)
+}
+
+fn doc_get(d: *mut Doc, num: usize) -> u32 {
+    if num == 0 || num >= (*d).nobj {
+        return 0
+    }
+    let cached: u32 = *(((*d).cache as u64 + (num * 4) as u64) as *mut u32)
+    if cached != 0 as u32 {
+        return cached
+    }
+    if *(((*d).busy as u64 + num as u64) as *mut u8) != 0 as u8 {
+        return 0
+    }
+    *(((*d).busy as u64 + num as u64) as *mut u8) = 1 as u8
+    var h: u32 = 0
+    let t: u8 = *(((*d).typ as u64 + num as u64) as *mut u8)
+    if t == 1 as u8 {
+        let at: usize = (*(((*d).off as u64 + (num * 8) as u64)
+            as *mut u64)) as usize
+        h = parse_indirect(d, at, num)
+    } else if t == 2 as u8 {
+        let snum: usize = (*(((*d).off as u64 + (num * 8) as u64)
+            as *mut u64)) as usize
+        let idx: usize = (*(((*d).sidx as u64 + (num * 4) as u64)
+            as *mut u32)) as usize
+        h = from_objstm(d, snum, idx, num)
+    }
+    *(((*d).busy as u64 + num as u64) as *mut u8) = 0 as u8
+    *(((*d).cache as u64 + (num * 4) as u64) as *mut u32) = h
+    return h
+}
+
+fn parse_indirect(d: *mut Doc, at: usize, want: usize) -> u32 {
+    if at == 0 || at >= (*d).len {
+        return 0
+    }
+    var lx: obj.Lex = obj.lex_new((*d).data, (*d).len)
+    obj.lex_set(&lx, at)
+    obj.skip_ws(&lx)
+    var i: usize = obj.lex_at(&lx)
+    if i >= (*d).len || !is_digit(ld8((*d).data, i)) {
+        return 0
+    }
+    var got: usize = 0
+    while i < (*d).len && is_digit(ld8((*d).data, i)) && got < MAX_NUM {
+        got = got * 10 + ((ld8((*d).data, i) as usize) - 48)
+        i = i + 1
+    }
+    if got != want {
+        return 0
+    }
+    while i < (*d).len && is_ws(ld8((*d).data, i)) {
+        i = i + 1
+    }
+    while i < (*d).len && is_digit(ld8((*d).data, i)) {
+        i = i + 1
+    }
+    while i < (*d).len && is_ws(ld8((*d).data, i)) {
+        i = i + 1
+    }
+    var kw: [u8; 3] = "obj"
+    if !lit_at(d, i, (&kw[0]) as u64, 3) {
+        return 0
+    }
+    obj.lex_set(&lx, i + 3)
+    let h: u32 = obj.parse_obj(&(*d).ar, &lx, 0)
+    if obj.o_kind(&(*d).ar, h) == obj.T_STREAM {
+        fix_stream(d, h, &lx)
+    }
+    return h
+}
+
+fn fix_stream(d: *mut Doc, h: u32, lx: *mut obj.Lex) {
+    let start: usize = obj.o_stream_at(&(*d).ar, h) as usize
+    var ln: [u8; 6] = "Length"
+    let lh: u32 = obj.dict_get(&(*d).ar, h, (&ln[0]) as u64, 6)
+    var n: i64 = -1
+    if obj.o_kind(&(*d).ar, lh) == obj.T_INT {
+        n = obj.o_int(&(*d).ar, lh)
+    } else if obj.o_kind(&(*d).ar, lh) == obj.T_REF {
+        let target: u32 = doc_get(d, obj.o_int(&(*d).ar, lh) as usize)
+        if obj.o_kind(&(*d).ar, target) == obj.T_INT {
+            n = obj.o_int(&(*d).ar, target)
+        }
+    }
+    var good: bool = false
+    if n >= 0 && start + (n as usize) <= (*d).len {
+        var j: usize = start + (n as usize)
+        var k: usize = 0
+        while j < (*d).len && is_ws(ld8((*d).data, j)) && k < 4 {
+            j = j + 1
+            k = k + 1
+        }
+        var es: [u8; 9] = "endstream"
+        if lit_at(d, j, (&es[0]) as u64, 9) {
+            good = true
+        }
+    }
+    if good {
+        obj.o_set_stream(&(*d).ar, h, start as u64, n as usize)
+        obj.lex_set(lx, start + (n as usize))
+        return
+    }
+    var es2: [u8; 9] = "endstream"
+    var j2: usize = start
+    while j2 + 9 <= (*d).len {
+        if ld8((*d).data, j2) == 101 as u8 &&
+        lit_at(d, j2, (&es2[0]) as u64, 9) {
+            var e: usize = j2
+            if e > start && ld8((*d).data, e - 1) == 10 as u8 {
+                e = e - 1
+            }
+            if e > start && ld8((*d).data, e - 1) == 13 as u8 {
+                e = e - 1
+            }
+            obj.o_set_stream(&(*d).ar, h, start as u64, e - start)
+            obj.lex_set(lx, j2 + 9)
+            return
+        }
+        j2 = j2 + 1
+    }
+    obj.o_set_stream(&(*d).ar, h, start as u64, (*d).len - start)
+    obj.lex_set(lx, (*d).len)
+}
+
+fn doc_stream(d: *mut Doc, h: u32, out: *mut rt.Buf) -> bool {
+    if obj.o_kind(&(*d).ar, h) != obj.T_STREAM {
+        return false
+    }
+    let at: usize = obj.o_stream_at(&(*d).ar, h) as usize
+    let raw: usize = obj.o_stream_len(&(*d).ar, h)
+    if at >= (*d).len {
+        return false
+    }
+    var n: usize = raw
+    if at + n > (*d).len {
+        n = (*d).len - at
+    }
+    var fn1: [u8; 6] = "Filter"
+    var fn2: [u8; 1] = "F"
+    var fh: u32 = doc_dict_get(d, h, (&fn1[0]) as u64, 6)
+    var pn1: [u8; 11] = "DecodeParms"
+    var pn2: [u8; 2] = "DP"
+    var ph: u32 = doc_dict_get(d, h, (&pn1[0]) as u64, 11)
+    if ph == 0 as u32 {
+        ph = doc_dict_get(d, h, (&pn2[0]) as u64, 2)
+    }
+    var cnt: usize = 1
+    if obj.o_kind(&(*d).ar, fh) == obj.T_ARR {
+        cnt = obj.o_arr_len(&(*d).ar, fh)
+    } else if obj.o_kind(&(*d).ar, fh) != obj.T_NAME {
+        var i: usize = 0
+        while i < n {
+            rt.buf_push(out, ld8((*d).data, at + i))
+            i = i + 1
+        }
+        return true
+    }
+    var cur: rt.Buf = rt.buf_new()
+    var i2: usize = 0
+    while i2 < n {
+        rt.buf_push(&cur, ld8((*d).data, at + i2))
+        i2 = i2 + 1
+    }
+    var step: usize = 0
+    while step < cnt && step < 16 {
+        var name: u32 = fh
+        if obj.o_kind(&(*d).ar, fh) == obj.T_ARR {
+            name = doc_resolve(d, obj.o_arr_at(&(*d).ar, fh, step))
+        }
+        var parms: u32 = ph
+        if obj.o_kind(&(*d).ar, ph) == obj.T_ARR {
+            parms = doc_resolve(d, obj.o_arr_at(&(*d).ar, ph, step))
+        }
+        let id: u32 = filter.filter_id(obj.o_str_ptr(&(*d).ar, name),
+            obj.o_str_len(&(*d).ar, name))
+        if filter.filter_is_image(id) {
+            break
+        }
+        var nx: rt.Buf = rt.buf_new()
+        let src: u64 = rt.buf_ptr(&cur)
+        let sn: usize = rt.buf_len(&cur)
+        if id == filter.F_FLATE {
+            filter.f_flate(src, sn, &nx)
+        } else if id == filter.F_AHX {
+            filter.f_ahx(src, sn, &nx)
+        } else if id == filter.F_A85 {
+            filter.f_a85(src, sn, &nx)
+        } else if id == filter.F_RL {
+            filter.f_rl(src, sn, &nx)
+        } else if id == filter.F_LZW {
+            var ec: [u8; 11] = "EarlyChange"
+            var early: u32 = 1
+            if obj.o_kind(&(*d).ar, parms) == obj.T_DICT {
+                if doc_int(d, parms, (&ec[0]) as u64, 11, 1) == 0 {
+                    early = 0
+                }
+            }
+            filter.f_lzw(src, sn, &nx, early)
+        } else {
+            var q: usize = 0
+            while q < sn {
+                rt.buf_push(&nx, ld8(src, q))
+                q = q + 1
+            }
+        }
+        if obj.o_kind(&(*d).ar, parms) == obj.T_DICT {
+            var prn: [u8; 9] = "Predictor"
+            var con: [u8; 6] = "Colors"
+            var bpn: [u8; 16] = "BitsPerComponent"
+            var cln: [u8; 7] = "Columns"
+            let pr: i64 = doc_int(d, parms, (&prn[0]) as u64, 9, 1)
+            if pr > 1 {
+                let co: i64 = doc_int(d, parms, (&con[0]) as u64, 6, 1)
+                let bp: i64 = doc_int(d, parms, (&bpn[0]) as u64, 16, 8)
+                let cl: i64 = doc_int(d, parms, (&cln[0]) as u64, 7, 1)
+                filter.predict(&nx, 0, pr as u32, co as usize,
+                    bp as usize, cl as usize)
+            }
+        }
+        rt.buf_free(&cur)
+        cur = nx
+        step = step + 1
+    }
+    var w: usize = 0
+    let cp: u64 = rt.buf_ptr(&cur)
+    let cl2: usize = rt.buf_len(&cur)
+    while w < cl2 {
+        rt.buf_push(out, ld8(cp, w))
+        w = w + 1
+    }
+    rt.buf_free(&cur)
+    return true
+}
+
+fn from_objstm(d: *mut Doc, snum: usize, idx: usize, want: usize) -> u32 {
+    let sh: u32 = doc_get(d, snum)
+    if obj.o_kind(&(*d).ar, sh) != obj.T_STREAM {
+        return 0
+    }
+    var data: rt.Buf = rt.buf_new()
+    if !doc_stream(d, sh, &data) {
+        rt.buf_free(&data)
+        return 0
+    }
+    var nn: [u8; 1] = "N"
+    var fn2: [u8; 5] = "First"
+    let cnt: i64 = doc_int(d, sh, (&nn[0]) as u64, 1, 0)
+    let first: i64 = doc_int(d, sh, (&fn2[0]) as u64, 5, 0)
+    if cnt <= 0 || first < 0 || idx >= cnt as usize {
+        rt.buf_free(&data)
+        return 0
+    }
+    let p: u64 = rt.buf_ptr(&data)
+    let n: usize = rt.buf_len(&data)
+    var lx: obj.Lex = obj.lex_new(p, n)
+    var k: usize = 0
+    var found_off: i64 = -1
+    while k < cnt as usize {
+        obj.skip_ws(&lx)
+        var i: usize = obj.lex_at(&lx)
+        var num: usize = 0
+        var any: bool = false
+        while i < n && is_digit(ld8(p, i)) {
+            num = num * 10 + ((ld8(p, i) as usize) - 48)
+            i = i + 1
+            any = true
+        }
+        while i < n && is_ws(ld8(p, i)) {
+            i = i + 1
+        }
+        var off: usize = 0
+        var any2: bool = false
+        while i < n && is_digit(ld8(p, i)) {
+            off = off * 10 + ((ld8(p, i) as usize) - 48)
+            i = i + 1
+            any2 = true
+        }
+        obj.lex_set(&lx, i)
+        if !any || !any2 {
+            break
+        }
+        if k == idx {
+            if num != want {
+                found_off = -2
+            } else {
+                found_off = off as i64
+            }
+            if found_off != -2 {
+                k = cnt as usize
+            }
+        }
+        if found_off == -2 && num == want {
+            found_off = off as i64
+        }
+        k = k + 1
+    }
+    if found_off < 0 {
+        rt.buf_free(&data)
+        return 0
+    }
+    let at: usize = (first as usize) + (found_off as usize)
+    if at >= n {
+        rt.buf_free(&data)
+        return 0
+    }
+    obj.lex_set(&lx, at)
+    let h: u32 = obj.parse_obj(&(*d).ar, &lx, 0)
+    rt.buf_free(&data)
+    return h
+}
+
+fn find_header(d: *mut Doc) -> bool {
+    var h: [u8; 5] = "%PDF-"
+    var i: usize = 0
+    var lim: usize = 4096
+    if lim > (*d).len {
+        lim = (*d).len
+    }
+    while i + 5 <= lim {
+        if lit_at(d, i, (&h[0]) as u64, 5) {
+            (*d).base = i
+            if i + 7 < (*d).len {
+                (*d).major = (ld8((*d).data, i + 5) as u32) - 48
+                (*d).minor = (ld8((*d).data, i + 7) as u32) - 48
+            }
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn read_xref_table(d: *mut Doc, at: usize) -> usize {
+    var kw: [u8; 4] = "xref"
+    var i: usize = at
+    while i < (*d).len && is_ws(ld8((*d).data, i)) {
+        i = i + 1
+    }
+    if !lit_at(d, i, (&kw[0]) as u64, 4) {
+        return 0
+    }
+    i = i + 4
+    var guard: usize = 0
+    while i < (*d).len && guard < 100000 {
+        guard = guard + 1
+        while i < (*d).len && is_ws(ld8((*d).data, i)) {
+            i = i + 1
+        }
+        var tr: [u8; 7] = "trailer"
+        if lit_at(d, i, (&tr[0]) as u64, 7) {
+            return i + 7
+        }
+        if i >= (*d).len || !is_digit(ld8((*d).data, i)) {
+            return 0
+        }
+        var start: usize = 0
+        while i < (*d).len && is_digit(ld8((*d).data, i)) {
+            start = start * 10 + ((ld8((*d).data, i) as usize) - 48)
+            i = i + 1
+        }
+        while i < (*d).len && is_ws(ld8((*d).data, i)) {
+            i = i + 1
+        }
+        var cnt: usize = 0
+        while i < (*d).len && is_digit(ld8((*d).data, i)) {
+            cnt = cnt * 10 + ((ld8((*d).data, i) as usize) - 48)
+            i = i + 1
+        }
+        if cnt > MAX_NUM {
+            return 0
+        }
+        var k: usize = 0
+        while k < cnt && i < (*d).len {
+            while i < (*d).len && is_ws(ld8((*d).data, i)) {
+                i = i + 1
+            }
+            var v: u64 = 0
+            var any: bool = false
+            while i < (*d).len && is_digit(ld8((*d).data, i)) {
+                v = v * 10 + ((ld8((*d).data, i) as u64) - 48)
+                i = i + 1
+                any = true
+            }
+            while i < (*d).len && is_ws(ld8((*d).data, i)) {
+                i = i + 1
+            }
+            while i < (*d).len && is_digit(ld8((*d).data, i)) {
+                i = i + 1
+            }
+            while i < (*d).len && is_ws(ld8((*d).data, i)) {
+                i = i + 1
+            }
+            var ty: u8 = 0
+            if i < (*d).len {
+                ty = ld8((*d).data, i)
+                i = i + 1
+            }
+            if !any {
+                return 0
+            }
+            let num: usize = start + k
+            if ty == 110 as u8 && num < (*d).nobj {
+                set_entry(d, num, 1, v + (*d).base as u64, 0)
+            }
+            k = k + 1
+        }
+    }
+    return 0
+}
+
+#[no_gc]
+fn set_entry(d: *mut Doc, num: usize, t: u8, a: u64, idx: u32) {
+    if num == 0 || num >= (*d).nobj {
+        return
+    }
+    if *(((*d).typ as u64 + num as u64) as *mut u8) != 0 as u8 {
+        return
+    }
+    *(((*d).typ as u64 + num as u64) as *mut u8) = t
+    *(((*d).off as u64 + (num * 8) as u64) as *mut u64) = a
+    *(((*d).sidx as u64 + (num * 4) as u64) as *mut u32) = idx
+}
+
+fn read_xref_stream(d: *mut Doc, h: u32) -> bool {
+    if obj.o_kind(&(*d).ar, h) != obj.T_STREAM {
+        return false
+    }
+    var data: rt.Buf = rt.buf_new()
+    if !doc_stream(d, h, &data) {
+        rt.buf_free(&data)
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&data)
+    let n: usize = rt.buf_len(&data)
+    var wn: [u8; 1] = "W"
+    let wh: u32 = doc_dict_get(d, h, (&wn[0]) as u64, 1)
+    if obj.o_kind(&(*d).ar, wh) != obj.T_ARR {
+        rt.buf_free(&data)
+        return false
+    }
+    var w: [usize; 8] = [0; 8]
+    var nw: usize = obj.o_arr_len(&(*d).ar, wh)
+    if nw > 8 {
+        nw = 8
+    }
+    var i: usize = 0
+    var rowlen: usize = 0
+    while i < nw {
+        let v: i64 = obj.o_int(&(*d).ar,
+            doc_resolve(d, obj.o_arr_at(&(*d).ar, wh, i)))
+        if v < 0 || v > 8 {
+            rt.buf_free(&data)
+            return false
+        }
+        w[i] = v as usize
+        rowlen = rowlen + w[i]
+        i = i + 1
+    }
+    if rowlen == 0 {
+        rt.buf_free(&data)
+        return false
+    }
+    var idxn: [u8; 5] = "Index"
+    var szn: [u8; 4] = "Size"
+    let ih: u32 = doc_dict_get(d, h, (&idxn[0]) as u64, 5)
+    var blocks: usize = 1
+    var have_index: bool = false
+    if obj.o_kind(&(*d).ar, ih) == obj.T_ARR &&
+    obj.o_arr_len(&(*d).ar, ih) >= 2 {
+        blocks = obj.o_arr_len(&(*d).ar, ih) / 2
+        have_index = true
+    }
+    var row: usize = 0
+    var bl: usize = 0
+    while bl < blocks {
+        var first: usize = 0
+        var cnt: usize = doc_int(d, h, (&szn[0]) as u64, 4, 0) as usize
+        if have_index {
+            first = obj.o_int(&(*d).ar,
+                doc_resolve(d, obj.o_arr_at(&(*d).ar, ih, bl * 2))) as usize
+            cnt = obj.o_int(&(*d).ar,
+                doc_resolve(d, obj.o_arr_at(&(*d).ar, ih, bl * 2 + 1)))
+            as usize
+        }
+        var k: usize = 0
+        while k < cnt && (row + 1) * rowlen <= n {
+            let base: usize = row * rowlen
+            var f: [u64; 8] = [0; 8]
+            var o2: usize = 0
+            var c: usize = 0
+            while c < nw {
+                var v: u64 = 0
+                var b: usize = 0
+                while b < w[c] {
+                    v = (v << 8) | (ld8(p, base + o2 + b) as u64)
+                    b = b + 1
+                }
+                if w[c] == 0 && c == 0 {
+                    v = 1
+                }
+                f[c] = v
+                o2 = o2 + w[c]
+                c = c + 1
+            }
+            let num: usize = first + k
+            if f[0] == 1 {
+                set_entry(d, num, 1, f[1] + (*d).base as u64, 0)
+            } else if f[0] == 2 {
+                set_entry(d, num, 2, f[1], f[2] as u32)
+            }
+            row = row + 1
+            k = k + 1
+        }
+        bl = bl + 1
+    }
+    rt.buf_free(&data)
+    return true
+}
+
+fn follow_chain(d: *mut Doc, first: usize) -> bool {
+    var at: usize = first
+    var hops: usize = 0
+    var any: bool = false
+    var seen: [usize; 64] = [0; 64]
+    while at != 0 && at < (*d).len && hops < MAX_XREF_HOPS {
+        var s: usize = 0
+        var loop_: bool = false
+        while s < hops && s < 64 {
+            if seen[s] == at {
+                loop_ = true
+            }
+            s = s + 1
+        }
+        if loop_ {
+            break
+        }
+        if hops < 64 {
+            seen[hops] = at
+        }
+        hops = hops + 1
+        var trailer: u32 = 0
+        let tpos: usize = read_xref_table(d, at)
+        if tpos > 0 {
+            var lx: obj.Lex = obj.lex_new((*d).data, (*d).len)
+            obj.lex_set(&lx, tpos)
+            trailer = obj.parse_obj(&(*d).ar, &lx, 0)
+            any = true
+            var xs: [u8; 7] = "XRefStm"
+            let xh: u32 = obj.dict_get(&(*d).ar, trailer, (&xs[0]) as u64, 7)
+            if obj.o_kind(&(*d).ar, xh) == obj.T_INT {
+                let xat: usize = (obj.o_int(&(*d).ar, xh) as usize) + (*d).base
+                let sh: u32 = parse_any_indirect(d, xat)
+                if sh != 0 as u32 {
+                    read_xref_stream(d, sh)
+                }
+            }
+        } else {
+            let sh: u32 = parse_any_indirect(d, at)
+            if sh == 0 as u32 {
+                break
+            }
+            if !read_xref_stream(d, sh) {
+                break
+            }
+            trailer = sh
+            any = true
+        }
+        if (*d).trailer == 0 as u32 {
+            (*d).trailer = trailer
+        } else {
+            merge_trailer(d, trailer)
+        }
+        var pv: [u8; 4] = "Prev"
+        let ph: u32 = obj.dict_get(&(*d).ar, trailer, (&pv[0]) as u64, 4)
+        if obj.o_kind(&(*d).ar, ph) != obj.T_INT {
+            at = 0
+        } else {
+            at = (obj.o_int(&(*d).ar, ph) as usize) + (*d).base
+        }
+    }
+    return any
+}
+
+fn merge_trailer(d: *mut Doc, older: u32) {
+    var i: usize = 0
+    let n: usize = obj.o_dict_len(&(*d).ar, older)
+    while i < n {
+        let k: u32 = obj.o_dict_key(&(*d).ar, older, i)
+        let kp: u64 = obj.o_str_ptr(&(*d).ar, k)
+        let kl: usize = obj.o_str_len(&(*d).ar, k)
+        if obj.dict_get(&(*d).ar, (*d).trailer, kp, kl) == 0 as u32 {
+            obj.a_dict_put(&(*d).ar, (*d).trailer, k,
+                obj.o_dict_val(&(*d).ar, older, i))
+        }
+        i = i + 1
+    }
+}
+
+fn parse_any_indirect(d: *mut Doc, at: usize) -> u32 {
+    if at == 0 || at >= (*d).len {
+        return 0
+    }
+    var i: usize = at
+    while i < (*d).len && is_ws(ld8((*d).data, i)) {
+        i = i + 1
+    }
+    if i >= (*d).len || !is_digit(ld8((*d).data, i)) {
+        return 0
+    }
+    var num: usize = 0
+    while i < (*d).len && is_digit(ld8((*d).data, i)) {
+        num = num * 10 + ((ld8((*d).data, i) as usize) - 48)
+        i = i + 1
+    }
+    return parse_indirect(d, at, num)
+}
+
+fn rebuild(d: *mut Doc) {
+    (*d).recovered = 1
+    var i: usize = 0
+    var kw: [u8; 3] = "obj"
+    var z: usize = 0
+    while z < (*d).nobj {
+        *(((*d).typ as u64 + z as u64) as *mut u8) = 0 as u8
+        z = z + 1
+    }
+    while i + 3 <= (*d).len {
+        if ld8((*d).data, i) == 111 as u8 && lit_at(d, i, (&kw[0]) as u64, 3) {
+            var j: usize = i
+            var ok: bool = true
+            while j > 0 && is_ws(ld8((*d).data, j - 1)) {
+                j = j - 1
+            }
+            var ge: usize = j
+            while j > 0 && is_digit(ld8((*d).data, j - 1)) {
+                j = j - 1
+            }
+            if j == ge {
+                ok = false
+            }
+            var gs: usize = j
+            while j > 0 && is_ws(ld8((*d).data, j - 1)) {
+                j = j - 1
+            }
+            if j == gs {
+                ok = false
+            }
+            var ne: usize = j
+            while j > 0 && is_digit(ld8((*d).data, j - 1)) {
+                j = j - 1
+            }
+            if j == ne {
+                ok = false
+            }
+            if ok {
+                var num: usize = 0
+                var q: usize = j
+                while q < ne && num < MAX_NUM {
+                    num = num * 10 + ((ld8((*d).data, q) as usize) - 48)
+                    q = q + 1
+                }
+                if num > 0 && num < (*d).nobj {
+                    *(((*d).typ as u64 + num as u64) as *mut u8) = 1 as u8
+                    *(((*d).off as u64 + (num * 8) as u64) as *mut u64) =
+                    j as u64
+                    *(((*d).cache as u64 + (num * 4) as u64) as *mut u32) = 0
+                }
+            }
+            i = i + 3
+        } else {
+            i = i + 1
+        }
+    }
+    var t: [u8; 4] = "Type"
+    var os: [u8; 6] = "ObjStm"
+    var num2: usize = 1
+    while num2 < (*d).nobj {
+        if *(((*d).typ as u64 + num2 as u64) as *mut u8) == 1 as u8 {
+            let h: u32 = doc_get(d, num2)
+            if obj.o_kind(&(*d).ar, h) == obj.T_STREAM {
+                let ty: u32 = doc_dict_get(d, h, (&t[0]) as u64, 4)
+                if obj.o_name_eq(&(*d).ar, ty, (&os[0]) as u64, 6) {
+                    claim_objstm(d, num2, h)
+                }
+            }
+        }
+        num2 = num2 + 1
+    }
+    if (*d).root == 0 as u32 {
+        find_catalog(d)
+    }
+}
+
+fn claim_objstm(d: *mut Doc, snum: usize, sh: u32) {
+    var data: rt.Buf = rt.buf_new()
+    if !doc_stream(d, sh, &data) {
+        rt.buf_free(&data)
+        return
+    }
+    var nn: [u8; 1] = "N"
+    let cnt: i64 = doc_int(d, sh, (&nn[0]) as u64, 1, 0)
+    let p: u64 = rt.buf_ptr(&data)
+    let n: usize = rt.buf_len(&data)
+    var i: usize = 0
+    var k: usize = 0
+    while k < cnt as usize && i < n {
+        while i < n && is_ws(ld8(p, i)) {
+            i = i + 1
+        }
+        var num: usize = 0
+        var any: bool = false
+        while i < n && is_digit(ld8(p, i)) {
+            num = num * 10 + ((ld8(p, i) as usize) - 48)
+            i = i + 1
+            any = true
+        }
+        while i < n && is_ws(ld8(p, i)) {
+            i = i + 1
+        }
+        while i < n && is_digit(ld8(p, i)) {
+            i = i + 1
+        }
+        if !any {
+            break
+        }
+        if num > 0 && num < (*d).nobj &&
+        *(((*d).typ as u64 + num as u64) as *mut u8) == 0 as u8 {
+            *(((*d).typ as u64 + num as u64) as *mut u8) = 2 as u8
+            *(((*d).off as u64 + (num * 8) as u64) as *mut u64) = snum as u64
+            *(((*d).sidx as u64 + (num * 4) as u64) as *mut u32) = k as u32
+        }
+        k = k + 1
+    }
+    rt.buf_free(&data)
+}
+
+fn find_catalog(d: *mut Doc) {
+    var t: [u8; 4] = "Type"
+    var cat: [u8; 7] = "Catalog"
+    var num: usize = 1
+    while num < (*d).nobj {
+        if *(((*d).typ as u64 + num as u64) as *mut u8) != 0 as u8 {
+            let h: u32 = doc_get(d, num)
+            if obj.o_kind(&(*d).ar, h) == obj.T_DICT {
+                let ty: u32 = doc_dict_get(d, h, (&t[0]) as u64, 4)
+                if obj.o_name_eq(&(*d).ar, ty, (&cat[0]) as u64, 7) {
+                    (*d).root = h
+                    return
+                }
+            }
+        }
+        num = num + 1
+    }
+}
+
+fn grow_pages(d: *mut Doc) -> bool {
+    if (*d).npages < (*d).pcap {
+        return true
+    }
+    var nc: usize = (*d).pcap * 2
+    if nc == 0 {
+        nc = 64
+    }
+    if nc > MAX_PAGES {
+        return false
+    }
+    let a: *mut u8 = mem.heap_alloc(nc * 4)
+    let b: *mut u8 = mem.heap_alloc(nc * 4)
+    let c: *mut u8 = mem.heap_alloc(nc * 4)
+    let e: *mut u8 = mem.heap_alloc(nc * 4)
+    let f: *mut u8 = mem.heap_alloc(nc * 4)
+    if a as usize == 0 || b as usize == 0 || c as usize == 0 ||
+    e as usize == 0 || f as usize == 0 {
+        return false
+    }
+    if (*d).pcap > 0 {
+        mem.mem_copy(a, (*d).pages as *mut u8, (*d).npages * 4)
+        mem.mem_copy(b, (*d).pres as *mut u8, (*d).npages * 4)
+        mem.mem_copy(c, (*d).pmb as *mut u8, (*d).npages * 4)
+        mem.mem_copy(e, (*d).pcb as *mut u8, (*d).npages * 4)
+        mem.mem_copy(f, (*d).prot as *mut u8, (*d).npages * 4)
+        mem.heap_free((*d).pages as *mut u8, (*d).pcap * 4)
+        mem.heap_free((*d).pres as *mut u8, (*d).pcap * 4)
+        mem.heap_free((*d).pmb as *mut u8, (*d).pcap * 4)
+        mem.heap_free((*d).pcb as *mut u8, (*d).pcap * 4)
+        mem.heap_free((*d).prot as *mut u8, (*d).pcap * 4)
+    }
+    (*d).pages = a as *mut u32
+    (*d).pres = b as *mut u32
+    (*d).pmb = c as *mut u32
+    (*d).pcb = e as *mut u32
+    (*d).prot = f as *mut u32
+    (*d).pcap = nc
+    return true
+}
+
+fn walk_pages(d: *mut Doc, node: u32, res: u32, mb: u32, cb: u32,
+    rot: u32, depth: usize, visited: *mut u32, nvis: *mut usize) {
+    if depth > MAX_TREE || (*d).npages >= MAX_PAGES {
+        return
+    }
+    if obj.o_kind(&(*d).ar, node) != obj.T_DICT {
+        return
+    }
+    var v: usize = 0
+    while v < *nvis && v < MAX_TREE {
+        if *((visited as u64 + (v * 4) as u64) as *mut u32) == node {
+            return
+        }
+        v = v + 1
+    }
+    if *nvis < MAX_TREE {
+        *((visited as u64 + (*nvis * 4) as u64) as *mut u32) = node
+        *nvis = *nvis + 1
+    }
+    var rn: [u8; 9] = "Resources"
+    var mn: [u8; 8] = "MediaBox"
+    var cn: [u8; 7] = "CropBox"
+    var ron: [u8; 6] = "Rotate"
+    var kn: [u8; 4] = "Kids"
+    var tn: [u8; 4] = "Type"
+    var pg: [u8; 4] = "Page"
+    var pgs: [u8; 5] = "Pages"
+    var r2: u32 = res
+    let rh: u32 = doc_dict_get(d, node, (&rn[0]) as u64, 9)
+    if obj.o_kind(&(*d).ar, rh) == obj.T_DICT {
+        r2 = rh
+    }
+    var m2: u32 = mb
+    let mh: u32 = doc_dict_get(d, node, (&mn[0]) as u64, 8)
+    if obj.o_kind(&(*d).ar, mh) == obj.T_ARR &&
+    obj.o_arr_len(&(*d).ar, mh) >= 4 {
+        m2 = mh
+    }
+    var c2: u32 = cb
+    let ch: u32 = doc_dict_get(d, node, (&cn[0]) as u64, 7)
+    if obj.o_kind(&(*d).ar, ch) == obj.T_ARR &&
+    obj.o_arr_len(&(*d).ar, ch) >= 4 {
+        c2 = ch
+    }
+    var ro2: u32 = rot
+    let roh: u32 = doc_dict_get(d, node, (&ron[0]) as u64, 6)
+    if obj.o_is_num(&(*d).ar, roh) {
+        ro2 = (obj.o_int(&(*d).ar, roh) as i32) as u32
+    }
+    let kids: u32 = doc_dict_get(d, node, (&kn[0]) as u64, 4)
+    let ty: u32 = doc_dict_get(d, node, (&tn[0]) as u64, 4)
+    let is_leaf: bool = obj.o_name_eq(&(*d).ar, ty, (&pg[0]) as u64, 4) ||
+    (obj.o_kind(&(*d).ar, kids) != obj.T_ARR &&
+    !obj.o_name_eq(&(*d).ar, ty, (&pgs[0]) as u64, 5))
+    if is_leaf {
+        if !grow_pages(d) {
+            return
+        }
+        let i: usize = (*d).npages
+        *(((*d).pages as u64 + (i * 4) as u64) as *mut u32) = node
+        *(((*d).pres as u64 + (i * 4) as u64) as *mut u32) = r2
+        *(((*d).pmb as u64 + (i * 4) as u64) as *mut u32) = m2
+        *(((*d).pcb as u64 + (i * 4) as u64) as *mut u32) = c2
+        *(((*d).prot as u64 + (i * 4) as u64) as *mut u32) = ro2
+        (*d).npages = i + 1
+        return
+    }
+    let n: usize = obj.o_arr_len(&(*d).ar, kids)
+    var k: usize = 0
+    while k < n {
+        let kid: u32 = doc_resolve(d, obj.o_arr_at(&(*d).ar, kids, k))
+        walk_pages(d, kid, r2, m2, c2, ro2, depth + 1, visited, nvis)
+        k = k + 1
+    }
+    if *nvis > 0 {
+        *nvis = *nvis - 1
+    }
+}
+
+fn pages_by_scan(d: *mut Doc) {
+    var t: [u8; 4] = "Type"
+    var pg: [u8; 4] = "Page"
+    var rn: [u8; 9] = "Resources"
+    var mn: [u8; 8] = "MediaBox"
+    var ron: [u8; 6] = "Rotate"
+    var num: usize = 1
+    while num < (*d).nobj && (*d).npages < MAX_PAGES {
+        if *(((*d).typ as u64 + num as u64) as *mut u8) != 0 as u8 {
+            let h: u32 = doc_get(d, num)
+            if obj.o_kind(&(*d).ar, h) == obj.T_DICT {
+                let ty: u32 = doc_dict_get(d, h, (&t[0]) as u64, 4)
+                if obj.o_name_eq(&(*d).ar, ty, (&pg[0]) as u64, 4) {
+                    if grow_pages(d) {
+                        let i: usize = (*d).npages
+                        *(((*d).pages as u64 + (i * 4) as u64) as *mut u32) = h
+                        *(((*d).pres as u64 + (i * 4) as u64) as *mut u32) =
+                        doc_dict_get(d, h, (&rn[0]) as u64, 9)
+                        *(((*d).pmb as u64 + (i * 4) as u64) as *mut u32) =
+                        doc_dict_get(d, h, (&mn[0]) as u64, 8)
+                        *(((*d).pcb as u64 + (i * 4) as u64) as *mut u32) = 0
+                        var ro: u32 = 0
+                        let roh: u32 = doc_dict_get(d, h, (&ron[0]) as u64, 6)
+                        if obj.o_is_num(&(*d).ar, roh) {
+                            ro = (obj.o_int(&(*d).ar, roh) as i32) as u32
+                        }
+                        *(((*d).prot as u64 + (i * 4) as u64) as *mut u32) = ro
+                        (*d).npages = i + 1
+                    }
+                }
+            }
+        }
+        num = num + 1
+    }
+}
+
+fn doc_page_box(d: *mut Doc, i: usize, crop: bool, out: *mut f64) -> bool {
+    var h: u32 = 0
+    if i < (*d).npages {
+        if crop {
+            h = *(((*d).pcb as u64 + (i * 4) as u64) as *mut u32)
+        }
+        if h == 0 as u32 {
+            h = *(((*d).pmb as u64 + (i * 4) as u64) as *mut u32)
+        }
+    }
+    if obj.o_kind(&(*d).ar, h) != obj.T_ARR ||
+    obj.o_arr_len(&(*d).ar, h) < 4 {
+        *((out as u64) as *mut f64) = 0.0
+        *((out as u64 + 8) as *mut f64) = 0.0
+        *((out as u64 + 16) as *mut f64) = 612.0
+        *((out as u64 + 24) as *mut f64) = 792.0
+        return false
+    }
+    var v: [f64; 4] = [0.0; 4]
+    var k: usize = 0
+    while k < 4 {
+        v[k] = obj.o_num(&(*d).ar,
+            doc_resolve(d, obj.o_arr_at(&(*d).ar, h, k)))
+        k = k + 1
+    }
+    var x0: f64 = v[0]
+    var x1: f64 = v[2]
+    if x0 > x1 {
+        x0 = v[2]
+        x1 = v[0]
+    }
+    var y0: f64 = v[1]
+    var y1: f64 = v[3]
+    if y0 > y1 {
+        y0 = v[3]
+        y1 = v[1]
+    }
+    *((out as u64) as *mut f64) = x0
+    *((out as u64 + 8) as *mut f64) = y0
+    *((out as u64 + 16) as *mut f64) = x1
+    *((out as u64 + 24) as *mut f64) = y1
+    return true
+}
+
+fn doc_open(d: *mut Doc, data: u64, len: usize) -> bool {
+    (*d).data = data
+    (*d).len = len
+    if !obj.arena_init(&(*d).ar) {
+        (*d).err = E_BROKEN
+        return false
+    }
+    if !find_header(d) {
+        (*d).err = E_NOHEADER
+        return false
+    }
+    var n: usize = len / 8 + 64
+    if n > MAX_NUM {
+        n = MAX_NUM
+    }
+    (*d).nobj = n
+    (*d).typ = mem.heap_alloc(n)
+    (*d).off = mem.heap_alloc(n * 8) as *mut u64
+    (*d).sidx = mem.heap_alloc(n * 4) as *mut u32
+    (*d).cache = mem.heap_alloc(n * 4) as *mut u32
+    (*d).busy = mem.heap_alloc(n)
+    if (*d).typ as usize == 0 || (*d).off as usize == 0 ||
+    (*d).sidx as usize == 0 || (*d).cache as usize == 0 ||
+    (*d).busy as usize == 0 {
+        (*d).err = E_BROKEN
+        return false
+    }
+    var sx: [u8; 9] = "startxref"
+    var found: usize = 0
+    var i: usize = len
+    var back: usize = 0
+    while i > 0 && back < 4096 {
+        i = i - 1
+        back = back + 1
+        if ld8(data, i) == 115 as u8 && lit_at(d, i, (&sx[0]) as u64, 9) {
+            found = i + 9
+            i = 0
+        }
+    }
+    var first: usize = 0
+    if found > 0 {
+        var j: usize = found
+        while j < len && is_ws(ld8(data, j)) {
+            j = j + 1
+        }
+        var v: usize = 0
+        while j < len && is_digit(ld8(data, j)) {
+            v = v * 10 + ((ld8(data, j) as usize) - 48)
+            j = j + 1
+        }
+        first = v + (*d).base
+    }
+    var ok: bool = false
+    if first > 0 && first < len {
+        ok = follow_chain(d, first)
+    }
+    var rn: [u8; 4] = "Root"
+    if (*d).trailer != 0 as u32 {
+        let rh: u32 = doc_dict_get(d, (*d).trailer, (&rn[0]) as u64, 4)
+        if obj.o_kind(&(*d).ar, rh) == obj.T_DICT {
+            (*d).root = rh
+        }
+    }
+    if !ok || (*d).root == 0 as u32 {
+        rebuild(d)
+        if (*d).trailer != 0 as u32 && (*d).root == 0 as u32 {
+            let rh2: u32 = doc_dict_get(d, (*d).trailer, (&rn[0]) as u64, 4)
+            if obj.o_kind(&(*d).ar, rh2) == obj.T_DICT {
+                (*d).root = rh2
+            }
+        }
+        if (*d).root == 0 as u32 {
+            find_catalog(d)
+        }
+    }
+    var en: [u8; 7] = "Encrypt"
+    if (*d).trailer != 0 as u32 &&
+    obj.dict_get(&(*d).ar, (*d).trailer, (&en[0]) as u64, 7) != 0 as u32 {
+        (*d).encrypted = 1
+    }
+    var pn: [u8; 5] = "Pages"
+    var visited: [u32; 64] = [0 as u32; 64]
+    var nvis: usize = 0
+    if (*d).root != 0 as u32 {
+        let ph: u32 = doc_dict_get(d, (*d).root, (&pn[0]) as u64, 5)
+        if obj.o_kind(&(*d).ar, ph) == obj.T_DICT {
+            walk_pages(d, ph, 0, 0, 0, 0, 0, (&visited[0]) as *mut u32,
+                &nvis)
+        }
+    }
+    if (*d).npages == 0 {
+        if (*d).recovered == 0 as u32 {
+            rebuild(d)
+            nvis = 0
+            if (*d).root != 0 as u32 {
+                let ph2: u32 = doc_dict_get(d, (*d).root, (&pn[0]) as u64, 5)
+                if obj.o_kind(&(*d).ar, ph2) == obj.T_DICT {
+                    walk_pages(d, ph2, 0, 0, 0, 0, 0,
+                        (&visited[0]) as *mut u32, &nvis)
+                }
+            }
+        }
+    }
+    if (*d).npages == 0 {
+        pages_by_scan(d)
+    }
+    if (*d).encrypted != 0 as u32 {
+        (*d).err = E_ENCRYPTED
+        return false
+    }
+    if (*d).npages == 0 {
+        (*d).err = E_NOPAGES
+        return false
+    }
+    (*d).err = E_OK
+    return true
+}
