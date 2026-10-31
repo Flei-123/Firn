@@ -72,8 +72,8 @@ done
 [ "$(num B spawns)" -ge 2 ] 2>/dev/null || { echo "  FAIL  B did not see player + item spawn"; ERR=1; }
 INV=$(grep "mcplay: inv updates" "$W/A.out" | tail -1)
 echo "  A: ${INV:0:140}"
-[ "$(echo "$INV" | grep -o "updates=[0-9]*" | cut -d= -f2)" -ge 1 ] 2>/dev/null || { echo "  FAIL  A got no inventory update"; ERR=1; }
-[ "$(echo "$INV" | grep -o " bad=[0-9]*" | cut -d= -f2)" = 0 ] || { echo "  FAIL  A: bad inventory packets"; ERR=1; }
+[ "$(echo "$INV" | grep -o " updates=[0-9]*" | head -1 | cut -d= -f2)" -ge 1 ] 2>/dev/null || { echo "  FAIL  A got no inventory update"; ERR=1; }
+[ "$(echo "$INV" | grep -o " bad=[0-9]*" | head -1 | cut -d= -f2)" = 0 ] || { echo "  FAIL  A: bad inventory packets"; ERR=1; }
 echo "$INV" | grep -q "hotbar=-1x0," && [ "${SERVER:-firn}" = firn ] && { echo "  FAIL  A hotbar slot 0 empty after pickup"; ERR=1; }
 grep -E "dig=|bchange" "$W/A.out" | tail -1 | cut -c1-200 | sed 's/^/  A: /'
 grep -E "rror|xception|lost connection|Kick" "$W/server.log" | tail -3 | cut -c1-200 | sed 's/^/  srv: /'
