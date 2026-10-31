@@ -153,6 +153,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "constant folding (Bin/Cmp/Un/Cast with constant operands)",
     },
     PassInfo {
+        name: "vectorize",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "SSE2 loop vectorizer (x86-64): reductions, maps and stores over Vec elements with run-time alias checks",
+    },
+    PassInfo {
         name: "sroa",
         scope: Scope::Func,
         debug_preserving: false,
@@ -1154,6 +1160,15 @@ fn optimize_func_inner(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &m
             }
             break;
         }
+    }
+    if cfg.runs("vectorize") {
+        let t = std::time::Instant::now();
+        let n = crate::vectorize::run(f);
+        clk.add2("vectorize", t, n > 0);
+        if n > 0 {
+            remove_dead_insts(f, st);
+        }
+        phi_check(f, "vectorize");
     }
     // ROUND TEMPO 10 -- VERY LAST, AND ONLY ONCE.
     //

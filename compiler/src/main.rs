@@ -93,6 +93,8 @@ mod loadpre;
 mod storemerge;
 mod sroa;
 mod unroll;
+mod vectorize;
+mod vectorize_emit;
 mod vec2reg;
 mod ivsr;
 mod addrsink;
