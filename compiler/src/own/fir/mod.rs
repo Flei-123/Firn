@@ -51,11 +51,11 @@ pub(crate) fn prepare(m: &mut Module) {
     }
 }
 
-pub(crate) fn run(m: &mut Module) -> Vec<usize> {
+pub(crate) fn run(m: &mut Module) {
     let mode = super::mode();
     let free_fn = registry::free_fn(mode);
     if !m.funcs.iter().any(|f| f.name == free_fn) {
-        return Vec::new();
+        return;
     }
     let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
     let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
@@ -66,7 +66,7 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     let base: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
     if base.is_empty() {
         report(sites, frees, reuses, t0);
-        return Vec::new();
+        return;
     }
     let ts = std::time::Instant::now();
     let (sums, roots, st) = summary::compute(m, &base);
@@ -75,12 +75,12 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     let plans = crate::parfn::map_slice(&roots, |&fi| analyze(&m.funcs[fi], &sums, reuse_on, reuse_calls));
     let ana_ms = ta.elapsed().as_millis();
     let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
-    let mut reverted: Vec<usize> = Vec::new();
+    let mut reverted = 0usize;
     for (&fi, plan) in roots.iter().zip(plans) {
         let f = &mut m.funcs[fi];
         sites += plan.sites;
         if revert_calls(f, &plan.kept, &defined) {
-            reverted.push(fi);
+            reverted += 1;
         }
         if let Some((sl, d, drops, plans, allocs, exits)) = plan.pending {
             let fns: Vec<&str> = drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
@@ -102,14 +102,9 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
         );
     }
     report(sites, frees, reuses, t0);
-    if reverted.is_empty() {
-        return reverted;
-    }
-    let changed = inline_reverted(m);
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
-        eprintln!("ownership fir: reverted calls in {} functions, {} changed by inlining", reverted.len(), changed.len());
+        eprintln!("ownership fir: reverted calls in {} functions", reverted);
     }
-    changed
 }
 
 struct Plan {
@@ -166,25 +161,6 @@ fn revert_calls(f: &mut crate::fir::Func, kept: &crate::fx::HashSet<(usize, usiz
         }
     }
     any
-}
-
-fn inline_reverted(m: &mut Module) -> Vec<usize> {
-    let mut saved: Vec<(usize, Option<bool>)> = Vec::new();
-    for (i, f) in m.funcs.iter_mut().enumerate() {
-        let mine = registry::RENAMES.iter().any(|(from, _)| *from == f.name);
-        if mine || f.inline_hint == Some(true) {
-            saved.push((i, f.inline_hint));
-            f.inline_hint = if mine { Some(true) } else { None };
-        }
-    }
-    let mut changed = Vec::new();
-    crate::inline::inline_requested_tracked(m, &mut changed);
-    for (i, h) in saved {
-        m.funcs[i].inline_hint = h;
-    }
-    changed.sort_unstable();
-    changed.dedup();
-    changed
 }
 
 fn has_producer_call(f: &crate::fir::Func) -> bool {

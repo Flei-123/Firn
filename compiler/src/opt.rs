@@ -535,11 +535,9 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     let mut st = optimize_with_taken(m, cfg);
     crate::gtaken::set(None);
     if own {
-        let changed = crate::own::fir::run(m);
-        if !changed.is_empty() {
-            let mut clk = PassClock::default();
-            optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
-        }
+        let mut stage = StageClock::new();
+        crate::own::fir::run(m);
+        stage.mark("ownership fir");
     }
     st
 }

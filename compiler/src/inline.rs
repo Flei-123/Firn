@@ -676,10 +676,6 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
     }
 }
 
-pub(crate) fn inline_requested_tracked(m: &mut Module, changed: &mut Vec<usize>) -> usize {
-    inline_module_track(m, true, changed)
-}
-
 /// Round EINBETTEN -- only the EXPLICITLY requested inlinings.
 ///
 /// This is the pass for the default level (`dev-fast`). The size rule stays
