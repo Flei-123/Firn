@@ -29,9 +29,11 @@ check_targets() {
 
 check_osum() {
   local osum=${OSUM_DIR:-/root/jarvis/projects/u_DiS4in7esMF1/osum}
-  local lib=$osum/vendor/firn/lib
+  local pin=${OSUM_PIN:-5e447fc8}
+  mkdir -p "$D/osum"
+  git -C "$osum" archive "$pin" kernel | tar -x -C "$D/osum"
   for f in kernel/kmain.fi kernel/uprog.fi kernel/user/settings.fi; do
-    if (cd "$osum" && FIRNLIB=$lib "$FIRNC" --no-cache --ownership="$MODE" "$f" -o "$D/osum.o") > "$D/osum.log" 2>&1; then
+    if (cd "$D/osum" && FIRN_USE_AS=1 "$FIRNC" --no-cache --ownership="$MODE" "$f" -o "$D/osum.o") > "$D/osum.log" 2>&1; then
       emit "osum:$f" build_ok 0
     else
       emit "osum:$f" build_fail 1
