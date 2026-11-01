@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8mc
+import media.video.vp8.vp8mem
+import media.video.vp8.vp8recon
+import media.video.vp8.vp8state
+
+export { recon_inter_mb }
+
+fn div_trunc(a: i64, b: i64) -> i64 {
+    if a < 0 {
+        return 0 - ((0 - a) / b)
+    }
+    return a / b
+}
+
+fn full_pixel(f: *mut vp8state.Vp8, v: i64) -> i64 {
+    if (*f).version == 3 {
+        return v & (0 - 8)
+    }
+    return v
+}
+
+fn chroma_mv_whole(f: *mut vp8state.Vp8, v: i64) -> i64 {
+    var s: i64 = 1
+    if v < 0 {
+        s = 0 - 1
+    }
+    return full_pixel(f, div_trunc(v + s, 2))
+}
+
+fn chroma_mv_quad(f: *mut vp8state.Vp8, sum: i64) -> i64 {
+    var t: i64 = sum + 4
+    if sum < 0 {
+        t = sum - 4
+    }
+    return full_pixel(f, div_trunc(t, 8))
+}
+
+fn block_mv(mb: u64, b: i64, comp: usize) -> i64 {
+    return vp8mem.ldi(mb, vp8state.C_SMV + (b * 2) as usize + comp)
+}
+
+fn predict_luma(f: *mut vp8state.Vp8, ry: u64, row: i64, col: i64, mb: u64, yp: u64, bil: bool) {
+    let ys: i64 = (*f).ys
+    let pw: i64 = (*f).mbw * 16
+    let ph: i64 = (*f).mbh * 16
+    if vp8mem.ldi(mb, vp8state.C_YMODE) != vp8state.Y_SPLIT {
+        vp8mc.predict_block(bil, ry, ys, pw, ph, col * 16, row * 16, vp8mem.ldi(mb, vp8state.C_MVX),
+            vp8mem.ldi(mb, vp8state.C_MVY), 16, 16, yp, ys, (*f).emu, (*f).tmp)
+        return
+    }
+    var q: i64 = 0
+    while q < 4 {
+        let b0: i64 = (q >> 1) * 8 + (q & 1) * 2
+        let qy: i64 = block_mv(mb, b0, 0)
+        let qx: i64 = block_mv(mb, b0, 1)
+        let same: bool = block_mv(mb, b0 + 1, 0) == qy && block_mv(mb, b0 + 1, 1) == qx
+            && block_mv(mb, b0 + 4, 0) == qy && block_mv(mb, b0 + 4, 1) == qx
+            && block_mv(mb, b0 + 5, 0) == qy && block_mv(mb, b0 + 5, 1) == qx
+        let ox: i64 = (q & 1) * 8
+        let oy: i64 = (q >> 1) * 8
+        if same {
+            vp8mc.predict_block(bil, ry, ys, pw, ph, col * 16 + ox, row * 16 + oy, qx, qy, 8, 8,
+                ((yp as i64) + oy * ys + ox) as u64, ys, (*f).emu, (*f).tmp)
+        } else {
+            var s: i64 = 0
+            while s < 4 {
+                let b: i64 = b0 + (s >> 1) * 4 + (s & 1)
+                let sx: i64 = ox + (s & 1) * 4
+                let sy: i64 = oy + (s >> 1) * 4
+                vp8mc.predict_block(bil, ry, ys, pw, ph, col * 16 + sx, row * 16 + sy, block_mv(mb, b, 1),
+                    block_mv(mb, b, 0), 4, 4, ((yp as i64) + sy * ys + sx) as u64, ys, (*f).emu, (*f).tmp)
+                s = s + 1
+            }
+        }
+        q = q + 1
+    }
+}
+
+fn predict_chroma_plane(f: *mut vp8state.Vp8, rp: u64, row: i64, col: i64, mb: u64, dp: u64, bil: bool) {
+    let uvs: i64 = (*f).uvs
+    let pw: i64 = (*f).mbw * 8
+    let ph: i64 = (*f).mbh * 8
+    if vp8mem.ldi(mb, vp8state.C_YMODE) != vp8state.Y_SPLIT {
+        let cy: i64 = chroma_mv_whole(f, vp8mem.ldi(mb, vp8state.C_MVY))
+        let cx: i64 = chroma_mv_whole(f, vp8mem.ldi(mb, vp8state.C_MVX))
+        vp8mc.predict_block(bil, rp, uvs, pw, ph, col * 8, row * 8, cx, cy, 8, 8, dp, uvs, (*f).emu, (*f).tmp)
+        return
+    }
+    var i: i64 = 0
+    while i < 2 {
+        var j: i64 = 0
+        while j < 2 {
+            let b: i64 = i * 8 + j * 2
+            let sy: i64 = block_mv(mb, b, 0) + block_mv(mb, b + 1, 0) + block_mv(mb, b + 4, 0) + block_mv(mb, b + 5, 0)
+            let sx: i64 = block_mv(mb, b, 1) + block_mv(mb, b + 1, 1) + block_mv(mb, b + 4, 1) + block_mv(mb, b + 5, 1)
+            vp8mc.predict_block(bil, rp, uvs, pw, ph, col * 8 + j * 4, row * 8 + i * 4, chroma_mv_quad(f, sx),
+                chroma_mv_quad(f, sy), 4, 4, ((dp as i64) + i * 4 * uvs + j * 4) as u64, uvs, (*f).emu, (*f).tmp)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn recon_inter_mb(f: *mut vp8state.Vp8, mb: u64, row: i64, col: i64) {
+    let rbuf: i64 = (*f).refs[vp8mem.ldi(mb, vp8state.C_REF) as usize]
+    let ys: i64 = (*f).ys
+    let uvs: i64 = (*f).uvs
+    let skip: i64 = vp8mem.ldi(mb, vp8state.C_SKIP)
+    let bil: bool = (*f).version != 0
+    let yp: u64 = ((vp8state.plane_y(f, (*f).cur) as i64) + row * 16 * ys + col * 16) as u64
+    let up: u64 = ((vp8state.plane_u(f, (*f).cur) as i64) + row * 8 * uvs + col * 8) as u64
+    let vp: u64 = ((vp8state.plane_v(f, (*f).cur) as i64) + row * 8 * uvs + col * 8) as u64
+    predict_luma(f, vp8state.plane_y(f, rbuf), row, col, mb, yp, bil)
+    predict_chroma_plane(f, vp8state.plane_u(f, rbuf), row, col, mb, up, bil)
+    predict_chroma_plane(f, vp8state.plane_v(f, rbuf), row, col, mb, vp, bil)
+    if skip == 0 {
+        vp8recon.recon_residual_luma(f, yp, ys, vp8mem.ldi(mb, vp8state.C_YMODE) != vp8state.Y_SPLIT)
+        vp8recon.recon_residual_chroma(f, up, vp, uvs)
+    }
+}
