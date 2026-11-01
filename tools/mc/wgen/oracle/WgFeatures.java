@@ -45,6 +45,8 @@ public class WgFeatures {
         BiomeManager bm;
         BiomeManager.NoiseBiomeSource nbs;
         RandomSource rnd = new XoroshiroRandomSource(0L);
+        boolean setOn;
+        String setFile;
 
         void set(BlockPos p, BlockState st) {
             ChunkAccess c = chunk(p.getX() >> 4, p.getZ() >> 4);
@@ -90,6 +92,12 @@ public class WgFeatures {
                 case "setBlock": {
                     BlockPos p = (BlockPos) args[0];
                     if (!r.canWrite(p)) return false;
+                    if (r.setOn) {
+                        try {
+                            java.nio.file.Files.write(java.nio.file.Paths.get(r.setFile), ("SET " + p.getX() + " " + p.getY() + " " + p.getZ() + " " + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(((BlockState) args[1]).getBlock()).getPath() + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                        } catch (java.io.IOException ex) {
+                        }
+                    }
                     r.set(p, (BlockState) args[1]);
                     return true;
                 }
@@ -196,7 +204,26 @@ public class WgFeatures {
         Map<PlacedFeature, String> pfNames = new java.util.IdentityHashMap<>();
         e.prov.lookupOrThrow(Registries.PLACED_FEATURE).listElements().forEach(h -> pfNames.put(h.value(), h.key().location().getPath()));
         java.util.Set<String> failed = new java.util.TreeSet<>();
-        WorldgenRandom rnd = new WorldgenRandom(new XoroshiroRandomSource(0L));
+        final boolean[] dbgOn = new boolean[1];
+        final int[] dbgIdx = new int[1];
+        final String dbgFile = System.getProperty("wg.drawlog");
+        final String dbgSel = System.getProperty("wg.drawsel");
+        WorldgenRandom rnd = new WorldgenRandom(new XoroshiroRandomSource(0L)) {
+            @Override
+            public int next(int bits) {
+                int v = super.next(bits);
+                if (dbgOn[0]) {
+                    StackTraceElement[] st = new Throwable().getStackTrace();
+                    StringBuilder sb = new StringBuilder();
+                    for (int q = 1; q < Math.min(st.length, 6); q++) sb.append(st[q].getClassName().replaceAll(".*\\.", "")).append(".").append(st[q].getMethodName()).append(":").append(st[q].getLineNumber()).append(" ");
+                    try {
+                        java.nio.file.Files.write(java.nio.file.Paths.get(dbgFile), ("D " + (dbgIdx[0]++) + " " + bits + " " + v + " " + sb + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                    } catch (java.io.IOException ex) {
+                    }
+                }
+                return v;
+            }
+        };
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
                 int nx = cx + dx;
@@ -227,7 +254,25 @@ public class WgFeatures {
                         if (dirOnly && !allowed.contains(pfNames.get(pf))) continue;
                         rnd.setFeatureSeed(l, n, j);
                         try {
+                            dbgOn[0] = dbgSel != null && dbgSel.equals(nx + ":" + nz + ":" + j + ":" + n);
+                            dbgIdx[0] = 0;
+                            r.setOn = dbgOn[0] && System.getProperty("wg.setlog") != null;
+                            r.setFile = dbgFile;
+                            if (dbgOn[0] && System.getProperty("wg.colprobe") != null) {
+                                String[] cp = System.getProperty("wg.colprobe").split(":");
+                                StringBuilder cs = new StringBuilder("COL");
+                                for (int yy = Integer.parseInt(cp[2]); yy <= Integer.parseInt(cp[3]); yy++) {
+                                    BlockPos cpos = new BlockPos(Integer.parseInt(cp[0]), yy, Integer.parseInt(cp[1]));
+                                    cs.append(" ").append(yy).append("=").append(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(level.getBlockState(cpos).getBlock()).getPath()).append("/s").append(level.getBlockState(cpos).isSolid() ? 1 : 0).append("/").append(level.getBiome(cpos).unwrapKey().get().location().getPath());
+                                }
+                                java.nio.file.Files.write(java.nio.file.Paths.get(dbgFile), (cs + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                            }
                             pf.placeWithBiomeCheck(level, gen, rnd, origin);
+                            dbgOn[0] = false;
+                            r.setOn = false;
+                            if (System.getProperty("wg.cntlog") != null) {
+                                java.nio.file.Files.write(java.nio.file.Paths.get(System.getProperty("wg.cntlog")), ("CNT " + cx + " " + cz + " " + nx + " " + nz + " " + j + " " + n + " " + rnd.getCount() + " " + pfNames.get(pf) + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                            }
                         } catch (RuntimeException ex) {
                             if (dirOnly) throw ex;
                             failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
