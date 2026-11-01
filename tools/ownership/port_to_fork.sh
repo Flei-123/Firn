@@ -15,6 +15,12 @@ fi
 if [ ! -e "$DST/compiler/src/parfn.rs" ]; then
   cp "$SRC/tools/ownership/fork_parfn.rs" "$DST/compiler/src/parfn.rs"
   sed -i '0,/^mod fx;/s//mod fx;\nmod parfn;/' "$DST/compiler/src/main.rs"
+elif ! grep -q "fn map_weighted" "$DST/compiler/src/parfn.rs"; then
+  sed -n "/^pub(crate) fn map_weighted/,\$p" "$SRC/tools/ownership/fork_parfn.rs" > "$DST/compiler/src/parfn.tmp"
+  (echo; cat "$DST/compiler/src/parfn.tmp") >> "$DST/compiler/src/parfn.rs"
+  rm "$DST/compiler/src/parfn.tmp"
+  sed -i '1i use crate::fir::Func;' "$DST/compiler/src/parfn.rs"
+  sed -i 's/^fn threads()/pub(crate) fn threads()/' "$DST/compiler/src/parfn.rs"
 fi
 if ! grep -q "fn for_each_use_mut" "$DST/compiler/src/fir.rs"; then
   python3 -I - "$SRC/tools/ownership/fork_use_mut.rs.inc" "$DST/compiler/src/fir.rs" <<'PY'
