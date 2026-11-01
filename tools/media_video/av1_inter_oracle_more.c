@@ -144,8 +144,9 @@ static uint32_t case_warpest(const int *p) {
   int pts1[16], pts2[16];
   for (int i = 0; i < 16; i++) { pts1[i] = p[7 + i]; pts2[i] = p[23 + i]; }
   WarpedMotionParams wm; memset(&wm, 0, sizeof(wm)); wm.wmtype = AFFINE;
-  int bs = 0;
+  int bs = -1;
   for (int b = 0; b < 22; b++) if (blk_w[b] == bw && blk_h[b] == bh) bs = b;
+  if (bs < 0) exit(3);
   int bad = av1_find_projection(np, pts1, pts2, bs, mvy, mvx, &wm, mi_row, mi_col);
   uint32_t hsh = 2166136261u;
   hsh = fnv(hsh, bad ? 0 : 1);

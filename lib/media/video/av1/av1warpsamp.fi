@@ -1,176 +1,159 @@
 // SPDX-License-Identifier: MPL-2.0
-import media.video.av1.av1blkst
-import media.video.av1.av1blkdat
-import media.video.av1.av1interdef
-import media.video.av1.av1interctx
-import media.video.av1.av1intermv
+import media.video.av1.av1ipm
 
-export { find_warp_samples, has_overlappable_candidates, SAMPLES_MAX }
+export { find_samples, select_samples, FIELD_REF0, FIELD_REF1, FIELD_W4, FIELD_H4, FIELD_MV_ROW, FIELD_MV_COL, MAX_SAMPLES }
 
-const SAMPLES_MAX: i64 = 8
+const MAX_SAMPLES: i64 = 8
+const FIELD_REF0: i64 = 0
+const FIELD_REF1: i64 = 1
+const FIELD_W4: i64 = 2
+const FIELD_H4: i64 = 3
+const FIELD_MV_ROW: i64 = 4
+const FIELD_MV_COL: i64 = 5
 
-fn inside(td: *mut av1blkst.TileDec, r: i64, c: i64) -> bool {
-    return c >= (*td).mi_col_start && c < (*td).mi_col_end && r >= (*td).mi_row_start && r < (*td).mi_row_end
+fn record_sample(get: fn(u64, i64, i64, i64) -> i64, ctx: u64, row: i64, col: i64, row_offset: i64, sign_r: i64, col_offset: i64, sign_c: i64, pts: u64, inref: u64, n: i64) {
+    let bw: i64 = get(ctx, FIELD_W4, row, col) * 4
+    let bh: i64 = get(ctx, FIELD_H4, row, col) * 4
+    let x: i64 = col_offset * 4 + (sign_c * bw) / 2 - 1
+    let y: i64 = row_offset * 4 + (sign_r * bh) / 2 - 1
+    let px: i64 = x * 8
+    let py: i64 = y * 8
+    av1ipm.st64(pts, n * 2, px)
+    av1ipm.st64(pts, n * 2 + 1, py)
+    av1ipm.st64(inref, n * 2, px + get(ctx, FIELD_MV_COL, row, col))
+    av1ipm.st64(inref, n * 2 + 1, py + get(ctx, FIELD_MV_ROW, row, col))
 }
 
-fn add_sample(td: *mut av1blkst.TileDec, scanned: *mut i64, delta_row: i64, delta_col: i64) {
-    if *scanned >= SAMPLES_MAX {
-        return
-    }
-    let r: i64 = (*td).mi_row + delta_row
-    let c: i64 = (*td).mi_col + delta_col
-    if !inside(td, r, c) {
-        return
-    }
-    if av1blkst.mi_get(td, (*td).wr_a, r, c) == 0 {
-        return
-    }
-    if av1interctx.nb_ref(td, r, c, 0) != (*td).ref_frame[0] || av1interctx.nb_ref(td, r, c, 1) != av1interdef.NONE_FRAME {
-        return
-    }
-    let cand_size: i64 = av1blkst.mi_get(td, (*td).mi_size_a, r, c)
-    let w4: i64 = av1blkdat.bw4(cand_size)
-    let h4: i64 = av1blkdat.bh4(cand_size)
-    let cand_row: i64 = r & (0 - h4)
-    let cand_col: i64 = c & (0 - w4)
-    let mid_y: i64 = cand_row * 4 + h4 * 2 - 1
-    let mid_x: i64 = cand_col * 4 + w4 * 2 - 1
-    let bw: i64 = av1blkdat.bw_px((*td).mi_size)
-    let bh: i64 = av1blkdat.bh_px((*td).mi_size)
-    var mx: i64 = bw
-    if bh > mx {
-        mx = bh
-    }
-    let thresh: i64 = av1interdef.clip3(16, 112, mx)
-    let mv_r: i64 = av1intermv.mv_load(td, r, c, 0, 0)
-    let mv_c: i64 = av1intermv.mv_load(td, r, c, 0, 1)
-    let diff: i64 = av1interdef.abs_i(mv_r - (*td).mvs[0]) + av1interdef.abs_i(mv_c - (*td).mvs[1])
-    let valid: bool = diff <= thresh
-    *scanned = *scanned + 1
-    if !valid && *scanned > 1 {
-        return
-    }
-    let n: i64 = (*td).num_samples * 4
-    (*td).samples[n as usize] = mid_y * 8
-    (*td).samples[(n + 1) as usize] = mid_x * 8
-    (*td).samples[(n + 2) as usize] = mid_y * 8 + mv_r
-    (*td).samples[(n + 3) as usize] = mid_x * 8 + mv_c
-    if valid {
-        (*td).num_samples = (*td).num_samples + 1
-    }
+fn matches(get: fn(u64, i64, i64, i64) -> i64, ctx: u64, row: i64, col: i64, ref0: i64) -> bool {
+    return get(ctx, FIELD_REF0, row, col) == ref0 && get(ctx, FIELD_REF1, row, col) == 0 - 1
 }
 
-fn find_warp_samples(td: *mut av1blkst.TileDec) {
-    (*td).num_samples = 0
-    var scanned: i64 = 0
-    let w4: i64 = (*td).bw4
-    let h4: i64 = (*td).bh4
-    var do_top_left: bool = true
-    var do_top_right: bool = true
-    if (*td).avail_u != 0 {
-        let src_w: i64 = av1blkdat.bw4(av1blkst.mi_get(td, (*td).mi_size_a, (*td).mi_row - 1, (*td).mi_col))
-        if w4 <= src_w {
-            let col_off: i64 = 0 - ((*td).mi_col & (src_w - 1))
-            if col_off < 0 {
-                do_top_left = false
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn find_samples(get: fn(u64, i64, i64, i64) -> i64, ctx: u64, mi_row: i64, mi_col: i64, bw4: i64, bh4: i64, mi_rows: i64, mi_cols: i64, up_avail: i64, left_avail: i64, tr_avail: i64, ref0: i64, pts: u64, inref: u64) -> i64 {
+    var np: i64 = 0
+    var do_tl: bool = true
+    var do_tr: bool = true
+    if up_avail != 0 {
+        var sbw: i64 = get(ctx, FIELD_W4, 0 - 1, 0)
+        if bw4 <= sbw {
+            let col_offset: i64 = 0 - (mi_col % sbw)
+            if col_offset < 0 {
+                do_tl = false
             }
-            if col_off + src_w > w4 {
-                do_top_right = false
+            if col_offset + sbw > bw4 {
+                do_tr = false
             }
-            add_sample(td, &scanned, 0 - 1, 0)
+            if matches(get, ctx, 0 - 1, 0, ref0) {
+                record_sample(get, ctx, 0 - 1, 0, 0, 0 - 1, col_offset, 1, pts, inref, np)
+                np = np + 1
+                if np >= MAX_SAMPLES {
+                    return MAX_SAMPLES
+                }
+            }
         } else {
-            var lim: i64 = (*td).mi_cols - (*td).mi_col
-            if w4 < lim {
-                lim = w4
-            }
+            let lim: i64 = imin(bw4, mi_cols - mi_col)
             var i: i64 = 0
             while i < lim {
-                let sw: i64 = av1blkdat.bw4(av1blkst.mi_get(td, (*td).mi_size_a, (*td).mi_row - 1, (*td).mi_col + i))
-                var step: i64 = w4
-                if sw < step {
-                    step = sw
+                sbw = get(ctx, FIELD_W4, 0 - 1, i)
+                if matches(get, ctx, 0 - 1, i, ref0) {
+                    record_sample(get, ctx, 0 - 1, i, 0, 0 - 1, i, 1, pts, inref, np)
+                    np = np + 1
+                    if np >= MAX_SAMPLES {
+                        return MAX_SAMPLES
+                    }
                 }
-                add_sample(td, &scanned, 0 - 1, i)
-                i = i + step
+                i = i + sbw
             }
         }
     }
-    if (*td).avail_l != 0 {
-        let src_h: i64 = av1blkdat.bh4(av1blkst.mi_get(td, (*td).mi_size_a, (*td).mi_row, (*td).mi_col - 1))
-        if h4 <= src_h {
-            let row_off: i64 = 0 - ((*td).mi_row & (src_h - 1))
-            if row_off < 0 {
-                do_top_left = false
+    if left_avail != 0 {
+        var sbh: i64 = get(ctx, FIELD_H4, 0, 0 - 1)
+        if bh4 <= sbh {
+            let row_offset: i64 = 0 - (mi_row % sbh)
+            if row_offset < 0 {
+                do_tl = false
             }
-            add_sample(td, &scanned, 0, 0 - 1)
+            if matches(get, ctx, 0, 0 - 1, ref0) {
+                record_sample(get, ctx, 0, 0 - 1, row_offset, 1, 0, 0 - 1, pts, inref, np)
+                np = np + 1
+                if np >= MAX_SAMPLES {
+                    return MAX_SAMPLES
+                }
+            }
         } else {
-            var lim: i64 = (*td).mi_rows - (*td).mi_row
-            if h4 < lim {
-                lim = h4
-            }
+            let lim: i64 = imin(bh4, mi_rows - mi_row)
             var i: i64 = 0
             while i < lim {
-                let sh: i64 = av1blkdat.bh4(av1blkst.mi_get(td, (*td).mi_size_a, (*td).mi_row + i, (*td).mi_col - 1))
-                var step: i64 = h4
-                if sh < step {
-                    step = sh
+                sbh = get(ctx, FIELD_H4, i, 0 - 1)
+                if matches(get, ctx, i, 0 - 1, ref0) {
+                    record_sample(get, ctx, i, 0 - 1, i, 1, 0, 0 - 1, pts, inref, np)
+                    np = np + 1
+                    if np >= MAX_SAMPLES {
+                        return MAX_SAMPLES
+                    }
                 }
-                add_sample(td, &scanned, i, 0 - 1)
-                i = i + step
+                i = i + sbh
             }
         }
     }
-    if do_top_left {
-        add_sample(td, &scanned, 0 - 1, 0 - 1)
-    }
-    if do_top_right {
-        var mx: i64 = w4
-        if h4 > mx {
-            mx = h4
-        }
-        if mx <= 16 {
-            add_sample(td, &scanned, 0 - 1, w4)
+    if do_tl && left_avail != 0 && up_avail != 0 {
+        if matches(get, ctx, 0 - 1, 0 - 1, ref0) {
+            record_sample(get, ctx, 0 - 1, 0 - 1, 0, 0 - 1, 0, 0 - 1, pts, inref, np)
+            np = np + 1
+            if np >= MAX_SAMPLES {
+                return MAX_SAMPLES
+            }
         }
     }
-    if (*td).num_samples == 0 && scanned > 0 {
-        (*td).num_samples = 1
+    if do_tr && tr_avail != 0 {
+        if matches(get, ctx, 0 - 1, bw4, ref0) {
+            record_sample(get, ctx, 0 - 1, bw4, 0, 0 - 1, bw4, 1, pts, inref, np)
+            np = np + 1
+            if np >= MAX_SAMPLES {
+                return MAX_SAMPLES
+            }
+        }
     }
+    return np
 }
 
-fn has_overlappable_candidates(td: *mut av1blkst.TileDec) -> bool {
-    if (*td).avail_u != 0 {
-        var lim: i64 = (*td).mi_col + (*td).bw4
-        if (*td).mi_cols < lim {
-            lim = (*td).mi_cols
-        }
-        var x: i64 = (*td).mi_col
-        while x < lim {
-            var x5: i64 = x | 1
-            if x5 >= (*td).mi_cols {
-                x5 = (*td).mi_cols - 1
-            }
-            if av1interctx.nb_ref(td, (*td).mi_row - 1, x5, 0) > av1interdef.INTRA_FRAME {
-                return true
-            }
-            x = x + 2
-        }
+fn select_samples(mv_row: i64, mv_col: i64, pts: u64, inref: u64, len: i64, bw: i64, bh: i64) -> i64 {
+    var big: i64 = bw
+    if bh > big {
+        big = bh
     }
-    if (*td).avail_l != 0 {
-        var lim: i64 = (*td).mi_row + (*td).bh4
-        if (*td).mi_rows < lim {
-            lim = (*td).mi_rows
-        }
-        var y: i64 = (*td).mi_row
-        while y < lim {
-            var y5: i64 = y | 1
-            if y5 >= (*td).mi_rows {
-                y5 = (*td).mi_rows - 1
-            }
-            if av1interctx.nb_ref(td, y5, (*td).mi_col - 1, 0) > av1interdef.INTRA_FRAME {
-                return true
-            }
-            y = y + 2
-        }
+    var thresh: i64 = big
+    if thresh < 16 {
+        thresh = 16
     }
-    return false
+    if thresh > 112 {
+        thresh = 112
+    }
+    var ret: i64 = 0
+    var i: i64 = 0
+    while i < len {
+        let dc: i64 = av1ipm.ld64(inref, i * 2) - av1ipm.ld64(pts, i * 2) - mv_col
+        let dr: i64 = av1ipm.ld64(inref, i * 2 + 1) - av1ipm.ld64(pts, i * 2 + 1) - mv_row
+        let diff: i64 = av1ipm.iabs(dc) + av1ipm.iabs(dr)
+        if diff <= thresh {
+            if ret != i {
+                av1ipm.st64(pts, ret * 2, av1ipm.ld64(pts, i * 2))
+                av1ipm.st64(pts, ret * 2 + 1, av1ipm.ld64(pts, i * 2 + 1))
+                av1ipm.st64(inref, ret * 2, av1ipm.ld64(inref, i * 2))
+                av1ipm.st64(inref, ret * 2 + 1, av1ipm.ld64(inref, i * 2 + 1))
+            }
+            ret = ret + 1
+        }
+        i = i + 1
+    }
+    if ret < 1 {
+        return 1
+    }
+    return ret
 }
