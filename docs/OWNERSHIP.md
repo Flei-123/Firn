@@ -27,7 +27,7 @@ Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r13
 - Elements stay with the GC: storing an object into a container is a heap store and sinks the element.
 - Closures: the record is a plain gc allocation (value site). `calli (load x)(..., x)` borrows `x` (the record is only read by its own body), so records called in place and passed to borrowing callers (`apply(f, x)`) are freed; stored or returned records sink. `FnRef` carries no seed (static record, free is a no-op), so a `catch` fallback phi keeps the must-handle.
 - Known gap: a closure stored in a gc class field is not traced by the collector (segfault after `gc_collect`, also with ownership off) -- roadmap.
-- Measured on main + (c) (release-fast binary_trees, release-safe OpenPlan derive 300, callgrind, 1 run): binary_trees 1.754G -> 1.235G Ir (0.704), GC runs 32 -> 3, RSS 21.0 -> 8.2 MB, alloc 278.8 -> 9.5 MB; OpenPlan 6.071G -> 5.601G Ir (0.922), GC pause total 134.9 -> 76.5 ms, alloc 246.6 -> 112.7 MB, 2866 sites, 1235 frees (OpenPlan has no freed container sites; the gain is the string/object part). Compile OpenPlan release-safe user time (load ~55): off 147 s, on 172 s.
+- Measured on main + (c) (release-fast binary_trees, release-safe OpenPlan derive 300, callgrind, 1 run): binary_trees 1.754G -> 1.235G Ir (0.704), GC runs 32 -> 3, RSS 21.0 -> 8.2 MB, alloc 278.8 -> 9.5 MB; OpenPlan 6.071G -> 5.601G Ir (0.922), GC pause total 134.9 -> 76.5 ms, alloc 246.6 -> 112.7 MB, 2866 sites, 1235 frees (same free count as without (c)). Compile OpenPlan release-safe user time (load ~55): off 147 s, on 172 s.
 
 ## 1. Prior art
 
