@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1ipm
+import media.video.av1.av1lrsrc
+
+export { sgr_rect }
+
+static SGR_P: [u16; 64] = [
+    2, 140, 1, 3236, 2, 112, 1, 2158, 2, 93, 1, 1618, 2, 80, 1, 1438,
+    2, 70, 1, 1295, 2, 58, 1, 1177, 2, 47, 1, 1079, 2, 37, 1, 996,
+    2, 30, 1, 925, 2, 25, 1, 863, 0, 0, 1, 2589, 0, 0, 1, 1618,
+    0, 0, 1, 1177, 0, 0, 1, 925, 2, 56, 0, 0, 2, 22, 0, 0
+]
+
+fn round2(v: i64, n: i64) -> i64 {
+    if n == 0 {
+        return v
+    }
+    return (v + (1 << ((n - 1) as u64))) >> (n as u64)
+}
+
+fn box_coeffs(c: *mut av1lrsrc.LrCtx, x: i64, y: i64, i: i64, j: i64, r: i64, s: i64, ab: u64, idx: i64) {
+    let bd: i64 = (*c).bit_depth
+    let n: i64 = (2 * r + 1) * (2 * r + 1)
+    let one_over_n: i64 = ((1 << 12) + n / 2) / n
+    var a: i64 = 0
+    var b: i64 = 0
+    var dy: i64 = 0 - r
+    while dy <= r {
+        var dx: i64 = 0 - r
+        while dx <= r {
+            let v: i64 = av1lrsrc.lr_sample(c, x + j + dx, y + i + dy)
+            a = a + v * v
+            b = b + v
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    a = round2(a, 2 * (bd - 8))
+    let d: i64 = round2(b, bd - 8)
+    let p: i64 = av1ipm.imax(0, a * n - d * d)
+    let z: i64 = round2(p * s, 20)
+    var a2: i64 = 0
+    if z >= 255 {
+        a2 = 256
+    } else if z == 0 {
+        a2 = 1
+    } else {
+        a2 = ((z << 8) + z / 2) / (z + 1)
+    }
+    let b2: i64 = (256 - a2) * b * one_over_n
+    av1ipm.st64(ab, idx * 2, a2)
+    av1ipm.st64(ab, idx * 2 + 1, round2(b2, 12))
+}
+
+fn box_filter(c: *mut av1lrsrc.LrCtx, x: i64, y: i64, w: i64, h: i64, set: i64, pass: i64, flt: u64) {
+    let r: i64 = SGR_P[(set * 4 + pass * 2) as usize] as i64
+    let sv: i64 = SGR_P[(set * 4 + pass * 2 + 1) as usize] as i64
+    let aw: i64 = w + 2
+    let ab_n: usize = ((h + 2) * aw) as usize * 16
+    let ab: u64 = vp9mem.alloc(ab_n)
+    var i: i64 = -1
+    while i < h + 1 {
+        if pass == 1 || (i & 1) != 0 {
+            var j: i64 = -1
+            while j < w + 1 {
+                box_coeffs(c, x, y, i, j, r, sv, ab, (i + 1) * aw + j + 1)
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    let cdef: u64 = (*(*c).cdef).planes[(*c).plane as usize]
+    i = 0
+    while i < h {
+        var shift: i64 = 5
+        if pass == 0 && (i & 1) != 0 {
+            shift = 4
+        }
+        var j: i64 = 0
+        while j < w {
+            var a: i64 = 0
+            var b: i64 = 0
+            var dy: i64 = -1
+            while dy <= 1 {
+                var dx: i64 = -1
+                while dx <= 1 {
+                    var weight: i64 = 0
+                    if pass == 0 {
+                        if ((i + dy) & 1) != 0 {
+                            weight = 5
+                            if dx == 0 {
+                                weight = 6
+                            }
+                        }
+                    } else {
+                        weight = 3
+                        if dx == 0 || dy == 0 {
+                            weight = 4
+                        }
+                    }
+                    if weight != 0 {
+                        let k: i64 = (i + 1 + dy) * aw + j + 1 + dx
+                        a = a + weight * av1ipm.ld64(ab, k * 2)
+                        b = b + weight * av1ipm.ld64(ab, k * 2 + 1)
+                    }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            let v: i64 = a * av1ipm.ld(cdef, (y + i) * (*c).stride + x + j) + b
+            av1ipm.st64(flt, i * w + j, round2(v, 8 + shift - 4))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    vp9mem.free(ab, ab_n)
+}
+
+fn sgr_rect(c: *mut av1lrsrc.LrCtx, unit: u64, x: i64, y: i64, w: i64, h: i64) {
+    let set: i64 = av1lrsrc.lr_unit_val(unit, 1)
+    let r0: i64 = SGR_P[(set * 4) as usize] as i64
+    let r1: i64 = SGR_P[(set * 4 + 2) as usize] as i64
+    let w0: i64 = av1lrsrc.lr_unit_val(unit, 8)
+    let w1: i64 = av1lrsrc.lr_unit_val(unit, 9)
+    let w2: i64 = 128 - w0 - w1
+    let fn_: usize = (w * h) as usize * 8
+    let f0: u64 = vp9mem.alloc(fn_)
+    let f1: u64 = vp9mem.alloc(fn_)
+    if r0 != 0 {
+        box_filter(c, x, y, w, h, set, 0, f0)
+    }
+    if r1 != 0 {
+        box_filter(c, x, y, w, h, set, 1, f1)
+    }
+    let cdef: u64 = (*(*c).cdef).planes[(*c).plane as usize]
+    let out: u64 = (*(*c).out).planes[(*c).plane as usize]
+    let maxv: i64 = (1 << ((*c).bit_depth as u64)) - 1
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        while j < w {
+            let u: i64 = av1ipm.ld(cdef, (y + i) * (*c).stride + x + j) << 4
+            var v: i64 = w1 * u
+            if r0 != 0 {
+                v = v + w0 * av1ipm.ld64(f0, i * w + j)
+            } else {
+                v = v + w0 * u
+            }
+            if r1 != 0 {
+                v = v + w2 * av1ipm.ld64(f1, i * w + j)
+            } else {
+                v = v + w2 * u
+            }
+            av1ipm.st(out, (y + i) * (*c).stride + x + j, av1ipm.imax(0, av1ipm.imin(maxv, round2(v, 11))))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    vp9mem.free(f0, fn_)
+    vp9mem.free(f1, fn_)
+}
