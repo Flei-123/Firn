@@ -27,4 +27,7 @@ if text.count(marker) != 1:
 open(sys.argv[2], "w").write(text.replace(marker, inc + marker))
 PY
 fi
+if grep -q "s.push_str(crate::own::RUNTIME);" "$DST/compiler/src/gc.rs"; then
+  sed -i 's/^        s.push_str(crate::own::RUNTIME);$/        crate::own::patch_gc_runtime(\&mut s);\n        s.push_str(\&crate::own::runtime_text());/' "$DST/compiler/src/gc.rs"
+fi
 echo "ported $SRC -> $DST"
