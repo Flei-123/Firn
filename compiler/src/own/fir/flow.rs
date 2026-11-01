@@ -35,6 +35,7 @@ pub(crate) struct Flow {
     other_bits: Bits,
     pub owner_bits: Bits,
     pub zero_add: HashMap<Val, Val>,
+    code_of: HashMap<Val, Val>,
     scratch: Bits,
     uses: Vec<Val>,
 }
@@ -72,6 +73,7 @@ impl Flow {
                 owner_bits.set(1 + nparams + k);
             }
         }
+        let code_of = code_loads(f);
         if owner_bits.count() > 0 {
             for b in f.blocks.iter() {
                 for inst in b.insts.iter() {
@@ -98,6 +100,7 @@ impl Flow {
             other_bits: Bits::single(nseeds, OTHER),
             owner_bits,
             zero_add,
+            code_of,
             scratch: Bits::new(nseeds),
             uses: Vec::new(),
         };
@@ -236,12 +239,11 @@ impl Flow {
                 }
                 der = true;
             }
-            Op::Const(0) => {}
+            Op::Const(0) | Op::FnRef { .. } => {}
             Op::Cmp { .. }
             | Op::Const(_)
             | Op::Alloca { .. }
             | Op::GlobalAddr { .. }
-            | Op::FnRef { .. }
             | Op::VtabAddr { .. }
             | Op::GcAddr { .. }
             | Op::ThreadSelf => acc.assign(&self.other_bits),
@@ -286,6 +288,16 @@ impl Flow {
                 }
                 acc.assign(&self.other_bits);
             }
+            Op::CallIndirect { target, args } => {
+                let env = self.code_of.get(target).copied().filter(|e| args.last() == Some(e) && !self.derived[*e as usize]);
+                self.sink(*target);
+                for v in args.iter() {
+                    if Some(*v) != env {
+                        self.sink(*v);
+                    }
+                }
+                acc.assign(&self.other_bits);
+            }
             _ => {
                 inst.op.uses(&mut uses);
                 for v in uses.iter() {
@@ -316,4 +328,29 @@ fn join(a: &mut [CellVal], b: &[CellVal]) {
         x.may.union(&y.may);
         x.derived |= y.derived;
     }
+}
+
+fn code_loads(f: &Func) -> HashMap<Val, Val> {
+    let mut targets: crate::fx::HashSet<Val> = Default::default();
+    for b in f.blocks.iter() {
+        for inst in b.insts.iter() {
+            if let Op::CallIndirect { target, .. } = &inst.op {
+                targets.insert(*target);
+            }
+        }
+    }
+    let mut out = HashMap::default();
+    if targets.is_empty() {
+        return out;
+    }
+    for b in f.blocks.iter() {
+        for inst in b.insts.iter() {
+            if let (Op::Load { addr }, Some(d)) = (&inst.op, inst.dst) {
+                if targets.contains(&d) {
+                    out.insert(d, *addr);
+                }
+            }
+        }
+    }
+    out
 }

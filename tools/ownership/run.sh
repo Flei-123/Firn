@@ -62,6 +62,10 @@ expect_rc fir_vec_freed check 0
 expect_rc fir_map_freed on 0
 expect_rc fir_map_freed check 0
 expect_rc fir_vec_poison check 86
+same_out fir_clo_local
+same_out fir_clo_stored
+expect_rc fir_clo_freed on 0
+expect_rc fir_clo_freed check 0
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]
