@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1cdfctx
+import media.video.av1.av1sym
+import media.video.av1.av1fhdr
+import media.video.av1.av1part
+import media.video.av1.av1resid
+import media.video.vp9.vp9mem
+
+export { tile_decode, tile_group_decode }
+
+fn clear_above_context(td: *mut av1blkst.TileDec) {
+    var p: usize = 0
+    while p < 3 {
+        let n: usize = ((*td).mi_cols + 64) as usize
+        vp9mem.zero((*td).above_level[p], n)
+        vp9mem.zero((*td).above_dc[p], n)
+        p = p + 1
+    }
+}
+
+fn clear_left_context(td: *mut av1blkst.TileDec) {
+    var p: usize = 0
+    while p < 3 {
+        let n: usize = ((*td).mi_rows + 64) as usize
+        vp9mem.zero((*td).left_level[p], n)
+        vp9mem.zero((*td).left_dc[p], n)
+        p = p + 1
+    }
+}
+
+fn clear_cdef(td: *mut av1blkst.TileDec, r: i64, c: i64) {
+    let row: i64 = r >> 4
+    let col: i64 = c >> 4
+    av1blkst.st((*td).cdef_a, row * (*td).cdef_stride + col, 255)
+    if (*td).sb128 != 0 {
+        av1blkst.st((*td).cdef_a, row * (*td).cdef_stride + col + 1, 255)
+        av1blkst.st((*td).cdef_a, (row + 1) * (*td).cdef_stride + col, 255)
+        av1blkst.st((*td).cdef_a, (row + 1) * (*td).cdef_stride + col + 1, 255)
+    }
+}
+
+fn reset_references(td: *mut av1blkst.TileDec) {
+    var p: usize = 0
+    while p < 3 {
+        (*td).ref_sgr[p * 2] = 0 - 32
+        (*td).ref_sgr[p * 2 + 1] = 31
+        var pass: usize = 0
+        while pass < 2 {
+            (*td).ref_wiener[p * 6 + pass * 3] = 3
+            (*td).ref_wiener[p * 6 + pass * 3 + 1] = 0 - 7
+            (*td).ref_wiener[p * 6 + pass * 3 + 2] = 15
+            pass = pass + 1
+        }
+        p = p + 1
+    }
+}
+
+fn read_lr(td: *mut av1blkst.TileDec, r: i64, c: i64, sb_size: i64) -> i64 {
+    if (*(*td).fh).uses_lr == 0 {
+        return av1blkst.TD_OK
+    }
+    return av1blkst.TD_UNSUPPORTED
+}
+
+fn decode_tile_body(td: *mut av1blkst.TileDec) -> i64 {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    clear_above_context(td)
+    var i: usize = 0
+    while i < 4 {
+        (*td).delta_lf[i] = 0
+        i = i + 1
+    }
+    reset_references(td)
+    var sb_size: i64 = av1blkdat.BLOCK_64X64
+    if (*td).sb128 != 0 {
+        sb_size = av1blkdat.BLOCK_128X128
+    }
+    let sb4: i64 = av1blkdat.bw4(sb_size)
+    var r: i64 = (*td).mi_row_start
+    while r < (*td).mi_row_end {
+        clear_left_context(td)
+        var c: i64 = (*td).mi_col_start
+        while c < (*td).mi_col_end {
+            (*td).read_deltas = (*fh).delta_q_present
+            clear_cdef(td, r, c)
+            av1resid.clear_block_decoded(td, r, c, sb4)
+            var rc: i64 = read_lr(td, r, c, sb_size)
+            if rc == av1blkst.TD_OK {
+                rc = av1part.decode_partition(td, r, c, sb_size)
+            }
+            if rc != av1blkst.TD_OK {
+                return rc
+            }
+            if !av1sym.sym_ok(&(*td).sym) {
+                return av1blkst.TD_ERR
+            }
+            c = c + sb4
+        }
+        r = r + sb4
+    }
+    return av1blkst.TD_OK
+}
+
+fn tile_decode(td: *mut av1blkst.TileDec, cdfs: *mut av1cdfctx.CdfState, tile_num: i64, data: u64, size: i64) -> i64 {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    if tile_num < 0 || tile_num >= (*fh).tile_cols * (*fh).tile_rows || size <= 0 {
+        return av1blkst.TD_ERR
+    }
+    let tile_row: i64 = tile_num / (*fh).tile_cols
+    let tile_col: i64 = tile_num % (*fh).tile_cols
+    (*td).tile_num = tile_num
+    (*td).mi_row_start = (*fh).mi_row_starts[tile_row as usize]
+    (*td).mi_row_end = (*fh).mi_row_starts[(tile_row + 1) as usize]
+    (*td).mi_col_start = (*fh).mi_col_starts[tile_col as usize]
+    (*td).mi_col_end = (*fh).mi_col_starts[(tile_col + 1) as usize]
+    (*td).cur_q = (*fh).base_q_idx
+    av1cdfctx.cdfs_begin_tile(cdfs)
+    (*td).cdf = (*cdfs).tile
+    av1sym.sym_init(&(*td).sym, data, size as usize, (*fh).disable_cdf_update == 0)
+    let rc: i64 = decode_tile_body(td)
+    if rc != av1blkst.TD_OK {
+        return rc
+    }
+    av1cdfctx.cdfs_end_tile(cdfs, tile_num, (*fh).context_update_tile_id)
+    return av1blkst.TD_OK
+}
+
+fn tile_group_decode(td: *mut av1blkst.TileDec, cdfs: *mut av1cdfctx.CdfState, data: u64, size: i64, tg_start: i64, tg_end: i64) -> i64 {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    var pos: i64 = 0
+    var t: i64 = tg_start
+    while t <= tg_end {
+        var tile_size: i64 = size - pos
+        if t != tg_end {
+            let nb: i64 = (*fh).tile_size_bytes
+            if pos + nb > size {
+                return av1blkst.TD_ERR
+            }
+            var v: i64 = 0
+            var i: i64 = 0
+            while i < nb {
+                v = v + (av1blkst.ld(data, pos + i) << ((i * 8) as u64))
+                i = i + 1
+            }
+            pos = pos + nb
+            tile_size = v + 1
+        }
+        if tile_size <= 0 || pos + tile_size > size {
+            return av1blkst.TD_ERR
+        }
+        let rc: i64 = tile_decode(td, cdfs, t, data + pos as u64, tile_size)
+        if rc != av1blkst.TD_OK {
+            return rc
+        }
+        pos = pos + tile_size
+        t = t + 1
+    }
+    return av1blkst.TD_OK
+}
