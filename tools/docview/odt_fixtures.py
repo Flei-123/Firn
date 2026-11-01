@@ -59,6 +59,7 @@ def main(out):
           '<table:table-row>' + cell('a2', 'table:number-rows-spanned="2"') + cell('b2') + cell('c2') + '</table:table-row>'
           '<table:table-row><table:covered-table-cell/>' + cell('b3') + cell('c3') + '</table:table-row></table:table>', tauto)
     write(out + '/image.odt', '<text:p>Before <draw:frame svg:width="2cm" svg:height="2cm" text:anchor-type="as-char"><draw:image xlink:href="Pictures/a.png"/></draw:frame> after</text:p>', extra={'Pictures/a.png': png()})
+    write(out + '/textbox.odt', '<text:p>Body line one</text:p><text:p>Anchor <draw:frame svg:x="9cm" svg:y="1cm" svg:width="5cm" svg:height="2cm" text:anchor-type="paragraph"><draw:text-box><text:p>Boxed text</text:p><text:p>Second box line</text:p></draw:text-box></draw:frame>paragraph tail</text:p><text:p>Body line three</text:p>')
     longp = ''.join('<text:p>Paragraph number %d with some filler words to make the line wrap around the page width a few times for pagination.</text:p>' % i for i in range(120))
     write(out + '/long.odt', longp)
 
