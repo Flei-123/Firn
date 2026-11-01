@@ -1,0 +1,257 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1fg
+import media.video.av1.av1mem
+import media.video.av1.av1tabfg
+
+export { GrainTpl, TPL_LUMA_W, TPL_LUMA_H, grain_rand, grain_tpl_new, grain_tpl_free, grain_tpl_build, scaling_lut_build, scale_lut }
+
+const TPL_LUMA_W: i64 = 82
+const TPL_LUMA_H: i64 = 73
+
+struct GrainTpl {
+    luma: [i64; 5986],
+    cb: [i64; 5986],
+    cr: [i64; 5986],
+    chroma_w: i64,
+    chroma_h: i64,
+    grain_min: i64,
+    grain_max: i64,
+    lut: [i64; 771],
+    rng: i64,
+}
+
+fn grain_tpl_new() -> *mut GrainTpl {
+    return av1mem.av1_zalloc[GrainTpl]()
+}
+
+fn grain_tpl_free(t: *mut GrainTpl) {
+    av1mem.av1_zfree[GrainTpl](t)
+}
+
+fn grain_rand(t: *mut GrainTpl, bits: i64) -> i64 {
+    let r: i64 = (*t).rng
+    let bit: i64 = ((r >> 0) ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1
+    let nr: i64 = (r >> 1) | (bit << 15)
+    (*t).rng = nr
+    return (nr >> ((16 - bits) as u64)) & ((1 << (bits as u64)) - 1)
+}
+
+fn gauss(t: *mut GrainTpl, shift: i64) -> i64 {
+    let g: i64 = av1tabfg.GAUSSIAN_SEQUENCE[grain_rand(t, 11) as usize] as i64
+    return (g + ((1 << (shift as u64)) >> 1)) >> (shift as u64)
+}
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn build_luma(t: *mut GrainTpl, g: *mut av1fg.FilmGrain, bit_depth: i64) {
+    if (*g).num_y_points == 0 {
+        return
+    }
+    (*t).rng = (*g).grain_seed
+    let shift: i64 = 12 - bit_depth + (*g).grain_scale_shift
+    var y: i64 = 0
+    while y < TPL_LUMA_H {
+        var x: i64 = 0
+        while x < TPL_LUMA_W {
+            (*t).luma[(y * TPL_LUMA_W + x) as usize] = gauss(t, shift)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ar_shift: i64 = (*g).ar_coeff_shift_minus_6 + 6
+    let lag: i64 = (*g).ar_coeff_lag
+    y = 3
+    while y < TPL_LUMA_H {
+        var x: i64 = 3
+        while x < TPL_LUMA_W - 3 {
+            var sum: i64 = 0
+            var pos: usize = 0
+            var dr: i64 = 0 - lag
+            while dr <= 0 {
+                var dc: i64 = 0 - lag
+                while dc <= lag {
+                    if dr == 0 && dc == 0 {
+                        break
+                    }
+                    let c: i64 = (*g).ar_coeffs_y_plus_128[pos] - 128
+                    sum = sum + (*t).luma[((y + dr) * TPL_LUMA_W + x + dc) as usize] * c
+                    pos = pos + 1
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let idx: usize = (y * TPL_LUMA_W + x) as usize
+            (*t).luma[idx] = clip3((*t).grain_min, (*t).grain_max, (*t).luma[idx] + ((sum + ((1 << (ar_shift as u64)) >> 1)) >> (ar_shift as u64)))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn fill_chroma(t: *mut GrainTpl, g: *mut av1fg.FilmGrain, bit_depth: i64, seed_xor: i64, is_cb: bool) {
+    let shift: i64 = 12 - bit_depth + (*g).grain_scale_shift
+    (*t).rng = (*g).grain_seed ^ seed_xor
+    var i: i64 = 0
+    while i < (*t).chroma_h * (*t).chroma_w {
+        if is_cb {
+            (*t).cb[i as usize] = gauss(t, shift)
+        } else {
+            (*t).cr[i as usize] = gauss(t, shift)
+        }
+        i = i + 1
+    }
+}
+
+fn chroma_ar(t: *mut GrainTpl, g: *mut av1fg.FilmGrain, ssx: i64, ssy: i64, is_cb: bool) {
+    let ar_shift: i64 = (*g).ar_coeff_shift_minus_6 + 6
+    let lag: i64 = (*g).ar_coeff_lag
+    let w: i64 = (*t).chroma_w
+    var y: i64 = 3
+    while y < (*t).chroma_h {
+        var x: i64 = 3
+        while x < w - 3 {
+            var sum: i64 = 0
+            var pos: usize = 0
+            var dr: i64 = 0 - lag
+            while dr <= 0 {
+                var dc: i64 = 0 - lag
+                while dc <= lag {
+                    var c: i64 = 0
+                    if is_cb {
+                        c = (*g).ar_coeffs_cb_plus_128[pos] - 128
+                    } else {
+                        c = (*g).ar_coeffs_cr_plus_128[pos] - 128
+                    }
+                    if dr == 0 && dc == 0 {
+                        if (*g).num_y_points > 0 {
+                            var luma: i64 = 0
+                            let lx: i64 = ((x - 3) << (ssx as u64)) + 3
+                            let ly: i64 = ((y - 3) << (ssy as u64)) + 3
+                            var i: i64 = 0
+                            while i <= ssy {
+                                var j: i64 = 0
+                                while j <= ssx {
+                                    luma = luma + (*t).luma[((ly + i) * TPL_LUMA_W + lx + j) as usize]
+                                    j = j + 1
+                                }
+                                i = i + 1
+                            }
+                            let sh: i64 = ssx + ssy
+                            luma = (luma + ((1 << (sh as u64)) >> 1)) >> (sh as u64)
+                            sum = sum + luma * c
+                        }
+                        break
+                    }
+                    let idx: usize = ((y + dr) * w + x + dc) as usize
+                    if is_cb {
+                        sum = sum + (*t).cb[idx] * c
+                    } else {
+                        sum = sum + (*t).cr[idx] * c
+                    }
+                    pos = pos + 1
+                    dc = dc + 1
+                }
+                if dr == 0 {
+                    break
+                }
+                dr = dr + 1
+            }
+            let at: usize = (y * w + x) as usize
+            let add: i64 = (sum + ((1 << (ar_shift as u64)) >> 1)) >> (ar_shift as u64)
+            if is_cb {
+                (*t).cb[at] = clip3((*t).grain_min, (*t).grain_max, (*t).cb[at] + add)
+            } else {
+                (*t).cr[at] = clip3((*t).grain_min, (*t).grain_max, (*t).cr[at] + add)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn grain_tpl_build(t: *mut GrainTpl, g: *mut av1fg.FilmGrain, bit_depth: i64, ssx: i64, ssy: i64, mono: bool) {
+    let center: i64 = 128 << ((bit_depth - 8) as u64)
+    (*t).grain_min = 0 - center
+    (*t).grain_max = (256 << ((bit_depth - 8) as u64)) - 1 - center
+    (*t).chroma_w = TPL_LUMA_W
+    (*t).chroma_h = TPL_LUMA_H
+    if ssx == 1 {
+        (*t).chroma_w = 44
+    }
+    if ssy == 1 {
+        (*t).chroma_h = 38
+    }
+    build_luma(t, g, bit_depth)
+    if mono {
+        return
+    }
+    if (*g).num_cb_points > 0 || (*g).chroma_scaling_from_luma == 1 {
+        fill_chroma(t, g, bit_depth, 0xb524, true)
+        chroma_ar(t, g, ssx, ssy, true)
+    }
+    if (*g).num_cr_points > 0 || (*g).chroma_scaling_from_luma == 1 {
+        fill_chroma(t, g, bit_depth, 0x49d8, false)
+        chroma_ar(t, g, ssx, ssy, false)
+    }
+}
+
+fn lut_plane(t: *mut GrainTpl, plane: i64, n: i64, vals: *mut [i64; 16], scal: *mut [i64; 16]) {
+    let base: i64 = plane * 257
+    var x: i64 = 0
+    if n == 0 {
+        return
+    }
+    while x < (*vals)[0] {
+        (*t).lut[(base + x) as usize] = (*scal)[0]
+        x = x + 1
+    }
+    var i: usize = 0
+    while (i as i64) < n - 1 {
+        let dy: i64 = (*scal)[i + 1] - (*scal)[i]
+        let dx: i64 = (*vals)[i + 1] - (*vals)[i]
+        let delta: i64 = dy * ((65536 + (dx >> 1)) / dx)
+        x = 0
+        while x < dx {
+            (*t).lut[(base + (*vals)[i] + x) as usize] = (*scal)[i] + ((x * delta + 32768) >> 16)
+            x = x + 1
+        }
+        i = i + 1
+    }
+    x = (*vals)[(n - 1) as usize]
+    while x < 256 {
+        (*t).lut[(base + x) as usize] = (*scal)[(n - 1) as usize]
+        x = x + 1
+    }
+}
+
+fn scaling_lut_build(t: *mut GrainTpl, g: *mut av1fg.FilmGrain) {
+    lut_plane(t, 0, (*g).num_y_points, &(*g).point_y_value, &(*g).point_y_scaling)
+    if (*g).chroma_scaling_from_luma == 1 {
+        lut_plane(t, 1, (*g).num_y_points, &(*g).point_y_value, &(*g).point_y_scaling)
+        lut_plane(t, 2, (*g).num_y_points, &(*g).point_y_value, &(*g).point_y_scaling)
+    } else {
+        lut_plane(t, 1, (*g).num_cb_points, &(*g).point_cb_value, &(*g).point_cb_scaling)
+        lut_plane(t, 2, (*g).num_cr_points, &(*g).point_cr_value, &(*g).point_cr_scaling)
+    }
+}
+
+fn scale_lut(t: *mut GrainTpl, plane: i64, index: i64, bit_depth: i64) -> i64 {
+    let base: i64 = plane * 257
+    let shift: i64 = bit_depth - 8
+    let x: i64 = index >> (shift as u64)
+    if shift == 0 || x == 255 {
+        return (*t).lut[(base + x) as usize]
+    }
+    let rem: i64 = index - (x << (shift as u64))
+    let start: i64 = (*t).lut[(base + x) as usize]
+    let end: i64 = (*t).lut[(base + x + 1) as usize]
+    return start + (((end - start) * rem + (1 << ((shift - 1) as u64))) >> (shift as u64))
+}

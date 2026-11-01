@@ -11,6 +11,7 @@ FAIL=0
 run_case() {
   local name=$1 src=$2 size=$3 pix=$4 frames=$5 params=$6
   shift 6
+  [ -z "$ONLY" ] || [[ $name == $ONLY ]] || return 0
   local w=${size%x*} h=${size#*x} bps=1 ssx=1 ssy=1
   case $pix in
     *10le|*12le) bps=2 ;;
@@ -107,5 +108,28 @@ run_svt sr_321x177 321x177 yuv420p 10 -crf 50
 run_svt sr_704x144 704x144 yuv420p 14
 run_svt sr_256x160 256x160 yuv420p 12 -crf 20
 run_svt sr_640x360 640x360 yuv420p 11 -crf 45
+FGP="enable-palette=0:enable-intrabc=0"
+for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  run_case fg_t$k testsrc2 200x130 yuv420p 1 "$FGP:film-grain-test=$k" -cpu-used 4 -crf 30 -b:v 0
+done
+run_case fg_t1_352 testsrc2 352x288 yuv420p 1 "$FGP:film-grain-test=1" -crf 30 -b:v 0
+run_case fg_t5_352 mandelbrot 352x288 yuv420p 1 "$FGP:film-grain-test=5" -crf 30 -b:v 0
+run_case fg_odd testsrc2 17x13 yuv420p 1 "$FGP:film-grain-test=2" -crf 30 -b:v 0
+run_case fg_odd2 testsrc2 131x75 yuv420p 1 "$FGP:film-grain-test=7" -crf 30 -b:v 0
+run_case fg_tiles testsrc2 704x144 yuv420p 1 "$FGP:film-grain-test=3" -crf 30 -b:v 0 -tile-columns 2
+run_case fg_10 testsrc2 96x64 yuv420p10le 1 "$FGP:film-grain-test=4" -crf 30 -b:v 0
+run_case fg_10b testsrc2 200x130 yuv420p10le 1 "$FGP:film-grain-test=9" -crf 30 -b:v 0
+run_case fg_12 testsrc2 96x64 yuv420p12le 1 "$FGP:film-grain-test=6" -crf 30 -b:v 0 -strict -2
+run_case fg_444 testsrc2 96x64 yuv444p 1 "$FGP:film-grain-test=8" -crf 30 -b:v 0
+run_case fg_444b testsrc2 200x130 yuv444p 1 "$FGP:film-grain-test=1" -crf 30 -b:v 0
+run_case fg_422 testsrc2 96x64 yuv422p 1 "$FGP:film-grain-test=10" -crf 30 -b:v 0 -strict -2
+run_case fg_gray testsrc2 96x64 gray 1 "$FGP:film-grain-test=11" -crf 30 -b:v 0
+run_case fg_multi testsrc2 128x96 yuv420p 6 "$FGP:film-grain-test=12" -crf 30 -b:v 0
+run_case fg_sb128 testsrc2 256x160 yuv420p 1 "$FGP:film-grain-test=13:sb-size=128" -crf 30 -b:v 0
+for lvl in 10 25 40; do
+  run_case fg_dn$lvl testsrc2 320x240 yuv420p 2 "$FGP:denoise-noise-level=$lvl" -crf 30 -b:v 0 -vf noise=alls=$lvl
+done
+run_case fg_dn_444 testsrc2 160x96 yuv444p 2 "$FGP:denoise-noise-level=30" -crf 30 -b:v 0 -vf noise=alls=30
+run_case fg_dn_10 testsrc2 160x96 yuv420p10le 2 "$FGP:denoise-noise-level=30" -crf 30 -b:v 0 -vf noise=alls=30
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]
