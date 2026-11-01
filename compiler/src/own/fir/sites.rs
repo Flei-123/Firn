@@ -76,6 +76,21 @@ pub(crate) fn find(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows) -> Found 
             }
         }
     }
+    let mut cell_def: HashMap<usize, usize> = HashMap::default();
+    for &bi in ix.rpo.iter() {
+        for inst in f.blocks[bi].insts.iter() {
+            let Op::Store { addr, val } = &inst.op else { continue };
+            let (Some(&i), Some(a)) = (pos.get(val), sl.access(*addr, inst.ty)) else { continue };
+            if !a.strong {
+                continue;
+            }
+            let j = *cell_def.entry(a.cell).or_insert(i);
+            let (x, y) = (root(&mut uf, j), root(&mut uf, i));
+            if x != y {
+                uf[y] = x;
+            }
+        }
+    }
     let mut has_slow = vec![false; defs.len()];
     for i in 0..defs.len() {
         if defs[i].slow {
