@@ -53,14 +53,16 @@ ERLAUBT = {'lang', 'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
            # license (LICENSES/MIT.old.txt) -- not German words here.
            'der', 'mit',
            # `grab` is the English verb (mouse/pointer grab, lib/input/grab.fi), not the German "Grab".
-           'grab'}
+           'grab',
+           # R602: English words in path names (kerning, fall damage, version, altered ground, art).
+           'kern', 'fall', 'vers', 'alter', 'art'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
 # als Zeichenfolge.
 ENGLISCH = {'absolute', 'relative', 'negative', 'signature',
             'aggregate', 'profile', 'surrogate', 'parameter',
-            'alternative', 'imperative', 'declarative', 'iterative'}
+            'alternative', 'imperative', 'declarative', 'iterative', 'profiles'}
 
 
 def morpheme():

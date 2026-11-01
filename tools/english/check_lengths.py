@@ -29,9 +29,9 @@ def echte_laenge(roh):
     # OKTETTE, nicht Zeichen: '—' ist in UTF-8 drei Oktette lang. Fluchtfolgen
     # (\0, \n, \t, \\, \") zaehlen als EIN Oktett, ein abschliessendes \0
     # gehoert nicht zum Text.
-    s = re.sub(r'\\.', 'X', roh)
+    s = re.sub(r'\\x[0-9a-fA-F]{2}|\\.', 'X', roh)
     n = len(s.encode('utf-8'))
-    return n - (1 if roh.endswith('\\0') else 0)
+    return n - (1 if roh.endswith(('\\0', '\\x00')) else 0)
 
 
 def main():
@@ -54,7 +54,7 @@ def main():
                 getrimmt = len(roh.rstrip().encode('utf-8'))
                 # Endet der Text auf \0, darf die Zahl das Nulloktett
                 # mitzaehlen (dann ist eine C-Zeichenkette gemeint).
-                mitnull = echt + (1 if roh.endswith('\\0') else 0)
+                mitnull = echt + (1 if roh.endswith(('\\0', '\\x00')) else 0)
                 if zahl not in (echt, getrimmt, mitnull):
                     treffer.append((f, i + 1, name, zahl, echt, roh))
     for t in treffer:
