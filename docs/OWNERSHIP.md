@@ -58,6 +58,19 @@ What the numbers say:
 
 Reproduce: `/root/jarvis/data/staff_scratch/b1own/{meas.sh,meas2.sh,gcstate.sh,cgsym.py,cert.sh}` (scratch; `gcstate.sh` finds the state block via the first rip-relative `lea` in `gc_init` and dumps it at `exit`; offsets as in `lib/gc/gc.fi`: 32 runs, 72 pause max, 80 pause total, 104 allocation count, 296 total bytes + 88 since).
 
+## 3a. What the AST pass infers today (`compiler/src/own/`)
+
+- Shapes (`shape.rs`): classes whose fields are scalars or pointers to the same class; collected from parameter/return types AND from every `gc C{}` in a body.
+- Fresh builders (`fresh.rs`): functions that only return new allocations (or null) whose pointer fields are fresh again; `init_class` accepts a builder call or a `gc C{..} catch null` literal with fresh fields.
+- Borrowed parameters (`borrow.rs`): fixed point over all plain functions; a parameter is borrowed when it is only compared, read through scalar fields, written through scalar fields, or passed to a borrowed parameter.
+- Single owner (`reuse.rs`): an immutable `let x = <fresh init>` (one binder in the function) owns the object; when every later statement only borrows `x`, `__own_drop_tree(x)` goes right after the last statement that mentions it (last use). A fresh builder call or literal passed straight into a borrowed argument is hoisted into such a `let`. In a loop the freed block is the head of its size-class free list, so the next allocation of the same class takes the same cell (in-place reuse through the LIFO list).
+- Never rejects a program: everything else stays with the tracing GC.
+
+## 3b. Validation (01.11.2026, branch staff/firn-mvxytevc)
+
+- `tools/ownership/run.sh`: 15/15 (cases incl. `local_owner`, `local_owner_count`: 3000 frees, 0 poison).
+- `tools/ownership/suite.sh` over all 1244 `tests/*.fi`, release-fast + release-safe, `FIRNC_OWNERSHIP=check` vs `off`: 2488 runs, 0 poison hits, 0 compile failures, outcome identical in 2487/2488 (the one difference is `2061_std_env_shell`, environment dependent, red in `off`). The pass fires in few tests (tree drops in 3 tests, concat fusion in 335): coverage, not safety, is the gap.
+
 ## 4. Recommended approach: hybrid, escape + last use, GC as the fall-back
 
 No RC. Ownership is a compile-time fact or nothing; where it is nothing, the object is an ordinary GC object, exactly as today. The runtime only gains a way to give a block back early.

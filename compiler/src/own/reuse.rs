@@ -26,7 +26,7 @@ fn find_candidate(rw: &Rw, e: &Expr, cond: bool, out: &mut Vec<(ExprId, Vec<usiz
                 .enumerate()
                 .filter(|(i, a)| {
                     flags.get(*i).copied().unwrap_or(false)
-                        && matches!(&a.kind, ExprKind::Call(g, _, _) if rw.fresh.contains_key(g))
+                        && super::fresh::init_class(a, rw.shapes, rw.fresh).is_some()
                 })
                 .map(|(i, _)| i)
                 .collect();
