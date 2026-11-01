@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.video.vp9.vp9mem
+import media.video.av1.av1mem
+import media.video.av1.av1br
+import media.video.av1.av1obu
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+import media.video.av1.av1frh
+import media.video.av1.av1ref
+import media.video.av1.av1cdfctx
+import media.video.av1.av1blkst
+import media.video.av1.av1tile
+import media.video.av1.av1frame
+import media.video.av1.av1recon
+
+export { Decoder, dec_new, dec_free, dec_stream, DEC_OK, DEC_ERR_OBU, DEC_ERR_SEQ, DEC_ERR_HDR, DEC_ERR_CDF, DEC_ERR_TILE, DEC_ERR_UNSUPPORTED }
+
+const DEC_OK: i64 = 0
+const DEC_ERR_OBU: i64 = 10
+const DEC_ERR_SEQ: i64 = 11
+const DEC_ERR_HDR: i64 = 13
+const DEC_ERR_CDF: i64 = 16
+const DEC_ERR_TILE: i64 = 17
+const DEC_ERR_UNSUPPORTED: i64 = 18
+
+struct Decoder {
+    seq: *mut av1seq.SeqHdr,
+    fh: *mut av1fhdr.FrameHdr,
+    st: *mut av1ref.RefState,
+    cdfs: av1cdfctx.CdfState,
+    td: *mut av1blkst.TileDec,
+    rc: *mut av1recon.Recon,
+    slots: [u64; 8],
+    cur: u64,
+    have_seq: bool,
+    frames_out: i64,
+    frames_decoded: i64,
+    err: i64,
+    err_tile: i64,
+    err_mi_row: i64,
+    err_mi_col: i64,
+    err_blocks: i64,
+    postfilter: i64,
+}
+
+fn dec_new() -> *mut Decoder {
+    let d: *mut Decoder = av1mem.av1_zalloc[Decoder]()
+    (*d).seq = av1seq.seq_new()
+    (*d).fh = av1fhdr.fhdr_new()
+    (*d).st = av1ref.ref_state_new()
+    (*d).cdfs = av1cdfctx.cdfs_new()
+    (*d).td = av1blkst.td_new()
+    (*d).rc = av1recon.recon_new()
+    av1recon.recon_attach((*d).rc, (*d).td)
+    return d
+}
+
+fn dec_free(d: *mut Decoder) {
+    var i: usize = 0
+    while i < 8 {
+        if (*d).slots[i] != 0 {
+            av1frame.frame_release((*d).slots[i] as *mut av1frame.Frame)
+        }
+        i = i + 1
+    }
+    if (*d).cur != 0 {
+        av1frame.frame_release((*d).cur as *mut av1frame.Frame)
+    }
+    av1recon.recon_free((*d).rc)
+    av1blkst.td_free((*d).td)
+    av1cdfctx.cdfs_free(&(*d).cdfs)
+    av1ref.ref_state_free((*d).st)
+    av1fhdr.fhdr_free((*d).fh)
+    av1seq.seq_free((*d).seq)
+    av1mem.av1_zfree[Decoder](d)
+}
+
+fn fail(d: *mut Decoder, code: i64) {
+    if (*d).err == 0 {
+        (*d).err = code
+    }
+}
+
+fn do_seq(d: *mut Decoder, data: u64, o: *mut av1obu.Obu) {
+    var r: av1br.BR = av1br.br_new(data + (*o).pay_off as u64, (*o).pay_len)
+    if av1seq.seq_parse(&r, (*d).seq) != av1seq.SEQ_OK {
+        fail(d, DEC_ERR_SEQ)
+        return
+    }
+    (*d).have_seq = true
+}
+
+fn emit(d: *mut Decoder, f: *mut av1frame.Frame, out: *mut rt.Buf) {
+    av1frame.frame_append(f, out)
+    (*d).frames_out = (*d).frames_out + 1
+}
+
+fn begin_frame(d: *mut Decoder) -> bool {
+    let fh: *mut av1fhdr.FrameHdr = (*d).fh
+    let seq: *mut av1seq.SeqHdr = (*d).seq
+    if (*d).cur != 0 {
+        av1frame.frame_release((*d).cur as *mut av1frame.Frame)
+    }
+    let f: *mut av1frame.Frame = av1frame.frame_new((*fh).upscaled_width, (*fh).frame_height, (*fh).mi_cols, (*fh).mi_rows, (*seq).subsampling_x, (*seq).subsampling_y, (*seq).num_planes, (*seq).bit_depth)
+    (*d).cur = f as u64
+    av1blkst.td_setup_frame((*d).td, seq, fh)
+    av1recon.recon_begin_frame((*d).rc, (*d).td, f)
+    let none: bool = (*fh).primary_ref_frame == av1fhdr.PRIMARY_REF_NONE
+    var slot: usize = 0
+    if !none {
+        slot = (*fh).ref_frame_idx[(*fh).primary_ref_frame as usize] as usize
+    }
+    (*d).postfilter = 0
+    if (*fh).loop_filter_level[0] != 0 || (*fh).loop_filter_level[1] != 0 {
+        (*d).postfilter = (*d).postfilter | 1
+    }
+    if (*seq).enable_cdef != 0 && (*fh).coded_lossless == 0 && (*fh).allow_intrabc == 0 {
+        (*d).postfilter = (*d).postfilter | 2
+    }
+    if (*fh).uses_lr != 0 {
+        (*d).postfilter = (*d).postfilter | 4
+    }
+    if (*fh).use_superres != 0 {
+        (*d).postfilter = (*d).postfilter | 8
+    }
+    return av1cdfctx.cdfs_begin_frame(&(*d).cdfs, none, slot, (*fh).base_q_idx)
+}
+
+fn finish_frame(d: *mut Decoder, out: *mut rt.Buf) {
+    let fh: *mut av1fhdr.FrameHdr = (*d).fh
+    av1cdfctx.cdfs_end_frame(&(*d).cdfs, (*fh).disable_frame_end_update_cdf != 0)
+    let f: *mut av1frame.Frame = (*d).cur as *mut av1frame.Frame
+    var i: usize = 0
+    while i < 8 {
+        if (((*fh).refresh_frame_flags >> (i as u64)) & 1) != 0 {
+            av1cdfctx.cdfs_save_slot(&(*d).cdfs, i)
+            if (*d).slots[i] != 0 {
+                av1frame.frame_release((*d).slots[i] as *mut av1frame.Frame)
+            }
+            (*d).slots[i] = av1frame.frame_retain(f) as u64
+        }
+        i = i + 1
+    }
+    (*d).frames_decoded = (*d).frames_decoded + 1
+    if (*fh).show_frame != 0 {
+        emit(d, f, out)
+    }
+    (*(*d).st).seen_frame_header = 0
+}
+
+fn show_existing(d: *mut Decoder, out: *mut rt.Buf) {
+    let fh: *mut av1fhdr.FrameHdr = (*d).fh
+    let idx: usize = (*fh).frame_to_show_map_idx as usize
+    if (*d).slots[idx] == 0 {
+        fail(d, DEC_ERR_HDR)
+        return
+    }
+    let f: *mut av1frame.Frame = (*d).slots[idx] as *mut av1frame.Frame
+    emit(d, f, out)
+    if (*fh).frame_type == av1fhdr.KEY_FRAME {
+        var i: usize = 0
+        while i < 8 {
+            if i != idx {
+                av1cdfctx.cdfs_load_slot(&(*d).cdfs, idx)
+                av1cdfctx.cdfs_save_slot(&(*d).cdfs, i)
+                if (*d).slots[i] != 0 {
+                    av1frame.frame_release((*d).slots[i] as *mut av1frame.Frame)
+                }
+                (*d).slots[i] = av1frame.frame_retain(f) as u64
+            }
+            i = i + 1
+        }
+    }
+    av1ref.ref_show_existing((*d).st, fh)
+    (*(*d).st).seen_frame_header = 0
+}
+
+fn decode_tiles(d: *mut Decoder, out: *mut rt.Buf, data: u64, size: i64, t: *mut av1frh.TgInfo) {
+    let rc: i64 = av1tile.tile_group_decode((*d).td, &(*d).cdfs, data, size, (*t).tg_start, (*t).tg_end)
+    if rc != av1blkst.TD_OK {
+        (*d).err_tile = (*(*d).td).tile_num
+        (*d).err_mi_row = (*(*d).td).mi_row
+        (*d).err_mi_col = (*(*d).td).mi_col
+        (*d).err_blocks = (*(*d).td).n_blocks
+        if rc == av1blkst.TD_UNSUPPORTED {
+            fail(d, DEC_ERR_UNSUPPORTED)
+        } else {
+            fail(d, DEC_ERR_TILE)
+        }
+        return
+    }
+    if (*t).frame_done == 1 {
+        finish_frame(d, out)
+    }
+}
+
+fn do_frame(d: *mut Decoder, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
+    if !(*d).have_seq {
+        fail(d, DEC_ERR_SEQ)
+        return
+    }
+    let is_frame: bool = (*o).kind == av1obu.OBU_FRAME
+    if (*o).kind == av1obu.OBU_REDUNDANT_HDR || ((*o).kind == av1obu.OBU_FRAME_HDR && (*(*d).st).seen_frame_header == 1) {
+        return
+    }
+    let base: u64 = data + (*o).pay_off as u64
+    var r: av1br.BR = av1br.br_new(base, (*o).pay_len)
+    let rc: i64 = av1frh.fh_parse(&r, (*d).fh, (*d).seq, (*d).st, (*o).tid, (*o).sid)
+    if rc == av1frh.FH_ERR {
+        fail(d, DEC_ERR_HDR)
+        return
+    }
+    if rc == av1frh.FH_SHOW_EXISTING {
+        show_existing(d, out)
+        return
+    }
+    av1ref.ref_update((*d).st, (*d).fh, (*d).seq)
+    (*(*d).st).seen_frame_header = 1
+    if !begin_frame(d) {
+        fail(d, DEC_ERR_CDF)
+        return
+    }
+    if is_frame {
+        av1br.br_align(&r)
+        var t: av1frh.TgInfo = av1frh.TgInfo { tile_start_and_end_present_flag: 0, tg_start: 0, tg_end: 0, header_bytes: 0, frame_done: 0 }
+        if av1frh.tg_parse(&r, (*d).fh, &t, 0) < 0 {
+            fail(d, DEC_ERR_HDR)
+            return
+        }
+        let off: i64 = av1br.br_pos(&r) >> 3
+        decode_tiles(d, out, base + off as u64, (*o).pay_len as i64 - off, &t)
+    }
+}
+
+fn do_tile_group(d: *mut Decoder, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
+    if (*(*d).st).seen_frame_header == 0 || (*d).cur == 0 {
+        fail(d, DEC_ERR_HDR)
+        return
+    }
+    let base: u64 = data + (*o).pay_off as u64
+    var r: av1br.BR = av1br.br_new(base, (*o).pay_len)
+    var t: av1frh.TgInfo = av1frh.TgInfo { tile_start_and_end_present_flag: 0, tg_start: 0, tg_end: 0, header_bytes: 0, frame_done: 0 }
+    if av1frh.tg_parse(&r, (*d).fh, &t, (*o).pay_len as i64) < 0 {
+        fail(d, DEC_ERR_HDR)
+        return
+    }
+    let off: i64 = av1br.br_pos(&r) >> 3
+    decode_tiles(d, out, base + off as u64, (*o).pay_len as i64 - off, &t)
+}
+
+fn dec_chunk(d: *mut Decoder, out: *mut rt.Buf, data: u64, size: usize) {
+    var pos: usize = 0
+    while pos < size && (*d).err == 0 {
+        var o: av1obu.Obu = av1obu.Obu { kind: 0, has_ext: false, tid: 0, sid: 0, has_size: false, pay_off: 0, pay_len: 0, total: 0 }
+        if av1obu.obu_parse(data, size, pos, &o) != av1obu.OBU_OK {
+            fail(d, DEC_ERR_OBU)
+            return
+        }
+        var drop: bool = false
+        if o.kind != av1obu.OBU_SEQ && o.kind != av1obu.OBU_TD && o.has_ext && (*d).have_seq {
+            let idc: i64 = (*(*d).seq).operating_point_idc_sel
+            if idc != 0 {
+                let in_t: i64 = (idc >> (o.tid as u64)) & 1
+                let in_s: i64 = (idc >> ((o.sid + 8) as u64)) & 1
+                if in_t == 0 || in_s == 0 {
+                    drop = true
+                }
+            }
+        }
+        if !drop {
+            if o.kind == av1obu.OBU_SEQ {
+                do_seq(d, data, &o)
+            } else if o.kind == av1obu.OBU_FRAME || o.kind == av1obu.OBU_FRAME_HDR || o.kind == av1obu.OBU_REDUNDANT_HDR {
+                do_frame(d, out, data, &o)
+            } else if o.kind == av1obu.OBU_TILE_GROUP {
+                do_tile_group(d, out, data, &o)
+            } else if o.kind == av1obu.OBU_TD {
+                (*(*d).st).seen_frame_header = 0
+            }
+        }
+        pos = pos + o.total
+    }
+}
+
+fn le32(data: u64, pos: usize) -> usize {
+    return (vp9mem.ld8(data, pos) + (vp9mem.ld8(data, pos + 1) << 8) + (vp9mem.ld8(data, pos + 2) << 16) + (vp9mem.ld8(data, pos + 3) << 24)) as usize
+}
+
+fn dec_stream(d: *mut Decoder, out: *mut rt.Buf, data: u64, n: usize) {
+    if n >= 32 && vp9mem.ld8(data, 0) == 68 && vp9mem.ld8(data, 1) == 75 && vp9mem.ld8(data, 2) == 73 && vp9mem.ld8(data, 3) == 70 {
+        var pos: usize = vp9mem.ld8(data, 6) as usize + vp9mem.ld8(data, 7) as usize * 256
+        while pos + 12 <= n && (*d).err == 0 {
+            let fsz: usize = le32(data, pos)
+            if pos + 12 + fsz > n {
+                break
+            }
+            dec_chunk(d, out, data + pos as u64 + 12, fsz)
+            pos = pos + 12 + fsz
+        }
+    } else {
+        dec_chunk(d, out, data, n)
+    }
+}

@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1mem
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1frame
+import media.video.av1.av1ipred
+import media.video.av1.av1ipcfl
+import media.video.av1.av1itx
+import media.video.av1.av1coef
+import media.video.av1.av1seq
+
+export { Recon, recon_new, recon_free, recon_begin_frame, recon_attach }
+
+struct Recon {
+    frame: *mut av1frame.Frame,
+    uv_mode_a: u64,
+    mi_count: i64,
+    ipred_scr: u64,
+    itx_scr: u64,
+    cfl_tmp: u64,
+    n_pred: i64,
+    n_resid: i64,
+}
+
+fn recon_new() -> *mut Recon {
+    let rc: *mut Recon = av1mem.av1_zalloc[Recon]()
+    (*rc).ipred_scr = vp9mem.alloc(av1ipred.IPRED_SCRATCH * 2)
+    (*rc).itx_scr = vp9mem.alloc(av1itx.ITX_SCRATCH * 2)
+    (*rc).cfl_tmp = vp9mem.alloc(16384)
+    return rc
+}
+
+fn recon_free(rc: *mut Recon) {
+    if (*rc).uv_mode_a != 0 {
+        vp9mem.free((*rc).uv_mode_a, (*rc).mi_count as usize)
+    }
+    vp9mem.free((*rc).ipred_scr, av1ipred.IPRED_SCRATCH * 2)
+    vp9mem.free((*rc).itx_scr, av1itx.ITX_SCRATCH * 2)
+    vp9mem.free((*rc).cfl_tmp, 16384)
+    av1mem.av1_zfree[Recon](rc)
+}
+
+fn recon_begin_frame(rc: *mut Recon, td: *mut av1blkst.TileDec, frame: *mut av1frame.Frame) {
+    if (*rc).uv_mode_a != 0 {
+        vp9mem.free((*rc).uv_mode_a, (*rc).mi_count as usize)
+    }
+    (*rc).mi_count = (*td).mi_count
+    (*rc).uv_mode_a = vp9mem.alloc((*rc).mi_count as usize)
+    vp9mem.zero((*rc).uv_mode_a, (*rc).mi_count as usize)
+    (*rc).frame = frame
+}
+
+fn recon_attach(rc: *mut Recon, td: *mut av1blkst.TileDec) {
+    (*td).hook_ctx = rc as u64
+    (*td).hook_tx = recon_tx
+    (*td).hook_coef = av1coef.coef_read
+}
+
+fn mark_uv_mode(rc: *mut Recon, td: *mut av1blkst.TileDec) {
+    var y: i64 = 0
+    while y < (*td).bh4 {
+        var x: i64 = 0
+        while x < (*td).bw4 {
+            let r: i64 = (*td).mi_row + y
+            let c: i64 = (*td).mi_col + x
+            if r < (*td).mi_rows && c < (*td).mi_cols {
+                av1blkst.st((*rc).uv_mode_a, r * (*td).mi_cols + c, (*td).uv_mode)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn is_smooth_mode(m: i64) -> bool {
+    return m >= 9 && m <= 11
+}
+
+fn smooth_at(rc: *mut Recon, td: *mut av1blkst.TileDec, plane: i64, r: i64, c: i64) -> bool {
+    if av1blkst.mi_get(td, (*td).inter_a, r, c) != 0 {
+        return false
+    }
+    if plane == 0 {
+        return is_smooth_mode(av1blkst.mi_get(td, (*td).ymode_a, r, c))
+    }
+    return is_smooth_mode(av1blkst.ld((*rc).uv_mode_a, r * (*td).mi_cols + c))
+}
+
+fn filter_type(rc: *mut Recon, td: *mut av1blkst.TileDec, plane: i64) -> i64 {
+    var avail_u: i64 = (*td).avail_u
+    var avail_l: i64 = (*td).avail_l
+    if plane > 0 {
+        avail_u = (*td).avail_uc
+        avail_l = (*td).avail_lc
+    }
+    if avail_u != 0 {
+        var r: i64 = (*td).mi_row - 1
+        var c: i64 = (*td).mi_col
+        if plane > 0 {
+            if (*td).ss_x != 0 && (c & 1) == 0 {
+                c = c + 1
+            }
+            if (*td).ss_y != 0 && ((*td).mi_row & 1) != 0 {
+                r = r - 1
+            }
+        }
+        if smooth_at(rc, td, plane, r, c) {
+            return 1
+        }
+    }
+    if avail_l != 0 {
+        var r: i64 = (*td).mi_row
+        var c: i64 = (*td).mi_col - 1
+        if plane > 0 {
+            if (*td).ss_x != 0 && ((*td).mi_col & 1) != 0 {
+                c = c - 1
+            }
+            if (*td).ss_y != 0 && (r & 1) == 0 {
+                r = r + 1
+            }
+        }
+        if smooth_at(rc, td, plane, r, c) {
+            return 1
+        }
+    }
+    return 0
+}
+
+fn predict_block(rc: *mut Recon, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame) {
+    let plane: i64 = (*td).ev_plane
+    let p: usize = plane as usize
+    let buf: u64 = (*f).planes[p]
+    let stride: i64 = (*f).strides[p]
+    let x: i64 = (*td).ev_x
+    let y: i64 = (*td).ev_y
+    let w: i64 = (*td).ev_tw
+    let h: i64 = (*td).ev_th
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    var ad: i64 = (*td).angle_y
+    var fm: i64 = 0 - 1
+    if plane == 0 {
+        if (*td).use_filter_intra != 0 {
+            fm = (*td).filter_intra_mode
+        }
+    } else {
+        ad = (*td).angle_uv
+    }
+    let xr: i64 = (((*td).mi_cols * 4) >> (sx as u64)) - (x + w)
+    let yd: i64 = (((*td).mi_rows * 4) >> (sy as u64)) - (y + h)
+    let et: i64 = filter_type(rc, td, plane)
+    let ef: bool = (*(*td).seq).enable_intra_edge_filter != 0
+    av1ipred.predict_intra(buf, stride, x, y, w, h, (*td).ev_mode, ad, fm, (*td).ev_have_l != 0, (*td).ev_have_u != 0, (*td).ev_have_ar != 0, (*td).ev_have_bl != 0, xr, yd, et, ef, (*td).bit_depth, (*rc).ipred_scr)
+    if (*td).ev_is_cfl != 0 {
+        var alpha: i64 = (*td).cfl_u
+        if plane == 2 {
+            alpha = (*td).cfl_v
+        }
+        let dst: u64 = buf + ((y * stride + x) * 2) as u64
+        av1ipcfl.pred_cfl((*f).planes[0], (*f).strides[0], x << (sx as u64), y << (sy as u64), (*td).max_luma_w, (*td).max_luma_h, dst, stride, w, h, sx, sy, alpha, (*td).bit_depth, (*rc).cfl_tmp)
+    }
+    (*rc).n_pred = (*rc).n_pred + 1
+}
+
+fn add_residual(rc: *mut Recon, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame) {
+    let p: usize = (*td).ev_plane as usize
+    let stride: i64 = (*f).strides[p]
+    let dst: u64 = (*f).planes[p] + (((*td).ev_y * stride + (*td).ev_x) * 2) as u64
+    if (*td).lossless != 0 {
+        av1itx.iwht_add((*td).dequant, dst, stride, (*td).bit_depth, (*rc).itx_scr)
+    } else {
+        av1itx.itx_add((*td).dequant, dst, stride, (*td).ev_tx_size, (*td).ev_tx_type, (*td).bit_depth, (*rc).itx_scr)
+    }
+    (*rc).n_resid = (*rc).n_resid + 1
+}
+
+fn recon_tx(ctx: u64, tdp: u64) {
+    let rc: *mut Recon = ctx as *mut Recon
+    let td: *mut av1blkst.TileDec = tdp as *mut av1blkst.TileDec
+    let f: *mut av1frame.Frame = (*rc).frame
+    if (*td).ev_plane == 1 {
+        mark_uv_mode(rc, td)
+    }
+    if (*td).is_inter == 0 {
+        predict_block(rc, td, f)
+    }
+    if (*td).ev_eob > 0 {
+        add_residual(rc, td, f)
+    }
+}
