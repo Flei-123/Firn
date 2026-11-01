@@ -59,7 +59,7 @@ pub(crate) fn run(m: &mut Module) {
     }
     let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
     let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
-    let reuse_on = mode == super::Mode::On && std::env::var_os("FIRN_OWN_NO_REUSE").is_none();
+    let reuse_on = matches!(mode, super::Mode::On | super::Mode::Strict) && std::env::var_os("FIRN_OWN_NO_REUSE").is_none();
     let reuse_calls = m.funcs.iter().any(|f| f.name == registry::REUSE_ALLOC);
     let t0 = std::time::Instant::now();
     let (mut sites, mut frees, mut reuses) = (0usize, 0usize, 0usize);

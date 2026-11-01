@@ -1605,7 +1605,8 @@ pub(crate) fn runtime_source(
         s.push_str(RUNTIME_MAP);
     }
     if crate::own::enabled() {
-        s.push_str(crate::own::RUNTIME);
+        crate::own::patch_gc_runtime(&mut s);
+        s.push_str(&crate::own::runtime_text());
     }
     s
 }

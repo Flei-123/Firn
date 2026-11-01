@@ -426,7 +426,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 let v = &a["--ownership=".len()..];
                 match own::parse(v) {
                     Some(m) => own::set_mode(m),
-                    None => return Err(format!("unknown ownership mode '{}' (allowed: off, on, check)", v)),
+                    None => return Err(format!("unknown ownership mode '{}' (allowed: {})", v, own::ALLOWED)),
                 }
             }
             _ if a.starts_with("--opt-level=") => {
