@@ -266,6 +266,8 @@ public class WgSurfaceOracle {
                         n += "[leaves=" + st.getValue(net.minecraft.world.level.block.BambooStalkBlock.LEAVES).getSerializedName() + ",stage=" + st.getValue(net.minecraft.world.level.block.BambooStalkBlock.STAGE) + "]";
                     } else if (st.is(net.minecraft.tags.BlockTags.LOGS) && st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS)) {
                         n += "[axis=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).getSerializedName() + "]";
+                    } else if (st.getBlock() instanceof net.minecraft.world.level.block.PinkPetalsBlock) {
+                        n += "[facing=" + st.getValue(net.minecraft.world.level.block.PinkPetalsBlock.FACING).getSerializedName() + ",flower_amount=" + st.getValue(net.minecraft.world.level.block.PinkPetalsBlock.AMOUNT) + "]";
                     } else if (waterlogged) {
                         n += "[waterlogged=true]";
                     }

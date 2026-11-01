@@ -163,3 +163,6 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 - Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`, pixel check `pptx_pixcheck.py <exe> <basic.pptx>` (picture colour, crop, ellipse, gradient, rounded rect).
 
 - ODT: anchored (page/paragraph) `draw:text-box` frames become floats (`od_body.frame_float`); XLSX: fraction formats (`# ?/?`, `# ??/??`, fixed denominators, ids 12/13) in `xl_fmtfrac.fi`, test 6420.
+
+- PDF text fill with patterns (axial/radial/tiling, Tj/TJ) goes through `prast.pr_raster_to_mask` + `pattern_paint`. FontFile3/FontFile2 in an OpenType (OTTO) container: `embfont.sfnt_table` extracts the `CFF ` table. Fixtures: `tools/docview/pdf_otf_fixtures.py` (OTTO simple, OTTO CID, raw CIDFontType0C), `pdf_pattern_fixtures.py` (text_axial, text_tiling); all MAD < 1 except text patterns (glyph advance of the substitute font).
+- Sizes now: `kpview_wasm_office` 1 616 KB fast / 3 870 KB safe.

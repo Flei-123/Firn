@@ -100,6 +100,15 @@ def make(out_dir):
         "/Pattern cs /Pt scn 0 0 200 200 re f",
         "/Pattern << /Pt 5 0 R >>",
         extra=[stream("/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 16 /YStep 16 /Resources << >>", b"0 0.5 0.5 rg -5 -5 30 30 re f")])
+    font_res = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >> >> "
+    cases["text_axial"] = page_pdf(
+        "/P1 cs /Pt scn BT /F1 64 Tf 10 70 Td (Firn) Tj ET",
+        font_res + "/Pattern << /Pt << /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [10 0 190 0] /Function "
+        + exp_fn("1 0 0", "0 0 1") + " /Extend [true true] >> >> >> /ColorSpace << /P1 /Pattern >>")
+    cases["text_tiling"] = page_pdf(
+        "/Pattern cs /Pt scn BT /F1 64 Tf 10 70 Td [(Fi) -50 (rn)] TJ ET",
+        font_res + "/Pattern << /Pt 5 0 R >>",
+        extra=[stream("/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>", tile.encode())])
     for name, data in cases.items():
         with open(os.path.join(out_dir, name + ".pdf"), "wb") as handle:
             handle.write(data)
