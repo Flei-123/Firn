@@ -4,7 +4,8 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 FIRNLIB=$ROOT/lib ${FIRNC:-firnc} -o "$D/av1dec" "$ROOT/tools/media_video/av1dec.fi"
-BASE="enable-palette=0:enable-intrabc=0:enable-cdef=0:enable-restoration=0:loopfilter-control=0"
+NOPF="enable-palette=0:enable-intrabc=0:enable-cdef=0:enable-restoration=0"
+BASE="$NOPF:loopfilter-control=0"
 PASS=0
 FAIL=0
 run_case() {
@@ -44,5 +45,19 @@ run_case c444 testsrc2 96x64 yuv444p 1 "$BASE" -crf 25 -b:v 0
 run_case qm testsrc2 128x96 yuv420p 1 "$BASE:enable-qm=1:qm-min=2:qm-max=10" -crf 25 -b:v 0
 run_case deltaq testsrc2 192x112 yuv420p 1 "$BASE:deltaq-mode=1" -crf 25 -b:v 0
 run_case aq testsrc2 192x112 yuv420p 1 "$BASE" -aq-mode 1 -crf 30 -b:v 0
+for s in testsrc2:64x48 testsrc2:128x96 mandelbrot:96x64 testsrc2:352x288 testsrc2:17x13 testsrc2:200x130; do
+  src=${s%%:*}; size=${s#*:}
+  run_case lf_${src}_$size $src $size yuv420p 1 "$NOPF" -crf 25 -b:v 0
+  run_case lfhq_${src}_$size $src $size yuv420p 1 "$NOPF" -crf 8 -b:v 0
+  run_case lflq_${src}_$size $src $size yuv420p 1 "$NOPF" -crf 60 -b:v 0
+done
+run_case lf_sharp testsrc2 192x112 yuv420p 1 "$NOPF:sharpness=5" -crf 40 -b:v 0
+run_case lf_sb128 testsrc2 256x160 yuv420p 1 "$NOPF:sb-size=128" -crf 40 -b:v 0
+run_case lf_tiles testsrc2 704x144 yuv420p 1 "$NOPF" -crf 40 -b:v 0 -tile-columns 2 -tile-rows 1
+run_case lf_10 testsrc2 96x64 yuv420p10le 1 "$NOPF" -crf 40 -b:v 0
+run_case lf_444 testsrc2 96x64 yuv444p 1 "$NOPF" -crf 40 -b:v 0
+run_case lf_deltaq testsrc2 192x112 yuv420p 1 "$NOPF:deltaq-mode=1:delta-lf-mode=1" -crf 30 -b:v 0
+run_case lf_aq testsrc2 192x112 yuv420p 1 "$NOPF" -aq-mode 1 -crf 40 -b:v 0
+run_case lf_multi testsrc2 128x96 yuv420p 4 "$NOPF" -crf 40 -b:v 0
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]
