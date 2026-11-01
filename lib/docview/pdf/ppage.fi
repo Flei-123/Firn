@@ -6,6 +6,7 @@ import docview.pdf.pobj
 import docview.pdf.pdoc
 import docview.pdf.prast
 import docview.pdf.pfont
+import docview.pdf.psmask
 import docview.pdf.embfont
 import docview.pdf.pannot
 import paint.canvas
@@ -89,6 +90,7 @@ struct Run {
     lasty: f64,
     ex: f64,
     ey: f64,
+    smdepth: usize,
     lasth: f64,
 }
 
@@ -386,8 +388,9 @@ fn run_free(r: *mut Run) {
     mem.heap_free((*r).racc, RASTER_CAP)
 }
 
-fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
-    let ar: *mut pobj.PdfArena = &(*d).ar
+fn cs_kind(d: *mut pdoc.Doc, kar: *mut pobj.PdfArena, h: u32, pal: *mut u32,
+    base: *mut u32) -> u32 {
+    let ar: *mut pobj.PdfArena = kar
     *pal = 0
     *base = 1
     var g1: [u8; 10] = "DeviceGray"
@@ -432,7 +435,7 @@ fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
             if pobj.o_arr_len(ar, h) >= 4 {
                 var bp: u32 = 0
                 var bb: u32 = 0
-                let bk: u32 = cs_kind(d,
+                let bk: u32 = cs_kind(d, &(*d).ar,
                     pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 1)), &bp, &bb)
                 *base = bk
                 *pal = pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 3))
@@ -820,7 +823,11 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
         var csh: u32 = resolve_cs(r, nm, res)
         var pal: u32 = 0
         var base: u32 = 1
-        let k: u32 = cs_kind((*r).d, csh, &pal, &base)
+        var kar: *mut pobj.PdfArena = &(*(*r).d).ar
+        if csh == nm {
+            kar = ar
+        }
+        let k: u32 = cs_kind((*r).d, kar, csh, &pal, &base)
         if c0 == 99 as u8 {
             (*g).fcs = k
             (*g).fpal = pal
@@ -938,6 +945,73 @@ fn apply_extgstate(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) {
     (*g).fa = pdoc.doc_num(d, e, (&can[0]) as u64, 2, (*g).fa)
     (*g).sa = pdoc.doc_num(d, e, (&cAn[0]) as u64, 2, (*g).sa)
     (*g).lw = pdoc.doc_num(d, e, (&lwn[0]) as u64, 2, (*g).lw)
+    var smn: [u8; 5] = "SMask"
+    let sm: u32 = pdoc.doc_dict_get(d, e, (&smn[0]) as u64, 5)
+    if pobj.o_kind(&(*d).ar, sm) == pobj.T_DICT {
+        apply_smask(r, sm)
+    }
+}
+
+#[allow_escape]
+fn apply_smask(r: *mut Run, sm: u32) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
+    if (*r).smdepth > 0 || (*r).nmask >= MASKMAX - 1 || (*r).gsp + 2 >= GSMAX {
+        return
+    }
+    var gn: [u8; 1] = "G"
+    let form: u32 = pdoc.doc_dict_get(d, sm, (&gn[0]) as u64, 1)
+    if pobj.o_kind(dar, form) != pobj.T_STREAM {
+        return
+    }
+    var sn: [u8; 1] = "S"
+    var ln: [u8; 10] = "Luminosity"
+    let kind: u32 = pdoc.doc_dict_get(d, sm, (&sn[0]) as u64, 1)
+    let luma: bool = pobj.o_name_eq(dar, kind, (&ln[0]) as u64, 10)
+    let w: usize = canvas.canvas_width((*r).cv)
+    let h: usize = canvas.canvas_height((*r).cv)
+    var tc: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&tc, w, h) {
+        canvas.canvas_free(&tc)
+        return
+    }
+    if luma {
+        canvas.canvas_clear(&tc, canvas.color_of(255, 0, 0, 0))
+    } else {
+        canvas.canvas_clear(&tc, canvas.color_of(0, 0, 0, 0))
+    }
+    let saved: *mut canvas.Canvas = (*r).cv
+    let g: *mut GS = cur(r)
+    let base: i32 = (*g).clip
+    (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+    (*r).gsp = (*r).gsp + 1
+    let g2: *mut GS = cur(r)
+    (*g2).clip = -1
+    (*g2).fa = 1.0
+    (*g2).sa = 1.0
+    (*r).cv = &tc
+    (*r).smdepth = 1
+    var rn: [u8; 9] = "Resources"
+    var fres: u32 = pdoc.doc_dict_get(d, form, (&rn[0]) as u64, 9)
+    if pobj.o_kind(dar, fres) != pobj.T_DICT {
+        fres = 0
+    }
+    exec_form(r, form, fres, 1)
+    (*r).smdepth = 0
+    (*r).cv = saved
+    (*r).gsp = (*r).gsp - 1
+    var cm: *mut prast.Mask = &(*r).masks[MASKMAX - 1]
+    if base >= 0 {
+        cm = &(*r).masks[base as usize]
+    }
+    let k: usize = (*r).nmask
+    (*r).masks[k] = psmask.sm_build(&tc, cm, luma)
+    canvas.canvas_free(&tc)
+    if (*r).masks[k].p as usize == 0 {
+        return
+    }
+    (*r).nmask = k + 1
+    (*cur(r)).clip = k as i32
 }
 
 #[no_gc]
@@ -1406,6 +1480,12 @@ fn do_xobject(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32,
     if !pobj.o_name_eq(dar, st, (&fo[0]) as u64, 4) {
         return
     }
+    exec_form(r, x, res, depth)
+}
+
+fn exec_form(r: *mut Run, x: u32, res: u32, depth: usize) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
     if (*r).gsp + 1 >= GSMAX {
         return
     }
@@ -1473,7 +1553,7 @@ fn draw_image(r: *mut Run, x: u32) {
     var base: u32 = 1
     var kind: u32 = CS_GRAY
     if !is_mask {
-        kind = cs_kind(d, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
+        kind = cs_kind(d, dar, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
             &pal, &base)
     }
     var comps: usize = 1
@@ -2000,5 +2080,5 @@ fn run_new() -> Run {
         ops: 0, glyphs: 0, paths: 0, images: 0, imgfail: 0,
         fontmiss: 0, txt: 0,
         ras: raster.raster_new(), scratch: 0 as *mut u8,
-        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, ex: 0.0, ey: 0.0, lasth: 0.0 }
+        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, ex: 0.0, ey: 0.0, smdepth: 0, lasth: 0.0 }
 }
