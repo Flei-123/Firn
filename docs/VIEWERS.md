@@ -159,5 +159,5 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 
 - `lib/docview/office/pp_*.fi`: one Sect per slide (sldSz), background float, master/layout shapes behind, slide shapes as REL_PAGE floats on one anchor paragraph.
 - Placeholders inherit geometry, fill, bodyPr and text styles from layout and master (title/body/other); lstStyle chain down to defaultTextStyle; bullets (char, autonum), fontScale, anchor, insets.
-- Shapes: sp (fill, outline), lines, groups (child transform), pictures, tables (spans, fills, borders, default Medium Style 2 look). Not done: curved geometries, charts, SmartArt, notes, rotation, crop, gradients (first stop only).
-- Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`.
+- Shapes: sp (fill, outline), lines, groups (child transform), pictures, tables (spans, fills, borders, default Medium Style 2 look). Ellipse and roundRect geometry (fill, outline, adj), two-stop linear gradients (vertical/horizontal), picture srcRect crop (`dx_shape.fi`, Prim.a = geo | grad<<4). Not done: other preset geometries/curves, charts, SmartArt, notes, rotation, multi-stop/diagonal gradients.
+- Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`, pixel check `pptx_pixcheck.py <exe> <basic.pptx>` (picture colour, crop, ellipse, gradient, rounded rect).
