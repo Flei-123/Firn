@@ -1,4 +1,5 @@
-use super::index::{Bits, Index};
+use super::index::Bits;
+use super::prep::Prep;
 use super::registry::Drop;
 use super::sites::{self, Site};
 use super::slots::Slots;
@@ -57,7 +58,8 @@ impl Flow {
         m.iter().next().filter(|s| *s > self.nparams)
     }
 
-    pub fn build(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows, with_sites: bool) -> Flow {
+    pub fn build(f: &Func, pr: &Prep, br: &dyn Borrows, with_sites: bool) -> Flow {
+        let (ix, sl) = (&pr.ix, &pr.sl);
         let nparams = f.params.len();
         let (sites, site_at, drops) = if with_sites {
             let found = sites::find(f, ix, sl, br);
@@ -67,24 +69,14 @@ impl Flow {
         };
         let nseeds = 1 + nparams + sites.len();
         let mut owner_bits = Bits::new(nseeds);
-        let mut zero_add = HashMap::default();
         for (k, d) in drops.iter().enumerate() {
             if *d == Drop::SlotsOwner {
                 owner_bits.set(1 + nparams + k);
             }
         }
-        let code_of = code_loads(f);
-        if owner_bits.count() > 0 {
-            for b in f.blocks.iter() {
-                for inst in b.insts.iter() {
-                    if let (Op::PtrAdd { base, off }, Some(d)) = (&inst.op, inst.dst) {
-                        if ix.const_of(f, *off) == Some(0) {
-                            zero_add.insert(d, *base);
-                        }
-                    }
-                }
-            }
-        }
+        let owners = owner_bits.count() > 0;
+        let zero_add = if owners { pr.zero_add.clone() } else { HashMap::default() };
+        let code_of = pr.code_of.clone();
         let mut fl = Flow {
             nseeds,
             nparams,
@@ -108,7 +100,7 @@ impl Flow {
             fl.may[i].set(1 + i);
         }
         let entry = ix.rpo.first().copied().unwrap_or(0);
-        let deps = value_users(f, ix, &fl.zero_add);
+        let deps = pr.users(f, owners);
         let mut dirty = vec![true; f.blocks.len()];
         let mut cout: Vec<Option<Vec<CellVal>>> = vec![None; f.blocks.len()];
         let mut rounds = 0;
@@ -344,61 +336,4 @@ fn join(a: &mut [CellVal], b: &[CellVal]) {
         x.may.union(&y.may);
         x.derived |= y.derived;
     }
-}
-
-fn value_users(f: &Func, ix: &Index, zero_add: &HashMap<Val, Val>) -> Vec<Vec<u32>> {
-    let mut users: Vec<Vec<u32>> = vec![Vec::new(); ix.nvals];
-    let mut buf = Vec::new();
-    let mut add = |users: &mut Vec<Vec<u32>>, v: Val, bi: usize| {
-        if let Some(u) = users.get_mut(v as usize) {
-            if u.last() != Some(&(bi as u32)) {
-                u.push(bi as u32);
-            }
-        }
-    };
-    for (bi, b) in f.blocks.iter().enumerate() {
-        for inst in b.insts.iter() {
-            buf.clear();
-            inst.op.uses(&mut buf);
-            if let Op::Load { addr } = &inst.op {
-                if let Some(&base) = zero_add.get(addr) {
-                    buf.push(base);
-                }
-            }
-            for &v in buf.iter() {
-                add(&mut users, v, bi);
-            }
-        }
-        buf.clear();
-        super::index::term_uses(&b.term, &mut buf);
-        for &v in buf.iter() {
-            add(&mut users, v, bi);
-        }
-    }
-    users
-}
-
-fn code_loads(f: &Func) -> HashMap<Val, Val> {
-    let mut targets: crate::fx::HashSet<Val> = Default::default();
-    for b in f.blocks.iter() {
-        for inst in b.insts.iter() {
-            if let Op::CallIndirect { target, .. } = &inst.op {
-                targets.insert(*target);
-            }
-        }
-    }
-    let mut out = HashMap::default();
-    if targets.is_empty() {
-        return out;
-    }
-    for b in f.blocks.iter() {
-        for inst in b.insts.iter() {
-            if let (Op::Load { addr }, Some(d)) = (&inst.op, inst.dst) {
-                if targets.contains(&d) {
-                    out.insert(d, *addr);
-                }
-            }
-        }
-    }
-    out
 }

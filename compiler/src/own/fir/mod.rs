@@ -1,8 +1,10 @@
 pub(crate) mod bits;
+pub(crate) mod borrow;
 pub(crate) mod flow;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod live;
+pub(crate) mod prep;
 pub(crate) mod registry;
 pub(crate) mod reuse;
 pub(crate) mod reuse_apply;
@@ -69,10 +71,14 @@ pub(crate) fn run(m: &mut Module) {
         return;
     }
     let ts = std::time::Instant::now();
-    let (sums, roots, st) = summary::compute(m, &base);
+    let cache = prep::Cache::new(m.funcs.len());
+    let (sums, roots, st) = summary::compute(m, &base, &cache);
     let sum_ms = ts.elapsed().as_millis();
     let ta = std::time::Instant::now();
-    let plans = crate::parfn::map_slice(&roots, |&fi| analyze(&m.funcs[fi], &sums, reuse_on, reuse_calls));
+    let plans = {
+        let m: &Module = m;
+        crate::parfn::map_weighted(&roots, |&fi| crate::parfn::weight(&m.funcs[fi]), |&fi| analyze(m, fi, &cache, &sums, reuse_on, reuse_calls))
+    };
     let ana_ms = ta.elapsed().as_millis();
     let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
     let mut reverted = 0usize;
@@ -82,7 +88,7 @@ pub(crate) fn run(m: &mut Module) {
         sites += plan.sites;
         let mut plan = plan;
         if plan.pending.is_some() && std::env::var_os("FIRN_OWN_TRACE").is_some() {
-            let kinds = plan.pending.as_ref().map(|p| format!("{:?}", p.2)).unwrap_or_default();
+            let kinds = plan.pending.as_ref().map(|p| format!("{:?}", p.1)).unwrap_or_default();
             eprintln!("ownership fir: root {} {} {}", pos, f.name, kinds);
         }
         if pos < window.0 || pos >= window.1 {
@@ -91,20 +97,21 @@ pub(crate) fn run(m: &mut Module) {
         if revert_calls(f, &plan.kept, &defined) {
             reverted += 1;
         }
-        if let Some((sl, d, drops, plans, allocs, exits)) = plan.pending {
+        if let Some((d, drops, plans, allocs, exits)) = plan.pending {
+            let Some(sl) = cache.built(fi).map(|p| &p.sl) else { continue };
             let fns: Vec<&str> = drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
             let marked: crate::fx::HashSet<usize> = plans.iter().map(|p| p.free).collect();
-            let (n, handles) = insert::apply(f, &sl, d, &fns, &marked);
+            let (n, handles) = insert::apply(f, sl, d, &fns, &marked);
             frees += n;
             reuses += reuse_apply::apply(f, &plans, &allocs, &handles, &exits, free_fn);
         }
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!(
-            "ownership fir: summaries {} ms ({} borrow evals in {} waves, {} fresh evals), {} roots analyzed in {} ms",
+            "ownership fir: summaries {} ms ({} borrow evals in {} rounds, {} fresh evals), {} roots analyzed in {} ms",
             sum_ms,
             st.borrow_evals,
-            st.waves,
+            st.rounds,
             st.fresh_evals,
             roots.len(),
             ana_ms
@@ -126,37 +133,38 @@ fn root_window() -> (usize, usize) {
 
 struct Plan {
     kept: crate::fx::HashSet<(usize, usize)>,
-    pending: Option<(slots::Slots, Vec<live::Free>, Vec<registry::Drop>, Vec<reuse::Plan>, Vec<reuse::Alloc>, Vec<Vec<(usize, usize)>>)>,
+    pending: Option<(Vec<live::Free>, Vec<registry::Drop>, Vec<reuse::Plan>, Vec<reuse::Alloc>, Vec<Vec<(usize, usize)>>)>,
     sites: usize,
 }
 
-fn analyze(f: &crate::fir::Func, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool) -> Plan {
+fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool) -> Plan {
+    let f = &m.funcs[fi];
     let mut plan = Plan { kept: Default::default(), pending: None, sites: 0 };
     if summary::skipped(f) {
         return plan;
     }
-    let ix = index::Index::build(f);
-    let sl = slots::Slots::build(f, &ix);
-    let mut fl = flow::Flow::build(f, &ix, &sl, sums, true);
+    let p = cache.get(m, fi);
+    let (ix, sl) = (&p.ix, &p.sl);
+    let mut fl = flow::Flow::build(f, p, sums, true);
     if fl.sites.is_empty() || fl.sites.len().saturating_mul(f.inst_count()) > summary::MAX_SITE_WORK {
         return plan;
     }
     plan.sites = fl.sites.len();
-    let (d, freed) = live::deaths(f, &ix, &sl, &mut fl, sums);
+    let (d, freed) = live::deaths(f, ix, sl, &mut fl, sums);
     for (&at, &k) in fl.site_at.iter() {
         if freed[k] {
             plan.kept.insert(at);
         }
     }
     let (plans, allocs) = if reuse_on {
-        let classes = reuse::site_classes(f, &ix, &fl.sites, &fl.drops, &fl.site_at);
-        let allocs = reuse::allocs(f, &ix, reuse_calls);
-        (reuse::plan(f, &ix, &d, &classes, &allocs), allocs)
+        let classes = reuse::site_classes(f, ix, &fl.sites, &fl.drops, &fl.site_at);
+        let allocs = reuse::allocs(f, ix, reuse_calls);
+        (reuse::plan(f, ix, &d, &classes, &allocs), allocs)
     } else {
         (Vec::new(), Vec::new())
     };
-    let exits: Vec<Vec<(usize, usize)>> = plans.iter().map(|p| reuse::side_exits(&ix, &p.path)).collect();
-    plan.pending = Some((sl, d, fl.drops.clone(), plans, allocs, exits));
+    let exits: Vec<Vec<(usize, usize)>> = plans.iter().map(|q| reuse::side_exits(ix, &q.path)).collect();
+    plan.pending = Some((d, fl.drops.clone(), plans, allocs, exits));
     plan
 }
 
