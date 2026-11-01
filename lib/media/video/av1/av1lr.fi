@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1cdfidx
+import media.video.av1.av1sym
+import media.video.av1.av1fhdr
+
+export { read_lr, LR_UNIT_BYTES }
+
+const LR_UNIT_BYTES: i64 = 40
+const RESTORE_NONE: i64 = 0
+const RESTORE_WIENER: i64 = 1
+const RESTORE_SGRPROJ: i64 = 2
+const RESTORE_SWITCHABLE: i64 = 3
+
+static WIENER_MIN: [i8; 3] = [-5, -23, -17]
+static WIENER_MAX: [i8; 3] = [10, 8, 46]
+static WIENER_K: [u8; 3] = [1, 2, 3]
+static SGR_MIN: [i8; 2] = [-96, -32]
+static SGR_MAX: [i8; 2] = [31, 95]
+static SGR_R0: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 2, 2]
+static SGR_R1: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+
+fn lit(td: *mut av1blkst.TileDec, n: i64) -> i64 {
+    return av1sym.sym_literal(&(*td).sym, n)
+}
+
+fn floor_log2(x: i64) -> i64 {
+    var n: i64 = 0
+    var v: i64 = x
+    while v > 1 {
+        v = v >> 1
+        n = n + 1
+    }
+    return n
+}
+
+fn read_ns(td: *mut av1blkst.TileDec, n: i64) -> i64 {
+    let w: i64 = floor_log2(n) + 1
+    let m: i64 = (1 << (w as u64)) - n
+    let v: i64 = lit(td, w - 1)
+    if v < m {
+        return v
+    }
+    let extra: i64 = lit(td, 1)
+    return (v << 1) - m + extra
+}
+
+fn read_subexp(td: *mut av1blkst.TileDec, num_syms: i64, k: i64) -> i64 {
+    var i: i64 = 0
+    var mk: i64 = 0
+    while true {
+        var b2: i64 = k
+        if i != 0 {
+            b2 = k + i - 1
+        }
+        let a: i64 = 1 << (b2 as u64)
+        if num_syms <= mk + 3 * a {
+            return read_ns(td, num_syms - mk) + mk
+        }
+        if lit(td, 1) == 1 {
+            i = i + 1
+            mk = mk + a
+        } else {
+            return lit(td, b2) + mk
+        }
+    }
+    return 0
+}
+
+fn inverse_recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        return v
+    }
+    if (v & 1) != 0 {
+        return r - ((v + 1) >> 1)
+    }
+    return r + (v >> 1)
+}
+
+fn read_signed_subexp_ref(td: *mut av1blkst.TileDec, low: i64, high: i64, k: i64, ref: i64) -> i64 {
+    let mx: i64 = high - low
+    let r: i64 = ref - low
+    let v: i64 = read_subexp(td, mx, k)
+    var x: i64 = 0
+    if (r << 1) <= mx {
+        x = inverse_recenter(r, v)
+    } else {
+        x = mx - 1 - inverse_recenter(mx - 1 - r, v)
+    }
+    return x + low
+}
+
+fn read_lr_unit(td: *mut av1blkst.TileDec, plane: i64, row: i64, col: i64) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let ft: i64 = (*fh).frame_restoration_type[plane as usize]
+    var rtype: i64 = RESTORE_NONE
+    if ft == RESTORE_WIENER {
+        if av1blkst.rd_sym(td, av1cdfidx.CDF_WIENER_RESTORE, 2) == 1 {
+            rtype = RESTORE_WIENER
+        }
+    } else if ft == RESTORE_SGRPROJ {
+        if av1blkst.rd_sym(td, av1cdfidx.CDF_SGRPROJ_RESTORE, 2) == 1 {
+            rtype = RESTORE_SGRPROJ
+        }
+    } else {
+        rtype = av1blkst.rd_sym(td, av1cdfidx.CDF_SWITCHABLE_RESTORE, 3)
+    }
+    let unit: u64 = (*td).lr_units[plane as usize] + ((row * (*td).lr_cols[plane as usize] + col) * LR_UNIT_BYTES) as u64
+    av1blkst.st(unit, 0, rtype)
+    (*td).n_lr = (*td).n_lr + 1
+    if rtype == RESTORE_WIENER {
+        var pass: i64 = 0
+        while pass < 2 {
+            var first: i64 = 0
+            if plane > 0 {
+                first = 1
+                av1blkst.st(unit, 2 + pass * 3, 0)
+            }
+            var j: i64 = first
+            while j < 3 {
+                let idx: usize = (plane * 6 + pass * 3 + j) as usize
+                let v: i64 = read_signed_subexp_ref(td, WIENER_MIN[j as usize] as i64, (WIENER_MAX[j as usize] as i64) + 1, WIENER_K[j as usize] as i64, (*td).ref_wiener[idx])
+                av1blkst.st(unit, 2 + pass * 3 + j, v)
+                (*td).ref_wiener[idx] = v
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+    } else if rtype == RESTORE_SGRPROJ {
+        let set: i64 = lit(td, 4)
+        av1blkst.st(unit, 1, set)
+        var i: i64 = 0
+        while i < 2 {
+            var radius: i64 = SGR_R0[set as usize] as i64
+            if i == 1 {
+                radius = SGR_R1[set as usize] as i64
+            }
+            let lo: i64 = SGR_MIN[i as usize] as i64
+            let hi: i64 = SGR_MAX[i as usize] as i64
+            let ridx: usize = (plane * 2 + i) as usize
+            var v: i64 = 0
+            if radius != 0 {
+                v = read_signed_subexp_ref(td, lo, hi + 1, 4, (*td).ref_sgr[ridx])
+            } else if i == 1 {
+                v = 128 - (*td).ref_sgr[(plane * 2) as usize]
+                if v < lo {
+                    v = lo
+                }
+                if v > hi {
+                    v = hi
+                }
+            }
+            av1blkst.st(unit, 8 + i, v)
+            (*td).ref_sgr[ridx] = v
+            i = i + 1
+        }
+    }
+}
+
+fn read_lr(td: *mut av1blkst.TileDec, r: i64, c: i64, bsize_w4: i64, bsize_h4: i64) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    if (*fh).uses_lr == 0 || (*fh).allow_intrabc == 1 {
+        return
+    }
+    var plane: i64 = 0
+    while plane < (*td).num_planes {
+        if (*fh).frame_restoration_type[plane as usize] != RESTORE_NONE {
+            var sx: i64 = 0
+            var sy: i64 = 0
+            if plane > 0 {
+                sx = (*td).ss_x
+                sy = (*td).ss_y
+            }
+            let unit: i64 = (*fh).loop_restoration_size[plane as usize]
+            let rows: i64 = (*td).lr_rows[plane as usize]
+            let cols: i64 = (*td).lr_cols[plane as usize]
+            let msy: i64 = 4 >> (sy as u64)
+            var row_start: i64 = (r * msy + unit - 1) / unit
+            var row_end: i64 = ((r + bsize_h4) * msy + unit - 1) / unit
+            if row_end > rows {
+                row_end = rows
+            }
+            var num: i64 = 4 >> (sx as u64)
+            var den: i64 = unit
+            if (*fh).use_superres == 1 {
+                num = num * (*fh).superres_denom
+                den = unit * 8
+            }
+            let col_start: i64 = (c * num + den - 1) / den
+            var col_end: i64 = ((c + bsize_w4) * num + den - 1) / den
+            if col_end > cols {
+                col_end = cols
+            }
+            var ur: i64 = row_start
+            while ur < row_end {
+                var uc: i64 = col_start
+                while uc < col_end {
+                    read_lr_unit(td, plane, ur, uc)
+                    uc = uc + 1
+                }
+                ur = ur + 1
+            }
+        }
+        plane = plane + 1
+    }
+}
