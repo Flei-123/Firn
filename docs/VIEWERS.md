@@ -161,3 +161,5 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 - Placeholders inherit geometry, fill, bodyPr and text styles from layout and master (title/body/other); lstStyle chain down to defaultTextStyle; bullets (char, autonum), fontScale, anchor, insets.
 - Shapes: sp (fill, outline), lines, groups (child transform), pictures, tables (spans, fills, borders, default Medium Style 2 look). Ellipse and roundRect geometry (fill, outline, adj), two-stop linear gradients (vertical/horizontal), picture srcRect crop (`dx_shape.fi`, Prim.a = geo | grad<<4). Not done: other preset geometries/curves, charts, SmartArt, notes, rotation, multi-stop/diagonal gradients.
 - Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`, pixel check `pptx_pixcheck.py <exe> <basic.pptx>` (picture colour, crop, ellipse, gradient, rounded rect).
+
+- ODT: anchored (page/paragraph) `draw:text-box` frames become floats (`od_body.frame_float`); XLSX: fraction formats (`# ?/?`, `# ??/??`, fixed denominators, ids 12/13) in `xl_fmtfrac.fi`, test 6420.
