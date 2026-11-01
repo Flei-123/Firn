@@ -30,6 +30,29 @@ run_case() {
     echo "FAIL $name $(grep -h 'err=\|err_mi\|err_tile\|postfilter' "$D/$name.info" | paste -sd' ')"
   fi
 }
+run_screen() {
+  local name=$1 w=$2 h=$3 pix=$4 seed=$5 params=$6
+  shift 6
+  local bps=1 ssx=1 ssy=1
+  case $pix in
+    *10le|*12le) bps=2 ;;
+  esac
+  case $pix in
+    yuv444*) ssx=0; ssy=0 ;;
+    yuv422*) ssy=0 ;;
+  esac
+  python3 -I "$ROOT/tools/media_video/gen_av1_screen.py" "$D/$name.png" $w $h $seed ${SCREEN_REPEAT:-}
+  ffmpeg -nostdin -v error -y -i "$D/$name.png" -frames:v 1 -pix_fmt $pix -c:v libaom-av1 -g 1 -cpu-used ${SCREEN_CPU:-4} -aom-params "$params" "$@" "$D/$name.ivf" >/dev/null 2>&1 || { echo "SKIP $name (encode)"; return; }
+  ffmpeg -nostdin -v error -y -c:v libdav1d -i "$D/$name.ivf" -f rawvideo -pix_fmt $pix "$D/$name.ref" >/dev/null 2>&1
+  "$D/av1dec" "$D/$name.ivf" "$D/$name.yuv" "$D/$name.info" || true
+  if python3 -I "$ROOT/tools/media_video/av1yuv_cmp.py" "$D/$name.yuv" "$D/$name.ref" $w $h $bps $ssx $ssy; then
+    PASS=$((PASS+1))
+    echo "ok   $name $(grep -h 'n_palette\|n_intrabc' "$D/$name.info" | paste -sd' ')"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL $name $(grep -h 'err=\|err_mi\|err_tile' "$D/$name.info" | paste -sd' ')"
+  fi
+}
 run_svt() {
   local name=$1 size=$2 pix=$3 denom=$4
   shift 4
@@ -107,5 +130,20 @@ run_svt sr_321x177 321x177 yuv420p 10 -crf 50
 run_svt sr_704x144 704x144 yuv420p 14
 run_svt sr_256x160 256x160 yuv420p 12 -crf 20
 run_svt sr_640x360 640x360 yuv420p 11 -crf 45
+SC="tune-content=screen:enable-palette=1:enable-intrabc=0"
+NOF="enable-cdef=0:enable-restoration=0:loopfilter-control=0"
+run_screen pal_192x128 192 128 yuv420p 11 "$SC:$NOF" -crf 20 -b:v 0
+run_screen pal_200x130 200 130 yuv420p 12 "$SC:$NOF" -crf 35 -b:v 0
+run_screen pal_352x288 352 288 yuv420p 13 "$SC:$NOF" -crf 10 -b:v 0
+run_screen pal_10 96 64 yuv420p10le 14 "$SC:$NOF" -crf 25 -b:v 0
+run_screen pal_12 96 64 yuv420p12le 15 "$SC:$NOF" -crf 30 -b:v 0 -strict -2
+run_screen pal_444 96 64 yuv444p 16 "$SC:$NOF" -crf 25 -b:v 0
+run_screen pal_422 96 64 yuv422p 17 "$SC:$NOF" -crf 25 -b:v 0 -strict -2
+run_screen pal_gray 96 64 gray 18 "$SC:$NOF" -crf 25 -b:v 0
+run_screen pal_sb128 256 160 yuv420p 19 "$SC:$NOF:sb-size=128" -crf 25 -b:v 0
+run_screen pal_17x13 17 13 yuv420p 20 "$SC:$NOF" -crf 25 -b:v 0
+run_screen pal_flt 320 240 yuv420p 21 "$SC" -crf 30 -b:v 0 -cpu-used 2
+run_screen pal_lossless 192 128 yuv420p 22 "$SC:lossless=1:$NOF" -b:v 0
+run_screen pal_tiles 704 144 yuv420p 23 "$SC:$NOF" -crf 30 -b:v 0 -tile-columns 2 -tile-rows 1
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]
