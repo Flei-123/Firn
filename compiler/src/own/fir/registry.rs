@@ -31,6 +31,8 @@ const DROP_FNS: &[(Drop, &str, &str)] = &[
     (Drop::SlotsOwner, "__own_drop_slots_owner", "__own_drop_slots_owner_check"),
 ];
 
+pub(crate) const REUSE_ALLOC: &str = "__own_reuse_alloc";
+
 pub(crate) const RENAMES: &[(&str, &str)] = &[
     ("__str_concat", "__own_str_concat2"),
     ("__str_concat3", "__own_str_concat3"),
@@ -40,6 +42,7 @@ pub(crate) const RENAMES: &[(&str, &str)] = &[
 pub(crate) const CONSUMES: &[&str] = &[
     "__gc_free_block",
     "__gc_poison_block",
+    REUSE_ALLOC,
     "__own_drop_slots_owner",
     "__own_drop_slots_owner_check",
     "__own_poison_quiet",
@@ -97,6 +100,7 @@ pub(crate) fn drop_fn(drop: Drop, mode: Mode) -> &'static str {
 pub(crate) fn root_names() -> Vec<String> {
     let mut v: Vec<String> = PRODUCERS.iter().map(|p| p.name.to_string()).collect();
     v.extend(RENAMES.iter().map(|(from, _)| from.to_string()));
+    v.push(REUSE_ALLOC.to_string());
     for (_, free, poison) in DROP_FNS.iter() {
         v.push(free.to_string());
         v.push(poison.to_string());

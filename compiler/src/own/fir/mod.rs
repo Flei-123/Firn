@@ -4,6 +4,8 @@ pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod live;
 pub(crate) mod registry;
+pub(crate) mod reuse;
+pub(crate) mod reuse_apply;
 pub(crate) mod sites;
 pub(crate) mod slots;
 pub(crate) mod summary;
@@ -57,11 +59,13 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     }
     let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
     let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
+    let reuse_on = mode == super::Mode::On && std::env::var_os("FIRN_OWN_NO_REUSE").is_none();
+    let reuse_calls = m.funcs.iter().any(|f| f.name == registry::REUSE_ALLOC);
     let t0 = std::time::Instant::now();
-    let (mut sites, mut frees) = (0usize, 0usize);
+    let (mut sites, mut frees, mut reuses) = (0usize, 0usize, 0usize);
     let base: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
     if base.is_empty() {
-        report(sites, frees, t0);
+        report(sites, frees, reuses, t0);
         return Vec::new();
     }
     let ts = std::time::Instant::now();
@@ -72,7 +76,7 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     for &fi in roots.iter() {
         let f = &mut m.funcs[fi];
         let mut kept: crate::fx::HashSet<(usize, usize)> = crate::fx::HashSet::default();
-        let mut pending: Option<(slots::Slots, Vec<live::Free>, Vec<&str>)> = None;
+        let mut pending: Option<(slots::Slots, Vec<live::Free>, Vec<&str>, Vec<reuse::Plan>, Vec<reuse::Alloc>)> = None;
         if !summary::skipped(f) {
             let ix = index::Index::build(f);
             let sl = slots::Slots::build(f, &ix);
@@ -86,20 +90,30 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
                     }
                 }
                 let fns: Vec<&str> = fl.drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
-                pending = Some((sl, d, fns));
+                let (plans, allocs) = if reuse_on {
+                    let classes = reuse::site_classes(f, &ix, &fl.sites, &fl.drops, &fl.site_at);
+                    let allocs = reuse::allocs(f, &ix, reuse_calls);
+                    (reuse::plan(f, &ix, &d, &classes, &allocs), allocs)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                pending = Some((sl, d, fns, plans, allocs));
             }
         }
         if revert_calls(f, &kept, &defined) {
             reverted.push(fi);
         }
-        if let Some((sl, d, fns)) = pending {
-            frees += insert::apply(f, &sl, d, &fns);
+        if let Some((sl, d, fns, plans, allocs)) = pending {
+            let marked: crate::fx::HashSet<usize> = plans.iter().map(|p| p.free).collect();
+            let (n, handles) = insert::apply(f, &sl, d, &fns, &marked);
+            frees += n;
+            reuses += reuse_apply::apply(f, &plans, &allocs, &handles, free_fn);
         }
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!("ownership fir: summaries {} ms", sum_ms);
     }
-    report(sites, frees, t0);
+    report(sites, frees, reuses, t0);
     if reverted.is_empty() {
         return reverted;
     }
@@ -153,8 +167,8 @@ fn has_producer_call(f: &crate::fir::Func) -> bool {
     f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(&i.op, Op::Call { name, .. } if registry::producer(name).is_some() || registry::is_gc_alloc(name))))
 }
 
-fn report(sites: usize, frees: usize, t0: std::time::Instant) {
+fn report(sites: usize, frees: usize, reuses: usize, t0: std::time::Instant) {
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
-        eprintln!("ownership fir: {} sites, {} frees, {} ms", sites, frees, t0.elapsed().as_millis());
+        eprintln!("ownership fir: {} sites, {} frees, {} reuses, {} ms", sites, frees, reuses, t0.elapsed().as_millis());
     }
 }

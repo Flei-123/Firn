@@ -137,7 +137,7 @@ fn root(uf: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-fn fast_def(f: &Func, ix: &Index, base: Val, off: Val) -> bool {
+pub(crate) fn fast_def(f: &Func, ix: &Index, base: Val, off: Val) -> bool {
     if ix.const_of(f, off) != Some(crate::gc::BLOCK_HEADER as i128) {
         return false;
     }
