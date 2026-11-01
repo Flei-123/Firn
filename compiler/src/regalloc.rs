@@ -3139,8 +3139,8 @@ fn ra_compact_enabled() -> bool {
 ///   into its slot before the call and loaded after it (`call_saves`). The
 ///   slot has to be there for the whole interval, so such a value keeps a
 ///   slot of its own, and the entries are rewritten to the new offset.
-/// * A function with a `v128` value (16 octets, 16 aligned) keeps the old
-///   layout.
+/// * A `v128` value (16 octets, 16 aligned) keeps a slot of its own, laid
+///   out in front of the 8-octet slots.
 ///
 /// Secret values keep a slot of their own too. The layout stays: value slots
 /// first (8..=K*8), then the `alloca` places, then the save slots of the
@@ -3154,9 +3154,6 @@ fn compact_frame(
     save_owner: &HashMap<u64, Val>,
 ) {
     let nv = f.val_types.len();
-    if f.val_types.iter().any(|t| *t == FTy::V128) {
-        return;
-    }
     let mut lo = vec![usize::MAX; nv];
     let mut hi = vec![0usize; nv];
     fn touch(v: Val, p: usize, lo: &mut [usize], hi: &mut [usize]) {
@@ -3221,11 +3218,16 @@ fn compact_frame(
     // (range start, range end, members, old slot) per group that can share
     let mut cand: Vec<(usize, usize, Vec<Val>, u64)> = Vec::new();
     let mut private: Vec<(Vec<Val>, u64)> = Vec::new();
+    let mut wide: Vec<(Vec<Val>, u64)> = Vec::new();
     let mut untouched: Vec<(Vec<Val>, u64)> = Vec::new();
     let mut keys: Vec<u64> = groups.keys().copied().collect();
     keys.sort_unstable();
     for off in keys {
         let members = groups.remove(&off).unwrap_or_default();
+        if members.iter().any(|v| f.val_ty(*v) == FTy::V128) {
+            wide.push((members, off));
+            continue;
+        }
         if members.iter().any(|v| f.is_secret(*v)) {
             private.push((members, off));
             continue;
@@ -3245,7 +3247,11 @@ fn compact_frame(
         }
     }
     for (off, v) in &owned {
-        private.push((vec![*v], *off));
+        if f.val_ty(*v) == FTy::V128 {
+            wide.push((vec![*v], *off));
+        } else {
+            private.push((vec![*v], *off));
+        }
     }
     cand.sort_by(|a, b| (a.0, a.1, a.3).cmp(&(b.0, b.1, b.3)));
     // linear scan over the slots
@@ -3285,12 +3291,27 @@ fn compact_frame(
             slot_no.insert(*old, nslots);
         }
     }
-    // the new layout: value slots, allocas, save slots
+    let mut wide_cursor = 0u64;
+    let mut wide_off: HashMap<u64, u64> = HashMap::default();
+    for (_members, old) in &wide {
+        wide_cursor = align_up(wide_cursor + 16, 16);
+        wide_off.insert(*old, wide_cursor);
+    }
+    let wide_words = wide_cursor / 8;
     let mut new_slot = vec![0u64; nv];
+    for (members, old) in wide.iter().map(|w| (&w.0, w.1)) {
+        let off = wide_off[&old];
+        for v in members {
+            new_slot[*v as usize] = off;
+            if matches!(alloc.locs[*v as usize], Loc::Slot(_)) {
+                alloc.locs[*v as usize] = Loc::Slot(off);
+            }
+        }
+    }
     for (members, old) in cand.iter().map(|c| (&c.2, c.3)).chain(
         private.iter().map(|p| (&p.0, p.1)).chain(untouched.iter().map(|u| (&u.0, u.1))),
     ) {
-        let off = slot_no[&old] * 8;
+        let off = (wide_words + slot_no[&old]) * 8;
         for v in members {
             new_slot[*v as usize] = off;
             // A register value with a save slot keeps its register.
@@ -3299,7 +3320,7 @@ fn compact_frame(
             }
         }
     }
-    let mut cursor = nslots * 8;
+    let mut cursor = (wide_words + nslots) * 8;
     let mut alloca_off: Vec<Option<u64>> = vec![None; nv];
     for b in &f.blocks {
         if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
@@ -3337,7 +3358,7 @@ fn compact_frame(
     }
     alloc.frame = Frame { slot: new_slot, alloca_off, size: align_up(cursor, 16) };
     alloc.saved = saved;
-    alloc.value_slots = nslots as usize;
+    alloc.value_slots = (wide_words + nslots) as usize;
 }
 
 // ------------------------------------------------------------- Emission ---
