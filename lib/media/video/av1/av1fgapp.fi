@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1fg
+import media.video.av1.av1frame
+import media.video.av1.av1fgsyn
+import media.video.av1.av1fgnoise
+import media.video.av1.av1ipm
+
+export { fg_apply_frame, fg_output_frame }
+
+const MC_IDENTITY: i64 = 0
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn fg_output_frame(src: *mut av1frame.Frame, g: *mut av1fg.FilmGrain, matrix_coefficients: i64) -> *mut av1frame.Frame {
+    let dst: *mut av1frame.Frame = av1frame.frame_clone(src)
+    fg_apply_frame(dst, g, matrix_coefficients)
+    return dst
+}
+
+fn blend_chroma(t: *mut av1fgsyn.GrainTpl, g: *mut av1fg.FilmGrain, f: *mut av1frame.Frame, bufs: *mut [u64; 3], prevs: *mut [u64; 3], plane: i64, n: i64, sw: i64, min_v: i64, max_c: i64) {
+    let bd: i64 = (*f).bit_depth
+    let ssx: i64 = (*f).ss_x
+    let ssy: i64 = (*f).ss_y
+    let cfl: bool = (*g).chroma_scaling_from_luma == 1
+    var npts: i64 = (*g).num_cb_points
+    var mult: i64 = (*g).cb_mult - 128
+    var lmult: i64 = (*g).cb_luma_mult - 128
+    var off: i64 = (*g).cb_offset - 256
+    if plane == 2 {
+        npts = (*g).num_cr_points
+        mult = (*g).cr_mult - 128
+        lmult = (*g).cr_luma_mult - 128
+        off = (*g).cr_offset - 256
+    }
+    if npts == 0 && !cfl {
+        return
+    }
+    let pw: i64 = ((*f).width + ssx) >> (ssx as u64)
+    let ph: i64 = ((*f).height + ssy) >> (ssy as u64)
+    let sh: i64 = 32 >> (ssy as u64)
+    let shift: i64 = (*g).grain_scaling_minus_8 + 8
+    let top: i64 = (1 << (bd as u64)) - 1
+    var y: i64 = n * sh
+    while y < ph && y < (n + 1) * sh {
+        var x: i64 = 0
+        while x < pw {
+            let lx: i64 = x << (ssx as u64)
+            let ly: i64 = y << (ssy as u64)
+            var nx: i64 = lx + 1
+            if nx > (*f).width - 1 {
+                nx = (*f).width - 1
+            }
+            var avg: i64 = av1ipm.ld((*f).planes[0], ly * (*f).strides[0] + lx)
+            if ssx == 1 {
+                avg = (avg + av1ipm.ld((*f).planes[0], ly * (*f).strides[0] + nx) + 1) >> 1
+            }
+            let orig: i64 = av1ipm.ld((*f).planes[plane as usize], y * (*f).strides[plane as usize] + x)
+            var merged: i64 = avg
+            if !cfl {
+                merged = clip3(0, top, (((avg * lmult + orig * mult) >> 6) + (off << ((bd - 8) as u64))))
+            }
+            let nz: i64 = av1fgnoise.noise_at(t, g, (*bufs)[plane as usize], (*prevs)[plane as usize], n, y - n * sh, x, ssy, sw)
+            let scaled: i64 = (av1fgsyn.scale_lut(t, plane, merged, bd) * nz + ((1 << (shift as u64)) >> 1)) >> (shift as u64)
+            av1ipm.st((*f).planes[plane as usize], y * (*f).strides[plane as usize] + x, clip3(min_v, max_c, orig + scaled))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn blend_luma(t: *mut av1fgsyn.GrainTpl, g: *mut av1fg.FilmGrain, f: *mut av1frame.Frame, bufs: *mut [u64; 3], prevs: *mut [u64; 3], n: i64, sw: i64, min_v: i64, max_l: i64) {
+    if (*g).num_y_points == 0 {
+        return
+    }
+    let bd: i64 = (*f).bit_depth
+    let shift: i64 = (*g).grain_scaling_minus_8 + 8
+    var y: i64 = n * 32
+    while y < (*f).height && y < (n + 1) * 32 {
+        var x: i64 = 0
+        while x < (*f).width {
+            let orig: i64 = av1ipm.ld((*f).planes[0], y * (*f).strides[0] + x)
+            let nz: i64 = av1fgnoise.noise_at(t, g, (*bufs)[0], (*prevs)[0], n, y - n * 32, x, 0, sw)
+            let scaled: i64 = (av1fgsyn.scale_lut(t, 0, orig, bd) * nz + ((1 << (shift as u64)) >> 1)) >> (shift as u64)
+            av1ipm.st((*f).planes[0], y * (*f).strides[0] + x, clip3(min_v, max_l, orig + scaled))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn fg_apply_frame(f: *mut av1frame.Frame, g: *mut av1fg.FilmGrain, matrix_coefficients: i64) {
+    let t: *mut av1fgsyn.GrainTpl = av1fgsyn.grain_tpl_new()
+    let bd: i64 = (*f).bit_depth
+    let np: i64 = (*f).num_planes
+    av1fgsyn.grain_tpl_build(t, g, bd, (*f).ss_x, (*f).ss_y, np == 1)
+    av1fgsyn.scaling_lut_build(t, g)
+    var min_v: i64 = 0
+    var max_l: i64 = (256 << ((bd - 8) as u64)) - 1
+    var max_c: i64 = max_l
+    if (*g).clip_to_restricted_range == 1 {
+        min_v = 16 << ((bd - 8) as u64)
+        max_l = 235 << ((bd - 8) as u64)
+        max_c = 240 << ((bd - 8) as u64)
+        if matrix_coefficients == MC_IDENTITY {
+            max_c = max_l
+        }
+    }
+    let sw: i64 = (*f).width + 96
+    let bytes: usize = (34 * sw * 8) as usize
+    var bufs: [u64; 3] = [0, 0, 0]
+    var prevs: [u64; 3] = [0, 0, 0]
+    var p: usize = 0
+    while (p as i64) < np {
+        bufs[p] = vp9mem.alloc(bytes)
+        prevs[p] = vp9mem.alloc(bytes)
+        vp9mem.zero(bufs[p], bytes)
+        vp9mem.zero(prevs[p], bytes)
+        p = p + 1
+    }
+    let stripes: i64 = (((*f).height + 1) / 2 + 15) / 16
+    var n: i64 = 0
+    while n < stripes {
+        av1fgnoise.stripe_gen(t, g, &bufs, np, (*f).ss_x, (*f).ss_y, n, (*f).width, sw)
+        if np > 1 {
+            blend_chroma(t, g, f, &bufs, &prevs, 1, n, sw, min_v, max_c)
+            blend_chroma(t, g, f, &bufs, &prevs, 2, n, sw, min_v, max_c)
+        }
+        blend_luma(t, g, f, &bufs, &prevs, n, sw, min_v, max_l)
+        var q: usize = 0
+        while (q as i64) < np {
+            let tmp: u64 = bufs[q]
+            bufs[q] = prevs[q]
+            prevs[q] = tmp
+            q = q + 1
+        }
+        n = n + 1
+    }
+    p = 0
+    while (p as i64) < np {
+        vp9mem.free(bufs[p], bytes)
+        vp9mem.free(prevs[p], bytes)
+        p = p + 1
+    }
+    av1fgsyn.grain_tpl_free(t)
+}
