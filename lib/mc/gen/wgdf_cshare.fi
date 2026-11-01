@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/wgdf_cshare.fi -- tile-wide shared cache of interpolation corner columns (one column = all y corners of one node at one x/z corner).
+import std.rt
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_ops
+
+export { CornerShare, share_new, share_free, share_reset, node_slot, acquire, column_ptr, publish, COL_READY, COL_OWN, COL_LOCAL }
+
+const WIN_X: i32 = 25
+const WIN_Z: i32 = 33
+const WIN_COLS: usize = 825
+const MAX_SLOTS: usize = 8
+const SPIN_LIMIT: u32 = 400000
+const CELL_EMPTY: u64 = 0
+const CELL_BUSY: u64 = 1
+const CELL_READY: u64 = 2
+const COL_READY: i32 = 0
+const COL_OWN: i32 = 1
+const COL_LOCAL: i32 = 2
+
+struct CornerShare {
+    base_qx: i32,
+    base_qz: i32,
+    cw: i32,
+    stride: usize,
+    vals: u64,
+    node_slot: [i32; 3072],
+    state: [u64; 6600],
+}
+
+fn share_new(g: *wgdf_graph.WgGraph) -> *mut CornerShare {
+    let s: *mut CornerShare = rt.heap_alloc(wgdf_graph.wg_size_of[CornerShare]()) as *mut CornerShare
+    (*s).base_qx = 0
+    (*s).base_qz = 0
+    (*s).cw = (*g).size_h * 4
+    (*s).stride = ((*g).height / ((*g).size_v * 4) + 1) as usize
+    (*s).vals = rt.heap_alloc(MAX_SLOTS * WIN_COLS * (*s).stride * 8)
+    var next: i32 = 0
+    var k: usize = 0
+    while k < 3072 {
+        (*s).node_slot[k] = -1
+        if (k as i32) < (*g).n_nodes && (*g).op[k] == wgdf_ops.OP_MARKER && (*g).b[k] == wgdf_ops.MK_INTERPOLATED && next < (MAX_SLOTS as i32) {
+            (*s).node_slot[k] = next
+            next = next + 1
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < MAX_SLOTS * WIN_COLS {
+        (*s).state[k] = CELL_EMPTY
+        k = k + 1
+    }
+    return s
+}
+
+fn share_free(s: *mut CornerShare) {
+    rt.heap_free((*s).vals, MAX_SLOTS * WIN_COLS * (*s).stride * 8)
+    rt.heap_free(s as u64, wgdf_graph.wg_size_of[CornerShare]())
+}
+
+fn share_reset(s: *mut CornerShare, tile_x: i32, tile_z: i32) {
+    (*s).base_qx = ((tile_x - 2) * 16) / (*s).cw
+    (*s).base_qz = ((tile_z - 2) * 16) / (*s).cw
+    var k: usize = 0
+    while k < MAX_SLOTS * WIN_COLS {
+        (*s).state[k] = CELL_EMPTY
+        k = k + 1
+    }
+}
+
+fn node_slot(s: *CornerShare, n: i32) -> i32 {
+    return (*s).node_slot[n as usize]
+}
+
+fn cell_of(s: *CornerShare, slot: i32, qx: i32, qz: i32) -> i32 {
+    let a: i32 = qx - (*s).base_qx
+    let c: i32 = qz - (*s).base_qz
+    if a < 0 || a >= WIN_X || c < 0 || c >= WIN_Z {
+        return -1
+    }
+    return slot * (WIN_COLS as i32) + c * WIN_X + a
+}
+
+fn acquire(s: *mut CornerShare, slot: i32, qx: i32, qz: i32) -> i32 {
+    let at: i32 = cell_of(s, slot, qx, qz)
+    if at < 0 {
+        return COL_LOCAL
+    }
+    let p: *mut u64 = (&(*s).state[at as usize]) as *mut u64
+    var spins: u32 = 0
+    while spins < SPIN_LIMIT {
+        let st: u64 = __atomic_add(p, 0)
+        if st == CELL_READY {
+            return COL_READY
+        }
+        if st == CELL_EMPTY && __atomic_swap(p, CELL_EMPTY, CELL_BUSY) == CELL_EMPTY {
+            return COL_OWN
+        }
+        spins = spins + 1
+    }
+    return COL_LOCAL
+}
+
+fn column_ptr(s: *CornerShare, slot: i32, qx: i32, qz: i32) -> u64 {
+    let at: i32 = cell_of(s, slot, qx, qz)
+    return (*s).vals + (((at as usize) * (*s).stride * 8) as u64)
+}
+
+fn publish(s: *mut CornerShare, slot: i32, qx: i32, qz: i32) {
+    let at: i32 = cell_of(s, slot, qx, qz)
+    __atomic_add((&(*s).state[at as usize]) as *mut u64, 1)
+}
