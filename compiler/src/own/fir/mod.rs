@@ -4,6 +4,7 @@ pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod live;
 pub(crate) mod registry;
+pub(crate) mod sites;
 pub(crate) mod slots;
 pub(crate) mod summary;
 
@@ -55,17 +56,17 @@ pub(crate) fn run(m: &mut Module) {
     }
     let t0 = std::time::Instant::now();
     let (mut sites, mut frees) = (0usize, 0usize);
-    let roots: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
-    if roots.is_empty() {
+    let base: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
+    if base.is_empty() {
         report(sites, frees, t0);
         return;
     }
     let ts = std::time::Instant::now();
-    let sums = summary::compute(m, &roots);
+    let (sums, roots) = summary::compute(m, &base);
     let sum_ms = ts.elapsed().as_millis();
     for &fi in roots.iter() {
         let f = &mut m.funcs[fi];
-        if f.constant_time || f.interrupt || !summary::analyzable(f) || f.name.starts_with("__gc_") || f.name.starts_with("__own_") {
+        if summary::skipped(f) {
             continue;
         }
         let ix = index::Index::build(f);
@@ -85,7 +86,7 @@ pub(crate) fn run(m: &mut Module) {
 }
 
 fn has_producer_call(f: &crate::fir::Func) -> bool {
-    f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(&i.op, Op::Call { name, .. } if registry::producer(name).is_some())))
+    f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(&i.op, Op::Call { name, .. } if registry::producer(name).is_some() || registry::is_gc_alloc(name))))
 }
 
 fn report(sites: usize, frees: usize, t0: std::time::Instant) {

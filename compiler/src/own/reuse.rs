@@ -206,7 +206,7 @@ fn locals_of(f: &FnDecl, binders: &StdMap<String, usize>) -> StdSet<String> {
 }
 
 pub(crate) fn apply(prog: &mut Program) {
-    if !super::enabled() || !crate::gc::has_classes() {
+    if !super::enabled() || !crate::gc::has_classes() || std::env::var_os("FIRN_OWN_NO_AST").is_some() {
         return;
     }
     let shapes = super::shape::collect(prog);
