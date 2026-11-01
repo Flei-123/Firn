@@ -84,12 +84,38 @@ const firn = {
     },
 };
 
+const facePackUrl = new URL('../../demos/webdemo/pdffonts.pack', import.meta.url);
+function faceHost() {
+    let pack = null;
+    try {
+        const bytes = fs.readFileSync(facePackUrl);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const count = view.getUint32(0, true);
+        const offs = [];
+        for (let i = 0; i <= count; i++) offs.push(view.getUint32(4 + i * 4, true));
+        pack = { count, offs, base: 4 + (count + 1) * 4, bytes };
+    } catch (e) {
+        pack = null;
+    }
+    const span = (i) => (pack && i < pack.count ? pack.offs[i + 1] - pack.offs[i] : 0);
+    return {
+        firn_web_face_size: (i) => span(i),
+        firn_web_face_read: (i, p, n) => {
+            if (span(i) !== n) return 0;
+            const from = pack.base + pack.offs[i];
+            new Uint8Array(memory.buffer, p, n).set(pack.bytes.subarray(from, from + n));
+            return n;
+        },
+    };
+}
+
 let code = 0;
 try {
     const { instance } = await WebAssembly.instantiate(fs.readFileSync(file), {
         firn,
-        env: new Proxy({}, {
-            get(_, name) {
+        env: new Proxy(faceHost(), {
+            get(target, name) {
+                if (name in target) return target[name];
                 return () => {
                     throw new Error(`the program imports env.${String(name)}, which this host does not provide`);
                 };
