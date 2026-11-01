@@ -30,4 +30,30 @@ fi
 if grep -q "s.push_str(crate::own::RUNTIME);" "$DST/compiler/src/gc.rs"; then
   sed -i 's/^        s.push_str(crate::own::RUNTIME);$/        crate::own::patch_gc_runtime(\&mut s);\n        s.push_str(\&crate::own::runtime_text());/' "$DST/compiler/src/gc.rs"
 fi
+python3 -I - "$DST/compiler/src/opt.rs" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = """    let mut st = optimize_with_base(m, cfg);
+    if own {
+        let changed = crate::own::fir::run(m);
+        if !changed.is_empty() {
+            let mut clk = PassClock {
+                on: std::env::var_os("FIRN_PASS_TIMINGS").is_some(),
+                ..Default::default()
+            };
+            for &i in changed.iter() {
+                optimize_func(&mut m.funcs[i], &mut st, cfg, &mut clk);
+            }
+        }
+    }
+"""
+new = """    let st = optimize_with_base(m, cfg);
+    if own {
+        crate::own::fir::run(m);
+    }
+"""
+if old in text:
+    open(path, "w").write(text.replace(old, new))
+PY
 echo "ported $SRC -> $DST"
