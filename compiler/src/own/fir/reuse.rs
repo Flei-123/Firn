@@ -82,6 +82,8 @@ pub(crate) fn allocs(f: &Func, ix: &Index, with_calls: bool) -> Vec<Alloc> {
             }
         }
     }
+    let slows: HashSet<usize> = out.iter().filter(|a| !a.call).map(|a| a.slow).collect();
+    out.retain(|a| !a.call || !slows.contains(&a.head));
     out
 }
 
@@ -163,8 +165,24 @@ pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>]
         plans.push(Plan { free: i, path, alloc: k });
     }
     let heads: HashSet<usize> = plans.iter().map(|p| allocs[p.alloc].head).collect();
-    plans.retain(|p| p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)) && simple_preds(ix, &p.path));
+    plans.retain(|p| p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)) && simple_preds(ix, &p.path) && exits_ok(ix, &p.path, &allocs[p.alloc]));
     plans
+}
+
+pub(crate) fn side_exits(ix: &Index, path: &[usize]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for k in 0..path.len().saturating_sub(1) {
+        for &y in ix.succs[path[k]].iter() {
+            if y != path[k + 1] && !out.contains(&(k, y)) {
+                out.push((k, y));
+            }
+        }
+    }
+    out
+}
+
+fn exits_ok(ix: &Index, path: &[usize], a: &Alloc) -> bool {
+    side_exits(ix, path).iter().all(|&(k, y)| (!a.call && y == a.slow) || ix.preds[y] == [path[k]])
 }
 
 fn def_pos(ix: &Index, v: Val) -> usize {

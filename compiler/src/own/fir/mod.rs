@@ -76,7 +76,7 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     for &fi in roots.iter() {
         let f = &mut m.funcs[fi];
         let mut kept: crate::fx::HashSet<(usize, usize)> = crate::fx::HashSet::default();
-        let mut pending: Option<(slots::Slots, Vec<live::Free>, Vec<&str>, Vec<reuse::Plan>, Vec<reuse::Alloc>)> = None;
+        let mut pending: Option<(slots::Slots, Vec<live::Free>, Vec<&str>, Vec<reuse::Plan>, Vec<reuse::Alloc>, Vec<Vec<(usize, usize)>>)> = None;
         if !summary::skipped(f) {
             let ix = index::Index::build(f);
             let sl = slots::Slots::build(f, &ix);
@@ -97,17 +97,18 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
                 } else {
                     (Vec::new(), Vec::new())
                 };
-                pending = Some((sl, d, fns, plans, allocs));
+                let exits: Vec<Vec<(usize, usize)>> = plans.iter().map(|p| reuse::side_exits(&ix, &p.path)).collect();
+                pending = Some((sl, d, fns, plans, allocs, exits));
             }
         }
         if revert_calls(f, &kept, &defined) {
             reverted.push(fi);
         }
-        if let Some((sl, d, fns, plans, allocs)) = pending {
+        if let Some((sl, d, fns, plans, allocs, exits)) = pending {
             let marked: crate::fx::HashSet<usize> = plans.iter().map(|p| p.free).collect();
             let (n, handles) = insert::apply(f, &sl, d, &fns, &marked);
             frees += n;
-            reuses += reuse_apply::apply(f, &plans, &allocs, &handles, free_fn);
+            reuses += reuse_apply::apply(f, &plans, &allocs, &handles, &exits, free_fn);
         }
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {

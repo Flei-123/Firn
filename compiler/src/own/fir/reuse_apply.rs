@@ -4,11 +4,11 @@ use crate::fx::{HashMap, HashSet};
 
 const FLAGS_WITHOUT_MARK: i128 = 0xFFFF_FFFC;
 
-pub(crate) fn apply(f: &mut Func, plans: &[Plan], allocs: &[Alloc], handles: &HashMap<usize, Val>, free_fn: &str) -> usize {
+pub(crate) fn apply(f: &mut Func, plans: &[Plan], allocs: &[Alloc], handles: &HashMap<usize, Val>, exits: &[Vec<(usize, usize)>], free_fn: &str) -> usize {
     let mut n = 0;
-    for p in plans {
+    for (p, ex) in plans.iter().zip(exits.iter()) {
         if let Some(&h) = handles.get(&p.free) {
-            reuse_one(f, p, &allocs[p.alloc], h, free_fn);
+            reuse_one(f, p, &allocs[p.alloc], h, ex, free_fn);
             n += 1;
         }
     }
@@ -55,11 +55,17 @@ fn push(f: &mut Func, b: usize, ty: FTy, op: Op) -> Val {
     v
 }
 
-fn reuse_one(f: &mut Func, p: &Plan, a: &Alloc, h: Val, free_fn: &str) {
+fn free_at_start(f: &mut Func, b: usize, h: Val, free_fn: &str) {
+    let at = f.blocks[b].insts.iter().position(|i| !matches!(i.op, Op::Phi { .. })).unwrap_or(f.blocks[b].insts.len());
+    f.blocks[b].insts.insert(at, Inst::new(None, FTy::Void, Op::Call { name: free_fn.to_string(), args: vec![h] }));
+}
+
+fn reuse_one(f: &mut Func, p: &Plan, a: &Alloc, h: Val, exits: &[(usize, usize)], free_fn: &str) {
     let entry = pos_of(f, f.entry());
     let ty = f.val_ty(h);
     let zero = konst(f, entry, ty, 0);
     let mut hv = h;
+    let mut at_path: Vec<Val> = vec![h];
     let mut scope: Vec<usize> = vec![p.path[0]];
     for k in 1..p.path.len() {
         let (prev, x) = (p.path[k - 1], p.path[k]);
@@ -72,6 +78,12 @@ fn reuse_one(f: &mut Func, p: &Plan, a: &Alloc, h: Val, free_fn: &str) {
             scope.clear();
         }
         scope.push(x);
+        at_path.push(hv);
+    }
+    for &(k, y) in exits.iter() {
+        if a.call || y != a.slow {
+            free_at_start(f, y, at_path[k], free_fn);
+        }
     }
     let head = a.head;
     let Some(idx) = f.blocks[head].insts.iter().position(|i| i.dst == Some(a.b0)) else { return };
@@ -107,8 +119,7 @@ fn reuse_one(f: &mut Func, p: &Plan, a: &Alloc, h: Val, free_fn: &str) {
     let rb = push(f, r, f.val_ty(a.b0), Op::PtrAdd { base: hv, off: c16 });
     clone_take(f, a, h2, r, rb);
     if preds_of(f, a.slow).iter().all(|q| *q == h2 || scope.contains(q)) {
-        let at = f.blocks[a.slow].insts.iter().position(|i| !matches!(i.op, Op::Phi { .. })).unwrap_or(f.blocks[a.slow].insts.len());
-        f.blocks[a.slow].insts.insert(at, Inst::new(None, FTy::Void, Op::Call { name: free_fn.to_string(), args: vec![hv] }));
+        free_at_start(f, a.slow, hv, free_fn);
     }
 }
 
