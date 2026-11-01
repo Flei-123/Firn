@@ -1,0 +1,699 @@
+// SPDX-License-Identifier: MPL-2.0
+// Compact Font Format (CFF / Type1C / CIDFontType0C): tables, charset, encoding and glyph lookup.
+import html.mem
+import rt.rt
+import font.cff_data
+
+export {
+    CffFont, CffIndex,
+    cff_new, cff_init, cff_free, cff_ok,
+    cff_glyph_count, cff_is_cid, cff_upem,
+    cff_gid_for_name, cff_gid_for_code, cff_gid_for_cid,
+    cff_name_copy, cff_byte,
+    cff_cs_range, cff_fd_of, cff_fd_subrs, cff_fd_widths,
+    cff_gsubrs, cff_idx_item, cff_idx_count,
+    cff_std_code_gid,
+}
+
+const MAX_FD: usize = 32
+const MAX_GLYPHS: usize = 65535
+
+struct CffIndex {
+    count: usize,
+    osz: usize,
+    offs: usize,
+    base: usize,
+    end: usize,
+}
+
+struct CffFont {
+    data: u64,
+    len: usize,
+    ok: u32,
+    iscid: u32,
+    nglyphs: usize,
+    sids: u64,
+    cidmap: u64,
+    upem: f64,
+    strings: CffIndex,
+    gsubrs: CffIndex,
+    charstrings: CffIndex,
+    fdsel: usize,
+    fdfmt: u32,
+    nfd: usize,
+    lsubrs: [CffIndex; 32],
+    defw: [f64; 32],
+    nomw: [f64; 32],
+    enc: [u32; 256],
+}
+
+fn idx_empty() -> CffIndex {
+    return CffIndex { count: 0, osz: 0, offs: 0, base: 0, end: 0 }
+}
+
+fn cff_new() -> CffFont {
+    return CffFont { data: 0, len: 0, ok: 0, iscid: 0, nglyphs: 0, sids: 0,
+        cidmap: 0, upem: 1000.0, strings: idx_empty(), gsubrs: idx_empty(),
+        charstrings: idx_empty(), fdsel: 0, fdfmt: 0, nfd: 0,
+        lsubrs: [idx_empty(); 32], defw: [0.0; 32], nomw: [0.0; 32],
+        enc: [0 as u32; 256] }
+}
+
+fn cff_free(f: *mut CffFont) {
+    if (*f).sids != 0 {
+        mem.heap_free((*f).sids as *mut u8, (*f).nglyphs * 2)
+    }
+    if (*f).cidmap != 0 {
+        mem.heap_free((*f).cidmap as *mut u8, 65536 * 2)
+    }
+    *f = cff_new()
+}
+
+fn cff_ok(f: *mut CffFont) -> bool {
+    return (*f).ok != 0 as u32
+}
+
+fn cff_glyph_count(f: *mut CffFont) -> usize {
+    return (*f).nglyphs
+}
+
+fn cff_is_cid(f: *mut CffFont) -> bool {
+    return (*f).iscid != 0 as u32
+}
+
+fn cff_upem(f: *mut CffFont) -> f64 {
+    return (*f).upem
+}
+
+fn cb(f: *mut CffFont, off: usize) -> u32 {
+    if off >= (*f).len {
+        return 0
+    }
+    return rt.ld8((*f).data, off) as u32
+}
+
+fn cff_byte(f: *mut CffFont, off: usize) -> u32 {
+    return cb(f, off)
+}
+
+fn c16(f: *mut CffFont, off: usize) -> u32 {
+    return (cb(f, off) << 8) | cb(f, off + 1)
+}
+
+fn cn(f: *mut CffFont, off: usize, n: usize) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < n {
+        v = (v << 8) | (cb(f, off + i) as usize)
+        i = i + 1
+    }
+    return v
+}
+
+fn idx_open(f: *mut CffFont, off: usize) -> CffIndex {
+    var ix: CffIndex = idx_empty()
+    if off >= (*f).len || off + 2 > (*f).len {
+        return ix
+    }
+    let count: usize = c16(f, off) as usize
+    if count == 0 {
+        ix.end = off + 2
+        ix.base = off + 2
+        return ix
+    }
+    let osz: usize = cb(f, off + 2) as usize
+    if osz < 1 || osz > 4 {
+        return ix
+    }
+    let offs: usize = off + 3
+    let base: usize = offs + (count + 1) * osz - 1
+    let last: usize = cn(f, offs + count * osz, osz)
+    if last < 1 || base + last > (*f).len {
+        return ix
+    }
+    ix.count = count
+    ix.osz = osz
+    ix.offs = offs
+    ix.base = base
+    ix.end = base + last
+    return ix
+}
+
+fn cff_idx_count(ix: *mut CffIndex) -> usize {
+    return (*ix).count
+}
+
+fn cff_idx_item(f: *mut CffFont, ix: *mut CffIndex, i: usize,
+    start: *mut usize, len: *mut usize) -> bool {
+    if i >= (*ix).count {
+        return false
+    }
+    let a: usize = cn(f, (*ix).offs + i * (*ix).osz, (*ix).osz)
+    let b: usize = cn(f, (*ix).offs + (i + 1) * (*ix).osz, (*ix).osz)
+    if a < 1 || b < a {
+        return false
+    }
+    if (*ix).base + b > (*f).len {
+        return false
+    }
+    *start = (*ix).base + a
+    *len = b - a
+    return true
+}
+
+fn real_value(f: *mut CffFont, off: usize, end: usize, used: *mut usize) -> f64 {
+    var i: usize = off
+    var mant: f64 = 0.0
+    var frac: f64 = 0.0
+    var scale: f64 = 1.0
+    var neg: bool = false
+    var seen_dot: bool = false
+    var exp: i64 = 0
+    var exp_neg: bool = false
+    var in_exp: bool = false
+    var done: bool = false
+    while i < end && !done {
+        let byte: u32 = cb(f, i)
+        i = i + 1
+        var half: usize = 0
+        while half < 2 && !done {
+            var nib: u32 = byte >> 4
+            if half == 1 {
+                nib = byte & 15
+            }
+            half = half + 1
+            if nib <= 9 {
+                if in_exp {
+                    if exp < 1000 {
+                        exp = exp * 10 + (nib as i64)
+                    }
+                } else if seen_dot {
+                    scale = scale / 10.0
+                    frac = frac + (nib as f64) * scale
+                } else {
+                    mant = mant * 10.0 + (nib as f64)
+                }
+            }
+            if nib == 10 {
+                seen_dot = true
+            }
+            if nib == 11 {
+                in_exp = true
+            }
+            if nib == 12 {
+                in_exp = true
+                exp_neg = true
+            }
+            if nib == 14 {
+                neg = true
+            }
+            if nib == 15 {
+                done = true
+            }
+        }
+    }
+    var v: f64 = mant + frac
+    var e: i64 = exp
+    if e > 40 {
+        e = 40
+    }
+    while e > 0 {
+        if exp_neg {
+            v = v / 10.0
+        } else {
+            v = v * 10.0
+        }
+        e = e - 1
+    }
+    if neg {
+        v = 0.0 - v
+    }
+    *used = i - off
+    return v
+}
+
+fn dict_get(f: *mut CffFont, start: usize, len: usize, want: u32,
+    out: *mut f64, cap: usize) -> i32 {
+    var stack: [f64; 48] = [0.0; 48]
+    var n: usize = 0
+    var i: usize = start
+    let end: usize = start + len
+    var found: i32 = -1
+    while i < end && i < (*f).len {
+        let b0: u32 = cb(f, i)
+        if b0 <= 21 {
+            var op: u32 = b0
+            i = i + 1
+            if b0 == 12 {
+                op = 1200 + cb(f, i)
+                i = i + 1
+            }
+            if op == want {
+                var k: usize = 0
+                while k < n && k < cap {
+                    *((out as u64 + (k * 8) as u64) as *mut f64) = stack[k]
+                    k = k + 1
+                }
+                found = n as i32
+            }
+            n = 0
+        } else {
+            var v: f64 = 0.0
+            if b0 == 28 {
+                var s: i32 = c16(f, i + 1) as i32
+                if s >= 32768 {
+                    s = s - 65536
+                }
+                v = s as f64
+                i = i + 3
+            } else if b0 == 29 {
+                var s2: i64 = cn(f, i + 1, 4) as i64
+                if s2 >= 2147483648 {
+                    s2 = s2 - 4294967296
+                }
+                v = s2 as f64
+                i = i + 5
+            } else if b0 == 30 {
+                var used: usize = 0
+                v = real_value(f, i + 1, end, &used)
+                i = i + 1 + used
+            } else if b0 >= 32 && b0 <= 246 {
+                v = (b0 as f64) - 139.0
+                i = i + 1
+            } else if b0 >= 247 && b0 <= 250 {
+                v = ((b0 as f64) - 247.0) * 256.0 + (cb(f, i + 1) as f64) + 108.0
+                i = i + 2
+            } else if b0 >= 251 && b0 <= 254 {
+                v = 0.0 - ((b0 as f64) - 251.0) * 256.0 - (cb(f, i + 1) as f64) - 108.0
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            if n < 48 {
+                stack[n] = v
+                n = n + 1
+            }
+        }
+    }
+    return found
+}
+
+fn num_off(v: f64) -> usize {
+    if v < 0.0 || v > 100000000.0 {
+        return 0
+    }
+    return v as usize
+}
+
+fn read_private(f: *mut CffFont, fd: usize, dict_start: usize, dict_len: usize) {
+    var pv: [f64; 4] = [0.0; 4]
+    let n: i32 = dict_get(f, dict_start, dict_len, 18, &pv[0], 2)
+    if n < 2 {
+        return
+    }
+    let psize: usize = num_off(pv[0])
+    let poff: usize = num_off(pv[1])
+    if psize == 0 || poff == 0 || poff + psize > (*f).len {
+        return
+    }
+    var v: [f64; 4] = [0.0; 4]
+    if dict_get(f, poff, psize, 20, &v[0], 1) >= 1 {
+        (*f).defw[fd] = v[0]
+    }
+    if dict_get(f, poff, psize, 21, &v[0], 1) >= 1 {
+        (*f).nomw[fd] = v[0]
+    }
+    if dict_get(f, poff, psize, 19, &v[0], 1) >= 1 {
+        let so: usize = num_off(v[0])
+        if so > 0 {
+            (*f).lsubrs[fd] = idx_open(f, poff + so)
+        }
+    }
+}
+
+fn load_charset(f: *mut CffFont, off: usize) {
+    let n: usize = (*f).nglyphs
+    let sp: u64 = (*f).sids
+    if off <= 2 {
+        var g: usize = 0
+        while g < n {
+            rt.st16(sp, g, g as u16)
+            g = g + 1
+        }
+        return
+    }
+    let fmt: u32 = cb(f, off)
+    var p: usize = off + 1
+    var g2: usize = 1
+    if fmt == 0 {
+        while g2 < n && p + 1 < (*f).len {
+            rt.st16(sp, g2, c16(f, p) as u16)
+            p = p + 2
+            g2 = g2 + 1
+        }
+        return
+    }
+    if fmt == 1 || fmt == 2 {
+        while g2 < n && p + 2 < (*f).len {
+            let first: u32 = c16(f, p)
+            var left: u32 = cb(f, p + 2)
+            p = p + 3
+            if fmt == 2 {
+                left = (left << 8) | cb(f, p)
+                p = p + 1
+            }
+            var k: u32 = 0
+            while k <= left && g2 < n {
+                rt.st16(sp, g2, (first + k) as u16)
+                g2 = g2 + 1
+                k = k + 1
+            }
+        }
+    }
+}
+
+fn gid_of_sid(f: *mut CffFont, sid: u32) -> u32 {
+    var g: usize = 0
+    while g < (*f).nglyphs {
+        if (rt.ld16((*f).sids, g) as u32) == sid {
+            return g as u32
+        }
+        g = g + 1
+    }
+    return 0
+}
+
+fn cff_std_code_gid(f: *mut CffFont, code: u32) -> u32 {
+    let sid: u32 = cff_data.cff_std_encoding_sid(code as usize)
+    if sid == 0 as u32 {
+        return 0
+    }
+    return gid_of_sid(f, sid)
+}
+
+fn load_encoding(f: *mut CffFont, off: usize) {
+    if off == 0 {
+        var rev: [u32; 391] = [0 as u32; 391]
+        var c: usize = 0
+        while c < 256 {
+            let sid: u32 = cff_data.cff_std_encoding_sid(c)
+            if sid != 0 as u32 && sid < 391 as u32 {
+                rev[sid as usize] = (c as u32) + 1
+            }
+            c = c + 1
+        }
+        var g: usize = 1
+        while g < (*f).nglyphs {
+            let sid2: u32 = rt.ld16((*f).sids, g) as u32
+            if sid2 < 391 as u32 && rev[sid2 as usize] != 0 as u32 {
+                (*f).enc[(rev[sid2 as usize] - 1) as usize] = g as u32
+            }
+            g = g + 1
+        }
+        return
+    }
+    if off == 1 {
+        return
+    }
+    let fmt: u32 = cb(f, off)
+    var p: usize = off + 1
+    if (fmt & 127) == 0 {
+        let nc: usize = cb(f, p) as usize
+        p = p + 1
+        var i: usize = 0
+        while i < nc {
+            (*f).enc[cb(f, p + i) as usize] = (i + 1) as u32
+            i = i + 1
+        }
+        p = p + nc
+    }
+    if (fmt & 127) == 1 {
+        let nr: usize = cb(f, p) as usize
+        p = p + 1
+        var gid: u32 = 1
+        var r: usize = 0
+        while r < nr {
+            let first: u32 = cb(f, p)
+            let left: u32 = cb(f, p + 1)
+            p = p + 2
+            var k: u32 = 0
+            while k <= left {
+                if first + k < 256 as u32 {
+                    (*f).enc[(first + k) as usize] = gid
+                }
+                gid = gid + 1
+                k = k + 1
+            }
+            r = r + 1
+        }
+    }
+    if (fmt & 128) != 0 as u32 {
+        let ns: usize = cb(f, p) as usize
+        p = p + 1
+        var s: usize = 0
+        while s < ns {
+            let code: u32 = cb(f, p + s * 3)
+            let sid3: u32 = c16(f, p + s * 3 + 1)
+            (*f).enc[code as usize] = gid_of_sid(f, sid3)
+            s = s + 1
+        }
+    }
+}
+
+fn read_matrix(f: *mut CffFont, start: usize, len: usize) -> bool {
+    var m: [f64; 8] = [0.0; 8]
+    if dict_get(f, start, len, 1207, &m[0], 6) >= 6 && m[0] > 0.0 {
+        (*f).upem = 1.0 / m[0]
+        return true
+    }
+    return false
+}
+
+fn cff_init(f: *mut CffFont, data: u64, len: usize) -> bool {
+    *f = cff_new()
+    (*f).data = data
+    (*f).len = len
+    if len < 8 || cb(f, 0) != 1 {
+        return false
+    }
+    let hdr: usize = cb(f, 2) as usize
+    let names: CffIndex = idx_open(f, hdr)
+    if names.end == 0 {
+        return false
+    }
+    var tops: CffIndex = idx_open(f, names.end)
+    (*f).strings = idx_open(f, tops.end)
+    (*f).gsubrs = idx_open(f, (*f).strings.end)
+    var ts: usize = 0
+    var tl: usize = 0
+    if !cff_idx_item(f, &tops, 0, &ts, &tl) {
+        return false
+    }
+    var v: [f64; 4] = [0.0; 4]
+    if dict_get(f, ts, tl, 17, &v[0], 1) < 1 {
+        return false
+    }
+    let cso: usize = num_off(v[0])
+    if cso == 0 {
+        return false
+    }
+    (*f).charstrings = idx_open(f, cso)
+    var ng: usize = (*f).charstrings.count
+    if ng == 0 {
+        return false
+    }
+    if ng > MAX_GLYPHS {
+        ng = MAX_GLYPHS
+    }
+    (*f).nglyphs = ng
+    (*f).sids = mem.heap_alloc(ng * 2) as u64
+    if (*f).sids == 0 {
+        (*f).nglyphs = 0
+        return false
+    }
+    var cso2: usize = 0
+    if dict_get(f, ts, tl, 15, &v[0], 1) >= 1 {
+        cso2 = num_off(v[0])
+    }
+    load_charset(f, cso2)
+    let gotm: bool = read_matrix(f, ts, tl)
+    if dict_get(f, ts, tl, 1230, &v[0], 1) >= 0 {
+        (*f).iscid = 1
+    }
+    if (*f).iscid != 0 as u32 {
+        if dict_get(f, ts, tl, 1237, &v[0], 1) >= 1 {
+            (*f).fdsel = num_off(v[0])
+            (*f).fdfmt = cb(f, (*f).fdsel)
+        }
+        var fda: CffIndex = idx_empty()
+        if dict_get(f, ts, tl, 1236, &v[0], 1) >= 1 {
+            fda = idx_open(f, num_off(v[0]))
+        }
+        var nfd: usize = fda.count
+        if nfd > MAX_FD {
+            nfd = MAX_FD
+        }
+        (*f).nfd = nfd
+        var i: usize = 0
+        while i < nfd {
+            var fs: usize = 0
+            var fl: usize = 0
+            if cff_idx_item(f, &fda, i, &fs, &fl) {
+                read_private(f, i, fs, fl)
+                if i == 0 && !gotm {
+                    read_matrix(f, fs, fl)
+                }
+            }
+            i = i + 1
+        }
+        (*f).cidmap = mem.heap_alloc(65536 * 2) as u64
+        if (*f).cidmap != 0 {
+            var g: usize = (*f).nglyphs
+            while g > 0 {
+                g = g - 1
+                rt.st16((*f).cidmap, rt.ld16((*f).sids, g) as usize, g as u16)
+            }
+        }
+    } else {
+        (*f).nfd = 1
+        read_private(f, 0, ts, tl)
+        var eo: usize = 0
+        if dict_get(f, ts, tl, 16, &v[0], 1) >= 1 {
+            eo = num_off(v[0])
+        }
+        load_encoding(f, eo)
+    }
+    (*f).ok = 1
+    return true
+}
+
+fn cff_cs_range(f: *mut CffFont, gid: u32, start: *mut usize, len: *mut usize) -> bool {
+    if (gid as usize) >= (*f).nglyphs {
+        return false
+    }
+    return cff_idx_item(f, &(*f).charstrings, gid as usize, start, len)
+}
+
+fn cff_fd_of(f: *mut CffFont, gid: u32) -> usize {
+    if (*f).iscid == 0 as u32 || (*f).fdsel == 0 {
+        return 0
+    }
+    var fd: usize = 0
+    let g: usize = gid as usize
+    if (*f).fdfmt == 0 {
+        fd = cb(f, (*f).fdsel + 1 + g) as usize
+    }
+    if (*f).fdfmt == 3 {
+        let nr: usize = c16(f, (*f).fdsel + 1) as usize
+        var r: usize = 0
+        while r < nr {
+            let at: usize = (*f).fdsel + 3 + r * 3
+            let first: usize = c16(f, at) as usize
+            let next: usize = c16(f, at + 3) as usize
+            if g >= first && g < next {
+                fd = cb(f, at + 2) as usize
+                break
+            }
+            r = r + 1
+        }
+    }
+    if fd >= (*f).nfd {
+        return 0
+    }
+    return fd
+}
+
+fn cff_fd_subrs(f: *mut CffFont, fd: usize) -> *mut CffIndex {
+    return &(*f).lsubrs[fd]
+}
+
+fn cff_gsubrs(f: *mut CffFont) -> *mut CffIndex {
+    return &(*f).gsubrs
+}
+
+fn cff_fd_widths(f: *mut CffFont, fd: usize, defw: *mut f64, nomw: *mut f64) {
+    *defw = (*f).defw[fd]
+    *nomw = (*f).nomw[fd]
+}
+
+fn string_bytes(f: *mut CffFont, sid: u32, start: *mut usize, len: *mut usize) -> bool {
+    if sid >= 391 as u32 {
+        return cff_idx_item(f, &(*f).strings, (sid - 391) as usize, start, len)
+    }
+    return false
+}
+
+fn custom_name_eq(f: *mut CffFont, sid: u32, p: u64, n: usize) -> bool {
+    var s: usize = 0
+    var l: usize = 0
+    if !string_bytes(f, sid, &s, &l) || l != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if cb(f, s + i) != (rt.ld8(p, i) as u32) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn cff_gid_for_name(f: *mut CffFont, p: u64, n: usize) -> u32 {
+    if (*f).ok == 0 as u32 || n == 0 || n > 63 || (*f).iscid != 0 as u32 {
+        return 0
+    }
+    let std: i32 = cff_data.cff_std_sid_for_name(p, n)
+    if std >= 0 {
+        return gid_of_sid(f, std as u32)
+    }
+    var k: usize = 0
+    while k < (*f).strings.count {
+        if custom_name_eq(f, (k as u32) + 391, p, n) {
+            return gid_of_sid(f, (k as u32) + 391)
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn cff_gid_for_code(f: *mut CffFont, code: u32) -> u32 {
+    if code > 255 {
+        return 0
+    }
+    return (*f).enc[code as usize]
+}
+
+fn cff_gid_for_cid(f: *mut CffFont, cid: u32) -> u32 {
+    if (*f).iscid == 0 as u32 {
+        if (cid as usize) < (*f).nglyphs {
+            return cid
+        }
+        return 0
+    }
+    if (*f).cidmap == 0 || cid > 65535 {
+        return 0
+    }
+    return rt.ld16((*f).cidmap, cid as usize) as u32
+}
+
+fn cff_name_copy(f: *mut CffFont, gid: u32, out: *mut u8, cap: usize) -> usize {
+    if (gid as usize) >= (*f).nglyphs || (*f).iscid != 0 as u32 {
+        return 0
+    }
+    let sid: u32 = rt.ld16((*f).sids, gid as usize) as u32
+    if sid < 391 as u32 {
+        return cff_data.cff_std_string_copy(sid as usize, out, cap)
+    }
+    var s: usize = 0
+    var l: usize = 0
+    if !string_bytes(f, sid, &s, &l) {
+        return 0
+    }
+    var i: usize = 0
+    while i < l && i < cap {
+        *((out as u64 + i as u64) as *mut u8) = cb(f, s + i) as u8
+        i = i + 1
+    }
+    return i
+}
