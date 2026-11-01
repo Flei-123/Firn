@@ -105,9 +105,39 @@ struct Borrow<'a> {
     exhausted: bool,
     evals: usize,
     waves: usize,
+    height: Vec<u32>,
 }
 
+const UNSEEN: u32 = u32::MAX;
+const OPEN: u32 = u32::MAX - 1;
+
 impl<'a> Borrow<'a> {
+    fn heights(&mut self, nodes: &[usize]) {
+        let callees = &self.g.callees;
+        let height = &mut self.height;
+        for &r in nodes {
+            if height[r] != UNSEEN {
+                continue;
+            }
+            height[r] = OPEN;
+            let mut stack: Vec<(usize, usize)> = vec![(r, 0)];
+            while let Some(top) = stack.last_mut() {
+                let (i, k) = *top;
+                if k < callees[i].len() {
+                    top.1 += 1;
+                    let j = callees[i][k];
+                    if height[j] == UNSEEN {
+                        height[j] = OPEN;
+                        stack.push((j, 0));
+                    }
+                } else {
+                    height[i] = callees[i].iter().map(|&j| height[j]).filter(|&h| h < OPEN).map(|h| h + 1).max().unwrap_or(0);
+                    stack.pop();
+                }
+            }
+        }
+    }
+
     fn extend(&mut self, s: &mut Summaries, roots: &[usize]) {
         let mut stack: Vec<usize> = Vec::new();
         let mut fresh_reach: Vec<usize> = Vec::new();
@@ -126,18 +156,22 @@ impl<'a> Borrow<'a> {
                 }
             }
         }
+        self.heights(&fresh_reach);
         let n = self.m.funcs.len();
         let mut queued = vec![false; n];
-        let mut work: Vec<usize> = Vec::new();
+        let mut work: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+        let mut total = 0;
         for i in fresh_reach {
             if analyzable(&self.m.funcs[i]) {
                 queued[i] = true;
-                work.push(i);
+                work.entry(self.height[i]).or_default().push(i);
+                total += 1;
             }
         }
-        self.budget += 8 * work.len();
-        while !work.is_empty() {
-            if self.budget < work.len() {
+        self.budget += 8 * total;
+        while let Some(h) = work.keys().next().copied() {
+            let mut batch = work.remove(&h).unwrap_or_default();
+            if self.budget < batch.len() {
                 for v in s.map.values_mut() {
                     v.iter_mut().for_each(|b| *b = false);
                 }
@@ -145,10 +179,9 @@ impl<'a> Borrow<'a> {
                 self.exhausted = true;
                 return;
             }
-            self.budget -= work.len();
-            self.evals += work.len();
+            self.budget -= batch.len();
+            self.evals += batch.len();
             self.waves += 1;
-            let mut batch = std::mem::take(&mut work);
             batch.sort_unstable();
             batch.iter().for_each(|&i| queued[i] = false);
             let m = self.m;
@@ -163,7 +196,7 @@ impl<'a> Borrow<'a> {
                     for &c in self.g.callers[i].iter() {
                         if self.reach[c] && !queued[c] {
                             queued[c] = true;
-                            work.push(c);
+                            work.entry(self.height[c]).or_default().push(c);
                         }
                     }
                 }
@@ -179,7 +212,7 @@ pub(crate) fn compute(m: &Module, base: &[usize]) -> (Summaries, Vec<usize>, Sta
         s.map.insert(f.name.clone(), vec![analyzable(f); f.params.len()]);
     }
     let g = Graph::build(m);
-    let mut bw = Borrow { m, g: &g, reach: vec![false; n], budget: 1000, exhausted: false, evals: 0, waves: 0 };
+    let mut bw = Borrow { m, g: &g, reach: vec![false; n], budget: 1000, exhausted: false, evals: 0, waves: 0, height: vec![UNSEEN; n] };
     let mut fresh_evals = 0;
     bw.extend(&mut s, base);
     let stats = |bw: &Borrow, fe: usize| Stats { borrow_evals: bw.evals, fresh_evals: fe, waves: bw.waves };
