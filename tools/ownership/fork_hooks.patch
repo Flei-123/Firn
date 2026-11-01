@@ -1,0 +1,154 @@
+diff --git a/compiler/src/fir.rs b/compiler/src/fir.rs
+index df9e05d..76dc9af 100644
+--- a/compiler/src/fir.rs
++++ b/compiler/src/fir.rs
+@@ -641,6 +641,24 @@ pub enum Term {
+ }
+ 
+ impl Term {
++    #[inline]
++    pub fn for_each_succ(&self, mut g: impl FnMut(BlockId)) {
++        match self {
++            Term::Br(b) => g(*b),
++            Term::BrCond { then_bb, else_bb, .. } => {
++                g(*then_bb);
++                g(*else_bb);
++            }
++            Term::Switch { cases, default, .. } => {
++                for (_, b) in cases.iter() {
++                    g(*b);
++                }
++                g(*default);
++            }
++            Term::Ret(_) | Term::Unset => {}
++        }
++    }
++
+     pub fn successors(&self) -> Vec<BlockId> {
+         match self {
+             Term::Br(b) => vec![*b],
+@@ -700,6 +718,7 @@ pub struct Func {
+     /// functions are lowered one after another, and a stale stamp would
+     /// attribute the prologue of the second to the last line of the first.
+     pub loc_stamp: Loc,
++    pub inline_hint: Option<bool>,
+ }
+ 
+ impl Func {
+@@ -717,6 +736,7 @@ impl Func {
+             constant_time: false,
+             interrupt: false,
+             loc_stamp: Loc::NONE,
++            inline_hint: None,
+         }
+     }
+ 
+diff --git a/compiler/src/inline.rs b/compiler/src/inline.rs
+index e70a013..a93779d 100644
+--- a/compiler/src/inline.rs
++++ b/compiler/src/inline.rs
+@@ -100,6 +100,9 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
+ }
+ 
+ fn inlinable(callee: &Func) -> bool {
++    if callee.inline_hint == Some(false) {
++        return false;
++    }
+     // Loop free bodies WITHOUT a return value (effect through pointer
+     // arguments, say the sink mutators of the tokenizer) may have more
+     // blocks: their control flow is a DAG, and because `dst` is empty, not
+@@ -164,6 +167,62 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize,
+     None
+ }
+ 
++pub(crate) fn inline_requested_tracked(m: &mut Module, changed: &mut Vec<usize>) -> usize {
++    let self_rec: Vec<bool> = m.funcs.iter().map(|f| reaches_itself_self(m, &f.name)).collect();
++    let mut n = 0usize;
++    for ci in 0..m.funcs.len() {
++        loop {
++            let site = find_requested_site(m, ci, &self_rec);
++            match site {
++                Some((bi, ii, gi)) => {
++                    inline_one(m, ci, bi, ii, gi);
++                    changed.push(ci);
++                    n += 1;
++                }
++                None => break,
++            }
++        }
++    }
++    n
++}
++
++fn find_requested_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
++    let caller = &m.funcs[ci];
++    if caller.constant_time || !caller.secret.is_empty() {
++        return None;
++    }
++    if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
++        return None;
++    }
++    for (bi, b) in caller.blocks.iter().enumerate() {
++        for (ii, inst) in b.insts.iter().enumerate() {
++            if let Op::Call { name, args } = &inst.op {
++                let gi = match m.funcs.iter().position(|f| &f.name == name) {
++                    Some(g) => g,
++                    None => continue,
++                };
++                let callee = &m.funcs[gi];
++                if gi == ci || callee.inline_hint != Some(true) {
++                    continue;
++                }
++                if callee.constant_time
++                    || !callee.secret.is_empty()
++                    || callee.blocks.iter().any(|b| matches!(b.term, Term::Unset))
++                    || callee.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i)
++                    || callee.params.len() != args.len()
++                    || (inst.dst.is_some() && callee.ret == FTy::Void)
++                    || self_rec[gi]
++                    || reaches(m, &callee.name, &caller.name)
++                {
++                    continue;
++                }
++                return Some((bi, ii, gi));
++            }
++        }
++    }
++    None
++}
++
+ /// Embeds exactly one call site.
+ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
+     let callee = m.funcs[gi].clone();
+diff --git a/compiler/src/opt.rs b/compiler/src/opt.rs
+index 0c39491..b4c0a7b 100644
+--- a/compiler/src/opt.rs
++++ b/compiler/src/opt.rs
+@@ -332,6 +332,27 @@ impl PassClock {
+ }
+ 
+ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
++    let own = crate::own::fir::active(cfg.level);
++    if own {
++        crate::own::fir::prepare(m);
++    }
++    let mut st = optimize_with_base(m, cfg);
++    if own {
++        let changed = crate::own::fir::run(m);
++        if !changed.is_empty() {
++            let mut clk = PassClock {
++                on: std::env::var_os("FIRN_PASS_TIMINGS").is_some(),
++                ..Default::default()
++            };
++            for &i in changed.iter() {
++                optimize_func(&mut m.funcs[i], &mut st, cfg, &mut clk);
++            }
++        }
++    }
++    st
++}
++
++fn optimize_with_base(m: &mut Module, cfg: &OptConfig) -> OptStats {
+     let mut st = OptStats::default();
+     if cfg.level == Level::Dev {
+         return st;
