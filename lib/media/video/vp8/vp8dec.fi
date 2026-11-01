@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8bool
+import media.video.vp8.vp8hdr
+import media.video.vp8.vp8intra
+import media.video.vp8.vp8lf
+import media.video.vp8.vp8loop
+import media.video.vp8.vp8mb
+import media.video.vp8.vp8mem
+import media.video.vp8.vp8mode
+import media.video.vp8.vp8recon
+import media.video.vp8.vp8state
+
+export { dec_frame, dec_copy_yuv420, dec_yuv_size, DEC_OK, DEC_BAD, DEC_NEED_KEY, DEC_UNSUPPORTED }
+
+const DEC_OK: i64 = 0
+const DEC_BAD: i64 = 1
+const DEC_NEED_KEY: i64 = 2
+const DEC_UNSUPPORTED: i64 = 3
+
+fn pick_buffer(f: *mut vp8state.Vp8) -> i64 {
+    var i: i64 = 0
+    while i < 4 {
+        if i != (*f).refs[1] && i != (*f).refs[2] && i != (*f).refs[3] {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn extend_row(f: *mut vp8state.Vp8, row: i64) {
+    let ys: i64 = (*f).ys
+    let ep: u64 = ((vp8state.plane_y(f, (*f).cur) as i64) + row * 16 * ys) as u64
+    let lastv: i64 = vp8intra.at(ep, ys, (*f).mbw * 16 - 1, 15)
+    var e: i64 = 0
+    while e < 4 {
+        vp8intra.put(ep, ys, (*f).mbw * 16 + e, 15, lastv)
+        e = e + 1
+    }
+}
+
+fn decode_key_rows(f: *mut vp8state.Vp8) {
+    let d: *mut vp8bool.BD = &(*f).d0
+    let stride: u64 = (vp8state.MBI_CELLS * 4) as u64
+    let up: u64 = (((*f).mbw + 1) as u64) * stride
+    var row: i64 = 0
+    while row < (*f).mbh {
+        let pd: *mut vp8bool.BD = &(*f).parts[(row & ((*f).nparts - 1)) as usize]
+        vp8mb.mb_row_init(f)
+        var col: i64 = 0
+        while col < (*f).mbw {
+            let mb: u64 = vp8state.mbi_at(f, row, col)
+            vp8mode.read_key_modes(f, d, mb, mb - up, mb - stride)
+            let nz: i64 = vp8mb.read_mb_tokens(f, pd, mb, col)
+            vp8mem.sti(mb, vp8state.C_NZ, nz)
+            vp8recon.recon_intra_mb(f, mb, row, col)
+            col = col + 1
+        }
+        extend_row(f, row)
+        row = row + 1
+    }
+}
+
+fn update_references(f: *mut vp8state.Vp8) {
+    if (*f).copy_arf == 1 {
+        (*f).refs[3] = (*f).refs[1]
+    }
+    if (*f).copy_arf == 2 {
+        (*f).refs[3] = (*f).refs[2]
+    }
+    if (*f).copy_gf == 1 {
+        (*f).refs[2] = (*f).refs[1]
+    }
+    if (*f).copy_gf == 2 {
+        (*f).refs[2] = (*f).refs[3]
+    }
+    if (*f).refresh_gf == 1 {
+        (*f).refs[2] = (*f).cur
+    }
+    if (*f).refresh_arf == 1 {
+        (*f).refs[3] = (*f).cur
+    }
+    if (*f).refresh_last == 1 {
+        (*f).refs[1] = (*f).cur
+    }
+}
+
+fn restore_entropy(f: *mut vp8state.Vp8) {
+    if (*f).refresh_entropy != 0 {
+        return
+    }
+    var i: usize = 0
+    while i < vp8state.ENT_LEN {
+        vp8mem.st8((*f).ent, i, vp8mem.ld8((*f).saved, i))
+        i = i + 1
+    }
+}
+
+fn dec_frame(f: *mut vp8state.Vp8, src: u64, n: usize) -> i64 {
+    let rc: i64 = vp8hdr.hdr_parse(f, src, n)
+    if rc == vp8hdr.HDR_NOT_KEY_FIRST {
+        return DEC_NEED_KEY
+    }
+    if rc != vp8hdr.HDR_OK {
+        return DEC_BAD
+    }
+    if !(*f).keyframe {
+        return DEC_UNSUPPORTED
+    }
+    (*f).cur = pick_buffer(f)
+    vp8lf.lf_init()
+    vp8mb.mb_frame_init(f)
+    decode_key_rows(f)
+    vp8loop.loop_filter_frame(f)
+    restore_entropy(f)
+    update_references(f)
+    return DEC_OK
+}
+
+fn dec_yuv_size(f: *mut vp8state.Vp8) -> usize {
+    let cw: i64 = ((*f).w + 1) / 2
+    let ch: i64 = ((*f).h + 1) / 2
+    return ((*f).w * (*f).h + 2 * cw * ch) as usize
+}
+
+fn copy_plane(src: u64, st: i64, w: i64, h: i64, dst: u64) {
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            vp8mem.st8(dst + (y * w) as u64, x as usize, vp8mem.ld8o(src, y * st + x))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn dec_copy_yuv420(f: *mut vp8state.Vp8, dst: u64) {
+    let w: i64 = (*f).w
+    let h: i64 = (*f).h
+    let cw: i64 = (w + 1) / 2
+    let ch: i64 = (h + 1) / 2
+    copy_plane(vp8state.plane_y(f, (*f).cur), (*f).ys, w, h, dst)
+    copy_plane(vp8state.plane_u(f, (*f).cur), (*f).uvs, cw, ch, dst + (w * h) as u64)
+    copy_plane(vp8state.plane_v(f, (*f).cur), (*f).uvs, cw, ch, dst + (w * h + cw * ch) as u64)
+}
