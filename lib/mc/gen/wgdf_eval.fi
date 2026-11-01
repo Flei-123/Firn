@@ -11,6 +11,7 @@ import mc.gen.mg_noise
 import mc.gen.wgdf_ops
 import mc.gen.wgdf_memo
 import mc.gen.wgdf_graph
+import mc.gen.wgdf_cshare
 
 export { WgNoises, NOISES_BYTES, FillGrid, GRID_BYTES, MAX_GRID_NODES, SLAB_SIDE, noises_alloc, noises_build, eval, eval_direct, floor_div }
 
@@ -24,6 +25,7 @@ struct WgNoises {
     ps: u64,
     memo: u64,
     aqs: u64,
+    cs: u64,
     seed: i64,
     islands: simplex.Simplex,
     quant: bool,
@@ -62,6 +64,7 @@ fn noises_alloc() -> *mut WgNoises {
     (*ns).ps = 0
     (*ns).memo = 0
     (*ns).aqs = 0
+    (*ns).cs = 0
     (*ns).seed = 0
     (*ns).quant = false
     return ns
@@ -86,6 +89,40 @@ fn grid_index(gr: *FillGrid, slot: i32, gx: i32, gy: i32, gz: i32) -> usize {
     return (slot * GRID_NODE_STRIDE + gx * xs + gz * zs + gy) as usize
 }
 
+fn compute_column(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, slot: i32, n: i32, gx: i32, gz: i32) {
+    let x: i32 = (*gr).min_x + gx * (*gr).cw
+    let z: i32 = (*gr).min_z + gz * (*gr).cw
+    var gy: i32 = 0
+    while gy <= (*gr).cells_y {
+        let v: f64 = eval(g, ns, (*g).a[n as usize], x, ((*gr).cell_min_y + gy) * (*gr).ch, z)
+        (*gr).vals[grid_index(gr, slot, gx, gy, gz)] = v
+        gy = gy + 1
+    }
+}
+
+fn shared_column(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, slot: i32, n: i32, gx: i32, gz: i32) {
+    let cs: *mut wgdf_cshare.CornerShare = (*ns).cs as *mut wgdf_cshare.CornerShare
+    let sslot: i32 = wgdf_cshare.node_slot(cs, n)
+    if sslot < 0 || (*gr).min_x % (*gr).cw != 0 || (*gr).min_z % (*gr).cw != 0 {
+        compute_column(g, ns, gr, slot, n, gx, gz)
+        return
+    }
+    let qx: i32 = (*gr).min_x / (*gr).cw + gx
+    let qz: i32 = (*gr).min_z / (*gr).cw + gz
+    let bytes: usize = ((*gr).cells_y + 1) as usize * 8
+    let st: i32 = wgdf_cshare.acquire(cs, sslot, qx, qz)
+    let dst: u64 = (&(*gr).vals[grid_index(gr, slot, gx, 0, gz)]) as u64
+    if st == wgdf_cshare.COL_READY {
+        rt.mem_copy(dst, wgdf_cshare.column_ptr(cs, sslot, qx, qz), bytes)
+        return
+    }
+    compute_column(g, ns, gr, slot, n, gx, gz)
+    if st == wgdf_cshare.COL_OWN {
+        rt.mem_copy(wgdf_cshare.column_ptr(cs, sslot, qx, qz), dst, bytes)
+        wgdf_cshare.publish(cs, sslot, qx, qz)
+    }
+}
+
 fn grid_build(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, n: i32) -> i32 {
     let slot: i32 = (*gr).next_slot
     if slot >= MAX_GRID_NODES {
@@ -98,11 +135,10 @@ fn grid_build(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, n: i32) 
     while gx <= (*gr).cells_x {
         var gz: i32 = 0
         while gz <= (*gr).cells_x {
-            var gy: i32 = 0
-            while gy <= (*gr).cells_y {
-                let v: f64 = eval(g, ns, (*g).a[n as usize], (*gr).min_x + gx * (*gr).cw, ((*gr).cell_min_y + gy) * (*gr).ch, (*gr).min_z + gz * (*gr).cw)
-                (*gr).vals[grid_index(gr, slot, gx, gy, gz)] = v
-                gy = gy + 1
+            if (*ns).cs != 0 {
+                shared_column(g, ns, gr, slot, n, gx, gz)
+            } else {
+                compute_column(g, ns, gr, slot, n, gx, gz)
             }
             gz = gz + 1
         }
