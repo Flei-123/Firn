@@ -138,3 +138,11 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 - `media.video.h264.picture` renamed `h264pic` (module names are global; PDF `image.picture` clashed in one program).
 - Sizes (wasm32-browser, whole module): kitview + PDF + DOCX (`kpview_wasm_office`) 1 495 KB fast / 3 140 KB safe, with fonts linked in 1 857 KB / 3 639 KB. DOCX probe 899 KB -> 540 KB fast (fonts lazy), 366 KB without image decoders; safe 1.68 MB -> 1.30 MB / 0.68 MB.
 - Checks: `bash tools/docview/run_lazyfaces.sh` (Chromium, 17 checks: pack not fetched at startup, fetched once, PDF/DOCX page hash = native, embedded build identical, prefetch, missing pack, wasm `micros()` clock for the PDF time limit), test 6416.
+
+## Status G3 ODT (2026-11-01)
+
+- ODT reuses the DOCX model/layout/painter: loader modules `lib/docview/office/od_*` fill `dx_model.Docx`, `dx_ops` holds the shared opener (`open_with(p, n, LoadFn)`, `view_ops(open)`), `od_open.odt_install_lazy()` registers KIND_ODT as "odt.native" (`kpdocs.install_odt` / `install_pdf_docx_odt`).
+- Modules: od_units (lengths/colors), od_style (style:style -> `dx_style.Styles`, cell/column/row/table styles), od_list (list styles, labels 1/a/A/i/I, display-levels), od_inline (spans, tabs, spaces, frames with images, page-number/page-count fields), od_body (paragraphs, headings, lists), od_table (colspan, rowspan via covered cells, repeated rows/cols, header rows), od_page (page layout, header/footer of the first master page), od_load, od_open, od_ctx.
+- `dx_style.style_find` now returns the LAST match (content.xml automatic styles shadow styles.xml); `dx_style.style_add` added; `dx_runs` holds the run emitters shared by DOCX and ODT.
+- Checks: test 6417_docview_odt, `tools/docview/odt_fixtures.py <dir>` (6 hand-written ODTs), `odtmain` (`firnc -o odt tools/docview/odtmain.fi`; `odt i|t|b|r file`), `odt_fuzz.py <odt-bin> <fixture-dir> <runs>` (600 runs, 0 crashes, 0 hangs).
+- Gaps: text boxes inline only, frames not floated, multiple master pages/section switching, header-left/first, tracked changes, ods/odp (not routed to ODT). XLSX and PPTX openers not built yet.

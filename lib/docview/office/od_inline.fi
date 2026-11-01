@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.xml
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_style
+import docview.office.dx_model
+import docview.office.dx_runs
+import docview.office.od_units
+import docview.office.od_ctx
+
+export { InState, in_new, inline_children }
+
+struct InState {
+    para: u32,
+    last_space: bool,
+}
+
+fn in_new(para: u32) -> InState {
+    return InState { para: para, last_space: true }
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == (32 as u8) || c == (9 as u8) || c == (10 as u8) || c == (13 as u8)
+}
+
+fn emit_collapsed(d: *mut dx_model.Docx, st: *mut InState, rp: *mut dx_props.RunProps, s: str) {
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if is_ws(c) {
+            if !(*st).last_space {
+                rt.buf_push(&tmp, 32 as u8)
+                (*st).last_space = true
+            }
+        } else {
+            rt.buf_push(&tmp, c)
+            (*st).last_space = false
+        }
+        i = i + 1
+    }
+    dx_runs.emit_text(d, (*st).para, rp, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+}
+
+fn emit_spaces(d: *mut dx_model.Docx, st: *mut InState, rp: *mut dx_props.RunProps, n: i64) {
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    var i: i64 = 0
+    while i < n {
+        rt.buf_push(&tmp, 32 as u8)
+        i = i + 1
+    }
+    dx_runs.emit_text(d, (*st).para, rp, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    (*st).last_space = true
+}
+
+fn strip_dot(href: str) -> str {
+    if href.n > 2 && rt.ld8(href.p as u64, 0) == (46 as u8) && rt.ld8(href.p as u64, 1) == (47 as u8) {
+        return od_units.rest_of(href, 2)
+    }
+    return href
+}
+
+fn frame_size(x: *mut xml.Doc, fr: u32, w: *mut f64, h: *mut f64) {
+    var wv: f64 = (od_units.len_tw(ooxml.attr_l(x, fr, "width"), 1440) as f64) / 15.0
+    var hv: f64 = (od_units.len_tw(ooxml.attr_l(x, fr, "height"), 1440) as f64) / 15.0
+    if wv < 1.0 { wv = 1.0 }
+    if hv < 1.0 { hv = 1.0 }
+    if wv > 30000.0 { wv = 30000.0 }
+    if hv > 30000.0 { hv = 30000.0 }
+    *w = wv
+    *h = hv
+}
+
+fn parse_frame(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, fr: u32, rp: *mut dx_props.RunProps,
+    st: *mut InState, depth: i32) {
+    let img: u32 = ooxml.child_l(x, fr, "image")
+    if img != xml.NONE {
+        let href: str = strip_dot(ooxml.attr_l(x, img, "href"))
+        if href.n > 0 && !ooxml.starts_with(href, "http") && !ooxml.starts_with(href, "file:") {
+            var w: f64 = 96.0
+            var h: f64 = 96.0
+            frame_size(x, fr, &w, &h)
+            let idx: u32 = dx_model.new_image(d, href)
+            dx_runs.emit_simple(d, rp, dx_model.R_IMAGE, idx as i64, w, h)
+            (*st).last_space = false
+        }
+        return
+    }
+    let tb: u32 = ooxml.child_l(x, fr, "text-box")
+    if tb != xml.NONE {
+        var p: u32 = ooxml.first_el(x, tb)
+        var first: bool = true
+        while p != xml.NONE {
+            if ooxml.is_el(x, p, "p") || ooxml.is_el(x, p, "h") {
+                if !first {
+                    dx_runs.emit_simple(d, rp, dx_model.R_BREAK, dx_model.BR_LINE, 0.0, 0.0)
+                    (*st).last_space = true
+                }
+                first = false
+                inline_children(c, d, x, p, rp, st, depth + 1)
+            }
+            p = ooxml.next_el(x, p)
+        }
+    }
+}
+
+fn skipped(nm: str) -> bool {
+    return nm == "note" || nm == "annotation" || nm == "annotation-end" || nm == "bookmark" || nm == "bookmark-start"
+        || nm == "bookmark-end" || nm == "soft-page-break" || nm == "change" || nm == "change-start"
+        || nm == "change-end" || nm == "tracked-changes" || nm == "alphabetical-index-mark"
+        || nm == "toc-mark" || nm == "toc-mark-start" || nm == "toc-mark-end" || nm == "reference-mark"
+        || nm == "reference-mark-start" || nm == "reference-mark-end" || nm == "user-index-mark"
+        || nm == "binary-data" || nm == "ruby-text"
+}
+
+fn inline_children(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, parent: u32, rp: *mut dx_props.RunProps,
+    st: *mut InState, depth: i32) {
+    if depth > od_ctx.MAX_DEPTH {
+        return
+    }
+    var ch: u32 = xml.first(x, parent)
+    while ch != xml.NONE {
+        let k: u8 = xml.kind(x, ch)
+        if k == xml.TEXT {
+            emit_collapsed(d, st, rp, xml.text(x, ch))
+        } else if k == xml.ELEMENT {
+            let nm: str = ooxml.local_name(xml.name(x, ch))
+            if nm == "s" {
+                emit_spaces(d, st, rp, od_units.clamp_i(ooxml.attr_i64(x, ch, "c", 1), 1, 1000))
+            } else if nm == "tab" {
+                dx_runs.emit_simple(d, rp, dx_model.R_TAB, 0, 0.0, 0.0)
+                (*st).last_space = true
+            } else if nm == "line-break" {
+                dx_runs.emit_simple(d, rp, dx_model.R_BREAK, dx_model.BR_LINE, 0.0, 0.0)
+                (*st).last_space = true
+            } else if nm == "page-number" {
+                dx_runs.emit_simple(d, rp, dx_model.R_FIELD, dx_model.FLD_PAGE, 0.0, 0.0)
+                (*st).last_space = false
+            } else if nm == "page-count" {
+                dx_runs.emit_simple(d, rp, dx_model.R_FIELD, dx_model.FLD_NUMPAGES, 0.0, 0.0)
+                (*st).last_space = false
+            } else if nm == "frame" {
+                parse_frame(c, d, x, ch, rp, st, depth)
+            } else if nm == "span" || nm == "a" {
+                var rp2: dx_props.RunProps = *rp
+                let sn: str = ooxml.attr_l(x, ch, "style-name")
+                if sn.n > 0 {
+                    dx_style.resolve_char(&(*(*c).od).st, sn, &rp2)
+                }
+                inline_children(c, d, x, ch, &rp2, st, depth + 1)
+            } else if !skipped(nm) && nm != "g" && nm != "custom-shape" && nm != "line" && nm != "rect" && nm != "path" {
+                inline_children(c, d, x, ch, rp, st, depth + 1)
+            }
+        }
+        ch = xml.next(x, ch)
+    }
+}
