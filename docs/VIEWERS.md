@@ -154,3 +154,10 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 - Limits: 256 columns, 20000 rows, 400000 cells, 64 sheets. Hidden sheets/rows/cols skipped. All visible sheets are laid out in order (no sheet picker yet).
 - Checks: test 6418_docview_xlsx, `tools/docview/xlsx_fixtures.py <dir>` (openpyxl: basic, wide, formats), `xlsxmain` (`xlsx i|t|b|r file`), `xlsx_fuzz.py <bin> <dir> <runs>` (800 runs, 0 crashes).
 - Gaps: PPTX not built; fractions (`# ?/?`), conditional sections `[>100]`, sub-second `.0`, images/charts/drawings, cell comments, frozen panes, repeated print titles, vertical alignment, rotated text, theme fonts; non-wrapped text wraps inside the cell instead of overflowing.
+
+## Status G3 PPTX
+
+- `lib/docview/office/pp_*.fi`: one Sect per slide (sldSz), background float, master/layout shapes behind, slide shapes as REL_PAGE floats on one anchor paragraph.
+- Placeholders inherit geometry, fill, bodyPr and text styles from layout and master (title/body/other); lstStyle chain down to defaultTextStyle; bullets (char, autonum), fontScale, anchor, insets.
+- Shapes: sp (fill, outline), lines, groups (child transform), pictures, tables (spans, fills, borders, default Medium Style 2 look). Not done: curved geometries, charts, SmartArt, notes, rotation, crop, gradients (first stop only).
+- Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`.
