@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1mem
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+import media.video.av1.av1ref
+import media.video.av1.av1mfbuf
+import media.video.av1.av1ohint
+
+export { MotionField, mfld_new, mfld_free, mfld_at, mfld_valid, mfld_estimate, mv_projection, MFLD_INVALID, MAX_FRAME_DISTANCE }
+
+const MFLD_INVALID: i64 = 0 - 32768
+const MAX_FRAME_DISTANCE: i64 = 31
+const LAST_FRAME: i64 = 1
+const LAST2_FRAME: i64 = 2
+const GOLDEN_FRAME: i64 = 4
+const BWDREF_FRAME: i64 = 5
+const ALTREF2_FRAME: i64 = 6
+const ALTREF_FRAME: i64 = 7
+
+struct MotionField {
+    rows8: i64,
+    cols8: i64,
+    mvs: u64,
+}
+
+fn plane_cells(m: *mut MotionField) -> usize {
+    return ((*m).rows8 * (*m).cols8) as usize
+}
+
+fn mfld_new(mi_rows: i64, mi_cols: i64) -> *mut MotionField {
+    let m: *mut MotionField = av1mem.av1_zalloc[MotionField]()
+    (*m).rows8 = mi_rows >> 1
+    (*m).cols8 = mi_cols >> 1
+    (*m).mvs = vp9mem.alloc(plane_cells(m) * 32 + 8)
+    return m
+}
+
+fn mfld_free(m: *mut MotionField) {
+    vp9mem.free((*m).mvs, plane_cells(m) * 32 + 8)
+    av1mem.av1_zfree[MotionField](m)
+}
+
+fn mfld_at(m: *mut MotionField, ref_frame: i64, y8: i64, x8: i64, k: i64) -> i64 {
+    return vp9mem.ldi16((*m).mvs, (((ref_frame * (*m).rows8 + y8) * (*m).cols8 + x8) * 2 + k) as usize)
+}
+
+fn mfld_valid(m: *mut MotionField, ref_frame: i64, y8: i64, x8: i64) -> bool {
+    return mfld_at(m, ref_frame, y8, x8, 0) != MFLD_INVALID
+}
+
+fn iabs(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn div_mult(den: i64) -> i64 {
+    if den <= 0 {
+        return 0
+    }
+    return 16384 / den
+}
+
+fn round_shift14(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - ((0 - v + 8192) >> 14)
+    }
+    return (v + 8192) >> 14
+}
+
+fn mv_projection(v: i64, num_in: i64, den_in: i64) -> i64 {
+    let den: i64 = vp9mem.imin(den_in, MAX_FRAME_DISTANCE)
+    var num: i64 = num_in
+    if num > 0 {
+        num = vp9mem.imin(num, MAX_FRAME_DISTANCE)
+    } else {
+        num = vp9mem.imax(num, 0 - MAX_FRAME_DISTANCE)
+    }
+    let r: i64 = round_shift14(v * num * div_mult(den))
+    return vp9mem.imax(vp9mem.imin(r, 16383), 0 - 16383)
+}
+
+fn block_offset(mv: i64) -> i64 {
+    if mv >= 0 {
+        return mv >> 6
+    }
+    return 0 - ((0 - mv) >> 6)
+}
+
+fn store_cell(m: *mut MotionField, y8: i64, x8: i64, mvr: i64, mvc: i64, off: i64, to_dst: *mut [i64; 8]) {
+    var dst: i64 = LAST_FRAME
+    while dst <= ALTREF_FRAME {
+        let at: usize = (((dst * (*m).rows8 + y8) * (*m).cols8 + x8) * 2) as usize
+        vp9mem.sti16((*m).mvs, at, mv_projection(mvr, (*to_dst)[dst as usize], off))
+        vp9mem.sti16((*m).mvs, at + 1, mv_projection(mvc, (*to_dst)[dst as usize], off))
+        dst = dst + 1
+    }
+}
+
+fn project(m: *mut MotionField, fh: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState, src_ref: i64, dst_sign: i64) -> i64 {
+    let sl: *mut av1ref.RefSlot = &(*st).slots[(*fh).ref_frame_idx[(src_ref - 1) as usize] as usize]
+    if (*sl).valid == 0 || (*sl).mf == 0 {
+        return 0
+    }
+    if (*sl).frame_type == av1fhdr.KEY_FRAME || (*sl).frame_type == av1fhdr.INTRA_ONLY_FRAME {
+        return 0
+    }
+    if (*sl).mi_rows != (*fh).mi_rows || (*sl).mi_cols != (*fh).mi_cols {
+        return 0
+    }
+    let mf: *mut av1mfbuf.MfBuf = (*sl).mf as *mut av1mfbuf.MfBuf
+    let ref_to_cur: i64 = av1ohint.rel_dist(s, (*sl).order_hint, (*fh).order_hint) * dst_sign
+    var ref_offset: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    var to_dst: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    var k: i64 = LAST_FRAME
+    while k <= ALTREF_FRAME {
+        ref_offset[k as usize] = av1ohint.rel_dist(s, (*sl).order_hint, (*sl).saved_order_hints[k as usize])
+        to_dst[k as usize] = av1ohint.rel_dist(s, (*fh).order_hint, (*fh).order_hints[k as usize])
+        k = k + 1
+    }
+    let rows8: i64 = (*m).rows8
+    let cols8: i64 = (*m).cols8
+    var y8: i64 = 0
+    while y8 < rows8 {
+        var x8: i64 = 0
+        while x8 < cols8 {
+            let r: i64 = av1mfbuf.mf_ref_at(mf, y8, x8)
+            if r > 0 {
+                let off: i64 = ref_offset[r as usize]
+                if off > 0 && off <= MAX_FRAME_DISTANCE && iabs(ref_to_cur) <= MAX_FRAME_DISTANCE {
+                    let mvr: i64 = av1mfbuf.mf_mv_at(mf, y8, x8, 0)
+                    let mvc: i64 = av1mfbuf.mf_mv_at(mf, y8, x8, 1)
+                    let dr: i64 = block_offset(mv_projection(mvr, ref_to_cur, off))
+                    let dc: i64 = block_offset(mv_projection(mvc, ref_to_cur, off))
+                    let py: i64 = y8 + dst_sign * dr
+                    let px: i64 = x8 + dst_sign * dc
+                    let base_y: i64 = (y8 >> 3) << 3
+                    let base_x: i64 = (x8 >> 3) << 3
+                    if py >= 0 && py < rows8 && px >= 0 && px < cols8 && py >= base_y && py < base_y + 8 && px >= base_x - 8 && px < base_x + 16 {
+                        store_cell(m, py, px, mvr, mvc, off, &to_dst)
+                    }
+                }
+            }
+            x8 = x8 + 1
+        }
+        y8 = y8 + 1
+    }
+    return 1
+}
+
+fn mfld_estimate(m: *mut MotionField, fh: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState) {
+    var i: usize = 0
+    let n: usize = plane_cells(m) * 16
+    while i < n {
+        vp9mem.sti16((*m).mvs, i, MFLD_INVALID)
+        i = i + 1
+    }
+    if (*s).enable_order_hint == 0 {
+        return
+    }
+    let last: *mut av1ref.RefSlot = &(*st).slots[(*fh).ref_frame_idx[0] as usize]
+    if (*last).saved_order_hints[ALTREF_FRAME as usize] != (*fh).order_hints[GOLDEN_FRAME as usize] {
+        project(m, fh, s, st, LAST_FRAME, 0 - 1)
+    }
+    var stamp: i64 = 1
+    if av1ohint.rel_dist(s, (*fh).order_hints[BWDREF_FRAME as usize], (*fh).order_hint) > 0 {
+        if project(m, fh, s, st, BWDREF_FRAME, 1) == 1 {
+            stamp = stamp - 1
+        }
+    }
+    if av1ohint.rel_dist(s, (*fh).order_hints[ALTREF2_FRAME as usize], (*fh).order_hint) > 0 {
+        if project(m, fh, s, st, ALTREF2_FRAME, 1) == 1 {
+            stamp = stamp - 1
+        }
+    }
+    if av1ohint.rel_dist(s, (*fh).order_hints[ALTREF_FRAME as usize], (*fh).order_hint) > 0 && stamp >= 0 {
+        if project(m, fh, s, st, ALTREF_FRAME, 1) == 1 {
+            stamp = stamp - 1
+        }
+    }
+    if stamp >= 0 {
+        project(m, fh, s, st, LAST2_FRAME, 0 - 1)
+    }
+}
