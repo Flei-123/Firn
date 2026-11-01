@@ -24,20 +24,22 @@ expect_rc() {
 same_out() {
   case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
   local ref=""
-  for m in off on check; do
+  for m in off on check strict; do
     build "$1" "$m" || return
     run "$1" "$m" > /dev/null
   done
-  for m in on check; do
+  for m in on check strict; do
     if cmp -s "$D/$1_off.out" "$D/$1_$m.out"; then pass=$((pass + 1)); else echo "FAIL $1: output $m differs from off"; fail=$((fail + 1)); fi
   done
 }
 same_out concat_chain
 expect_rc free_reuse on 0
+expect_rc free_reuse strict 0
 expect_rc free_reuse check 0
 expect_rc poison_hit check 86
 same_out tree_drop
 expect_rc tree_drop_count on 0
+expect_rc tree_drop_count strict 0
 expect_rc tree_drop_count check 0
 expect_rc tree_drop_bad check 86
 same_out fir_str_loop
@@ -47,6 +49,7 @@ same_out fir_str_ret
 same_out fir_str_escape
 same_out fir_str_escape_novec
 expect_rc fir_str_freed on 0
+expect_rc fir_str_freed strict 0
 expect_rc fir_str_freed check 0
 same_out fir_obj_loop
 same_out fir_obj_branch
@@ -54,6 +57,7 @@ same_out fir_obj_field
 same_out fir_obj_factory
 same_out fir_obj_escape
 FIRN_OWN_NO_REUSE=1 expect_rc fir_obj_freed on 0
+FIRN_OWN_NO_REUSE=1 expect_rc fir_obj_freed strict 0
 expect_rc fir_obj_freed check 0
 same_out fir_vec_loop
 same_out fir_vec_ret
@@ -61,13 +65,16 @@ same_out fir_vec_field
 same_out fir_vec_iter
 same_out fir_map_loop
 expect_rc fir_vec_freed on 0
+expect_rc fir_vec_freed strict 0
 expect_rc fir_vec_freed check 0
 expect_rc fir_map_freed on 0
+expect_rc fir_map_freed strict 0
 expect_rc fir_map_freed check 0
 expect_rc fir_vec_poison check 86
 same_out fir_clo_local
 same_out fir_clo_stored
 FIRN_OWN_NO_REUSE=1 expect_rc fir_clo_freed on 0
+FIRN_OWN_NO_REUSE=1 expect_rc fir_clo_freed strict 0
 expect_rc fir_clo_freed check 0
 has_reuse() {
   case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
@@ -80,9 +87,14 @@ for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; d
   has_reuse "$c"
 done
 same_out fir_mt_loop
+same_out fir_vec_cycle
+expect_rc strict_trip on 0
+expect_rc strict_trip strict 86
 [ -n "${OWN_FORK:-}" ] && same_out fork_mt_par
 expect_rc fir_mt_freed on 0
+expect_rc fir_mt_freed strict 0
 expect_rc fir_mt_freed check 0
+grep -q "reached the collector" "$D/strict_trip_strict.err" && pass=$((pass + 1)) || { echo "FAIL strict_trip: no message"; fail=$((fail + 1)); }
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]

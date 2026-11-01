@@ -17,7 +17,7 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS=$2; shift 2 ;;
     --list) cut -d'|' -f1 "$HERE/steps.txt"; exit 0 ;;
     --summary) CMD=summary; shift ;;
-    -*) echo "usage: check_all.sh [--mode check|on|off] [--out DIR] [--base DIR] [--jobs N<=3] [--list] [--summary] [step...]" >&2; exit 2 ;;
+    -*) echo "usage: check_all.sh [--mode check|strict|on|off] [--out DIR] [--base DIR] [--jobs N<=3] [--list] [--summary] [step...]" >&2; exit 2 ;;
     *) ONLY+=("$1"); shift ;;
   esac
 done
