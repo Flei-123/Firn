@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1ipm
+import media.video.av1.av1mc
+import media.video.av1.av1tabwarp
+
+export { msb_of, resolve_divisor, setup_shear, warp_block, WARP_PARAM_ELEMS, WARP_SCRATCH_ELEMS }
+
+const WARP_PARAM_ELEMS: i64 = 10
+const WARP_SCRATCH_ELEMS: i64 = 120
+
+fn msb_of(v: i64) -> i64 {
+    var n: i64 = 0
+    var x: i64 = v
+    while x > 1 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+fn resolve_divisor(d: i64) -> i64 {
+    var shift: i64 = msb_of(d)
+    let e: i64 = d - (1 << (shift as u64))
+    var f: i64 = 0
+    if shift > 8 {
+        f = av1mc.round2s(e, shift - 8)
+    } else {
+        f = e << ((8 - shift) as u64)
+    }
+    shift = shift + 14
+    return (shift << 16) | vp9mem.ld16(av1tabwarp.div_lut_addr(), f as usize)
+}
+
+fn clamp16(v: i64) -> i64 {
+    if v < 0 - 32768 {
+        return 0 - 32768
+    }
+    if v > 32767 {
+        return 32767
+    }
+    return v
+}
+
+fn reduce6(v: i64) -> i64 {
+    return av1mc.round2_signed(v, 6) * 64
+}
+
+fn setup_shear(mat: u64, out: u64) -> i64 {
+    let m2: i64 = av1ipm.ld64(mat, 2)
+    let m3: i64 = av1ipm.ld64(mat, 3)
+    let m4: i64 = av1ipm.ld64(mat, 4)
+    let m5: i64 = av1ipm.ld64(mat, 5)
+    if m2 <= 0 {
+        return 0
+    }
+    var alpha: i64 = clamp16(m2 - 65536)
+    var beta: i64 = clamp16(m3)
+    let rd: i64 = resolve_divisor(av1ipm.iabs(m2))
+    let shift: i64 = rd >> 16
+    let y: i64 = rd & 65535
+    var v: i64 = (m4 * 65536) * y
+    var gamma: i64 = clamp16(av1mc.round2_signed(v, shift))
+    v = (m3 * m4) * y
+    var delta: i64 = clamp16(m5 - av1mc.round2_signed(v, shift) - 65536)
+    alpha = reduce6(alpha)
+    beta = reduce6(beta)
+    gamma = reduce6(gamma)
+    delta = reduce6(delta)
+    av1ipm.st64(out, 0, alpha)
+    av1ipm.st64(out, 1, beta)
+    av1ipm.st64(out, 2, gamma)
+    av1ipm.st64(out, 3, delta)
+    if 4 * av1ipm.iabs(alpha) + 7 * av1ipm.iabs(beta) >= 65536 {
+        return 0
+    }
+    if 4 * av1ipm.iabs(gamma) + 4 * av1ipm.iabs(delta) >= 65536 {
+        return 0
+    }
+    return 1
+}
+
+fn clip_i(v: i64, hi: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn warp_block(ref_buf: u64, stride: i64, width: i64, height: i64, wp: u64, p_col: i64, p_row: i64, pw: i64, ph: i64, ssx: i64, ssy: i64, bd: i64, compound: i64, tmp: u64, out: u64) {
+    let tab: u64 = av1tabwarp.warped_filter_addr()
+    let m0: i64 = av1ipm.ld64(wp, 0)
+    let m1: i64 = av1ipm.ld64(wp, 1)
+    let m2: i64 = av1ipm.ld64(wp, 2)
+    let m3: i64 = av1ipm.ld64(wp, 3)
+    let m4: i64 = av1ipm.ld64(wp, 4)
+    let m5: i64 = av1ipm.ld64(wp, 5)
+    let alpha: i64 = av1ipm.ld64(wp, 6)
+    let beta: i64 = av1ipm.ld64(wp, 7)
+    let gamma: i64 = av1ipm.ld64(wp, 8)
+    let delta: i64 = av1ipm.ld64(wp, 9)
+    let reduce_h: i64 = av1mc.round0_of(bd)
+    var reduce_v: i64 = 14 - reduce_h
+    if compound != 0 {
+        reduce_v = 7
+    }
+    var i: i64 = p_row
+    while i < p_row + ph {
+        var j: i64 = p_col
+        while j < p_col + pw {
+            let src_x: i64 = (j + 4) << (ssx as u64)
+            let src_y: i64 = (i + 4) << (ssy as u64)
+            let dst_x: i64 = m2 * src_x + m3 * src_y + m0
+            let dst_y: i64 = m4 * src_x + m5 * src_y + m1
+            let x4: i64 = dst_x >> (ssx as u64)
+            let y4: i64 = dst_y >> (ssy as u64)
+            let ix4: i64 = x4 >> 16
+            var sx4: i64 = x4 & 65535
+            let iy4: i64 = y4 >> 16
+            var sy4: i64 = y4 & 65535
+            sx4 = sx4 + alpha * (0 - 4) + beta * (0 - 4)
+            sy4 = sy4 + gamma * (0 - 4) + delta * (0 - 4)
+            sx4 = sx4 & (0 - 64)
+            sy4 = sy4 & (0 - 64)
+            var k: i64 = 0 - 7
+            while k < 8 {
+                let iy: i64 = clip_i(iy4 + k, height - 1)
+                var sx: i64 = sx4 + beta * (k + 4)
+                var l: i64 = 0 - 4
+                while l < 4 {
+                    let ix: i64 = ix4 + l - 3
+                    let offs: i64 = av1mc.round2s(sx, 10) + 64
+                    var sum: i64 = 0
+                    var m: i64 = 0
+                    while m < 8 {
+                        sum = sum + vp9mem.ldi16(tab, (offs * 8 + m) as usize) * av1ipm.ld(ref_buf, iy * stride + clip_i(ix + m, width - 1))
+                        m = m + 1
+                    }
+                    av1ipm.st64(tmp, (k + 7) * 8 + (l + 4), av1mc.round2s(sum, reduce_h))
+                    sx = sx + alpha
+                    l = l + 1
+                }
+                k = k + 1
+            }
+            var kk: i64 = 0 - 4
+            while kk < 4 && kk < p_row + ph - i - 4 {
+                var sy: i64 = sy4 + delta * (kk + 4)
+                var l: i64 = 0 - 4
+                while l < 4 && l < p_col + pw - j - 4 {
+                    let offs: i64 = av1mc.round2s(sy, 10) + 64
+                    var sum: i64 = 0
+                    var m: i64 = 0
+                    while m < 8 {
+                        sum = sum + vp9mem.ldi16(tab, (offs * 8 + m) as usize) * av1ipm.ld64(tmp, (kk + m + 4) * 8 + (l + 4))
+                        m = m + 1
+                    }
+                    av1ipm.st64(out, (i - p_row + kk + 4) * pw + (j - p_col + l + 4), av1mc.round2s(sum, reduce_v))
+                    sy = sy + gamma
+                    l = l + 1
+                }
+                kk = kk + 1
+            }
+            j = j + 8
+        }
+        i = i + 8
+    }
+}
