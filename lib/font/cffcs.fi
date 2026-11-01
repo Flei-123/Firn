@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: MPL-2.0
+// Type 2 charstring interpreter: turns a CFF glyph into a cubic path.
+import std.math
+import rt.rt
+import font.cff
+import font.gpath
+
+export {
+    cffcs_outline,
+}
+
+const STACK_MAX: usize = 96
+const MAX_DEPTH: usize = 10
+const MAX_STEPS: usize = 400000
+
+struct Cs {
+    f: *mut cff.CffFont,
+    g: *mut gpath.GPath,
+    st: [f64; 96],
+    n: usize,
+    x: f64,
+    y: f64,
+    tx: f64,
+    ty: f64,
+    open: bool,
+    nhints: usize,
+    wd: bool,
+    fd: usize,
+    steps: usize,
+    done: bool,
+    fail: bool,
+    trans: [f64; 32],
+}
+
+fn bias_of(count: usize) -> i64 {
+    if count < 1240 {
+        return 107
+    }
+    if count < 33900 {
+        return 1131
+    }
+    return 32768
+}
+
+fn push(s: *mut Cs, v: f64) {
+    if (*s).n < STACK_MAX {
+        (*s).st[(*s).n] = v
+        (*s).n = (*s).n + 1
+    } else {
+        (*s).fail = true
+    }
+}
+
+fn pop(s: *mut Cs) -> f64 {
+    if (*s).n == 0 {
+        return 0.0
+    }
+    (*s).n = (*s).n - 1
+    return (*s).st[(*s).n]
+}
+
+fn drop_first(s: *mut Cs) {
+    var i: usize = 1
+    while i < (*s).n {
+        (*s).st[i - 1] = (*s).st[i]
+        i = i + 1
+    }
+    if (*s).n > 0 {
+        (*s).n = (*s).n - 1
+    }
+}
+
+fn take_width_even(s: *mut Cs) {
+    if !(*s).wd {
+        (*s).wd = true
+        if ((*s).n % 2) == 1 {
+            drop_first(s)
+        }
+    }
+}
+
+fn take_width_move(s: *mut Cs, args: usize) {
+    if !(*s).wd {
+        (*s).wd = true
+        if (*s).n > args {
+            drop_first(s)
+        }
+    }
+}
+
+fn move_to(s: *mut Cs, dx: f64, dy: f64) {
+    if (*s).open {
+        gpath.gp_close((*s).g)
+    }
+    (*s).x = (*s).x + dx
+    (*s).y = (*s).y + dy
+    gpath.gp_move((*s).g, (*s).x + (*s).tx, (*s).y + (*s).ty)
+    (*s).open = true
+}
+
+fn line_by(s: *mut Cs, dx: f64, dy: f64) {
+    (*s).x = (*s).x + dx
+    (*s).y = (*s).y + dy
+    gpath.gp_line((*s).g, (*s).x + (*s).tx, (*s).y + (*s).ty)
+}
+
+fn curve_by(s: *mut Cs, d1x: f64, d1y: f64, d2x: f64, d2y: f64, d3x: f64,
+    d3y: f64) {
+    let x1: f64 = (*s).x + d1x
+    let y1: f64 = (*s).y + d1y
+    let x2: f64 = x1 + d2x
+    let y2: f64 = y1 + d2y
+    let x3: f64 = x2 + d3x
+    let y3: f64 = y2 + d3y
+    gpath.gp_curve((*s).g, x1 + (*s).tx, y1 + (*s).ty, x2 + (*s).tx,
+        y2 + (*s).ty, x3 + (*s).tx, y3 + (*s).ty)
+    (*s).x = x3
+    (*s).y = y3
+}
+
+fn op_hvlines(s: *mut Cs, horizontal: bool) {
+    var h: bool = horizontal
+    var i: usize = 0
+    while i < (*s).n {
+        if h {
+            line_by(s, (*s).st[i], 0.0)
+        } else {
+            line_by(s, 0.0, (*s).st[i])
+        }
+        h = !h
+        i = i + 1
+    }
+}
+
+fn op_hvcurves(s: *mut Cs, horizontal: bool) {
+    var h: bool = horizontal
+    var i: usize = 0
+    while i + 4 <= (*s).n {
+        var last: f64 = 0.0
+        if (*s).n - i == 5 {
+            last = (*s).st[i + 4]
+        }
+        if h {
+            curve_by(s, (*s).st[i], 0.0, (*s).st[i + 1], (*s).st[i + 2], last,
+                (*s).st[i + 3])
+        } else {
+            curve_by(s, 0.0, (*s).st[i], (*s).st[i + 1], (*s).st[i + 2],
+                (*s).st[i + 3], last)
+        }
+        h = !h
+        i = i + 4
+    }
+}
+
+fn op_vvcurve(s: *mut Cs) {
+    var i: usize = 0
+    var d1: f64 = 0.0
+    if ((*s).n % 2) == 1 {
+        d1 = (*s).st[0]
+        i = 1
+    }
+    while i + 4 <= (*s).n {
+        curve_by(s, d1, (*s).st[i], (*s).st[i + 1], (*s).st[i + 2], 0.0,
+            (*s).st[i + 3])
+        d1 = 0.0
+        i = i + 4
+    }
+}
+
+fn op_hhcurve(s: *mut Cs) {
+    var i: usize = 0
+    var d1: f64 = 0.0
+    if ((*s).n % 2) == 1 {
+        d1 = (*s).st[0]
+        i = 1
+    }
+    while i + 4 <= (*s).n {
+        curve_by(s, (*s).st[i], d1, (*s).st[i + 1], (*s).st[i + 2],
+            (*s).st[i + 3], 0.0)
+        d1 = 0.0
+        i = i + 4
+    }
+}
+
+fn op_flex(s: *mut Cs, sub: u32) {
+    let sy: f64 = (*s).y
+    let sx: f64 = (*s).x
+    if sub == 35 && (*s).n >= 12 {
+        curve_by(s, (*s).st[0], (*s).st[1], (*s).st[2], (*s).st[3],
+            (*s).st[4], (*s).st[5])
+        curve_by(s, (*s).st[6], (*s).st[7], (*s).st[8], (*s).st[9],
+            (*s).st[10], (*s).st[11])
+    }
+    if sub == 34 && (*s).n >= 7 {
+        curve_by(s, (*s).st[0], 0.0, (*s).st[1], (*s).st[2], (*s).st[3], 0.0)
+        curve_by(s, (*s).st[4], 0.0, (*s).st[5], 0.0 - (*s).st[2], (*s).st[6],
+            0.0)
+    }
+    if sub == 36 && (*s).n >= 9 {
+        curve_by(s, (*s).st[0], (*s).st[1], (*s).st[2], (*s).st[3],
+            (*s).st[4], 0.0)
+        curve_by(s, (*s).st[5], 0.0, (*s).st[6], (*s).st[7], (*s).st[8],
+            sy - ((*s).y + (*s).st[7]))
+    }
+    if sub == 37 && (*s).n >= 11 {
+        let dx: f64 = (*s).st[0] + (*s).st[2] + (*s).st[4] + (*s).st[6] + (*s).st[8]
+        let dy: f64 = (*s).st[1] + (*s).st[3] + (*s).st[5] + (*s).st[7] + (*s).st[9]
+        curve_by(s, (*s).st[0], (*s).st[1], (*s).st[2], (*s).st[3],
+            (*s).st[4], (*s).st[5])
+        var ex: f64 = (*s).st[10]
+        var ey: f64 = 0.0
+        if math.fabs(dx) <= math.fabs(dy) {
+            ex = 0.0
+            ey = (*s).st[10]
+        }
+        var fx: f64 = ex
+        var fy: f64 = ey
+        if math.fabs(dx) > math.fabs(dy) {
+            fy = sy - ((*s).y + (*s).st[7] + (*s).st[9])
+        } else {
+            fx = sx - ((*s).x + (*s).st[6] + (*s).st[8])
+        }
+        curve_by(s, (*s).st[6], (*s).st[7], (*s).st[8], (*s).st[9], fx, fy)
+    }
+    (*s).n = 0
+}
+
+fn op_arith(s: *mut Cs, sub: u32) {
+    if sub == 9 {
+        push(s, math.fabs(pop(s)))
+    }
+    if sub == 10 {
+        let b: f64 = pop(s)
+        push(s, pop(s) + b)
+    }
+    if sub == 11 {
+        let b2: f64 = pop(s)
+        push(s, pop(s) - b2)
+    }
+    if sub == 12 {
+        let b3: f64 = pop(s)
+        let a3: f64 = pop(s)
+        if b3 == 0.0 {
+            push(s, 0.0)
+        } else {
+            push(s, a3 / b3)
+        }
+    }
+    if sub == 14 {
+        push(s, 0.0 - pop(s))
+    }
+    if sub == 24 {
+        let b4: f64 = pop(s)
+        push(s, pop(s) * b4)
+    }
+    if sub == 26 {
+        let v: f64 = pop(s)
+        if v > 0.0 {
+            push(s, math.sqrt(v))
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 18 {
+        pop(s)
+    }
+    if sub == 27 {
+        let d: f64 = pop(s)
+        push(s, d)
+        push(s, d)
+    }
+    if sub == 28 {
+        let b5: f64 = pop(s)
+        let a5: f64 = pop(s)
+        push(s, b5)
+        push(s, a5)
+    }
+    if sub == 3 {
+        let b6: f64 = pop(s)
+        let a6: f64 = pop(s)
+        if a6 != 0.0 && b6 != 0.0 {
+            push(s, 1.0)
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 4 {
+        let b7: f64 = pop(s)
+        let a7: f64 = pop(s)
+        if a7 != 0.0 || b7 != 0.0 {
+            push(s, 1.0)
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 5 {
+        if pop(s) == 0.0 {
+            push(s, 1.0)
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 15 {
+        let b8: f64 = pop(s)
+        let a8: f64 = pop(s)
+        if a8 == b8 {
+            push(s, 1.0)
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 22 {
+        let v2: f64 = pop(s)
+        let v1: f64 = pop(s)
+        let s2: f64 = pop(s)
+        let s1: f64 = pop(s)
+        if v1 <= v2 {
+            push(s, s1)
+        } else {
+            push(s, s2)
+        }
+    }
+    if sub == 23 {
+        push(s, 0.5)
+    }
+    if sub == 20 {
+        let idx: f64 = pop(s)
+        let val: f64 = pop(s)
+        if idx >= 0.0 && idx < 32.0 {
+            (*s).trans[idx as usize] = val
+        }
+    }
+    if sub == 21 {
+        let gi: f64 = pop(s)
+        if gi >= 0.0 && gi < 32.0 {
+            push(s, (*s).trans[gi as usize])
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 29 {
+        var k: f64 = pop(s)
+        if k < 0.0 {
+            k = 0.0
+        }
+        let at: usize = k as usize
+        if at < (*s).n {
+            push(s, (*s).st[(*s).n - 1 - at])
+        } else {
+            push(s, 0.0)
+        }
+    }
+    if sub == 30 {
+        let j: i64 = pop(s) as i64
+        let cnt: i64 = pop(s) as i64
+        if cnt > 0 && (cnt as usize) <= (*s).n {
+            let c: usize = cnt as usize
+            let base: usize = (*s).n - c
+            var tmp: [f64; 96] = [0.0; 96]
+            var i: usize = 0
+            while i < c {
+                tmp[i] = (*s).st[base + i]
+                i = i + 1
+            }
+            var sh: i64 = j % cnt
+            if sh < 0 {
+                sh = sh + cnt
+            }
+            var k2: usize = 0
+            while k2 < c {
+                (*s).st[base + (k2 + (sh as usize)) % c] = tmp[k2]
+                k2 = k2 + 1
+            }
+        }
+    }
+}
+
+fn run_glyph(s: *mut Cs, gid: u32, depth: usize) {
+    var cs: usize = 0
+    var cl: usize = 0
+    if !cff.cff_cs_range((*s).f, gid, &cs, &cl) {
+        (*s).fail = true
+        return
+    }
+    (*s).fd = cff.cff_fd_of((*s).f, gid)
+    run(s, cs, cl, depth)
+}
+
+fn do_seac(s: *mut Cs, depth: usize) {
+    if depth >= MAX_DEPTH || (*s).n < 4 {
+        return
+    }
+    let base: usize = (*s).n - 4
+    let adx: f64 = (*s).st[base]
+    let ady: f64 = (*s).st[base + 1]
+    let bch: u32 = ((*s).st[base + 2] as i64) as u32
+    let ach: u32 = ((*s).st[base + 3] as i64) as u32
+    let bg: u32 = cff.cff_std_code_gid((*s).f, bch)
+    let ag: u32 = cff.cff_std_code_gid((*s).f, ach)
+    if (*s).open {
+        gpath.gp_close((*s).g)
+        (*s).open = false
+    }
+    let sfd: usize = (*s).fd
+    let stx: f64 = (*s).tx
+    let sty: f64 = (*s).ty
+    var k: usize = 0
+    while k < 2 {
+        var gid: u32 = bg
+        var ox: f64 = stx
+        var oy: f64 = sty
+        if k == 1 {
+            gid = ag
+            ox = stx + adx
+            oy = sty + ady
+        }
+        if gid != 0 as u32 {
+            (*s).n = 0
+            (*s).x = 0.0
+            (*s).y = 0.0
+            (*s).tx = ox
+            (*s).ty = oy
+            (*s).wd = false
+            (*s).nhints = 0
+            (*s).done = false
+            run_glyph(s, gid, depth + 1)
+            if (*s).open {
+                gpath.gp_close((*s).g)
+                (*s).open = false
+            }
+        }
+        k = k + 1
+    }
+    (*s).fd = sfd
+    (*s).tx = stx
+    (*s).ty = sty
+    (*s).done = true
+}
+
+fn call_subr(s: *mut Cs, global: bool, depth: usize) {
+    var ix: *mut cff.CffIndex = cff.cff_gsubrs((*s).f)
+    if !global {
+        ix = cff.cff_fd_subrs((*s).f, (*s).fd)
+    }
+    let which: f64 = pop(s)
+    let n: usize = cff.cff_idx_count(ix)
+    let at: i64 = (which as i64) + bias_of(n)
+    if at < 0 || (at as usize) >= n {
+        (*s).fail = true
+        return
+    }
+    var ss: usize = 0
+    var sl: usize = 0
+    if !cff.cff_idx_item((*s).f, ix, at as usize, &ss, &sl) {
+        (*s).fail = true
+        return
+    }
+    run(s, ss, sl, depth + 1)
+}
+
+fn run(s: *mut Cs, start: usize, len: usize, depth: usize) {
+    if depth > MAX_DEPTH {
+        (*s).fail = true
+        return
+    }
+    let f: *mut cff.CffFont = (*s).f
+    var i: usize = start
+    let end: usize = start + len
+    while i < end && !(*s).done && !(*s).fail {
+        (*s).steps = (*s).steps + 1
+        if (*s).steps > MAX_STEPS {
+            (*s).fail = true
+            return
+        }
+        let b0: u32 = cff.cff_byte(f, i)
+        i = i + 1
+        if b0 == 28 {
+            var v: i32 = ((cff.cff_byte(f, i) << 8) | cff.cff_byte(f, i + 1)) as i32
+            if v >= 32768 {
+                v = v - 65536
+            }
+            push(s, v as f64)
+            i = i + 2
+            continue
+        }
+        if b0 >= 32 && b0 <= 246 {
+            push(s, (b0 as f64) - 139.0)
+            continue
+        }
+        if b0 >= 247 && b0 <= 250 {
+            push(s, ((b0 as f64) - 247.0) * 256.0 + (cff.cff_byte(f, i) as f64) + 108.0)
+            i = i + 1
+            continue
+        }
+        if b0 >= 251 && b0 <= 254 {
+            push(s, 0.0 - ((b0 as f64) - 251.0) * 256.0 - (cff.cff_byte(f, i) as f64) - 108.0)
+            i = i + 1
+            continue
+        }
+        if b0 == 255 {
+            var w: i64 = ((cff.cff_byte(f, i) << 24) | (cff.cff_byte(f, i + 1) << 16) |
+                (cff.cff_byte(f, i + 2) << 8) | cff.cff_byte(f, i + 3)) as i64
+            if w >= 2147483648 {
+                w = w - 4294967296
+            }
+            push(s, (w as f64) / 65536.0)
+            i = i + 4
+            continue
+        }
+        if b0 == 1 || b0 == 3 || b0 == 18 || b0 == 23 {
+            take_width_even(s)
+            (*s).nhints = (*s).nhints + (*s).n / 2
+            (*s).n = 0
+            continue
+        }
+        if b0 == 19 || b0 == 20 {
+            take_width_even(s)
+            (*s).nhints = (*s).nhints + (*s).n / 2
+            (*s).n = 0
+            i = i + ((*s).nhints + 7) / 8
+            continue
+        }
+        if b0 == 21 {
+            take_width_move(s, 2)
+            if (*s).n >= 2 {
+                move_to(s, (*s).st[(*s).n - 2], (*s).st[(*s).n - 1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 22 {
+            take_width_move(s, 1)
+            if (*s).n >= 1 {
+                move_to(s, (*s).st[(*s).n - 1], 0.0)
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 4 {
+            take_width_move(s, 1)
+            if (*s).n >= 1 {
+                move_to(s, 0.0, (*s).st[(*s).n - 1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 5 {
+            var k: usize = 0
+            while k + 2 <= (*s).n {
+                line_by(s, (*s).st[k], (*s).st[k + 1])
+                k = k + 2
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 6 {
+            op_hvlines(s, true)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 7 {
+            op_hvlines(s, false)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 8 {
+            var k2: usize = 0
+            while k2 + 6 <= (*s).n {
+                curve_by(s, (*s).st[k2], (*s).st[k2 + 1], (*s).st[k2 + 2],
+                    (*s).st[k2 + 3], (*s).st[k2 + 4], (*s).st[k2 + 5])
+                k2 = k2 + 6
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 24 {
+            var k3: usize = 0
+            while k3 + 6 + 2 <= (*s).n {
+                curve_by(s, (*s).st[k3], (*s).st[k3 + 1], (*s).st[k3 + 2],
+                    (*s).st[k3 + 3], (*s).st[k3 + 4], (*s).st[k3 + 5])
+                k3 = k3 + 6
+            }
+            if k3 + 2 <= (*s).n {
+                line_by(s, (*s).st[k3], (*s).st[k3 + 1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 25 {
+            var k4: usize = 0
+            while k4 + 2 + 6 <= (*s).n {
+                line_by(s, (*s).st[k4], (*s).st[k4 + 1])
+                k4 = k4 + 2
+            }
+            if k4 + 6 <= (*s).n {
+                curve_by(s, (*s).st[k4], (*s).st[k4 + 1], (*s).st[k4 + 2],
+                    (*s).st[k4 + 3], (*s).st[k4 + 4], (*s).st[k4 + 5])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 26 {
+            op_vvcurve(s)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 27 {
+            op_hhcurve(s)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 30 {
+            op_hvcurves(s, false)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 31 {
+            op_hvcurves(s, true)
+            (*s).n = 0
+            continue
+        }
+        if b0 == 10 {
+            call_subr(s, false, depth)
+            continue
+        }
+        if b0 == 29 {
+            call_subr(s, true, depth)
+            continue
+        }
+        if b0 == 11 {
+            return
+        }
+        if b0 == 14 {
+            if !(*s).wd {
+                (*s).wd = true
+                if (*s).n == 1 || (*s).n == 5 {
+                    drop_first(s)
+                }
+            }
+            if (*s).n >= 4 {
+                do_seac(s, depth)
+            }
+            (*s).done = true
+            (*s).n = 0
+            continue
+        }
+        if b0 == 12 {
+            let sub: u32 = cff.cff_byte(f, i)
+            i = i + 1
+            if sub >= 34 && sub <= 37 {
+                op_flex(s, sub)
+                continue
+            }
+            op_arith(s, sub)
+            continue
+        }
+        (*s).n = 0
+    }
+}
+
+fn cffcs_outline(f: *mut cff.CffFont, gid: u32, g: *mut gpath.GPath) -> bool {
+    if !cff.cff_ok(f) {
+        return false
+    }
+    var s: Cs = Cs { f: f, g: g, st: [0.0; 96], n: 0, x: 0.0, y: 0.0,
+        tx: 0.0, ty: 0.0, open: false, nhints: 0, wd: false, fd: 0, steps: 0,
+        done: false, fail: false, trans: [0.0; 32] }
+    run_glyph(&s, gid, 0)
+    if s.open {
+        gpath.gp_close(g)
+    }
+    return !s.fail && gpath.gp_ok(g)
+}
