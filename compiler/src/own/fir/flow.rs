@@ -108,12 +108,17 @@ impl Flow {
             fl.may[i].set(1 + i);
         }
         let entry = ix.rpo.first().copied().unwrap_or(0);
+        let deps = value_users(f, ix, &fl.zero_add);
+        let mut dirty = vec![true; f.blocks.len()];
         let mut cout: Vec<Option<Vec<CellVal>>> = vec![None; f.blocks.len()];
         let mut rounds = 0;
         loop {
             rounds += 1;
             let mut changed = false;
             for &bi in ix.rpo.iter() {
+                if !dirty[bi] {
+                    continue;
+                }
                 let mut cells: Vec<CellVal> = if bi == entry {
                     vec![fl.other(); sl.cells.len()]
                 } else {
@@ -131,12 +136,20 @@ impl Flow {
                         None => continue,
                     }
                 };
-                if fl.cin[bi].as_ref() != Some(&cells) {
+                dirty[bi] = false;
+                if with_sites && fl.cin[bi].as_ref() != Some(&cells) {
                     fl.cin[bi] = Some(cells.clone());
                     changed = true;
                 }
                 for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
-                    changed |= fl.transfer(f, sl, br, &mut cells, inst, (bi, ii), true);
+                    if fl.transfer(f, sl, br, &mut cells, inst, (bi, ii), true) {
+                        changed = true;
+                        if let Some(d) = inst.dst {
+                            for &u in deps[d as usize].iter() {
+                                dirty[u as usize] = true;
+                            }
+                        }
+                    }
                 }
                 if let Term::Ret(Some(v)) = &f.blocks[bi].term {
                     let m = fl.may[*v as usize].clone();
@@ -146,6 +159,9 @@ impl Flow {
                 if cout[bi].as_ref() != Some(&cells) {
                     cout[bi] = Some(cells);
                     changed = true;
+                    for &s in ix.succs[bi].iter() {
+                        dirty[s] = true;
+                    }
                 }
             }
             if !changed || rounds > 200 {
@@ -328,6 +344,38 @@ fn join(a: &mut [CellVal], b: &[CellVal]) {
         x.may.union(&y.may);
         x.derived |= y.derived;
     }
+}
+
+fn value_users(f: &Func, ix: &Index, zero_add: &HashMap<Val, Val>) -> Vec<Vec<u32>> {
+    let mut users: Vec<Vec<u32>> = vec![Vec::new(); ix.nvals];
+    let mut buf = Vec::new();
+    let mut add = |users: &mut Vec<Vec<u32>>, v: Val, bi: usize| {
+        if let Some(u) = users.get_mut(v as usize) {
+            if u.last() != Some(&(bi as u32)) {
+                u.push(bi as u32);
+            }
+        }
+    };
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for inst in b.insts.iter() {
+            buf.clear();
+            inst.op.uses(&mut buf);
+            if let Op::Load { addr } = &inst.op {
+                if let Some(&base) = zero_add.get(addr) {
+                    buf.push(base);
+                }
+            }
+            for &v in buf.iter() {
+                add(&mut users, v, bi);
+            }
+        }
+        buf.clear();
+        super::index::term_uses(&b.term, &mut buf);
+        for &v in buf.iter() {
+            add(&mut users, v, bi);
+        }
+    }
+    users
 }
 
 fn code_loads(f: &Func) -> HashMap<Val, Val> {

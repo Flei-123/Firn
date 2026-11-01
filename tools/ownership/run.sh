@@ -79,6 +79,9 @@ for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; d
   same_out "$c"
   has_reuse "$c"
 done
+same_out fir_mt_loop
+expect_rc fir_mt_freed on 0
+expect_rc fir_mt_freed check 0
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -312,7 +312,7 @@ fn alloc_and_init(
 /// `addr` the address the store went to (computed once, by the caller).
 pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr, addr: Val) -> Option<()> {
     let t = lo.ty_of(target);
-    if !gc::is_gc_ptr(&t) {
+    if !gc::is_gc_traced(&t) {
         return Some(());
     }
     // Only writes INTO the heap need the barrier; a local variable
