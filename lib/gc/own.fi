@@ -4,6 +4,9 @@ const OWN_POISON: u32 = 128
 const OWN_MASK_SLOTS: u32 = 4294967260
 const OWN_POISON_WORD: u64 = 16059518370053521118
 const OWN_VERIFY_EVERY: u64 = 1024
+const OWN_FT_FREED: u64 = 496
+const OWN_FT_SINCE: u64 = 504
+const OWN_SINCE_BATCH: u64 = 65536
 
 static mut OWN_FREED: u64 = 0
 static mut OWN_DEFERRED: u64 = 0
@@ -77,9 +80,7 @@ fn __own_free_masked(p: *mut u8, mask: u32) {
     let header: u64 = base + class * 8
     *((b + HEADER) as *mut u64) = (*((header) as *mut u64))
     *((header) as *mut u64) = b
-    __own_listed(base, 1, multi)
-    __own_since_sub(st, (*((c + 16) as *mut u64)), multi)
-    __own_bump((&OWN_FREED) as u64, 1, multi)
+    __own_note(st, base, 1, (*((c + 16) as *mut u64)), multi, 0)
 }
 
 fn __own_list_base(st: u64, multi: u64) -> u64 {
@@ -93,12 +94,22 @@ fn __own_list_base(st: u64, multi: u64) -> u64 {
     return tcb + FT_FREE
 }
 
-fn __own_listed(base: u64, n: u64, multi: u64) {
-    if multi == 0 || n == 0 {
+fn __own_note(st: u64, base: u64, n: u64, bytes: u64, multi: u64, clamp: u64) {
+    if multi == 0 {
+        OWN_FREED = OWN_FREED + n
+        __own_since_sub(st, bytes, 0, clamp)
         return
     }
-    let at: u64 = base - FT_FREE + FT_FREIN
-    *((at) as *mut u64) = (*((at) as *mut u64)) + n
+    let tcb: u64 = base - FT_FREE
+    *((tcb + FT_FREIN) as *mut u64) = (*((tcb + FT_FREIN) as *mut u64)) + n
+    *((tcb + OWN_FT_FREED) as *mut u64) = (*((tcb + OWN_FT_FREED) as *mut u64)) + n
+    let pend: u64 = (*((tcb + OWN_FT_SINCE) as *mut u64)) + bytes
+    if pend < OWN_SINCE_BATCH {
+        *((tcb + OWN_FT_SINCE) as *mut u64) = pend
+        return
+    }
+    *((tcb + OWN_FT_SINCE) as *mut u64) = 0
+    __own_since_sub(st, pend, 1, 1)
 }
 
 fn __own_bump(cell: u64, n: u64, multi: u64) -> u64 {
@@ -110,21 +121,22 @@ fn __own_bump(cell: u64, n: u64, multi: u64) -> u64 {
     return __atomic_add(cell as *mut u64, n) + n
 }
 
-fn __own_since_sub(st: u64, n: u64, multi: u64) {
+fn __own_since_sub(st: u64, n: u64, multi: u64, clamp: u64) {
     let at: u64 = st + S_SINCE
     var since: u64 = (*((at) as *mut u64))
-    if multi == 0 {
-        if since >= n {
-            *((at) as *mut u64) = since - n
-        } else {
-            *((at) as *mut u64) = 0
-        }
-        return
-    }
     while since != 0 {
-        var want: u64 = 0
+        var want: u64 = since
         if since >= n {
             want = since - n
+        } else {
+            if clamp == 0 {
+                return
+            }
+            want = 0
+        }
+        if multi == 0 {
+            *((at) as *mut u64) = want
+            return
         }
         let seen: u64 = __atomic_swap(at as *mut u64, since, want)
         if seen == since {
@@ -270,7 +282,19 @@ fn gc_own_verify() {
 }
 
 fn gc_own_freed() -> u64 {
-    return OWN_FREED
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = (*((st + S_THREAD_TAB) as *mut u64))
+    var n: u64 = OWN_FREED
+    if tab == 0 {
+        return n
+    }
+    let hi: u64 = (*((st + S_THREAD_HI) as *mut u64))
+    var i: u64 = 0
+    while i < hi {
+        n = n + (*((tab + i * FT_BYTES + OWN_FT_FREED) as *mut u64))
+        i = i + 1
+    }
+    return n
 }
 
 fn gc_own_deferred() -> u64 {
@@ -478,9 +502,7 @@ fn __own_drop_run(p: u64, check: u64) {
     }
     let freed: u64 = (*((at + 48) as *mut u64))
     if freed != 0 {
-        __own_listed(base, freed, multi)
-        __own_bump((&OWN_FREED) as u64, freed, multi)
-        __own_since_sub(st, (*((at + 56) as *mut u64)), multi)
+        __own_note(st, base, freed, (*((at + 56) as *mut u64)), multi, 1)
     }
 }
 
