@@ -331,7 +331,7 @@ fn usage() -> String {
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
-         --ownership=<m>    off | on | check (automatic ownership, default off)\n  \
+         --ownership=<m>    off | on | check (automatic ownership, default off; env FIRNC_OWNERSHIP)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
@@ -362,6 +362,13 @@ fn usage() -> String {
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
+    if let Some(v) = std::env::var_os("FIRNC_OWNERSHIP") {
+        let v = v.to_string_lossy();
+        match own::parse(&v) {
+            Some(m) => own::set_mode(m),
+            None => return Err(format!("unknown FIRNC_OWNERSHIP mode '{}' (allowed: off, on, check)", v)),
+        }
+    }
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut package: Option<String> = None;
@@ -1247,6 +1254,7 @@ fn run(opts: &Options) -> i32 {
     }
     tm.mark("prune");
 
+    own::stats::report();
     // --- Optimizer ---
     if opts.optimize {
         let optcfg = opts.optcfg.clone();

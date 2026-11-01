@@ -22,6 +22,13 @@ impl<'a> Probe<'a> {
         }
     }
 
+    fn scalar_slot(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Field(b, f, _) => matches!(&b.kind, ExprKind::Ident(n) if n == self.var) && self.shape.scalar_fields.contains(f),
+            _ => false,
+        }
+    }
+
     fn borrowed_arg(&self, callee: &str, i: usize) -> bool {
         self.borrows.get(callee).and_then(|v| v.get(i)).copied().unwrap_or(false)
     }
@@ -49,7 +56,7 @@ impl<'a> Probe<'a> {
     pub(crate) fn stmt_ok(&self, s: &Stmt) -> bool {
         match s {
             Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
-                !mentions(target, self.var) && self.expr_ok(value)
+                (self.scalar_slot(target) || !mentions(target, self.var)) && self.expr_ok(value)
             }
             Stmt::Step { target, .. } => !mentions(target, self.var),
             Stmt::Defer(..) | Stmt::Error(_) => !super::walk::stmt_mentions(s, self.var),

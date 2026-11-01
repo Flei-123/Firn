@@ -2,7 +2,7 @@
 
 Goal: the compiler infers ownership and lifetimes of heap objects by itself — no annotations, no borrow checker — and frees deterministically at the last use or reuses the memory in place. Whatever it cannot prove (cycles, unclear aliases) stays with the tracing GC (`docs/GC.md`). The prototype lives behind a flag and changes nothing while the flag is off.
 
-Status: design + baseline only. No compiler change yet.
+Status (01.11.2026): B3.0 runtime (`lib/gc/own.fi`: `__gc_free_block`, poison check), B3.1 concat fusion and an AST-level tree drop (`compiler/src/own/{shape,fresh,borrow,reuse}.rs`: self-recursive classes with scalar fields, fresh builders, borrowed callees) are in main behind `--ownership=on|check`, default `off`. Not built yet: the FIR inference of section 4.2 for structs/arrays/Vec/maps/closures/strings (roadmap r1325), reuse (r1328), default on (r1329). Validation harness: `FIRNC_OWNERSHIP=check` (env override, part of the build-cache key) and `tools/ownership/suite.sh` (every `tests/*.fi` in check mode, expectation + poison + per-test `FIRN_OWN_STATS` counters).
 
 ## 1. Prior art
 
@@ -105,7 +105,7 @@ Debug mode `--ownership=check`: `__gc_free_block` does not free but poisons the 
 
 ### 4.6 Flag and compiler parity
 
-- `--ownership=off|on|check` (default `off`). Env override `FIRNC_OWNERSHIP` for measurement only.
+- `--ownership=off|on|check` (default `off`). Env `FIRNC_OWNERSHIP` sets the mode for every firnc0 call of a script (the flag wins); `FIRN_OWN_STATS=1` prints `firn-own-stats: ... tree_drops=N fused_concats=M` to stderr.
 - Implemented in firnc0 only (FIR pass in the `opt` pipeline, registered in `opt.rs` like the other passes). firnc1 accepts the flag and ignores it; `fir_compare` compares pre-optimization FIR, so parity is unaffected; fixpoint builds with the default `off`.
 - When the prototype is accepted, the FIR pass moves to firnc1 as a twin like `escape.fi`, with a compare tool (`tools/ownership/compare.sh`: same free sites per function in both compilers).
 

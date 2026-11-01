@@ -111,3 +111,21 @@ pub(crate) fn compute(prog: &Program, shapes: &HashMap<String, Shape>, uniq: &Ha
         }
     }
 }
+
+pub(crate) fn init_class<'a>(e: &'a Expr, shapes: &'a HashMap<String, Shape>, fresh: &'a HashMap<String, String>) -> Option<&'a str> {
+    let class: &str = match &e.kind {
+        ExprKind::Call(name, args, _) if name == crate::errors::CATCH_NAME && args.len() == 2 => match &args[0].kind {
+            ExprKind::Call(g, _, _) => alloc_class(g)?,
+            _ => return None,
+        },
+        ExprKind::Call(name, _, _) => return fresh.get(name).map(|c| c.as_str()),
+        _ => return None,
+    };
+    let shape = shapes.get(class)?;
+    let mut cx = Cx { class, shape, fresh, lets: HashMap::default(), consumed: Vec::new() };
+    if fresh_expr(&mut cx, e, 0) && cx.consumed.is_empty() {
+        Some(class)
+    } else {
+        None
+    }
+}

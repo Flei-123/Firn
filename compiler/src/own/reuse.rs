@@ -154,8 +154,7 @@ fn insert_drops(rw: &mut Rw, stmts: &mut Vec<Stmt>) {
     let mut ins: Vec<(usize, String, crate::diag::Span)> = Vec::new();
     for k in 0..stmts.len() {
         let Stmt::Let { name, mutable: false, init, span, .. } = &stmts[k] else { continue };
-        let ExprKind::Call(g, _, _) = &init.kind else { continue };
-        let Some(class) = rw.fresh.get(g) else { continue };
+        let Some(class) = super::fresh::init_class(init, rw.shapes, rw.fresh) else { continue };
         let Some(shape) = rw.shapes.get(class) else { continue };
         if rw.binders.get(name).copied() != Some(1) {
             continue;
@@ -175,6 +174,7 @@ fn insert_drops(rw: &mut Rw, stmts: &mut Vec<Stmt>) {
         }
         ins.push((last + 1, name.clone(), *span));
     }
+    super::stats::tree_drops(ins.len());
     ins.sort_by(|a, b| b.0.cmp(&a.0));
     for (at, name, span) in ins {
         let d = drop_stmt(rw, &name, span);
@@ -215,9 +215,6 @@ pub(crate) fn apply(prog: &mut Program) {
     }
     let uniq = super::shape::unique_names(prog);
     let fresh = super::fresh::compute(prog, &shapes, &uniq);
-    if fresh.is_empty() {
-        return;
-    }
     let borrows = super::borrow::compute(prog, &shapes, &uniq);
     let drop_name = if super::mode() == super::Mode::Check { "__own_drop_tree_check" } else { "__own_drop_tree" };
     let mut next = prog.expr_count;

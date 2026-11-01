@@ -38,6 +38,9 @@ same_out tree_drop
 expect_rc tree_drop_count on 0
 expect_rc tree_drop_count check 0
 expect_rc tree_drop_bad check 86
+same_out local_owner
+expect_rc local_owner_count on 0
+expect_rc local_owner_count check 0
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -5,6 +5,7 @@ pub(crate) mod concat;
 pub(crate) mod fresh;
 pub(crate) mod reuse;
 pub(crate) mod shape;
+pub(crate) mod stats;
 pub(crate) mod walk;
 
 use std::sync::atomic::{AtomicU8, Ordering};

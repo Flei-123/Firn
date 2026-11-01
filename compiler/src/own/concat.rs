@@ -60,6 +60,7 @@ fn callee(lw: &Lower, parts: &[&Expr]) -> &'static str {
 }
 
 pub(crate) fn lower_into(lw: &mut Lower, e: &Expr, addr: crate::fir::Val) -> Option<()> {
+    super::stats::fused_concat();
     let refs = split(lw, e, 4);
     let name = callee(lw, &refs);
     let parts: Vec<Expr> = refs.into_iter().cloned().collect();
@@ -75,6 +76,7 @@ pub(crate) fn wants_assign(lw: &Lower, value: &Expr) -> bool {
 }
 
 pub(crate) fn lower_assign(lw: &mut Lower, target: &Expr, value: &Expr, addr: crate::fir::Val, span: crate::diag::Span) -> Option<()> {
+    super::stats::fused_concat();
     let mut parts: Vec<Expr> = vec![target.clone()];
     parts.extend(split(lw, value, 3).into_iter().cloned());
     let name = if parts.len() == 4 { FN_CONCAT4 } else { FN_CONCAT3 };

@@ -1,4 +1,4 @@
-use crate::ast::{FnDecl, Program, TypeExpr};
+use crate::ast::{ExprKind, FnDecl, Program, TypeExpr};
 use crate::fx::{HashMap, HashSet};
 
 pub(crate) struct Shape {
@@ -36,6 +36,14 @@ fn build(class: &str) -> Option<Shape> {
     Some(shape)
 }
 
+fn add(c: &str, seen: &mut HashSet<String>, out: &mut HashMap<String, Shape>) {
+    if seen.insert(c.to_string()) {
+        if let Some(s) = build(c) {
+            out.insert(c.to_string(), s);
+        }
+    }
+}
+
 pub(crate) fn collect(prog: &Program) -> HashMap<String, Shape> {
     let mut out: HashMap<String, Shape> = HashMap::default();
     let mut seen: HashSet<String> = HashSet::default();
@@ -43,12 +51,19 @@ pub(crate) fn collect(prog: &Program) -> HashMap<String, Shape> {
         let tys = f.params.iter().map(|p| &p.ty).chain(f.ret.iter());
         for t in tys {
             if let Some(c) = class_of(t) {
-                if seen.insert(c.to_string()) {
-                    if let Some(s) = build(c) {
-                        out.insert(c.to_string(), s);
-                    }
+                add(c, &mut seen, &mut out);
+            }
+        }
+        let mut allocs: Vec<String> = Vec::new();
+        super::walk::walk_block(&f.body, &mut |e| {
+            if let ExprKind::Call(name, _, _) = &e.kind {
+                if let Some(c) = alloc_class(name) {
+                    allocs.push(c.to_string());
                 }
             }
+        });
+        for c in allocs {
+            add(&c, &mut seen, &mut out);
         }
     }
     out
