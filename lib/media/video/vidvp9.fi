@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: MPL-2.0
+import docview.obj
+import media.demux
+import media.video.convert
+import media.video.vidops
+import media.video.vp9.vp9dec
+import media.video.vp9.vp9state
+import media.video.vp9.vp9sf
+
+export { vvp9_ops }
+
+struct Vp9Source {
+    dm: demux.Demux,
+    dec: vp9state.Vp9,
+    track: i32,
+    data: u64,
+    next: usize,
+    count: usize,
+    open: bool,
+}
+
+fn h_create() -> u64 {
+    let raw: u64 = obj.obj_alloc[Vp9Source]()
+    if raw == 0 as u64 {
+        return raw
+    }
+    *(raw as *mut Vp9Source) = Vp9Source { dm: demux.demux_new(), dec: vp9state.vp9_new(), track: -1, data: 0, next: 0, count: 0, open: false }
+    return raw
+}
+
+fn h_destroy(h: u64) {
+    if h != 0 as u64 {
+        obj.obj_free[Vp9Source](h)
+    }
+}
+
+fn h_open(h: u64, data: u64, n: usize) -> i32 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    if demux.demux_open(&(*vs).dm, data, n) != 0 {
+        return vidops.VO_ERR_FORMAT
+    }
+    let t: i32 = demux.demux_find_track(&(*vs).dm, demux.TK_VIDEO)
+    if t < 0 {
+        return vidops.VO_ERR_FORMAT
+    }
+    if demux.demux_track_codec(&(*vs).dm, t) != demux.CODEC_VP9 {
+        return vidops.VO_ERR_UNSUPPORTED
+    }
+    (*vs).track = t
+    (*vs).data = data
+    (*vs).count = demux.demux_nsamples(&(*vs).dm, t)
+    (*vs).open = true
+    return vidops.VO_OK
+}
+
+fn h_close(h: u64) {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    vp9state.vp9_release(&(*vs).dec)
+    demux.demux_free(&(*vs).dm)
+    (*vs).open = false
+}
+
+fn h_width(h: u64) -> u32 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    return demux.demux_track_width(&(*vs).dm, (*vs).track)
+}
+
+fn h_height(h: u64) -> u32 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    return demux.demux_track_height(&(*vs).dm, (*vs).track)
+}
+
+fn h_duration(h: u64) -> i64 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    return demux.demux_track_duration_us(&(*vs).dm, (*vs).track)
+}
+
+fn h_fps(h: u64) -> u32 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    let dur: i64 = h_duration(h)
+    if dur <= 0 || (*vs).count == 0 {
+        return 0
+    }
+    return (((*vs).count as i64) * 1000000000 / dur) as u32
+}
+
+fn h_bytes(h: u64) -> usize {
+    return (h_width(h) as usize) * (h_height(h) as usize) * 4
+}
+
+fn h_next(h: u64, out: u64, pts: *mut i64) -> i32 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    if !(*vs).open {
+        return vidops.VO_ERR_UNSUPPORTED
+    }
+    while (*vs).next < (*vs).count {
+        let i: usize = (*vs).next
+        (*vs).next = i + 1
+        let sp: u64 = (*vs).data + demux.demux_sample_off(&(*vs).dm, (*vs).track, i)
+        let ss: usize = demux.demux_sample_size(&(*vs).dm, (*vs).track, i) as usize
+        let nf: i64 = vp9sf.sf_count(sp, ss)
+        var k: i64 = 0
+        var shown: bool = false
+        while k < nf {
+            let fsz: usize = vp9sf.sf_frame_size(sp, ss, k)
+            let fp: u64 = sp + vp9sf.sf_frame_offset(sp, ss, k) as u64
+            k = k + 1
+            if fsz == 0 {
+                continue
+            }
+            let rc: i64 = vp9dec.dec_frame(&(*vs).dec, fp, fsz)
+            if rc == vp9dec.DEC_SHOWN {
+                shown = true
+            } else if rc != vp9dec.DEC_HIDDEN {
+                return vidops.VO_ERR_DECODE
+            }
+        }
+        if shown {
+            let d: *mut vp9state.Vp9 = &(*vs).dec
+            let b: *mut vp9state.Buf9 = &(*d).pool[(*d).out_buf as usize]
+            if (*b).w != (h_width(h) as i64) || (*b).h != (h_height(h) as i64) {
+                return vidops.VO_ERR_DECODE
+            }
+            convert.yuv420_to_rgba((*b).y, (*b).u, (*b).v, (*b).ys as usize, (*b).uvs as usize, (*b).w as usize, (*b).h as usize, 6, out)
+            *pts = demux.demux_sample_pts_us(&(*vs).dm, (*vs).track, i)
+            return 1
+        }
+    }
+    return vidops.VO_END
+}
+
+fn h_seek(h: u64, t: i64) -> i64 {
+    let vs: *mut Vp9Source = h as *mut Vp9Source
+    let k: usize = demux.demux_seek_sync(&(*vs).dm, (*vs).track, t)
+    (*vs).next = k
+    return demux.demux_sample_pts_us(&(*vs).dm, (*vs).track, k)
+}
+
+fn vvp9_ops() -> vidops.VideoOps {
+    return vidops.VideoOps { create: h_create, destroy: h_destroy, open: h_open, close: h_close, width: h_width,
+        height: h_height, fps_milli: h_fps, rgba_bytes: h_bytes, duration_us: h_duration, next_frame: h_next,
+        seek: h_seek }
+}
