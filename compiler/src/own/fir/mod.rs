@@ -76,9 +76,18 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     let ana_ms = ta.elapsed().as_millis();
     let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
     let mut reverted: Vec<usize> = Vec::new();
-    for (&fi, plan) in roots.iter().zip(plans) {
+    let window = root_window();
+    for (pos, (&fi, plan)) in roots.iter().zip(plans).enumerate() {
         let f = &mut m.funcs[fi];
         sites += plan.sites;
+        let mut plan = plan;
+        if plan.pending.is_some() && std::env::var_os("FIRN_OWN_TRACE").is_some() {
+            let kinds = plan.pending.as_ref().map(|p| format!("{:?}", p.2)).unwrap_or_default();
+            eprintln!("ownership fir: root {} {} {}", pos, f.name, kinds);
+        }
+        if pos < window.0 || pos >= window.1 {
+            plan.pending = None;
+        }
         if revert_calls(f, &plan.kept, &defined) {
             reverted.push(fi);
         }
@@ -110,6 +119,14 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
         eprintln!("ownership fir: reverted calls in {} functions, {} changed by inlining", reverted.len(), changed.len());
     }
     changed
+}
+
+fn root_window() -> (usize, usize) {
+    let parse = |v: &str| -> Option<(usize, usize)> {
+        let (lo, hi) = v.split_once(':')?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    };
+    std::env::var("FIRN_OWN_ROOT_WINDOW").ok().and_then(|v| parse(&v)).unwrap_or((0, usize::MAX))
 }
 
 struct Plan {
