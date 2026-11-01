@@ -72,6 +72,29 @@ run_svt() {
     echo "FAIL $name $(grep -h 'err=\|postfilter' "$D/$name.info" | paste -sd' ')"
   fi
 }
+run_inter() {
+  local name=$1 src=$2 size=$3 pix=$4 frames=$5 params=$6
+  shift 6
+  [ -z "$ONLY" ] || [[ $name == $ONLY ]] || return 0
+  local w=${size%x*} h=${size#*x} bps=1 ssx=1 ssy=1
+  case $pix in
+    *10le|*12le) bps=2 ;;
+  esac
+  case $pix in
+    yuv444*) ssx=0; ssy=0 ;;
+    yuv422*) ssy=0 ;;
+  esac
+  ffmpeg -nostdin -v error -y -f lavfi -i "$src=size=$size:rate=25" -frames:v $frames -pix_fmt $pix -c:v libaom-av1 -g 30 -cpu-used 8 -aom-params "$params" "$@" "$D/$name.ivf" >/dev/null 2>&1 || { echo "SKIP $name (encode)"; return; }
+  ffmpeg -nostdin -v error -y -c:v libdav1d -i "$D/$name.ivf" -f rawvideo -pix_fmt $pix "$D/$name.ref" >/dev/null 2>&1
+  "$D/av1dec" "$D/$name.ivf" "$D/$name.yuv" "$D/$name.info" || true
+  if python3 -I "$ROOT/tools/media_video/av1yuv_cmp.py" "$D/$name.yuv" "$D/$name.ref" $w $h $bps $ssx $ssy; then
+    PASS=$((PASS+1))
+    echo "ok   $name"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL $name $(grep -h 'err=\|err_mi\|err_tile' "$D/$name.info" | paste -sd' ')"
+  fi
+}
 for s in testsrc2:64x48 testsrc2:128x96 mandelbrot:96x64 testsrc2:352x288 testsrc2:17x13 testsrc2:200x130; do
   src=${s%%:*}; size=${s#*:}
   run_case ll_${src}_$size $src $size yuv420p 1 "lossless=1:$BASE"
@@ -178,5 +201,15 @@ for lvl in 10 25 40; do
 done
 run_case fg_dn_444 testsrc2 160x96 yuv444p 2 "$FGP:denoise-noise-level=30" -crf 30 -b:v 0 -vf noise=alls=30
 run_case fg_dn_10 testsrc2 160x96 yuv420p10le 2 "$FGP:denoise-noise-level=30" -crf 30 -b:v 0 -vf noise=alls=30
+IOFF="$BASE:enable-obmc=0:enable-warped-motion=0:enable-global-motion=0:enable-masked-comp=0:enable-interintra-comp=0:enable-dist-wtd-comp=0:enable-dual-filter=0:enable-ref-frame-mvs=0"
+run_inter in_simple testsrc2 176x144 yuv420p 8 "$IOFF" -crf 30 -b:v 0
+run_inter in_mfmv testsrc2 176x144 yuv420p 8 "$IOFF:enable-ref-frame-mvs=1" -crf 30 -b:v 0
+run_inter in_masked testsrc2 176x144 yuv420p 8 "$BASE:enable-obmc=0:enable-warped-motion=0:enable-global-motion=0" -crf 30 -b:v 0
+run_inter in_obmc testsrc2 176x144 yuv420p 8 "$BASE:enable-warped-motion=0:enable-global-motion=0" -crf 30 -b:v 0
+run_inter in_notools testsrc2 176x144 yuv420p 8 "$BASE" -crf 30 -b:v 0
+run_inter in_default testsrc2 176x144 yuv420p 8 "" -crf 30 -b:v 0
+run_inter in_mandel mandelbrot 200x130 yuv420p 10 "" -crf 25 -b:v 0
+run_inter in_444 testsrc2 96x64 yuv444p 6 "" -crf 30 -b:v 0
+run_inter in_10 testsrc2 96x64 yuv420p10le 6 "" -crf 30 -b:v 0
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]
