@@ -386,6 +386,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut no_cache = false;
     let mut env_allow: Vec<String> = Vec::new();
     let mut env_log = false;
+    own::apply_env()?;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];

@@ -38,6 +38,27 @@ pub(crate) fn set_mode(m: Mode) {
     MODE.store(v, Ordering::Relaxed);
 }
 
+pub(crate) fn mode_name() -> &'static str {
+    match mode() {
+        Mode::Off => "off",
+        Mode::On => "on",
+        Mode::Check => "check",
+    }
+}
+
+pub(crate) fn apply_env() -> Result<(), String> {
+    match std::env::var("FIRNC_OWNERSHIP") {
+        Ok(v) if !v.is_empty() => match parse(&v) {
+            Some(m) => {
+                set_mode(m);
+                Ok(())
+            }
+            None => Err(format!("unknown FIRNC_OWNERSHIP value '{}' (allowed: off, on, check)", v)),
+        },
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
         1 => Mode::On,

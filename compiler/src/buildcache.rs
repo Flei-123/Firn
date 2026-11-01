@@ -215,6 +215,7 @@ fn base_hasher(args: &[String]) -> Option<KeyHasher> {
     for a in key_args(args) {
         push_field(&mut h, "arg", a.as_bytes());
     }
+    push_field(&mut h, "ownership", crate::own::mode_name().as_bytes());
     let mut env: Vec<(String, Vec<u8>)> = std::env::vars_os()
         .filter_map(|(k, v)| {
             let k = k.into_string().ok()?;
