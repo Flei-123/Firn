@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9state
+import media.video.vp9.vp9blk
+import media.video.vp9.vp9lpf
+
+export { lf_frame }
+
+fn seg_level(f: *mut vp9state.Vp9, seg: i64) -> i64 {
+    var lvl: i64 = (*f).lf_level
+    if (*f).seg_on && (*f).seg_en[(seg * 4 + 1) as usize] == 1 {
+        let d: i64 = (*f).seg_data[(seg * 4 + 1) as usize]
+        if (*f).seg_abs {
+            lvl = d
+        } else {
+            lvl = lvl + d
+        }
+        lvl = vp9mem.imax(0, vp9mem.imin(63, lvl))
+    }
+    return lvl
+}
+
+fn mi_level(f: *mut vp9state.Vp9, mi: u64) -> i64 {
+    let seg: i64 = vp9mem.ld8(mi, vp9state.MI_SEG)
+    var lvl: i64 = seg_level(f, seg)
+    if (*f).lf_delta_en {
+        let scale: i64 = 1 << (((*f).lf_level >> 5) as u64)
+        let ref0: i64 = vp9mem.ld8(mi, vp9state.MI_REF0)
+        if ref0 == 0 {
+            lvl = lvl + (*f).ref_delta[0] * scale
+        } else {
+            var mode_idx: usize = 1
+            if vp9mem.ld8(mi, vp9state.MI_MODE) == 12 {
+                mode_idx = 0
+            }
+            lvl = lvl + (*f).ref_delta[ref0 as usize] * scale + (*f).mode_delta[mode_idx] * scale
+        }
+        lvl = vp9mem.imax(0, vp9mem.imin(63, lvl))
+    }
+    return lvl
+}
+
+fn filter_row_vert(s: u64, stride: i64, m16: i64, m8: i64, m4: i64, m4i: i64, lfl: *mut [i64; 64], base: usize, sharp: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        let bit: i64 = 1 << (k as u64)
+        let lvl: i64 = (*lfl)[base + k as usize]
+        let sp: u64 = ((s as i64) + k * 8) as u64
+        if (m16 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, 1, stride, 16, lvl, sharp)
+        } else if (m8 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, 1, stride, 8, lvl, sharp)
+        } else if (m4 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, 1, stride, 4, lvl, sharp)
+        }
+        if (m4i & bit) != 0 {
+            vp9lpf.lpf_edge(sp + 4, 1, stride, 4, lvl, sharp)
+        }
+        k = k + 1
+    }
+}
+
+fn filter_row_horiz(s: u64, stride: i64, m16: i64, m8: i64, m4: i64, m4i: i64, lfl: *mut [i64; 64], base: usize, sharp: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        let bit: i64 = 1 << (k as u64)
+        let lvl: i64 = (*lfl)[base + k as usize]
+        let sp: u64 = ((s as i64) + k * 8) as u64
+        if (m16 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, stride, 1, 16, lvl, sharp)
+        } else if (m8 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, stride, 1, 8, lvl, sharp)
+        } else if (m4 & bit) != 0 {
+            vp9lpf.lpf_edge(sp, stride, 1, 4, lvl, sharp)
+        }
+        if (m4i & bit) != 0 {
+            vp9lpf.lpf_edge(((sp as i64) + 4 * stride) as u64, stride, 1, 4, lvl, sharp)
+        }
+        k = k + 1
+    }
+}
+
+fn lf_plane(f: *mut vp9state.Vp9, plane: usize, mi_row: i64, mi_col: i64, base: u64, stride: i64) {
+    var ss: i64 = 0
+    if plane > 0 {
+        ss = 1
+    }
+    let step: i64 = 1 << (ss as u64)
+    var m16: [i64; 8] = [0; 8]
+    var m8: [i64; 8] = [0; 8]
+    var m4: [i64; 8] = [0; 8]
+    var m4i: [i64; 8] = [0; 8]
+    var lfl: [i64; 64] = [0; 64]
+    let px0: i64 = (mi_col * 8) >> (ss as u64)
+    let py0: i64 = (mi_row * 8) >> (ss as u64)
+    let sharp: i64 = (*f).lf_sharp
+    var r: i64 = 0
+    while r < 8 && mi_row + r < (*f).mi_rows {
+        var c16: i64 = 0
+        var c8: i64 = 0
+        var c4: i64 = 0
+        var c: i64 = 0
+        while c < 8 && mi_col + c < (*f).mi_cols {
+            let mi: u64 = vp9state.mi_ptr(f, mi_row + r, mi_col + c)
+            let bsize: i64 = vp9blk.mi_bsize(mi)
+            let skip_this: bool = vp9mem.ld8(mi, vp9state.MI_SKIP) == 1 && vp9mem.ld8(mi, vp9state.MI_REF0) > 0
+            var edge_l: bool = true
+            if vp9blk.bw4(bsize) > 1 {
+                edge_l = (c & (vp9blk.bw8(bsize) - 1)) == 0
+            }
+            let skip_c: bool = skip_this && !edge_l
+            var edge_a: bool = true
+            if vp9blk.bh4(bsize) > 1 {
+                edge_a = (r & (vp9blk.bh8(bsize) - 1)) == 0
+            }
+            let skip_r: bool = skip_this && !edge_a
+            let tx: i64 = vp9blk.plane_tx(mi, plane)
+            let skip_b4c: bool = ss == 1 && mi_col + c == (*f).mi_cols - 1
+            let skip_b4r: bool = ss == 1 && mi_row + r == (*f).mi_rows - 1
+            let lvl: i64 = mi_level(f, mi)
+            lfl[(r * 8 + (c >> (ss as u64))) as usize] = lvl
+            if lvl != 0 {
+                let cb: i64 = 1 << ((c >> (ss as u64)) as u64)
+                let cc: i64 = c >> (ss as u64)
+                let rr: i64 = r >> (ss as u64)
+                if tx == 3 {
+                    if !skip_c && (cc & 3) == 0 {
+                        if !skip_b4c {
+                            c16 = c16 | cb
+                        } else {
+                            c8 = c8 | cb
+                        }
+                    }
+                    if !skip_r && (rr & 3) == 0 {
+                        if !skip_b4r {
+                            m16[r as usize] = m16[r as usize] | cb
+                        } else {
+                            m8[r as usize] = m8[r as usize] | cb
+                        }
+                    }
+                } else if tx == 2 {
+                    if !skip_c && (cc & 1) == 0 {
+                        if !skip_b4c {
+                            c16 = c16 | cb
+                        } else {
+                            c8 = c8 | cb
+                        }
+                    }
+                    if !skip_r && (rr & 1) == 0 {
+                        if !skip_b4r {
+                            m16[r as usize] = m16[r as usize] | cb
+                        } else {
+                            m8[r as usize] = m8[r as usize] | cb
+                        }
+                    }
+                } else {
+                    if !skip_c {
+                        if tx == 1 || (cc & 3) == 0 {
+                            c8 = c8 | cb
+                        } else {
+                            c4 = c4 | cb
+                        }
+                    }
+                    if !skip_r {
+                        if tx == 1 || (rr & 3) == 0 {
+                            m8[r as usize] = m8[r as usize] | cb
+                        } else {
+                            m4[r as usize] = m4[r as usize] | cb
+                        }
+                    }
+                    if !skip_this && tx < 1 && !skip_b4c {
+                        m4i[r as usize] = m4i[r as usize] | cb
+                    }
+                }
+            }
+            c = c + step
+        }
+        var border: i64 = 255
+        if mi_col == 0 {
+            border = 254
+        }
+        let rowp: u64 = ((base as i64) + (py0 + (r >> (ss as u64)) * 8) * stride + px0) as u64
+        filter_row_vert(rowp, stride, c16 & border, c8 & border, c4 & border, m4i[r as usize], &lfl, (r * 8) as usize, sharp)
+        r = r + step
+    }
+    r = 0
+    while r < 8 && mi_row + r < (*f).mi_rows {
+        let skip_b4r: bool = ss == 1 && mi_row + r == (*f).mi_rows - 1
+        var i4: i64 = m4i[r as usize]
+        if skip_b4r {
+            i4 = 0
+        }
+        var a16: i64 = m16[r as usize]
+        var a8: i64 = m8[r as usize]
+        var a4: i64 = m4[r as usize]
+        if mi_row + r == 0 {
+            a16 = 0
+            a8 = 0
+            a4 = 0
+        }
+        let rowp: u64 = ((base as i64) + (py0 + (r >> (ss as u64)) * 8) * stride + px0) as u64
+        filter_row_horiz(rowp, stride, a16, a8, a4, i4, &lfl, (r * 8) as usize, sharp)
+        r = r + step
+    }
+}
+
+fn lf_frame(f: *mut vp9state.Vp9) {
+    if (*f).lf_level == 0 {
+        return
+    }
+    let b: *mut vp9state.Buf9 = &(*f).pool[(*f).cur as usize]
+    var sr: i64 = 0
+    while sr < (*f).sb_rows {
+        var sc: i64 = 0
+        while sc < (*f).sb_cols {
+            lf_plane(f, 0, sr * 8, sc * 8, (*b).y, (*b).ys)
+            lf_plane(f, 1, sr * 8, sc * 8, (*b).u, (*b).uvs)
+            lf_plane(f, 2, sr * 8, sc * 8, (*b).v, (*b).uvs)
+            sc = sc + 1
+        }
+        sr = sr + 1
+    }
+}
