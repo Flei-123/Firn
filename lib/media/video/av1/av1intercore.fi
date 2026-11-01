@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1mem
+import media.video.av1.av1ipm
+import media.video.av1.av1ipred
+import media.video.av1.av1blkst
+import media.video.av1.av1fhdr
+import media.video.av1.av1frame
+import media.video.av1.av1mc
+import media.video.av1.av1warp
+import media.video.av1.av1warpest
+import media.video.av1.av1wedge
+import media.video.av1.av1mvmi
+import media.video.av1.av1interdef
+
+export { InterCtx, ic_new, ic_free, ic_set_ref, ic_is_scaled, predict_ref, local_warp_setup, PIX_BYTES }
+
+const PIX_BYTES: usize = 32768
+
+struct InterCtx {
+    refs: [u64; 8],
+    scratch: u64,
+    out0: u64,
+    out1: u64,
+    mask: u64,
+    a2: u64,
+    a3: u64,
+    pix: u64,
+    obl: u64,
+    wp: u64,
+    lwp: u64,
+    t4: u64,
+    wtmp: u64,
+    pts1: u64,
+    pts2: u64,
+    ipscr: u64,
+    local_valid: i64,
+}
+
+fn ic_new() -> *mut InterCtx {
+    let ic: *mut InterCtx = av1mem.av1_zalloc[InterCtx]()
+    (*ic).scratch = vp9mem.alloc((av1mc.SCRATCH_ELEMS * 8) as usize)
+    (*ic).out0 = vp9mem.alloc((av1mc.OUT_ELEMS * 8) as usize)
+    (*ic).out1 = vp9mem.alloc((av1mc.OUT_ELEMS * 8) as usize)
+    (*ic).mask = vp9mem.alloc((av1mc.OUT_ELEMS * 2) as usize)
+    (*ic).a2 = vp9mem.alloc((av1mc.OUT_ELEMS * 8) as usize)
+    (*ic).a3 = vp9mem.alloc((av1mc.OUT_ELEMS * 8) as usize)
+    (*ic).pix = vp9mem.alloc(PIX_BYTES)
+    (*ic).obl = av1wedge.wedge_obl_new()
+    (*ic).wp = vp9mem.alloc(128)
+    (*ic).lwp = vp9mem.alloc(128)
+    (*ic).t4 = vp9mem.alloc(128)
+    (*ic).wtmp = vp9mem.alloc(1024)
+    (*ic).pts1 = vp9mem.alloc(256)
+    (*ic).pts2 = vp9mem.alloc(256)
+    (*ic).ipscr = vp9mem.alloc(av1ipred.IPRED_SCRATCH * 2)
+    return ic
+}
+
+fn ic_free(ic: *mut InterCtx) {
+    vp9mem.free((*ic).scratch, (av1mc.SCRATCH_ELEMS * 8) as usize)
+    vp9mem.free((*ic).out0, (av1mc.OUT_ELEMS * 8) as usize)
+    vp9mem.free((*ic).out1, (av1mc.OUT_ELEMS * 8) as usize)
+    vp9mem.free((*ic).mask, (av1mc.OUT_ELEMS * 2) as usize)
+    vp9mem.free((*ic).a2, (av1mc.OUT_ELEMS * 8) as usize)
+    vp9mem.free((*ic).a3, (av1mc.OUT_ELEMS * 8) as usize)
+    vp9mem.free((*ic).pix, PIX_BYTES)
+    av1wedge.wedge_obl_free((*ic).obl)
+    vp9mem.free((*ic).wp, 128)
+    vp9mem.free((*ic).lwp, 128)
+    vp9mem.free((*ic).t4, 128)
+    vp9mem.free((*ic).wtmp, 1024)
+    vp9mem.free((*ic).pts1, 256)
+    vp9mem.free((*ic).pts2, 256)
+    vp9mem.free((*ic).ipscr, av1ipred.IPRED_SCRATCH * 2)
+    av1mem.av1_zfree[InterCtx](ic)
+}
+
+fn ic_set_ref(ic: *mut InterCtx, rf: i64, f: u64) {
+    (*ic).refs[rf as usize] = f
+}
+
+fn ic_is_scaled(f: *mut av1frame.Frame, frame_width: i64, frame_height: i64) -> bool {
+    return av1mc.scale_factor((*f).width, frame_width) != 16384 || av1mc.scale_factor((*f).height, frame_height) != 16384
+}
+
+fn global_warp_setup(ic: *mut InterCtx, td: *mut av1blkst.TileDec, rf: i64) -> bool {
+    var i: i64 = 0
+    while i < 6 {
+        av1ipm.st64((*ic).wp, i, (*(*td).fh).gm_params[(rf * 6 + i) as usize])
+        i = i + 1
+    }
+    if av1warp.setup_shear((*ic).wp, (*ic).t4) == 0 {
+        return false
+    }
+    i = 0
+    while i < 4 {
+        av1ipm.st64((*ic).wp, 6 + i, av1ipm.ld64((*ic).t4, i))
+        i = i + 1
+    }
+    return true
+}
+
+fn local_warp_setup(ic: *mut InterCtx, td: *mut av1blkst.TileDec) {
+    (*ic).local_valid = 0
+    if (*td).num_samples <= 0 {
+        return
+    }
+    let bw: i64 = (*td).bw4 * 4
+    let bh: i64 = (*td).bh4 * 4
+    let org_y: i64 = (*td).mi_row * 32
+    let org_x: i64 = (*td).mi_col * 32
+    var i: i64 = 0
+    while i < (*td).num_samples {
+        av1ipm.st64((*ic).pts1, i * 2, (*td).samples[(i * 4 + 1) as usize] - org_x)
+        av1ipm.st64((*ic).pts1, i * 2 + 1, (*td).samples[(i * 4) as usize] - org_y)
+        av1ipm.st64((*ic).pts2, i * 2, (*td).samples[(i * 4 + 3) as usize] - org_x)
+        av1ipm.st64((*ic).pts2, i * 2 + 1, (*td).samples[(i * 4 + 2) as usize] - org_y)
+        i = i + 1
+    }
+    let ok: i64 = av1warpest.warp_estimate((*td).num_samples, (*ic).pts1, (*ic).pts2, bw, bh, (*td).mvs[0], (*td).mvs[1], (*td).mi_row, (*td).mi_col, (*ic).lwp)
+    (*ic).local_valid = ok
+}
+
+fn predict_ref(ic: *mut InterCtx, td: *mut av1blkst.TileDec, plane: i64, bx: i64, by: i64, w: i64, h: i64, cr: i64, cc: i64, list: i64, compound: i64, allow_warp: bool, out: u64) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let rf: i64 = av1mvmi.ref_get(td, cr, cc, list)
+    let fr: *mut av1frame.Frame = (*ic).refs[rf as usize] as *mut av1frame.Frame
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    let rw: i64 = (*fr).width
+    let rh: i64 = (*fr).height
+    let scx: i64 = av1mc.scale_factor(rw, (*fh).frame_width)
+    let scy: i64 = av1mc.scale_factor(rh, (*fh).frame_height)
+    let mvr: i64 = av1mvmi.mv_get(td, cr, cc, list, 0)
+    let mvc: i64 = av1mvmi.mv_get(td, cr, cc, list, 1)
+    let p: usize = plane as usize
+    let buf: u64 = (*fr).planes[p]
+    let stride: i64 = (*fr).strides[p]
+    let last_x: i64 = ((rw + sx) >> (sx as u64)) - 1
+    let last_y: i64 = ((rh + sy) >> (sy as u64)) - 1
+    var warp: i64 = 0
+    if allow_warp && w >= 8 && h >= 8 && (*fh).force_integer_mv == 0 && scx == 16384 && scy == 16384 {
+        if (*td).motion_mode == av1interdef.MM_LOCALWARP && (*ic).local_valid != 0 {
+            warp = 2
+        } else if ((*td).y_mode == av1interdef.GLOBALMV || (*td).y_mode == av1interdef.GLOBAL_GLOBALMV) && (*fh).gm_type[rf as usize] > 1 {
+            if global_warp_setup(ic, td, rf) {
+                warp = 1
+            }
+        }
+    }
+    if warp == 2 {
+        var i: i64 = 0
+        while i < 10 {
+            av1ipm.st64((*ic).wp, i, av1ipm.ld64((*ic).lwp, i))
+            i = i + 1
+        }
+    }
+    if warp != 0 {
+        av1warp.warp_block(buf, stride, last_x + 1, last_y + 1, (*ic).wp, bx, by, w, h, sx, sy, (*td).bit_depth, compound, (*ic).wtmp, out)
+        return
+    }
+    let mi: i64 = cr * (*td).mi_cols + cc
+    let fty: i64 = av1blkst.ld((*td).interp_a, mi * 2)
+    let ftx: i64 = av1blkst.ld((*td).interp_a, mi * 2 + 1)
+    av1mc.predict_block(buf, stride, last_x, last_y, av1mc.start_pos(bx, mvc, sx, scx), av1mc.start_pos(by, mvr, sy, scy), av1mc.step_size(scx), av1mc.step_size(scy), w, h, ftx, fty, (*td).bit_depth, compound, (*ic).scratch, out)
+}

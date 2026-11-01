@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1ipm
+import media.video.av1.av1ipred
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1fhdr
+import media.video.av1.av1frame
+import media.video.av1.av1mc
+import media.video.av1.av1mcmask
+import media.video.av1.av1wedge
+import media.video.av1.av1mvmi
+import media.video.av1.av1interdef
+import media.video.av1.av1intercore
+import media.video.av1.av1interobmc
+
+export { predict_inter_block }
+
+
+fn rel_dist(td: *mut av1blkst.TileDec, a: i64, b: i64) -> i64 {
+    if (*(*td).seq).enable_order_hint == 0 {
+        return 0
+    }
+    let m: i64 = 1 << (((*(*td).seq).order_hint_bits - 1) as u64)
+    let diff: i64 = a - b
+    return (diff & (m - 1)) - (diff & m)
+}
+
+fn dist_of(td: *mut av1blkst.TileDec, list: i64) -> i64 {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let d: i64 = rel_dist(td, (*fh).order_hints[(*td).ref_frame[list as usize] as usize], (*fh).order_hint)
+    return av1interdef.clip3(0, 31, av1interdef.abs_i(d))
+}
+
+fn intra_mode_of(ii_mode: i64) -> i64 {
+    if ii_mode == 0 {
+        return 0
+    }
+    if ii_mode == 1 {
+        return 1
+    }
+    if ii_mode == 2 {
+        return 2
+    }
+    return 9
+}
+
+fn predict_intra_part(ic: *mut av1intercore.InterCtx, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame, plane: i64, bx: i64, by: i64, w: i64, h: i64) {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    var al: i64 = (*td).avail_l
+    var au: i64 = (*td).avail_u
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+        al = (*td).avail_lc
+        au = (*td).avail_uc
+    }
+    let p: usize = plane as usize
+    let xr: i64 = (((*td).mi_cols * 4) >> (sx as u64)) - (bx + w)
+    let yd: i64 = (((*td).mi_rows * 4) >> (sy as u64)) - (by + h)
+    av1ipred.predict_intra((*f).planes[p], (*f).strides[p], bx, by, w, h, intra_mode_of((*td).interintra_mode), 0, 0 - 1, al != 0, au != 0, false, false, xr, yd, 0, false, (*td).bit_depth, (*ic).ipscr)
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        while j < w {
+            av1ipm.st64((*ic).a2, i * w + j, av1ipm.ld((*f).planes[p], (by + i) * (*f).strides[p] + bx + j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn clip_to(ic: *mut av1intercore.InterCtx, w: i64, h: i64, bd: i64) {
+    var i: i64 = 0
+    while i < w * h {
+        av1ipm.st64((*ic).a3, i, av1ipm.clip_px(av1ipm.ld64((*ic).out0, i), bd))
+        i = i + 1
+    }
+}
+
+fn predict_inter(ic: *mut av1intercore.InterCtx, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame, plane: i64, bx: i64, by: i64, w: i64, h: i64, cr: i64, cc: i64, is_ii: bool) {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    let bd: i64 = (*td).bit_depth
+    let p: usize = plane as usize
+    let stride: i64 = (*f).strides[p]
+    let dst: u64 = (*f).planes[p] + ((by * stride + bx) * 2) as u64
+    let compound: bool = av1mvmi.ref_get(td, cr, cc, 1) > 0
+    var comp: i64 = 0
+    if compound {
+        comp = 1
+    }
+    av1intercore.predict_ref(ic, td, plane, bx, by, w, h, cr, cc, 0, comp, true, (*ic).out0)
+    if compound {
+        av1intercore.predict_ref(ic, td, plane, bx, by, w, h, cr, cc, 1, comp, true, (*ic).out1)
+    }
+    let bwl: i64 = (*td).bw4 * 4
+    let post: i64 = av1mc.post_round_of(bd)
+    if is_ii {
+        clip_to(ic, w, h, bd)
+        if (*td).wedge_interintra != 0 {
+            av1wedge.wedge_mask((*ic).obl, (*td).mi_size, (*td).wedge_index, 0, (*ic).mask)
+        } else {
+            av1wedge.smooth_mask((*td).mi_size, (*td).interintra_mode, (*ic).mask)
+        }
+        av1mcmask.mask_to_plane((*ic).a2, (*ic).a3, (*ic).mask, bwl, sx, sy, w, h, 0, dst, stride, bd)
+        return
+    }
+    if !compound {
+        av1mcmask.single_to_plane((*ic).out0, w, h, dst, stride, bd)
+        return
+    }
+    let ct: i64 = (*td).compound_type
+    if ct == av1interdef.CT_AVERAGE {
+        av1mcmask.avg_to_plane((*ic).out0, (*ic).out1, w, h, dst, stride, bd)
+    } else if ct == av1interdef.CT_DISTANCE {
+        let wt: i64 = av1mcmask.dist_weights(dist_of(td, 1), dist_of(td, 0))
+        av1mcmask.dist_to_plane((*ic).out0, (*ic).out1, w, h, wt >> 8, wt & 255, dst, stride, bd)
+    } else {
+        if plane == 0 {
+            if ct == av1interdef.CT_WEDGE {
+                av1wedge.wedge_mask((*ic).obl, (*td).mi_size, (*td).wedge_index, (*td).wedge_sign, (*ic).mask)
+            } else {
+                av1mcmask.diffwtd_mask((*ic).out0, (*ic).out1, w, h, bd, (*td).mask_type, (*ic).mask)
+            }
+        }
+        av1mcmask.mask_to_plane((*ic).out0, (*ic).out1, (*ic).mask, bwl, sx, sy, w, h, post, dst, stride, bd)
+    }
+}
+
+fn predict_plane(ic: *mut av1intercore.InterCtx, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame, plane: i64) {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    let psz: i64 = av1blkdat.subsampled_size((*td).mi_size, sx, sy)
+    let n4w: i64 = av1blkdat.bw4(psz)
+    let n4h: i64 = av1blkdat.bh4(psz)
+    let base_x: i64 = ((*td).mi_col >> (sx as u64)) * 4
+    let base_y: i64 = ((*td).mi_row >> (sy as u64)) * 4
+    var cand_row: i64 = ((*td).mi_row >> (sy as u64)) << (sy as u64)
+    var cand_col: i64 = ((*td).mi_col >> (sx as u64)) << (sx as u64)
+    let is_ii: bool = (*td).interintra != 0
+    if is_ii {
+        predict_intra_part(ic, td, f, plane, base_x, base_y, n4w * 4, n4h * 4)
+    }
+    var pred_w: i64 = ((*td).bw4 * 4) >> (sx as u64)
+    var pred_h: i64 = ((*td).bh4 * 4) >> (sy as u64)
+    var some_intra: bool = false
+    var r: i64 = 0
+    while r < (n4h << (sy as u64)) {
+        var c: i64 = 0
+        while c < (n4w << (sx as u64)) {
+            if av1mvmi.ref_get(td, cand_row + r, cand_col + c, 0) == 0 {
+                some_intra = true
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    if some_intra {
+        pred_w = n4w * 4
+        pred_h = n4h * 4
+        cand_row = (*td).mi_row
+        cand_col = (*td).mi_col
+    }
+    var rr: i64 = 0
+    var y: i64 = 0
+    while y < n4h * 4 {
+        var cc: i64 = 0
+        var x: i64 = 0
+        while x < n4w * 4 {
+            predict_inter(ic, td, f, plane, base_x + x, base_y + y, pred_w, pred_h, cand_row + rr, cand_col + cc, is_ii)
+            cc = cc + 1
+            x = x + pred_w
+        }
+        rr = rr + 1
+        y = y + pred_h
+    }
+    if (*td).motion_mode == av1interdef.MM_OBMC {
+        av1interobmc.obmc_plane(ic, td, f, plane)
+    }
+}
+
+fn predict_inter_block(ic: *mut av1intercore.InterCtx, td: *mut av1blkst.TileDec, f: *mut av1frame.Frame) {
+    if (*td).motion_mode == av1interdef.MM_LOCALWARP {
+        av1intercore.local_warp_setup(ic, td)
+    }
+    var planes: i64 = 1
+    if (*td).has_chroma != 0 {
+        planes = 3
+    }
+    var plane: i64 = 0
+    while plane < planes {
+        predict_plane(ic, td, f, plane)
+        plane = plane + 1
+    }
+}
