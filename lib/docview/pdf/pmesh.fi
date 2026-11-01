@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: MPL-2.0
+// PDF mesh shadings (types 4-7): vertex and patch stream decoding into triangles, and Gouraud triangle painting.
+import html.mem
+import std.math
+import rt.rt
+import paint.canvas
+import docview.pdf.pdoc
+import docview.pdf.pfunc
+import docview.pdf.prast
+
+export {
+    Mesh,
+    mesh_new, mesh_free, mesh_load, mesh_paint, mesh_vertex_count, mesh_vertex_ptr,
+    mesh_stride,
+}
+
+const MESH_MAXV: usize = 150000
+const MESH_GRID: usize = 8
+const MESH_MAXNC: usize = 8
+
+struct Mesh {
+    v: *mut f64,
+    nv: usize,
+    cap: usize,
+    nc: usize,
+}
+
+struct BitR {
+    p: u64,
+    n: usize,
+    pos: usize,
+}
+
+fn mesh_new() -> Mesh {
+    return Mesh { v: 0 as *mut f64, nv: 0, cap: 0, nc: 0 }
+}
+
+fn mesh_free(m: *mut Mesh) {
+    if (*m).v as usize != 0 {
+        mem.heap_free((*m).v as *mut u8, (*m).cap * mesh_stride(m) * 8)
+        (*m).v = 0 as *mut f64
+    }
+    (*m).nv = 0
+    (*m).cap = 0
+}
+
+fn mesh_stride(m: *mut Mesh) -> usize {
+    return 2 + (*m).nc
+}
+
+fn mesh_vertex_count(m: *mut Mesh) -> usize {
+    return (*m).nv
+}
+
+fn mesh_vertex_ptr(m: *mut Mesh, i: usize) -> *mut f64 {
+    return ((*m).v as u64 + (i * mesh_stride(m) * 8) as u64) as *mut f64
+}
+
+#[no_gc]
+fn mm_ld(p: *mut f64, i: usize) -> f64 {
+    return *((p as u64 + (i * 8) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn mm_st(p: *mut f64, i: usize, v: f64) {
+    *((p as u64 + (i * 8) as u64) as *mut f64) = v
+}
+
+fn mesh_reserve(m: *mut Mesh, extra: usize) -> bool {
+    if (*m).nv + extra > MESH_MAXV {
+        return false
+    }
+    if (*m).nv + extra <= (*m).cap {
+        return true
+    }
+    var ncap: usize = (*m).cap * 2
+    if ncap < 768 {
+        ncap = 768
+    }
+    while ncap < (*m).nv + extra {
+        ncap = ncap * 2
+    }
+    if ncap > MESH_MAXV {
+        ncap = MESH_MAXV
+    }
+    let st: usize = mesh_stride(m)
+    let np: *mut f64 = mem.heap_alloc(ncap * st * 8) as *mut f64
+    if np as usize == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < (*m).nv * st {
+        mm_st(np, i, mm_ld((*m).v, i))
+        i = i + 1
+    }
+    if (*m).v as usize != 0 {
+        mem.heap_free((*m).v as *mut u8, (*m).cap * st * 8)
+    }
+    (*m).v = np
+    (*m).cap = ncap
+    return true
+}
+
+fn mesh_tri(m: *mut Mesh, a: *mut f64, b: *mut f64, c: *mut f64) -> bool {
+    if !mesh_reserve(m, 3) {
+        return false
+    }
+    let st: usize = mesh_stride(m)
+    var w: usize = 0
+    while w < 3 {
+        var src: *mut f64 = a
+        if w == 1 {
+            src = b
+        }
+        if w == 2 {
+            src = c
+        }
+        let dst: *mut f64 = mesh_vertex_ptr(m, (*m).nv + w)
+        var k: usize = 0
+        while k < st {
+            mm_st(dst, k, mm_ld(src, k))
+            k = k + 1
+        }
+        w = w + 1
+    }
+    (*m).nv = (*m).nv + 3
+    return true
+}
+
+fn br_left(b: *mut BitR) -> usize {
+    return (*b).n * 8 - (*b).pos
+}
+
+fn br_read(b: *mut BitR, nbits: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < nbits {
+        let at: usize = (*b).pos
+        var bit: u64 = 0
+        if (at >> 3) < (*b).n {
+            let by: u8 = *(((*b).p + (at >> 3) as u64) as *mut u8)
+            bit = ((by >> (7 - (at & 7)) as u8) & 1 as u8) as u64
+        }
+        v = (v << 1) | bit
+        (*b).pos = at + 1
+        i = i + 1
+    }
+    return v
+}
+
+fn br_align(b: *mut BitR) {
+    (*b).pos = (((*b).pos + 7) / 8) * 8
+}
+
+fn mm_dec(raw: u64, bits: usize, lo: f64, hi: f64) -> f64 {
+    var maxv: f64 = 4294967295.0
+    if bits < 32 {
+        maxv = ((1 as u64) << bits as u64) as f64 - 1.0
+    }
+    if maxv <= 0.0 {
+        return lo
+    }
+    return lo + (raw as f64) * (hi - lo) / maxv
+}
+
+fn mm_read_xy(b: *mut BitR, bpc: usize, dec: *mut f64, x: *mut f64, y: *mut f64) {
+    *x = mm_dec(br_read(b, bpc), bpc, mm_ld(dec, 0), mm_ld(dec, 1))
+    *y = mm_dec(br_read(b, bpc), bpc, mm_ld(dec, 2), mm_ld(dec, 3))
+}
+
+fn mm_read_comps(b: *mut BitR, bpcomp: usize, dec: *mut f64, nread: usize,
+    out: *mut f64) {
+    var k: usize = 0
+    while k < nread {
+        mm_st(out, k, mm_dec(br_read(b, bpcomp), bpcomp, mm_ld(dec, 4 + 2 * k),
+            mm_ld(dec, 5 + 2 * k)))
+        k = k + 1
+    }
+}
+
+fn mm_read_vertex(b: *mut BitR, bpc: usize, bpcomp: usize, dec: *mut f64,
+    nread: usize, out: *mut f64) {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    mm_read_xy(b, bpc, dec, &x, &y)
+    mm_st(out, 0, x)
+    mm_st(out, 1, y)
+    mm_read_comps(b, bpcomp, dec, nread, ((out as u64) + 16) as *mut f64)
+}
+
+fn mm_copy_vertex(dst: *mut f64, src: *mut f64, st: usize) {
+    var k: usize = 0
+    while k < st {
+        mm_st(dst, k, mm_ld(src, k))
+        k = k + 1
+    }
+}
+
+fn mm_load_free_form(m: *mut Mesh, b: *mut BitR, bpf: usize, bpc: usize,
+    bpcomp: usize, dec: *mut f64, nread: usize) {
+    let st: usize = 2 + nread
+    let vbits: usize = 2 * bpc + nread * bpcomp
+    var va: [f64; 10] = [0.0; 10]
+    var vb: [f64; 10] = [0.0; 10]
+    var vc: [f64; 10] = [0.0; 10]
+    var cur: [f64; 10] = [0.0; 10]
+    var have: bool = false
+    while br_left(b) >= bpf + vbits {
+        let f: u64 = br_read(b, bpf)
+        mm_read_vertex(b, bpc, bpcomp, dec, nread, (&cur[0]) as *mut f64)
+        br_align(b)
+        if f == 0 || !have {
+            mm_copy_vertex((&va[0]) as *mut f64, (&cur[0]) as *mut f64, st)
+            if br_left(b) < bpf + vbits {
+                return
+            }
+            br_read(b, bpf)
+            mm_read_vertex(b, bpc, bpcomp, dec, nread, (&vb[0]) as *mut f64)
+            br_align(b)
+            if br_left(b) < bpf + vbits {
+                return
+            }
+            br_read(b, bpf)
+            mm_read_vertex(b, bpc, bpcomp, dec, nread, (&vc[0]) as *mut f64)
+            br_align(b)
+            have = true
+        } else {
+            if f == 1 {
+                mm_copy_vertex((&va[0]) as *mut f64, (&vb[0]) as *mut f64, st)
+                mm_copy_vertex((&vb[0]) as *mut f64, (&vc[0]) as *mut f64, st)
+                mm_copy_vertex((&vc[0]) as *mut f64, (&cur[0]) as *mut f64, st)
+            } else {
+                mm_copy_vertex((&vb[0]) as *mut f64, (&vc[0]) as *mut f64, st)
+                mm_copy_vertex((&vc[0]) as *mut f64, (&cur[0]) as *mut f64, st)
+            }
+        }
+        if !mesh_tri(m, (&va[0]) as *mut f64, (&vb[0]) as *mut f64,
+            (&vc[0]) as *mut f64) {
+            return
+        }
+    }
+}
+
+fn mm_load_lattice(m: *mut Mesh, b: *mut BitR, bpc: usize, bpcomp: usize,
+    dec: *mut f64, nread: usize, vpr: usize) {
+    let st: usize = 2 + nread
+    let vbits: usize = 2 * bpc + nread * bpcomp
+    var total: usize = 0
+    let maxv: usize = 40000
+    let buf: *mut f64 = mem.heap_alloc(maxv * st * 8) as *mut f64
+    if buf as usize == 0 {
+        return
+    }
+    while br_left(b) >= vbits && total < maxv {
+        mm_read_vertex(b, bpc, bpcomp, dec, nread, mesh_row_ptr(buf, total, st))
+        br_align(b)
+        total = total + 1
+    }
+    let rows: usize = total / vpr
+    var r: usize = 0
+    while r + 1 < rows {
+        var c: usize = 0
+        while c + 1 < vpr {
+            let v00: *mut f64 = mesh_row_ptr(buf, r * vpr + c, st)
+            let v01: *mut f64 = mesh_row_ptr(buf, r * vpr + c + 1, st)
+            let v10: *mut f64 = mesh_row_ptr(buf, (r + 1) * vpr + c, st)
+            let v11: *mut f64 = mesh_row_ptr(buf, (r + 1) * vpr + c + 1, st)
+            if !mesh_tri(m, v00, v01, v10) || !mesh_tri(m, v01, v11, v10) {
+                mem.heap_free(buf as *mut u8, maxv * st * 8)
+                return
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    mem.heap_free(buf as *mut u8, maxv * st * 8)
+}
+
+fn mesh_row_ptr(buf: *mut f64, i: usize, st: usize) -> *mut f64 {
+    return ((buf as u64) + (i * st * 8) as u64) as *mut f64
+}
+
+fn mm_bern(t: f64, k: usize) -> f64 {
+    let s: f64 = 1.0 - t
+    if k == 0 {
+        return s * s * s
+    }
+    if k == 1 {
+        return 3.0 * t * s * s
+    }
+    if k == 2 {
+        return 3.0 * t * t * s
+    }
+    return t * t * t
+}
+
+fn mm_coons_interior(g: *mut f64) {
+    let p00: f64 = mm_ld(g, 0)
+    let p01: f64 = mm_ld(g, 1)
+    let p02: f64 = mm_ld(g, 2)
+    let p03: f64 = mm_ld(g, 3)
+    let p10: f64 = mm_ld(g, 4)
+    let p13: f64 = mm_ld(g, 7)
+    let p20: f64 = mm_ld(g, 8)
+    let p23: f64 = mm_ld(g, 11)
+    let p30: f64 = mm_ld(g, 12)
+    let p31: f64 = mm_ld(g, 13)
+    let p32: f64 = mm_ld(g, 14)
+    let p33: f64 = mm_ld(g, 15)
+    mm_st(g, 5, (-4.0 * p00 + 6.0 * (p01 + p10) - 2.0 * (p03 + p30) +
+        3.0 * (p31 + p13) - p33) / 9.0)
+    mm_st(g, 6, (-4.0 * p03 + 6.0 * (p02 + p13) - 2.0 * (p00 + p33) +
+        3.0 * (p32 + p10) - p30) / 9.0)
+    mm_st(g, 9, (-4.0 * p30 + 6.0 * (p31 + p20) - 2.0 * (p33 + p00) +
+        3.0 * (p01 + p23) - p03) / 9.0)
+    mm_st(g, 10, (-4.0 * p33 + 6.0 * (p32 + p23) - 2.0 * (p30 + p03) +
+        3.0 * (p02 + p20) - p00) / 9.0)
+}
+
+fn mm_tessellate(m: *mut Mesh, gx: *mut f64, gy: *mut f64, col: *mut f64,
+    nread: usize) -> bool {
+    let st: usize = 2 + nread
+    var grid: [f64; 810] = [0.0; 810]
+    let gp: *mut f64 = (&grid[0]) as *mut f64
+    var a: usize = 0
+    while a <= MESH_GRID {
+        var bb: usize = 0
+        while bb <= MESH_GRID {
+            let u: f64 = (a as f64) / (MESH_GRID as f64)
+            let v: f64 = (bb as f64) / (MESH_GRID as f64)
+            var sx: f64 = 0.0
+            var sy: f64 = 0.0
+            var i: usize = 0
+            while i < 4 {
+                var j: usize = 0
+                while j < 4 {
+                    let w: f64 = mm_bern(u, i) * mm_bern(v, j)
+                    sx = sx + w * mm_ld(gx, i * 4 + j)
+                    sy = sy + w * mm_ld(gy, i * 4 + j)
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            let at: usize = (a * (MESH_GRID + 1) + bb) * st
+            mm_st(gp, at, sx)
+            mm_st(gp, at + 1, sy)
+            var k: usize = 0
+            while k < nread {
+                let c00: f64 = mm_ld(col, k)
+                let c03: f64 = mm_ld(col, nread + k)
+                let c33: f64 = mm_ld(col, 2 * nread + k)
+                let c30: f64 = mm_ld(col, 3 * nread + k)
+                mm_st(gp, at + 2 + k, (1.0 - u) * (1.0 - v) * c00 +
+                    (1.0 - u) * v * c03 + u * v * c33 + u * (1.0 - v) * c30)
+                k = k + 1
+            }
+            bb = bb + 1
+        }
+        a = a + 1
+    }
+    a = 0
+    while a < MESH_GRID {
+        var bb: usize = 0
+        while bb < MESH_GRID {
+            let p00: *mut f64 = mesh_row_ptr(gp, a * (MESH_GRID + 1) + bb, st)
+            let p01: *mut f64 = mesh_row_ptr(gp, a * (MESH_GRID + 1) + bb + 1, st)
+            let p10: *mut f64 = mesh_row_ptr(gp, (a + 1) * (MESH_GRID + 1) + bb, st)
+            let p11: *mut f64 = mesh_row_ptr(gp, (a + 1) * (MESH_GRID + 1) + bb + 1, st)
+            if !mesh_tri(m, p00, p01, p10) || !mesh_tri(m, p01, p11, p10) {
+                return false
+            }
+            bb = bb + 1
+        }
+        a = a + 1
+    }
+    return true
+}
+
+fn mm_grid_index(k: usize) -> usize {
+    var gi: [usize; 16] = [0, 0, 0, 0, 1, 2, 3, 3, 3, 3, 2, 1, 1, 1, 2, 2]
+    var gj: [usize; 16] = [0, 1, 2, 3, 3, 3, 3, 2, 1, 0, 0, 0, 1, 2, 2, 1]
+    return gi[k] * 4 + gj[k]
+}
+
+fn mm_load_patches(m: *mut Mesh, b: *mut BitR, stype: i64, bpf: usize,
+    bpc: usize, bpcomp: usize, dec: *mut f64, nread: usize) {
+    var total: usize = 12
+    if stype == 7 {
+        total = 16
+    }
+    var px: [f64; 16] = [0.0; 16]
+    var py: [f64; 16] = [0.0; 16]
+    var cl: [f64; 32] = [0.0; 32]
+    var qx: [f64; 16] = [0.0; 16]
+    var qy: [f64; 16] = [0.0; 16]
+    var ql: [f64; 32] = [0.0; 32]
+    var gx: [f64; 16] = [0.0; 16]
+    var gy: [f64; 16] = [0.0; 16]
+    var have: bool = false
+    var emap: [usize; 12] = [3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11, 0]
+    while br_left(b) >= bpf {
+        let f: u64 = br_read(b, bpf) & 3
+        var skip: usize = 0
+        var npts: usize = total
+        var ncol: usize = 4
+        if f != 0 {
+            if !have {
+                return
+            }
+            skip = 4
+            npts = total - 4
+            ncol = 2
+        }
+        if br_left(b) < npts * 2 * bpc + ncol * nread * bpcomp {
+            return
+        }
+        if f != 0 {
+            let fu: usize = f as usize
+            let base: usize = (fu - 1) * 4
+            var k: usize = 0
+            while k < 4 {
+                qx[k] = px[emap[base + k]]
+                qy[k] = py[emap[base + k]]
+                k = k + 1
+            }
+            var ci0: usize = 0
+            while ci0 < 2 {
+                var kc: usize = 0
+                while kc < nread {
+                    ql[ci0 * nread + kc] = cl[((fu + ci0) % 4) * nread + kc]
+                    kc = kc + 1
+                }
+                ci0 = ci0 + 1
+            }
+            k = 0
+            while k < 4 {
+                px[k] = qx[k]
+                py[k] = qy[k]
+                k = k + 1
+            }
+            k = 0
+            while k < 2 * nread {
+                cl[k] = ql[k]
+                k = k + 1
+            }
+        }
+        var i: usize = skip
+        while i < total {
+            mm_read_xy(b, bpc, dec, (&px[i]) as *mut f64, (&py[i]) as *mut f64)
+            i = i + 1
+        }
+        var ci: usize = 0
+        if f != 0 {
+            ci = 2
+        }
+        while ci < 4 {
+            mm_read_comps(b, bpcomp, dec, nread, (&cl[ci * nread]) as *mut f64)
+            ci = ci + 1
+        }
+        br_align(b)
+        have = true
+        var k2: usize = 0
+        while k2 < total {
+            let gidx: usize = mm_grid_index(k2)
+            gx[gidx] = px[k2]
+            gy[gidx] = py[k2]
+            k2 = k2 + 1
+        }
+        if stype == 6 {
+            mm_coons_interior((&gx[0]) as *mut f64)
+            mm_coons_interior((&gy[0]) as *mut f64)
+        }
+        if !mm_tessellate(m, (&gx[0]) as *mut f64, (&gy[0]) as *mut f64,
+            (&cl[0]) as *mut f64, nread) {
+            return
+        }
+    }
+}
+
+fn mesh_load(d: *mut pdoc.Doc, sh: u32, m: *mut Mesh, stype: i64, ncs: usize,
+    hasfn: bool, trange: *mut f64) -> bool {
+    var nread: usize = ncs
+    if hasfn {
+        nread = 1
+    }
+    if nread == 0 || nread > MESH_MAXNC {
+        return false
+    }
+    (*m).nc = nread
+    var nbc: [u8; 17] = "BitsPerCoordinate"
+    var nbp: [u8; 16] = "BitsPerComponent"
+    var nbf: [u8; 11] = "BitsPerFlag"
+    var nde: [u8; 6] = "Decode"
+    var nvr: [u8; 14] = "VerticesPerRow"
+    let bpc: i64 = pdoc.doc_int(d, sh, (&nbc[0]) as u64, 17, 0)
+    let bpcomp: i64 = pdoc.doc_int(d, sh, (&nbp[0]) as u64, 16, 0)
+    var bpf: i64 = 0
+    if stype != 5 {
+        bpf = pdoc.doc_int(d, sh, (&nbf[0]) as u64, 11, 0)
+        if bpf < 1 || bpf > 8 {
+            return false
+        }
+    }
+    if bpc < 1 || bpc > 32 || bpcomp < 1 || bpcomp > 16 {
+        return false
+    }
+    var dec: [f64; 24] = [0.0; 24]
+    let dn: usize = pfunc.pf_nums(d, sh, (&nde[0]) as u64, 6,
+        (&dec[0]) as *mut f64, 24)
+    if dn < 4 + 2 * nread {
+        return false
+    }
+    mm_st(trange, 0, dec[4])
+    mm_st(trange, 1, dec[5])
+    var vpr: i64 = 0
+    if stype == 5 {
+        vpr = pdoc.doc_int(d, sh, (&nvr[0]) as u64, 14, 0)
+        if vpr < 2 || vpr > 4096 {
+            return false
+        }
+    }
+    var data: rt.Buf = rt.buf_new()
+    if !pdoc.doc_stream(d, sh, &data) {
+        rt.buf_free(&data)
+        return false
+    }
+    var br: BitR = BitR { p: rt.buf_ptr(&data), n: rt.buf_len(&data), pos: 0 }
+    if stype == 4 {
+        mm_load_free_form(m, &br, bpf as usize, bpc as usize, bpcomp as usize,
+            (&dec[0]) as *mut f64, nread)
+    }
+    if stype == 5 {
+        mm_load_lattice(m, &br, bpc as usize, bpcomp as usize,
+            (&dec[0]) as *mut f64, nread, vpr as usize)
+    }
+    if stype == 6 || stype == 7 {
+        mm_load_patches(m, &br, stype, bpf as usize, bpc as usize,
+            bpcomp as usize, (&dec[0]) as *mut f64, nread)
+    }
+    rt.buf_free(&data)
+    return (*m).nv > 0
+}
+
+fn mm_edge(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> f64 {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+fn mm_chan(c: u32, sh: u32) -> f64 {
+    return ((c >> sh) & 255) as f64
+}
+
+fn mm_clamp255(v: f64) -> u32 {
+    if v <= 0.0 {
+        return 0
+    }
+    if v >= 255.0 {
+        return 255
+    }
+    return (v + 0.5) as u32
+}
+
+fn mesh_paint(m: *mut Mesh, cv: *mut canvas.Canvas, mask: *mut prast.Mask,
+    x0: usize, y0: usize, x1: usize, y1: usize, fm: *mut f64, lut: *mut u32,
+    vcol: *mut u32, uselut: bool, t0: f64, t1: f64, alpha: f64) {
+    let st: usize = mesh_stride(m)
+    let ntri: usize = (*m).nv / 3
+    var tri: usize = 0
+    while tri < ntri {
+        var dx: [f64; 3] = [0.0; 3]
+        var dy: [f64; 3] = [0.0; 3]
+        var q: usize = 0
+        while q < 3 {
+            let vp: *mut f64 = mesh_vertex_ptr(m, tri * 3 + q)
+            let sx: f64 = mm_ld(vp, 0)
+            let sy: f64 = mm_ld(vp, 1)
+            dx[q] = mm_ld(fm, 0) * sx + mm_ld(fm, 2) * sy + mm_ld(fm, 4)
+            dy[q] = mm_ld(fm, 1) * sx + mm_ld(fm, 3) * sy + mm_ld(fm, 5)
+            q = q + 1
+        }
+        let area: f64 = mm_edge(dx[0], dy[0], dx[1], dy[1], dx[2], dy[2])
+        if area > 0.000000001 || area < -0.000000001 {
+            var minx: f64 = dx[0]
+            var maxx: f64 = dx[0]
+            var miny: f64 = dy[0]
+            var maxy: f64 = dy[0]
+            q = 1
+            while q < 3 {
+                if dx[q] < minx {
+                    minx = dx[q]
+                }
+                if dx[q] > maxx {
+                    maxx = dx[q]
+                }
+                if dy[q] < miny {
+                    miny = dy[q]
+                }
+                if dy[q] > maxy {
+                    maxy = dy[q]
+                }
+                q = q + 1
+            }
+            if maxx >= (x0 as f64) && minx < (x1 as f64) && maxy >= (y0 as f64) &&
+                miny < (y1 as f64) {
+                var bx0: usize = x0
+                if minx > (x0 as f64) {
+                    bx0 = math.floor(minx) as usize
+                }
+                var by0: usize = y0
+                if miny > (y0 as f64) {
+                    by0 = math.floor(miny) as usize
+                }
+                var bx1: usize = x1
+                if maxx + 1.0 < (x1 as f64) {
+                    bx1 = math.floor(maxx) as usize + 1
+                }
+                var by1: usize = y1
+                if maxy + 1.0 < (y1 as f64) {
+                    by1 = math.floor(maxy) as usize + 1
+                }
+                let v0: *mut f64 = mesh_vertex_ptr(m, tri * 3)
+                let v1: *mut f64 = mesh_vertex_ptr(m, tri * 3 + 1)
+                let v2: *mut f64 = mesh_vertex_ptr(m, tri * 3 + 2)
+                var y: usize = by0
+                while y < by1 {
+                    var x: usize = bx0
+                    while x < bx1 {
+                        let fx: f64 = (x as f64) + 0.5
+                        let fy: f64 = (y as f64) + 0.5
+                        let w0: f64 = mm_edge(dx[1], dy[1], dx[2], dy[2], fx, fy) / area
+                        let w1: f64 = mm_edge(dx[2], dy[2], dx[0], dy[0], fx, fy) / area
+                        let w2: f64 = 1.0 - w0 - w1
+                        if w0 >= -0.002 && w1 >= -0.002 && w2 >= -0.002 {
+                            let cov: f64 = prast.mask_at(mask, x, y) * alpha
+                            if cov > 0.0016 {
+                                var col: u32 = 0
+                                if uselut {
+                                    let t: f64 = w0 * mm_ld(v0, 2) + w1 * mm_ld(v1, 2) +
+                                        w2 * mm_ld(v2, 2)
+                                    var u: f64 = 0.0
+                                    if t1 != t0 {
+                                        u = (t - t0) / (t1 - t0)
+                                    }
+                                    if u < 0.0 {
+                                        u = 0.0
+                                    }
+                                    if u > 1.0 {
+                                        u = 1.0
+                                    }
+                                    col = *((lut as u64 + (((u * 256.0 + 0.5) as usize) * 4) as u64) as *mut u32)
+                                } else {
+                                    let c0: u32 = *((vcol as u64 + ((tri * 3) * 4) as u64) as *mut u32)
+                                    let c1: u32 = *((vcol as u64 + ((tri * 3 + 1) * 4) as u64) as *mut u32)
+                                    let c2: u32 = *((vcol as u64 + ((tri * 3 + 2) * 4) as u64) as *mut u32)
+                                    let r: u32 = mm_clamp255(w0 * mm_chan(c0, 16) +
+                                        w1 * mm_chan(c1, 16) + w2 * mm_chan(c2, 16))
+                                    let g: u32 = mm_clamp255(w0 * mm_chan(c0, 8) +
+                                        w1 * mm_chan(c1, 8) + w2 * mm_chan(c2, 8))
+                                    let bl: u32 = mm_clamp255(w0 * mm_chan(c0, 0) +
+                                        w1 * mm_chan(c1, 0) + w2 * mm_chan(c2, 0))
+                                    col = canvas.color_of(255, r, g, bl)
+                                }
+                                canvas.canvas_blend(cv, x, y, col, cov)
+                            }
+                        }
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+            }
+        }
+        tri = tri + 1
+    }
+}
