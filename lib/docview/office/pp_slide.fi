@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.opc
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_runs
+import docview.office.xl_color
+import docview.office.pp_color
+import docview.office.pp_ctx
+import docview.office.pp_shape
+
+export { SlideParts, load_slide }
+
+struct SlideParts {
+    pk: *mut opc.Package,
+    px: *mut xml.Doc,
+    defaults: u32,
+    page_w: i32,
+    page_h: i32,
+}
+
+fn read_part(pk: *mut opc.Package, name: str, raw: *mut rt.Buf, x: *mut xml.Doc) -> bool {
+    return opc.pkg_read_xml(pk, name, raw, x)
+}
+
+fn bg_color(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, root: u32) -> u32 {
+    let bg: u32 = ooxml.child_l(x, ooxml.child_l(x, root, "cSld"), "bg")
+    if bg == xml.NONE {
+        return 0 as u32
+    }
+    let pr: u32 = ooxml.child_l(x, bg, "bgPr")
+    if pr != xml.NONE {
+        let sf: u32 = ooxml.child_l(x, pr, "solidFill")
+        if sf != xml.NONE {
+            return pp_color.color_in(&(*c).pal, x, sf)
+        }
+        let gf: u32 = ooxml.child_l(x, pr, "gradFill")
+        if gf != xml.NONE {
+            return pp_color.color_in(&(*c).pal, x, gf)
+        }
+        return 0 as u32
+    }
+    let rf: u32 = ooxml.child_l(x, bg, "bgRef")
+    if rf != xml.NONE {
+        return pp_color.color_in(&(*c).pal, x, rf)
+    }
+    return 0 as u32
+}
+
+fn bg_float(c: *mut pp_ctx.Ctx, col: u32, w: f64, h: f64) {
+    var f: dx_model.Float = dx_model.Float { img: -1, w: w, h: h, hrel: dx_model.REL_PAGE, vrel: dx_model.REL_PAGE, hoff: 0.0,
+        voff: 0.0, halign: -1, valign: -1, behind: true, fill: col, ins_l: 0.0, ins_t: 0.0, ins_r: 0.0, ins_b: 0.0,
+        tx_node: xml.NONE, blocks: dx_model.blist_new(), vtext: 0, line: 0 as u32, line_w: 0.0, fx: dx_model.fx_none() }
+    let id: u32 = dx_model.new_float((*c).d, f)
+    if id != dx_model.NIL {
+        vec_push[u32](&(*c).floats, id)
+    }
+}
+
+fn anchor_para(c: *mut pp_ctx.Ctx, list: *mut dx_model.BList) {
+    let d: *mut dx_model.Docx = (*c).d
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    pp.line = 20
+    pp.rule = dx_props.RULE_EXACT
+    dx_props.pp_finish(&pp)
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    rp.size_hp = 2
+    dx_props.rp_finish(&rp)
+    let idx: u32 = dx_model.new_para(d, pp)
+    (*dx_model.para_at(d, idx)).base_rp = rp
+    var i: usize = 0
+    let n: usize = vec_len[u32](&(*c).floats)
+    while i < n {
+        dx_runs.emit_simple(d, &rp, dx_model.R_FLOAT, (*vec_elem_ptr[u32](&(*c).floats, i)) as i64, 0.0, 0.0)
+        i = i + 1
+    }
+    let pa: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pa).rcount = (vec_len[dx_model.Run](&(*d).runs) as u32) - (*pa).rfirst
+    dx_model.block_add(d, list, dx_model.B_PARA, idx, (*c).sect)
+}
+
+fn load_theme_and_map(c: *mut pp_ctx.Ctx, sp: *mut SlideParts, mx: *mut xml.Doc, mpath: str) {
+    var mr: opc.Rels = opc.rels_new()
+    defer opc.rels_free(&mr)
+    opc.rels_load((*sp).pk, mpath, &mr)
+    let ti: i64 = opc.rels_find_type(&mr, "/theme")
+    if ti >= 0 {
+        var raw: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&raw)
+        var tx: xml.Doc = xml.doc_new()
+        defer xml.doc_free(&tx)
+        if read_part((*sp).pk, opc.rels_target(&mr, ti as usize), &raw, &tx) {
+            xl_color.theme_load(&(*c).pal.th, &tx)
+        }
+    }
+    pp_color.palette_set_map(&(*c).pal, mx, ooxml.child_l(mx, xml.root(mx), "clrMap"))
+}
+
+fn load_slide(sp: *mut SlideParts, d: *mut dx_model.Docx, spath: str, list: *mut dx_model.BList) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var sx: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&sx)
+    if !read_part((*sp).pk, spath, &raw, &sx) {
+        return false
+    }
+    let sroot: u32 = xml.root(&sx)
+    if ooxml.attr_l(&sx, sroot, "show") == "0" {
+        return false
+    }
+    var srels: opc.Rels = opc.rels_new()
+    defer opc.rels_free(&srels)
+    opc.rels_load((*sp).pk, spath, &srels)
+    var c: pp_ctx.Ctx = pp_ctx.ctx_new()
+    defer vec_free[u32](&c.floats)
+    c.d = d
+    c.pk = (*sp).pk
+    c.sx = &sx
+    c.px = (*sp).px
+    c.defaults = (*sp).defaults
+    c.rels = &srels
+    var lx: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&lx)
+    var mx: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&mx)
+    var lraw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&lraw)
+    var mraw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mraw)
+    var has_l: bool = false
+    var has_m: bool = false
+    var lroot: u32 = xml.NONE
+    var mroot: u32 = xml.NONE
+    let li: i64 = opc.rels_find_type(&srels, "/slideLayout")
+    if li >= 0 {
+        let lpath: str = opc.rels_target(&srels, li as usize)
+        has_l = read_part((*sp).pk, lpath, &lraw, &lx)
+        if has_l {
+            lroot = xml.root(&lx)
+            var lr: opc.Rels = opc.rels_new()
+            defer opc.rels_free(&lr)
+            opc.rels_load((*sp).pk, lpath, &lr)
+            let mi: i64 = opc.rels_find_type(&lr, "/slideMaster")
+            if mi >= 0 {
+                let mpath: str = opc.rels_target(&lr, mi as usize)
+                has_m = read_part((*sp).pk, mpath, &mraw, &mx)
+                if has_m {
+                    mroot = xml.root(&mx)
+                    load_theme_and_map(&c, sp, &mx, mpath)
+                }
+            }
+        }
+    }
+    if has_l {
+        c.lx = &lx
+        c.l_tree = ooxml.child_l(&lx, ooxml.child_l(&lx, lroot, "cSld"), "spTree")
+    }
+    if has_m {
+        c.mx = &mx
+        c.m_tree = ooxml.child_l(&mx, ooxml.child_l(&mx, mroot, "cSld"), "spTree")
+        c.m_styles = ooxml.child_l(&mx, mroot, "txStyles")
+    }
+    let si: u32 = dx_model.new_sect(d)
+    c.sect = si
+    let st: *mut dx_model.Sect = dx_model.sect_at(d, si)
+    (*st).w = (*sp).page_w
+    (*st).h = (*sp).page_h
+    (*st).ml = 0
+    (*st).mr = 0
+    (*st).mt = 0
+    (*st).mb = 0
+    (*st).header_dist = 0
+    (*st).footer_dist = 0
+    let pw: f64 = ((*sp).page_w as f64) / 15.0
+    let ph: f64 = ((*sp).page_h as f64) / 15.0
+    var bg: u32 = bg_color(&c, &sx, sroot)
+    if bg == 0 as u32 && has_l {
+        bg = bg_color(&c, &lx, lroot)
+    }
+    if bg == 0 as u32 && has_m {
+        bg = bg_color(&c, &mx, mroot)
+    }
+    if bg == 0 as u32 {
+        bg = c.pal.th.c[c.pal.map[0] as usize]
+    }
+    bg_float(&c, bg, pw, ph)
+    var fr: pp_ctx.Frame = pp_ctx.frame_root()
+    let slide_hides: bool = ooxml.attr_l(&sx, sroot, "showMasterSp") == "0"
+    if has_m && !slide_hides && !(has_l && ooxml.attr_l(&lx, lroot, "showMasterSp") == "0") {
+        pp_shape.walk_tree(&c, &mx, c.m_tree, &fr, false, true, 0)
+    }
+    if has_l && !slide_hides {
+        pp_shape.walk_tree(&c, &lx, c.l_tree, &fr, false, true, 0)
+    }
+    let stree: u32 = ooxml.child_l(&sx, ooxml.child_l(&sx, sroot, "cSld"), "spTree")
+    pp_shape.walk_tree(&c, &sx, stree, &fr, true, false, 0)
+    anchor_para(&c, list)
+    return true
+}

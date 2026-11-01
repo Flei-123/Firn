@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.xml
+import std.vec
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_style
+import docview.office.dx_model
+import docview.office.dx_gap
+import docview.office.dx_anchor
+import docview.office.dx_runs
+import docview.office.od_units
+import docview.office.od_ctx
+import docview.office.od_style
+import docview.office.od_list
+import docview.office.od_inline
+import docview.office.od_table
+import docview.office.dx_utf8
+
+export { parse_blocks, add_empty_para }
+
+struct ListFrame {
+    name: str,
+    counters: [i32; 10],
+}
+
+fn heading_defaults(level: i64, rp: *mut dx_props.RunProps, pp: *mut dx_props.ParaProps) {
+    var sz: i32 = 24
+    if level == 1 { sz = 36 }
+    if level == 2 { sz = 30 }
+    if level == 3 { sz = 28 }
+    (*rp).size_hp = sz
+    (*rp).bold = 1
+    if (*pp).before == dx_props.UNSET_T { (*pp).before = 240 }
+    if (*pp).after == dx_props.UNSET_T { (*pp).after = 120 }
+    (*pp).keep_next = 1
+}
+
+fn add_empty_para(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, list: *mut dx_model.BList) {
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    dx_style.resolve_para(&(*(*c).od).st, "", &rp, &pp)
+    dx_props.pp_finish(&pp)
+    dx_props.rp_finish(&rp)
+    let idx: u32 = dx_model.new_para(d, pp)
+    (*dx_model.para_at(d, idx)).base_rp = rp
+    dx_model.block_add(d, list, dx_model.B_PARA, idx, (*c).sect_idx)
+}
+
+fn frame_float(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, fr: u32, depth: i32) -> u32 {
+    var f: dx_model.Float = dx_anchor.float_new()
+    od_inline.frame_size(x, fr, &f.w, &f.h)
+    let page: bool = ooxml.attr_l(x, fr, "anchor-type") == "page"
+    f.hrel = dx_model.REL_MARGIN
+    f.vrel = dx_model.REL_PARA
+    if page {
+        f.hrel = dx_model.REL_PAGE
+        f.vrel = dx_model.REL_PAGE
+    }
+    f.hoff = (od_units.len_tw(ooxml.attr_l(x, fr, "x"), 0) as f64) / 15.0
+    f.voff = (od_units.len_tw(ooxml.attr_l(x, fr, "y"), 0) as f64) / 15.0
+    f.ins_l = 4.0
+    f.ins_t = 4.0
+    f.ins_r = 4.0
+    f.ins_b = 4.0
+    if (*c).frame_depth >= 3 {
+        return dx_model.NIL
+    }
+    (*c).frame_depth = (*c).frame_depth + 1
+    parse_blocks(c, d, x, ooxml.child_l(x, fr, "text-box"), &f.blocks, depth + 1)
+    (*c).frame_depth = (*c).frame_depth - 1
+    if f.blocks.head == dx_model.NIL {
+        return dx_model.NIL
+    }
+    return dx_model.new_float(d, f)
+}
+
+fn collect_frames(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, n: u32, out: *mut Vec[u32], depth: i32) {
+    if depth > 8 {
+        return
+    }
+    var ch: u32 = xml.first(x, n)
+    while ch != xml.NONE {
+        if xml.kind(x, ch) == xml.ELEMENT {
+            let nm: str = ooxml.local_name(xml.name(x, ch))
+            if nm == "frame" {
+                if od_inline.anchored_box(x, ch) {
+                    let id: u32 = frame_float(c, d, x, ch, depth)
+                    if id != dx_model.NIL {
+                        vec_push[u32](out, id)
+                    }
+                }
+            } else if nm != "note" && nm != "annotation" {
+                collect_frames(c, d, x, ch, out, depth + 1)
+            }
+        }
+        ch = xml.next(x, ch)
+    }
+}
+
+fn build_para(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, n: u32, heading: i64,
+    lf: *mut ListFrame, level: i32, labelled: bool, list: *mut dx_model.BList) {
+    if vec_len[dx_model.Para](&(*d).paras) >= dx_model.MAX_PARAS {
+        (*d).truncated = true
+        return
+    }
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    let sid: str = ooxml.attr_l(x, n, "style-name")
+    dx_style.resolve_para(&(*(*c).od).st, sid, &rp, &pp)
+    if heading > 0 && dx_style.style_find(&(*(*c).od).st, sid) < 0 {
+        heading_defaults(heading, &rp, &pp)
+    }
+    if heading > 0 {
+        pp.outline = (heading - 1) as i32
+    }
+    var frames: Vec[u32] = Vec[u32] { ptr: 0, len: 0, cap: 0 }
+    defer vec_free[u32](&frames)
+    collect_frames(c, d, x, n, &frames, 0)
+    var label: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&label)
+    var has_label: bool = false
+    var lleft: i32 = 0
+    var lhang: i32 = 0
+    if (lf as u64) != 0 {
+        var info: *mut od_list.LvInfo = od_list.level_info((*c).ls, (*lf).name, level)
+        if (info as u64) != 0 {
+            lleft = (*info).left
+            lhang = (*info).hang
+            if labelled {
+                od_list.label_text((*c).ls, info, &(*lf).counters, (*lf).name, &label)
+                has_label = rt.buf_len(&label) > 0
+            }
+        } else {
+            lleft = 360 * (level + 1)
+            lhang = 360
+            if labelled {
+                dx_utf8.push_cp(&label, 0x2022 as u32)
+                has_label = true
+            }
+        }
+        pp.left = lleft
+        pp.first = 0 - lhang
+    }
+    dx_props.pp_finish(&pp)
+    var finished: dx_props.RunProps = rp
+    dx_props.rp_finish(&finished)
+    let idx: u32 = dx_model.new_para(d, pp)
+    let pa: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pa).base_rp = finished
+    (*pa).style_key = dx_gap.style_hash(sid)
+    if has_label {
+        (*pa).has_label = true
+        (*pa).lab_off = dx_model.pool_add(d, rt.buf_ptr(&label), rt.buf_len(&label))
+        (*pa).lab_n = rt.buf_len(&label) as u32
+        (*pa).lab_left = lleft
+        (*pa).lab_hang = lhang
+    }
+    var st: od_inline.InState = od_inline.in_new(idx)
+    od_inline.inline_children(c, d, x, n, &finished, &st, 0)
+    var fi: usize = 0
+    while fi < vec_len[u32](&frames) {
+        dx_runs.emit_simple(d, &finished, dx_model.R_FLOAT, (*vec_elem_ptr[u32](&frames, fi)) as i64, 0.0, 0.0)
+        fi = fi + 1
+    }
+    let pb: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pb).rcount = (vec_len[dx_model.Run](&(*d).runs) as u32) - (*pb).rfirst
+    dx_model.block_add(d, list, dx_model.B_PARA, idx, (*c).sect_idx)
+}
+
+fn is_container(nm: str) -> bool {
+    return nm == "section" || nm == "index-body" || nm == "index-title" || nm == "table-of-content"
+        || nm == "illustration-index" || nm == "alphabetical-index" || nm == "bibliography"
+        || nm == "user-index" || nm == "object-index" || nm == "table-index" || nm == "list-header"
+}
+
+fn parse_item(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, item: u32, lf: *mut ListFrame,
+    level: i32, list: *mut dx_model.BList, depth: i32) {
+    var first: bool = true
+    var ch: u32 = ooxml.first_el(x, item)
+    while ch != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, ch))
+        if nm == "p" {
+            build_para(c, d, x, ch, 0, lf, level, first, list)
+            first = false
+        } else if nm == "h" {
+            build_para(c, d, x, ch, ooxml.attr_i64(x, ch, "outline-level", 1), lf, level, first, list)
+            first = false
+        } else if nm == "list" {
+            parse_list(c, d, x, ch, lf, level + 1, list, depth + 1)
+        } else if nm == "table" {
+            od_table.parse_table(c, d, x, ch, list, depth + 1, parse_blocks)
+        } else if is_container(nm) {
+            parse_blocks(c, d, x, ch, list, depth + 1)
+        }
+        ch = ooxml.next_el(x, ch)
+    }
+}
+
+fn parse_list(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, ln: u32, parent: *mut ListFrame,
+    level: i32, list: *mut dx_model.BList, depth: i32) {
+    if depth > od_ctx.MAX_DEPTH || level >= (od_list.MAX_LEVELS as i32) {
+        return
+    }
+    var own: ListFrame = ListFrame { name: "", counters: [0; 10] }
+    var lf: *mut ListFrame = &own
+    if (parent as u64) != 0 && level > 0 {
+        lf = parent
+    }
+    var sn: str = ooxml.attr_l(x, ln, "style-name")
+    if sn.n > 0 {
+        (*lf).name = sn
+    }
+    let info: *mut od_list.LvInfo = od_list.level_info((*c).ls, (*lf).name, level)
+    var start: i32 = 1
+    if (info as u64) != 0 {
+        start = (*info).start
+    }
+    (*lf).counters[level as usize] = start - 1
+    var z: usize = (level as usize) + 1
+    while z < od_list.MAX_LEVELS {
+        (*lf).counters[z] = 0
+        z = z + 1
+    }
+    var it: u32 = ooxml.first_el(x, ln)
+    while it != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, it))
+        if nm == "list-item" {
+            if ooxml.has_attr_l(x, it, "start-value") {
+                (*lf).counters[level as usize] = od_units.clamp_i(ooxml.attr_i64(x, it, "start-value", 1), 0, 100000) as i32
+            } else {
+                (*lf).counters[level as usize] = (*lf).counters[level as usize] + 1
+            }
+            parse_item(c, d, x, it, lf, level, list, depth)
+        } else if nm == "list-header" {
+            parse_item(c, d, x, it, lf, level, list, depth)
+        }
+        it = ooxml.next_el(x, it)
+    }
+}
+
+fn parse_blocks(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, parent: u32, list: *mut dx_model.BList, depth: i32) {
+    if depth > od_ctx.MAX_DEPTH {
+        return
+    }
+    var ch: u32 = ooxml.first_el(x, parent)
+    while ch != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, ch))
+        if nm == "p" {
+            build_para(c, d, x, ch, 0, 0 as *mut ListFrame, 0, false, list)
+        } else if nm == "h" {
+            build_para(c, d, x, ch, ooxml.attr_i64(x, ch, "outline-level", 1), 0 as *mut ListFrame, 0, false, list)
+        } else if nm == "list" {
+            parse_list(c, d, x, ch, 0 as *mut ListFrame, 0, list, depth + 1)
+        } else if nm == "table" {
+            od_table.parse_table(c, d, x, ch, list, depth + 1, parse_blocks)
+        } else if is_container(nm) {
+            parse_blocks(c, d, x, ch, list, depth + 1)
+        }
+        ch = ooxml.next_el(x, ch)
+    }
+}

@@ -138,3 +138,28 @@ Open: real PulseAudio playback test, WebAudio on a real sound card/Firefox/Safar
 - `media.video.h264.picture` renamed `h264pic` (module names are global; PDF `image.picture` clashed in one program).
 - Sizes (wasm32-browser, whole module): kitview + PDF + DOCX (`kpview_wasm_office`) 1 495 KB fast / 3 140 KB safe, with fonts linked in 1 857 KB / 3 639 KB. DOCX probe 899 KB -> 540 KB fast (fonts lazy), 366 KB without image decoders; safe 1.68 MB -> 1.30 MB / 0.68 MB.
 - Checks: `bash tools/docview/run_lazyfaces.sh` (Chromium, 17 checks: pack not fetched at startup, fetched once, PDF/DOCX page hash = native, embedded build identical, prefetch, missing pack, wasm `micros()` clock for the PDF time limit), test 6416.
+
+## Status G3 ODT (2026-11-01)
+
+- ODT reuses the DOCX model/layout/painter: loader modules `lib/docview/office/od_*` fill `dx_model.Docx`, `dx_ops` holds the shared opener (`open_with(p, n, LoadFn)`, `view_ops(open)`), `od_open.odt_install_lazy()` registers KIND_ODT as "odt.native" (`kpdocs.install_odt` / `install_pdf_docx_odt`).
+- Modules: od_units (lengths/colors), od_style (style:style -> `dx_style.Styles`, cell/column/row/table styles), od_list (list styles, labels 1/a/A/i/I, display-levels), od_inline (spans, tabs, spaces, frames with images, page-number/page-count fields), od_body (paragraphs, headings, lists), od_table (colspan, rowspan via covered cells, repeated rows/cols, header rows), od_page (page layout, header/footer of the first master page), od_load, od_open, od_ctx.
+- `dx_style.style_find` now returns the LAST match (content.xml automatic styles shadow styles.xml); `dx_style.style_add` added; `dx_runs` holds the run emitters shared by DOCX and ODT.
+- Checks: test 6417_docview_odt, `tools/docview/odt_fixtures.py <dir>` (6 hand-written ODTs), `odtmain` (`firnc -o odt tools/docview/odtmain.fi`; `odt i|t|b|r file`), `odt_fuzz.py <odt-bin> <fixture-dir> <runs>` (600 runs, 0 crashes, 0 hangs).
+- Gaps: text boxes inline only, frames not floated, multiple master pages/section switching, header-left/first, tracked changes, ods/odp (not routed to ODT). PPTX opener not built yet.
+
+## Status G3 XLSX (2026-11-01)
+
+- XLSX reuses the DOCX model: one section per visible sheet (page width grows to the column widths, A4 landscape minimum, 720 tw margins), sheet name as bold heading, one table per sheet (gridlines as light-grey table borders unless `showGridLines=0`). `xl_open.xlsx_install_lazy()` registers KIND_XLSX as "xlsx.native" (`kpdocs.install_xlsx` / `install_pdf_office`).
+- Modules `lib/docview/office/xl_*`: xl_pool (string pool), xl_sst (shared strings, rich text flattened), xl_color (rgb/indexed/theme + tint), xl_style (numFmts, fonts, fills, borders, cellXfs), xl_numfmt/xl_fmtscan/xl_fmtnum/xl_fmtdate/xl_general/xl_digits/xl_date (number and date format engine: sections, `0 # ? , % E+`, quoted/escaped literals, `[$X]`, date tokens, AM/PM, `[h]` elapsed, 1904 system), xl_ref (A1 refs, f64 parse), xl_sheet (extents, cols, hidden, merges, row/col defaults), xl_cellval, xl_cellout, xl_build (rows, colspan, rowspan with continuation cells), xl_load, xl_open.
+- Limits: 256 columns, 20000 rows, 400000 cells, 64 sheets. Hidden sheets/rows/cols skipped. All visible sheets are laid out in order (no sheet picker yet).
+- Checks: test 6418_docview_xlsx, `tools/docview/xlsx_fixtures.py <dir>` (openpyxl: basic, wide, formats), `xlsxmain` (`xlsx i|t|b|r file`), `xlsx_fuzz.py <bin> <dir> <runs>` (800 runs, 0 crashes).
+- Gaps: PPTX not built; fractions (`# ?/?`), conditional sections `[>100]`, sub-second `.0`, images/charts/drawings, cell comments, frozen panes, repeated print titles, vertical alignment, rotated text, theme fonts; non-wrapped text wraps inside the cell instead of overflowing.
+
+## Status G3 PPTX
+
+- `lib/docview/office/pp_*.fi`: one Sect per slide (sldSz), background float, master/layout shapes behind, slide shapes as REL_PAGE floats on one anchor paragraph.
+- Placeholders inherit geometry, fill, bodyPr and text styles from layout and master (title/body/other); lstStyle chain down to defaultTextStyle; bullets (char, autonum), fontScale, anchor, insets.
+- Shapes: sp (fill, outline), lines, groups (child transform), pictures, tables (spans, fills, borders, default Medium Style 2 look). Ellipse and roundRect geometry (fill, outline, adj), two-stop linear gradients (vertical/horizontal), picture srcRect crop (`dx_shape.fi`, Prim.a = geo | grad<<4). Not done: other preset geometries/curves, charts, SmartArt, notes, rotation, multi-stop/diagonal gradients.
+- Test 6419, fixtures `tools/docview/pptx_fixtures.py`, fuzz `pptx_fuzz.py`, pixel check `pptx_pixcheck.py <exe> <basic.pptx>` (picture colour, crop, ellipse, gradient, rounded rect).
+
+- ODT: anchored (page/paragraph) `draw:text-box` frames become floats (`od_body.frame_float`); XLSX: fraction formats (`# ?/?`, `# ??/??`, fixed denominators, ids 12/13) in `xl_fmtfrac.fi`, test 6420.

@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.opc
+import docview.office.ooxml
+import docview.office.dx_model
+import docview.office.dx_props
+import docview.office.dx_anchor
+import docview.office.pp_color
+import docview.office.pp_ctx
+import docview.office.pp_ph
+import docview.office.pp_text
+import docview.office.pp_tbl
+
+export { walk_tree, MAX_DEPTH }
+
+const MAX_DEPTH: i32 = 6
+
+struct Inherit {
+    ph: u32,
+    kind: i32,
+    lsp: u32,
+    msp: u32,
+}
+
+fn float_base(px: f64, py: f64, pw: f64, ph: f64) -> dx_model.Float {
+    return dx_model.Float { img: -1, w: pw, h: ph, hrel: dx_model.REL_PAGE, vrel: dx_model.REL_PAGE, hoff: px, voff: py,
+        halign: -1, valign: -1, behind: false, fill: 0 as u32, ins_l: 9.6, ins_t: 4.8, ins_r: 9.6, ins_b: 4.8,
+        tx_node: xml.NONE, blocks: dx_model.blist_new(), vtext: 0, line: 0 as u32, line_w: 0.0, fx: dx_model.fx_none() }
+}
+
+fn inherit_of(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sp: u32, is_slide: bool) -> Inherit {
+    var inh: Inherit = Inherit { ph: ph_none(), kind: pp_ph.PH_NONE, lsp: xml.NONE, msp: xml.NONE }
+    if !is_slide {
+        return inh
+    }
+    let ph: u32 = pp_ph.ph_node(x, sp)
+    if ph == xml.NONE {
+        return inh
+    }
+    inh.ph = ph
+    inh.kind = pp_ph.ph_kind(x, ph)
+    if ((*c).lx as u64) != 0 {
+        inh.lsp = pp_ph.find_ph((*c).lx, (*c).l_tree, ph, x)
+    }
+    if ((*c).mx as u64) != 0 {
+        inh.msp = pp_ph.find_ph((*c).mx, (*c).m_tree, ph, x)
+    }
+    return inh
+}
+
+fn ph_none() -> u32 {
+    return xml.NONE
+}
+
+fn sp_geo(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, holder: u32, inh: *mut Inherit) -> pp_ph.Geo {
+    var g: pp_ph.Geo = pp_ph.geo_new()
+    pp_ph.read_xfrm(x, holder, &g)
+    if !g.has && (*inh).lsp != xml.NONE {
+        pp_ph.read_xfrm((*c).lx, ooxml.child_l((*c).lx, (*inh).lsp, "spPr"), &g)
+    }
+    if !g.has && (*inh).msp != xml.NONE {
+        pp_ph.read_xfrm((*c).mx, ooxml.child_l((*c).mx, (*inh).msp, "spPr"), &g)
+    }
+    return g
+}
+
+fn style_color(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sp: u32, tag: str) -> u32 {
+    let st: u32 = ooxml.child_l(x, sp, "style")
+    if st == xml.NONE {
+        return 0 as u32
+    }
+    let r: u32 = ooxml.child_l(x, st, tag)
+    if r == xml.NONE {
+        return 0 as u32
+    }
+    if tag != "fontRef" && ooxml.attr_i64(x, r, "idx", 0) == 0 {
+        return 0 as u32
+    }
+    return pp_color.color_in(&(*c).pal, x, r)
+}
+
+fn fill_of(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sp: u32, sppr: u32, col: *mut u32) -> bool {
+    if sppr != xml.NONE {
+        if ooxml.child_l(x, sppr, "noFill") != xml.NONE {
+            *col = 0 as u32
+            return true
+        }
+        let sf: u32 = ooxml.child_l(x, sppr, "solidFill")
+        if sf != xml.NONE {
+            *col = pp_color.color_in(&(*c).pal, x, sf)
+            return true
+        }
+        let gf: u32 = ooxml.child_l(x, sppr, "gradFill")
+        if gf != xml.NONE {
+            *col = pp_color.color_in(&(*c).pal, x, gf)
+            return true
+        }
+        if ooxml.child_l(x, sppr, "blipFill") != xml.NONE || ooxml.child_l(x, sppr, "pattFill") != xml.NONE {
+            return true
+        }
+    }
+    let sc: u32 = style_color(c, x, sp, "fillRef")
+    if sc != 0 as u32 {
+        *col = sc
+        return true
+    }
+    return false
+}
+
+fn line_of(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sp: u32, sppr: u32, col: *mut u32, wpx: *mut f64) -> bool {
+    var w: f64 = 1.0
+    if sppr != xml.NONE {
+        let ln: u32 = ooxml.child_l(x, sppr, "ln")
+        if ln != xml.NONE {
+            if ooxml.has_attr_l(x, ln, "w") {
+                w = (ooxml.attr_i64(x, ln, "w", 12700) as f64) / 9525.0
+            }
+            if ooxml.child_l(x, ln, "noFill") != xml.NONE {
+                return false
+            }
+            let sf: u32 = ooxml.child_l(x, ln, "solidFill")
+            if sf != xml.NONE {
+                *col = pp_color.color_in(&(*c).pal, x, sf)
+                *wpx = w
+                return *col != 0 as u32
+            }
+            if ooxml.has_attr_l(x, ln, "w") {
+                let sc: u32 = style_color(c, x, sp, "lnRef")
+                if sc != 0 as u32 {
+                    *col = sc
+                    *wpx = w
+                    return true
+                }
+            }
+        }
+    }
+    let sc: u32 = style_color(c, x, sp, "lnRef")
+    if sc != 0 as u32 {
+        *col = sc
+        *wpx = w
+        return true
+    }
+    return false
+}
+
+fn build_chain(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tx: u32, inh: *mut Inherit, ch: *mut pp_ctx.Chain) {
+    pp_ctx.chain_clear(ch)
+    pp_ctx.chain_push(ch, x, ooxml.child_l(x, tx, "lstStyle"))
+    if (*inh).lsp != xml.NONE {
+        pp_ctx.chain_push(ch, (*c).lx, ooxml.child_l((*c).lx, ooxml.child_l((*c).lx, (*inh).lsp, "txBody"), "lstStyle"))
+    }
+    if (*inh).msp != xml.NONE {
+        pp_ctx.chain_push(ch, (*c).mx, ooxml.child_l((*c).mx, ooxml.child_l((*c).mx, (*inh).msp, "txBody"), "lstStyle"))
+    }
+    if (*c).m_styles != xml.NONE {
+        var name: str = "otherStyle"
+        if (*inh).kind == pp_ph.PH_TITLE {
+            name = "titleStyle"
+        } else if (*inh).kind == pp_ph.PH_BODY {
+            name = "bodyStyle"
+        }
+        pp_ctx.chain_push(ch, (*c).mx, ooxml.child_l((*c).mx, (*c).m_styles, name))
+    }
+    pp_ctx.chain_push(ch, (*c).px, (*c).defaults)
+}
+
+fn body_props(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tx_parent: u32, inh: *mut Inherit, f: *mut dx_model.Float) {
+    var bp: pp_ctx.Chain = pp_ctx.Chain { items: [pp_ctx.Link { x: x, n: xml.NONE }; 8], count: 0 }
+    pp_ctx.chain_push(&bp, x, ooxml.child_l(x, ooxml.child_l(x, tx_parent, "txBody"), "bodyPr"))
+    if (*inh).lsp != xml.NONE {
+        pp_ctx.chain_push(&bp, (*c).lx, ooxml.child_l((*c).lx, ooxml.child_l((*c).lx, (*inh).lsp, "txBody"), "bodyPr"))
+    }
+    if (*inh).msp != xml.NONE {
+        pp_ctx.chain_push(&bp, (*c).mx, ooxml.child_l((*c).mx, ooxml.child_l((*c).mx, (*inh).msp, "txBody"), "bodyPr"))
+    }
+    let l: str = pp_ph.chain_attr(&bp, "lIns")
+    let t: str = pp_ph.chain_attr(&bp, "tIns")
+    let r: str = pp_ph.chain_attr(&bp, "rIns")
+    let b: str = pp_ph.chain_attr(&bp, "bIns")
+    if l.n > 0 { (*f).ins_l = (ooxml.parse_i64(l, 91440) as f64) / 9525.0 }
+    if t.n > 0 { (*f).ins_t = (ooxml.parse_i64(t, 45720) as f64) / 9525.0 }
+    if r.n > 0 { (*f).ins_r = (ooxml.parse_i64(r, 91440) as f64) / 9525.0 }
+    if b.n > 0 { (*f).ins_b = (ooxml.parse_i64(b, 45720) as f64) / 9525.0 }
+    let an: str = pp_ph.chain_attr(&bp, "anchor")
+    if an == "ctr" {
+        (*f).vtext = 1
+    } else if an == "b" {
+        (*f).vtext = 2
+    }
+    (*c).font_scale = 1.0
+    if bp.count > 0 {
+        let na: u32 = ooxml.child_l(x, bp.items[0].n, "normAutofit")
+        if na != xml.NONE && bp.items[0].x == x {
+            (*c).font_scale = (ooxml.attr_i64(x, na, "fontScale", 100000) as f64) / 100000.0
+        }
+    }
+}
+
+fn has_content(x: *mut xml.Doc, tx: u32) -> bool {
+    var p: u32 = ooxml.first_el(x, tx)
+    while p != xml.NONE {
+        if ooxml.is_el(x, p, "p") && ooxml.first_el(x, p) != xml.NONE {
+            return true
+        }
+        p = ooxml.next_el(x, p)
+    }
+    return false
+}
+
+fn push_float(c: *mut pp_ctx.Ctx, f: dx_model.Float) {
+    let id: u32 = dx_model.new_float((*c).d, f)
+    if id != dx_model.NIL {
+        vec_push[u32](&(*c).floats, id)
+    }
+}
+
+fn fmla_val(s: str, dflt: i64) -> i64 {
+    var i: usize = 0
+    var v: i64 = 0
+    var seen: bool = false
+    while i < s.n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c >= (48 as u8) && c <= (57 as u8) {
+            v = v * 10 + ((c - (48 as u8)) as i64)
+            seen = true
+        } else if seen {
+            break
+        }
+        i = i + 1
+    }
+    if !seen {
+        return dflt
+    }
+    return v
+}
+
+fn geometry_of(x: *mut xml.Doc, sppr: u32, f: *mut dx_model.Float) {
+    let pg: u32 = ooxml.child_l(x, sppr, "prstGeom")
+    if pg == xml.NONE {
+        return
+    }
+    let prst: str = ooxml.attr_l(x, pg, "prst")
+    if prst == "ellipse" {
+        (*f).fx.geo = dx_model.GEO_ELLIPSE
+    } else if prst == "roundRect" {
+        (*f).fx.geo = dx_model.GEO_ROUND
+        var adj: i64 = 16667
+        let av: u32 = ooxml.child_l(x, pg, "avLst")
+        let gd: u32 = ooxml.child_l(x, av, "gd")
+        if gd != xml.NONE {
+            adj = fmla_val(ooxml.attr_l(x, gd, "fmla"), 16667)
+        }
+        var side: f64 = (*f).w
+        if (*f).h < side { side = (*f).h }
+        (*f).fx.radius = side * (adj as f64) / 100000.0
+    }
+}
+
+fn gradient_of(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sppr: u32, f: *mut dx_model.Float) {
+    if sppr == xml.NONE {
+        return
+    }
+    let gf: u32 = ooxml.child_l(x, sppr, "gradFill")
+    let gl: u32 = ooxml.child_l(x, gf, "gsLst")
+    let first: u32 = ooxml.first_el(x, gl)
+    if first == xml.NONE {
+        return
+    }
+    var last: u32 = first
+    var n: u32 = first
+    while n != xml.NONE {
+        last = n
+        n = ooxml.next_el(x, n)
+    }
+    var c1: u32 = pp_color.color_in(&(*c).pal, x, first)
+    var c2: u32 = pp_color.color_in(&(*c).pal, x, last)
+    if c1 == 0 as u32 || c2 == 0 as u32 || first == last {
+        return
+    }
+    let lin: u32 = ooxml.child_l(x, gf, "lin")
+    var ang: i64 = 5400000
+    if lin != xml.NONE {
+        ang = ooxml.attr_i64(x, lin, "ang", 0)
+    }
+    ang = (ang / 60000) % 360
+    if ang < 0 { ang = ang + 360 }
+    var swap: bool = false
+    if ang >= 45 && ang < 135 {
+        (*f).fx.grad = dx_model.GRAD_V
+    } else if ang >= 225 && ang < 315 {
+        (*f).fx.grad = dx_model.GRAD_V
+        swap = true
+    } else {
+        (*f).fx.grad = dx_model.GRAD_H
+        swap = ang >= 135 && ang < 225
+    }
+    if swap {
+        let t: u32 = c1
+        c1 = c2
+        c2 = t
+    }
+    (*f).fill = c1
+    (*f).fx.fill2 = c2
+}
+
+fn do_sp(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, sp: u32, fr: *mut pp_ctx.Frame, is_slide: bool, behind: bool, line_only: bool) {
+    var inh: Inherit = inherit_of(c, x, sp, is_slide)
+    if !is_slide && pp_ph.ph_node(x, sp) != xml.NONE {
+        return
+    }
+    let sppr: u32 = ooxml.child_l(x, sp, "spPr")
+    var g: pp_ph.Geo = sp_geo(c, x, sppr, &inh)
+    if !g.has {
+        return
+    }
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    var pw: f64 = 0.0
+    var phh: f64 = 0.0
+    pp_ph.geo_frame(fr, &g, &px, &py, &pw, &phh)
+    var f: dx_model.Float = float_base(px, py, pw, phh)
+    f.behind = behind
+    var fcol: u32 = 0
+    var lcol: u32 = 0
+    var lw: f64 = 0.0
+    let has_fill: bool = fill_of(c, x, sp, sppr, &fcol)
+    if !has_fill && inh.lsp != xml.NONE {
+        fill_of(c, (*c).lx, inh.lsp, ooxml.child_l((*c).lx, inh.lsp, "spPr"), &fcol)
+    }
+    if !has_fill && fcol == 0 as u32 && inh.msp != xml.NONE {
+        fill_of(c, (*c).mx, inh.msp, ooxml.child_l((*c).mx, inh.msp, "spPr"), &fcol)
+    }
+    f.fill = fcol
+    if has_fill {
+        gradient_of(c, x, sppr, &f)
+    }
+    geometry_of(x, sppr, &f)
+    let has_line: bool = line_of(c, x, sp, sppr, &lcol, &lw)
+    if line_only {
+        if pw <= 2.0 || phh <= 2.0 {
+            if has_line {
+                f.fill = lcol
+                if pw < lw { f.w = lw }
+                if phh < lw { f.h = lw }
+                push_float(c, f)
+            }
+        }
+        return
+    }
+    if has_line && lcol != 0 as u32 {
+        var geom: str = ""
+        let pg: u32 = ooxml.child_l(x, sppr, "prstGeom")
+        if pg != xml.NONE {
+            geom = ooxml.attr_l(x, pg, "prst")
+        }
+        if geom == "line" || geom == "straightConnector1" {
+            if pw <= 2.0 || phh <= 2.0 {
+                f.fill = lcol
+                if pw < lw { f.w = lw }
+                if phh < lw { f.h = lw }
+            }
+        } else {
+            f.line = lcol
+            f.line_w = lw
+        }
+    }
+    let tx: u32 = ooxml.child_l(x, sp, "txBody")
+    if tx != xml.NONE && has_content(x, tx) {
+        var ch: pp_ctx.Chain = pp_ctx.Chain { items: [pp_ctx.Link { x: x, n: xml.NONE }; 8], count: 0 }
+        build_chain(c, x, tx, &inh, &ch)
+        body_props(c, x, sp, &inh, &f)
+        (*c).font_color = 0 as u32
+        if inh.kind == pp_ph.PH_NONE {
+            (*c).font_color = style_color(c, x, sp, "fontRef")
+        }
+        var bl: dx_model.BList = dx_model.blist_new()
+        pp_text.emit_body(c, x, tx, &ch, &bl)
+        (*c).font_color = 0 as u32
+        f.blocks = bl
+    }
+    if f.fill == 0 as u32 && f.line == 0 as u32 && f.blocks.head == dx_model.NIL {
+        return
+    }
+    push_float(c, f)
+}
+
+fn crop_unit(x: *mut xml.Doc, n: u32, name: str) -> u32 {
+    var v: i64 = ooxml.attr_i64(x, n, name, 0)
+    if v < 0 { v = 0 }
+    if v > 100000 { v = 100000 }
+    return ((v * 255 + 50000) / 100000) as u32
+}
+
+fn crop_pack(x: *mut xml.Doc, sr: u32) -> u32 {
+    return crop_unit(x, sr, "l") | (crop_unit(x, sr, "t") << (8 as u32)) | (crop_unit(x, sr, "r") << (16 as u32)) | (crop_unit(x, sr, "b") << (24 as u32))
+}
+
+fn do_pic(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, pic: u32, fr: *mut pp_ctx.Frame, is_slide: bool, behind: bool) {
+    var inh: Inherit = inherit_of(c, x, pic, is_slide)
+    let sppr: u32 = ooxml.child_l(x, pic, "spPr")
+    var g: pp_ph.Geo = sp_geo(c, x, sppr, &inh)
+    if !g.has {
+        return
+    }
+    let bf: u32 = ooxml.child_l(x, pic, "blipFill")
+    let blip: u32 = ooxml.child_l(x, bf, "blip")
+    if blip == xml.NONE {
+        return
+    }
+    let rid: str = ooxml.attr_l(x, blip, "embed")
+    let ri: i64 = opc.rels_find_id((*c).rels, rid)
+    if ri < 0 || opc.rels_external((*c).rels, ri as usize) {
+        return
+    }
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    var pw: f64 = 0.0
+    var phh: f64 = 0.0
+    pp_ph.geo_frame(fr, &g, &px, &py, &pw, &phh)
+    var f: dx_model.Float = float_base(px, py, pw, phh)
+    f.behind = behind
+    let sr: u32 = ooxml.child_l(x, bf, "srcRect")
+    if sr != xml.NONE {
+        f.fx.crop = crop_pack(x, sr)
+    }
+    f.img = dx_model.new_image((*c).d, opc.rels_target((*c).rels, ri as usize)) as i32
+    push_float(c, f)
+}
+
+fn do_frame(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, gf: u32, fr: *mut pp_ctx.Frame, behind: bool) {
+    var g: pp_ph.Geo = pp_ph.geo_new()
+    pp_ph.read_xfrm(x, gf, &g)
+    if !g.has {
+        return
+    }
+    let tbl: u32 = pp_tbl.find_tbl(x, gf)
+    if tbl == xml.NONE {
+        return
+    }
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    var pw: f64 = 0.0
+    var phh: f64 = 0.0
+    pp_ph.geo_frame(fr, &g, &px, &py, &pw, &phh)
+    var f: dx_model.Float = float_base(px, py, pw, phh)
+    f.behind = behind
+    f.ins_l = 0.0
+    f.ins_t = 0.0
+    f.ins_r = 0.0
+    f.ins_b = 0.0
+    var bl: dx_model.BList = dx_model.blist_new()
+    pp_tbl.build_table(c, x, tbl, pw, &bl)
+    f.blocks = bl
+    push_float(c, f)
+}
+
+fn walk_tree(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tree: u32, fr: *mut pp_ctx.Frame, is_slide: bool, behind: bool, depth: i32) {
+    if depth > MAX_DEPTH || tree == xml.NONE {
+        return
+    }
+    var n: u32 = ooxml.first_el(x, tree)
+    while n != xml.NONE {
+        if ooxml.is_el(x, n, "sp") {
+            do_sp(c, x, n, fr, is_slide, behind, false)
+        } else if ooxml.is_el(x, n, "cxnSp") {
+            do_sp(c, x, n, fr, is_slide, behind, true)
+        } else if ooxml.is_el(x, n, "pic") {
+            do_pic(c, x, n, fr, is_slide, behind)
+        } else if ooxml.is_el(x, n, "graphicFrame") {
+            do_frame(c, x, n, fr, behind)
+        } else if ooxml.is_el(x, n, "grpSp") {
+            var g: pp_ph.Geo = pp_ph.geo_new()
+            pp_ph.read_xfrm(x, ooxml.child_l(x, n, "grpSpPr"), &g)
+            if g.has {
+                var nf: pp_ctx.Frame = pp_ph.group_frame(fr, &g)
+                walk_tree(c, x, n, &nf, is_slide, behind, depth + 1)
+            } else {
+                walk_tree(c, x, n, fr, is_slide, behind, depth + 1)
+            }
+        }
+        n = ooxml.next_el(x, n)
+    }
+}
