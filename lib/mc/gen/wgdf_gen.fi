@@ -23,15 +23,14 @@ import mc.gen.wgcv_run
 import mc.gen.wgft_def
 import mc.gen.wgft_load
 import mc.gen.wgft_region
+import mc.gen.wgdf_slots
 import mc.gen.wgft_run
 
 export { WgGen, gen_thread_work, gen_open, gen_chunk, gen_close, gen_default_block, gen_min_y, gen_height, gen_bio_count, gen_bio_name, gen_surface_count, gen_surface_name, gen_surface_code, gen_code_name }
 
 const MAX_THREADS: usize = 8
-const CACHE_SIDE: i32 = 32
 const CACHE_SLOTS: usize = 1024
 const TILE_W: i32 = 2
-const TERRAIN_SIDE: i32 = 32
 const TERRAIN_SLOTS: usize = 1024
 const TERRAIN_LIST: usize = 64
 const FEATURE_MARGIN: i32 = 2
@@ -54,9 +53,9 @@ struct WgGen {
     regions: [u64; 8],
     tcache: u64,
     tbio_cache: u64,
-    ttag_x: [i32; 1024],
-    ttag_z: [i32; 1024],
-    ttag_ok: [bool; 1024],
+    tmap: wgdf_slots.SlotMap,
+    tl_s: [usize; 64],
+    out_slot: [usize; 8],
     tl_x: [i32; 64],
     tl_z: [i32; 64],
     tl_n: usize,
@@ -64,9 +63,7 @@ struct WgGen {
     start_cache: u64,
     bio_cache: u64,
     bio_bytes: usize,
-    tag_x: [i32; 1024],
-    tag_z: [i32; 1024],
-    tag_ok: [bool; 1024],
+    omap: wgdf_slots.SlotMap,
     pool: jobs.Jobs,
 }
 
@@ -128,12 +125,8 @@ fn gen_open(data_root: str, dim: str, seed: i64, surface: bool, carvers: bool, f
     }
     (*gen).bio_cache = rt.heap_alloc((*gen).bio_bytes * CACHE_SLOTS)
     rt.mem_set((*gen).bio_cache, 0 as u8, (*gen).bio_bytes * CACHE_SLOTS)
+    wgdf_slots.slots_init(&(*gen).omap)
     var i: usize = 0
-    while i < CACHE_SLOTS {
-        (*gen).tag_ok[i] = false
-        i = i + 1
-    }
-    i = 0
     while i < threads {
         let ns: *mut wgdf_eval.WgNoises = wgdf_eval.noises_alloc()
         wgdf_eval.noises_build(g, ns, seed)
@@ -171,12 +164,8 @@ fn gen_open(data_root: str, dim: str, seed: i64, surface: bool, carvers: bool, f
 fn features_alloc(gen: *mut WgGen) {
     (*gen).tbio_cache = rt.heap_alloc((*gen).bio_bytes * TERRAIN_SLOTS)
     rt.mem_set((*gen).tbio_cache, 0 as u8, (*gen).bio_bytes * TERRAIN_SLOTS)
+    wgdf_slots.slots_init(&(*gen).tmap)
     var i: usize = 0
-    while i < TERRAIN_SLOTS {
-        (*gen).ttag_ok[i] = false
-        i = i + 1
-    }
-    i = 0
     while i < (*gen).threads {
         (*gen).regions[i] = wgft_region.region_new((*gen).ft, (*gen).chunk_bytes, (*gen).bio_bytes) as u64
         i = i + 1
@@ -191,10 +180,6 @@ fn features_free(gen: *mut WgGen) {
         i = i + 1
     }
     wgft_def.def_free((*gen).ft)
-}
-
-fn slot_of(cx: i32, cz: i32) -> usize {
-    return ((cz & (CACHE_SIDE - 1)) * CACHE_SIDE + (cx & (CACHE_SIDE - 1))) as usize
 }
 
 fn surface_pass(gen: *mut WgGen, worker: usize, cx: i32, cz: i32, dst: u64, bio_buf: u64) {
@@ -242,24 +227,12 @@ fn tile_body(ctx: u64, lo: u64, hi: u64) {
     while i < hi {
         let cx: i32 = (*tc).tx + (i as i32) % TILE_W
         let cz: i32 = (*tc).tz + (i as i32) / TILE_W
-        let slot: usize = slot_of(cx, cz)
+        let slot: usize = (*gen).out_slot[i as usize]
         let dst: u64 = (*gen).tcache + ((slot * (*gen).chunk_bytes) as u64)
         terrain_chunk(gen, i as usize, cx, cz, dst, (*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64))
         wgdf_widen.widen_codes((*gen).cache + ((slot * (*gen).cache_bytes) as u64), dst, (*gen).chunk_bytes)
-        (*gen).tag_x[slot] = cx
-        (*gen).tag_z[slot] = cz
-        (*gen).tag_ok[slot] = true
         i = i + 1
     }
-}
-
-fn tslot_of(cx: i32, cz: i32) -> usize {
-    return ((cz & (TERRAIN_SIDE - 1)) * TERRAIN_SIDE + (cx & (TERRAIN_SIDE - 1))) as usize
-}
-
-fn terrain_ready(gen: *mut WgGen, cx: i32, cz: i32) -> bool {
-    let s: usize = tslot_of(cx, cz)
-    return (*gen).ttag_ok[s] && (*gen).ttag_x[s] == cx && (*gen).ttag_z[s] == cz
 }
 
 fn terrain_body(ctx: u64, lo: u64, hi: u64) {
@@ -271,11 +244,8 @@ fn terrain_body(ctx: u64, lo: u64, hi: u64) {
         while k < (*gen).tl_n {
             let cx: i32 = (*gen).tl_x[k]
             let cz: i32 = (*gen).tl_z[k]
-            let s: usize = tslot_of(cx, cz)
+            let s: usize = (*gen).tl_s[k]
             terrain_chunk(gen, w as usize, cx, cz, (*gen).tcache + ((s * (*gen).chunk_bytes) as u64), (*gen).tbio_cache + ((s * (*gen).bio_bytes) as u64))
-            (*gen).ttag_x[s] = cx
-            (*gen).ttag_z[s] = cz
-            (*gen).ttag_ok[s] = true
             k = k + (*gen).threads
         }
         w = w + 1
@@ -295,21 +265,18 @@ fn decorate_body(ctx: u64, lo: u64, hi: u64) {
         while dz <= FEATURE_MARGIN {
             var dx: i32 = 0 - FEATURE_MARGIN
             while dx <= FEATURE_MARGIN {
-                let s: usize = tslot_of(cx + dx, cz + dz)
+                let s: usize = wgdf_slots.slots_find(&(*gen).tmap, cx + dx, cz + dz) as usize
                 wgft_region.region_load(r, cx, cz, (dz + FEATURE_MARGIN) * wgft_region.SIDE + dx + FEATURE_MARGIN, (*gen).tcache + ((s * (*gen).chunk_bytes) as u64), (*gen).tbio_cache + ((s * (*gen).bio_bytes) as u64))
                 dx = dx + 1
             }
             dz = dz + 1
         }
         wgft_run.decorate(r, (*gen).seed, cx, cz)
-        let slot: usize = slot_of(cx, cz)
+        let slot: usize = (*gen).out_slot[i as usize]
         let mid: u64 = (*r).blocks + ((12 as u64) * ((*gen).cache_bytes as u64))
         rt.mem_copy((*gen).cache + ((slot * (*gen).cache_bytes) as u64), mid, (*gen).cache_bytes)
-        let ts: usize = tslot_of(cx, cz)
+        let ts: usize = wgdf_slots.slots_find(&(*gen).tmap, cx, cz) as usize
         rt.mem_copy((*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64), (*gen).tbio_cache + ((ts * (*gen).bio_bytes) as u64), (*gen).bio_bytes)
-        (*gen).tag_x[slot] = cx
-        (*gen).tag_z[slot] = cz
-        (*gen).tag_ok[slot] = true
         i = i + 1
     }
 }
@@ -320,9 +287,10 @@ fn collect_terrain(gen: *mut WgGen, tx: i32, tz: i32, rows: i32) {
     while dz < rows + FEATURE_MARGIN {
         var dx: i32 = 0 - FEATURE_MARGIN
         while dx < TILE_W + FEATURE_MARGIN {
-            if !terrain_ready(gen, tx + dx, tz + dz) && (*gen).tl_n < TERRAIN_LIST {
+            if wgdf_slots.slots_find(&(*gen).tmap, tx + dx, tz + dz) < 0 && (*gen).tl_n < TERRAIN_LIST {
                 (*gen).tl_x[(*gen).tl_n] = tx + dx
                 (*gen).tl_z[(*gen).tl_n] = tz + dz
+                (*gen).tl_s[(*gen).tl_n] = wgdf_slots.slots_take(&(*gen).tmap, tx + dx, tz + dz, tx - FEATURE_MARGIN, tz - FEATURE_MARGIN, TILE_W + 2 * FEATURE_MARGIN, rows + 2 * FEATURE_MARGIN)
                 (*gen).tl_n = (*gen).tl_n + 1
             }
             dx = dx + 1
@@ -331,7 +299,23 @@ fn collect_terrain(gen: *mut WgGen, tx: i32, tz: i32, rows: i32) {
     }
 }
 
+fn assign_out_slots(gen: *mut WgGen, rows: i32) {
+    var i: i32 = 0
+    while i < TILE_W * rows {
+        let cx: i32 = (*gen).job.tx + i % TILE_W
+        let cz: i32 = (*gen).job.tz + i / TILE_W
+        let found: i32 = wgdf_slots.slots_find(&(*gen).omap, cx, cz)
+        if found >= 0 {
+            (*gen).out_slot[i as usize] = found as usize
+        } else {
+            (*gen).out_slot[i as usize] = wgdf_slots.slots_take(&(*gen).omap, cx, cz, (*gen).job.tx, (*gen).job.tz, TILE_W, rows)
+        }
+        i = i + 1
+    }
+}
+
 fn run_tile(gen: *mut WgGen, rows: i32) {
+    assign_out_slots(gen, rows)
     wgdf_cshare.share_reset((*gen).cs as *mut wgdf_cshare.CornerShare, (*gen).job.tx, (*gen).job.tz)
     if (*gen).aqs != 0 {
         wgdf_aqshare.share_reset((*gen).aqs as *mut wgdf_aqshare.AqShare, (*gen).job.tx, (*gen).job.tz)
@@ -346,12 +330,12 @@ fn run_tile(gen: *mut WgGen, rows: i32) {
 }
 
 fn gen_chunk(gen: *mut WgGen, cx: i32, cz: i32, out: *mut u16, bio_out: *mut u8) {
-    let slot: usize = slot_of(cx, cz)
-    if !((*gen).tag_ok[slot] && (*gen).tag_x[slot] == cx && (*gen).tag_z[slot] == cz) {
+    if wgdf_slots.slots_find(&(*gen).omap, cx, cz) < 0 {
         let rows: i32 = ((*gen).threads as i32) / TILE_W
         (*gen).job = TileCtx { gen: gen, tx: wgdf_eval.floor_div(cx, TILE_W) * TILE_W, tz: wgdf_eval.floor_div(cz, rows) * rows }
         run_tile(gen, rows)
     }
+    let slot: usize = wgdf_slots.slots_find(&(*gen).omap, cx, cz) as usize
     rt.mem_copy(out as u64, (*gen).cache + ((slot * (*gen).cache_bytes) as u64), (*gen).cache_bytes)
     rt.mem_copy(bio_out as u64, (*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64), (*gen).bio_bytes)
 }

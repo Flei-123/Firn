@@ -22,7 +22,7 @@ compare() {
     fi
 }
 
-"$FIRNC" -o "$W/probe" $WG/probe.fi 2>"$W/err" || { echo "  FAIL  compile probe"; head -8 "$W/err"; exit 1; }
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/probe" $WG/probe.fi 2>"$W/err" || { echo "  FAIL  compile probe"; head -8 "$W/err"; exit 1; }
 
 version_jar_cp() {
     local ver=$1 dir=$2

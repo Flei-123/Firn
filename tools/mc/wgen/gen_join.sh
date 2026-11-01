@@ -12,7 +12,7 @@ SEED=${GEN_SEED:-11}
 VIEW=${GEN_VIEW:-3}
 EXPECT=$(( (2 * VIEW + 1) * (2 * VIEW + 1) ))
 PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-"$FIRNC" -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
 mkdir -p "$W/run"
 printf 'level-type=minecraft:normal\nlevel-seed=%s\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nworldgen-surface=false\nview-distance=%s\nwhite-list=false\nserver-port=%s\n' "$SEED" "$ROOT" "$VIEW" "$PORT" > "$W/run/server.properties"
 mkfifo "$W/run/in.fifo"

@@ -9,7 +9,7 @@ DATA=tools/mcgen/worldgen/1.20.1
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 ERR=0
-"$FIRNC" -o "$W/surface_probe" tools/mc/wgen/surface_probe.fi 2>"$W/err" || { echo "  FAIL  compile surface_probe"; head -8 "$W/err"; exit 1; }
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/surface_probe" tools/mc/wgen/surface_probe.fi 2>"$W/err" || { echo "  FAIL  compile surface_probe"; head -8 "$W/err"; exit 1; }
 
 run_dim() {
     local dim=$1; shift

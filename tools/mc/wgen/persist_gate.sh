@@ -10,7 +10,7 @@ trap 'pkill -9 -f "$W/firnmc-server" 2>/dev/null; rm -rf "$W"' EXIT
 SEED=11
 BOT=tools/mc/wgen/persist_bot.cjs
 PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-"$FIRNC" -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
 mkdir -p "$W/run"
 printf 'level-type=minecraft:normal\nlevel-seed=%s\nlevel-name=gw\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nview-distance=2\nwhite-list=false\nserver-port=%s\n' "$SEED" "$ROOT" "$PORT" > "$W/run/server.properties"
 

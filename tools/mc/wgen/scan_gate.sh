@@ -10,7 +10,7 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 ERR=0
 RANDOM=${SCAN_SEED:-7}
-"$FIRNC" -o "$W/surface_probe" tools/mc/wgen/surface_probe.fi 2>"$W/err" || { echo "  FAIL  compile surface_probe"; head -8 "$W/err"; exit 1; }
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/surface_probe" tools/mc/wgen/surface_probe.fi 2>"$W/err" || { echo "  FAIL  compile surface_probe"; head -8 "$W/err"; exit 1; }
 
 random_tasks() {
     local n=$1 span=$2 i
