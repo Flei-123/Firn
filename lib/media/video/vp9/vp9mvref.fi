@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9state
+import media.video.vp9.vp9blk
+import media.video.vp9.vp9mvmi
+
+export {
+    MvRefs, mvrefs_new, find_mv_refs, mode_context, append_sub8x8, lower_mv_precision, clamp_mv_ref,
+    use_prev_mvs, mv_use_hp, lower_comp,
+}
+
+static MV_REF_BLOCKS: [i8; 208] = [
+    -1, 0, 0, -1, -1, -1, -2, 0, 0, -2, -2, -1, -1, -2, -2, -2,
+    -1, 0, 0, -1, -1, -1, -2, 0, 0, -2, -2, -1, -1, -2, -2, -2,
+    -1, 0, 0, -1, -1, -1, -2, 0, 0, -2, -2, -1, -1, -2, -2, -2,
+    -1, 0, 0, -1, -1, -1, -2, 0, 0, -2, -2, -1, -1, -2, -2, -2,
+    0, -1, -1, 0, 1, -1, -1, -1, 0, -2, -2, 0, -2, -1, -1, -2,
+    -1, 0, 0, -1, -1, 1, -1, -1, -2, 0, 0, -2, -1, -2, -2, -1,
+    -1, 0, 0, -1, -1, 1, 1, -1, -1, -1, -3, 0, 0, -3, -3, -3,
+    0, -1, -1, 0, 2, -1, -1, -1, -1, 1, 0, -3, -3, 0, -3, -3,
+    -1, 0, 0, -1, -1, 2, -1, -1, 1, -1, -3, 0, 0, -3, -3, -3,
+    -1, 1, 1, -1, -1, 2, 2, -1, -1, -1, -3, 0, 0, -3, -3, -3,
+    0, -1, -1, 0, 4, -1, -1, 2, -1, -1, 0, -3, -3, 0, 2, -1,
+    -1, 0, 0, -1, -1, 4, 2, -1, -1, -1, -3, 0, 0, -3, -1, 2,
+    -1, 3, 3, -1, -1, 4, 4, -1, -1, -1, -1, 0, 0, -1, -1, 6,
+]
+static MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1]
+static COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6]
+static SUB_BLOCK_IDX: [u8; 8] = [1, 2, 1, 3, 3, 2, 3, 3]
+
+struct MvRefs {
+    r0: i64,
+    c0: i64,
+    r1: i64,
+    c1: i64,
+    count: i64,
+}
+
+fn mvrefs_new() -> MvRefs {
+    return MvRefs { r0: 0, c0: 0, r1: 0, c1: 0, count: 0 }
+}
+
+fn use_prev_mvs(f: *mut vp9state.Vp9) -> bool {
+    return !(*f).error_res && (*f).w == (*f).last_w && (*f).h == (*f).last_h && !(*f).last_intra_only
+        && (*f).last_show && !(*f).last_key
+}
+
+fn mv_use_hp(row: i64, col: i64) -> bool {
+    return (vp9mem.iabs(row) >> 3) < 8 && (vp9mem.iabs(col) >> 3) < 8
+}
+
+fn lower_comp(v: i64) -> i64 {
+    if (v & 1) != 0 {
+        if v > 0 {
+            return v - 1
+        }
+        return v + 1
+    }
+    return v
+}
+
+fn lower_mv_precision(out: *mut MvRefs, allow_hp: bool, which: i64) {
+    var r: i64 = (*out).r0
+    var c: i64 = (*out).c0
+    if which == 1 {
+        r = (*out).r1
+        c = (*out).c1
+    }
+    if !(allow_hp && mv_use_hp(r, c)) {
+        r = lower_comp(r)
+        c = lower_comp(c)
+    }
+    if which == 1 {
+        (*out).r1 = r
+        (*out).c1 = c
+    } else {
+        (*out).r0 = r
+        (*out).c0 = c
+    }
+}
+
+fn clamp_val(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn clamp_mv_ref(f: *mut vp9state.Vp9, out: *mut MvRefs, row: i64, col: i64, bsize: i64) {
+    let left: i64 = 0 - col * 64 - 128
+    let right: i64 = ((*f).mi_cols - vp9blk.bw8(bsize) - col) * 64 + 128
+    let top: i64 = 0 - row * 64 - 128
+    let bottom: i64 = ((*f).mi_rows - vp9blk.bh8(bsize) - row) * 64 + 128
+    (*out).c0 = clamp_val((*out).c0, left, right)
+    (*out).r0 = clamp_val((*out).r0, top, bottom)
+    (*out).c1 = clamp_val((*out).c1, left, right)
+    (*out).r1 = clamp_val((*out).r1, top, bottom)
+}
+
+fn add_mv(out: *mut MvRefs, r: i64, c: i64) -> bool {
+    if (*out).count > 0 {
+        if !vp9mvmi.mv_equal(r, c, (*out).r0, (*out).c0) {
+            (*out).r1 = r
+            (*out).c1 = c
+            (*out).count = 2
+            return true
+        }
+        return false
+    }
+    (*out).r0 = r
+    (*out).c0 = c
+    (*out).count = 1
+    return false
+}
+
+fn is_inside(f: *mut vp9state.Vp9, r: i64, c: i64) -> bool {
+    return r >= 0 && c >= (*f).tile_c0 && r < (*f).mi_rows && c < (*f).tile_c1
+}
+
+fn add_scaled(f: *mut vp9state.Vp9, out: *mut MvRefs, ref_frame: i64, cand_ref: i64, r: i64, c: i64) -> bool {
+    if (*f).sign_bias[cand_ref as usize] != (*f).sign_bias[ref_frame as usize] {
+        return add_mv(out, 0 - r, 0 - c)
+    }
+    return add_mv(out, r, c)
+}
+
+fn add_diff_ref(f: *mut vp9state.Vp9, out: *mut MvRefs, ref_frame: i64, ref0: i64, ref1: i64, r0: i64, c0: i64, r1: i64, c1: i64) -> bool {
+    if ref0 > 0 {
+        if ref0 != ref_frame {
+            if add_scaled(f, out, ref_frame, ref0, r0, c0) {
+                return true
+            }
+        }
+        if ref1 > 0 && ref1 != ref_frame && !vp9mvmi.mv_equal(r1, c1, r0, c0) {
+            if add_scaled(f, out, ref_frame, ref1, r1, c1) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn scan_same_ref(f: *mut vp9state.Vp9, out: *mut MvRefs, row: i64, col: i64, bsize: i64, ref_frame: i64, block: i64) -> bool {
+    var i: i64 = 0
+    while i < 8 {
+        let k: usize = (bsize * 16 + i * 2) as usize
+        let dr: i64 = MV_REF_BLOCKS[k] as i64
+        let dc: i64 = MV_REF_BLOCKS[k + 1] as i64
+        if is_inside(f, row + dr, col + dc) {
+            let cand: u64 = vp9state.mi_ptr(f, row + dr, col + dc)
+            var which: i64 = 0 - 1
+            if vp9mem.ld8(cand, vp9state.MI_REF0) == ref_frame {
+                which = 0
+            } else if vp9mem.ld8(cand, vp9state.MI_REF1) == ref_frame {
+                which = 1
+            }
+            if which >= 0 {
+                var r: i64 = vp9mvmi.mv_row(cand, which)
+                var c: i64 = vp9mvmi.mv_col(cand, which)
+                if i < 2 && block >= 0 && vp9mem.ld8(cand, vp9state.MI_BSIZE) < 3 {
+                    var sel: i64 = 0
+                    if dc == 0 {
+                        sel = 1
+                    }
+                    let sb: i64 = SUB_BLOCK_IDX[(block * 2 + sel) as usize] as i64
+                    r = vp9mvmi.bmi_row(cand, sb, which)
+                    c = vp9mvmi.bmi_col(cand, sb, which)
+                }
+                if add_mv(out, r, c) {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn scan_diff_ref(f: *mut vp9state.Vp9, out: *mut MvRefs, row: i64, col: i64, bsize: i64, ref_frame: i64) -> bool {
+    var i: i64 = 0
+    while i < 8 {
+        let k: usize = (bsize * 16 + i * 2) as usize
+        let dr: i64 = MV_REF_BLOCKS[k] as i64
+        let dc: i64 = MV_REF_BLOCKS[k + 1] as i64
+        if is_inside(f, row + dr, col + dc) {
+            let cand: u64 = vp9state.mi_ptr(f, row + dr, col + dc)
+            if add_diff_ref(f, out, ref_frame, vp9mem.ld8(cand, vp9state.MI_REF0), vp9mem.ld8(cand, vp9state.MI_REF1),
+                vp9mvmi.mv_row(cand, 0), vp9mvmi.mv_col(cand, 0), vp9mvmi.mv_row(cand, 1), vp9mvmi.mv_col(cand, 1)) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn any_neighbor_inside(f: *mut vp9state.Vp9, row: i64, col: i64, bsize: i64) -> bool {
+    var i: i64 = 0
+    while i < 8 {
+        let k: usize = (bsize * 16 + i * 2) as usize
+        if is_inside(f, row + (MV_REF_BLOCKS[k] as i64), col + (MV_REF_BLOCKS[k + 1] as i64)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn prev_cell(f: *mut vp9state.Vp9, row: i64, col: i64) -> u64 {
+    return (*f).prev_mi + (((row * ((*f).sb_cols * 8) + col) as usize) * vp9state.MI_SIZE) as u64
+}
+
+fn scan_prev(f: *mut vp9state.Vp9, out: *mut MvRefs, row: i64, col: i64, ref_frame: i64, same: bool) -> bool {
+    let p: u64 = prev_cell(f, row, col)
+    let ref0: i64 = vp9mem.ld8(p, vp9state.MI_REF0)
+    let ref1: i64 = vp9mem.ld8(p, vp9state.MI_REF1)
+    if same {
+        if ref0 == ref_frame {
+            return add_mv(out, vp9mvmi.mv_row(p, 0), vp9mvmi.mv_col(p, 0))
+        } else if ref1 == ref_frame {
+            return add_mv(out, vp9mvmi.mv_row(p, 1), vp9mvmi.mv_col(p, 1))
+        }
+        return false
+    }
+    if ref0 != ref_frame && ref0 > 0 {
+        if add_scaled(f, out, ref_frame, ref0, vp9mvmi.mv_row(p, 0), vp9mvmi.mv_col(p, 0)) {
+            return true
+        }
+    }
+    if ref1 > 0 && ref1 != ref_frame && !vp9mvmi.mv_equal(vp9mvmi.mv_row(p, 1), vp9mvmi.mv_col(p, 1), vp9mvmi.mv_row(p, 0), vp9mvmi.mv_col(p, 0)) {
+        if add_scaled(f, out, ref_frame, ref1, vp9mvmi.mv_row(p, 1), vp9mvmi.mv_col(p, 1)) {
+            return true
+        }
+    }
+    return false
+}
+
+fn find_mv_refs(f: *mut vp9state.Vp9, out: *mut MvRefs, row: i64, col: i64, bsize: i64, ref_frame: i64, block: i64) {
+    (*out).r0 = 0
+    (*out).c0 = 0
+    (*out).r1 = 0
+    (*out).c1 = 0
+    (*out).count = 0
+    let prev: bool = use_prev_mvs(f)
+    var done: bool = scan_same_ref(f, out, row, col, bsize, ref_frame, block)
+    if !done && prev {
+        done = scan_prev(f, out, row, col, ref_frame, true)
+    }
+    if !done && any_neighbor_inside(f, row, col, bsize) {
+        done = scan_diff_ref(f, out, row, col, bsize, ref_frame)
+    }
+    if !done && prev {
+        done = scan_prev(f, out, row, col, ref_frame, false)
+    }
+    clamp_mv_ref(f, out, row, col, bsize)
+}
+
+fn mode_context(f: *mut vp9state.Vp9, row: i64, col: i64, bsize: i64) -> i64 {
+    var counter: i64 = 0
+    var i: i64 = 0
+    while i < 2 {
+        let k: usize = (bsize * 16 + i * 2) as usize
+        let pr: i64 = row + (MV_REF_BLOCKS[k] as i64)
+        let pc: i64 = col + (MV_REF_BLOCKS[k + 1] as i64)
+        if is_inside(f, pr, pc) {
+            counter = counter + (MODE_2_COUNTER[vp9mem.ld8(vp9state.mi_ptr(f, pr, pc), vp9state.MI_MODE) as usize] as i64)
+        }
+        i = i + 1
+    }
+    return COUNTER_TO_CONTEXT[counter as usize] as i64
+}
+
+fn first_other(cur_r: i64, cur_c: i64, cand_r: i64, cand_c: i64, out: *mut MvRefs) -> bool {
+    if !vp9mvmi.mv_equal(cur_r, cur_c, cand_r, cand_c) {
+        (*out).r0 = cand_r
+        (*out).c0 = cand_c
+        return true
+    }
+    return false
+}
+
+fn append_sub8x8(f: *mut vp9state.Vp9, mi: u64, out: *mut MvRefs, row: i64, col: i64, bsize: i64, b_mode: i64, block: i64, which: i64, ref_frame: i64) {
+    var list: MvRefs = mvrefs_new()
+    (*out).r0 = 0
+    (*out).c0 = 0
+    if block == 0 {
+        find_mv_refs(f, &list, row, col, bsize, ref_frame, block)
+        if b_mode == 11 {
+            (*out).r0 = list.r1
+            (*out).c0 = list.c1
+        } else {
+            (*out).r0 = list.r0
+            (*out).c0 = list.c0
+        }
+        return
+    }
+    if block == 3 {
+        let br: i64 = vp9mvmi.bmi_row(mi, 2, which)
+        let bc: i64 = vp9mvmi.bmi_col(mi, 2, which)
+        if b_mode == 10 {
+            (*out).r0 = br
+            (*out).c0 = bc
+            return
+        }
+        if first_other(br, bc, vp9mvmi.bmi_row(mi, 1, which), vp9mvmi.bmi_col(mi, 1, which), out) {
+            return
+        }
+        if first_other(br, bc, vp9mvmi.bmi_row(mi, 0, which), vp9mvmi.bmi_col(mi, 0, which), out) {
+            return
+        }
+        find_mv_refs(f, &list, row, col, bsize, ref_frame, block)
+        if first_other(br, bc, list.r0, list.c0, out) {
+            return
+        }
+        first_other(br, bc, list.r1, list.c1, out)
+        return
+    }
+    let br: i64 = vp9mvmi.bmi_row(mi, 0, which)
+    let bc: i64 = vp9mvmi.bmi_col(mi, 0, which)
+    if b_mode == 10 {
+        (*out).r0 = br
+        (*out).c0 = bc
+        return
+    }
+    find_mv_refs(f, &list, row, col, bsize, ref_frame, block)
+    if first_other(br, bc, list.r0, list.c0, out) {
+        return
+    }
+    first_other(br, bc, list.r1, list.c1, out)
+}
