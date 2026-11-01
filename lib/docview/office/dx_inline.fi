@@ -9,6 +9,8 @@ import docview.office.dx_style
 import docview.office.dx_model
 import docview.office.dx_ctx
 import docview.office.dx_utf8
+import docview.office.dx_drawutil
+import docview.office.dx_anchor
 
 export { ParaState, parse_inline, para_state_new }
 
@@ -62,64 +64,32 @@ fn emit_simple(d: *mut dx_model.Docx, rp: *mut dx_props.RunProps, kind: u32, a: 
     dx_model.run_add(d, dx_model.Run { kind: kind, rp: *rp, toff: 0 as u32, tn: 0 as u32, a: a, w: w, h: h })
 }
 
-fn find_desc(x: *mut xml.Doc, n: u32, name: str, depth: i32) -> u32 {
-    if depth > 14 || n == xml.NONE {
-        return xml.NONE
-    }
-    var c: u32 = ooxml.first_el(x, n)
-    while c != xml.NONE {
-        if ooxml.is_el(x, c, name) {
-            return c
-        }
-        let r: u32 = find_desc(x, c, name, depth + 1)
-        if r != xml.NONE {
-            return r
-        }
-        c = ooxml.next_el(x, c)
-    }
-    return xml.NONE
-}
-
-fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
-    if v < lo { return lo }
-    if v > hi { return hi }
-    return v
-}
-
-fn rel_part(c: *mut dx_ctx.Ctx, rid: str, out: *mut rt.Buf) -> bool {
-    if rid.n == 0 {
-        return false
-    }
-    let i: i64 = opc.rels_find_id((*c).rels, rid)
-    if i < 0 {
-        return false
-    }
-    if opc.rels_external((*c).rels, i as usize) {
-        return false
-    }
-    let t: str = opc.rels_target((*c).rels, i as usize)
-    rt.buf_push_bytes(out, t.p as u64, t.n)
-    return true
-}
-
 fn parse_drawing(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, dr: u32, rp: *mut dx_props.RunProps) {
-    let ext: u32 = find_desc(x, dr, "extent", 0)
+    let anc: u32 = ooxml.child_l(x, dr, "anchor")
+    if anc != xml.NONE && (*c).table_depth == 0 && (*c).float_depth == 0 {
+        let fi: u32 = dx_anchor.parse_anchor(c, d, x, anc)
+        if fi != dx_model.NIL {
+            emit_simple(d, rp, dx_model.R_FLOAT, fi as i64, 0.0, 0.0)
+        }
+        return
+    }
+    let ext: u32 = dx_drawutil.find_desc(x, dr, "extent", 0)
     var w: f64 = 96.0
     var h: f64 = 96.0
     if ext != xml.NONE {
-        w = clampf((ooxml.attr_i64(x, ext, "cx", 914400) as f64) / 9525.0, 1.0, 30000.0)
-        h = clampf((ooxml.attr_i64(x, ext, "cy", 914400) as f64) / 9525.0, 1.0, 30000.0)
+        w = dx_drawutil.clampf((ooxml.attr_i64(x, ext, "cx", 914400) as f64) / 9525.0, 1.0, 30000.0)
+        h = dx_drawutil.clampf((ooxml.attr_i64(x, ext, "cy", 914400) as f64) / 9525.0, 1.0, 30000.0)
     }
-    let blip: u32 = find_desc(x, dr, "blip", 0)
+    let blip: u32 = dx_drawutil.find_desc(x, dr, "blip", 0)
     var idx: i64 = -1
     if blip != xml.NONE {
         var part: rt.Buf = rt.buf_new()
         defer rt.buf_free(&part)
-        if rel_part(c, ooxml.attr_l(x, blip, "embed"), &part) {
+        if dx_drawutil.rel_part(c, ooxml.attr_l(x, blip, "embed"), &part) {
             idx = dx_model.new_image(d, rt.buf_str(&part)) as i64
         }
     } else {
-        let gf: u32 = find_desc(x, dr, "wsp", 0)
+        let gf: u32 = dx_drawutil.find_desc(x, dr, "wsp", 0)
         if gf != xml.NONE {
             return
         }
@@ -127,69 +97,29 @@ fn parse_drawing(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, dr:
     emit_simple(d, rp, dx_model.R_IMAGE, idx, w, h)
 }
 
-fn style_len(s: str, key: str, dflt: f64) -> f64 {
-    var i: usize = 0
-    while i + key.n < s.n {
-        if rt.mem_eq((s.p as u64) + (i as u64), key.p as u64, key.n) {
-            var j: usize = i + key.n
-            var v: f64 = 0.0
-            var frac: f64 = 0.0
-            var scale: f64 = 0.1
-            var seen_dot: bool = false
-            while j < s.n {
-                let ch: u8 = rt.ld8(s.p as u64, j)
-                if ch >= 48 as u8 && ch <= 57 as u8 {
-                    if seen_dot {
-                        frac = frac + ((ch - 48 as u8) as f64) * scale
-                        scale = scale * 0.1
-                    } else {
-                        v = v * 10.0 + ((ch - 48 as u8) as f64)
-                    }
-                } else if ch == 46 as u8 {
-                    seen_dot = true
-                } else {
-                    break
-                }
-                j = j + 1
-            }
-            v = v + frac
-            if j + 1 < s.n {
-                let u0: u8 = rt.ld8(s.p as u64, j)
-                let u1: u8 = rt.ld8(s.p as u64, j + 1)
-                if u0 == 112 as u8 && u1 == 116 as u8 {
-                    return v * 96.0 / 72.0
-                }
-                if u0 == 105 as u8 && u1 == 110 as u8 {
-                    return v * 96.0
-                }
-                if u0 == 99 as u8 && u1 == 109 as u8 {
-                    return v * 96.0 / 2.54
-                }
-            }
-            return v
-        }
-        i = i + 1
-    }
-    return dflt
-}
-
 fn parse_pict(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, pc: u32, rp: *mut dx_props.RunProps) {
-    let im: u32 = find_desc(x, pc, "imagedata", 0)
+    let im: u32 = dx_drawutil.find_desc(x, pc, "imagedata", 0)
     if im == xml.NONE {
+        if (*c).table_depth == 0 && (*c).float_depth == 0 {
+            let fi: u32 = dx_anchor.parse_vml_box(c, d, x, pc)
+            if fi != dx_model.NIL {
+                emit_simple(d, rp, dx_model.R_FLOAT, fi as i64, 0.0, 0.0)
+            }
+        }
         return
     }
     var w: f64 = 96.0
     var h: f64 = 96.0
-    let sh: u32 = find_desc(x, pc, "shape", 0)
+    let sh: u32 = dx_drawutil.find_desc(x, pc, "shape", 0)
     if sh != xml.NONE {
         let st: str = ooxml.attr_l(x, sh, "style")
-        w = clampf(style_len(st, "width:", 96.0), 1.0, 30000.0)
-        h = clampf(style_len(st, "height:", 96.0), 1.0, 30000.0)
+        w = dx_drawutil.clampf(dx_drawutil.style_len(st, "width:", 96.0), 1.0, 30000.0)
+        h = dx_drawutil.clampf(dx_drawutil.style_len(st, "height:", 96.0), 1.0, 30000.0)
     }
     var part: rt.Buf = rt.buf_new()
     defer rt.buf_free(&part)
     var idx: i64 = -1
-    if rel_part(c, ooxml.attr_l(x, im, "id"), &part) {
+    if dx_drawutil.rel_part(c, ooxml.attr_l(x, im, "id"), &part) {
         idx = dx_model.new_image(d, rt.buf_str(&part)) as i64
     }
     emit_simple(d, rp, dx_model.R_IMAGE, idx, w, h)
