@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1br
+import media.video.vp9.vp9mem
+
+export { Sym, sym_new, sym_init, sym_read, sym_bool, sym_literal, sym_ok }
+
+struct Sym {
+    br: av1br.BR,
+    value: i64,
+    range: i64,
+    max_bits: i64,
+    update: bool,
+    bcdf: [u16; 3],
+}
+
+fn sym_new() -> Sym {
+    return Sym { br: av1br.br_new(0, 0), value: 0, range: 32768, max_bits: 0, update: true, bcdf: [16384, 32768, 0] }
+}
+
+fn sym_init(s: *mut Sym, data: u64, sz: usize, update: bool) {
+    (*s).br = av1br.br_new(data, sz)
+    var nb: i64 = (sz as i64) * 8
+    if nb > 15 {
+        nb = 15
+    }
+    let buf: i64 = av1br.rd(&(*s).br, nb, "")
+    let padded: i64 = buf << ((15 - nb) as u64)
+    (*s).value = 32767 ^ padded
+    (*s).range = 32768
+    (*s).max_bits = 8 * (sz as i64) - 15
+    (*s).update = update
+}
+
+fn sym_ok(s: *mut Sym) -> bool {
+    return (*s).max_bits >= 0 - 14
+}
+
+fn floor_log2(x: i64) -> i64 {
+    var n: i64 = 0
+    var v: i64 = x
+    while v > 1 {
+        v = v >> 1
+        n = n + 1
+    }
+    return n
+}
+
+fn renorm(s: *mut Sym) {
+    let bits: i64 = 15 - floor_log2((*s).range)
+    (*s).range = (*s).range << (bits as u64)
+    var nbits: i64 = bits
+    if (*s).max_bits < nbits {
+        nbits = (*s).max_bits
+    }
+    if nbits < 0 {
+        nbits = 0
+    }
+    let new_data: i64 = av1br.rd(&(*s).br, nbits, "")
+    let padded: i64 = new_data << ((bits - nbits) as u64)
+    (*s).value = padded ^ ((((*s).value + 1) << (bits as u64)) - 1)
+    (*s).max_bits = (*s).max_bits - bits
+}
+
+fn decode_with(s: *mut Sym, cdf: u64, n: i64) -> i64 {
+    var cur: i64 = (*s).range
+    var prev: i64 = 0
+    var sym: i64 = 0 - 1
+    while true {
+        sym = sym + 1
+        prev = cur
+        let f: i64 = 32768 - vp9mem.ld16(cdf, sym as usize)
+        cur = ((((*s).range >> 8) * (f >> 6)) >> 1) + 4 * (n - sym - 1)
+        if (*s).value >= cur || sym >= n - 1 {
+            break
+        }
+    }
+    (*s).range = prev - cur
+    (*s).value = (*s).value - cur
+    renorm(s)
+    return sym
+}
+
+fn sym_read(s: *mut Sym, cdf: u64, n: i64) -> i64 {
+    let sym: i64 = decode_with(s, cdf, n)
+    if (*s).update {
+        let cnt: i64 = vp9mem.ld16(cdf, n as usize)
+        var rate: i64 = 3 + floor_log2(n)
+        if floor_log2(n) > 2 {
+            rate = 5
+        }
+        if cnt > 15 {
+            rate = rate + 1
+        }
+        if cnt > 31 {
+            rate = rate + 1
+        }
+        var tmp: i64 = 0
+        var i: i64 = 0
+        while i < n - 1 {
+            if i == sym {
+                tmp = 32768
+            }
+            let c: i64 = vp9mem.ld16(cdf, i as usize)
+            if tmp < c {
+                vp9mem.st16(cdf, i as usize, c - ((c - tmp) >> (rate as u64)))
+            } else {
+                vp9mem.st16(cdf, i as usize, c + ((tmp - c) >> (rate as u64)))
+            }
+            i = i + 1
+        }
+        if cnt < 32 {
+            vp9mem.st16(cdf, n as usize, cnt + 1)
+        }
+    }
+    return sym
+}
+
+fn sym_bool(s: *mut Sym) -> i64 {
+    let cp: *mut [u16; 3] = &(*s).bcdf
+    let saved: bool = (*s).update
+    (*s).update = false
+    let v: i64 = decode_with(s, cp as u64, 2)
+    (*s).update = saved
+    return v
+}
+
+fn sym_literal(s: *mut Sym, n: i64) -> i64 {
+    var x: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        x = 2 * x + sym_bool(s)
+        i = i + 1
+    }
+    return x
+}

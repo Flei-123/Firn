@@ -44,6 +44,22 @@ def ffmpeg_elements(path, fmt):
     return out
 
 
+def merge_unary(items):
+    res = []
+    for n, b, v in items:
+        if n in ("increment_tile_cols_log2", "increment_tile_rows_log2"):
+            base = n.replace("increment_", "")
+            if res and res[-1][0] == base and res[-1][3]:
+                res[-1] = (base, res[-1][1] + b, res[-1][2] + v, v == 1)
+            else:
+                res.append((base, b, v, v == 1))
+        elif n == "lr_unit_extra_shift" and res and res[-1][0] == "lr_unit_shift":
+            res[-1] = ("lr_unit_shift", 2, res[-1][2] + v, False)
+        else:
+            res.append((n, b, v, False))
+    return [(n, b, v) for n, b, v, _ in res]
+
+
 def mine_elements(exe, path):
     d = tempfile.mkdtemp()
     o = os.path.join(d, "o.txt")
@@ -57,8 +73,9 @@ def mine_elements(exe, path):
                     continue
                 n, b, v = line.rsplit(" ", 2)
                 if int(b) > 0:
-                    out.append((strip(n), int(b), int(v)))
-        return r.returncode, out
+                    n = {"tile_size_bytes_minus_1": "tile_size_bytes_minus1"}.get(strip(n), strip(n))
+                    out.append((n, int(b), int(v)))
+        return r.returncode, merge_unary(out)
     finally:
         for x in os.listdir(d):
             os.remove(os.path.join(d, x))
