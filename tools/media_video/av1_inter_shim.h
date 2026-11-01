@@ -76,6 +76,11 @@ static inline int get_msb64(uint64_t n) { return 63 - __builtin_clzll(n); }
 #define MAX_SB_SIZE_LOG2 7
 #define LEAST_SQUARES_SAMPLES_MAX_BITS 3
 #define IMPLIES(a, b) (!(a) || (b))
+#define MI_SIZE 4
+static inline int negative_to_zero(int value) { return value & ~(value >> (sizeof(value) * 8 - 1)); }
+#define CONFIG_AV1_HIGHBITDEPTH 1
+#define AOM_BLEND_AVG(v0, v1) ROUND_POWER_OF_TWO((v0) + (v1), 1)
+static inline uint8_t clip_pixel(int val) { return (uint8_t)clamp(val, 0, 255); }
 typedef int16_t WarpedFilterCoeff;
 typedef enum { IDENTITY = 0, TRANSLATION = 1, ROTZOOM = 2, AFFINE = 3 } TransformationType;
 typedef struct { TransformationType wmtype; int32_t wmmat[8]; int16_t alpha, beta, gamma, delta; int8_t invalid; } WarpedMotionParams;

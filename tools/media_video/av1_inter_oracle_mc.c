@@ -2,7 +2,7 @@ static int64_t rs_state;
 static int rnd(int n) { rs_state = (rs_state * 1103515245 + 12345) & 2147483647; return (int)(((rs_state >> 16) & 32767) % n); }
 static int bigr(int n) { int a = rnd(32768); int b = rnd(32768); return (int)(((int64_t)a * 32768 + b) % n); }
 static uint32_t fnv(uint32_t h, uint32_t b) { return (uint32_t)(((uint64_t)(h ^ b) * 16777619ULL) & 4294967295ULL); }
-#define PAD 640
+#define PAD 1024
 static int64_t round2_signed(int64_t v, int n) { return v >= 0 ? ((v + ((int64_t)1 << (n - 1))) >> n) : -((-v + ((int64_t)1 << (n - 1))) >> n); }
 
 static void run_pred(const uint16_t *pad, int pstride, int rw, int rh, int bd, int w, int h, int fxt, int fyt,

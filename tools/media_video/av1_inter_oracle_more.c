@@ -71,6 +71,7 @@ static uint32_t case_mask(const int *p) {
     for (int i = 0; i < w * h; i++) { int pix = bigr(1 << bd); int v = (pix << post) + rnd(1 << post) - (1 << post) / 2; c0[i] = v + round_off; }
     for (int i = 0; i < w * h; i++) { int pix = bigr(1 << bd); int v = (pix << post) + rnd(1 << post) - (1 << post) / 2; c1[i] = v + round_off; }
     memcpy(mask, wedge_tab + wedge_off(bs, sg, widx), bwl * bhl);
+    for (int i = 0; i < bwl * bhl; i++) hsh = fnv(hsh, mask[i]);
     ConvolveParams cp; memset(&cp, 0, sizeof(cp)); cp.round_0 = r0; cp.round_1 = 7; cp.is_compound = 1;
     aom_highbd_blend_a64_d16_mask_c(CONVERT_TO_BYTEPTR(dst), w, c0, w, c1, w, mask, bwl, w, h, ssx, ssy, &cp, bd);
     free(c0); free(c1);
@@ -80,6 +81,7 @@ static uint32_t case_mask(const int *p) {
     for (int i = 0; i < w * h; i++) c1[i] = bigr(1 << bd);
     if (type == 3) memcpy(mask, wedge_tab + wedge_off(bs, 0, widx), bwl * bhl);
     else memcpy(mask, wedge_tab + smooth_off(sg, bs), bwl * bhl);
+    for (int i = 0; i < bwl * bhl; i++) hsh = fnv(hsh, mask[i]);
     aom_highbd_blend_a64_mask_c(CONVERT_TO_BYTEPTR(dst), w, CONVERT_TO_BYTEPTR(c0), w, CONVERT_TO_BYTEPTR(c1), w, mask, bwl, w, h, ssx, ssy, bd);
     free(c0); free(c1);
   }
