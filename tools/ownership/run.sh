@@ -72,7 +72,7 @@ expect_rc fir_clo_freed check 0
 has_reuse() {
   case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
   local n
-  n=$(FIRN_OWN_STATS=1 "$FIRNC" --no-cache --ownership=on "$C/$1.fi" -o "$D/$1_stats" 2>&1 | sed -n 's/.* \([0-9]*\) reuses.*/\1/p' | tail -1)
+  n=$(FIRN_OWN_STATS=1 "$FIRNC" ${OWN_NO_CACHE---no-cache} --ownership=on "$C/$1.fi" -o "$D/$1_stats" 2>&1 | sed -n 's/.* \([0-9]*\) reuses.*/\1/p' | tail -1)
   if [ "${n:-0}" -gt 0 ]; then pass=$((pass + 1)); else echo "FAIL $1: no reuse"; fail=$((fail + 1)); fi
 }
 for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; do
@@ -80,6 +80,7 @@ for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; d
   has_reuse "$c"
 done
 same_out fir_mt_loop
+[ -n "${OWN_FORK:-}" ] && same_out fork_mt_par
 expect_rc fir_mt_freed on 0
 expect_rc fir_mt_freed check 0
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
