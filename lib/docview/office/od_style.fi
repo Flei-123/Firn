@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_pr
+import docview.office.dx_style
+import docview.office.od_units
+
+export {
+    OdStyles, CellStyle, CK_CELL, CK_COLUMN, CK_ROW, CK_TABLE,
+    od_new, od_free, od_load_styles, cell_style_find, border_of,
+}
+
+const CK_CELL: i32 = 0
+const CK_COLUMN: i32 = 1
+const CK_ROW: i32 = 2
+const CK_TABLE: i32 = 3
+const MAX_CELL_STYLES: usize = 20000
+
+struct CellStyle {
+    name_off: u32,
+    name_n: u32,
+    kind: i32,
+    shade: u32,
+    bt: dx_props.Border,
+    bl: dx_props.Border,
+    bb: dx_props.Border,
+    br: dx_props.Border,
+    size: i32,
+    exact: bool,
+    align: i32,
+    parent_off: u32,
+    parent_n: u32,
+}
+
+struct OdStyles {
+    st: dx_style.Styles,
+    cells: Vec[CellStyle],
+    pool: rt.Buf,
+}
+
+fn od_new() -> OdStyles {
+    var od: OdStyles = OdStyles { st: dx_style.styles_new(), cells: vec_new[CellStyle](), pool: rt.buf_new() }
+    od.st.dflt_rp.size_hp = 24
+    return od
+}
+
+fn od_free(od: *mut OdStyles) {
+    dx_style.styles_free(&(*od).st)
+    vec_free[CellStyle](&(*od).cells)
+    rt.buf_free(&(*od).pool)
+}
+
+fn pool_put(od: *mut OdStyles, s: str) -> u32 {
+    let off: usize = rt.buf_len(&(*od).pool)
+    rt.buf_push_bytes(&(*od).pool, s.p as u64, s.n)
+    return off as u32
+}
+
+fn pool_get(od: *mut OdStyles, off: u32, n: u32) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*od).pool) + (off as u64)), n: n as usize }
+}
+
+fn cell_style_find(od: *mut OdStyles, name: str, kind: i32) -> *mut CellStyle {
+    var i: usize = vec_len[CellStyle](&(*od).cells)
+    while i > 0 {
+        i = i - 1
+        let c: *mut CellStyle = vec_elem_ptr[CellStyle](&(*od).cells, i)
+        if (*c).kind == kind && pool_get(od, (*c).name_off, (*c).name_n) == name {
+            return c
+        }
+    }
+    return 0 as *mut CellStyle
+}
+
+fn border_of(v: str) -> dx_props.Border {
+    if v.n == 0 {
+        return dx_props.border_unset()
+    }
+    if v == "none" || v == "hidden" {
+        return dx_props.border_none()
+    }
+    var sz: i32 = 4
+    var col: u32 = 0xFF000000 as u32
+    var at: usize = 0
+    var tk: str = ""
+    var seen_w: bool = false
+    while at < v.n {
+        at = od_units.token(v, at, &tk)
+        if tk.n == 0 {
+            break
+        }
+        if rt.ld8(tk.p as u64, 0) == (35 as u8) {
+            let c: u32 = od_units.color(tk)
+            if c != 0 as u32 {
+                col = c
+            }
+        } else if !seen_w {
+            let tw: i64 = od_units.len_tw(tk, -1)
+            if tw >= 0 {
+                seen_w = true
+                var e: i64 = (tw * 2) / 5
+                if e < 1 { e = 1 }
+                if e > 200 { e = 200 }
+                sz = e as i32
+                if tw == 0 {
+                    return dx_props.border_none()
+                }
+            }
+        }
+    }
+    return dx_props.Border { sz: sz, color: col }
+}
+
+fn bg_of(v: str) -> u32 {
+    if v == "transparent" {
+        return 0 as u32
+    }
+    return od_units.color(v)
+}
+
+fn read_text_props(x: *mut xml.Doc, n: u32, rp: *mut dx_props.RunProps, base_hp: i32) {
+    if n == xml.NONE {
+        return
+    }
+    let fw: str = ooxml.attr_l(x, n, "font-weight")
+    if fw.n > 0 {
+        if fw == "bold" {
+            (*rp).bold = 1
+        } else if fw == "normal" {
+            (*rp).bold = 0
+        } else {
+            let wv: i64 = ooxml.parse_i64(fw, 400)
+            if wv >= 600 { (*rp).bold = 1 } else { (*rp).bold = 0 }
+        }
+    }
+    let fs: str = ooxml.attr_l(x, n, "font-style")
+    if fs.n > 0 {
+        if fs == "italic" || fs == "oblique" { (*rp).italic = 1 } else { (*rp).italic = 0 }
+    }
+    let us: str = ooxml.attr_l(x, n, "text-underline-style")
+    if us.n > 0 {
+        if us == "none" {
+            (*rp).underline = 0
+        } else if ooxml.attr_l(x, n, "text-underline-type") == "double" {
+            (*rp).underline = 2
+        } else {
+            (*rp).underline = 1
+        }
+    }
+    let ls: str = ooxml.attr_l(x, n, "text-line-through-style")
+    if ls.n > 0 {
+        if ls == "none" { (*rp).strike = 0 } else { (*rp).strike = 1 }
+    }
+    let pos: str = ooxml.attr_l(x, n, "text-position")
+    if pos.n > 0 {
+        if ooxml.starts_with(pos, "super") {
+            (*rp).vert = dx_props.VA_SUPER
+        } else if ooxml.starts_with(pos, "sub") {
+            (*rp).vert = dx_props.VA_SUB
+        } else {
+            var e: usize = 0
+            let pv: f64 = od_units.parse_num(pos, &e)
+            if e > 0 && pv > 0.0 {
+                (*rp).vert = dx_props.VA_SUPER
+            } else if e > 0 && pv < 0.0 {
+                (*rp).vert = dx_props.VA_SUB
+            } else {
+                (*rp).vert = dx_props.VA_BASE
+            }
+        }
+    }
+    let col: u32 = od_units.color(ooxml.attr_l(x, n, "color"))
+    if col != 0 as u32 {
+        (*rp).color = col
+    }
+    let bg: u32 = bg_of(ooxml.attr_l(x, n, "background-color"))
+    if bg != 0 as u32 {
+        (*rp).shade = bg
+    }
+    let sz: str = ooxml.attr_l(x, n, "font-size")
+    if sz.n > 0 {
+        let pc: f64 = od_units.percent(sz)
+        if pc >= 0.0 {
+            var hp: f64 = (base_hp as f64) * pc / 100.0
+            if hp < 2.0 { hp = 2.0 }
+            if hp > 1584.0 { hp = 1584.0 }
+            (*rp).size_hp = (hp + 0.5) as i32
+        } else {
+            let tw: i64 = od_units.len_tw(sz, 0)
+            if tw > 0 {
+                (*rp).size_hp = od_units.clamp_i(tw / 10, 2, 1584) as i32
+            }
+        }
+    }
+    var fname: str = ooxml.attr_l(x, n, "font-name")
+    if fname.n == 0 {
+        fname = ooxml.attr_l(x, n, "font-family")
+    }
+    if fname.n > 0 {
+        if dx_pr.is_mono_name(fname) { (*rp).mono = 1 } else { (*rp).mono = 0 }
+    }
+    let tt: str = ooxml.attr_l(x, n, "text-transform")
+    let fv: str = ooxml.attr_l(x, n, "font-variant")
+    if tt == "uppercase" || fv == "small-caps" {
+        (*rp).caps = 1
+    } else if tt == "none" || fv == "normal" {
+        (*rp).caps = 0
+    }
+}
+
+fn read_tabs(x: *mut xml.Doc, n: u32, pp: *mut dx_props.ParaProps) {
+    var t: u32 = ooxml.first_el(x, n)
+    var k: i32 = 0
+    while t != xml.NONE && (k as usize) < dx_props.MAX_TABS {
+        if ooxml.is_el(x, t, "tab-stop") {
+            let ty: str = ooxml.attr_l(x, t, "type")
+            var kind: i32 = dx_props.TAB_LEFT
+            if ty == "center" {
+                kind = dx_props.TAB_CENTER
+            } else if ty == "right" {
+                kind = dx_props.TAB_RIGHT
+            }
+            let p: i64 = od_units.len_tw(ooxml.attr_l(x, t, "position"), 0)
+            (*pp).tabs[k as usize] = dx_props.TabStop { pos: od_units.clamp_i(p, 0, 200000) as i32, kind: kind }
+            k = k + 1
+        }
+        t = ooxml.next_el(x, t)
+    }
+    (*pp).ntabs = k
+}
+
+fn side(x: *mut xml.Doc, n: u32, name: str, whole: str) -> i32 {
+    let v: str = ooxml.attr_l(x, n, name)
+    if v.n > 0 {
+        return od_units.clamp_i(od_units.len_tw(v, 0), -200000, 200000) as i32
+    }
+    if whole.n > 0 {
+        return od_units.clamp_i(od_units.len_tw(whole, 0), -200000, 200000) as i32
+    }
+    return dx_props.UNSET_T
+}
+
+fn read_para_props(x: *mut xml.Doc, n: u32, pp: *mut dx_props.ParaProps) {
+    if n == xml.NONE {
+        return
+    }
+    let al: str = ooxml.attr_l(x, n, "text-align")
+    if al.n > 0 {
+        if al == "center" {
+            (*pp).align = dx_props.ALIGN_CENTER
+        } else if al == "end" || al == "right" {
+            (*pp).align = dx_props.ALIGN_RIGHT
+        } else if al == "justify" {
+            (*pp).align = dx_props.ALIGN_JUSTIFY
+        } else {
+            (*pp).align = dx_props.ALIGN_LEFT
+        }
+    }
+    let m: str = ooxml.attr_l(x, n, "margin")
+    (*pp).left = side(x, n, "margin-left", m)
+    (*pp).right = side(x, n, "margin-right", m)
+    (*pp).before = side(x, n, "margin-top", m)
+    (*pp).after = side(x, n, "margin-bottom", m)
+    let ti: str = ooxml.attr_l(x, n, "text-indent")
+    if ti.n > 0 {
+        (*pp).first = od_units.clamp_i(od_units.len_tw(ti, 0), -200000, 200000) as i32
+    }
+    let lh: str = ooxml.attr_l(x, n, "line-height")
+    if lh.n > 0 {
+        let pc: f64 = od_units.percent(lh)
+        if pc >= 0.0 {
+            (*pp).line = od_units.clamp_i((pc * 2.4 + 0.5) as i64, 24, 24000) as i32
+            (*pp).rule = dx_props.RULE_AUTO
+        } else if lh != "normal" {
+            (*pp).line = od_units.clamp_i(od_units.len_tw(lh, 240), 20, 20000) as i32
+            (*pp).rule = dx_props.RULE_EXACT
+        }
+    }
+    let la: str = ooxml.attr_l(x, n, "line-height-at-least")
+    if la.n > 0 {
+        (*pp).line = od_units.clamp_i(od_units.len_tw(la, 240), 20, 20000) as i32
+        (*pp).rule = dx_props.RULE_ATLEAST
+    }
+    let bb: str = ooxml.attr_l(x, n, "break-before")
+    if bb.n > 0 {
+        if bb == "page" { (*pp).page_break_before = 1 } else { (*pp).page_break_before = 0 }
+    }
+    let kn: str = ooxml.attr_l(x, n, "keep-with-next")
+    if kn.n > 0 {
+        if kn == "always" { (*pp).keep_next = 1 } else { (*pp).keep_next = 0 }
+    }
+    let kt: str = ooxml.attr_l(x, n, "keep-together")
+    if kt.n > 0 {
+        if kt == "always" { (*pp).keep_lines = 1 } else { (*pp).keep_lines = 0 }
+    }
+    let bg: u32 = bg_of(ooxml.attr_l(x, n, "background-color"))
+    if bg != 0 as u32 {
+        (*pp).shade = bg
+    }
+    let ts: u32 = ooxml.child_l(x, n, "tab-stops")
+    if ts != xml.NONE {
+        read_tabs(x, ts, pp)
+    }
+}
+
+fn parent_hp(od: *mut OdStyles, parent: str) -> i32 {
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    dx_style.resolve_para(&(*od).st, parent, &rp, &pp)
+    if rp.size_hp > 0 {
+        return rp.size_hp
+    }
+    return 24
+}
+
+fn add_cell_style(od: *mut OdStyles, x: *mut xml.Doc, n: u32, name: str, parent: str, kind: i32) {
+    if vec_len[CellStyle](&(*od).cells) >= MAX_CELL_STYLES {
+        return
+    }
+    var cs: CellStyle = CellStyle { name_off: pool_put(od, name), name_n: name.n as u32, kind: kind, shade: 0 as u32,
+        bt: dx_props.border_unset(), bl: dx_props.border_unset(), bb: dx_props.border_unset(), br: dx_props.border_unset(),
+        size: 0, exact: false, align: -1, parent_off: pool_put(od, parent), parent_n: parent.n as u32 }
+    if kind == CK_CELL {
+        let p: u32 = ooxml.child_l(x, n, "table-cell-properties")
+        if p != xml.NONE {
+            cs.shade = bg_of(ooxml.attr_l(x, p, "background-color"))
+            let all: dx_props.Border = border_of(ooxml.attr_l(x, p, "border"))
+            cs.bt = all
+            cs.bl = all
+            cs.bb = all
+            cs.br = all
+            var v: str = ooxml.attr_l(x, p, "border-top")
+            if v.n > 0 { cs.bt = border_of(v) }
+            v = ooxml.attr_l(x, p, "border-left")
+            if v.n > 0 { cs.bl = border_of(v) }
+            v = ooxml.attr_l(x, p, "border-bottom")
+            if v.n > 0 { cs.bb = border_of(v) }
+            v = ooxml.attr_l(x, p, "border-right")
+            if v.n > 0 { cs.br = border_of(v) }
+        }
+    } else if kind == CK_COLUMN {
+        let p2: u32 = ooxml.child_l(x, n, "table-column-properties")
+        if p2 != xml.NONE {
+            cs.size = od_units.clamp_i(od_units.len_tw(ooxml.attr_l(x, p2, "column-width"), 0), 0, 200000) as i32
+        }
+    } else if kind == CK_ROW {
+        let p3: u32 = ooxml.child_l(x, n, "table-row-properties")
+        if p3 != xml.NONE {
+            var h: i64 = od_units.len_tw(ooxml.attr_l(x, p3, "row-height"), 0)
+            if h > 0 {
+                cs.exact = true
+            } else {
+                h = od_units.len_tw(ooxml.attr_l(x, p3, "min-row-height"), 0)
+            }
+            cs.size = od_units.clamp_i(h, 0, 100000) as i32
+        }
+    } else {
+        let p4: u32 = ooxml.child_l(x, n, "table-properties")
+        if p4 != xml.NONE {
+            cs.size = od_units.clamp_i(od_units.len_tw(ooxml.attr_l(x, p4, "width"), 0), 0, 200000) as i32
+            let a: str = ooxml.attr_l(x, p4, "align")
+            if a == "center" {
+                cs.align = dx_props.ALIGN_CENTER
+            } else if a == "right" {
+                cs.align = dx_props.ALIGN_RIGHT
+            } else if a == "left" || a == "margins" {
+                cs.align = dx_props.ALIGN_LEFT
+            }
+        }
+    }
+    vec_push[CellStyle](&(*od).cells, cs)
+}
+
+fn add_text_style(od: *mut OdStyles, x: *mut xml.Doc, n: u32, name: str, parent: str, kind: u32) {
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    let base: i32 = parent_hp(od, parent)
+    read_text_props(x, ooxml.child_l(x, n, "text-properties"), &rp, base)
+    if kind == dx_style.ST_PARA {
+        read_para_props(x, ooxml.child_l(x, n, "paragraph-properties"), &pp)
+    }
+    dx_style.style_add(&(*od).st, name, parent, kind, rp, pp, dx_props.tbl_unset())
+}
+
+fn load_style(od: *mut OdStyles, x: *mut xml.Doc, n: u32) {
+    let name: str = ooxml.attr_l(x, n, "name")
+    let family: str = ooxml.attr_l(x, n, "family")
+    let parent: str = ooxml.attr_l(x, n, "parent-style-name")
+    if name.n == 0 {
+        return
+    }
+    if family == "paragraph" {
+        add_text_style(od, x, n, name, parent, dx_style.ST_PARA)
+    } else if family == "text" {
+        add_text_style(od, x, n, name, parent, dx_style.ST_CHAR)
+    } else if family == "table-cell" {
+        add_cell_style(od, x, n, name, parent, CK_CELL)
+    } else if family == "table-column" {
+        add_cell_style(od, x, n, name, parent, CK_COLUMN)
+    } else if family == "table-row" {
+        add_cell_style(od, x, n, name, parent, CK_ROW)
+    } else if family == "table" {
+        add_cell_style(od, x, n, name, parent, CK_TABLE)
+    }
+}
+
+fn od_load_styles(od: *mut OdStyles, x: *mut xml.Doc, parent: u32) {
+    if parent == xml.NONE {
+        return
+    }
+    var c: u32 = ooxml.first_el(x, parent)
+    while c != xml.NONE {
+        if ooxml.is_el(x, c, "default-style") {
+            if ooxml.attr_l(x, c, "family") == "paragraph" {
+                read_text_props(x, ooxml.child_l(x, c, "text-properties"), &(*od).st.dflt_rp, 24)
+                read_para_props(x, ooxml.child_l(x, c, "paragraph-properties"), &(*od).st.dflt_pp)
+            }
+        } else if ooxml.is_el(x, c, "style") {
+            load_style(od, x, c)
+        }
+        c = ooxml.next_el(x, c)
+    }
+}

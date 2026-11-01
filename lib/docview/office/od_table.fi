@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.xml
+import std.vec
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.od_units
+import docview.office.od_ctx
+import docview.office.od_style
+
+export { parse_table, BlocksFn }
+
+type BlocksFn = fn(*mut od_ctx.OdCtx, *mut dx_model.Docx, *mut xml.Doc, u32, *mut dx_model.BList, i32)
+
+struct TableState {
+    ncols: usize,
+    cols: [i32; 256],
+    vrem: [i32; 256],
+    vspan: [i32; 256],
+    fresh: [bool; 256],
+    ti: u32,
+    blocks: BlocksFn,
+    rows: usize,
+}
+
+fn gather_cols(c: *mut od_ctx.OdCtx, x: *mut xml.Doc, node: u32, ts: *mut TableState, depth: i32) {
+    if depth > 4 {
+        return
+    }
+    var ch: u32 = ooxml.first_el(x, node)
+    while ch != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, ch))
+        if nm == "table-column" {
+            let rep: i64 = od_units.clamp_i(ooxml.attr_i64(x, ch, "number-columns-repeated", 1), 1, 256)
+            let cs: *mut od_style.CellStyle = od_style.cell_style_find((*c).od, ooxml.attr_l(x, ch, "style-name"), od_style.CK_COLUMN)
+            var w: i32 = 0
+            if (cs as u64) != 0 {
+                w = (*cs).size
+            }
+            var r: i64 = 0
+            while r < rep && (*ts).ncols < 256 {
+                (*ts).cols[(*ts).ncols] = w
+                (*ts).ncols = (*ts).ncols + 1
+                r = r + 1
+            }
+        } else if nm == "table-columns" || nm == "table-header-columns" || nm == "table-column-group" {
+            gather_cols(c, x, ch, ts, depth + 1)
+        }
+        ch = ooxml.next_el(x, ch)
+    }
+}
+
+fn fix_widths(c: *mut od_ctx.OdCtx, ts: *mut TableState, table_w: i32) {
+    var sum: i64 = 0
+    var known: i64 = 0
+    var i: usize = 0
+    while i < (*ts).ncols {
+        if (*ts).cols[i] > 0 {
+            sum = sum + ((*ts).cols[i] as i64)
+            known = known + 1
+        }
+        i = i + 1
+    }
+    var avg: i64 = 0
+    if known > 0 {
+        avg = sum / known
+    } else if (*ts).ncols > 0 {
+        var tw: i64 = (*c).text_w as i64
+        if table_w > 0 {
+            tw = table_w as i64
+        }
+        avg = tw / ((*ts).ncols as i64)
+    }
+    if avg < 200 { avg = 200 }
+    i = 0
+    while i < (*ts).ncols {
+        if (*ts).cols[i] <= 0 {
+            (*ts).cols[i] = avg as i32
+        }
+        i = i + 1
+    }
+}
+
+fn span_width(ts: *mut TableState, col: usize, span: usize) -> i32 {
+    var w: i64 = 0
+    var k: usize = 0
+    while k < span && col + k < (*ts).ncols {
+        w = w + ((*ts).cols[col + k] as i64)
+        k = k + 1
+    }
+    return od_units.clamp_i(w, 0, 200000) as i32
+}
+
+fn fill_cell_style(c: *mut od_ctx.OdCtx, x: *mut xml.Doc, tc: u32, ce: *mut dx_model.Cell) {
+    let cs: *mut od_style.CellStyle = od_style.cell_style_find((*c).od, ooxml.attr_l(x, tc, "style-name"), od_style.CK_CELL)
+    if (cs as u64) == 0 {
+        return
+    }
+    (*ce).shade = (*cs).shade
+    (*ce).bt = (*cs).bt
+    (*ce).bl = (*cs).bl
+    (*ce).bb = (*cs).bb
+    (*ce).br = (*cs).br
+}
+
+fn parse_cell_blocks(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, tc: u32, ci: u32,
+    ts: *mut TableState, depth: i32) {
+    var bl: dx_model.BList = dx_model.blist_new()
+    (*c).table_depth = (*c).table_depth + 1
+    ((*ts).blocks)(c, d, x, tc, &bl, depth + 1)
+    (*c).table_depth = (*c).table_depth - 1
+    if bl.head == dx_model.NIL {
+        add_blank(c, d, &bl)
+    }
+    (*dx_model.cell_at(d, ci)).blocks = bl
+}
+
+fn add_blank(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, bl: *mut dx_model.BList) {
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    dx_props.pp_finish(&pp)
+    od_style_default(c, &rp, &pp)
+    dx_props.rp_finish(&rp)
+    let idx: u32 = dx_model.new_para(d, pp)
+    (*dx_model.para_at(d, idx)).base_rp = rp
+    dx_model.block_add(d, bl, dx_model.B_PARA, idx, (*c).sect_idx)
+}
+
+fn od_style_default(c: *mut od_ctx.OdCtx, rp: *mut dx_props.RunProps, pp: *mut dx_props.ParaProps) {
+    dx_props.rp_apply(rp, &(*(*c).od).st.dflt_rp)
+    var tmp: dx_props.ParaProps = dx_props.pp_unset()
+    dx_props.pp_apply(&tmp, &(*(*c).od).st.dflt_pp)
+    dx_props.pp_finish(&tmp)
+    *pp = tmp
+}
+
+fn parse_row(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, tr: u32, header: bool,
+    ts: *mut TableState, depth: i32) {
+    if vec_len[dx_model.Cell](&(*d).cells) >= dx_model.MAX_CELLS {
+        (*d).truncated = true
+        return
+    }
+    let ri: u32 = dx_model.new_row(d, (*ts).ti)
+    (*ts).rows = (*ts).rows + 1
+    let rs: *mut od_style.CellStyle = od_style.cell_style_find((*c).od, ooxml.attr_l(x, tr, "style-name"), od_style.CK_ROW)
+    if (rs as u64) != 0 {
+        (*dx_model.row_at(d, ri)).height = (*rs).size
+        (*dx_model.row_at(d, ri)).exact = (*rs).exact
+    }
+    (*dx_model.row_at(d, ri)).header = header
+    var k: usize = 0
+    while k < 256 {
+        (*ts).fresh[k] = false
+        k = k + 1
+    }
+    var col: usize = 0
+    var tc: u32 = ooxml.first_el(x, tr)
+    while tc != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, tc))
+        let normal: bool = nm == "table-cell"
+        if normal || nm == "covered-table-cell" {
+            let rep: i64 = od_units.clamp_i(ooxml.attr_i64(x, tc, "number-columns-repeated", 1), 1, 64)
+            var r: i64 = 0
+            while r < rep && col < (*ts).ncols {
+                if normal {
+                    if vec_len[dx_model.Cell](&(*d).cells) >= dx_model.MAX_CELLS {
+                        (*d).truncated = true
+                        return
+                    }
+                    var span: i64 = od_units.clamp_i(ooxml.attr_i64(x, tc, "number-columns-spanned", 1), 1, 64)
+                    if col + (span as usize) > (*ts).ncols {
+                        span = ((*ts).ncols - col) as i64
+                    }
+                    let rspan: i64 = od_units.clamp_i(ooxml.attr_i64(x, tc, "number-rows-spanned", 1), 1, 500)
+                    let ci: u32 = dx_model.new_cell(d, ri)
+                    let ce: *mut dx_model.Cell = dx_model.cell_at(d, ci)
+                    (*ce).span = span as i32
+                    (*ce).width = span_width(ts, col, span as usize)
+                    if rspan > 1 {
+                        (*ce).vmerge = 1
+                    }
+                    fill_cell_style(c, x, tc, ce)
+                    var j: usize = 0
+                    while j < (span as usize) {
+                        (*ts).fresh[col + j] = true
+                        if rspan > 1 {
+                            (*ts).vrem[col + j] = (rspan - 1) as i32
+                        } else {
+                            (*ts).vrem[col + j] = 0
+                        }
+                        (*ts).vspan[col + j] = 0
+                        j = j + 1
+                    }
+                    if rspan > 1 {
+                        (*ts).vspan[col] = span as i32
+                    }
+                    parse_cell_blocks(c, d, x, tc, ci, ts, depth)
+                } else if (*ts).vrem[col] > 0 && !(*ts).fresh[col] {
+                    if (*ts).vspan[col] > 0 {
+                        let sp: usize = (*ts).vspan[col] as usize
+                        let ci2: u32 = dx_model.new_cell(d, ri)
+                        let ce2: *mut dx_model.Cell = dx_model.cell_at(d, ci2)
+                        (*ce2).span = sp as i32
+                        (*ce2).width = span_width(ts, col, sp)
+                        (*ce2).vmerge = 2
+                        var bl: dx_model.BList = dx_model.blist_new()
+                        add_blank(c, d, &bl)
+                        (*dx_model.cell_at(d, ci2)).blocks = bl
+                    }
+                    (*ts).vrem[col] = (*ts).vrem[col] - 1
+                }
+                col = col + 1
+                r = r + 1
+            }
+        }
+        tc = ooxml.next_el(x, tc)
+    }
+}
+
+fn walk_rows(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, node: u32, header: bool,
+    ts: *mut TableState, depth: i32) {
+    if depth > 8 {
+        return
+    }
+    var ch: u32 = ooxml.first_el(x, node)
+    while ch != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, ch))
+        if nm == "table-row" {
+            let rep: i64 = od_units.clamp_i(ooxml.attr_i64(x, ch, "number-rows-repeated", 1), 1, od_ctx.MAX_ROW_REPEAT)
+            var r: i64 = 0
+            while r < rep {
+                parse_row(c, d, x, ch, header, ts, depth)
+                r = r + 1
+            }
+        } else if nm == "table-header-rows" {
+            walk_rows(c, d, x, ch, true, ts, depth + 1)
+        } else if nm == "table-rows" || nm == "table-row-group" {
+            walk_rows(c, d, x, ch, header, ts, depth + 1)
+        }
+        ch = ooxml.next_el(x, ch)
+    }
+}
+
+fn parse_table(c: *mut od_ctx.OdCtx, d: *mut dx_model.Docx, x: *mut xml.Doc, t: u32, list: *mut dx_model.BList,
+    depth: i32, blocks: BlocksFn) {
+    if (*c).table_depth >= od_ctx.MAX_TABLE_DEPTH {
+        return
+    }
+    var tp: dx_props.TblProps = dx_props.tbl_unset()
+    var table_w: i32 = 0
+    let cs: *mut od_style.CellStyle = od_style.cell_style_find((*c).od, ooxml.attr_l(x, t, "style-name"), od_style.CK_TABLE)
+    if (cs as u64) != 0 {
+        if (*cs).align >= 0 {
+            tp.align = (*cs).align
+        }
+        table_w = (*cs).size
+    }
+    let ti: u32 = dx_model.new_table(d, tp)
+    var ts: TableState = TableState { ncols: 0, cols: [0; 256], vrem: [0; 256], vspan: [0; 256],
+        fresh: [false; 256], ti: ti, blocks: blocks, rows: 0 }
+    gather_cols(c, x, t, &ts, 0)
+    if ts.ncols == 0 {
+        var probe: u32 = ooxml.first_el(x, t)
+        while probe != xml.NONE && ts.ncols == 0 {
+            if ooxml.is_el(x, probe, "table-row") {
+                var cc: u32 = ooxml.first_el(x, probe)
+                var cnt: usize = 0
+                while cc != xml.NONE {
+                    cnt = cnt + 1
+                    cc = ooxml.next_el(x, cc)
+                }
+                if cnt > 256 { cnt = 256 }
+                ts.ncols = cnt
+            }
+            probe = ooxml.next_el(x, probe)
+        }
+    }
+    if ts.ncols == 0 {
+        return
+    }
+    fix_widths(c, &ts, table_w)
+    var i: usize = 0
+    while i < ts.ncols {
+        vec_push[i32](&(*d).grid, ts.cols[i])
+        i = i + 1
+    }
+    (*dx_model.table_at(d, ti)).gn = ts.ncols as u32
+    dx_model.block_add(d, list, dx_model.B_TABLE, ti, (*c).sect_idx)
+    walk_rows(c, d, x, t, false, &ts, 0)
+}
