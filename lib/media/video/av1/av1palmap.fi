@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1cdfidx
+import media.video.av1.av1sym
+import media.video.av1.av1palette
+
+export { palette_tokens, palette_predict, MAP_STRIDE }
+
+const MAP_STRIDE: i64 = 64
+
+fn lit(td: *mut av1blkst.TileDec, n: i64) -> i64 {
+    return av1sym.sym_literal(&(*td).sym, n)
+}
+
+fn read_ns(td: *mut av1blkst.TileDec, n: i64) -> i64 {
+    var w: i64 = 0
+    var x: i64 = n
+    while x != 0 {
+        x = x >> 1
+        w = w + 1
+    }
+    let m: i64 = (1 << (w as u64)) - n
+    let v: i64 = lit(td, w - 1)
+    if v < m {
+        return v
+    }
+    return (v << 1) - m + lit(td, 1)
+}
+
+fn hash_ctx(h: i64) -> i64 {
+    if h == 2 {
+        return 0
+    }
+    if h == 5 {
+        return 4
+    }
+    if h == 6 {
+        return 3
+    }
+    if h == 7 {
+        return 2
+    }
+    if h == 8 {
+        return 1
+    }
+    return 0 - 1
+}
+
+fn color_context(td: *mut av1blkst.TileDec, map: u64, r: i64, c: i64, n: i64) -> i64 {
+    var i: usize = 0
+    while i < 8 {
+        (*td).pal_scores[i] = 0
+        (*td).pal_order[i] = i as i64
+        i = i + 1
+    }
+    if c > 0 {
+        (*td).pal_scores[av1blkst.ld(map, r * MAP_STRIDE + c - 1) as usize] += 2
+    }
+    if r > 0 && c > 0 {
+        (*td).pal_scores[av1blkst.ld(map, (r - 1) * MAP_STRIDE + c - 1) as usize] += 1
+    }
+    if r > 0 {
+        (*td).pal_scores[av1blkst.ld(map, (r - 1) * MAP_STRIDE + c) as usize] += 2
+    }
+    var a: i64 = 0
+    while a < 3 {
+        var max_score: i64 = (*td).pal_scores[a as usize]
+        var max_idx: i64 = a
+        var j: i64 = a + 1
+        while j < n {
+            if (*td).pal_scores[j as usize] > max_score {
+                max_score = (*td).pal_scores[j as usize]
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != a {
+            let max_order: i64 = (*td).pal_order[max_idx as usize]
+            var k: i64 = max_idx
+            while k > a {
+                (*td).pal_scores[k as usize] = (*td).pal_scores[(k - 1) as usize]
+                (*td).pal_order[k as usize] = (*td).pal_order[(k - 1) as usize]
+                k = k - 1
+            }
+            (*td).pal_scores[a as usize] = max_score
+            (*td).pal_order[a as usize] = max_order
+        }
+        a = a + 1
+    }
+    let h: i64 = (*td).pal_scores[0] + (*td).pal_scores[1] * 2 + (*td).pal_scores[2] * 2
+    return hash_ctx(h)
+}
+
+fn read_map(td: *mut av1blkst.TileDec, map: u64, size: i64, cdf: usize, bw: i64, bh: i64, ow: i64, oh: i64) -> i64 {
+    av1blkst.st(map, 0, read_ns(td, size))
+    var i: i64 = 1
+    while i < oh + ow - 1 {
+        var j: i64 = i
+        if j > ow - 1 {
+            j = ow - 1
+        }
+        var jmin: i64 = i - oh + 1
+        if jmin < 0 {
+            jmin = 0
+        }
+        while j >= jmin {
+            let ctx: i64 = color_context(td, map, i - j, j, size)
+            if ctx < 0 {
+                return av1blkst.TD_ERR
+            }
+            let sym: i64 = av1blkst.rd_sym(td, cdf + ((size - 2) * 45 + ctx * 9) as usize, size)
+            av1blkst.st(map, (i - j) * MAP_STRIDE + j, (*td).pal_order[sym as usize])
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var y: i64 = 0
+    while y < oh {
+        var x: i64 = ow
+        while x < bw {
+            av1blkst.st(map, y * MAP_STRIDE + x, av1blkst.ld(map, y * MAP_STRIDE + ow - 1))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    y = oh
+    while y < bh {
+        var x: i64 = 0
+        while x < bw {
+            av1blkst.st(map, y * MAP_STRIDE + x, av1blkst.ld(map, (oh - 1) * MAP_STRIDE + x))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return av1blkst.TD_OK
+}
+
+fn palette_tokens(td: *mut av1blkst.TileDec) -> i64 {
+    if (*td).pal_size_y == 0 && (*td).pal_size_uv == 0 {
+        return av1blkst.TD_OK
+    }
+    let ms: i64 = (*td).mi_size
+    let bh: i64 = av1blkdat.bh_px(ms)
+    let bw: i64 = av1blkdat.bw_px(ms)
+    var oh: i64 = (*td).mi_rows - (*td).mi_row
+    oh = oh * 4
+    if oh > bh {
+        oh = bh
+    }
+    var ow: i64 = ((*td).mi_cols - (*td).mi_col) * 4
+    if ow > bw {
+        ow = bw
+    }
+    if (*td).pal_size_y > 0 {
+        let rc: i64 = read_map(td, (*td).map_y, (*td).pal_size_y, av1cdfidx.CDF_PALETTE_Y_COLOR_INDEX, bw, bh, ow, oh)
+        if rc != av1blkst.TD_OK {
+            return rc
+        }
+    }
+    if (*td).pal_size_uv > 0 {
+        var cbw: i64 = bw >> ((*td).ss_x as u64)
+        var cbh: i64 = bh >> ((*td).ss_y as u64)
+        var cow: i64 = ow >> ((*td).ss_x as u64)
+        var coh: i64 = oh >> ((*td).ss_y as u64)
+        if cbw < 4 {
+            cbw = cbw + 2
+            cow = cow + 2
+        }
+        if cbh < 4 {
+            cbh = cbh + 2
+            coh = coh + 2
+        }
+        return read_map(td, (*td).map_uv, (*td).pal_size_uv, av1cdfidx.CDF_PALETTE_UV_COLOR_INDEX, cbw, cbh, cow, coh)
+    }
+    return av1blkst.TD_OK
+}
+
+fn palette_predict(td: *mut av1blkst.TileDec, buf: u64, stride: i64, plane: i64) {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    var map: u64 = (*td).map_y
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+        map = (*td).map_uv
+    }
+    let x0: i64 = (*td).ev_x - ((*td).mi_col >> (sx as u64)) * 4
+    let y0: i64 = (*td).ev_y - ((*td).mi_row >> (sy as u64)) * 4
+    var i: i64 = 0
+    while i < (*td).ev_th {
+        var j: i64 = 0
+        while j < (*td).ev_tw {
+            let idx: i64 = av1blkst.ld(map, (y0 + i) * MAP_STRIDE + x0 + j)
+            let v: i64 = av1palette.get_color(td, plane, idx)
+            vp9mem.st16(buf, (((*td).ev_y + i) * stride + (*td).ev_x + j) as usize, v)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}

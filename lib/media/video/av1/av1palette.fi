@@ -1,0 +1,257 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1cdfidx
+import media.video.av1.av1sym
+
+export { palette_mode_info, palette_store, get_color }
+
+fn lit(td: *mut av1blkst.TileDec, n: i64) -> i64 {
+    return av1sym.sym_literal(&(*td).sym, n)
+}
+
+fn ceil_log2(x: i64) -> i64 {
+    if x < 2 {
+        return 0
+    }
+    var i: i64 = 1
+    var p: i64 = 2
+    while p < x {
+        i = i + 1
+        p = p * 2
+    }
+    return i
+}
+
+fn get_color(td: *mut av1blkst.TileDec, plane: i64, i: i64) -> i64 {
+    if plane == 0 {
+        return (*td).pal_y[i as usize]
+    }
+    if plane == 1 {
+        return (*td).pal_u[i as usize]
+    }
+    return (*td).pal_v[i as usize]
+}
+
+fn set_color(td: *mut av1blkst.TileDec, plane: i64, i: i64, v: i64) {
+    if plane == 0 {
+        (*td).pal_y[i as usize] = v
+    } else if plane == 1 {
+        (*td).pal_u[i as usize] = v
+    } else {
+        (*td).pal_v[i as usize] = v
+    }
+}
+
+fn sort_colors(td: *mut av1blkst.TileDec, plane: i64, n: i64) {
+    var i: i64 = 1
+    while i < n {
+        let v: i64 = get_color(td, plane, i)
+        var j: i64 = i - 1
+        while j >= 0 && get_color(td, plane, j) > v {
+            set_color(td, plane, j + 1, get_color(td, plane, j))
+            j = j - 1
+        }
+        set_color(td, plane, j + 1, v)
+        i = i + 1
+    }
+}
+
+fn neighbor_size(td: *mut av1blkst.TileDec, plane: i64, r: i64, c: i64) -> i64 {
+    if plane == 0 {
+        return av1blkst.mi_get(td, (*td).paly_a, r, c)
+    }
+    return av1blkst.mi_get(td, (*td).paluv_a, r, c)
+}
+
+fn neighbor_color(td: *mut av1blkst.TileDec, plane: i64, r: i64, c: i64, k: i64) -> i64 {
+    let base: u64 = (*td).palc_a + ((r * (*td).mi_cols + c) * 32) as u64
+    return vp9mem.ld16(base, (plane * 8 + k) as usize)
+}
+
+fn push_cache(td: *mut av1blkst.TileDec, n: i64, v: i64) -> i64 {
+    if n == 0 || (*td).pal_cache[(n - 1) as usize] != v {
+        (*td).pal_cache[n as usize] = v
+        return n + 1
+    }
+    return n
+}
+
+fn get_cache(td: *mut av1blkst.TileDec, plane: i64) -> i64 {
+    var above_n: i64 = 0
+    var left_n: i64 = 0
+    let r: i64 = (*td).mi_row
+    let c: i64 = (*td).mi_col
+    if ((r * 4) & 63) != 0 && (*td).avail_u != 0 {
+        above_n = neighbor_size(td, plane, r - 1, c)
+    }
+    if (*td).avail_l != 0 {
+        left_n = neighbor_size(td, plane, r, c - 1)
+    }
+    var ai: i64 = 0
+    var li: i64 = 0
+    var n: i64 = 0
+    while ai < above_n && li < left_n {
+        let ac: i64 = neighbor_color(td, plane, r - 1, c, ai)
+        let lc: i64 = neighbor_color(td, plane, r, c - 1, li)
+        if lc < ac {
+            n = push_cache(td, n, lc)
+            li = li + 1
+        } else {
+            n = push_cache(td, n, ac)
+            ai = ai + 1
+            if lc == ac {
+                li = li + 1
+            }
+        }
+    }
+    while ai < above_n {
+        n = push_cache(td, n, neighbor_color(td, plane, r - 1, c, ai))
+        ai = ai + 1
+    }
+    while li < left_n {
+        n = push_cache(td, n, neighbor_color(td, plane, r, c - 1, li))
+        li = li + 1
+    }
+    return n
+}
+
+fn read_plane_colors(td: *mut av1blkst.TileDec, plane: i64, size: i64) {
+    let bd: i64 = (*td).bit_depth
+    let cache_n: i64 = get_cache(td, plane)
+    var idx: i64 = 0
+    var i: i64 = 0
+    while i < cache_n && idx < size {
+        if lit(td, 1) == 1 {
+            set_color(td, plane, idx, (*td).pal_cache[i as usize])
+            idx = idx + 1
+        }
+        i = i + 1
+    }
+    if idx < size {
+        set_color(td, plane, idx, lit(td, bd))
+        idx = idx + 1
+    }
+    var bits: i64 = 0
+    if idx < size {
+        bits = bd - 3 + lit(td, 2)
+    }
+    var minv: i64 = 1
+    if plane == 1 {
+        minv = 0
+    }
+    let maxc: i64 = (1 << (bd as u64)) - 1
+    while idx < size {
+        var v: i64 = get_color(td, plane, idx - 1) + lit(td, bits) + minv
+        if v > maxc {
+            v = maxc
+        }
+        set_color(td, plane, idx, v)
+        let range: i64 = (1 << (bd as u64)) - v - minv
+        let cl: i64 = ceil_log2(range)
+        if cl < bits {
+            bits = cl
+        }
+        idx = idx + 1
+    }
+    sort_colors(td, plane, size)
+}
+
+fn read_v_colors(td: *mut av1blkst.TileDec, size: i64) {
+    let bd: i64 = (*td).bit_depth
+    var idx: i64 = 0
+    if lit(td, 1) == 1 {
+        let bits: i64 = bd - 4 + lit(td, 2)
+        let maxv: i64 = 1 << (bd as u64)
+        set_color(td, 2, 0, lit(td, bd))
+        idx = 1
+        while idx < size {
+            var d: i64 = lit(td, bits)
+            if d != 0 && lit(td, 1) == 1 {
+                d = 0 - d
+            }
+            var v: i64 = get_color(td, 2, idx - 1) + d
+            if v < 0 {
+                v = v + maxv
+            }
+            if v >= maxv {
+                v = v - maxv
+            }
+            set_color(td, 2, idx, v)
+            idx = idx + 1
+        }
+    } else {
+        while idx < size {
+            set_color(td, 2, idx, lit(td, bd))
+            idx = idx + 1
+        }
+    }
+}
+
+fn palette_mode_info(td: *mut av1blkst.TileDec) {
+    let ms: i64 = (*td).mi_size
+    if ms < av1blkdat.BLOCK_8X8 || av1blkdat.bw_px(ms) > 64 || av1blkdat.bh_px(ms) > 64 {
+        return
+    }
+    if (*(*td).fh).allow_screen_content_tools == 0 {
+        return
+    }
+    let bctx: i64 = av1blkdat.bw_log2(ms) + av1blkdat.bh_log2(ms) - 2
+    if (*td).y_mode == av1blkdat.DC_PRED {
+        var ctx: i64 = 0
+        if (*td).avail_u != 0 && av1blkst.mi_get(td, (*td).paly_a, (*td).mi_row - 1, (*td).mi_col) > 0 {
+            ctx = ctx + 1
+        }
+        if (*td).avail_l != 0 && av1blkst.mi_get(td, (*td).paly_a, (*td).mi_row, (*td).mi_col - 1) > 0 {
+            ctx = ctx + 1
+        }
+        if av1blkst.rd_sym(td, av1cdfidx.CDF_PALETTE_Y_MODE + (bctx * 9 + ctx * 3) as usize, 2) == 1 {
+            (*td).pal_size_y = av1blkst.rd_sym(td, av1cdfidx.CDF_PALETTE_Y_SIZE + (bctx * 8) as usize, 7) + 2
+            read_plane_colors(td, 0, (*td).pal_size_y)
+        }
+    }
+    if (*td).has_chroma != 0 && (*td).uv_mode == av1blkdat.DC_PRED {
+        var ctx: i64 = 0
+        if (*td).pal_size_y > 0 {
+            ctx = 1
+        }
+        if av1blkst.rd_sym(td, av1cdfidx.CDF_PALETTE_UV_MODE + (ctx * 3) as usize, 2) == 1 {
+            (*td).pal_size_uv = av1blkst.rd_sym(td, av1cdfidx.CDF_PALETTE_UV_SIZE + (bctx * 8) as usize, 7) + 2
+            read_plane_colors(td, 1, (*td).pal_size_uv)
+            read_v_colors(td, (*td).pal_size_uv)
+        }
+    }
+    if (*td).pal_size_y > 0 || (*td).pal_size_uv > 0 {
+        (*td).n_palette = (*td).n_palette + 1
+    }
+}
+
+fn palette_store(td: *mut av1blkst.TileDec) {
+    if (*td).palc_a == 0 || ((*td).pal_size_y == 0 && (*td).pal_size_uv == 0) {
+        return
+    }
+    var y: i64 = 0
+    while y < (*td).bh4 {
+        var x: i64 = 0
+        while x < (*td).bw4 {
+            let r: i64 = (*td).mi_row + y
+            let c: i64 = (*td).mi_col + x
+            if r < (*td).mi_rows && c < (*td).mi_cols {
+                let base: u64 = (*td).palc_a + ((r * (*td).mi_cols + c) * 32) as u64
+                var k: i64 = 0
+                while k < (*td).pal_size_y {
+                    vp9mem.st16(base, k as usize, (*td).pal_y[k as usize])
+                    k = k + 1
+                }
+                k = 0
+                while k < (*td).pal_size_uv {
+                    vp9mem.st16(base, (8 + k) as usize, (*td).pal_u[k as usize])
+                    k = k + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
