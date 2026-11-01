@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.md5
 import std.crypto.aes
+import docview.pdf.crypt5
 import rt.rt
 
 export {
     Crypt,
     crypt_new, crypt_derive, crypt_active,
     crypt_stream, crypt_string,
-    MODE_NONE, MODE_RC4, MODE_AES,
+    MODE_NONE, MODE_RC4, MODE_AES, MODE_AES256,
 }
 
 const MODE_NONE: u32 = 0
 const MODE_RC4: u32 = 1
 const MODE_AES: u32 = 2
+const MODE_AES256: u32 = 3
 
 const MAX_ID: usize = 64
 
@@ -23,7 +25,7 @@ struct Crypt {
     stm_mode: u32,
     str_mode: u32,
     klen: u32,
-    key: [u8; 16],
+    key: [u8; 32],
     ready: bool,
 }
 
@@ -33,7 +35,7 @@ fn ld8(p: u64, i: usize) -> u8 {
 }
 
 fn crypt_new() -> Crypt {
-    return Crypt { stm_mode: MODE_NONE, str_mode: MODE_NONE, klen: 0, key: [0 as u8; 16], ready: false }
+    return Crypt { stm_mode: MODE_NONE, str_mode: MODE_NONE, klen: 0, key: [0 as u8; 32], ready: false }
 }
 
 fn crypt_active(c: *mut Crypt) -> bool {
@@ -186,8 +188,24 @@ fn verify_user(buf: *mut [u8; 256], r: u32, klen: usize, key: *mut [u8; 16],
 
 fn crypt_derive(c: *mut Crypt, v: u32, r: u32, lenbits: u32, p: u32,
     o: u64, on: usize, u: u64, un: usize, id: u64, idn: usize,
-    encmeta: bool, pw: u64, pwn: usize, stm: u32, strm: u32) -> bool {
-    if v >= 5 || r < 2 || r > 4 || on < 32 || un < 32 {
+    encmeta: bool, pw: u64, pwn: usize, stm: u32, strm: u32, ue: u64,
+    uen: usize, oe: u64, oen: usize) -> bool {
+    if v == 5 {
+        if r < 5 || r > 6 {
+            return false
+        }
+        var fk: [u8; 32] = [0 as u8; 32]
+        if !crypt5.c5_derive(r, pw, pwn, u, un, o, on, ue, uen, oe, oen, &fk) {
+            return false
+        }
+        (*c).klen = 32
+        (*c).key = fk
+        (*c).stm_mode = stm
+        (*c).str_mode = strm
+        (*c).ready = true
+        return true
+    }
+    if v > 5 || r < 2 || r > 4 || on < 32 || un < 32 {
         return false
     }
     var klen: usize = 5
@@ -214,7 +232,13 @@ fn crypt_derive(c: *mut Crypt, v: u32, r: u32, lenbits: u32, p: u32,
         return false
     }
     (*c).klen = klen as u32
-    (*c).key = key
+    var wide: [u8; 32] = [0 as u8; 32]
+    var wi: usize = 0
+    while wi < 16 {
+        wide[wi] = key[wi]
+        wi = wi + 1
+    }
+    (*c).key = wide
     (*c).stm_mode = stm
     (*c).str_mode = strm
     (*c).ready = true
@@ -251,11 +275,42 @@ fn object_key(c: *mut Crypt, num: usize, gen: usize, aes_mode: bool,
     return okl
 }
 
+fn decrypt_aes256(c: *mut Crypt, src: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if n < 32 || (n % 16) != 0 {
+        return false
+    }
+    let body: usize = n - 16
+    let start: usize = rt.buf_len(out)
+    rt.buf_push_bytes(out, src + 16, body)
+    var iv: [u8; 16] = [0 as u8; 16]
+    var i: usize = 0
+    while i < 16 {
+        iv[i] = ld8(src, i)
+        i = i + 1
+    }
+    var ctx: aes.Aes = aes.aes256_new_soft((&(*c).key[0]) as u64)
+    let at: u64 = rt.buf_ptr(out) + start as u64
+    if !aes.aes_cbc_decrypt_soft(&ctx, (&iv[0]) as u64, at, body, at) {
+        rt.buf_set_len(out, start)
+        return false
+    }
+    let padn: usize = ld8(at, body - 1) as usize
+    var plain: usize = body
+    if padn >= 1 && padn <= 16 {
+        plain = body - padn
+    }
+    rt.buf_set_len(out, start + plain)
+    return true
+}
+
 fn decrypt_with(c: *mut Crypt, mode: u32, num: usize, gen: usize,
     src: u64, n: usize, out: *mut rt.Buf) -> bool {
     if mode == MODE_NONE {
         rt.buf_push_bytes(out, src, n)
         return true
+    }
+    if mode == MODE_AES256 {
+        return decrypt_aes256(c, src, n, out)
     }
     var h: [u8; 16] = [0 as u8; 16]
     let okl: usize = object_key(c, num, gen, mode == MODE_AES, &h)
