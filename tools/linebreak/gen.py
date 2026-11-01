@@ -16,6 +16,9 @@ Usage: python3 tools/linebreak/gen.py [--check]
 """
 import hashlib, os, sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ucd"))
+import blobpack
+
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 LB = os.path.join(ROOT, "tools/linebreak/data/LineBreak.txt")
 EAW = os.path.join(ROOT, "tools/linebreak/data/EastAsianWidth.txt")
@@ -134,10 +137,10 @@ def render(ranges):
 
 
 if __name__ == "__main__":
-    text = render(build())
+    text = blobpack.to_blob(render(build()))
     if "--check" in sys.argv:
         same = os.path.exists(OUT) and open(OUT, encoding="utf-8").read() == text
         print("generated/linebreak_tables.fi %s" % ("up to date" if same else "STALE"))
         sys.exit(0 if same else 1)
     open(OUT, "w", encoding="utf-8").write(text)
-    print("wrote %s (%d ranges)" % (OUT, text.count("    w(p, ")))
+    print("wrote %s (%d ranges)" % (OUT, int(text.split("const RANGES: usize = ")[1].split()[0])))
