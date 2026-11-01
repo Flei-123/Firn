@@ -31,11 +31,11 @@ def read_step(out, name):
 def main():
     out = sys.argv[1]
     base = sys.argv[2] if len(sys.argv) > 2 else None
-    names = sorted(f[:-4] for f in os.listdir(out) if f.endswith(".rc"))
+    names = sorted(f[:-3] for f in os.listdir(out) if f.endswith(".rc"))
     steps = [read_step(out, n) for n in names]
     base_steps = {}
     if base:
-        base_steps = {s["step"]: s for s in (read_step(base, n) for n in sorted(f[:-4] for f in os.listdir(base) if f.endswith(".rc")))}
+        base_steps = {s["step"]: s for s in (read_step(base, n) for n in sorted(f[:-3] for f in os.listdir(base) if f.endswith(".rc")))}
     report = {"out": out, "base": base, "steps": []}
     for s in steps:
         b = base_steps.get(s["step"])

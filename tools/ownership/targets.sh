@@ -26,7 +26,7 @@ target_build() {
     binary_trees) "$FIRNC" --no-cache --ownership="$mode" --opt-level=release-fast "$OWN_ROOT/bench/firn_vs_c/firn/binary_trees.fi" -o "$d/bin" ;;
     fvc_*) "$FIRNC" --no-cache --ownership="$mode" --opt-level=release-fast "$OWN_ROOT/bench/firn_vs_c/firn/${n#fvc_}.fi" -o "$d/bin" ;;
     db_bench) "$FIRNC" --no-cache --ownership="$mode" --opt-level=release-fast "$OWN_ROOT/tools/db/bench.fi" -o "$d/bin" ;;
-    openplan_derive) (cd "$OP_DIR" && "$FIRNC" --no-cache --ownership="$mode" --opt-level=release-safe --package src/cli -o "$d/bin") ;;
+    openplan_derive) (cd "$OP_DIR" && FIRN_USE_AS=1 "$FIRNC" --no-cache --ownership="$mode" --opt-level=release-safe --package src/cli -o "$d/bin") ;;
     *) echo "unknown target $n" >&2; return 2 ;;
   esac
 }
