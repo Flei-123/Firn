@@ -129,6 +129,12 @@ Expected gain (estimates, to be checked by B4): OpenPlan derive -5 to -10 % inst
 - Correctness: `--ownership=check` over `tests/` (all 4 stages), GC suite, `tools/gc_soak` short run, the four loads.
 - Gates for the merge: Stage 2, fixpoint, self_compare shards, a64 run (pass is target independent, but free calls change codegen), `cargo test --release`.
 
+### 6.1 Check and bench harness (tools/ownership/)
+
+- `FIRNC_OWNERSHIP=off|on|check` sets the mode for every firnc0 call (the `--ownership=` flag wins; the mode is part of the build cache key; firnc1 ignores it).
+- `check_all.sh [--mode check] [--out DIR] [--base DIR] [--jobs N<=3] [step...]` runs the steps of `steps.txt` (all 12 `test.sh` stages, fixpoint, lib/db, OpenPlan derive, the 20 firn_vs_c programs, Osum kernel build) as separate heavy calls with `FIRNC_OWNERSHIP` set; `--summary` writes `results.tsv/json` (exit 86 and poison hits, new FAIL lines against `--base`, output md5 differences).
+- `bench.sh [--targets ...] [--runs N] [--cg ...]` builds off and on, interleaves the runs, and prints a table (callgrind Ir, median user time, max RSS, GC runs, pause max/sum, bytes allocated, output equality); the GC counters come from `gcdump.sh` (gdb at exit).
+
 ## Sources
 
 1. Reinking, Xie, de Moura, Leijen: Perceus: Garbage Free Reference Counting with Reuse, PLDI 2021 / MSR-TR-2020-42 — https://www.microsoft.com/en-us/research/publication/perceus-garbage-free-reference-counting-with-reuse/
