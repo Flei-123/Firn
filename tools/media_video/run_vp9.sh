@@ -1,0 +1,42 @@
+#!/bin/bash
+set -e
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+D=$(mktemp -d)
+trap 'rm -rf "$D"' EXIT
+FIRNLIB=$ROOT/lib ${FIRNC:-firnc} "$ROOT/tools/media_video/vp9dec.fi" -o "$D/vp9dec"
+bad=0
+n=0
+run_clips() {
+  gopt=$1
+  while read -r name src size dur opts; do
+    [ -z "$name" ] && continue
+    [ -n "$ONLY" ] && [ "$ONLY" != "$name" ] && continue
+    ffmpeg -nostdin -v error -y -f lavfi -t "$dur" -i "$src=size=$size:rate=25" -pix_fmt yuv420p -c:v libvpx-vp9 $gopt $opts "$D/$name.webm" 2>/dev/null
+    ffmpeg -nostdin -v error -y -i "$D/$name.webm" -map 0:v:0 -fps_mode passthrough -f rawvideo -pix_fmt yuv420p "$D/ref.yuv"
+    rm -f "$D/out.yuv"
+    "$D/vp9dec" "$D/$name.webm" "$D/out.yuv" || true
+    n=$((n+1))
+    if ! cmp -s "$D/out.yuv" "$D/ref.yuv"; then echo "DIFF: $name $size $gopt $opts"; bad=$((bad+1)); fi
+  done
+}
+run_clips "-g 1" <<LIST
+i_small testsrc2 64x48 1 -b:v 500k
+i_odd testsrc2 100x62 2 -b:v 300k
+i_tiny testsrc2 17x13 2 -b:v 200k
+i_wide testsrc2 17x300 1 -b:v 300k
+i_cif testsrc2 352x288 2 -b:v 1M
+i_lowq testsrc2 160x96 1 -crf 55 -b:v 0
+i_hiq testsrc2 160x96 1 -crf 4 -b:v 0
+i_mandel mandelbrot 192x112 2 -b:v 400k
+i_tile2 testsrc2 704x144 2 -b:v 800k -tile-columns 1
+i_tile4 testsrc2 1024x96 2 -b:v 800k -tile-columns 2
+i_tilerows testsrc2 256x300 2 -b:v 800k -tile-rows 1
+i_lossless testsrc2 96x64 1 -lossless 1
+i_seg mandelbrot 192x112 2 -b:v 100k -aq-mode 1
+i_aq3 testsrc2 192x112 2 -b:v 200k -aq-mode 3
+i_sharp testsrc2 160x96 1 -b:v 150k -sharpness 7
+i_noerr testsrc2 160x96 1 -b:v 300k -frame-parallel 1
+i_err testsrc2 160x96 1 -b:v 300k -error-resilient 1
+LIST
+echo "vp9: $n clips, $bad diff"
+[ "$bad" -eq 0 ]
