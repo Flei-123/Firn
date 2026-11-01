@@ -21,6 +21,7 @@ FILES = [
     "av1/common/filter.h",
     "av1/common/reconinter.c",
     "av1/common/warped_motion.c",
+    "av1/common/mvref_common.c",
     "tools/gen_wedge_masks_data.py",
 ]
 STUBS = ["config/aom_config.h", "config/aom_dsp_rtcd.h", "aom/aom_integer.h", "aom_ports/mem.h", "aom_dsp/aom_dsp_common.h", "aom_dsp/blend.h"]
@@ -29,6 +30,7 @@ BLK = [(4, 4), (4, 8), (8, 4), (8, 8), (8, 16), (16, 8), (16, 16), (16, 32), (32
 WEDGE_BS = [3, 4, 5, 6, 7, 8, 9, 18, 19]
 SMOOTH_BS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 18, 19]
 DIMS = [2, 4, 8, 16, 32, 64, 128]
+WARP_BLK = [b for b in BLK if min(b) >= 8]
 PAIRS = [(9, 7), (7, 9), (11, 5), (5, 11), (12, 4), (4, 12), (13, 3), (3, 13)]
 
 
@@ -79,6 +81,13 @@ def warp_segments(lines):
     return first + lines[t:]
 
 
+def samp_segments(lines):
+    out = func_at(lines, r"^static inline void record_samples")
+    out += func_at(lines, r"^uint8_t av1_selectSamples")
+    out += func_at(lines, r"^uint8_t av1_findSamples")
+    return out
+
+
 def write_wedge_bin(d, work):
     sys.path.insert(0, work)
     import gen_wedge_masks_data as gw
@@ -121,9 +130,14 @@ def build_oracle(d, src=None):
     out += func_at(conv, r"^void av1_highbd_convolve_2d_scale_c") + [""]
     out += recon_segments(recon) + [""]
     out += warp_segments(warp) + [""]
+    mvref = lines_of(os.path.join(d, "mvref_common.c"))
+    out.append(open(os.path.join(HERE, "av1_inter_samp_defs.h")).read())
+    out.append("static const int mi_size_wide[22] = {%s};" % ",".join(str(w // 4) for w, h in BLK))
+    out.append("static const int mi_size_high[22] = {%s};" % ",".join(str(h // 4) for w, h in BLK))
+    out += samp_segments(mvref) + [""]
     for f in ("blend_a64_mask.c", "blend_a64_hmask.c", "blend_a64_vmask.c"):
         out.append('#include "%s"' % f)
-    for f in ("av1_inter_oracle_mc.c", "av1_inter_oracle_more.c", "av1_inter_oracle_main.c"):
+    for f in ("av1_inter_oracle_mc.c", "av1_inter_oracle_more.c", "av1_inter_oracle_samp.c", "av1_inter_oracle_main.c"):
         out.append(open(os.path.join(HERE, f)).read())
     open(os.path.join(d, "inter_tu.c"), "w").write("\n".join(out))
     exe = os.path.join(d, "inter_oracle")
@@ -263,29 +277,61 @@ def gen_warp(r):
 
 def gen_warpest(r):
     rows = []
-    for bw in (8, 16, 32, 64, 128):
-        for bh in (8, 16, 32, 64, 128):
-            for rep in range(8):
-                np_ = 1 + r.rnd(8)
-                mvy = r.rnd(1025) - 512
-                mvx = r.rnd(1025) - 512
-                p1 = []
-                p2 = []
-                for i in range(16):
-                    x = (r.rnd(bw + 129) - 64) * 8 + r.rnd(8)
-                    y = (r.rnd(bh + 129) - 64) * 8 + r.rnd(8)
-                    spread = (41, 41, 41, 101, 401, 1501)[r.rnd(6)]
-                    p1 += [x, y]
-                    p2 += [x + mvx + r.rnd(spread) - spread // 2, y + mvy + r.rnd(spread) - spread // 2]
-                rows.append([5, np_, bw, bh, mvy, mvx, r.rnd(300), r.rnd(300)] + p1[:16] + p2[:16])
+    for bw, bh in WARP_BLK:
+        for rep in range(8):
+            np_ = 1 + r.rnd(8)
+            mvy = r.rnd(1025) - 512
+            mvx = r.rnd(1025) - 512
+            p1 = []
+            p2 = []
+            for i in range(16):
+                x = (r.rnd(bw + 129) - 64) * 8 + r.rnd(8)
+                y = (r.rnd(bh + 129) - 64) * 8 + r.rnd(8)
+                spread = (41, 41, 41, 101, 401, 1501)[r.rnd(6)]
+                p1 += [x, y]
+                p2 += [x + mvx + r.rnd(spread) - spread // 2, y + mvy + r.rnd(spread) - spread // 2]
+            rows.append([5, np_, bw, bh, mvy, mvx, r.rnd(300), r.rnd(300)] + p1[:16] + p2[:16])
+    return rows
+
+
+def gen_samples(r):
+    rows = []
+    for rep in range(40):
+        for cur in range(22):
+            if rep >= 14 and max(BLK[cur]) < 128:
+                continue
+            bw4 = BLK[cur][0] // 4
+            bh4 = BLK[cur][1] // 4
+            if bw4 > 32 or bh4 > 32:
+                continue
+            mi_row = r.rnd(300)
+            mi_col = r.rnd(300)
+            if r.rnd(10) < 7:
+                mi_col = mi_col // bw4 * bw4
+                mi_row = mi_row // bh4 * bh4
+            mi_rows = mi_row + 1 + r.rnd(bh4 * 2)
+            mi_cols = mi_col + 1 + r.rnd(bw4 * 2)
+            up = 1 if mi_row > 0 and r.rnd(10) < 9 else 0
+            left = 1 if mi_col > 0 and r.rnd(10) < 9 else 0
+            tr = r.rnd(2)
+            ref0 = 1 + r.rnd(7)
+            mvr = r.rnd(401) - 200
+            mvc = r.rnd(401) - 200
+            row = [6, mi_row, mi_col, bw4, bh4, mi_rows, mi_cols, up, left, tr, ref0, mvr, mvc, cur]
+            hit = (2, 3, 3, 4)[r.rnd(4)]
+            spread = (17, 61, 241)[r.rnd(3)]
+            for i in range(bw4 + 2 + bh4):
+                rf0 = ref0 if r.rnd(4) < hit else r.rnd(8)
+                rf1 = -1 if r.rnd(8) else 1 + r.rnd(7)
+                row += [rf0, rf1, r.rnd(22), mvr + r.rnd(spread) - spread // 2, mvc + r.rnd(spread) - spread // 2]
+            rows.append(row)
     return rows
 
 
 def all_cases():
     r = Rng(20261101)
     rows = gen_mc(r) + gen_dist() + gen_mask(r) + gen_obmc(r) + gen_warp(r)
-    if "--warpest" in sys.argv or "--only" in sys.argv:
-        rows += gen_warpest(r)
+    rows += gen_warpest(r)
     return rows
 
 
@@ -299,6 +345,17 @@ def run_cases(exe, wedge, rows):
     return [int(v) for v in res]
 
 
+def write_samp_test(outdir, rows, exp):
+    assert len(exp) == len(rows)
+    flat = [v for row in rows for v in row[1:]]
+    tpl = open(os.path.join(HERE, "av1_samp_test.tpl")).read()
+    tpl = tpl.replace("@CASES@", str(len(rows))).replace("@FLAT_COUNT@", str(len(flat)))
+    tpl = tpl.replace("@FLAT@", fmt_array(flat, 16)).replace("@EXPECT@", fmt_array(exp))
+    tpl = tpl.replace("@BW4@", ", ".join(str(w // 4) for w, h in BLK)).replace("@BH4@", ", ".join(str(h // 4) for w, h in BLK))
+    open(os.path.join(outdir, "6611_av1_warp_samples.fi"), "w").write(tpl)
+    print("samples cases", len(rows))
+
+
 def main():
     outdir = sys.argv[1]
     src = sys.argv[sys.argv.index("--src") + 1] if "--src" in sys.argv else None
@@ -309,7 +366,10 @@ def main():
             only = int(sys.argv[sys.argv.index("--only") + 1])
             rows = [r for r in rows if r[0] == only]
         exp = run_cases(exe, wedge, rows)
+        samp_rows = gen_samples(Rng(20261102))
+        samp_exp = run_cases(exe, wedge, samp_rows)
     assert len(exp) == len(rows)
+    write_samp_test(outdir, samp_rows, samp_exp)
     flat = [v for row in rows for v in row]
     tpl = open(os.path.join(HERE, "av1_inter_test.tpl")).read()
     tpl = tpl.replace("@CASES@", str(len(rows))).replace("@FLAT_COUNT@", str(len(flat)))
