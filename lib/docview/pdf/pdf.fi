@@ -9,12 +9,15 @@ import docview.pdf.pfont
 import docview.pdf.ppage
 import docview.pdf.pannot
 import docview.pdf.textfold
+import docview.pdf.pdest
 
 export {
-    Pdf, pdf_new, pdf_open, pdf_free, pdf_error, pdf_pages, pdf_page_size,
+    Pdf, pdf_new, pdf_open, pdf_open_pw, pdf_free, pdf_error, pdf_pages, pdf_page_size,
     pdf_render, pdf_pixels, pdf_pixel_width, pdf_pixel_height, pdf_text,
     pdf_find, pdf_links, link_count, link_x, link_y, link_w, link_h,
-    link_uri_len, link_uri_at,
+    link_uri_len, link_uri_at, link_page, link_has_pos, link_tx, link_ty,
+    pdf_text_boxes, pdf_find_rects, rect_count, rect_x, rect_y, rect_w, rect_h,
+    pdf_named_dest,
     PDF_OK, PDF_ERR_FORMAT, PDF_ERR_NOPAGES, PDF_ERR_ENCRYPTED, PDF_ERR_BROKEN, PDF_ERR_RENDER,
 }
 
@@ -24,7 +27,9 @@ const PDF_ERR_NOPAGES: u32 = 2
 const PDF_ERR_ENCRYPTED: u32 = 3
 const PDF_ERR_BROKEN: u32 = 4
 const PDF_ERR_RENDER: u32 = 5
-const LINK_STRIDE: usize = 40
+const LINK_STRIDE: usize = 64
+const RECT_STRIDE: usize = 32
+const NO_PAGE: u32 = 4294967295
 
 struct Pdf {
     d: pdoc.Doc,
@@ -55,6 +60,10 @@ fn map_error(e: u32) -> u32 {
 }
 
 fn pdf_open(p: *mut Pdf, data: u64, n: usize) -> bool {
+    return pdf_open_pw(p, data, n, 0, 0)
+}
+
+fn pdf_open_pw(p: *mut Pdf, data: u64, n: usize, pw: u64, pwn: usize) -> bool {
     if n < 8 {
         (*p).err = PDF_ERR_FORMAT
         return false
@@ -65,8 +74,11 @@ fn pdf_open(p: *mut Pdf, data: u64, n: usize) -> bool {
         rt.buf_push(&(*p).bytes, rt.ld8(data, i))
         i = i + 1
     }
+    pdoc.doc_set_password(&(*p).d, pw, pwn)
     if !pdoc.doc_open(&(*p).d, rt.buf_ptr(&(*p).bytes), rt.buf_len(&(*p).bytes)) {
         (*p).err = map_error(pdoc.doc_err(&(*p).d))
+        pdoc.doc_free(&(*p).d)
+        (*p).d = pdoc.doc_new()
         return false
     }
     (*p).open = true
@@ -170,14 +182,60 @@ fn put_u32(out: *mut mem.Buf, v: u32) {
     mem.buf_push(out, ((v >> 24) & 255) as u8)
 }
 
+fn map_rect(bm: *mut f64, r0: f64, r1: f64, r2: f64, r3: f64, out: *mut f64) {
+    let ax: f64 = *((bm as u64) as *mut f64) * r0 + *((bm as u64 + 16) as *mut f64) * r1 + *((bm as u64 + 32) as *mut f64)
+    let ay: f64 = *((bm as u64 + 8) as *mut f64) * r0 + *((bm as u64 + 24) as *mut f64) * r1 + *((bm as u64 + 40) as *mut f64)
+    let bx: f64 = *((bm as u64) as *mut f64) * r2 + *((bm as u64 + 16) as *mut f64) * r3 + *((bm as u64 + 32) as *mut f64)
+    let by: f64 = *((bm as u64 + 8) as *mut f64) * r2 + *((bm as u64 + 24) as *mut f64) * r3 + *((bm as u64 + 40) as *mut f64)
+    var x0: f64 = ax
+    var x1: f64 = bx
+    var y0: f64 = ay
+    var y1: f64 = by
+    if bx < ax {
+        x0 = bx
+        x1 = ax
+    }
+    if by < ay {
+        y0 = by
+        y1 = ay
+    }
+    *((out as u64) as *mut f64) = x0
+    *((out as u64 + 8) as *mut f64) = y0
+    *((out as u64 + 16) as *mut f64) = x1 - x0
+    *((out as u64 + 24) as *mut f64) = y1 - y0
+}
+
+fn link_target(d: *mut pdoc.Doc, annot: u32, uri: *mut u32, dest: *mut pdest.Dest, has: *mut bool) {
+    var an: [u8; 1] = "A"
+    var un: [u8; 3] = "URI"
+    var sn: [u8; 1] = "S"
+    var gt: [u8; 4] = "GoTo"
+    var dk: [u8; 1] = "D"
+    var dn: [u8; 4] = "Dest"
+    let act: u32 = pdoc.doc_dict_get(d, annot, (&an[0]) as u64, 1)
+    var target: u32 = 0
+    if act != 0 as u32 {
+        *uri = pdoc.doc_dict_get(d, act, (&un[0]) as u64, 3)
+        let st: u32 = pdoc.doc_dict_get(d, act, (&sn[0]) as u64, 1)
+        if pobj.o_name_eq(&(*d).ar, st, (&gt[0]) as u64, 4) {
+            target = pdoc.doc_dict_get(d, act, (&dk[0]) as u64, 1)
+        }
+    } else {
+        target = pdoc.doc_dict_get(d, annot, (&dn[0]) as u64, 4)
+    }
+    if target != 0 as u32 {
+        *has = pdest.dest_resolve(d, target, dest)
+    }
+}
+
 #[allow_escape]
 fn pdf_links(p: *mut Pdf, page: usize, out: *mut mem.Buf, uris: *mut mem.Buf) -> usize {
     if !(*p).open || page >= pdoc.doc_page_count(&(*p).d) {
         return 0
     }
     let d: *mut pdoc.Doc = &(*p).d
-    var bx: [f64; 4] = [0.0; 4]
-    pdoc.doc_page_box(d, page, true, (&bx[0]) as *mut f64)
+    var bm: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ppage.base_matrix_for(d, page, 1.0, (&bm[0]) as *mut f64)
     let l: *mut pannot.AnnotList = pannot.an_load(d, page)
     let n: usize = pannot.an_count(l)
     var found: usize = 0
@@ -185,21 +243,17 @@ fn pdf_links(p: *mut Pdf, page: usize, out: *mut mem.Buf, uris: *mut mem.Buf) ->
     while i < n {
         let a: *mut pannot.Annot = pannot.an_at(l, i)
         if pannot.an_subtype(a) == pannot.ST_LINK {
-            var an: [u8; 1] = "A"
-            var un: [u8; 3] = "URI"
-            let act: u32 = pdoc.doc_dict_get(d, pannot.an_obj(a), (&an[0]) as u64, 1)
             var uri: u32 = 0
-            if act != 0 as u32 {
-                uri = pdoc.doc_dict_get(d, act, (&un[0]) as u64, 3)
-            }
-            let x0: f64 = pannot.an_rect(a, 0) - bx[0]
-            let y1: f64 = bx[3] - pannot.an_rect(a, 1)
-            let x1: f64 = pannot.an_rect(a, 2) - bx[0]
-            let y0: f64 = bx[3] - pannot.an_rect(a, 3)
-            put_f64(out, x0)
-            put_f64(out, y0)
-            put_f64(out, x1 - x0)
-            put_f64(out, y1 - y0)
+            var dest: pdest.Dest = pdest.dest_new()
+            var has: bool = false
+            link_target(d, pannot.an_obj(a), &uri, &dest, &has)
+            var rc: [f64; 4] = [0.0; 4]
+            map_rect((&bm[0]) as *mut f64, pannot.an_rect(a, 0), pannot.an_rect(a, 1),
+                pannot.an_rect(a, 2), pannot.an_rect(a, 3), (&rc[0]) as *mut f64)
+            put_f64(out, rc[0])
+            put_f64(out, rc[1])
+            put_f64(out, rc[2])
+            put_f64(out, rc[3])
             var ulen: usize = 0
             put_u32(out, mem.buf_len(uris) as u32)
             if uri != 0 as u32 && pobj.o_kind(&(*d).ar, uri) == pobj.T_STR {
@@ -212,6 +266,22 @@ fn pdf_links(p: *mut Pdf, page: usize, out: *mut mem.Buf, uris: *mut mem.Buf) ->
                 }
             }
             put_u32(out, ulen as u32)
+            var tp: u32 = NO_PAGE
+            var fl: u32 = 0
+            var tx: f64 = 0.0
+            var ty: f64 = 0.0
+            if has {
+                tp = dest.page as u32
+                if dest.has_pos {
+                    fl = 1
+                    tx = dest.x
+                    ty = dest.y
+                }
+            }
+            put_u32(out, tp)
+            put_u32(out, fl)
+            put_f64(out, tx)
+            put_f64(out, ty)
             found = found + 1
         }
         i = i + 1
@@ -220,12 +290,26 @@ fn pdf_links(p: *mut Pdf, page: usize, out: *mut mem.Buf, uris: *mut mem.Buf) ->
     return found
 }
 
+fn pdf_named_dest(p: *mut Pdf, name: u64, nn: usize, page: *mut usize, x: *mut f64, y: *mut f64) -> bool {
+    if !(*p).open {
+        return false
+    }
+    var dest: pdest.Dest = pdest.dest_new()
+    if !pdest.dest_named(&(*p).d, name, nn, &dest) {
+        return false
+    }
+    *page = dest.page
+    *x = dest.x
+    *y = dest.y
+    return true
+}
+
 fn link_count(out: *mut mem.Buf) -> usize {
     return mem.buf_len(out) / LINK_STRIDE
 }
 
-fn get_f64(out: *mut mem.Buf, i: usize, field: usize) -> f64 {
-    let q: u64 = mem.buf_ptr(out) as u64 + (i * LINK_STRIDE + field * 8) as u64
+fn rec_f64(out: *mut mem.Buf, i: usize, stride: usize, off: usize) -> f64 {
+    let q: u64 = mem.buf_ptr(out) as u64 + (i * stride + off) as u64
     var tmp: [f64; 1] = [0.0]
     let t: u64 = (&tmp[0]) as u64
     var k: usize = 0
@@ -234,6 +318,10 @@ fn get_f64(out: *mut mem.Buf, i: usize, field: usize) -> f64 {
         k = k + 1
     }
     return tmp[0]
+}
+
+fn get_f64(out: *mut mem.Buf, i: usize, field: usize) -> f64 {
+    return rec_f64(out, i, LINK_STRIDE, field * 8)
 }
 
 fn get_u32(out: *mut mem.Buf, i: usize, field: usize) -> u32 {
@@ -264,4 +352,156 @@ fn link_uri_len(out: *mut mem.Buf, i: usize) -> usize {
 
 fn link_uri_at(out: *mut mem.Buf, uris: *mut mem.Buf, i: usize) -> u64 {
     return mem.buf_ptr(uris) as u64 + get_u32(out, i, 0) as u64
+}
+
+fn link_page(out: *mut mem.Buf, i: usize) -> i64 {
+    let v: u32 = get_u32(out, i, 2)
+    if v == NO_PAGE {
+        return -1
+    }
+    return v as i64
+}
+
+fn link_has_pos(out: *mut mem.Buf, i: usize) -> bool {
+    return (get_u32(out, i, 3) & 1) != 0
+}
+
+fn link_tx(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, LINK_STRIDE, 48)
+}
+
+fn link_ty(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, LINK_STRIDE, 56)
+}
+
+fn pdf_text_boxes(p: *mut Pdf, page: usize, text: *mut mem.Buf, boxes: *mut mem.Buf) -> bool {
+    if !(*p).open {
+        return false
+    }
+    return ppage.page_text_boxes(&(*p).d, page, text, boxes)
+}
+
+fn rect_count(out: *mut mem.Buf) -> usize {
+    return mem.buf_len(out) / RECT_STRIDE
+}
+
+fn rect_x(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, RECT_STRIDE, 0)
+}
+
+fn rect_y(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, RECT_STRIDE, 8)
+}
+
+fn rect_w(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, RECT_STRIDE, 16)
+}
+
+fn rect_h(out: *mut mem.Buf, i: usize) -> f64 {
+    return rec_f64(out, i, RECT_STRIDE, 24)
+}
+
+fn read_u32(b: *mut mem.Buf, i: usize) -> usize {
+    let q: u64 = mem.buf_ptr(b) as u64 + (i * 4) as u64
+    return ((*(q as *mut u8)) as usize) | (((*((q + 1) as *mut u8)) as usize) << 8) |
+    (((*((q + 2) as *mut u8)) as usize) << 16) | (((*((q + 3) as *mut u8)) as usize) << 24)
+}
+
+fn count_cps(q: u64, qn: usize) -> usize {
+    var at: usize = 0
+    var c: usize = 0
+    while at < qn {
+        var len: usize = 1
+        textfold.utf8_next(q as *mut u8, qn, at, &len)
+        at = at + len
+        c = c + 1
+    }
+    return c
+}
+
+fn push_rect(out: *mut mem.Buf, x0: f64, y0: f64, x1: f64, y1: f64) {
+    put_f64(out, x0)
+    put_f64(out, y0)
+    put_f64(out, x1 - x0)
+    put_f64(out, y1 - y0)
+}
+
+fn pdf_find_rects(p: *mut Pdf, page: usize, query: u64, qn: usize, out: *mut mem.Buf) -> usize {
+    var t: mem.Buf = mem.buf_new()
+    var bx: mem.Buf = mem.buf_new()
+    var hits: mem.Buf = mem.buf_new()
+    mem.buf_init(&t)
+    mem.buf_init(&bx)
+    mem.buf_init(&hits)
+    var total: usize = 0
+    if pdf_text_boxes(p, page, &t, &bx) {
+        let nh: usize = textfold.find_all(mem.buf_ptr(&t), mem.buf_len(&t), query as *mut u8, qn, &hits)
+        let qc: usize = count_cps(query, qn)
+        let nb: usize = mem.buf_len(&bx) / RECT_STRIDE
+        var rot: i32 = pdoc.doc_page_rotate(&(*p).d, page) % 360
+        if rot < 0 {
+            rot = rot + 360
+        }
+        let vertical: bool = rot == 90 || rot == 270
+        var m: usize = 0
+        while m < nh {
+            let start: usize = read_u32(&hits, m)
+            var have: bool = false
+            var cx0: f64 = 0.0
+            var cy0: f64 = 0.0
+            var cx1: f64 = 0.0
+            var cy1: f64 = 0.0
+            var k: usize = start
+            while k < start + qc && k < nb {
+                let bw: f64 = rec_f64(&bx, k, RECT_STRIDE, 16)
+                let bh: f64 = rec_f64(&bx, k, RECT_STRIDE, 24)
+                if bw > 0.0 || bh > 0.0 {
+                    let bx0: f64 = rec_f64(&bx, k, RECT_STRIDE, 0)
+                    let by0: f64 = rec_f64(&bx, k, RECT_STRIDE, 8)
+                    var cy: f64 = by0 + bh / 2.0
+                    var lo: f64 = cy0
+                    var hi: f64 = cy1
+                    if vertical {
+                        cy = bx0 + bw / 2.0
+                        lo = cx0
+                        hi = cx1
+                    }
+                    if have && cy >= lo && cy <= hi {
+                        if bx0 < cx0 {
+                            cx0 = bx0
+                        }
+                        if bx0 + bw > cx1 {
+                            cx1 = bx0 + bw
+                        }
+                        if by0 < cy0 {
+                            cy0 = by0
+                        }
+                        if by0 + bh > cy1 {
+                            cy1 = by0 + bh
+                        }
+                    } else {
+                        if have {
+                            push_rect(out, cx0, cy0, cx1, cy1)
+                            total = total + 1
+                        }
+                        have = true
+                        cx0 = bx0
+                        cy0 = by0
+                        cx1 = bx0 + bw
+                        cy1 = by0 + bh
+                    }
+                }
+                k = k + 1
+            }
+            if have {
+                push_rect(out, cx0, cy0, cx1, cy1)
+                total = total + 1
+            }
+            m = m + 1
+        }
+    }
+    mem.buf_free(&t)
+    mem.buf_free(&bx)
+    mem.buf_free(&hits)
+    return total
 }

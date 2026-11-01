@@ -6,6 +6,8 @@ import docview.pdf.pobj
 import docview.pdf.pdoc
 import docview.pdf.prast
 import docview.pdf.pfont
+import docview.pdf.psmask
+import docview.pdf.embfont
 import docview.pdf.pannot
 import paint.canvas
 import image.picture
@@ -14,10 +16,12 @@ import font.raster
 
 export {
     fonthold_new, fonthold_load,
-    page_render, page_text, page_size,
+    page_render, page_text, page_text_boxes, page_size, base_matrix_for,
 }
 
 const GSMAX: usize = 32
+const BOX_ASCENT: f64 = 0.8
+const BOX_DESCENT: f64 = 0.2
 const MASKMAX: usize = 24
 const OPBUDGET: usize = 500000
 const TIME_LIMIT_US: u64 = 15000000
@@ -71,6 +75,7 @@ struct Run {
     t0: u64,
     stop: bool,
     fonts: [pfont.PFont; 6],
+    emb: [embfont.EmbFont; 6],
     fkey: [u64; 6],
     nfont: usize,
     ops: usize,
@@ -80,11 +85,16 @@ struct Run {
     imgfail: usize,
     fontmiss: usize,
     txt: u64,
+    bx: u64,
+    bm: [f64; 6],
     ras: raster.Raster,
     scratch: *mut u8,
     racc: *mut u8,
     lastx: f64,
     lasty: f64,
+    ex: f64,
+    ey: f64,
+    smdepth: usize,
     lasth: f64,
 }
 
@@ -373,12 +383,18 @@ fn run_free(r: *mut Run) {
         prast.mask_free(&(*r).masks[i])
         i = i + 1
     }
+    var ei: usize = 0
+    while ei < 6 {
+        embfont.emb_free(&(*r).emb[ei])
+        ei = ei + 1
+    }
     mem.heap_free((*r).scratch, SCRATCH)
     mem.heap_free((*r).racc, RASTER_CAP)
 }
 
-fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
-    let ar: *mut pobj.PdfArena = &(*d).ar
+fn cs_kind(d: *mut pdoc.Doc, kar: *mut pobj.PdfArena, h: u32, pal: *mut u32,
+    base: *mut u32) -> u32 {
+    let ar: *mut pobj.PdfArena = kar
     *pal = 0
     *base = 1
     var g1: [u8; 10] = "DeviceGray"
@@ -423,7 +439,7 @@ fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
             if pobj.o_arr_len(ar, h) >= 4 {
                 var bp: u32 = 0
                 var bb: u32 = 0
-                let bk: u32 = cs_kind(d,
+                let bk: u32 = cs_kind(d, &(*d).ar,
                     pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 1)), &bp, &bb)
                 *base = bk
                 *pal = pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 3))
@@ -811,7 +827,11 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
         var csh: u32 = resolve_cs(r, nm, res)
         var pal: u32 = 0
         var base: u32 = 1
-        let k: u32 = cs_kind((*r).d, csh, &pal, &base)
+        var kar: *mut pobj.PdfArena = &(*(*r).d).ar
+        if csh == nm {
+            kar = ar
+        }
+        let k: u32 = cs_kind((*r).d, kar, csh, &pal, &base)
         if c0 == 99 as u8 {
             (*g).fcs = k
             (*g).fpal = pal
@@ -867,8 +887,8 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
             (*g).tw = argf(ar, st, ns, 0)
             (*g).tc = argf(ar, st, ns, 1)
         }
-        nl_mark(r)
         next_line(r, 0.0, 0.0 - (*g).tl)
+        nl_resolve(r)
         let s: u32 = argh(st, ns, back(ns, 1))
         if pobj.o_kind(ar, s) == pobj.T_STR {
             show_string(r, ar, s, res)
@@ -929,6 +949,73 @@ fn apply_extgstate(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) {
     (*g).fa = pdoc.doc_num(d, e, (&can[0]) as u64, 2, (*g).fa)
     (*g).sa = pdoc.doc_num(d, e, (&cAn[0]) as u64, 2, (*g).sa)
     (*g).lw = pdoc.doc_num(d, e, (&lwn[0]) as u64, 2, (*g).lw)
+    var smn: [u8; 5] = "SMask"
+    let sm: u32 = pdoc.doc_dict_get(d, e, (&smn[0]) as u64, 5)
+    if pobj.o_kind(&(*d).ar, sm) == pobj.T_DICT {
+        apply_smask(r, sm)
+    }
+}
+
+#[allow_escape]
+fn apply_smask(r: *mut Run, sm: u32) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
+    if (*r).smdepth > 0 || (*r).nmask >= MASKMAX - 1 || (*r).gsp + 2 >= GSMAX {
+        return
+    }
+    var gn: [u8; 1] = "G"
+    let form: u32 = pdoc.doc_dict_get(d, sm, (&gn[0]) as u64, 1)
+    if pobj.o_kind(dar, form) != pobj.T_STREAM {
+        return
+    }
+    var sn: [u8; 1] = "S"
+    var ln: [u8; 10] = "Luminosity"
+    let kind: u32 = pdoc.doc_dict_get(d, sm, (&sn[0]) as u64, 1)
+    let luma: bool = pobj.o_name_eq(dar, kind, (&ln[0]) as u64, 10)
+    let w: usize = canvas.canvas_width((*r).cv)
+    let h: usize = canvas.canvas_height((*r).cv)
+    var tc: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&tc, w, h) {
+        canvas.canvas_free(&tc)
+        return
+    }
+    if luma {
+        canvas.canvas_clear(&tc, canvas.color_of(255, 0, 0, 0))
+    } else {
+        canvas.canvas_clear(&tc, canvas.color_of(0, 0, 0, 0))
+    }
+    let saved: *mut canvas.Canvas = (*r).cv
+    let g: *mut GS = cur(r)
+    let base: i32 = (*g).clip
+    (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+    (*r).gsp = (*r).gsp + 1
+    let g2: *mut GS = cur(r)
+    (*g2).clip = -1
+    (*g2).fa = 1.0
+    (*g2).sa = 1.0
+    (*r).cv = &tc
+    (*r).smdepth = 1
+    var rn: [u8; 9] = "Resources"
+    var fres: u32 = pdoc.doc_dict_get(d, form, (&rn[0]) as u64, 9)
+    if pobj.o_kind(dar, fres) != pobj.T_DICT {
+        fres = 0
+    }
+    exec_form(r, form, fres, 1)
+    (*r).smdepth = 0
+    (*r).cv = saved
+    (*r).gsp = (*r).gsp - 1
+    var cm: *mut prast.Mask = &(*r).masks[MASKMAX - 1]
+    if base >= 0 {
+        cm = &(*r).masks[base as usize]
+    }
+    let k: usize = (*r).nmask
+    (*r).masks[k] = psmask.sm_build(&tc, cm, luma)
+    canvas.canvas_free(&tc)
+    if (*r).masks[k].p as usize == 0 {
+        return
+    }
+    (*r).nmask = k + 1
+    (*cur(r)).clip = k as i32
 }
 
 #[no_gc]
@@ -988,9 +1075,48 @@ fn ident(m: *mut f64) {
     *((m as u64 + 40) as *mut f64) = 0.0
 }
 
-fn nl_mark(r: *mut Run) {
-    if (*r).txt != 0 {
-        mem.buf_push((*r).txt as *mut mem.Buf, 10 as u8)
+fn txt_last(b: *mut mem.Buf) -> u8 {
+    let n: usize = mem.buf_len(b)
+    if n == 0 {
+        return 10 as u8
+    }
+    return mem.buf_at(b, n - 1)
+}
+
+fn nl_resolve(r: *mut Run) {
+    if (*r).txt == 0 {
+        return
+    }
+    let b: *mut mem.Buf = (*r).txt as *mut mem.Buf
+    let g: *mut GS = cur(r)
+    let a: f64 = (*r).tm[0]
+    let c: f64 = (*r).tm[1]
+    var len: f64 = sq(a * a + c * c)
+    if len <= 0.0 {
+        len = 1.0
+    }
+    var size: f64 = (*g).fsize * len
+    if size < 0.0 {
+        size = 0.0 - size
+    }
+    let dx: f64 = (*r).tm[4] - (*r).ex
+    let dy: f64 = (*r).tm[5] - (*r).ey
+    let along: f64 = (dx * a + dy * c) / len
+    var perp: f64 = (dy * a - dx * c) / len
+    if perp < 0.0 {
+        perp = 0.0 - perp
+    }
+    let last: u8 = txt_last(b)
+    if size <= 0.0 || perp > size * 0.4 || along < 0.0 - size * 0.5 {
+        if last != 10 as u8 {
+            mem.buf_push(b, 10 as u8)
+            box_blank(r)
+        }
+        return
+    }
+    if along > size * 0.12 && last != 10 as u8 && last != 32 as u8 {
+        mem.buf_push(b, 32 as u8)
+        box_blank(r)
     }
 }
 
@@ -1019,31 +1145,31 @@ fn do_text_op(r: *mut Run, ar: *mut pobj.PdfArena, c1: u8, st: *mut u32,
         return
     }
     if c1 == 100 as u8 {
-        nl_mark(r)
         next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        nl_resolve(r)
         return
     }
     if c1 == 68 as u8 {
         (*g).tl = 0.0 - argf(ar, st, ns, 1)
-        nl_mark(r)
         next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        nl_resolve(r)
         return
     }
     if c1 == 109 as u8 {
         if ns >= 6 {
-            nl_mark(r)
             var i: usize = 0
             while i < 6 {
                 (*r).tm[i] = argf(ar, st, ns, back(ns, 6) + i)
                 (*r).tlm[i] = (*r).tm[i]
                 i = i + 1
             }
+            nl_resolve(r)
         }
         return
     }
     if c1 == 42 as u8 {
-        nl_mark(r)
         next_line(r, 0.0, 0.0 - (*g).tl)
+        nl_resolve(r)
         return
     }
     if c1 == 76 as u8 {
@@ -1093,6 +1219,7 @@ fn do_text_op(r: *mut Run, ar: *mut pobj.PdfArena, c1: u8, st: *mut u32,
                 let adj: f64 = 0.0 - raw / 1000.0 * (*g).fsize * (*g).th
                 if (*r).txt != 0 && raw <= 0.0 - 180.0 {
                     mem.buf_push((*r).txt as *mut mem.Buf, 32 as u8)
+                    box_blank(r)
                 }
                 advance(r, adj)
             }
@@ -1113,6 +1240,8 @@ fn advance(r: *mut Run, tx: f64) {
         (*r).tm[i] = o[i]
         i = i + 1
     }
+    (*r).ex = (*r).tm[4]
+    (*r).ey = (*r).tm[5]
 }
 
 fn font_slot(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) -> i32 {
@@ -1150,6 +1279,9 @@ fn font_slot(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) -> i32 {
         dict = pdoc.doc_dict_get(d, fd, np, nl)
     }
     pfont.pfont_load(d, dict, &(*r).fonts[slot])
+    if (*r).txt == 0 {
+        embfont.emb_load(d, dict, &(*r).emb[slot])
+    }
     (*r).fkey[slot] = key
     (*r).nfont = slot + 1
     return slot as i32
@@ -1173,7 +1305,7 @@ fn show_string(r: *mut Run, ar: *mut pobj.PdfArena, s: u32, res: u32) {
         }
         let w0: f64 = pfont.pf_width(d, pf, code) / 1000.0
         if (*r).txt != 0 {
-            emit_text(r, pf, code)
+            emit_text(r, pf, code, w0)
         } else if (*g).tr != 3 as u32 && (*g).tr != 7 as u32 {
             draw_glyph(r, pf, code)
         }
@@ -1186,7 +1318,7 @@ fn show_string(r: *mut Run, ar: *mut pobj.PdfArena, s: u32, res: u32) {
     }
 }
 
-fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
+fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32, w0: f64) {
     let b: *mut mem.Buf = (*r).txt as *mut mem.Buf
     var u: u32 = pfont.pf_unicode(pf, code)
     if u == 0 as u32 {
@@ -1207,6 +1339,80 @@ fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
         mem.buf_push(b, (128 + ((u >> 6) & 63 as u32)) as u8)
         mem.buf_push(b, (128 + (u & 63 as u32)) as u8)
     }
+    box_glyph(r, w0)
+}
+
+fn box_put(b: *mut mem.Buf, v: f64) {
+    var tmp: [f64; 1] = [v]
+    let q: u64 = (&tmp[0]) as u64
+    var i: usize = 0
+    while i < 8 {
+        mem.buf_push(b, ld8(q, i))
+        i = i + 1
+    }
+}
+
+fn box_blank(r: *mut Run) {
+    if (*r).bx == 0 {
+        return
+    }
+    let b: *mut mem.Buf = (*r).bx as *mut mem.Buf
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+}
+
+fn box_glyph(r: *mut Run, w0: f64) {
+    if (*r).bx == 0 {
+        return
+    }
+    let g: *mut GS = cur(r)
+    var ts: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ts[0] = (*g).fsize * (*g).th
+    ts[3] = (*g).fsize
+    ts[5] = (*g).ts
+    var a: [f64; 6] = [0.0; 6]
+    mmul((&ts[0]) as *mut f64, (&(*r).tm[0]) as *mut f64, (&a[0]) as *mut f64)
+    var m: [f64; 6] = [0.0; 6]
+    mmul((&a[0]) as *mut f64, (&(*g).m[0]) as *mut f64, (&m[0]) as *mut f64)
+    var dm: [f64; 6] = [0.0; 6]
+    mmul((&m[0]) as *mut f64, (&(*r).bm[0]) as *mut f64, (&dm[0]) as *mut f64)
+    var minx: f64 = 1.0e30
+    var miny: f64 = 1.0e30
+    var maxx: f64 = 0.0 - 1.0e30
+    var maxy: f64 = 0.0 - 1.0e30
+    var k: usize = 0
+    while k < 4 {
+        var px: f64 = 0.0
+        var py: f64 = 0.0 - BOX_DESCENT
+        if k == 1 || k == 3 {
+            px = w0
+        }
+        if k >= 2 {
+            py = BOX_ASCENT
+        }
+        let x: f64 = mapx((&dm[0]) as *mut f64, px, py)
+        let y: f64 = mapy((&dm[0]) as *mut f64, px, py)
+        if x < minx {
+            minx = x
+        }
+        if x > maxx {
+            maxx = x
+        }
+        if y < miny {
+            miny = y
+        }
+        if y > maxy {
+            maxy = y
+        }
+        k = k + 1
+    }
+    let b: *mut mem.Buf = (*r).bx as *mut mem.Buf
+    box_put(b, minx)
+    box_put(b, miny)
+    box_put(b, maxx - minx)
+    box_put(b, maxy - miny)
 }
 
 fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
@@ -1214,12 +1420,19 @@ fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
     if (*g).fsize == 0.0 {
         return
     }
-    let f: *mut ttf.Font = pfont.fonthold_face((*r).fh, pfont.pf_face(pf))
-    if !ttf.font_ok(f) {
-        return
+    var f: *mut ttf.Font = pfont.fonthold_face((*r).fh, pfont.pf_face(pf))
+    var gid: u32 = 0
+    let eb: *mut embfont.EmbFont = &(*r).emb[(*g).fslot as usize]
+    if embfont.emb_ok(eb) {
+        gid = embfont.emb_gid(eb, code, pfont.pf_unicode(pf, code))
+        if gid != 0 as u32 {
+            f = embfont.emb_font(eb)
+        }
     }
-    let gid: u32 = pfont.pf_glyph((*r).fh, pf, code)
     if gid == 0 as u32 {
+        gid = pfont.pf_glyph((*r).fh, pf, code)
+    }
+    if !ttf.font_ok(f) || gid == 0 as u32 {
         return
     }
     let upem: f64 = ttf.font_upem(f) as f64
@@ -1348,6 +1561,12 @@ fn do_xobject(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32,
     if !pobj.o_name_eq(dar, st, (&fo[0]) as u64, 4) {
         return
     }
+    exec_form(r, x, res, depth)
+}
+
+fn exec_form(r: *mut Run, x: u32, res: u32, depth: usize) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
     if (*r).gsp + 1 >= GSMAX {
         return
     }
@@ -1415,7 +1634,7 @@ fn draw_image(r: *mut Run, x: u32) {
     var base: u32 = 1
     var kind: u32 = CS_GRAY
     if !is_mask {
-        kind = cs_kind(d, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
+        kind = cs_kind(d, dar, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
             &pal, &base)
     }
     var comps: usize = 1
@@ -1908,6 +2127,23 @@ fn fill_rect_dev(r: *mut Run, x0: f64, y0: f64, x1: f64, y1: f64,
 }
 
 fn page_text(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf) -> bool {
+    return page_text_boxes(d, pg, out, 0 as *mut mem.Buf)
+}
+
+fn base_matrix_for(d: *mut pdoc.Doc, pg: usize, zoom: f64, m: *mut f64) {
+    var box_: [f64; 4] = [0.0; 4]
+    var w: usize = 0
+    var h: usize = 0
+    page_size(d, pg, zoom, &w, &h, (&box_[0]) as *mut f64)
+    var rot: i32 = pdoc.doc_page_rotate(d, pg) % 360
+    if rot < 0 {
+        rot = rot + 360
+    }
+    base_matrix((&box_[0]) as *mut f64, zoom, rot, w, h, m)
+}
+
+fn page_text_boxes(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf,
+    boxes: *mut mem.Buf) -> bool {
     if pg >= pdoc.doc_page_count(d) {
         return false
     }
@@ -1919,6 +2155,10 @@ fn page_text(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf) -> bool {
         return false
     }
     r.txt = out as u64
+    if boxes as u64 != 0 {
+        r.bx = boxes as u64
+        base_matrix_for(d, pg, 1.0, (&r.bm[0]) as *mut f64)
+    }
     var body: rt.Buf = rt.buf_new()
     page_content(d, pg, &body)
     let res: u32 = pdoc.doc_page_res(d, pg)
@@ -1937,10 +2177,10 @@ fn run_new() -> Run {
         tm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         tlm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         intext: false, t0: 0, stop: false,
-        fonts: [pfont.pfont_new(); 6], fkey: [0; 6],
+        fonts: [pfont.pfont_new(); 6], emb: [embfont.emb_new(); 6], fkey: [0; 6],
         nfont: 0,
         ops: 0, glyphs: 0, paths: 0, images: 0, imgfail: 0,
-        fontmiss: 0, txt: 0,
+        fontmiss: 0, txt: 0, bx: 0, bm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         ras: raster.raster_new(), scratch: 0 as *mut u8,
-        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, lasth: 0.0 }
+        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, ex: 0.0, ey: 0.0, smdepth: 0, lasth: 0.0 }
 }

@@ -4,9 +4,10 @@ import html.mem
 import rt.rt
 import docview.pdf.pobj
 import docview.pdf.filter
+import docview.pdf.crypt
 
 export {
-    Doc,
+    Doc, doc_set_password,
     doc_new, doc_open, doc_free,
     doc_get, doc_resolve, doc_dict_get,
     doc_stream, doc_num, doc_int,
@@ -32,6 +33,10 @@ const MAX_NUM: usize = 8000000
 const MAX_PAGES: usize = 200000
 const MAX_XREF_HOPS: usize = 64
 const MAX_TREE: usize = 64
+const DEC_BASE: u64 = 17592186044416
+const MAX_DEC: usize = 1073741824
+const CRYPT_BAD: u32 = 99
+const MAX_DEPTH_CRYPT: usize = 40
 
 struct Doc {
     data: u64,
@@ -59,6 +64,11 @@ struct Doc {
     npages: usize,
     pcap: usize,
     scratch: rt.Buf,
+    cr: crypt.Crypt,
+    dec: rt.Buf,
+    enc_obj: usize,
+    pw: [u8; 32],
+    pwn: usize,
 }
 
 #[no_gc]
@@ -100,7 +110,8 @@ fn doc_new() -> Doc {
         major: 0, minor: 0,
         pages: 0 as *mut u32, pres: 0 as *mut u32, pmb: 0 as *mut u32,
         pcb: 0 as *mut u32, prot: 0 as *mut u32,
-        npages: 0, pcap: 0, scratch: rt.buf_new() }
+        npages: 0, pcap: 0, scratch: rt.buf_new(),
+        cr: crypt.crypt_new(), dec: rt.buf_new(), enc_obj: 0, pw: [0 as u8; 32], pwn: 0 }
 }
 
 fn doc_free(d: *mut Doc) {
@@ -116,8 +127,22 @@ fn doc_free(d: *mut Doc) {
     mem.heap_free((*d).pcb as *mut u8, (*d).pcap * 4)
     mem.heap_free((*d).prot as *mut u8, (*d).pcap * 4)
     rt.buf_free(&(*d).scratch)
+    rt.buf_free(&(*d).dec)
     (*d).nobj = 0
     (*d).pcap = 0
+}
+
+fn doc_set_password(d: *mut Doc, p: u64, n: usize) {
+    var m: usize = n
+    if m > 32 {
+        m = 32
+    }
+    var i: usize = 0
+    while i < m {
+        (*d).pw[i] = ld8(p, i)
+        i = i + 1
+    }
+    (*d).pwn = m
 }
 
 #[no_gc]
@@ -263,7 +288,9 @@ fn parse_indirect(d: *mut Doc, at: usize, want: usize) -> u32 {
     while i < (*d).len && is_ws(ld8((*d).data, i)) {
         i = i + 1
     }
-    while i < (*d).len && is_digit(ld8((*d).data, i)) {
+    var gen: usize = 0
+    while i < (*d).len && is_digit(ld8((*d).data, i)) && gen < MAX_NUM {
+        gen = gen * 10 + ((ld8((*d).data, i) as usize) - 48)
         i = i + 1
     }
     while i < (*d).len && is_ws(ld8((*d).data, i)) {
@@ -278,7 +305,192 @@ fn parse_indirect(d: *mut Doc, at: usize, want: usize) -> u32 {
     if pobj.o_kind(&(*d).ar, h) == pobj.T_STREAM {
         fix_stream(d, h, &lx)
     }
+    if crypt.crypt_active(&(*d).cr) && want != (*d).enc_obj {
+        decrypt_strings(d, h, want, gen, 0)
+        if pobj.o_kind(&(*d).ar, h) == pobj.T_STREAM {
+            decrypt_stream_data(d, h, want, gen)
+        }
+    }
     return h
+}
+
+fn decrypt_strings(d: *mut Doc, h: u32, num: usize, gen: usize, depth: usize) {
+    if depth > MAX_DEPTH_CRYPT {
+        return
+    }
+    let k: u32 = pobj.o_kind(&(*d).ar, h)
+    if k == pobj.T_STR {
+        let n: usize = pobj.o_str_len(&(*d).ar, h)
+        if n == 0 {
+            return
+        }
+        var out: rt.Buf = rt.buf_new()
+        if crypt.crypt_string(&(*d).cr, num, gen,
+            pobj.o_str_ptr(&(*d).ar, h), n, &out) {
+            pobj.o_str_replace(&(*d).ar, h, rt.buf_ptr(&out), rt.buf_len(&out))
+        }
+        rt.buf_free(&out)
+        return
+    }
+    if k == pobj.T_ARR {
+        let cnt: usize = pobj.o_arr_len(&(*d).ar, h)
+        var i: usize = 0
+        while i < cnt {
+            decrypt_strings(d, pobj.o_arr_at(&(*d).ar, h, i), num, gen, depth + 1)
+            i = i + 1
+        }
+        return
+    }
+    if k == pobj.T_DICT || k == pobj.T_STREAM {
+        let cnt2: usize = pobj.o_dict_len(&(*d).ar, h)
+        var j: usize = 0
+        while j < cnt2 {
+            decrypt_strings(d, pobj.o_dict_val(&(*d).ar, h, j), num, gen, depth + 1)
+            j = j + 1
+        }
+    }
+}
+
+fn decrypt_stream_data(d: *mut Doc, h: u32, num: usize, gen: usize) {
+    var tn: [u8; 4] = "Type"
+    var xr: [u8; 4] = "XRef"
+    let ty: u32 = pobj.dict_get(&(*d).ar, h, (&tn[0]) as u64, 4)
+    if pobj.o_name_eq(&(*d).ar, ty, (&xr[0]) as u64, 4) {
+        return
+    }
+    let at: usize = pobj.o_stream_at(&(*d).ar, h) as usize
+    var n: usize = pobj.o_stream_len(&(*d).ar, h)
+    if at >= (*d).len {
+        pobj.o_set_stream(&(*d).ar, h, 0, 0)
+        return
+    }
+    if at + n > (*d).len {
+        n = (*d).len - at
+    }
+    let off: usize = rt.buf_len(&(*d).dec)
+    if off + n > MAX_DEC {
+        pobj.o_set_stream(&(*d).ar, h, 0, 0)
+        return
+    }
+    if crypt.crypt_stream(&(*d).cr, num, gen, (*d).data + at as u64, n, &(*d).dec) {
+        pobj.o_set_stream(&(*d).ar, h, DEC_BASE + off as u64,
+            rt.buf_len(&(*d).dec) - off)
+    } else {
+        pobj.o_set_stream(&(*d).ar, h, 0, 0)
+    }
+}
+
+fn crypt_filter_mode(d: *mut Doc, enc: u32, cf: u32, key: u64, kn: usize) -> u32 {
+    let nm: u32 = doc_dict_get(d, enc, key, kn)
+    if pobj.o_kind(&(*d).ar, nm) != pobj.T_NAME {
+        return crypt.MODE_NONE
+    }
+    var idn: [u8; 8] = "Identity"
+    if pobj.o_name_eq(&(*d).ar, nm, (&idn[0]) as u64, 8) {
+        return crypt.MODE_NONE
+    }
+    if pobj.o_kind(&(*d).ar, cf) != pobj.T_DICT {
+        return CRYPT_BAD
+    }
+    let f: u32 = doc_dict_get(d, cf, pobj.o_str_ptr(&(*d).ar, nm),
+        pobj.o_str_len(&(*d).ar, nm))
+    if pobj.o_kind(&(*d).ar, f) != pobj.T_DICT {
+        return CRYPT_BAD
+    }
+    var cfn: [u8; 3] = "CFM"
+    let m: u32 = doc_dict_get(d, f, (&cfn[0]) as u64, 3)
+    var v2: [u8; 2] = "V2"
+    var av: [u8; 5] = "AESV2"
+    var no: [u8; 4] = "None"
+    if pobj.o_name_eq(&(*d).ar, m, (&v2[0]) as u64, 2) {
+        return crypt.MODE_RC4
+    }
+    if pobj.o_name_eq(&(*d).ar, m, (&av[0]) as u64, 5) {
+        return crypt.MODE_AES
+    }
+    if pobj.o_name_eq(&(*d).ar, m, (&no[0]) as u64, 4) {
+        return crypt.MODE_NONE
+    }
+    return CRYPT_BAD
+}
+
+fn setup_encryption(d: *mut Doc) {
+    var en: [u8; 7] = "Encrypt"
+    let eh: u32 = pobj.dict_get(&(*d).ar, (*d).trailer, (&en[0]) as u64, 7)
+    if eh == 0 as u32 {
+        return
+    }
+    (*d).encrypted = 1
+    if pobj.o_kind(&(*d).ar, eh) == pobj.T_REF {
+        (*d).enc_obj = pobj.o_int(&(*d).ar, eh) as usize
+    }
+    let er: u32 = doc_resolve(d, eh)
+    if pobj.o_kind(&(*d).ar, er) != pobj.T_DICT {
+        return
+    }
+    var fl: [u8; 6] = "Filter"
+    var std: [u8; 8] = "Standard"
+    if !pobj.o_name_eq(&(*d).ar, doc_dict_get(d, er, (&fl[0]) as u64, 6),
+        (&std[0]) as u64, 8) {
+        return
+    }
+    var vn: [u8; 1] = "V"
+    var rn: [u8; 1] = "R"
+    var ln: [u8; 6] = "Length"
+    var pn: [u8; 1] = "P"
+    var on: [u8; 1] = "O"
+    var un: [u8; 1] = "U"
+    var emn: [u8; 15] = "EncryptMetadata"
+    let v: i64 = doc_int(d, er, (&vn[0]) as u64, 1, 0)
+    let r: i64 = doc_int(d, er, (&rn[0]) as u64, 1, 2)
+    var lenbits: i64 = doc_int(d, er, (&ln[0]) as u64, 6, 40)
+    let p: i64 = doc_int(d, er, (&pn[0]) as u64, 1, 0)
+    if lenbits < 0 || lenbits > 256 {
+        lenbits = 40
+    }
+    if v < 0 || v > 5 || r < 0 || r > 6 {
+        return
+    }
+    let oh: u32 = doc_dict_get(d, er, (&on[0]) as u64, 1)
+    let uh: u32 = doc_dict_get(d, er, (&un[0]) as u64, 1)
+    if pobj.o_kind(&(*d).ar, oh) != pobj.T_STR ||
+    pobj.o_kind(&(*d).ar, uh) != pobj.T_STR {
+        return
+    }
+    var encmeta: bool = true
+    let emh: u32 = doc_dict_get(d, er, (&emn[0]) as u64, 15)
+    if pobj.o_kind(&(*d).ar, emh) == pobj.T_BOOL {
+        encmeta = pobj.o_bool(&(*d).ar, emh)
+    }
+    var idp: u64 = 0
+    var idl: usize = 0
+    var idk: [u8; 2] = "ID"
+    let ih: u32 = doc_dict_get(d, (*d).trailer, (&idk[0]) as u64, 2)
+    if pobj.o_kind(&(*d).ar, ih) == pobj.T_ARR && pobj.o_arr_len(&(*d).ar, ih) > 0 {
+        let e0: u32 = doc_resolve(d, pobj.o_arr_at(&(*d).ar, ih, 0))
+        if pobj.o_kind(&(*d).ar, e0) == pobj.T_STR {
+            idp = pobj.o_str_ptr(&(*d).ar, e0)
+            idl = pobj.o_str_len(&(*d).ar, e0)
+        }
+    }
+    var stm: u32 = crypt.MODE_RC4
+    var strm: u32 = crypt.MODE_RC4
+    if v == 4 {
+        var cfn: [u8; 2] = "CF"
+        var sn: [u8; 4] = "StmF"
+        var rn2: [u8; 4] = "StrF"
+        let cf: u32 = doc_dict_get(d, er, (&cfn[0]) as u64, 2)
+        stm = crypt_filter_mode(d, er, cf, (&sn[0]) as u64, 4)
+        strm = crypt_filter_mode(d, er, cf, (&rn2[0]) as u64, 4)
+        if stm == CRYPT_BAD || strm == CRYPT_BAD {
+            return
+        }
+    }
+    crypt.crypt_derive(&(*d).cr, v as u32, r as u32, lenbits as u32,
+        (p & 4294967295) as u32,
+        pobj.o_str_ptr(&(*d).ar, oh), pobj.o_str_len(&(*d).ar, oh),
+        pobj.o_str_ptr(&(*d).ar, uh), pobj.o_str_len(&(*d).ar, uh),
+        idp, idl, encmeta, (&(*d).pw[0]) as u64, (*d).pwn, stm, strm)
 }
 
 fn fix_stream(d: *mut Doc, h: u32, lx: *mut pobj.Lex) {
@@ -338,14 +550,22 @@ fn doc_stream(d: *mut Doc, h: u32, out: *mut rt.Buf) -> bool {
     if pobj.o_kind(&(*d).ar, h) != pobj.T_STREAM {
         return false
     }
-    let at: usize = pobj.o_stream_at(&(*d).ar, h) as usize
+    let at64: u64 = pobj.o_stream_at(&(*d).ar, h)
     let raw: usize = pobj.o_stream_len(&(*d).ar, h)
-    if at >= (*d).len {
+    var n: usize = raw
+    var lim: usize = (*d).len
+    if at64 >= DEC_BASE {
+        lim = rt.buf_len(&(*d).dec)
+    }
+    var at: usize = at64 as usize
+    if at64 >= DEC_BASE {
+        at = (at64 - DEC_BASE) as usize
+    }
+    if at >= lim {
         return false
     }
-    var n: usize = raw
-    if at + n > (*d).len {
-        n = (*d).len - at
+    if at + n > lim {
+        n = lim - at
     }
     var fn1: [u8; 6] = "Filter"
     var fn2: [u8; 1] = "F"
@@ -356,13 +576,17 @@ fn doc_stream(d: *mut Doc, h: u32, out: *mut rt.Buf) -> bool {
     if ph == 0 as u32 {
         ph = doc_dict_get(d, h, (&pn2[0]) as u64, 2)
     }
+    var src0: u64 = (*d).data + at as u64
+    if at64 >= DEC_BASE {
+        src0 = rt.buf_ptr(&(*d).dec) + at as u64
+    }
     var cnt: usize = 1
     if pobj.o_kind(&(*d).ar, fh) == pobj.T_ARR {
         cnt = pobj.o_arr_len(&(*d).ar, fh)
     } else if pobj.o_kind(&(*d).ar, fh) != pobj.T_NAME {
         var i: usize = 0
         while i < n {
-            rt.buf_push(out, ld8((*d).data, at + i))
+            rt.buf_push(out, ld8(src0, i))
             i = i + 1
         }
         return true
@@ -370,7 +594,7 @@ fn doc_stream(d: *mut Doc, h: u32, out: *mut rt.Buf) -> bool {
     var cur: rt.Buf = rt.buf_new()
     var i2: usize = 0
     while i2 < n {
-        rt.buf_push(&cur, ld8((*d).data, at + i2))
+        rt.buf_push(&cur, ld8(src0, i2))
         i2 = i2 + 1
     }
     var step: usize = 0
@@ -1221,6 +1445,9 @@ fn doc_open(d: *mut Doc, data: u64, len: usize) -> bool {
     if first > 0 && first < len {
         ok = follow_chain(d, first)
     }
+    if (*d).trailer != 0 as u32 {
+        setup_encryption(d)
+    }
     var rn: [u8; 4] = "Root"
     if (*d).trailer != 0 as u32 {
         let rh: u32 = doc_dict_get(d, (*d).trailer, (&rn[0]) as u64, 4)
@@ -1271,7 +1498,7 @@ fn doc_open(d: *mut Doc, data: u64, len: usize) -> bool {
     if (*d).npages == 0 {
         pages_by_scan(d)
     }
-    if (*d).encrypted != 0 as u32 {
+    if (*d).encrypted != 0 as u32 && !crypt.crypt_active(&(*d).cr) {
         (*d).err = E_ENCRYPTED
         return false
     }
