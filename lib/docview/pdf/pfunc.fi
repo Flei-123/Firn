@@ -1,0 +1,492 @@
+// SPDX-License-Identifier: MPL-2.0
+// PDF functions: sampled (type 0), exponential (type 2) and stitching (type 3).
+import html.mem
+import std.math
+import rt.rt
+import docview.pdf.pobj
+import docview.pdf.pdoc
+
+export {
+    PFunc, PFuncSet,
+    pf_set_new, pf_set_init, pf_set_free,
+    pf_parse, pf_eval, pf_nout, pf_nums,
+}
+
+const PF_MAX: usize = 128
+const PF_POOL: usize = 65536
+const PF_MAXIN: usize = 4
+const PF_MAXOUT: usize = 8
+const PF_MAXKIDS: usize = 256
+const PF_SAMPLED: u32 = 0
+const PF_EXPO: u32 = 2
+const PF_STITCH: u32 = 3
+
+struct PFunc {
+    kind: u32,
+    nin: usize,
+    nout: usize,
+    dom: [f64; 8],
+    rng: [f64; 16],
+    hasrng: bool,
+    off: usize,
+    n: f64,
+    k: usize,
+    size: [usize; 4],
+    enc: [f64; 8],
+}
+
+struct PFuncSet {
+    f: [PFunc; 128],
+    nf: usize,
+    pool: *mut f64,
+    pn: usize,
+}
+
+fn pf_func_new() -> PFunc {
+    return PFunc { kind: 99, nin: 1, nout: 1, dom: [0.0; 8], rng: [0.0; 16],
+        hasrng: false, off: 0, n: 1.0, k: 0, size: [1; 4], enc: [0.0; 8] }
+}
+
+fn pf_set_new() -> PFuncSet {
+    return PFuncSet { f: [pf_func_new(); 128], nf: 0,
+        pool: 0 as *mut f64, pn: 0 }
+}
+
+fn pf_set_init(fs: *mut PFuncSet) -> bool {
+    (*fs).nf = 0
+    (*fs).pn = 0
+    (*fs).pool = mem.heap_alloc(PF_POOL * 8) as *mut f64
+    return (*fs).pool as usize != 0
+}
+
+fn pf_set_free(fs: *mut PFuncSet) {
+    if (*fs).pool as usize != 0 {
+        mem.heap_free((*fs).pool as *mut u8, PF_POOL * 8)
+        (*fs).pool = 0 as *mut f64
+    }
+}
+
+#[no_gc]
+fn pf_ld(p: *mut f64, i: usize) -> f64 {
+    return *((p as u64 + (i * 8) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn pf_st(p: *mut f64, i: usize, v: f64) {
+    *((p as u64 + (i * 8) as u64) as *mut f64) = v
+}
+
+#[no_gc]
+fn pf_clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    var x: f64 = v
+    if x < lo {
+        x = lo
+    }
+    if x > hi {
+        x = hi
+    }
+    return x
+}
+
+fn pf_nums(d: *mut pdoc.Doc, dict: u32, name: u64, n: usize, out: *mut f64,
+    cap: usize) -> usize {
+    let ar: *mut pobj.PdfArena = &(*d).ar
+    let a: u32 = pdoc.doc_dict_get(d, dict, name, n)
+    if pobj.o_kind(ar, a) != pobj.T_ARR {
+        return 0
+    }
+    var cnt: usize = pobj.o_arr_len(ar, a)
+    if cnt > cap {
+        cnt = cap
+    }
+    var i: usize = 0
+    while i < cnt {
+        let e: u32 = pdoc.doc_resolve(d, pobj.o_arr_at(ar, a, i))
+        var v: f64 = 0.0
+        if pobj.o_is_num(ar, e) {
+            v = pobj.o_num(ar, e)
+        }
+        pf_st(out, i, v)
+        i = i + 1
+    }
+    return cnt
+}
+
+fn pf_nout(fs: *mut PFuncSet, idx: i32) -> usize {
+    if idx < 0 || (idx as usize) >= (*fs).nf {
+        return 0
+    }
+    return (*fs).f[idx as usize].nout
+}
+
+fn pf_pool_take(fs: *mut PFuncSet, n: usize) -> usize {
+    if (*fs).pn + n > PF_POOL {
+        return PF_POOL + 1
+    }
+    let at: usize = (*fs).pn
+    (*fs).pn = at + n
+    return at
+}
+
+fn pf_bits(p: u64, n: usize, bitpos: usize, bps: usize) -> u64 {
+    var v: u64 = 0
+    var b: usize = 0
+    while b < bps {
+        let pos: usize = bitpos + b
+        let byte: usize = pos >> 3
+        var bit: u64 = 0
+        if byte < n {
+            let by: u8 = *((p + byte as u64) as *mut u8)
+            bit = ((by >> (7 - (pos & 7)) as u8) & 1 as u8) as u64
+        }
+        v = (v << 1) | bit
+        b = b + 1
+    }
+    return v
+}
+
+fn pf_parse(d: *mut pdoc.Doc, fs: *mut PFuncSet, h0: u32, depth: usize) -> i32 {
+    let ar: *mut pobj.PdfArena = &(*d).ar
+    let h: u32 = pdoc.doc_resolve(d, h0)
+    if depth > 6 || (*fs).nf >= PF_MAX {
+        return -1
+    }
+    let ok: u32 = pobj.o_kind(ar, h)
+    if ok != pobj.T_DICT && ok != pobj.T_STREAM {
+        return -1
+    }
+    var nft: [u8; 12] = "FunctionType"
+    var nd: [u8; 6] = "Domain"
+    var nr: [u8; 5] = "Range"
+    let ft: i64 = pdoc.doc_int(d, h, (&nft[0]) as u64, 12, -1)
+    var f: PFunc = pf_func_new()
+    var dn: usize = pf_nums(d, h, (&nd[0]) as u64, 6, (&f.dom[0]) as *mut f64, 8)
+    if dn < 2 {
+        return -1
+    }
+    f.nin = dn / 2
+    if f.nin > PF_MAXIN {
+        return -1
+    }
+    let rn: usize = pf_nums(d, h, (&nr[0]) as u64, 5, (&f.rng[0]) as *mut f64, 16)
+    f.hasrng = rn >= 2
+    if f.hasrng {
+        f.nout = rn / 2
+    }
+    if ft == 2 {
+        var n0: [u8; 2] = "C0"
+        var n1: [u8; 2] = "C1"
+        var nn: [u8; 1] = "N"
+        var c0: [f64; 8] = [0.0; 8]
+        var c1: [f64; 8] = [1.0; 8]
+        let k0: usize = pf_nums(d, h, (&n0[0]) as u64, 2, (&c0[0]) as *mut f64, 8)
+        let k1: usize = pf_nums(d, h, (&n1[0]) as u64, 2, (&c1[0]) as *mut f64, 8)
+        var no: usize = k0
+        if k1 > no {
+            no = k1
+        }
+        if no == 0 {
+            no = 1
+        }
+        if k0 == 0 {
+            c0[0] = 0.0
+        }
+        if k1 == 0 {
+            c1[0] = 1.0
+        }
+        f.kind = PF_EXPO
+        f.nin = 1
+        f.nout = no
+        f.n = pdoc.doc_num(d, h, (&nn[0]) as u64, 1, 1.0)
+        let at: usize = pf_pool_take(fs, no * 2)
+        if at > PF_POOL {
+            return -1
+        }
+        f.off = at
+        var j: usize = 0
+        while j < no {
+            pf_st((*fs).pool, at + j, c0[j])
+            pf_st((*fs).pool, at + no + j, c1[j])
+            j = j + 1
+        }
+        (*fs).f[(*fs).nf] = f
+        (*fs).nf = (*fs).nf + 1
+        return ((*fs).nf - 1) as i32
+    }
+    if ft == 3 {
+        var nfs: [u8; 9] = "Functions"
+        var nb: [u8; 6] = "Bounds"
+        var ne: [u8; 6] = "Encode"
+        let fa: u32 = pdoc.doc_dict_get(d, h, (&nfs[0]) as u64, 9)
+        if pobj.o_kind(ar, fa) != pobj.T_ARR {
+            return -1
+        }
+        let k: usize = pobj.o_arr_len(ar, fa)
+        if k == 0 || k > PF_MAXKIDS {
+            return -1
+        }
+        let at: usize = pf_pool_take(fs, k * 4)
+        if at > PF_POOL {
+            return -1
+        }
+        var i: usize = 0
+        var nout: usize = 0
+        while i < k {
+            let kid: i32 = pf_parse(d, fs, pobj.o_arr_at(ar, fa, i), depth + 1)
+            if kid < 0 {
+                return -1
+            }
+            if i == 0 {
+                nout = pf_nout(fs, kid)
+            }
+            pf_st((*fs).pool, at + i, kid as f64)
+            i = i + 1
+        }
+        var bnd: [f64; 256] = [0.0; 256]
+        var enc: [f64; 512] = [0.0; 512]
+        let bn: usize = pf_nums(d, h, (&nb[0]) as u64, 6, (&bnd[0]) as *mut f64, 256)
+        let en: usize = pf_nums(d, h, (&ne[0]) as u64, 6, (&enc[0]) as *mut f64, 512)
+        i = 0
+        while i < k {
+            var bv: f64 = f.dom[1]
+            if i < bn {
+                bv = bnd[i]
+            }
+            pf_st((*fs).pool, at + k + i, bv)
+            var e0: f64 = 0.0
+            var e1: f64 = 1.0
+            if i * 2 + 1 < en {
+                e0 = enc[i * 2]
+                e1 = enc[i * 2 + 1]
+            }
+            pf_st((*fs).pool, at + 2 * k + 2 * i, e0)
+            pf_st((*fs).pool, at + 2 * k + 2 * i + 1, e1)
+            i = i + 1
+        }
+        f.kind = PF_STITCH
+        f.nin = 1
+        f.nout = nout
+        f.k = k
+        f.off = at
+        (*fs).f[(*fs).nf] = f
+        (*fs).nf = (*fs).nf + 1
+        return ((*fs).nf - 1) as i32
+    }
+    if ft == 0 {
+        if !f.hasrng || f.nout > PF_MAXOUT {
+            return -1
+        }
+        var nsz: [u8; 4] = "Size"
+        var nbp: [u8; 13] = "BitsPerSample"
+        var ne: [u8; 6] = "Encode"
+        var ndc: [u8; 6] = "Decode"
+        var sz: [f64; 4] = [1.0; 4]
+        let sn: usize = pf_nums(d, h, (&nsz[0]) as u64, 4, (&sz[0]) as *mut f64, 4)
+        if sn < f.nin {
+            return -1
+        }
+        var total: usize = 1
+        var i: usize = 0
+        while i < f.nin {
+            var s: usize = 1
+            if sz[i] >= 1.0 && sz[i] < 100000.0 {
+                s = sz[i] as usize
+            }
+            f.size[i] = s
+            if total * s > PF_POOL {
+                return -1
+            }
+            total = total * s
+            i = i + 1
+        }
+        let bps: usize = pdoc.doc_int(d, h, (&nbp[0]) as u64, 13, 8) as usize
+        if bps == 0 || bps > 32 {
+            return -1
+        }
+        let cnt: usize = total * f.nout
+        let at: usize = pf_pool_take(fs, cnt)
+        if at > PF_POOL {
+            return -1
+        }
+        var enc: [f64; 8] = [0.0; 8]
+        let en: usize = pf_nums(d, h, (&ne[0]) as u64, 6, (&enc[0]) as *mut f64, 8)
+        i = 0
+        while i < f.nin {
+            if i * 2 + 1 < en {
+                f.enc[i * 2] = enc[i * 2]
+                f.enc[i * 2 + 1] = enc[i * 2 + 1]
+            } else {
+                f.enc[i * 2] = 0.0
+                f.enc[i * 2 + 1] = (f.size[i] - 1) as f64
+            }
+            i = i + 1
+        }
+        var dec: [f64; 16] = [0.0; 16]
+        let dc: usize = pf_nums(d, h, (&ndc[0]) as u64, 6, (&dec[0]) as *mut f64, 16)
+        var buf: rt.Buf = rt.buf_new()
+        if !pdoc.doc_stream(d, h, &buf) {
+            rt.buf_free(&buf)
+            return -1
+        }
+        let p: u64 = rt.buf_ptr(&buf)
+        let n: usize = rt.buf_len(&buf)
+        var maxv: f64 = 4294967295.0
+        if bps < 32 {
+            maxv = ((1 as u64) << bps as u64) as f64 - 1.0
+        }
+        var s: usize = 0
+        while s < cnt {
+            let j: usize = s % f.nout
+            var d0: f64 = f.rng[j * 2]
+            var d1: f64 = f.rng[j * 2 + 1]
+            if j * 2 + 1 < dc {
+                d0 = dec[j * 2]
+                d1 = dec[j * 2 + 1]
+            }
+            let raw: u64 = pf_bits(p, n, s * bps, bps)
+            pf_st((*fs).pool, at + s, d0 + (raw as f64) * (d1 - d0) / maxv)
+            s = s + 1
+        }
+        rt.buf_free(&buf)
+        f.kind = PF_SAMPLED
+        f.off = at
+        (*fs).f[(*fs).nf] = f
+        (*fs).nf = (*fs).nf + 1
+        return ((*fs).nf - 1) as i32
+    }
+    return -1
+}
+
+fn pf_eval_sampled(fs: *mut PFuncSet, f: *mut PFunc, inp: *mut f64,
+    out: *mut f64) {
+    var i0: [usize; 4] = [0; 4]
+    var fr: [f64; 4] = [0.0; 4]
+    var stride: [usize; 4] = [1; 4]
+    var i: usize = 0
+    var acc: usize = 1
+    while i < (*f).nin {
+        let d0: f64 = (*f).dom[i * 2]
+        let d1: f64 = (*f).dom[i * 2 + 1]
+        let x: f64 = pf_clamp(pf_ld(inp, i), d0, d1)
+        var e: f64 = (*f).enc[i * 2]
+        if d1 != d0 {
+            e = (*f).enc[i * 2] + (x - d0) * ((*f).enc[i * 2 + 1] -
+                (*f).enc[i * 2]) / (d1 - d0)
+        }
+        let sz: usize = (*f).size[i]
+        e = pf_clamp(e, 0.0, (sz - 1) as f64)
+        stride[i] = acc
+        acc = acc * sz
+        if sz == 1 {
+            i0[i] = 0
+            fr[i] = 0.0
+        } else {
+            var ix: usize = math.floor(e) as usize
+            if ix > sz - 2 {
+                ix = sz - 2
+            }
+            i0[i] = ix
+            fr[i] = e - (ix as f64)
+        }
+        i = i + 1
+    }
+    var j: usize = 0
+    while j < (*f).nout {
+        pf_st(out, j, 0.0)
+        j = j + 1
+    }
+    var c: usize = 0
+    let corners: usize = (1 as usize) << (*f).nin
+    while c < corners {
+        var w: f64 = 1.0
+        var at: usize = 0
+        i = 0
+        while i < (*f).nin {
+            var bit: usize = (c >> i) & 1
+            if bit == 1 {
+                w = w * fr[i]
+            } else {
+                w = w * (1.0 - fr[i])
+            }
+            at = at + (i0[i] + bit) * stride[i]
+            i = i + 1
+        }
+        if w > 0.0 {
+            j = 0
+            while j < (*f).nout {
+                let sv: f64 = pf_ld((*fs).pool, (*f).off + at * (*f).nout + j)
+                pf_st(out, j, pf_ld(out, j) + w * sv)
+                j = j + 1
+            }
+        }
+        c = c + 1
+    }
+}
+
+fn pf_eval(fs: *mut PFuncSet, idx: i32, inp: *mut f64, out: *mut f64) -> usize {
+    if idx < 0 || (idx as usize) >= (*fs).nf {
+        return 0
+    }
+    let f: *mut PFunc = &(*fs).f[idx as usize]
+    if (*f).kind == PF_EXPO {
+        let x: f64 = pf_clamp(pf_ld(inp, 0), (*f).dom[0], (*f).dom[1])
+        var xn: f64 = x
+        if (*f).n != 1.0 {
+            xn = 0.0
+            if x > 0.0 {
+                xn = math.powf(x, (*f).n)
+            }
+            if (*f).n == 0.0 {
+                xn = 1.0
+            }
+        }
+        var j: usize = 0
+        while j < (*f).nout {
+            let a: f64 = pf_ld((*fs).pool, (*f).off + j)
+            let b: f64 = pf_ld((*fs).pool, (*f).off + (*f).nout + j)
+            pf_st(out, j, a + xn * (b - a))
+            j = j + 1
+        }
+    }
+    if (*f).kind == PF_STITCH {
+        let x: f64 = pf_clamp(pf_ld(inp, 0), (*f).dom[0], (*f).dom[1])
+        let k: usize = (*f).k
+        var s: usize = 0
+        while s + 1 < k && x >= pf_ld((*fs).pool, (*f).off + k + s) {
+            s = s + 1
+        }
+        var lo: f64 = (*f).dom[0]
+        if s > 0 {
+            lo = pf_ld((*fs).pool, (*f).off + k + s - 1)
+        }
+        var hi: f64 = (*f).dom[1]
+        if s + 1 < k {
+            hi = pf_ld((*fs).pool, (*f).off + k + s)
+        }
+        let e0: f64 = pf_ld((*fs).pool, (*f).off + 2 * k + 2 * s)
+        let e1: f64 = pf_ld((*fs).pool, (*f).off + 2 * k + 2 * s + 1)
+        var xx: f64 = e0
+        if hi != lo {
+            xx = e0 + (x - lo) * (e1 - e0) / (hi - lo)
+        }
+        var tmp: [f64; 4] = [0.0; 4]
+        tmp[0] = xx
+        let kid: i32 = pf_ld((*fs).pool, (*f).off + s) as i32
+        if kid >= idx {
+            return 0
+        }
+        pf_eval(fs, kid, (&tmp[0]) as *mut f64, out)
+    }
+    if (*f).kind == PF_SAMPLED {
+        pf_eval_sampled(fs, f, inp, out)
+    }
+    if (*f).hasrng {
+        var j: usize = 0
+        while j < (*f).nout {
+            pf_st(out, j, pf_clamp(pf_ld(out, j), (*f).rng[j * 2],
+                (*f).rng[j * 2 + 1]))
+            j = j + 1
+        }
+    }
+    return (*f).nout
+}
