@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.aac.aac_state
+
+export { filterbank }
+
+fn fft(buf: u64, h: usize, fc: u64, fs: u64) {
+
+    var j: usize = 0
+    var i: usize = 0
+    while i < h - 1 {
+        if i < j {
+            let ar: f32 = aac_state.ldf(buf, 2 * i)
+            let ai: f32 = aac_state.ldf(buf, 2 * i + 1)
+            aac_state.stf(buf, 2 * i, aac_state.ldf(buf, 2 * j))
+            aac_state.stf(buf, 2 * i + 1, aac_state.ldf(buf, 2 * j + 1))
+            aac_state.stf(buf, 2 * j, ar)
+            aac_state.stf(buf, 2 * j + 1, ai)
+        }
+        var m: usize = h >> 1
+        while m >= 1 && (j & m) != 0 {
+            j = j ^ m
+            m = m >> 1
+        }
+        j = j | m
+        i = i + 1
+    }
+    var len: usize = 2
+    while len <= h {
+        let half: usize = len / 2
+        let step: usize = h / len
+        var s: usize = 0
+        while s < h {
+            var k: usize = 0
+            while k < half {
+                let wr: f32 = aac_state.ldf(fc, k * step)
+                let wi: f32 = aac_state.ldf(fs, k * step)
+                let xr: f32 = aac_state.ldf(buf, 2 * (s + k + half))
+                let xi: f32 = aac_state.ldf(buf, 2 * (s + k + half) + 1)
+                let tr: f32 = xr * wr - xi * wi
+                let ti: f32 = xr * wi + xi * wr
+                let ur: f32 = aac_state.ldf(buf, 2 * (s + k))
+                let ui: f32 = aac_state.ldf(buf, 2 * (s + k) + 1)
+                aac_state.stf(buf, 2 * (s + k), ur + tr)
+                aac_state.stf(buf, 2 * (s + k) + 1, ui + ti)
+                aac_state.stf(buf, 2 * (s + k + half), ur - tr)
+                aac_state.stf(buf, 2 * (s + k + half) + 1, ui - ti)
+                k = k + 1
+            }
+            s = s + len
+        }
+        len = len * 2
+    }
+}
+
+fn imdct(d: *mut aac_state.Aac, m: usize, coef: u64, out: u64) {
+    var pre: u64 = (*d).tw_pre_l
+    var post: u64 = (*d).tw_post_l
+    var fc: u64 = (*d).fft_cos_l
+    var fs: u64 = (*d).fft_sin_l
+    if m == aac_state.SHORT {
+        pre = (*d).tw_pre_s
+        post = (*d).tw_post_s
+        fc = (*d).fft_cos_s
+        fs = (*d).fft_sin_s
+    }
+    let h: usize = m / 2
+    let t: u64 = (*d).tmp2 + 1024
+    var k: usize = 0
+    while k < h {
+        let xr: f32 = aac_state.ldf(coef, 2 * k)
+        let xi: f32 = aac_state.ldf(coef, m - 1 - 2 * k)
+        let cr: f32 = aac_state.ldf(pre, 2 * k)
+        let ci: f32 = aac_state.ldf(pre, 2 * k + 1)
+        aac_state.stf(t, 2 * k, xr * cr - xi * ci)
+        aac_state.stf(t, 2 * k + 1, xr * ci + xi * cr)
+        k = k + 1
+    }
+    fft(t, h, fc, fs)
+
+    let y: u64 = (*d).tmp2 + 1024 + (m * 4) as% u64
+    let sc: f32 = 1.0 / (m as f32)
+    k = 0
+    while k < h {
+        let tr: f32 = aac_state.ldf(t, 2 * k)
+        let ti: f32 = aac_state.ldf(t, 2 * k + 1)
+        let pr: f32 = aac_state.ldf(post, 2 * k)
+        let pi: f32 = aac_state.ldf(post, 2 * k + 1)
+        aac_state.stf(y, 2 * k, (tr * pr - ti * pi) * sc)
+        aac_state.stf(y, m - 1 - 2 * k, (0.0 - (tr * pi + ti * pr)) * sc)
+        k = k + 1
+    }
+
+    let hh: usize = m / 2
+    var n: usize = 0
+    while n < 2 * m {
+        if n < hh {
+            aac_state.stf(out, n, aac_state.ldf(y, hh + n))
+        } else {
+            if n < 3 * hh {
+                aac_state.stf(out, n, 0.0 - aac_state.ldf(y, 3 * hh - 1 - n))
+            } else {
+                aac_state.stf(out, n, 0.0 - aac_state.ldf(y, n - 3 * hh))
+            }
+        }
+        n = n + 1
+    }
+}
+
+fn wrise(d: *mut aac_state.Aac, shape: u32, long: i32, n: usize) -> f32 {
+    if long != 0 {
+        if shape != 0 {
+            return aac_state.ldf((*d).win_kbd_l, n)
+        }
+        return aac_state.ldf((*d).win_sine_l, n)
+    }
+    if shape != 0 {
+        return aac_state.ldf((*d).win_kbd_s, n)
+    }
+    return aac_state.ldf((*d).win_sine_s, n)
+}
+
+fn filterbank(d: *mut aac_state.Aac, c: usize, out: u64) {
+    let sp: u64 = (*d).spec + (c * aac_state.FRAME * 4) as% u64
+    let ov: u64 = (*d).overlap + (c * aac_state.FRAME * 4) as% u64
+    let buf: u64 = (*d).tmp
+    let seq: u32 = (*d).ics[c].seq
+    let shape: u32 = (*d).ics[c].shape
+    let pshape: u32 = (*d).prev_shape[c]
+    var n: usize = 0
+    if seq != aac_state.EIGHT_SHORT {
+        imdct(d, aac_state.FRAME, sp, buf)
+
+        n = 0
+        while n < 2048 {
+            var w: f32 = 1.0
+            if n < 1024 {
+
+                if seq == aac_state.LONG_STOP {
+                    if n < 448 {
+                        w = 0.0
+                    } else {
+                        if n < 576 {
+                            w = wrise(d, pshape, 0, n - 448)
+                        } else {
+                            w = 1.0
+                        }
+                    }
+                } else {
+                    w = wrise(d, pshape, 1, n)
+                }
+            } else {
+
+                let r: usize = 2047 - n
+                if seq == aac_state.LONG_START {
+                    if n < 1472 {
+                        w = 1.0
+                    } else {
+                        if n < 1600 {
+                            w = wrise(d, shape, 0, 2047 - n - 448)
+                        } else {
+                            w = 0.0
+                        }
+                    }
+                } else {
+                    w = wrise(d, shape, 1, r)
+                }
+            }
+            aac_state.stf(buf, n, aac_state.ldf(buf, n) * w)
+            n = n + 1
+        }
+        n = 0
+        while n < 1024 {
+            aac_state.stf(out, n, aac_state.ldf(buf, n) + aac_state.ldf(ov, n))
+            aac_state.stf(ov, n, aac_state.ldf(buf, 1024 + n))
+            n = n + 1
+        }
+    } else {
+
+        let acc: u64 = (*d).tmp + 8192
+        rt.mem_set(acc, 0 as% u8, 2048 * 4)
+        let one: u64 = (*d).tmp + 16384
+        var wnd: usize = 0
+        while wnd < 8 {
+            imdct(d, aac_state.SHORT, sp + (wnd * 128 * 4) as% u64, one)
+            var lshape: u32 = shape
+            if wnd == 0 {
+                lshape = pshape
+            }
+            n = 0
+            while n < 256 {
+                var w: f32 = 0.0
+                if n < 128 {
+                    w = wrise(d, lshape, 0, n)
+                } else {
+                    w = wrise(d, shape, 0, 255 - n)
+                }
+                let at: usize = 448 + wnd * 128 + n
+                aac_state.stf(acc, at, aac_state.ldf(acc, at) + aac_state.ldf(one, n) * w)
+                n = n + 1
+            }
+            wnd = wnd + 1
+        }
+        n = 0
+        while n < 1024 {
+            aac_state.stf(out, n, aac_state.ldf(acc, n) + aac_state.ldf(ov, n))
+            aac_state.stf(ov, n, aac_state.ldf(acc, 1024 + n))
+            n = n + 1
+        }
+    }
+    (*d).prev_shape[c] = shape
+}

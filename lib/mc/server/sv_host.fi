@@ -3,20 +3,25 @@
 
 import std.rt
 import std.time
+import std.io
 import mc.mc_version
 import mc.mc_versions
 import mc.server.sv_state
 import mc.server.sv_core
 import mc.server.sv_flat
+import mc.server.sv_gen
+import mc.server.sv_gen_world
+import mc.server.sv_gen_state
 import mc.server.sv_save
 import mc.server.sv_world
-import mc.server.v763.sv_codec_v763
-import mc.server.v763.sv_join_v763
+import mc.server.sv_ver
+import mc.server.sv_vers
+import mc.server.sv_rs_host
 
-export { SERVER_KIND, server_main, Host, host_new, host_start, host_stop, host_port, host_ticks, host_avg_us, host_tps_x100, host_online, host_failed }
+export { SERVER_KIND, host_start_cfg, host_start_cfg_version, server_main, Host, host_new, host_start, host_stop, host_port, host_ticks, host_avg_us, host_tps_x100, host_online, host_failed }
 
 const SERVER_KIND: u64 = 1936291443
-const PROTOCOL: i32 = 763
+const DEFAULT_PROTOCOL: i32 = 763
 const READY_WAIT_MS: i64 = 5000
 
 struct Host {
@@ -33,20 +38,64 @@ fn host_new() -> Host {
     return Host { srv: 0 as *mut sv_state.Server, handle: 0, running: false }
 }
 
+fn setup_none(srv: *mut sv_state.Server) {}
+
 fn host_start(h: *mut Host, port: u16, view: i32, game_mode: i32, world_dir: str, ops: str) -> bool {
-    var ver: mc_version.Version = mc_version.version_empty()
-    if !mc_versions.version_by_protocol(PROTOCOL, &ver) { return false }
     var cfg: sv_state.Config = sv_state.config_default()
     cfg.view = view
     cfg.game_mode = game_mode
     cfg.ops = ops
-    var source: sv_world.WorldSource = sv_flat.flat_source_new(&ver, sv_codec_v763.BIOME_PLAINS)
-    if world_dir.n > 0 {
-        sv_world.world_free(&source)
-        if !sv_save.save_source_open(&ver, world_dir, sv_codec_v763.BIOME_PLAINS, &source) { return false }
+    return host_start_cfg(h, port, cfg, world_dir, setup_none)
+}
+
+fn host_start_cfg(h: *mut Host, port: u16, cfg: sv_state.Config, world_dir: str, setup: fn(*mut sv_state.Server)) -> bool {
+    return host_start_cfg_version(h, DEFAULT_PROTOCOL, port, cfg, world_dir, setup)
+}
+
+fn level_dat_path(world_dir: str) -> u64 {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, world_dir.p as u64, world_dir.n)
+    rt.buf_push_bytes(&b, "/level.dat".p as u64, 10)
+    rt.buf_push(&b, 0 as u8)
+    return rt.buf_ptr(&b)
+}
+
+fn host_start_cfg_version(h: *mut Host, protocol: i32, port: u16, cfg: sv_state.Config, world_dir: str, setup: fn(*mut sv_state.Server)) -> bool {
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(protocol, &ver) { return false }
+    var adapter: sv_ver.ServerVersion = sv_ver.adapter_none()
+    if !sv_vers.server_version_by_protocol(protocol, &adapter) { return false }
+    var source: sv_world.WorldSource = sv_flat.flat_source_new(&ver, adapter.biome_default)
+    let gen_dim: str = sv_gen.gen_dim_of_level_type(cfg.level_type)
+    var gen_world: bool = false
+    if world_dir.n > 0 && gen_dim.n > 0 && cfg.gen_dir.n > 0 && !io.file_exists(level_dat_path(world_dir)) {
+        gen_world = sv_gen_world.gen_world_prepare(world_dir, &cfg)
     }
-    (*h).srv = sv_core.server_box(sv_core.server_new(cfg, ver, source, sv_join_v763.join_send))
+    var gen_dim_use: str = gen_dim
+    if gen_world { gen_dim_use = sv_gen.gen_dim_of_level_type(cfg.level_type) }
+    if (world_dir.n == 0 || gen_world) && gen_dim_use.n > 0 && cfg.gen_dir.n > 0 {
+        var gen_src: sv_world.WorldSource = sv_gen.gen_source_new(&ver, adapter.biome_default, cfg.gen_dir, gen_dim_use, cfg.seed, cfg.gen_surface, cfg.gen_carvers, cfg.gen_features)
+        if gen_src.ctx != 0 as u64 {
+            sv_world.world_free(&source)
+            source = gen_src
+        }
+    }
+    if world_dir.n > 0 && !gen_world {
+        sv_world.world_free(&source)
+        if !sv_save.save_source_open(&ver, world_dir, adapter.biome_default, adapter.be_table, &source) { return false }
+    }
+    (*h).srv = sv_core.server_box(sv_core.server_new(cfg, ver, source, sv_ver.adapter_alloc(adapter)))
+    (*(*h).srv).ents.ops = adapter.entity_ops
+    (*(*h).srv).ents.loot = adapter.entity_loot
+    sv_rs_host.rs_install((*h).srv)
+    adapter.rs_bind(&(*(*h).srv).rs)
     rt.buf_push_bytes(&(*(*h).srv).world_dir, world_dir.p as u64, world_dir.n)
+    (*(*h).srv).gen_world = gen_world
+    if gen_world {
+        sv_gen_world.gen_world_load((*h).srv)
+        sv_gen_state.gen_state_load_clock((*h).srv)
+    }
+    setup((*h).srv)
     sv_state.shared_set((*(*h).srv).shared, sv_state.SH_PORT_WANT, port as u64)
     (*h).handle = thread_start(SERVER_KIND, (*h).srv as u64)
     (*h).running = (*h).handle != 0

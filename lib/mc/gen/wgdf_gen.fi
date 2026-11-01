@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.cpus
+import jobs.jobs
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_load
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fill
+import mc.gen.wgdf_widen
+import mc.gen.wgdf_pscache
+import mc.gen.wgdf_memo
+import mc.gen.wgbio_source
+import mc.gen.wgsr_def
+import mc.gen.wgsr_load
+import mc.gen.wgsr_seed
+import mc.gen.wgsr_ctx
+import mc.gen.wgsr_apply
+import mc.gen.wgdf_aqshare
+import mc.gen.wgdf_cshare
+import mc.gen.wgcv_def
+import mc.gen.wgcv_load
+import mc.gen.wgcv_run
+import mc.gen.wgft_def
+import mc.gen.wgft_load
+import mc.gen.wgft_region
+import mc.gen.wgdf_slots
+import mc.gen.wgft_run
+
+export { WgGen, gen_thread_work, gen_open, gen_chunk, gen_close, gen_default_block, gen_min_y, gen_height, gen_bio_count, gen_bio_name, gen_surface_count, gen_surface_name, gen_surface_code, gen_code_name }
+
+const MAX_THREADS: usize = 8
+const CACHE_SLOTS: usize = 1024
+const TILE_W: i32 = 2
+const TERRAIN_SLOTS: usize = 1024
+const TERRAIN_LIST: usize = 64
+const FEATURE_MARGIN: i32 = 2
+
+struct WgGen {
+    job: TileCtx,
+    g: *mut wgdf_graph.WgGraph,
+    ns: [u64; 8],
+    aqs: u64,
+    cs: u64,
+    threads: usize,
+    root: i32,
+    chunk_bytes: usize,
+    cache: u64,
+    cache_bytes: usize,
+    bio: *mut wgbio_source.BioSource,
+    sdef: *mut wgsr_def.SrDef,
+    cv: *mut wgcv_def.CvDef,
+    ft: *mut wgft_def.FtDef,
+    regions: [u64; 8],
+    tcache: u64,
+    tbio_cache: u64,
+    tmap: wgdf_slots.SlotMap,
+    tl_s: [usize; 64],
+    out_slot: [usize; 8],
+    tl_x: [i32; 64],
+    tl_z: [i32; 64],
+    tl_n: usize,
+    seed: i64,
+    start_cache: u64,
+    bio_cache: u64,
+    bio_bytes: usize,
+    omap: wgdf_slots.SlotMap,
+    pool: jobs.Jobs,
+}
+
+struct TileCtx {
+    gen: *mut WgGen,
+    tx: i32,
+    tz: i32,
+}
+
+fn gen_bytes() -> usize {
+    return wgdf_graph.wg_size_of[WgGen]()
+}
+
+fn gen_open(data_root: str, dim: str, seed: i64, surface: bool, carvers: bool, features: bool) -> *mut WgGen {
+    let g: *mut wgdf_graph.WgGraph = rt.heap_alloc(wgdf_graph.graph_bytes()) as *mut wgdf_graph.WgGraph
+    *g = wgdf_graph.graph_new()
+    if !wgdf_load.load_settings(g, data_root, dim) {
+        rt.heap_free(g as u64, wgdf_graph.graph_bytes())
+        return 0 as *mut WgGen
+    }
+    let root: i32 = wgdf_graph.router_find(g, "final_density")
+    if root < 0 {
+        rt.heap_free(g as u64, wgdf_graph.graph_bytes())
+        return 0 as *mut WgGen
+    }
+    let gen: *mut WgGen = rt.heap_alloc(gen_bytes()) as *mut WgGen
+    (*gen).g = g
+    (*gen).root = root
+    var n: usize = cpus.cpu_count() as usize
+    if n > MAX_THREADS { n = MAX_THREADS }
+    var threads: usize = 1
+    while threads * 2 <= n { threads = threads * 2 }
+    if threads < 2 { threads = 2 }
+    (*gen).threads = threads
+    (*gen).chunk_bytes = ((*g).height as usize) * 256
+    (*gen).cache_bytes = (*gen).chunk_bytes * 2
+    (*gen).cache = rt.heap_alloc((*gen).cache_bytes * CACHE_SLOTS)
+    (*gen).tcache = rt.heap_alloc((*gen).chunk_bytes * TERRAIN_SLOTS)
+    (*gen).bio = wgbio_source.bio_open(g, data_root, wgbio_source.bio_preset_of(dim))
+    (*gen).bio_bytes = (((*g).height / 16) as usize) * 64
+    (*gen).sdef = 0 as *mut wgsr_def.SrDef
+    if surface {
+        let sd: *mut wgsr_def.SrDef = wgsr_def.def_new()
+        if wgsr_load.def_load(sd, g, data_root, dim, (*gen).bio) {
+            (*gen).sdef = sd
+        } else {
+            wgsr_def.def_free(sd)
+        }
+    }
+    (*gen).seed = seed
+    (*gen).cv = 0 as *mut wgcv_def.CvDef
+    (*gen).start_cache = 0 as u64
+    if carvers && (*gen).sdef != (0 as *mut wgsr_def.SrDef) {
+        (*gen).cv = wgcv_load.cv_load(data_root, (*gen).sdef, (*gen).bio, (*g).min_y, (*g).height)
+        if (*gen).cv != (0 as *mut wgcv_def.CvDef) {
+            (*gen).start_cache = rt.heap_alloc(wgcv_run.START_CACHE_SLOTS * 8)
+            rt.mem_set((*gen).start_cache, 0 as u8, wgcv_run.START_CACHE_SLOTS * 8)
+        }
+    }
+    (*gen).bio_cache = rt.heap_alloc((*gen).bio_bytes * CACHE_SLOTS)
+    rt.mem_set((*gen).bio_cache, 0 as u8, (*gen).bio_bytes * CACHE_SLOTS)
+    wgdf_slots.slots_init(&(*gen).omap)
+    var i: usize = 0
+    while i < threads {
+        let ns: *mut wgdf_eval.WgNoises = wgdf_eval.noises_alloc()
+        wgdf_eval.noises_build(g, ns, seed)
+        (*gen).ns[i] = ns as u64
+        i = i + 1
+    }
+    (*gen).aqs = 0
+    if (*g).aquifers {
+        (*gen).aqs = wgdf_aqshare.share_new(wgdf_eval.floor_div((*g).min_y, 12) - 1) as u64
+        i = 0
+        while i < threads {
+            (*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).aqs = (*gen).aqs
+            i = i + 1
+        }
+    }
+    (*gen).cs = wgdf_cshare.share_new(g) as u64
+    i = 0
+    while i < threads {
+        (*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).cs = (*gen).cs
+        i = i + 1
+    }
+    if (*gen).sdef != (0 as *mut wgsr_def.SrDef) {
+        wgsr_seed.def_seed((*gen).sdef, seed)
+        wgsr_seed.def_noises_init((*gen).sdef)
+    }
+    (*gen).ft = 0 as *mut wgft_def.FtDef
+    if features && (*gen).cv != (0 as *mut wgcv_def.CvDef) {
+        (*gen).ft = wgft_load.ft_load(data_root, dim, (*gen).sdef, (*gen).bio, (*g).min_y, (*g).height, (*(*gen).sdef).zoom_seed)
+    }
+    if (*gen).ft != (0 as *mut wgft_def.FtDef) { features_alloc(gen) }
+    (*gen).pool = jobs.create((threads - 1) as u64)
+    return gen
+}
+
+fn features_alloc(gen: *mut WgGen) {
+    (*gen).tbio_cache = rt.heap_alloc((*gen).bio_bytes * TERRAIN_SLOTS)
+    rt.mem_set((*gen).tbio_cache, 0 as u8, (*gen).bio_bytes * TERRAIN_SLOTS)
+    wgdf_slots.slots_init(&(*gen).tmap)
+    var i: usize = 0
+    while i < (*gen).threads {
+        (*gen).regions[i] = wgft_region.region_new((*gen).ft, (*gen).chunk_bytes, (*gen).bio_bytes) as u64
+        i = i + 1
+    }
+}
+
+fn features_free(gen: *mut WgGen) {
+    rt.heap_free((*gen).tbio_cache, (*gen).bio_bytes * TERRAIN_SLOTS)
+    var i: usize = 0
+    while i < (*gen).threads {
+        wgft_region.region_free((*gen).regions[i] as *mut wgft_region.Region)
+        i = i + 1
+    }
+    wgft_def.def_free((*gen).ft)
+}
+
+fn surface_pass(gen: *mut WgGen, worker: usize, cx: i32, cz: i32, dst: u64, bio_buf: u64) {
+    if (*gen).sdef == (0 as *mut wgsr_def.SrDef) { return }
+    let ns: *mut wgdf_eval.WgNoises = (*gen).ns[worker] as *mut wgdf_eval.WgNoises
+    let sc: *mut wgsr_ctx.SrCtx = wgsr_ctx.ctx_new((*gen).sdef, (*gen).g, ns, (*gen).bio, cx, cz, dst, bio_buf)
+    wgsr_apply.surface_chunk(sc)
+    if (*gen).cv != (0 as *mut wgcv_def.CvDef) {
+        wgcv_run.carve_chunk((*gen).cv, sc, (*gen).g, ns, (*gen).bio, (*gen).seed, cx, cz, (*gen).start_cache)
+    }
+    wgsr_ctx.ctx_free(sc)
+}
+
+fn gen_surface_count(gen: *mut WgGen) -> usize {
+    if (*gen).sdef == (0 as *mut wgsr_def.SrDef) { return 0 }
+    return wgsr_def.block_count((*gen).sdef)
+}
+
+fn gen_surface_name(gen: *mut WgGen, idx: usize) -> str {
+    return wgsr_def.block_name((*gen).sdef, idx)
+}
+
+fn gen_surface_code(idx: usize) -> u16 {
+    return wgsr_def.index_code(idx as i32) as u16
+}
+
+fn gen_code_name(gen: *mut WgGen, code: u16) -> str {
+    if (*gen).sdef == (0 as *mut wgsr_def.SrDef) { return "unknown" }
+    return wgsr_def.code_name_of((*gen).sdef, code as i32)
+}
+
+fn terrain_chunk(gen: *mut WgGen, worker: usize, cx: i32, cz: i32, dst: u64, bio_buf: u64) {
+    let ns: *mut wgdf_eval.WgNoises = (*gen).ns[worker] as *mut wgdf_eval.WgNoises
+    wgdf_fill.fill_chunk((*gen).g, ns, (*gen).root, cx, cz, true, dst as *mut u8)
+    if (*gen).bio != (0 as *mut wgbio_source.BioSource) {
+        wgbio_source.bio_fill_chunk((*gen).bio, (*gen).g, ns, cx, cz, bio_buf as *mut u8)
+    }
+    surface_pass(gen, worker, cx, cz, dst, bio_buf)
+}
+
+fn tile_body(ctx: u64, lo: u64, hi: u64) {
+    let tc: *mut TileCtx = ctx as *mut TileCtx
+    let gen: *mut WgGen = (*tc).gen
+    var i: u64 = lo
+    while i < hi {
+        let cx: i32 = (*tc).tx + (i as i32) % TILE_W
+        let cz: i32 = (*tc).tz + (i as i32) / TILE_W
+        let slot: usize = (*gen).out_slot[i as usize]
+        let dst: u64 = (*gen).tcache + ((slot * (*gen).chunk_bytes) as u64)
+        terrain_chunk(gen, i as usize, cx, cz, dst, (*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64))
+        wgdf_widen.widen_codes((*gen).cache + ((slot * (*gen).cache_bytes) as u64), dst, (*gen).chunk_bytes)
+        i = i + 1
+    }
+}
+
+fn terrain_body(ctx: u64, lo: u64, hi: u64) {
+    let tc: *mut TileCtx = ctx as *mut TileCtx
+    let gen: *mut WgGen = (*tc).gen
+    var w: u64 = lo
+    while w < hi {
+        var k: usize = w as usize
+        while k < (*gen).tl_n {
+            let cx: i32 = (*gen).tl_x[k]
+            let cz: i32 = (*gen).tl_z[k]
+            let s: usize = (*gen).tl_s[k]
+            terrain_chunk(gen, w as usize, cx, cz, (*gen).tcache + ((s * (*gen).chunk_bytes) as u64), (*gen).tbio_cache + ((s * (*gen).bio_bytes) as u64))
+            k = k + (*gen).threads
+        }
+        w = w + 1
+    }
+}
+
+fn decorate_body(ctx: u64, lo: u64, hi: u64) {
+    let tc: *mut TileCtx = ctx as *mut TileCtx
+    let gen: *mut WgGen = (*tc).gen
+    var i: u64 = lo
+    while i < hi {
+        let cx: i32 = (*tc).tx + (i as i32) % TILE_W
+        let cz: i32 = (*tc).tz + (i as i32) / TILE_W
+        let r: *mut wgft_region.Region = (*gen).regions[i as usize] as *mut wgft_region.Region
+        wgft_region.region_reset(r)
+        var dz: i32 = 0 - FEATURE_MARGIN
+        while dz <= FEATURE_MARGIN {
+            var dx: i32 = 0 - FEATURE_MARGIN
+            while dx <= FEATURE_MARGIN {
+                let s: usize = wgdf_slots.slots_find(&(*gen).tmap, cx + dx, cz + dz) as usize
+                wgft_region.region_load(r, cx, cz, (dz + FEATURE_MARGIN) * wgft_region.SIDE + dx + FEATURE_MARGIN, (*gen).tcache + ((s * (*gen).chunk_bytes) as u64), (*gen).tbio_cache + ((s * (*gen).bio_bytes) as u64))
+                dx = dx + 1
+            }
+            dz = dz + 1
+        }
+        wgft_run.decorate(r, (*gen).seed, cx, cz)
+        let slot: usize = (*gen).out_slot[i as usize]
+        let mid: u64 = (*r).blocks + ((12 as u64) * ((*gen).cache_bytes as u64))
+        rt.mem_copy((*gen).cache + ((slot * (*gen).cache_bytes) as u64), mid, (*gen).cache_bytes)
+        let ts: usize = wgdf_slots.slots_find(&(*gen).tmap, cx, cz) as usize
+        rt.mem_copy((*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64), (*gen).tbio_cache + ((ts * (*gen).bio_bytes) as u64), (*gen).bio_bytes)
+        i = i + 1
+    }
+}
+
+fn collect_terrain(gen: *mut WgGen, tx: i32, tz: i32, rows: i32) {
+    (*gen).tl_n = 0
+    var dz: i32 = 0 - FEATURE_MARGIN
+    while dz < rows + FEATURE_MARGIN {
+        var dx: i32 = 0 - FEATURE_MARGIN
+        while dx < TILE_W + FEATURE_MARGIN {
+            if wgdf_slots.slots_find(&(*gen).tmap, tx + dx, tz + dz) < 0 && (*gen).tl_n < TERRAIN_LIST {
+                (*gen).tl_x[(*gen).tl_n] = tx + dx
+                (*gen).tl_z[(*gen).tl_n] = tz + dz
+                (*gen).tl_s[(*gen).tl_n] = wgdf_slots.slots_take(&(*gen).tmap, tx + dx, tz + dz, tx - FEATURE_MARGIN, tz - FEATURE_MARGIN, TILE_W + 2 * FEATURE_MARGIN, rows + 2 * FEATURE_MARGIN)
+                (*gen).tl_n = (*gen).tl_n + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+}
+
+fn assign_out_slots(gen: *mut WgGen, rows: i32) {
+    var i: i32 = 0
+    while i < TILE_W * rows {
+        let cx: i32 = (*gen).job.tx + i % TILE_W
+        let cz: i32 = (*gen).job.tz + i / TILE_W
+        let found: i32 = wgdf_slots.slots_find(&(*gen).omap, cx, cz)
+        if found >= 0 {
+            (*gen).out_slot[i as usize] = found as usize
+        } else {
+            (*gen).out_slot[i as usize] = wgdf_slots.slots_take(&(*gen).omap, cx, cz, (*gen).job.tx, (*gen).job.tz, TILE_W, rows)
+        }
+        i = i + 1
+    }
+}
+
+fn run_tile(gen: *mut WgGen, rows: i32) {
+    assign_out_slots(gen, rows)
+    wgdf_cshare.share_reset((*gen).cs as *mut wgdf_cshare.CornerShare, (*gen).job.tx, (*gen).job.tz)
+    if (*gen).aqs != 0 {
+        wgdf_aqshare.share_reset((*gen).aqs as *mut wgdf_aqshare.AqShare, (*gen).job.tx, (*gen).job.tz)
+    }
+    if (*gen).ft == (0 as *mut wgft_def.FtDef) {
+        jobs.parallel_for(&(*gen).pool, 0 as u64, (*gen).threads as u64, 1 as u64, tile_body, (&(*gen).job) as u64)
+        return
+    }
+    collect_terrain(gen, (*gen).job.tx, (*gen).job.tz, rows)
+    jobs.parallel_for(&(*gen).pool, 0 as u64, (*gen).threads as u64, 1 as u64, terrain_body, (&(*gen).job) as u64)
+    jobs.parallel_for(&(*gen).pool, 0 as u64, (*gen).threads as u64, 1 as u64, decorate_body, (&(*gen).job) as u64)
+}
+
+fn gen_chunk(gen: *mut WgGen, cx: i32, cz: i32, out: *mut u16, bio_out: *mut u8) {
+    if wgdf_slots.slots_find(&(*gen).omap, cx, cz) < 0 {
+        let rows: i32 = ((*gen).threads as i32) / TILE_W
+        (*gen).job = TileCtx { gen: gen, tx: wgdf_eval.floor_div(cx, TILE_W) * TILE_W, tz: wgdf_eval.floor_div(cz, rows) * rows }
+        run_tile(gen, rows)
+    }
+    let slot: usize = wgdf_slots.slots_find(&(*gen).omap, cx, cz) as usize
+    rt.mem_copy(out as u64, (*gen).cache + ((slot * (*gen).cache_bytes) as u64), (*gen).cache_bytes)
+    rt.mem_copy(bio_out as u64, (*gen).bio_cache + ((slot * (*gen).bio_bytes) as u64), (*gen).bio_bytes)
+}
+
+fn gen_bio_count(gen: *mut WgGen) -> usize {
+    if (*gen).bio == (0 as *mut wgbio_source.BioSource) { return 0 }
+    return wgbio_source.bio_name_count((*gen).bio)
+}
+
+fn gen_bio_name(gen: *mut WgGen, idx: usize) -> str {
+    return wgbio_source.bio_name((*gen).bio, idx)
+}
+
+fn gen_min_y(gen: *mut WgGen) -> i32 { return (*(*gen).g).min_y }
+
+fn gen_height(gen: *mut WgGen) -> i32 { return (*(*gen).g).height }
+
+fn gen_default_block(gen: *mut WgGen) -> str {
+    return str { p: &(*(*gen).g).default_block[0], n: (*(*gen).g).default_block_len }
+}
+
+fn gen_close(gen: *mut WgGen) {
+    jobs.destroy(&(*gen).pool)
+    var i: usize = 0
+    while i < (*gen).threads {
+        wgdf_memo.memo_release(&(*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).memo)
+        wgdf_pscache.ps_release(&(*((*gen).ns[i] as *mut wgdf_eval.WgNoises)).ps)
+        rt.heap_free((*gen).ns[i], wgdf_eval.NOISES_BYTES)
+        i = i + 1
+    }
+    if (*gen).aqs != 0 { wgdf_aqshare.share_free((*gen).aqs as *mut wgdf_aqshare.AqShare) }
+    wgdf_cshare.share_free((*gen).cs as *mut wgdf_cshare.CornerShare)
+    rt.heap_free((*gen).cache, (*gen).cache_bytes * CACHE_SLOTS)
+    rt.heap_free((*gen).tcache, (*gen).chunk_bytes * TERRAIN_SLOTS)
+    rt.heap_free((*gen).bio_cache, (*gen).bio_bytes * CACHE_SLOTS)
+    if (*gen).ft != (0 as *mut wgft_def.FtDef) { features_free(gen) }
+    if (*gen).cv != (0 as *mut wgcv_def.CvDef) {
+        wgcv_def.def_free((*gen).cv)
+        rt.heap_free((*gen).start_cache, wgcv_run.START_CACHE_SLOTS * 8)
+    }
+    if (*gen).sdef != (0 as *mut wgsr_def.SrDef) { wgsr_def.def_free((*gen).sdef) }
+    if (*gen).bio != (0 as *mut wgbio_source.BioSource) { wgbio_source.bio_close((*gen).bio) }
+    rt.heap_free((*gen).g as u64, wgdf_graph.graph_bytes())
+    rt.heap_free(gen as u64, gen_bytes())
+}
+
+fn gen_thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}

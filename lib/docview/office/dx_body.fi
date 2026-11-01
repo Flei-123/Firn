@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.xml
+import std.vec
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_pr
+import docview.office.dx_style
+import docview.office.dx_model
+import docview.office.dx_ctx
+import docview.office.dx_para
+import docview.office.dx_sect
+
+export { parse_blocks }
+
+fn is_wrapper(nm: str) -> bool {
+    return nm == "customXml" || nm == "ins" || nm == "moveTo" || nm == "smartTag" || nm == "dir" || nm == "bdo"
+}
+
+fn read_trpr(x: *mut xml.Doc, trpr: u32, d: *mut dx_model.Docx, ri: u32) {
+    if trpr == xml.NONE {
+        return
+    }
+    let hn: u32 = ooxml.child_l(x, trpr, "trHeight")
+    let rw: *mut dx_model.Row = dx_model.row_at(d, ri)
+    if hn != xml.NONE {
+        var v: i64 = ooxml.attr_i64(x, hn, "val", 0)
+        if v < 0 { v = 0 }
+        if v > 100000 { v = 100000 }
+        (*rw).height = v as i32
+        (*rw).exact = ooxml.attr_l(x, hn, "hRule") == "exact"
+    }
+    (*rw).header = ooxml.child_l(x, trpr, "tblHeader") != xml.NONE
+}
+
+fn read_tcpr(x: *mut xml.Doc, tcpr: u32, d: *mut dx_model.Docx, ci: u32) {
+    if tcpr == xml.NONE {
+        return
+    }
+    let ce: *mut dx_model.Cell = dx_model.cell_at(d, ci)
+    let w: u32 = ooxml.child_l(x, tcpr, "tcW")
+    if w != xml.NONE {
+        var v: i64 = ooxml.attr_i64(x, w, "w", 0)
+        if v < 0 { v = 0 }
+        if v > 200000 { v = 200000 }
+        (*ce).width = v as i32
+    }
+    let gs: u32 = ooxml.child_l(x, tcpr, "gridSpan")
+    if gs != xml.NONE {
+        var v2: i64 = ooxml.attr_i64(x, gs, "val", 1)
+        if v2 < 1 { v2 = 1 }
+        if v2 > 63 { v2 = 63 }
+        (*ce).span = v2 as i32
+    }
+    let vm: u32 = ooxml.child_l(x, tcpr, "vMerge")
+    if vm != xml.NONE {
+        if ooxml.attr_l(x, vm, "val") == "restart" {
+            (*ce).vmerge = 1
+        } else {
+            (*ce).vmerge = 2
+        }
+    }
+    let sh: u32 = ooxml.child_l(x, tcpr, "shd")
+    if sh != xml.NONE {
+        (*ce).shade = dx_pr.read_shd(x, sh)
+    }
+    let bs: u32 = ooxml.child_l(x, tcpr, "tcBorders")
+    if bs != xml.NONE {
+        (*ce).bt = dx_pr.read_border_named(x, bs, "top", "top")
+        (*ce).bl = dx_pr.read_border_named(x, bs, "left", "start")
+        (*ce).bb = dx_pr.read_border_named(x, bs, "bottom", "bottom")
+        (*ce).br = dx_pr.read_border_named(x, bs, "right", "end")
+    }
+}
+
+fn parse_cell(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, tc: u32, ri: u32, depth: i32) {
+    if vec_len[dx_model.Cell](&(*d).cells) >= dx_model.MAX_CELLS {
+        (*d).truncated = true
+        return
+    }
+    let ci: u32 = dx_model.new_cell(d, ri)
+    read_tcpr(x, ooxml.child_l(x, tc, "tcPr"), d, ci)
+    var bl: dx_model.BList = dx_model.blist_new()
+    parse_blocks(c, d, x, tc, &bl, depth + 1)
+    (*dx_model.cell_at(d, ci)).blocks = bl
+}
+
+fn parse_table(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, t: u32, list: *mut dx_model.BList, depth: i32) {
+    if (*c).table_depth >= dx_ctx.MAX_TABLE_DEPTH {
+        return
+    }
+    var tp: dx_props.TblProps = dx_props.tbl_unset()
+    let tpr: u32 = ooxml.child_l(x, t, "tblPr")
+    if tpr != xml.NONE {
+        let ts: u32 = ooxml.child_l(x, tpr, "tblStyle")
+        if ts != xml.NONE {
+            dx_style.resolve_table(&(*c).st, ooxml.attr_l(x, ts, "val"), &tp)
+        }
+        dx_pr.read_tblpr(x, tpr, &tp)
+    }
+    let ti: u32 = dx_model.new_table(d, tp)
+    let grid: u32 = ooxml.child_l(x, t, "tblGrid")
+    if grid != xml.NONE {
+        var g: u32 = ooxml.child_l(x, grid, "gridCol")
+        var k: u32 = 0 as u32
+        while g != xml.NONE && k < (512 as u32) {
+            var w: i64 = ooxml.attr_i64(x, g, "w", 0)
+            if w < 0 { w = 0 }
+            if w > 200000 { w = 200000 }
+            vec_push[i32](&(*d).grid, w as i32)
+            k = k + (1 as u32)
+            g = ooxml.next_l(x, g, "gridCol")
+        }
+        (*dx_model.table_at(d, ti)).gn = k
+    }
+    dx_model.block_add(d, list, dx_model.B_TABLE, ti, (*c).sect_idx)
+    (*c).table_depth = (*c).table_depth + 1
+    var tr: u32 = ooxml.child_l(x, t, "tr")
+    while tr != xml.NONE {
+        let ri: u32 = dx_model.new_row(d, ti)
+        read_trpr(x, ooxml.child_l(x, tr, "trPr"), d, ri)
+        var tc: u32 = ooxml.child_l(x, tr, "tc")
+        while tc != xml.NONE {
+            parse_cell(c, d, x, tc, ri, depth)
+            tc = ooxml.next_l(x, tc, "tc")
+        }
+        tr = ooxml.next_l(x, tr, "tr")
+    }
+    (*c).table_depth = (*c).table_depth - 1
+}
+
+fn parse_blocks(c: *mut dx_ctx.Ctx, d: *mut dx_model.Docx, x: *mut xml.Doc, parent: u32, list: *mut dx_model.BList, depth: i32) {
+    if depth > dx_ctx.MAX_DEPTH {
+        return
+    }
+    var ch: u32 = ooxml.first_el(x, parent)
+    while ch != xml.NONE {
+        let nm: str = ooxml.local_name(xml.name(x, ch))
+        if nm == "p" {
+            let idx: u32 = dx_para.parse_para(c, d, x, ch)
+            if idx != dx_model.NIL {
+                dx_model.block_add(d, list, dx_model.B_PARA, idx, (*c).sect_idx)
+                let ppr: u32 = ooxml.child_l(x, ch, "pPr")
+                let sp: u32 = ooxml.child_l(x, ppr, "sectPr")
+                if sp != xml.NONE && (*c).table_depth == 0 {
+                    dx_sect.read_sectpr(c, d, x, sp, (*c).sect_idx)
+                    if vec_len[dx_model.Sect](&(*d).sects) < dx_ctx.MAX_SECTS {
+                        (*c).sect_idx = dx_model.new_sect(d)
+                    }
+                }
+            }
+        } else if nm == "tbl" {
+            parse_table(c, d, x, ch, list, depth)
+        } else if nm == "sdt" {
+            let sc: u32 = ooxml.child_l(x, ch, "sdtContent")
+            if sc != xml.NONE {
+                parse_blocks(c, d, x, sc, list, depth + 1)
+            }
+        } else if is_wrapper(nm) {
+            parse_blocks(c, d, x, ch, list, depth + 1)
+        } else if nm == "sectPr" && depth == 0 {
+            dx_sect.read_sectpr(c, d, x, ch, (*c).sect_idx)
+        }
+        ch = ooxml.next_el(x, ch)
+    }
+}

@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.opc
+import docview.office.ooxml
+import docview.office.dx_utf8
+
+export {
+    Numbering, numbering_new, numbering_free, numbering_load, numbering_label, LabelInfo,
+    FMT_DECIMAL, FMT_BULLET,
+}
+
+const FMT_DECIMAL: u32 = 0
+const FMT_LOWER_LETTER: u32 = 1
+const FMT_UPPER_LETTER: u32 = 2
+const FMT_LOWER_ROMAN: u32 = 3
+const FMT_UPPER_ROMAN: u32 = 4
+const FMT_BULLET: u32 = 5
+const FMT_NONE: u32 = 6
+const FMT_DECIMAL_ZERO: u32 = 7
+const MAX_ABS: usize = 4000
+const MAX_NUMS: usize = 20000
+
+struct NumLvl {
+    start: i32,
+    fmt: u32,
+    text_off: u32,
+    text_n: u32,
+    left: i32,
+    hang: i32,
+    set: bool,
+}
+
+struct NumDef {
+    num_id: i32,
+    abs_idx: u32,
+    start_ov: [i32; 9],
+}
+
+struct LabelInfo {
+    left: i32,
+    hang: i32,
+    ok: bool,
+}
+
+struct Numbering {
+    pool: rt.Buf,
+    lvls: Vec[NumLvl],
+    abs_ids: Vec[i32],
+    nums: Vec[NumDef],
+    counters: Vec[i32],
+    started: Vec[i32],
+}
+
+fn numbering_new() -> Numbering {
+    return Numbering { pool: rt.buf_new(), lvls: vec_new[NumLvl](), abs_ids: vec_new[i32](), nums: vec_new[NumDef](),
+        counters: vec_new[i32](), started: vec_new[i32]() }
+}
+
+fn numbering_free(n: *mut Numbering) {
+    rt.buf_free(&(*n).pool)
+    vec_free[NumLvl](&(*n).lvls)
+    vec_free[i32](&(*n).abs_ids)
+    vec_free[NumDef](&(*n).nums)
+    vec_free[i32](&(*n).counters)
+    vec_free[i32](&(*n).started)
+}
+
+fn fmt_of(s: str) -> u32 {
+    if s == "decimal" { return FMT_DECIMAL }
+    if s == "lowerLetter" { return FMT_LOWER_LETTER }
+    if s == "upperLetter" { return FMT_UPPER_LETTER }
+    if s == "lowerRoman" { return FMT_LOWER_ROMAN }
+    if s == "upperRoman" { return FMT_UPPER_ROMAN }
+    if s == "bullet" { return FMT_BULLET }
+    if s == "none" { return FMT_NONE }
+    if s == "decimalZero" { return FMT_DECIMAL_ZERO }
+    return FMT_DECIMAL
+}
+
+fn numbering_load(pk: *mut opc.Package, part: str, nm: *mut Numbering) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var x: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&x)
+    if !opc.pkg_read_xml(pk, part, &raw, &x) {
+        return false
+    }
+    let root: u32 = xml.root(&x)
+    var c: u32 = ooxml.first_el(&x, root)
+    while c != xml.NONE {
+        if ooxml.is_el(&x, c, "abstractNum") && vec_len[i32](&(*nm).abs_ids) < MAX_ABS {
+            let base: usize = vec_len[NumLvl](&(*nm).lvls)
+            var k: usize = 0
+            while k < 9 {
+                vec_push[NumLvl](&(*nm).lvls, NumLvl { start: 1, fmt: FMT_DECIMAL, text_off: 0 as u32, text_n: 0 as u32,
+                    left: 0, hang: 0, set: false })
+                vec_push[i32](&(*nm).counters, 0)
+                vec_push[i32](&(*nm).started, 0)
+                k = k + 1
+            }
+            vec_push[i32](&(*nm).abs_ids, ooxml.attr_i64(&x, c, "abstractNumId", 0) as i32)
+            var l: u32 = ooxml.first_el(&x, c)
+            while l != xml.NONE {
+                if ooxml.is_el(&x, l, "lvl") {
+                    let il: i64 = ooxml.attr_i64(&x, l, "ilvl", 0)
+                    if il >= 0 && il < 9 {
+                        let e: *mut NumLvl = vec_elem_ptr[NumLvl](&(*nm).lvls, base + (il as usize))
+                        (*e).set = true
+                        let st: u32 = ooxml.child_l(&x, l, "start")
+                        if st != xml.NONE {
+                            (*e).start = ooxml.attr_i64(&x, st, "val", 1) as i32
+                        }
+                        let nf: u32 = ooxml.child_l(&x, l, "numFmt")
+                        if nf != xml.NONE {
+                            (*e).fmt = fmt_of(ooxml.attr_l(&x, nf, "val"))
+                        }
+                        let lt: u32 = ooxml.child_l(&x, l, "lvlText")
+                        if lt != xml.NONE {
+                            let t: str = ooxml.attr_l(&x, lt, "val")
+                            (*e).text_off = rt.buf_len(&(*nm).pool) as u32
+                            rt.buf_push_bytes(&(*nm).pool, t.p as u64, t.n)
+                            (*e).text_n = t.n as u32
+                        }
+                        let pp: u32 = ooxml.child_l(&x, l, "pPr")
+                        if pp != xml.NONE {
+                            let ind: u32 = ooxml.child_l(&x, pp, "ind")
+                            if ind != xml.NONE {
+                                var lf: i64 = ooxml.attr_i64(&x, ind, "left", -1000000)
+                                if lf == -1000000 {
+                                    lf = ooxml.attr_i64(&x, ind, "start", 0)
+                                }
+                                (*e).left = lf as i32
+                                (*e).hang = ooxml.attr_i64(&x, ind, "hanging", 0) as i32
+                            }
+                        }
+                    }
+                }
+                l = ooxml.next_el(&x, l)
+            }
+        }
+        c = ooxml.next_el(&x, c)
+    }
+    c = ooxml.first_el(&x, root)
+    while c != xml.NONE {
+        if ooxml.is_el(&x, c, "num") && vec_len[NumDef](&(*nm).nums) < MAX_NUMS {
+            let ai: u32 = ooxml.child_l(&x, c, "abstractNumId")
+            if ai != xml.NONE {
+                let want: i32 = ooxml.attr_i64(&x, ai, "val", 0) as i32
+                var found: i64 = -1
+                var k2: usize = 0
+                while k2 < vec_len[i32](&(*nm).abs_ids) {
+                    if vec_at[i32](&(*nm).abs_ids, k2) == want {
+                        found = k2 as i64
+                    }
+                    k2 = k2 + 1
+                }
+                if found >= 0 {
+                    var nd: NumDef = NumDef { num_id: ooxml.attr_i64(&x, c, "numId", 0) as i32, abs_idx: found as u32,
+                        start_ov: [-1; 9] }
+                    var o: u32 = ooxml.first_el(&x, c)
+                    while o != xml.NONE {
+                        if ooxml.is_el(&x, o, "lvlOverride") {
+                            let il2: i64 = ooxml.attr_i64(&x, o, "ilvl", 0)
+                            let so: u32 = ooxml.child_l(&x, o, "startOverride")
+                            if so != xml.NONE && il2 >= 0 && il2 < 9 {
+                                nd.start_ov[il2 as usize] = ooxml.attr_i64(&x, so, "val", 1) as i32
+                            }
+                        }
+                        o = ooxml.next_el(&x, o)
+                    }
+                    vec_push[NumDef](&(*nm).nums, nd)
+                }
+            }
+        }
+        c = ooxml.next_el(&x, c)
+    }
+    return true
+}
+
+fn find_num(nm: *mut Numbering, num_id: i32) -> i64 {
+    var i: usize = 0
+    let n: usize = vec_len[NumDef](&(*nm).nums)
+    while i < n {
+        if (*vec_elem_ptr[NumDef](&(*nm).nums, i)).num_id == num_id {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn push_roman(out: *mut rt.Buf, v: i32, upper: bool) {
+    var n: i32 = v
+    if n <= 0 || n >= 4000 {
+        rt.buf_push_dec_i64(out, v as i64)
+        return
+    }
+    var vals: [i32; 13] = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    var k: usize = 0
+    while k < 13 {
+        while n >= vals[k] {
+            n = n - vals[k]
+            roman_sym(out, k, upper)
+        }
+        k = k + 1
+    }
+}
+
+fn roman_sym(out: *mut rt.Buf, k: usize, upper: bool) {
+    var s: str = ""
+    if k == 0 { s = "m" }
+    if k == 1 { s = "cm" }
+    if k == 2 { s = "d" }
+    if k == 3 { s = "cd" }
+    if k == 4 { s = "c" }
+    if k == 5 { s = "xc" }
+    if k == 6 { s = "l" }
+    if k == 7 { s = "xl" }
+    if k == 8 { s = "x" }
+    if k == 9 { s = "ix" }
+    if k == 10 { s = "v" }
+    if k == 11 { s = "iv" }
+    if k == 12 { s = "i" }
+    var i: usize = 0
+    while i < s.n {
+        var c: u8 = rt.ld8(s.p as u64, i)
+        if upper {
+            c = c - 32 as u8
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+fn push_number(out: *mut rt.Buf, v: i32, fmt: u32) {
+    if fmt == FMT_LOWER_LETTER || fmt == FMT_UPPER_LETTER {
+        if v <= 0 {
+            rt.buf_push_dec_i64(out, v as i64)
+            return
+        }
+        var base: u8 = 97 as u8
+        if fmt == FMT_UPPER_LETTER {
+            base = 65 as u8
+        }
+        let ch: u8 = base + (((v - 1) % 26) as u8)
+        var reps: i32 = (v - 1) / 26 + 1
+        if reps > 8 { reps = 8 }
+        while reps > 0 {
+            rt.buf_push(out, ch)
+            reps = reps - 1
+        }
+        return
+    }
+    if fmt == FMT_LOWER_ROMAN {
+        push_roman(out, v, false)
+        return
+    }
+    if fmt == FMT_UPPER_ROMAN {
+        push_roman(out, v, true)
+        return
+    }
+    if fmt == FMT_DECIMAL_ZERO && v >= 0 && v < 10 {
+        rt.buf_push(out, 48 as u8)
+    }
+    if fmt == FMT_NONE {
+        return
+    }
+    rt.buf_push_dec_i64(out, v as i64)
+}
+
+fn push_bullet(out: *mut rt.Buf, t: str) {
+    if t.n == 0 {
+        dx_utf8.push_cp(out, 0x2022 as u32)
+        return
+    }
+    var len: usize = 0
+    let cp: u32 = dx_utf8.next_cp(t.p as u64, t.n, 0, &len)
+    if cp >= 0xF000 as u32 && cp <= 0xF0FF as u32 {
+        dx_utf8.push_cp(out, 0x2022 as u32)
+        return
+    }
+    if cp == 111 as u32 && t.n == 1 {
+        dx_utf8.push_cp(out, 0x2022 as u32)
+        return
+    }
+    rt.buf_push_bytes(out, t.p as u64, t.n)
+}
+
+fn numbering_label(nm: *mut Numbering, num_id: i32, ilvl: i32, out: *mut rt.Buf) -> LabelInfo {
+    let none: LabelInfo = LabelInfo { left: 0, hang: 0, ok: false }
+    if num_id <= 0 || ilvl < 0 || ilvl > 8 {
+        return none
+    }
+    let ni: i64 = find_num(nm, num_id)
+    if ni < 0 {
+        return none
+    }
+    let nd: *mut NumDef = vec_elem_ptr[NumDef](&(*nm).nums, ni as usize)
+    let base: usize = ((*nd).abs_idx as usize) * 9
+    let lv: usize = ilvl as usize
+    let e: *mut NumLvl = vec_elem_ptr[NumLvl](&(*nm).lvls, base + lv)
+    if !(*e).set {
+        return none
+    }
+    var start: i32 = (*e).start
+    if (*nd).start_ov[lv] >= 0 {
+        start = (*nd).start_ov[lv]
+    }
+    let cs: *mut i32 = vec_elem_ptr[i32](&(*nm).counters, base + lv)
+    let sd: *mut i32 = vec_elem_ptr[i32](&(*nm).started, base + lv)
+    if *sd == 0 {
+        *cs = start
+        *sd = 1
+    } else {
+        *cs = *cs + 1
+    }
+    var k: usize = lv + 1
+    while k < 9 {
+        *vec_elem_ptr[i32](&(*nm).started, base + k) = 0
+        k = k + 1
+    }
+    let txt: str = str { p: rt.ptr_of(rt.buf_ptr(&(*nm).pool) + ((*e).text_off as u64)), n: (*e).text_n as usize }
+    if (*e).fmt == FMT_BULLET {
+        push_bullet(out, txt)
+        return LabelInfo { left: (*e).left, hang: (*e).hang, ok: true }
+    }
+    var i: usize = 0
+    while i < txt.n {
+        let c: u8 = rt.ld8(txt.p as u64, i)
+        if c == 37 as u8 && i + 1 < txt.n {
+            let d: u8 = rt.ld8(txt.p as u64, i + 1)
+            if d >= 49 as u8 && d <= 57 as u8 {
+                let li: usize = (d - 49 as u8) as usize
+                let le: *mut NumLvl = vec_elem_ptr[NumLvl](&(*nm).lvls, base + li)
+                var val: i32 = *vec_elem_ptr[i32](&(*nm).counters, base + li)
+                if *vec_elem_ptr[i32](&(*nm).started, base + li) == 0 {
+                    val = (*le).start
+                }
+                push_number(out, val, (*le).fmt)
+                i = i + 2
+                continue
+            }
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+    return LabelInfo { left: (*e).left, hang: (*e).hang, ok: true }
+}

@@ -41,6 +41,8 @@ spawn-animals=false
 spawn-npcs=$NPCS
 enable-rcon=false
 enable-query=false
+enforce-secure-profile=false
+white-list=false
 PROPS
 mkfifo "$W/in"; exec 3<>"$W/in"
 ( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &

@@ -165,12 +165,30 @@ def emit(out_dir, icons, data):
             core += '    return ""\n}\n'
     open(os.path.join(out_dir, "ds_icons_core.fi"), "w").write(core)
     for size in SIZES:
-        o = head + "\nexport { regular, filled }\n"
-        for style in STYLES:
-            o += "\nfn %s(id: i64) -> str {\n" % style
-            o += variants(icons, data, size, style, False)
-            o += '    return ""\n}\n'
-        open(os.path.join(out_dir, "ds_icons_data%d.fi" % size), "w").write(o)
+        open(os.path.join(out_dir, "ds_icons_data%d.fi" % size), "w").write(data_module(head, icons, data, size))
+
+
+def data_module(head, icons, data, size):
+    funcs = []
+    for style in STYLES:
+        for n, _ in icons:
+            if n not in CORE and data.get((n, size, style)):
+                funcs.append((style, n))
+    exports = ["regular", "filled"] + [fn_name(st, n) for st, n in funcs]
+    o = head + "\nexport {\n" + ",\n".join("    " + ", ".join(exports[i:i + 6]) for i in range(0, len(exports), 6)) + ",\n}\n"
+    for style in STYLES:
+        o += "\nfn %s(id: i64) -> str {\n" % style
+        for i, (n, _) in enumerate(icons):
+            if (style, n) in funcs:
+                o += "    if id == %d { return %s() }\n" % (i, fn_name(style, n))
+        o += '    return ""\n}\n'
+    for style, n in funcs:
+        o += '\nfn %s() -> str {\n    return "%s"\n}\n' % (fn_name(style, n), data[(n, size, style)])
+    return o
+
+
+def fn_name(style, name):
+    return "%s_%s" % (style[0], name)
 
 
 def open_module(head, name):
@@ -192,15 +210,9 @@ def variants(icons, data, size, style, core):
 def load_existing(out_dir, icons):
     data = {}
     for size in SIZES:
-        sources = [os.path.join(out_dir, "ds_icons_data%d.fi" % size)]
-        for path in sources:
-            text = open(path).read()
-            for style in STYLES:
-                a = text.index("fn %s(id: i64)" % style)
-                b = text.find("\nfn ", a + 4)
-                body = text[a:] if b < 0 else text[a:b]
-                for m in re.finditer(r'if id == (\d+) \{\s*return "([^"]*)"', body):
-                    data[(icons[int(m.group(1))][0], size, style)] = m.group(2)
+        text = open(os.path.join(out_dir, "ds_icons_data%d.fi" % size)).read()
+        for m in re.finditer(r'fn ([rf])_([a-z0-9_]+)\(\) -> str \{\s*return "([^"]*)"', text):
+            data[(m.group(2), size, "regular" if m.group(1) == "r" else "filled")] = m.group(3)
     core_path = os.path.join(out_dir, "ds_icons_core.fi")
     if os.path.exists(core_path):
         text = open(core_path).read()

@@ -39,6 +39,7 @@ def fld(arg):
 
 
 src = open(template_path).read()
+src = re.sub(r'\$\{N:([^}]+)\}', lambda m: classes[m.group(1)], src)
 src = re.sub(r'\$\{C:([^}]+)\}', lambda m: cls(m.group(1)), src)
 src = re.sub(r'\$\{M:([^}]+)\}', lambda m: meth(m.group(1)), src)
 src = re.sub(r'\$\{F:([^}]+)\}', lambda m: fld(m.group(1)), src)

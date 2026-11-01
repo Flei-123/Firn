@@ -32,8 +32,8 @@ const perPacket = parseInt(process.argv[4] || '4', 10)
 if (!outDir) { console.error('usage: gen_fixtures.cjs <outdir> [version] [per-packet]'); process.exit(2) }
 fs.mkdirSync(outDir, { recursive: true })
 
-const data = mcData(version)
-const proto = data.protocol
+const data = mcData(process.env.MC_DATA_VERSION || version)
+const proto = process.env.MC_PROTOCOL_JSON ? JSON.parse(fs.readFileSync(process.env.MC_PROTOCOL_JSON, 'utf8')) : data.protocol
 
 // ---- the reference codec.
 // Versions that node-minecraft-protocol supports use ITS serializer. For newer versions

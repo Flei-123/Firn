@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.ogg_index
+
+export {
+    Opus, OpusPacket, opus_new, opus_packet_new, opus_open, opus_head_parse, opus_toc,
+    opus_channels, opus_pre_skip, opus_gain_q8, opus_input_rate, opus_total,
+    Ec, ec_new, ec_init, ec_decode, ec_decode_bin, ec_update, ec_bit_logp, ec_icdf, ec_bits, ec_uint, ec_tell, ec_tell_frac,
+    OPUS_E_HEAD, OPUS_E_MAPPING, OPUS_E_TOC,
+    OPUS_MODE_SILK, OPUS_MODE_HYBRID, OPUS_MODE_CELT,
+}
+
+const OPUS_E_HEAD: i32 = -1
+const OPUS_E_MAPPING: i32 = -2
+const OPUS_E_TOC: i32 = -3
+const OPUS_MODE_SILK: i32 = 0
+const OPUS_MODE_HYBRID: i32 = 1
+const OPUS_MODE_CELT: i32 = 2
+
+struct Opus {
+    channels: i32,
+    pre_skip: i32,
+    input_rate: i32,
+    gain_q8: i32,
+    family: i32,
+    total: i64,
+}
+
+struct OpusPacket {
+    mode: i32,
+    bandwidth: i32,
+    stereo: i32,
+    config: i32,
+    frame_samples: i32,
+    n: i32,
+    off: [i32; 48],
+    len: [i32; 48],
+}
+
+fn opus_new() -> Opus {
+    return Opus { channels: 0, pre_skip: 0, input_rate: 0, gain_q8: 0, family: 0, total: -1 }
+}
+
+fn opus_packet_new() -> OpusPacket {
+    return OpusPacket { mode: 0, bandwidth: 0, stereo: 0, config: 0, frame_samples: 0, n: 0, off: [0; 48], len: [0; 48] }
+}
+
+fn opus_channels(o: *mut Opus) -> i32 { return (*o).channels }
+fn opus_pre_skip(o: *mut Opus) -> i32 { return (*o).pre_skip }
+fn opus_gain_q8(o: *mut Opus) -> i32 { return (*o).gain_q8 }
+fn opus_input_rate(o: *mut Opus) -> i32 { return (*o).input_rate }
+fn opus_total(o: *mut Opus) -> i64 { return (*o).total }
+
+fn lb(p: u64, i: usize) -> i32 {
+    return (*((p + i as% u64) as *mut u8)) as% i32
+}
+
+fn opus_head_parse(o: *mut Opus, p: u64, n: usize) -> i32 {
+    if n < 19 {
+        return OPUS_E_HEAD
+    }
+    let magic: [u8; 8] = "OpusHead"
+    var i: usize = 0
+    while i < 8 {
+        if lb(p, i) != (magic[i] as% i32) {
+            return OPUS_E_HEAD
+        }
+        i = i + 1
+    }
+    if (lb(p, 8) & 0xF0) != 0 {
+        return OPUS_E_HEAD
+    }
+    (*o).channels = lb(p, 9)
+    (*o).pre_skip = lb(p, 10) | (lb(p, 11) << 8)
+    (*o).input_rate = lb(p, 12) | (lb(p, 13) << 8) | (lb(p, 14) << 16) | (lb(p, 15) << 24)
+    var gq: i32 = lb(p, 16) | (lb(p, 17) << 8)
+    if gq >= 32768 {
+        gq = gq - 65536
+    }
+    (*o).gain_q8 = gq
+    (*o).family = lb(p, 18)
+    if (*o).channels < 1 {
+        return OPUS_E_HEAD
+    }
+    if (*o).family != 0 || (*o).channels > 2 {
+        return OPUS_E_MAPPING
+    }
+    return 0
+}
+
+fn opus_open(o: *mut Opus, g: *mut ogg_index.Ogg) -> i32 {
+    if ogg_index.ogg_count(g) < 2 {
+        return OPUS_E_HEAD
+    }
+    let r: i32 = opus_head_parse(o, ogg_index.ogg_pkt(g, 0), ogg_index.ogg_len(g, 0))
+    if r != 0 {
+        return r
+    }
+    let lg: i64 = ogg_index.ogg_last_granule(g)
+    if lg >= 0 {
+        (*o).total = lg - ((*o).pre_skip as% i64)
+    }
+    return 0
+}
+
+fn frame_len(p: u64, at: i32, n: i32, used: *mut i32) -> i32 {
+    if at >= n {
+        return -1
+    }
+    let b0: i32 = lb(p, at as% usize)
+    if b0 < 252 {
+        *used = 1
+        return b0
+    }
+    if at + 1 >= n {
+        return -1
+    }
+    *used = 2
+    return 4 * lb(p, (at + 1) as% usize) + b0
+}
+
+fn opus_toc(p: u64, n: usize, out: *mut OpusPacket) -> i32 {
+    if n < 1 {
+        return OPUS_E_TOC
+    }
+    let len: i32 = n as% i32
+    let toc: i32 = lb(p, 0)
+    let cfg: i32 = toc >> 3
+    (*out).config = cfg
+    (*out).stereo = (toc >> 2) & 1
+    if cfg < 12 {
+        (*out).mode = OPUS_MODE_SILK
+        (*out).bandwidth = cfg >> 2
+    } else {
+        if cfg < 16 {
+            (*out).mode = OPUS_MODE_HYBRID
+            (*out).bandwidth = 3 + ((cfg - 12) >> 1)
+        } else {
+            (*out).mode = OPUS_MODE_CELT
+            (*out).bandwidth = 0
+        }
+    }
+
+    if (*out).mode == OPUS_MODE_CELT {
+        let c4: i32 = (cfg - 16) >> 2
+        if c4 == 0 {
+            (*out).bandwidth = 0
+        }
+        if c4 == 1 {
+            (*out).bandwidth = 2
+        }
+        if c4 == 2 {
+            (*out).bandwidth = 3
+        }
+        if c4 == 3 {
+            (*out).bandwidth = 4
+        }
+    }
+
+    var fs: i32 = 0
+    if (*out).mode == OPUS_MODE_SILK {
+        let k: i32 = cfg & 3
+        if k == 0 {
+            fs = 480
+        }
+        if k == 1 {
+            fs = 960
+        }
+        if k == 2 {
+            fs = 1920
+        }
+        if k == 3 {
+            fs = 2880
+        }
+    }
+    if (*out).mode == OPUS_MODE_HYBRID {
+        fs = 480
+        if (cfg & 1) != 0 {
+            fs = 960
+        }
+    }
+    if (*out).mode == OPUS_MODE_CELT {
+        let k: i32 = cfg & 3
+        fs = 120 << (k as% u32)
+    }
+    (*out).frame_samples = fs
+    let code: i32 = toc & 3
+    var pos: i32 = 1
+    var nf: i32 = 0
+    var used: i32 = 0
+    if code == 0 {
+
+        (*out).n = 1
+        (*out).off[0] = 1
+        (*out).len[0] = len - 1
+        if len - 1 > 1275 {
+            return OPUS_E_TOC
+        }
+        return 1
+    }
+    if code == 1 {
+
+        if ((len - 1) & 1) != 0 {
+            return OPUS_E_TOC
+        }
+        let h: i32 = (len - 1) / 2
+        if h > 1275 {
+            return OPUS_E_TOC
+        }
+        (*out).n = 2
+        (*out).off[0] = 1
+        (*out).len[0] = h
+        (*out).off[1] = 1 + h
+        (*out).len[1] = h
+        return 2
+    }
+    if code == 2 {
+
+        let l0: i32 = frame_len(p, pos, len, &used)
+        if l0 < 0 {
+            return OPUS_E_TOC
+        }
+        pos = pos + used
+        if pos + l0 > len {
+            return OPUS_E_TOC
+        }
+        let l1: i32 = len - pos - l0
+        if l1 > 1275 {
+            return OPUS_E_TOC
+        }
+        (*out).n = 2
+        (*out).off[0] = pos
+        (*out).len[0] = l0
+        (*out).off[1] = pos + l0
+        (*out).len[1] = l1
+        return 2
+    }
+
+    if len < 2 {
+        return OPUS_E_TOC
+    }
+    let fh: i32 = lb(p, 1)
+    pos = 2
+    nf = fh & 63
+    let vbr: i32 = (fh >> 7) & 1
+    let has_pad: i32 = (fh >> 6) & 1
+    if nf < 1 || nf > 48 {
+        return OPUS_E_TOC
+    }
+    if fs * nf > 5760 {
+        return OPUS_E_TOC
+    }
+    var pad: i32 = 0
+    if has_pad != 0 {
+        var more: i32 = 1
+        while more != 0 {
+            if pos >= len {
+                return OPUS_E_TOC
+            }
+            let pb: i32 = lb(p, pos as% usize)
+            pos = pos + 1
+            if pb == 255 {
+                pad = pad + 254
+            } else {
+                pad = pad + pb
+                more = 0
+            }
+        }
+    }
+    let end: i32 = len - pad
+    if end < pos {
+        return OPUS_E_TOC
+    }
+    (*out).n = nf
+    if vbr != 0 {
+        var i: i32 = 0
+        var total: i32 = 0
+        while i < nf - 1 {
+            let l: i32 = frame_len(p, pos, end, &used)
+            if l < 0 {
+                return OPUS_E_TOC
+            }
+            pos = pos + used
+            (*out).len[i as% usize] = l
+            total = total + l
+            i = i + 1
+        }
+        let rest: i32 = end - pos - total
+        if rest < 0 || rest > 1275 {
+            return OPUS_E_TOC
+        }
+        (*out).len[(nf - 1) as% usize] = rest
+        var at: i32 = pos
+        i = 0
+        while i < nf {
+            (*out).off[i as% usize] = at
+            at = at + (*out).len[i as% usize]
+            i = i + 1
+        }
+    } else {
+        let body: i32 = end - pos
+        if body < 0 || (body % nf) != 0 {
+            return OPUS_E_TOC
+        }
+        let l: i32 = body / nf
+        if l > 1275 {
+            return OPUS_E_TOC
+        }
+        var i: i32 = 0
+        while i < nf {
+            (*out).off[i as% usize] = pos + i * l
+            (*out).len[i as% usize] = l
+            i = i + 1
+        }
+    }
+    return nf
+}
+
+struct Ec {
+    buf: u64,
+    storage: i32,
+    end_offs: i32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    offs: i32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    err: i32,
+}
+
+fn ec_new() -> Ec {
+    return Ec { buf: 0, storage: 0, end_offs: 0, end_window: 0, nend_bits: 0, nbits_total: 0, offs: 0, rng: 0, val: 0, ext: 0, rem: 0, err: 0 }
+}
+
+fn ec_read_byte(e: *mut Ec) -> i32 {
+    if (*e).offs < (*e).storage {
+        let b: i32 = lb((*e).buf, (*e).offs as% usize)
+        (*e).offs = (*e).offs + 1
+        return b
+    }
+    return 0
+}
+
+fn ec_read_byte_end(e: *mut Ec) -> i32 {
+    if (*e).end_offs < (*e).storage {
+        (*e).end_offs = (*e).end_offs + 1
+        return lb((*e).buf, ((*e).storage - (*e).end_offs) as% usize)
+    }
+    return 0
+}
+
+fn ec_normalize(e: *mut Ec) {
+    while (*e).rng <= 8388608 {
+        (*e).nbits_total = (*e).nbits_total + 8
+        (*e).rng = (*e).rng << 8
+        let sym0: i32 = (*e).rem
+        (*e).rem = ec_read_byte(e)
+        let sym: u32 = (((sym0 << 8) | (*e).rem) >> 1) as% u32
+        (*e).val = (((*e).val << 8) + (255 as% u32 & (0xFFFFFFFF as% u32 ^ sym))) & 0x7FFFFFFF
+    }
+}
+
+fn ec_init(e: *mut Ec, buf: u64, len: i32) {
+    (*e).buf = buf
+    (*e).storage = len
+    (*e).end_offs = 0
+    (*e).end_window = 0
+    (*e).nend_bits = 0
+    (*e).nbits_total = 9
+    (*e).offs = 0
+    (*e).rng = 128
+    (*e).err = 0
+    (*e).rem = ec_read_byte(e)
+    (*e).val = ((*e).rng - 1 - (((*e).rem >> 1) as% u32))
+    (*e).ext = 0
+    ec_normalize(e)
+}
+
+fn ec_decode(e: *mut Ec, ft: u32) -> u32 {
+    (*e).ext = (*e).rng / ft
+    let s: u32 = (*e).val / (*e).ext
+    var r: u32 = s + 1
+    if r > ft {
+        r = ft
+    }
+    return ft - r
+}
+
+fn ec_decode_bin(e: *mut Ec, bits: i32) -> u32 {
+    (*e).ext = (*e).rng >> (bits as% u32)
+    let s: u32 = (*e).val / (*e).ext
+    let ft: u32 = (1 as% u32) << (bits as% u32)
+    var r: u32 = s + 1
+    if r > ft {
+        r = ft
+    }
+    return ft - r
+}
+
+fn ec_update(e: *mut Ec, fl: u32, fh: u32, ft: u32) {
+    let s: u32 = (*e).ext * (ft - fh)
+    (*e).val = (*e).val - s
+    if fl > 0 {
+        (*e).rng = (*e).ext * (fh - fl)
+    } else {
+        (*e).rng = (*e).rng - s
+    }
+    ec_normalize(e)
+}
+
+fn ec_bit_logp(e: *mut Ec, logp: i32) -> i32 {
+    let r: u32 = (*e).rng
+    let d: u32 = (*e).val
+    let s: u32 = r >> (logp as% u32)
+    var ret: i32 = 0
+    if d < s {
+        ret = 1
+        (*e).rng = s
+    } else {
+        (*e).val = d - s
+        (*e).rng = r - s
+    }
+    ec_normalize(e)
+    return ret
+}
+
+fn ec_icdf(e: *mut Ec, icdf: u64, ftb: i32) -> i32 {
+    let d: u32 = (*e).val
+    let r: u32 = (*e).rng >> (ftb as% u32)
+    var s: u32 = (*e).rng
+    var t: u32 = s
+    var ret: i32 = 0 - 1
+    var go: i32 = 1
+    while go != 0 {
+        t = s
+        ret = ret + 1
+        s = r * (lb(icdf, ret as% usize) as% u32)
+        if d >= s {
+            go = 0
+        }
+    }
+    (*e).val = d - s
+    (*e).rng = t - s
+    ec_normalize(e)
+    return ret
+}
+
+fn ec_bits(e: *mut Ec, bits: i32) -> u32 {
+    var window: u32 = (*e).end_window
+    var avail: i32 = (*e).nend_bits
+    if avail < bits {
+        var go: i32 = 1
+        while go != 0 {
+            window = window | ((ec_read_byte_end(e) as% u32) << (avail as% u32))
+            avail = avail + 8
+            if avail > 24 {
+                go = 0
+            }
+        }
+    }
+    let ret: u32 = window & (((1 as% u32) << (bits as% u32)) - 1)
+    window = window >> (bits as% u32)
+    avail = avail - bits
+    (*e).end_window = window
+    (*e).nend_bits = avail
+    (*e).nbits_total = (*e).nbits_total + bits
+    return ret
+}
+
+fn ilog32(v: u32) -> i32 {
+    var n: i32 = 0
+    var x: u32 = v
+    while x != 0 {
+        n = n + 1
+        x = x >> 1
+    }
+    return n
+}
+
+fn ec_uint(e: *mut Ec, ft0: u32) -> u32 {
+    var ft: u32 = ft0 - 1
+    var ftb: i32 = ilog32(ft)
+    if ftb > 8 {
+        ftb = ftb - 8
+        let ft1: u32 = (ft >> (ftb as% u32)) + 1
+        let s: u32 = ec_decode(e, ft1)
+        ec_update(e, s, s + 1, ft1)
+        let t: u32 = (s << (ftb as% u32)) | ec_bits(e, ftb)
+        if t <= ft {
+            return t
+        }
+        (*e).err = 1
+        return ft
+    }
+    ft = ft + 1
+    let s: u32 = ec_decode(e, ft)
+    ec_update(e, s, s + 1, ft)
+    return s
+}
+
+fn ec_tell(e: *mut Ec) -> i32 {
+    return (*e).nbits_total - ilog32((*e).rng)
+}
+
+fn ec_tell_frac(e: *mut Ec) -> i32 {
+    let correction: [u32; 8] = [35733, 38967, 42495, 46340, 50535, 55109, 60097, 65535]
+    let nbits: i32 = (*e).nbits_total << 3
+    let l0: i32 = ilog32((*e).rng)
+    let r: u32 = (*e).rng >> ((l0 - 16) as% u32)
+    var b: u32 = (r >> 12) - 8
+    if r > correction[b as% usize] { b = b + 1 }
+    let l: i32 = (l0 << 3) + (b as% i32)
+    return nbits - l
+}

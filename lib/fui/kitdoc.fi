@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import docview.dvdoc
+import docview.dvstrip
+import docview.search
+import docview.pagecache
+import fui.painter
+import fui.render
+import fui.kit
+import fui.style
+import fui.uiimage
+import fui.kitscroll
+
+export {
+    DocView, docv_new, docv_free, docv_open, docv_close, docv_ok, docv_pages, docv_zoom, docv_set_zoom,
+    docv_zoom_in, docv_zoom_out, docv_fit_width, docv_is_fit, docv_page, docv_goto, docv_next, docv_prev,
+    docv_wheel, docv_pan, docv_search, docv_hit_count, docv_hit_index, docv_hit_next, docv_hit_prev,
+    docv_clear_search, docv_status, docv_draw, docv_relayout, DOCV_CACHE_PAGES,
+}
+
+const DOCV_CACHE_PAGES: usize = 8
+const ZOOM_STEP: f64 = 1.25
+
+struct DocView {
+    doc: dvdoc.Doc,
+    strip: dvstrip.Strip,
+    cache: pagecache.PageCache,
+    scroll: kitscroll.Scroll,
+    pan: f64,
+    zoom: f64,
+    fit: bool,
+    view_w: f64,
+    view_h: f64,
+    dirty: bool,
+    hits: Vec[search.Hit],
+    hit_cur: i64,
+    query: rt.Buf,
+}
+
+fn docv_new() -> DocView {
+    return DocView { doc: dvdoc.doc_empty(), strip: dvstrip.strip_new(), cache: pagecache.cache_new(DOCV_CACHE_PAGES),
+        scroll: kitscroll.scroll_new(), pan: 0.0, zoom: 1.0, fit: true, view_w: 0.0, view_h: 0.0, dirty: true,
+        hits: vec_new[search.Hit](), hit_cur: -1, query: rt.buf_new() }
+}
+
+fn docv_close(v: *mut DocView) {
+    dvdoc.doc_free(&(*v).doc)
+    pagecache.cache_clear(&(*v).cache)
+    vec_clear[search.Hit](&(*v).hits)
+    (*v).hit_cur = -1
+    (*v).scroll = kitscroll.scroll_new()
+    (*v).pan = 0.0
+    (*v).dirty = true
+}
+
+fn docv_free(v: *mut DocView) {
+    docv_close(v)
+    dvstrip.strip_free(&(*v).strip)
+    pagecache.cache_free(&(*v).cache)
+    vec_free[search.Hit](&(*v).hits)
+    rt.buf_free(&(*v).query)
+}
+
+fn docv_open(v: *mut DocView, p: u64, n: usize, name: str) -> bool {
+    docv_close(v)
+    (*v).doc = dvdoc.doc_open_named(p, n, name)
+    (*v).fit = true
+    return (*v).doc.ok
+}
+
+fn docv_ok(v: *mut DocView) -> bool {
+    return (*v).doc.ok
+}
+
+fn docv_pages(v: *mut DocView) -> usize {
+    return dvdoc.doc_pages(&(*v).doc)
+}
+
+fn docv_zoom(v: *mut DocView) -> f64 {
+    return (*v).zoom
+}
+
+fn docv_is_fit(v: *mut DocView) -> bool {
+    return (*v).fit
+}
+
+fn docv_set_zoom(v: *mut DocView, z: f64) {
+    (*v).zoom = dvstrip.strip_clamp_zoom(z)
+    (*v).fit = false
+    (*v).dirty = true
+}
+
+fn docv_zoom_in(v: *mut DocView) {
+    docv_set_zoom(v, (*v).zoom * ZOOM_STEP)
+}
+
+fn docv_zoom_out(v: *mut DocView) {
+    docv_set_zoom(v, (*v).zoom / ZOOM_STEP)
+}
+
+fn docv_fit_width(v: *mut DocView) {
+    (*v).fit = true
+    (*v).dirty = true
+}
+
+fn docv_relayout(v: *mut DocView) {
+    let old: f64 = (*v).strip.zoom
+    if (*v).fit && (*v).view_w > 0.0 {
+        (*v).zoom = dvstrip.strip_fit_zoom(&(*v).doc, (*v).view_w, (*v).strip.pad)
+    }
+    dvstrip.strip_build(&(*v).doc, (*v).zoom, (*v).strip.gap, (*v).strip.pad, &(*v).strip)
+    if old > 0.0 && old != (*v).strip.zoom {
+        (*v).scroll.pos = (*v).scroll.pos * (*v).strip.zoom / old
+        (*v).pan = (*v).pan * (*v).strip.zoom / old
+    }
+    kitscroll.scroll_fit(&(*v).scroll, (*v).strip.total, (*v).view_h, 48.0)
+    (*v).dirty = false
+}
+
+fn docv_page(v: *mut DocView) -> usize {
+    return dvstrip.strip_page_at(&(*v).strip, (*v).scroll.pos + (*v).view_h * 0.35)
+}
+
+fn docv_goto(v: *mut DocView, page: usize) {
+    var pg: usize = page
+    let n: usize = docv_pages(v)
+    if n == 0 {
+        return
+    }
+    if pg >= n { pg = n - 1 }
+    (*v).scroll.pos = dvstrip.strip_y_of(&(*v).strip, pg) - (*v).strip.pad
+    if (*v).scroll.pos < 0.0 { (*v).scroll.pos = 0.0 }
+    if (*v).scroll.pos > (*v).scroll.max { (*v).scroll.pos = (*v).scroll.max }
+}
+
+fn docv_next(v: *mut DocView) {
+    docv_goto(v, docv_page(v) + 1)
+}
+
+fn docv_prev(v: *mut DocView) {
+    let p: usize = docv_page(v)
+    if p > 0 {
+        docv_goto(v, p - 1)
+    }
+}
+
+fn docv_wheel(v: *mut DocView, dy: f64) -> bool {
+    return kitscroll.scroll_by(&(*v).scroll, dy)
+}
+
+fn docv_pan(v: *mut DocView, dx: f64) {
+    (*v).pan = (*v).pan + dx
+}
+
+fn docv_clear_search(v: *mut DocView) {
+    vec_clear[search.Hit](&(*v).hits)
+    (*v).hit_cur = -1
+    rt.buf_clear(&(*v).query)
+}
+
+fn docv_hit_count(v: *mut DocView) -> usize {
+    return vec_len[search.Hit](&(*v).hits)
+}
+
+fn docv_hit_index(v: *mut DocView) -> i64 {
+    return (*v).hit_cur
+}
+
+fn show_hit(v: *mut DocView) {
+    if (*v).hit_cur >= 0 {
+        let h: *mut search.Hit = vec_elem_ptr[search.Hit](&(*v).hits, (*v).hit_cur as usize)
+        docv_goto(v, (*h).page)
+    }
+}
+
+fn docv_search(v: *mut DocView, q: str) -> usize {
+    rt.buf_clear(&(*v).query)
+    rt.buf_push_bytes(&(*v).query, q.p as u64, q.n)
+    let n: usize = search.search_run(&(*v).doc, q, &(*v).hits)
+    (*v).hit_cur = -1
+    if n > 0 {
+        (*v).hit_cur = search.hit_after(&(*v).hits, docv_page(v), 0)
+        if (*v).hit_cur < 0 { (*v).hit_cur = 0 }
+        show_hit(v)
+    }
+    return n
+}
+
+fn docv_hit_next(v: *mut DocView) {
+    let n: usize = docv_hit_count(v)
+    if n == 0 { return }
+    (*v).hit_cur = ((*v).hit_cur + 1) % (n as i64)
+    show_hit(v)
+}
+
+fn docv_hit_prev(v: *mut DocView) {
+    let n: usize = docv_hit_count(v)
+    if n == 0 { return }
+    (*v).hit_cur = ((*v).hit_cur + (n as i64) - 1) % (n as i64)
+    show_hit(v)
+}
+
+fn docv_status(v: *mut DocView, out: *mut rt.Buf) {
+    rt.buf_push_dec_u64(out, (docv_page(v) + 1) as u64)
+    rt.buf_push_bytes(out, " / ".p as u64, 3)
+    rt.buf_push_dec_u64(out, docv_pages(v) as u64)
+    rt.buf_push_bytes(out, "  ".p as u64, 2)
+    rt.buf_push_dec_u64(out, ((*v).zoom * 100.0 + 0.5) as u64)
+    rt.buf_push_bytes(out, "%".p as u64, 1)
+    if docv_hit_count(v) > 0 {
+        rt.buf_push_bytes(out, "  ".p as u64, 2)
+        rt.buf_push_dec_u64(out, ((*v).hit_cur + 1) as u64)
+        rt.buf_push_bytes(out, "/".p as u64, 1)
+        rt.buf_push_dec_u64(out, docv_hit_count(v) as u64)
+    }
+}
+
+fn page_has_hit(v: *mut DocView, page: usize) -> bool {
+    var i: usize = 0
+    while i < vec_len[search.Hit](&(*v).hits) {
+        if (*vec_elem_ptr[search.Hit](&(*v).hits, i)).page == page {
+            return true
+        }
+        i++
+    }
+    return false
+}
+
+fn draw_page(c: *mut render.Ctx, v: *mut DocView, page: usize, x: f64, y: f64, w: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let pw: f64 = *vec_elem_ptr[f64](&(*v).strip.ws, page)
+    let ph: f64 = *vec_elem_ptr[f64](&(*v).strip.hs, page)
+    var px: f64 = x + (w - pw) / 2.0
+    if pw > w - 2.0 * (*v).strip.pad {
+        px = x + (*v).strip.pad - (*v).pan
+    }
+    let py: f64 = y + dvstrip.strip_y_of(&(*v).strip, page) - (*v).scroll.pos
+    painter.surface(z, px, py, pw, ph, 4294967295 as u32)
+    let e: *mut pagecache.Entry = pagecache.cache_get(&(*v).cache, &(*v).doc, page, (*v).zoom)
+    if (e as u64) != 0 {
+        var im: uiimage.Image = uiimage.image_wrap(rt.buf_ptr(&(*e).px) as u64, (*e).w as usize, (*e).h as usize, 0)
+        uiimage.image_draw(z, &im, px, py, pw, ph, uiimage.FIT_STRETCH, 0 as u32)
+    }
+    if page_has_hit(v, page) {
+        painter.surface(z, px - 4.0, py, 3.0, ph, kit.tokc(c, style.TOK_ACCENT))
+    }
+}
+
+fn docv_draw(c: *mut render.Ctx, v: *mut DocView, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, x, y, w, h, kit.tokc(c, style.TOK_SURFACE))
+    if w != (*v).view_w || h != (*v).view_h {
+        (*v).view_w = w
+        (*v).view_h = h
+        (*v).dirty = true
+    }
+    if (*v).dirty {
+        docv_relayout(v)
+    }
+    var first: usize = 0
+    var last: usize = 0
+    if !dvstrip.strip_visible(&(*v).strip, (*v).scroll.pos, h, &first, &last) {
+        return
+    }
+    var pg: usize = first
+    while pg <= last {
+        draw_page(c, v, pg, x, y, w)
+        pg++
+    }
+}

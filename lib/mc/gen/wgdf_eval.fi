@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/gen/wgdf_eval.fi -- seeded noise instances for a wgdf_graph.WgGraph and the direct (uncached) density function interpreter.
+import std.rt
+import std.math
+import noise.perlin
+import noise.interp
+import noise.simplex
+import mc.gen.wgdf_end
+import mc.gen.mg_random
+import mc.gen.mg_noise
+import mc.gen.wgdf_ops
+import mc.gen.wgdf_memo
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_cshare
+
+export { WgNoises, NOISES_BYTES, FillGrid, GRID_BYTES, MAX_GRID_NODES, SLAB_SIDE, noises_alloc, noises_build, eval, eval_direct, floor_div }
+
+const NS_LEN: usize = 10
+const MAX_BLENDED: usize = 4
+
+struct WgNoises {
+    normal: [perlin.Normal; 96],
+    blended: [perlin.Blended; 4],
+    grid: u64,
+    ps: u64,
+    memo: u64,
+    aqs: u64,
+    cs: u64,
+    seed: i64,
+    islands: simplex.Simplex,
+    quant: bool,
+}
+
+const NOISES_BYTES: usize = 2700000
+const MAX_GRID_NODES: i32 = 8
+const GRID_NODE_STRIDE: i32 = 2425
+const SLAB_SIDE: i32 = 8
+const SLAB_CELLS: usize = 64
+const GRID_BYTES: usize = 220000
+
+struct FillGrid {
+    corner_mode: bool,
+    min_x: i32,
+    min_z: i32,
+    cw: i32,
+    ch: i32,
+    cw_shift: i32,
+    ch_shift: i32,
+    cw_inv: f64,
+    ch_inv: f64,
+    cells_x: i32,
+    cells_y: i32,
+    cell_min_y: i32,
+    next_slot: i32,
+    slot_of: [i32; 3072],
+    vals: [f64; 19400],
+    sl_valid: [bool; 8],
+    sl_y: [i32; 8],
+    sl_v: [f64; 512],
+    zx_valid: [bool; 8],
+    zx_x: [i32; 8],
+    zx_z0: [f64; 64],
+}
+
+fn noises_alloc() -> *mut WgNoises {
+    let ns: *mut WgNoises = rt.heap_alloc(NOISES_BYTES) as *mut WgNoises
+    (*ns).grid = 0
+    (*ns).ps = 0
+    (*ns).memo = 0
+    (*ns).aqs = 0
+    (*ns).cs = 0
+    (*ns).seed = 0
+    (*ns).quant = false
+    return ns
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    var q: i32 = a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+#[allow_fp]
+fn lerp64(t: f64, a: f64, b: f64) -> f64 {
+    return a + t * (b - a)
+}
+
+fn grid_index(gr: *FillGrid, slot: i32, gx: i32, gy: i32, gz: i32) -> usize {
+    let zs: i32 = (*gr).cells_y + 1
+    let xs: i32 = ((*gr).cells_x + 1) * zs
+    return (slot * GRID_NODE_STRIDE + gx * xs + gz * zs + gy) as usize
+}
+
+fn compute_column(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, slot: i32, n: i32, gx: i32, gz: i32) {
+    let x: i32 = (*gr).min_x + gx * (*gr).cw
+    let z: i32 = (*gr).min_z + gz * (*gr).cw
+    var gy: i32 = 0
+    while gy <= (*gr).cells_y {
+        let v: f64 = eval(g, ns, (*g).a[n as usize], x, ((*gr).cell_min_y + gy) * (*gr).ch, z)
+        (*gr).vals[grid_index(gr, slot, gx, gy, gz)] = v
+        gy = gy + 1
+    }
+}
+
+fn shared_column(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, slot: i32, n: i32, gx: i32, gz: i32) {
+    let cs: *mut wgdf_cshare.CornerShare = (*ns).cs as *mut wgdf_cshare.CornerShare
+    let sslot: i32 = wgdf_cshare.node_slot(cs, n)
+    if sslot < 0 || (*gr).min_x % (*gr).cw != 0 || (*gr).min_z % (*gr).cw != 0 {
+        compute_column(g, ns, gr, slot, n, gx, gz)
+        return
+    }
+    let qx: i32 = (*gr).min_x / (*gr).cw + gx
+    let qz: i32 = (*gr).min_z / (*gr).cw + gz
+    let bytes: usize = ((*gr).cells_y + 1) as usize * 8
+    let st: i32 = wgdf_cshare.acquire(cs, sslot, qx, qz)
+    let dst: u64 = (&(*gr).vals[grid_index(gr, slot, gx, 0, gz)]) as u64
+    if st == wgdf_cshare.COL_READY {
+        rt.mem_copy(dst, wgdf_cshare.column_ptr(cs, sslot, qx, qz), bytes)
+        return
+    }
+    compute_column(g, ns, gr, slot, n, gx, gz)
+    if st == wgdf_cshare.COL_OWN {
+        rt.mem_copy(wgdf_cshare.column_ptr(cs, sslot, qx, qz), dst, bytes)
+        wgdf_cshare.publish(cs, sslot, qx, qz)
+    }
+}
+
+fn grid_build(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, n: i32) -> i32 {
+    let slot: i32 = (*gr).next_slot
+    if slot >= MAX_GRID_NODES {
+        return -1
+    }
+    (*gr).next_slot = slot + 1
+    (*gr).slot_of[n as usize] = slot
+    (*gr).corner_mode = true
+    var gx: i32 = 0
+    while gx <= (*gr).cells_x {
+        var gz: i32 = 0
+        while gz <= (*gr).cells_x {
+            if (*ns).cs != 0 {
+                shared_column(g, ns, gr, slot, n, gx, gz)
+            } else {
+                compute_column(g, ns, gr, slot, n, gx, gz)
+            }
+            gz = gz + 1
+        }
+        gx = gx + 1
+    }
+    (*gr).corner_mode = false
+    return slot
+}
+
+#[inline]
+fn cell_of(v: i32, size: i32, shift: i32) -> i32 {
+    if shift >= 0 { return v >> shift }
+    return v / size
+}
+
+#[inline]
+#[allow_fp]
+fn frac_of(v: i32, cell: i32, size: i32, shift: i32, inv: f64) -> f64 {
+    if shift >= 0 { return ((v & (size - 1)) as f64) * inv }
+    return ((v - cell * size) as f64) / (size as f64)
+}
+
+#[allow_fp]
+fn grid_lerp(g: *wgdf_graph.WgGraph, ns: *WgNoises, gr: *mut FillGrid, n: i32, x: i32, y: i32, z: i32) -> f64 {
+    var slot: i32 = (*gr).slot_of[n as usize]
+    if slot < 0 {
+        slot = grid_build(g, ns, gr, n)
+        if slot < 0 {
+            return eval(g, ns, (*g).a[n as usize], x, y, z)
+        }
+    }
+    let rx: i32 = x - (*gr).min_x
+    let rz: i32 = z - (*gr).min_z
+    let w: i32 = (*gr).cells_x + 1
+    let si: usize = slot as usize
+    if !(*gr).sl_valid[si] || (*gr).sl_y[si] != y {
+        let ry: i32 = y - (*gr).cell_min_y * (*gr).ch
+        let gy: i32 = cell_of(ry, (*gr).ch, (*gr).ch_shift)
+        let ty: f64 = frac_of(ry, gy, (*gr).ch, (*gr).ch_shift, (*gr).ch_inv)
+        var ax: i32 = 0
+        while ax < w {
+            var az: i32 = 0
+            while az < w {
+                let lo: f64 = (*gr).vals[grid_index(gr, slot, ax, gy, az)]
+                let hi: f64 = (*gr).vals[grid_index(gr, slot, ax, gy + 1, az)]
+                (*gr).sl_v[si * SLAB_CELLS + ((ax * w + az) as usize)] = lerp64(ty, lo, hi)
+                az = az + 1
+            }
+            ax = ax + 1
+        }
+        (*gr).sl_valid[si] = true
+        (*gr).sl_y[si] = y
+        (*gr).zx_valid[si] = false
+    }
+    if !(*gr).zx_valid[si] || (*gr).zx_x[si] != x {
+        let gx: i32 = cell_of(rx, (*gr).cw, (*gr).cw_shift)
+        let tx: f64 = frac_of(rx, gx, (*gr).cw, (*gr).cw_shift, (*gr).cw_inv)
+        var bz: i32 = 0
+        while bz < w {
+            let v0: f64 = (*gr).sl_v[si * SLAB_CELLS + ((gx * w + bz) as usize)]
+            let v1: f64 = (*gr).sl_v[si * SLAB_CELLS + (((gx + 1) * w + bz) as usize)]
+            (*gr).zx_z0[si * (SLAB_SIDE as usize) + (bz as usize)] = lerp64(tx, v0, v1)
+            bz = bz + 1
+        }
+        (*gr).zx_valid[si] = true
+        (*gr).zx_x[si] = x
+    }
+    let gz: i32 = cell_of(rz, (*gr).cw, (*gr).cw_shift)
+    let tz: f64 = frac_of(rz, gz, (*gr).cw, (*gr).cw_shift, (*gr).cw_inv)
+    let z0: f64 = (*gr).zx_z0[si * (SLAB_SIDE as usize) + (gz as usize)]
+    let z1: f64 = (*gr).zx_z0[si * (SLAB_SIDE as usize) + ((gz + 1) as usize)]
+    return lerp64(tz, z0, z1)
+}
+
+fn marker_eval(g: *wgdf_graph.WgGraph, ns: *WgNoises, n: i32, x: i32, y: i32, z: i32) -> f64 {
+    let u: usize = n as usize
+    let inner: i32 = (*g).a[u]
+    if (*ns).grid == 0 {
+        if (*ns).quant && (*g).b[u] == wgdf_ops.MK_FLAT_CACHE {
+            return eval(g, ns, inner, (x >> 2) << 2, 0, (z >> 2) << 2)
+        }
+        return eval(g, ns, inner, x, y, z)
+    }
+    let gr: *mut FillGrid = (*ns).grid as *mut FillGrid
+    let kind: i32 = (*g).b[u]
+    if kind == wgdf_ops.MK_FLAT_CACHE {
+        let sx: i32 = (x >> 2) << 2
+        let sz: i32 = (z >> 2) << 2
+        var hit: f64 = 0.0
+        if wgdf_memo.memo_get(&(*(ns as *mut WgNoises)).memo, n, sx, sz, &hit) { return hit }
+        let v: f64 = eval(g, ns, inner, sx, 0, sz)
+        wgdf_memo.memo_put(&(*(ns as *mut WgNoises)).memo, n, sx, sz, v)
+        return v
+    }
+    if kind == wgdf_ops.MK_CACHE_2D {
+        var hit2: f64 = 0.0
+        if wgdf_memo.memo_get(&(*(ns as *mut WgNoises)).memo, n, x, z, &hit2) { return hit2 }
+        let v2: f64 = eval(g, ns, inner, x, y, z)
+        wgdf_memo.memo_put(&(*(ns as *mut WgNoises)).memo, n, x, z, v2)
+        return v2
+    }
+    if kind == wgdf_ops.MK_INTERPOLATED && !(*gr).corner_mode {
+        return grid_lerp(g, ns, gr, n, x, y, z)
+    }
+    return eval(g, ns, inner, x, y, z)
+}
+
+fn eval_direct(g: *wgdf_graph.WgGraph, ns: *WgNoises, n: i32, x: i32, y: i32, z: i32) -> f64 {
+    if (*ns).grid == 0 {
+        let m: *mut WgNoises = ns as *mut WgNoises
+        let saved: bool = (*m).quant
+        (*m).quant = true
+        let r: f64 = eval(g, ns, n, x, y, z)
+        (*m).quant = saved
+        return r
+    }
+    let gr: *mut FillGrid = (*ns).grid as *mut FillGrid
+    let prev: bool = (*gr).corner_mode
+    (*gr).corner_mode = true
+    let v: f64 = eval(g, ns, n, x, y, z)
+    (*gr).corner_mode = prev
+    return v
+}
+
+fn has_ns(g: *[u8; 96], len: usize) -> bool {
+    if len <= NS_LEN {
+        return false
+    }
+    let want: [u8; 10] = "minecraft:"
+    var i: usize = 0
+    while i < NS_LEN {
+        if (*g)[i] != want[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hashed_rng(pf: *mg_random.PosFactory, name: *[u8; 96], len: usize) -> mg_random.Rng {
+    if has_ns(name, len) {
+        return mg_random.pos_from_hash_of(pf, (&(*name)[0]) as u64, len)
+    }
+    var buf: [u8; 128] = [0; 128]
+    let want: [u8; 10] = "minecraft:"
+    var i: usize = 0
+    while i < NS_LEN {
+        buf[i] = want[i]
+        i = i + 1
+    }
+    i = 0
+    while i < len {
+        buf[NS_LEN + i] = (*name)[i]
+        i = i + 1
+    }
+    return mg_random.pos_from_hash_of(pf, (&buf[0]) as u64, len + NS_LEN)
+}
+
+fn noises_build(g: *wgdf_graph.WgGraph, ns: *mut WgNoises, seed: i64) {
+    (*ns).seed = seed
+    (*ns).islands = wgdf_end.end_islands_build(seed)
+    var r0: mg_random.Rng = mg_random.rng_xoro(seed)
+    if (*g).legacy_random {
+        r0 = mg_random.rng_legacy(seed)
+    }
+    let pf: mg_random.PosFactory = mg_random.rng_fork_positional(&r0)
+    var i: i32 = 0
+    while i < (*g).n_noise {
+        let nm: *[u8; 96] = &(*g).nz_name[i as usize]
+        let nl: usize = (*g).nz_name_len[i as usize]
+        var r: mg_random.Rng = hashed_rng(&pf, nm, nl)
+        if (*g).legacy_random && wgdf_graph.name_eq(nm, nl, "minecraft:temperature") {
+            r = mg_random.rng_legacy(seed)
+            var two: [f64; 32] = [0.0; 32]
+            two[0] = 1.0
+            two[1] = 1.0
+            (*ns).normal[i as usize] = mg_noise.normal_create(&r, -7, &two, 2, false)
+        } else if (*g).legacy_random && wgdf_graph.name_eq(nm, nl, "minecraft:vegetation") {
+            r = mg_random.rng_legacy(seed + 1)
+            var two: [f64; 32] = [0.0; 32]
+            two[0] = 1.0
+            two[1] = 1.0
+            (*ns).normal[i as usize] = mg_noise.normal_create(&r, -7, &two, 2, false)
+        } else if (*g).legacy_random && wgdf_graph.name_eq(nm, nl, "minecraft:offset") {
+            var zero: [f64; 32] = [0.0; 32]
+            (*ns).normal[i as usize] = mg_noise.normal_create(&r, 0, &zero, 1, true)
+        } else {
+            (*ns).normal[i as usize] = mg_noise.normal_create(&r, (*g).nz_first[i as usize], &(*g).nz_amp[i as usize], (*g).nz_count[i as usize], true)
+        }
+        i = i + 1
+    }
+    let terrain: [u8; 96] = [0; 96]
+    var k: i32 = 0
+    while k < (*g).n_nodes {
+        if (*g).op[k as usize] == wgdf_ops.OP_OLD_BLENDED {
+            let name: str = "minecraft:terrain"
+            var r: mg_random.Rng = mg_random.pos_from_hash_of(&pf, name.p as u64, name.n)
+            if (*g).legacy_random {
+                r = mg_random.rng_legacy(seed)
+            }
+            let slot: usize = (*g).a[k as usize] as usize
+            (*ns).blended[slot] = mg_noise.blended_create(
+                &r, (*g).p0[k as usize], (*g).p1[k as usize], (*g).p2[k as usize], (*g).p3[k as usize], (*g).p4[k as usize],
+            )
+        }
+        k = k + 1
+    }
+}
+
+#[allow_fp]
+fn lerp32(t: f32, a: f32, b: f32) -> f32 {
+    return a + t * (b - a)
+}
+
+#[allow_fp]
+fn linear_extend(f: f32, loc: f32, value: f32, deriv: f32) -> f32 {
+    if deriv == 0.0 {
+        return value
+    }
+    return value + deriv * (f - loc)
+}
+
+#[allow_fp]
+fn spline_eval(g: *wgdf_graph.WgGraph, ns: *WgNoises, s: i32, x: i32, y: i32, z: i32) -> f32 {
+    let su: usize = s as usize
+    let coord: i32 = (*g).spl_coord[su]
+    if coord < 0 {
+        return (*g).spl_const[su]
+    }
+    let f: f32 = eval(g, ns, coord, x, y, z) as f32
+    let first: usize = (*g).spl_first[su] as usize
+    let cnt: i32 = (*g).spl_count[su]
+    var lo: i32 = 0
+    var span: i32 = cnt
+    while span > 0 {
+        let half: i32 = span / 2
+        let k: i32 = lo + half
+        if f < (*g).pt_loc[first + (k as usize)] {
+            span = half
+        } else {
+            lo = k + 1
+            span = span - (half + 1)
+        }
+    }
+    let i: i32 = lo - 1
+    let j: i32 = cnt - 1
+    if i < 0 {
+        let v: f32 = spline_eval(g, ns, (*g).pt_val[first], x, y, z)
+        return linear_extend(f, (*g).pt_loc[first], v, (*g).pt_der[first])
+    }
+    if i == j {
+        let v: f32 = spline_eval(g, ns, (*g).pt_val[first + (j as usize)], x, y, z)
+        return linear_extend(f, (*g).pt_loc[first + (j as usize)], v, (*g).pt_der[first + (j as usize)])
+    }
+    let iu: usize = first + (i as usize)
+    let f1: f32 = (*g).pt_loc[iu]
+    let f2: f32 = (*g).pt_loc[iu + 1]
+    let f3: f32 = (f - f1) / (f2 - f1)
+    let f4: f32 = (*g).pt_der[iu]
+    let f5: f32 = (*g).pt_der[iu + 1]
+    let f6: f32 = spline_eval(g, ns, (*g).pt_val[iu], x, y, z)
+    let f7: f32 = spline_eval(g, ns, (*g).pt_val[iu + 1], x, y, z)
+    let f8: f32 = f4 * (f2 - f1) - (f7 - f6)
+    let f9: f32 = (0.0 - f5) * (f2 - f1) + (f7 - f6)
+    return lerp32(f3, f6, f7) + f3 * (1.0 - f3) * lerp32(f3, f8, f9)
+}
+
+#[allow_fp]
+fn noise_at(ns: *WgNoises, slot: i32, x: f64, y: f64, z: f64) -> f64 {
+    if slot < 0 {
+        return 0.0
+    }
+    return perlin.normal_value(&(*ns).normal[slot as usize], x, y, z)
+}
+
+#[allow_fp]
+fn weird_rarity(kind: i32, d: f64) -> f64 {
+    if kind == 2 {
+        if d < -0.75 { return 0.5 }
+        if d < -0.5 { return 0.75 }
+        if d < 0.5 { return 1.0 }
+        if d < 0.75 { return 2.0 }
+        return 3.0
+    }
+    if d < -0.5 { return 0.75 }
+    if d < 0.0 { return 1.0 }
+    if d < 0.5 { return 1.5 }
+    return 2.0
+}
+
+#[allow_fp]
+fn eval(g: *wgdf_graph.WgGraph, ns: *WgNoises, n: i32, x: i32, y: i32, z: i32) -> f64 {
+    if n < 0 {
+        return 0.0
+    }
+    let u: usize = n as usize
+    let op: i32 = (*g).op[u]
+    let xd: f64 = x as f64
+    let yd: f64 = y as f64
+    let zd: f64 = z as f64
+    if op == wgdf_ops.OP_CONST {
+        return (*g).p0[u]
+    }
+    if op == wgdf_ops.OP_ADD {
+        return eval(g, ns, (*g).a[u], x, y, z) + eval(g, ns, (*g).b[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_MUL {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a == 0.0 {
+            return 0.0
+        }
+        return a * eval(g, ns, (*g).b[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_MIN {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        let b: f64 = eval(g, ns, (*g).b[u], x, y, z)
+        if a < b { return a }
+        return b
+    }
+    if op == wgdf_ops.OP_MAX {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        let b: f64 = eval(g, ns, (*g).b[u], x, y, z)
+        if a > b { return a }
+        return b
+    }
+    if op == wgdf_ops.OP_MARKER {
+        return marker_eval(g, ns, n, x, y, z)
+    }
+    if op == wgdf_ops.OP_BLEND_DENSITY {
+        return eval(g, ns, (*g).a[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_ABS {
+        return math.fabs(eval(g, ns, (*g).a[u], x, y, z))
+    }
+    if op == wgdf_ops.OP_SQUARE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        return a * a
+    }
+    if op == wgdf_ops.OP_CUBE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        return a * a * a
+    }
+    if op == wgdf_ops.OP_HALF_NEG {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a > 0.0 { return a }
+        return a * 0.5
+    }
+    if op == wgdf_ops.OP_QUARTER_NEG {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a > 0.0 { return a }
+        return a * 0.25
+    }
+    if op == wgdf_ops.OP_SQUEEZE {
+        var a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a < -1.0 { a = -1.0 }
+        if a > 1.0 { a = 1.0 }
+        return a / 2.0 - a * a * a / 24.0
+    }
+    if op == wgdf_ops.OP_CLAMP {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if a < (*g).p0[u] { return (*g).p0[u] }
+        if a > (*g).p1[u] { return (*g).p1[u] }
+        return a
+    }
+    if op == wgdf_ops.OP_YGRAD {
+        return interp.clamped_map(yd, (*g).p0[u], (*g).p1[u], (*g).p2[u], (*g).p3[u])
+    }
+    if op == wgdf_ops.OP_NOISE {
+        return noise_at(ns, (*g).a[u], xd * (*g).p0[u], yd * (*g).p1[u], zd * (*g).p0[u])
+    }
+    if op == wgdf_ops.OP_SHIFTED_NOISE {
+        let d0: f64 = xd * (*g).p0[u] + eval(g, ns, (*g).b[u], x, y, z)
+        let d1: f64 = yd * (*g).p1[u] + eval(g, ns, (*g).c[u], x, y, z)
+        let d2: f64 = zd * (*g).p0[u] + eval(g, ns, (*g).d[u], x, y, z)
+        return noise_at(ns, (*g).a[u], d0, d1, d2)
+    }
+    if op == wgdf_ops.OP_SHIFT_A {
+        return noise_at(ns, (*g).a[u], xd * 0.25, 0.0, zd * 0.25) * 4.0
+    }
+    if op == wgdf_ops.OP_SHIFT_B {
+        return noise_at(ns, (*g).a[u], zd * 0.25, xd * 0.25, 0.0) * 4.0
+    }
+    if op == wgdf_ops.OP_SHIFT {
+        return noise_at(ns, (*g).a[u], xd * 0.25, yd * 0.25, zd * 0.25) * 4.0
+    }
+    if op == wgdf_ops.OP_RANGE_CHOICE {
+        let a: f64 = eval(g, ns, (*g).a[u], x, y, z)
+        if (*g).p0[u] <= a && a < (*g).p1[u] {
+            return eval(g, ns, (*g).b[u], x, y, z)
+        }
+        return eval(g, ns, (*g).c[u], x, y, z)
+    }
+    if op == wgdf_ops.OP_WEIRD {
+        let r: f64 = weird_rarity((*g).c[u], eval(g, ns, (*g).a[u], x, y, z))
+        return r * math.fabs(noise_at(ns, (*g).b[u], xd / r, yd / r, zd / r))
+    }
+    if op == wgdf_ops.OP_END_ISLANDS {
+        return wgdf_end.end_islands_value(&(*ns).islands, x, z)
+    }
+    if op == wgdf_ops.OP_BLEND_ALPHA {
+        return 1.0
+    }
+    if op == wgdf_ops.OP_OLD_BLENDED {
+        return perlin.blended_value(&(*ns).blended[(*g).a[u] as usize], x, y, z)
+    }
+    if op == wgdf_ops.OP_SPLINE {
+        return spline_eval(g, ns, (*g).a[u], x, y, z) as f64
+    }
+    return 0.0
+}

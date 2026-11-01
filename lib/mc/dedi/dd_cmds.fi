@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/dedi/dd_cmds.fi -- console commands (vanilla server console syntax, no slash), run on the server thread.
+
+import std.rt
+import mc.server.sv_state
+import mc.server.sv_send
+import mc.server.sv_play
+import mc.server.sv_persist
+import mc.server.sv_clock
+import mc.server.sv_cmds
+import mc.dedi.dd_text as tx
+import mc.dedi.dd_state
+import mc.dedi.dd_lists
+import mc.dedi.dd_cfg
+import mc.dedi.dd_log
+import mc.dedi.dd_queue
+
+export { console_execute }
+
+const DAY_TICKS: i64 = 24000
+const KICK_DEFAULT: str = "Kicked by an operator"
+const NOT_WHITELISTED: str = "You are not white-listed on this server!"
+
+fn text_buf(parts_a: str, parts_b: str, parts_c: str) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, parts_a.p as u64, parts_a.n)
+    rt.buf_push_bytes(&b, parts_b.p as u64, parts_b.n)
+    rt.buf_push_bytes(&b, parts_c.p as u64, parts_c.n)
+    return b
+}
+
+fn info3(a: str, b: str, c: str) {
+    var t: rt.Buf = text_buf(a, b, c)
+    dd_log.log_info(rt.buf_str(&t))
+    rt.buf_free(&t)
+}
+
+fn session_by_name(srv: *mut sv_state.Server, name: str) -> *mut sv_state.Session {
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).joined && !(*s).closing {
+            if tx.eq_ci(str { p: (&(*s).name[0]) as *mut u8, n: (*s).name_n }, name) { return s }
+        }
+        i = i + 1
+    }
+    return 0 as *mut sv_state.Session
+}
+
+fn cmd_help(srv: *mut sv_state.Server, args: str) {
+    dd_log.log_info("Available commands: help, stop, list, say, op, deop, kick, whitelist, save-all, time, tps, version")
+}
+
+fn cmd_stop(srv: *mut sv_state.Server, args: str) {
+    dd_log.log_info("Stopping the server")
+    dd_queue.stop_request((*dd_state.dedi_get()).queue)
+}
+
+fn cmd_list(srv: *mut sv_state.Server, args: str) {
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "There are ")
+    rt.buf_push_dec_i64(&b, (*srv).online as i64)
+    sv_send.push_str(&b, " of a max of ")
+    rt.buf_push_dec_i64(&b, (*srv).cfg.max_players as i64)
+    sv_send.push_str(&b, " players online:")
+    var first: bool = true
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).joined && !(*s).closing {
+            if first { rt.buf_push(&b, 32 as u8) } else { sv_send.push_str(&b, ", ") }
+            first = false
+            rt.buf_push_bytes(&b, (&(*s).name[0]) as u64, (*s).name_n)
+        }
+        i = i + 1
+    }
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn cmd_say(srv: *mut sv_state.Server, args: str) {
+    if args.n == 0 {
+        dd_log.log_info("Usage: say <message>")
+        return
+    }
+    var t: rt.Buf = text_buf("[Server] ", args, "")
+    sv_play.play_broadcast_chat(srv, rt.buf_ptr(&t), rt.buf_len(&t))
+    dd_log.log_info(rt.buf_str(&t))
+    rt.buf_free(&t)
+}
+
+fn cmd_op(srv: *mut sv_state.Server, args: str) {
+    var rest: str = ""
+    let name: str = tx.split_word(args, &rest)
+    if name.n == 0 {
+        dd_log.log_info("Usage: op <player>")
+        return
+    }
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    if dd_lists.ops_contains(name) {
+        dd_log.log_info("Nothing changed. The player already is an operator")
+        return
+    }
+    dd_lists.ops_set(name, (*d).op_level as i64)
+    dd_lists.lists_save_ops()
+    dd_cfg.sync_lists(srv)
+    let s: *mut sv_state.Session = session_by_name(srv, name)
+    if s as u64 != 0 { (*srv).on_join(srv, s) }
+    info3("Made ", name, " a server operator")
+}
+
+fn cmd_deop(srv: *mut sv_state.Server, args: str) {
+    var rest: str = ""
+    let name: str = tx.split_word(args, &rest)
+    if name.n == 0 {
+        dd_log.log_info("Usage: deop <player>")
+        return
+    }
+    if !dd_lists.ops_remove(name) {
+        dd_log.log_info("Nothing changed. The player is not an operator")
+        return
+    }
+    dd_lists.lists_save_ops()
+    dd_cfg.sync_lists(srv)
+    let s: *mut sv_state.Session = session_by_name(srv, name)
+    if s as u64 != 0 { (*srv).on_join(srv, s) }
+    info3("Made ", name, " no longer a server operator")
+}
+
+fn cmd_kick(srv: *mut sv_state.Server, args: str) {
+    var rest: str = ""
+    let name: str = tx.split_word(args, &rest)
+    if name.n == 0 {
+        dd_log.log_info("Usage: kick <player> [reason]")
+        return
+    }
+    let s: *mut sv_state.Session = session_by_name(srv, name)
+    if s as u64 == 0 {
+        dd_log.log_info("No player was found")
+        return
+    }
+    var reason: str = rest
+    if reason.n == 0 { reason = KICK_DEFAULT }
+    sv_send.send_kick(srv, s, reason)
+    var t: rt.Buf = text_buf("Kicked ", name, ": ")
+    rt.buf_push_bytes(&t, reason.p as u64, reason.n)
+    dd_log.log_info(rt.buf_str(&t))
+    rt.buf_free(&t)
+}
+
+fn enforce_whitelist(srv: *mut sv_state.Server) {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    if !(*srv).cfg.whitelist_on || !(*d).enforce_whitelist { return }
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(srv, i)
+        if (*s).used && (*s).joined && !(*s).closing {
+            if !dd_lists.whitelist_has(str { p: (&(*s).name[0]) as *mut u8, n: (*s).name_n }) { sv_send.send_kick(srv, s, NOT_WHITELISTED) }
+        }
+        i = i + 1
+    }
+}
+
+fn whitelist_list(srv: *mut sv_state.Server) {
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    let list: str = rt.buf_str(&(*d).whitelist)
+    if list.n == 0 {
+        dd_log.log_info("There are no whitelisted players")
+        return
+    }
+    var count: i64 = 1
+    var i: usize = 0
+    var shown: rt.Buf = rt.buf_new()
+    while i < list.n {
+        if rt.ld8(list.p as u64, i) == 44 as u8 {
+            count = count + 1
+            sv_send.push_str(&shown, ", ")
+        } else {
+            rt.buf_push(&shown, rt.ld8(list.p as u64, i))
+        }
+        i = i + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "There are ")
+    rt.buf_push_dec_i64(&b, count)
+    sv_send.push_str(&b, " whitelisted players: ")
+    rt.buf_push_bytes(&b, rt.buf_ptr(&shown), rt.buf_len(&shown))
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+    rt.buf_free(&shown)
+}
+
+fn cmd_whitelist(srv: *mut sv_state.Server, args: str) {
+    var rest: str = ""
+    let sub: str = tx.split_word(args, &rest)
+    let d: *mut dd_state.Dedi = dd_state.dedi_get()
+    if tx.eq(sub, "on") {
+        (*srv).cfg.whitelist_on = true
+        enforce_whitelist(srv)
+        dd_log.log_info("Whitelist is now turned on")
+    } else if tx.eq(sub, "off") {
+        (*srv).cfg.whitelist_on = false
+        dd_log.log_info("Whitelist is now turned off")
+    } else if tx.eq(sub, "list") {
+        whitelist_list(srv)
+    } else if tx.eq(sub, "reload") {
+        dd_lists.lists_load()
+        dd_cfg.sync_lists(srv)
+        enforce_whitelist(srv)
+        dd_log.log_info("Reloaded the whitelist")
+    } else if tx.eq(sub, "add") && rest.n > 0 {
+        if dd_lists.whitelist_add(rest) {
+            dd_lists.lists_save_whitelist()
+            dd_cfg.sync_lists(srv)
+            info3("Added ", rest, " to the whitelist")
+        } else {
+            dd_log.log_info("Player is already whitelisted")
+        }
+    } else if tx.eq(sub, "remove") && rest.n > 0 {
+        if dd_lists.whitelist_remove(rest) {
+            dd_lists.lists_save_whitelist()
+            dd_cfg.sync_lists(srv)
+            enforce_whitelist(srv)
+            info3("Removed ", rest, " from the whitelist")
+        } else {
+            dd_log.log_info("Player is not whitelisted")
+        }
+    } else {
+        dd_log.log_info("Usage: whitelist (on|off|list|reload|add <player>|remove <player>)")
+    }
+}
+
+fn cmd_save_all(srv: *mut sv_state.Server, args: str) {
+    dd_log.log_info("Saving the game (this may take a moment!)")
+    sv_persist.persist_save_all(srv)
+    dd_log.log_info("Saved the game")
+}
+
+fn day_time_of(srv: *mut sv_state.Server) -> i64 {
+    return ((*srv).day_time % DAY_TICKS + DAY_TICKS) % DAY_TICKS
+}
+
+fn time_set(srv: *mut sv_state.Server, v: i64) {
+    (*srv).day_time = v
+    sv_play.play_time_all(srv)
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "Set the time to ")
+    rt.buf_push_dec_i64(&b, day_time_of(srv))
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn time_reply(head: str, v: i64) {
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, head)
+    rt.buf_push_dec_i64(&b, v)
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn cmd_time(srv: *mut sv_state.Server, args: str) {
+    var rest: str = ""
+    let sub: str = tx.split_word(args, &rest)
+    var rest2: str = ""
+    let what: str = tx.split_word(rest, &rest2)
+    if tx.eq(sub, "set") {
+        if tx.eq(what, "day") { time_set(srv, 1000) } else if tx.eq(what, "noon") { time_set(srv, 6000) } else if tx.eq(what, "night") { time_set(srv, 13000) } else if tx.eq(what, "midnight") { time_set(srv, 18000) } else if tx.parse_int(what, 0 - 1) >= 0 { time_set(srv, tx.parse_int(what, 0)) } else { dd_log.log_info("Usage: time set (day|noon|night|midnight|<ticks>)") }
+    } else if tx.eq(sub, "add") && tx.parse_int(what, 0 - 1) >= 0 {
+        time_set(srv, (*srv).day_time + tx.parse_int(what, 0))
+    } else if tx.eq(sub, "query") && tx.eq(what, "daytime") {
+        time_reply("The time is ", day_time_of(srv))
+    } else if tx.eq(sub, "query") && tx.eq(what, "gametime") {
+        time_reply("The time is ", (*srv).game_time)
+    } else if tx.eq(sub, "query") && tx.eq(what, "day") {
+        time_reply("The time is ", (*srv).day_time / DAY_TICKS)
+    } else {
+        dd_log.log_info("Usage: time (set <value>|add <ticks>|query (daytime|gametime|day))")
+    }
+}
+
+fn cmd_tps(srv: *mut sv_state.Server, args: str) {
+    let x100: u64 = sv_clock.clock_tps_x100(&(*srv).clock)
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "TPS: ")
+    rt.buf_push_dec_i64(&b, (x100 / 100 as u64) as i64)
+    rt.buf_push(&b, 46 as u8)
+    rt.buf_push_dec_i64(&b, (x100 % 100 as u64) as i64)
+    sv_send.push_str(&b, ", average tick: ")
+    rt.buf_push_dec_i64(&b, sv_clock.clock_avg_us(&(*srv).clock) as i64)
+    sv_send.push_str(&b, " us")
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn cmd_version(srv: *mut sv_state.Server, args: str) {
+    var b: rt.Buf = rt.buf_new()
+    sv_send.push_str(&b, "This server is running Firn Minecraft Server version ")
+    rt.buf_push_bytes(&b, (*srv).ver.name, (*srv).ver.name_len)
+    sv_send.push_str(&b, " (protocol ")
+    rt.buf_push_dec_i64(&b, (*srv).ver.protocol as i64)
+    rt.buf_push(&b, 41 as u8)
+    dd_log.log_info(rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn console_execute(srv: *mut sv_state.Server, line: str) {
+    var rest: str = ""
+    var name: str = tx.split_word(line, &rest)
+    if name.n > 0 && rt.ld8(name.p as u64, 0) == 47 as u8 { name = tx.sub(name, 1, name.n) }
+    if name.n == 0 { return }
+    if tx.eq(name, "help") || tx.eq(name, "?") { cmd_help(srv, rest) } else if tx.eq(name, "stop") { cmd_stop(srv, rest) } else if tx.eq(name, "list") { cmd_list(srv, rest) } else if tx.eq(name, "say") { cmd_say(srv, rest) } else if tx.eq(name, "op") { cmd_op(srv, rest) } else if tx.eq(name, "deop") { cmd_deop(srv, rest) } else if tx.eq(name, "kick") { cmd_kick(srv, rest) } else if tx.eq(name, "whitelist") { cmd_whitelist(srv, rest) } else if tx.eq(name, "save-all") { cmd_save_all(srv, rest) } else if tx.eq(name, "time") { cmd_time(srv, rest) } else if tx.eq(name, "tps") { cmd_tps(srv, rest) } else if tx.eq(name, "version") { cmd_version(srv, rest) } else { dd_log.log_info("Unknown or incomplete command, see below for error") }
+}

@@ -1,0 +1,139 @@
+import std.rt
+import mc.gen.mg_random
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_eval
+import mc.gen.wgdf_fluid
+import mc.gen.wgdf_aquifer
+import mc.gen.wgdf_veins
+
+export { FillCtx, fill_begin, fill_end, fill_state, fill_chunk, fill_part }
+
+struct FillCtx {
+    root: i32,
+    aq: u64,
+    ore_pf: mg_random.PosFactory,
+    n_toggle: i32,
+    n_ridged: i32,
+    n_gap: i32,
+    ore_on: bool,
+}
+
+fn pow2_shift(v: i32) -> i32 {
+    var k: i32 = 0
+    while k < 30 {
+        if (1 << k) == v { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn fill_begin(g: *wgdf_graph.WgGraph, ns: *mut wgdf_eval.WgNoises, min_x: i32, min_z: i32, span: i32) {
+    if (*ns).grid == 0 {
+        (*ns).grid = rt.heap_alloc(wgdf_eval.GRID_BYTES)
+    }
+    let gr: *mut wgdf_eval.FillGrid = (*ns).grid as *mut wgdf_eval.FillGrid
+    let cw: i32 = (*g).size_h * 4
+    let ch: i32 = (*g).size_v * 4
+    (*gr).corner_mode = false
+    (*gr).min_x = min_x
+    (*gr).min_z = min_z
+    (*gr).cw = cw
+    (*gr).ch = ch
+    (*gr).cw_shift = pow2_shift(cw)
+    (*gr).ch_shift = pow2_shift(ch)
+    (*gr).cw_inv = 1.0 / (cw as f64)
+    (*gr).ch_inv = 1.0 / (ch as f64)
+    (*gr).cells_x = span / cw
+    (*gr).cells_y = (*g).height / ch
+    (*gr).cell_min_y = wgdf_eval.floor_div((*g).min_y, ch)
+    (*gr).next_slot = 0
+    var i: usize = 0
+    while i < 3072 {
+        (*gr).slot_of[i] = -1
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        (*gr).sl_valid[i] = false
+        (*gr).zx_valid[i] = false
+        i = i + 1
+    }
+}
+
+fn fill_end(ns: *mut wgdf_eval.WgNoises) {
+    if (*ns).grid != 0 {
+        rt.heap_free((*ns).grid, wgdf_eval.GRID_BYTES)
+        (*ns).grid = 0
+    }
+}
+
+fn ctx_new(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, root: i32, min_x: i32, min_z: i32) -> FillCtx {
+    var c: FillCtx = FillCtx {
+        root: root, aq: 0, ore_pf: wgdf_veins.vein_factory(g, ns),
+        n_toggle: wgdf_graph.router_find(g, "vein_toggle"),
+        n_ridged: wgdf_graph.router_find(g, "vein_ridged"),
+        n_gap: wgdf_graph.router_find(g, "vein_gap"),
+        ore_on: (*g).ore_veins,
+    }
+    if (*g).aquifers {
+        c.aq = wgdf_aquifer.aquifer_new(g, ns, min_x, min_z) as u64
+    }
+    return c
+}
+
+fn ctx_free(c: *mut FillCtx) {
+    if (*c).aq != 0 {
+        wgdf_aquifer.aquifer_free((*c).aq as *mut wgdf_aquifer.Aquifer)
+        (*c).aq = 0
+    }
+}
+
+fn fill_state(g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, c: *FillCtx, x: i32, y: i32, z: i32) -> u8 {
+    let density: f64 = wgdf_eval.eval(g, ns, (*c).root, x, y, z)
+    var st: u8 = 0
+    if (*c).aq != 0 {
+        st = wgdf_aquifer.aquifer_substance(g, ns, (*c).aq as *mut wgdf_aquifer.Aquifer, x, y, z, density)
+    } else if !(density > 0.0) {
+        let f: wgdf_fluid.Fluid = wgdf_fluid.fluid_global(g, y)
+        st = wgdf_fluid.fluid_at(&f, y)
+    }
+    if st != 0 {
+        return st
+    }
+    if (*c).ore_on {
+        st = wgdf_veins.vein_state(g, ns, &(*c).ore_pf, (*c).n_toggle, (*c).n_ridged, (*c).n_gap, x, y, z)
+        if st != 0 {
+            return st
+        }
+    }
+    return wgdf_fluid.STATE_SOLID
+}
+
+fn fill_part(g: *wgdf_graph.WgGraph, ns: *mut wgdf_eval.WgNoises, root: i32, cx: i32, cz: i32, ox: i32, oz: i32, span: i32, cached: bool, out: *mut u8) {
+    let min_x: i32 = cx * 16 + ox
+    let min_z: i32 = cz * 16 + oz
+    if cached {
+        fill_begin(g, ns, min_x, min_z, span)
+    }
+    var c: FillCtx = ctx_new(g, ns, root, cx * 16, cz * 16)
+    var yi: i32 = 0
+    while yi < (*g).height {
+        var lx: i32 = ox
+        while lx < ox + span {
+            var lz: i32 = oz
+            while lz < oz + span {
+                let st: u8 = fill_state(g, ns, &c, cx * 16 + lx, (*g).min_y + yi, cz * 16 + lz)
+                *(((out as u64) + ((((yi * 16 + lz) * 16 + lx) as usize) as u64)) as *mut u8) = st
+                lz = lz + 1
+            }
+            lx = lx + 1
+        }
+        yi = yi + 1
+    }
+    ctx_free(&c)
+    fill_end(ns)
+}
+
+fn fill_chunk(g: *wgdf_graph.WgGraph, ns: *mut wgdf_eval.WgNoises, root: i32, cx: i32, cz: i32, cached: bool, out: *mut u8) {
+    fill_part(g, ns, root, cx, cz, 0, 0, 16, cached, out)
+}

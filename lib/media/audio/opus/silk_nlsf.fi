@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_math
+import media.audio.opus.silk_nlsf_cb
+import media.audio.opus.silk_indices
+
+export { silk_nlsf_decode, silk_nlsf_stabilize }
+
+const MAX_LOOPS: i32 = 20
+const QUANT_LEVEL_ADJ_Q10: i32 = 102
+
+fn quant_step_q16(wb: i32) -> i32 {
+    if wb != 0 { return 9830 }
+    return 11796
+}
+
+fn residual_dequant(res: u64, idx: u64, pred_q8: u64, step_q16: i32, order: i32) {
+    var out_q10: i32 = 0
+    var i: i32 = order - 1
+    while i >= 0 {
+        let pred_q10: i32 = silk_math.smulbb(out_q10, celt_fix.ldb(pred_q8, i)) >> 8
+        out_q10 = celt_fix.ld32(idx, i + 1) << 10
+        if out_q10 > 0 {
+            out_q10 = out_q10 - QUANT_LEVEL_ADJ_Q10
+        } else if out_q10 < 0 {
+            out_q10 = out_q10 + QUANT_LEVEL_ADJ_Q10
+        }
+        out_q10 = silk_math.smlawb(pred_q10, out_q10, step_q16)
+        celt_fix.st16(res, i, out_q10)
+        i = i - 1
+    }
+}
+
+fn insertion_sort(a: u64, n: i32) {
+    var i: i32 = 1
+    while i < n {
+        let value: i32 = celt_fix.ld16(a, i)
+        var j: i32 = i - 1
+        while j >= 0 && value < celt_fix.ld16(a, j) {
+            celt_fix.st16(a, j + 1, celt_fix.ld16(a, j))
+            j = j - 1
+        }
+        celt_fix.st16(a, j + 1, value)
+        i = i + 1
+    }
+}
+
+fn silk_nlsf_stabilize(nlsf: u64, dmin: u64, l: i32) {
+    var loops: i32 = 0
+    while loops < MAX_LOOPS {
+        var min_diff: i32 = celt_fix.ld16(nlsf, 0) - celt_fix.ld16(dmin, 0)
+        var at: i32 = 0
+        var i: i32 = 1
+        while i <= l - 1 {
+            let diff: i32 = celt_fix.ld16(nlsf, i) - (celt_fix.ld16(nlsf, i - 1) + celt_fix.ld16(dmin, i))
+            if diff < min_diff {
+                min_diff = diff
+                at = i
+            }
+            i = i + 1
+        }
+        let diff_top: i32 = 32768 - (celt_fix.ld16(nlsf, l - 1) + celt_fix.ld16(dmin, l))
+        if diff_top < min_diff {
+            min_diff = diff_top
+            at = l
+        }
+        if min_diff >= 0 { return }
+        if at == 0 {
+            celt_fix.st16(nlsf, 0, celt_fix.ld16(dmin, 0))
+        } else if at == l {
+            celt_fix.st16(nlsf, l - 1, 32768 - celt_fix.ld16(dmin, l))
+        } else {
+            var min_center: i32 = 0
+            var k: i32 = 0
+            while k < at {
+                min_center = min_center + celt_fix.ld16(dmin, k)
+                k = k + 1
+            }
+            min_center = min_center + (celt_fix.ld16(dmin, at) >> 1)
+            var max_center: i32 = 32768
+            k = l
+            while k > at {
+                max_center = max_center - celt_fix.ld16(dmin, k)
+                k = k - 1
+            }
+            max_center = max_center - (celt_fix.ld16(dmin, at) >> 1)
+            let mid: i32 = silk_math.rshift_round(celt_fix.ld16(nlsf, at - 1) + celt_fix.ld16(nlsf, at), 1)
+            let center: i32 = (silk_math.limit32(mid, min_center, max_center) as% i16) as% i32
+            celt_fix.st16(nlsf, at - 1, center - (celt_fix.ld16(dmin, at) >> 1))
+            celt_fix.st16(nlsf, at, celt_fix.ld16(nlsf, at - 1) + celt_fix.ld16(dmin, at))
+        }
+        loops = loops + 1
+    }
+    insertion_sort(nlsf, l)
+    celt_fix.st16(nlsf, 0, celt_fix.imax(celt_fix.ld16(nlsf, 0), celt_fix.ld16(dmin, 0)))
+    var i: i32 = 1
+    while i < l {
+        let lo: i32 = silk_math.add_sat16(celt_fix.ld16(nlsf, i - 1), celt_fix.ld16(dmin, i))
+        celt_fix.st16(nlsf, i, celt_fix.imax(celt_fix.ld16(nlsf, i), lo))
+        i = i + 1
+    }
+    celt_fix.st16(nlsf, l - 1, celt_fix.imin(celt_fix.ld16(nlsf, l - 1), 32768 - celt_fix.ld16(dmin, l)))
+    i = l - 2
+    while i >= 0 {
+        celt_fix.st16(nlsf, i, celt_fix.imin(celt_fix.ld16(nlsf, i), celt_fix.ld16(nlsf, i + 1) - celt_fix.ld16(dmin, i + 1)))
+        i = i - 1
+    }
+}
+
+fn silk_nlsf_decode(wb: i32, idx: u64, out: u64) {
+    let order: i32 = silk_nlsf_cb.cb_order(wb)
+    var ec_ix: [i32; 16] = [0; 16]
+    var pred_q8: [u8; 16] = [0; 16]
+    var res: [i16; 16] = [0; 16]
+    let cb1: i32 = celt_fix.ld32(idx, 0)
+    silk_indices.silk_nlsf_unpack(wb, cb1, (&ec_ix[0]) as u64, (&pred_q8[0]) as u64)
+    residual_dequant((&res[0]) as u64, idx, (&pred_q8[0]) as u64, quant_step_q16(wb), order)
+    let elem: u64 = silk_nlsf_cb.cb_cb1(wb) +% ((cb1 *% order) as% u64)
+    let wght: u64 = silk_nlsf_cb.cb_wght(wb) +% ((cb1 *% order *% 2) as% u64)
+    var i: i32 = 0
+    while i < order {
+        let r: i32 = celt_fix.ld16((&res[0]) as u64, i)
+        let v: i32 = ((r << 14) / celt_fix.ld16(wght, i)) + (celt_fix.ldb(elem, i) << 7)
+        celt_fix.st16(out, i, silk_math.limit32(v, 0, 32767))
+        i = i + 1
+    }
+    silk_nlsf_stabilize(out, silk_nlsf_cb.cb_delta_min(wb), order)
+}

@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MPL-2.0
+// the PDF viewer model: open, page sizes, render to RGBA, text, search and links; no UI.
+import html.mem
+import rt.rt
+import paint.canvas
+import docview.pdf.pobj
+import docview.pdf.pdoc
+import docview.pdf.pfont
+import docview.pdf.ppage
+import docview.pdf.pannot
+import docview.pdf.textfold
+
+export {
+    Pdf, pdf_new, pdf_open, pdf_free, pdf_error, pdf_pages, pdf_page_size,
+    pdf_render, pdf_pixels, pdf_pixel_width, pdf_pixel_height, pdf_text,
+    pdf_find, pdf_links, link_count, link_x, link_y, link_w, link_h,
+    link_uri_len, link_uri_at,
+    PDF_OK, PDF_ERR_FORMAT, PDF_ERR_NOPAGES, PDF_ERR_ENCRYPTED, PDF_ERR_BROKEN, PDF_ERR_RENDER,
+}
+
+const PDF_OK: u32 = 0
+const PDF_ERR_FORMAT: u32 = 1
+const PDF_ERR_NOPAGES: u32 = 2
+const PDF_ERR_ENCRYPTED: u32 = 3
+const PDF_ERR_BROKEN: u32 = 4
+const PDF_ERR_RENDER: u32 = 5
+const LINK_STRIDE: usize = 40
+
+struct Pdf {
+    d: pdoc.Doc,
+    bytes: rt.Buf,
+    fh: pfont.FontHold,
+    cv: canvas.Canvas,
+    fonts_ready: bool,
+    open: bool,
+    err: u32,
+}
+
+fn pdf_new() -> Pdf {
+    return Pdf { d: pdoc.doc_new(), bytes: rt.buf_new(), fh: pfont.fonthold_new(),
+        cv: canvas.canvas_new(), fonts_ready: false, open: false, err: PDF_OK }
+}
+
+fn map_error(e: u32) -> u32 {
+    if e == pdoc.E_NOHEADER {
+        return PDF_ERR_FORMAT
+    }
+    if e == pdoc.E_NOPAGES {
+        return PDF_ERR_NOPAGES
+    }
+    if e == pdoc.E_ENCRYPTED {
+        return PDF_ERR_ENCRYPTED
+    }
+    return PDF_ERR_BROKEN
+}
+
+fn pdf_open(p: *mut Pdf, data: u64, n: usize) -> bool {
+    if n < 8 {
+        (*p).err = PDF_ERR_FORMAT
+        return false
+    }
+    rt.buf_clear(&(*p).bytes)
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&(*p).bytes, rt.ld8(data, i))
+        i = i + 1
+    }
+    if !pdoc.doc_open(&(*p).d, rt.buf_ptr(&(*p).bytes), rt.buf_len(&(*p).bytes)) {
+        (*p).err = map_error(pdoc.doc_err(&(*p).d))
+        return false
+    }
+    (*p).open = true
+    (*p).err = PDF_OK
+    return true
+}
+
+fn pdf_free(p: *mut Pdf) {
+    if (*p).open {
+        pdoc.doc_free(&(*p).d)
+    }
+    rt.buf_free(&(*p).bytes)
+    (*p).open = false
+}
+
+fn pdf_error(p: *mut Pdf) -> u32 {
+    return (*p).err
+}
+
+fn pdf_pages(p: *mut Pdf) -> usize {
+    if !(*p).open {
+        return 0
+    }
+    return pdoc.doc_page_count(&(*p).d)
+}
+
+fn pdf_page_size(p: *mut Pdf, page: usize, w: *mut f64, h: *mut f64) -> bool {
+    if !(*p).open || page >= pdoc.doc_page_count(&(*p).d) {
+        return false
+    }
+    var bx: [f64; 4] = [0.0; 4]
+    var pw: usize = 0
+    var ph: usize = 0
+    ppage.page_size(&(*p).d, page, 1.0, &pw, &ph, (&bx[0]) as *mut f64)
+    *w = pw as f64
+    *h = ph as f64
+    return true
+}
+
+fn pdf_render(p: *mut Pdf, page: usize, scale: f64) -> bool {
+    if !(*p).open || page >= pdoc.doc_page_count(&(*p).d) || scale <= 0.0 {
+        return false
+    }
+    if !(*p).fonts_ready {
+        ppage.fonthold_load(&(*p).fh)
+        (*p).fonts_ready = true
+    }
+    var stat: [usize; 5] = [0; 5]
+    if !ppage.page_render(&(*p).d, page, scale, &(*p).cv, &(*p).fh, (&stat[0]) as *mut usize) {
+        (*p).err = PDF_ERR_RENDER
+        return false
+    }
+    return true
+}
+
+fn pdf_pixels(p: *mut Pdf) -> u64 {
+    return (*p).cv.px as u64
+}
+
+fn pdf_pixel_width(p: *mut Pdf) -> usize {
+    return canvas.canvas_width(&(*p).cv)
+}
+
+fn pdf_pixel_height(p: *mut Pdf) -> usize {
+    return canvas.canvas_height(&(*p).cv)
+}
+
+fn pdf_text(p: *mut Pdf, page: usize, out: *mut mem.Buf) -> bool {
+    if !(*p).open {
+        return false
+    }
+    return ppage.page_text(&(*p).d, page, out)
+}
+
+fn pdf_find(p: *mut Pdf, page: usize, query: u64, qn: usize, out: *mut mem.Buf) -> usize {
+    var t: mem.Buf = mem.buf_new()
+    mem.buf_init(&t)
+    if !pdf_text(p, page, &t) {
+        mem.buf_free(&t)
+        return 0
+    }
+    let n: usize = textfold.find_all(mem.buf_ptr(&t), mem.buf_len(&t), query as *mut u8, qn, out)
+    mem.buf_free(&t)
+    return n
+}
+
+fn put_f64(out: *mut mem.Buf, v: f64) {
+    var tmp: [f64; 1] = [v]
+    let q: u64 = (&tmp[0]) as u64
+    var i: usize = 0
+    while i < 8 {
+        mem.buf_push(out, rt.ld8(q, i))
+        i = i + 1
+    }
+}
+
+fn put_u32(out: *mut mem.Buf, v: u32) {
+    mem.buf_push(out, (v & 255) as u8)
+    mem.buf_push(out, ((v >> 8) & 255) as u8)
+    mem.buf_push(out, ((v >> 16) & 255) as u8)
+    mem.buf_push(out, ((v >> 24) & 255) as u8)
+}
+
+#[allow_escape]
+fn pdf_links(p: *mut Pdf, page: usize, out: *mut mem.Buf, uris: *mut mem.Buf) -> usize {
+    if !(*p).open || page >= pdoc.doc_page_count(&(*p).d) {
+        return 0
+    }
+    let d: *mut pdoc.Doc = &(*p).d
+    var bx: [f64; 4] = [0.0; 4]
+    pdoc.doc_page_box(d, page, true, (&bx[0]) as *mut f64)
+    let l: *mut pannot.AnnotList = pannot.an_load(d, page)
+    let n: usize = pannot.an_count(l)
+    var found: usize = 0
+    var i: usize = 0
+    while i < n {
+        let a: *mut pannot.Annot = pannot.an_at(l, i)
+        if pannot.an_subtype(a) == pannot.ST_LINK {
+            var an: [u8; 1] = "A"
+            var un: [u8; 3] = "URI"
+            let act: u32 = pdoc.doc_dict_get(d, pannot.an_obj(a), (&an[0]) as u64, 1)
+            var uri: u32 = 0
+            if act != 0 as u32 {
+                uri = pdoc.doc_dict_get(d, act, (&un[0]) as u64, 3)
+            }
+            let x0: f64 = pannot.an_rect(a, 0) - bx[0]
+            let y1: f64 = bx[3] - pannot.an_rect(a, 1)
+            let x1: f64 = pannot.an_rect(a, 2) - bx[0]
+            let y0: f64 = bx[3] - pannot.an_rect(a, 3)
+            put_f64(out, x0)
+            put_f64(out, y0)
+            put_f64(out, x1 - x0)
+            put_f64(out, y1 - y0)
+            var ulen: usize = 0
+            put_u32(out, mem.buf_len(uris) as u32)
+            if uri != 0 as u32 && pobj.o_kind(&(*d).ar, uri) == pobj.T_STR {
+                ulen = pobj.o_str_len(&(*d).ar, uri)
+                let sp: u64 = pobj.o_str_ptr(&(*d).ar, uri)
+                var k: usize = 0
+                while k < ulen {
+                    mem.buf_push(uris, rt.ld8(sp, k))
+                    k = k + 1
+                }
+            }
+            put_u32(out, ulen as u32)
+            found = found + 1
+        }
+        i = i + 1
+    }
+    pannot.an_free(l)
+    return found
+}
+
+fn link_count(out: *mut mem.Buf) -> usize {
+    return mem.buf_len(out) / LINK_STRIDE
+}
+
+fn get_f64(out: *mut mem.Buf, i: usize, field: usize) -> f64 {
+    let q: u64 = mem.buf_ptr(out) as u64 + (i * LINK_STRIDE + field * 8) as u64
+    var tmp: [f64; 1] = [0.0]
+    let t: u64 = (&tmp[0]) as u64
+    var k: usize = 0
+    while k < 8 {
+        *((t + k as u64) as *mut u8) = *((q + k as u64) as *mut u8)
+        k = k + 1
+    }
+    return tmp[0]
+}
+
+fn get_u32(out: *mut mem.Buf, i: usize, field: usize) -> u32 {
+    let q: u64 = mem.buf_ptr(out) as u64 + (i * LINK_STRIDE + 32 + field * 4) as u64
+    return (*(q as *mut u8)) as u32 | (((*((q + 1) as *mut u8)) as u32) << 8) |
+    (((*((q + 2) as *mut u8)) as u32) << 16) | (((*((q + 3) as *mut u8)) as u32) << 24)
+}
+
+fn link_x(out: *mut mem.Buf, i: usize) -> f64 {
+    return get_f64(out, i, 0)
+}
+
+fn link_y(out: *mut mem.Buf, i: usize) -> f64 {
+    return get_f64(out, i, 1)
+}
+
+fn link_w(out: *mut mem.Buf, i: usize) -> f64 {
+    return get_f64(out, i, 2)
+}
+
+fn link_h(out: *mut mem.Buf, i: usize) -> f64 {
+    return get_f64(out, i, 3)
+}
+
+fn link_uri_len(out: *mut mem.Buf, i: usize) -> usize {
+    return get_u32(out, i, 1) as usize
+}
+
+fn link_uri_at(out: *mut mem.Buf, uris: *mut mem.Buf, i: usize) -> u64 {
+    return mem.buf_ptr(uris) as u64 + get_u32(out, i, 0) as u64
+}

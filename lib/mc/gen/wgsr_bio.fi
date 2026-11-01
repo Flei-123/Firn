@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import noise.psimplex
+import mc.gen.wgdf_graph
+import mc.gen.wgdf_eval
+import mc.gen.wgbio_source
+import mc.gen.wgsr_def
+
+export { Zoom, zoom_init, zoom_biome, zoom_pick, temperature_at }
+
+const SIDE: i32 = 6
+const DEPTH: i32 = 112
+const UNSET: u8 = 255
+
+struct Zoom {
+    qx0: i32,
+    qz0: i32,
+    qy0: i32,
+    memo: [u8; 4032],
+    pick: [i32; 3],
+    seed: i64,
+    bs: *mut wgbio_source.BioSource,
+    g: *wgdf_graph.WgGraph,
+    ns: *wgdf_eval.WgNoises,
+}
+
+fn zoom_init(z: *mut Zoom, d: *wgsr_def.SrDef, bs: *mut wgbio_source.BioSource, g: *wgdf_graph.WgGraph, ns: *wgdf_eval.WgNoises, cx: i32, cz: i32, bio_buf: u64) {
+    (*z).qx0 = cx * 4 - 1
+    (*z).qz0 = cz * 4 - 1
+    (*z).qy0 = wgdf_eval.floor_div((*g).min_y, 4) - 1
+    (*z).seed = (*d).zoom_seed
+    (*z).bs = bs
+    (*z).g = g
+    (*z).ns = ns
+    rt.mem_set((&(*z).memo[0]) as u64, UNSET, 4032)
+    var iy: i32 = 0
+    let cells: i32 = (*g).height / 4
+    while iy < cells {
+        let sec: usize = (iy / 4) as usize
+        let y4: usize = (iy % 4) as usize
+        var zz: i32 = 0
+        while zz < 4 {
+            var xx: i32 = 0
+            while xx < 4 {
+                let v: u8 = rt.ld8(bio_buf, sec * 64 + y4 * 16 + (zz as usize) * 4 + (xx as usize))
+                let at: i32 = ((zz + 1) * SIDE + (xx + 1)) * DEPTH + iy + 1
+                (*z).memo[at as usize] = v
+                xx = xx + 1
+            }
+            zz = zz + 1
+        }
+        iy = iy + 1
+    }
+}
+
+fn quart_biome(z: *mut Zoom, qx0: i32, qy0: i32, qz: i32) -> i32 {
+    let qx: i32 = qx0
+    var qy: i32 = qy0
+    let lo: i32 = (*z).qy0 + 1
+    let hi: i32 = lo + (*(*z).g).height / 4 - 1
+    if qy < lo { qy = lo }
+    if qy > hi { qy = hi }
+    let ix: i32 = qx - (*z).qx0
+    let iz: i32 = qz - (*z).qz0
+    let iy: i32 = qy - (*z).qy0
+    if ix < 0 || ix >= SIDE || iz < 0 || iz >= SIDE || iy < 0 || iy >= DEPTH {
+        return wgbio_source.bio_sample((*z).bs, (*z).g, (*z).ns, qx, qy, qz) as i32
+    }
+    let at: usize = ((iz * SIDE + ix) * DEPTH + iy) as usize
+    let v: u8 = (*z).memo[at]
+    if v != UNSET { return v as i32 }
+    let n: usize = wgbio_source.bio_sample((*z).bs, (*z).g, (*z).ns, qx, qy, qz)
+    (*z).memo[at] = n as u8
+    return n as i32
+}
+
+fn lcg_next(s: i64, inc: i64) -> i64 {
+    return s *% (s *% 6364136223846793005 +% 1442695040888963407) +% inc
+}
+
+#[allow_fp]
+fn fiddle(s: i64) -> f64 {
+    let m: i64 = (s >> 24) & 1023
+    let t: f64 = (m as f64) / 1024.0
+    return (t - 0.5) * 0.9
+}
+
+#[allow_fp]
+fn fiddled_distance(seed: i64, x: i32, y: i32, z: i32, dx: f64, dy: f64, dz: f64) -> f64 {
+    var s: i64 = lcg_next(seed, x as i64)
+    s = lcg_next(s, y as i64)
+    s = lcg_next(s, z as i64)
+    s = lcg_next(s, x as i64)
+    s = lcg_next(s, y as i64)
+    s = lcg_next(s, z as i64)
+    let f1: f64 = fiddle(s)
+    s = lcg_next(s, seed)
+    let f2: f64 = fiddle(s)
+    s = lcg_next(s, seed)
+    let f3: f64 = fiddle(s)
+    let a: f64 = dz + f3
+    let b: f64 = dy + f2
+    let c: f64 = dx + f1
+    return a * a + b * b + c * c
+}
+
+#[allow_fp]
+fn zoom_pick(seed: i64, x: i32, y: i32, zc: i32, out: *mut i32) {
+    let px: i32 = x - 2
+    let py: i32 = y - 2
+    let pz: i32 = zc - 2
+    let qx: i32 = px >> 2
+    let qy: i32 = py >> 2
+    let qz: i32 = pz >> 2
+    let fx: f64 = ((px & 3) as f64) / 4.0
+    let fy: f64 = ((py & 3) as f64) / 4.0
+    let fz: f64 = ((pz & 3) as f64) / 4.0
+    var best: i32 = 0
+    var best_d: f64 = 1.0e300
+    var i: i32 = 0
+    while i < 8 {
+        let ax: bool = (i & 4) == 0
+        let ay: bool = (i & 2) == 0
+        let az: bool = (i & 1) == 0
+        var cx: i32 = qx + 1
+        if ax { cx = qx }
+        var cy: i32 = qy + 1
+        if ay { cy = qy }
+        var cz: i32 = qz + 1
+        if az { cz = qz }
+        var dx: f64 = fx - 1.0
+        if ax { dx = fx }
+        var dy: f64 = fy - 1.0
+        if ay { dy = fy }
+        var dz: f64 = fz - 1.0
+        if az { dz = fz }
+        let dist: f64 = fiddled_distance(seed, cx, cy, cz, dx, dy, dz)
+        if best_d > dist {
+            best = i
+            best_d = dist
+        }
+        i = i + 1
+    }
+    var rx: i32 = qx + 1
+    if (best & 4) == 0 { rx = qx }
+    var ry: i32 = qy + 1
+    if (best & 2) == 0 { ry = qy }
+    var rz: i32 = qz + 1
+    if (best & 1) == 0 { rz = qz }
+    *out = rx
+    *((out as u64 + 4) as *mut i32) = ry
+    *((out as u64 + 8) as *mut i32) = rz
+}
+
+fn zoom_biome(z: *mut Zoom, x: i32, y: i32, zc: i32) -> i32 {
+    zoom_pick((*z).seed, x, y, zc, &(*z).pick[0])
+    return quart_biome(z, (*z).pick[0], (*z).pick[1], (*z).pick[2])
+}
+
+#[allow_fp]
+fn temperature_at(d: *wgsr_def.SrDef, biome: i32, x: i32, y: i32, z: i32) -> f32 {
+    var t: f32 = (*d).bio_temp[biome as usize]
+    if (*d).bio_frozen[biome as usize] {
+        let a: f64 = psimplex.psimplex_value(&(*d).f_noise, (x as f64) * 0.05, (z as f64) * 0.05, false) * 7.0
+        let b: f64 = psimplex.psimplex_value(&(*d).i_noise, (x as f64) * 0.2, (z as f64) * 0.2, false)
+        let c: f64 = a + b
+        if c < 0.3 {
+            let e: f64 = psimplex.psimplex_value(&(*d).i_noise, (x as f64) * 0.09, (z as f64) * 0.09, false)
+            if e < 0.8 {
+                t = 0.2
+            }
+        }
+    }
+    if y > 80 {
+        let eight: f32 = 8.0
+        let fx: f32 = (x as f32) / eight
+        let fz: f32 = (z as f32) / eight
+        let nv: f64 = psimplex.psimplex_value(&(*d).t_noise, fx as f64, fz as f64, false) * 8.0
+        let n: f32 = nv as f32
+        let c80: f32 = 80.0
+        let k1: f32 = 0.05
+        let k2: f32 = 40.0
+        var w: f32 = n + (y as f32)
+        w = w - c80
+        w = w * k1
+        w = w / k2
+        return t - w
+    }
+    return t
+}

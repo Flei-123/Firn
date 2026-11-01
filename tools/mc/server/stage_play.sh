@@ -33,6 +33,8 @@ check_play() {
         echo "  FAIL  $name: rc=$PLAY_RC spawn_ms=${SPAWN_MS:-none} columns=${cols:-0} colors=${colors:-0}"; tail -3 "$W/$name.out" | sed 's/^/        /'; touch "$W/failed"
     fi
 }
+listed=$("$W/mcplay" --list-versions 2>/dev/null)
+if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1])["versions"]; m=json.load(open(sys.argv[2]))["versions"]; j={k for k,v in m.items() if v["status"]=="joinable"}; assert {e["name"] for e in d}==j and all(e["client"] for e in d)' "$listed" "$REPO/tools/mcgen/supported.json" 2>/dev/null; then echo "  ok    mcplay --list-versions equals the joinable entries of supported.json"; else echo "  FAIL  mcplay --list-versions: $listed"; ERR=1; fi
 play_once sp_flat "$W/sp_flat.png"
 check_play sp_flat "$W/sp_flat.png"
 mkdir -p "$W/spworld"

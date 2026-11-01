@@ -7,11 +7,14 @@ import std.bytes
 import mc.mc_encode
 import mc.server.sv_world
 
-export { ChunkEnc, chunk_enc_new, chunk_enc_free, chunk_enc_data, chunk_enc_heightmap, chunk_enc_light, chunk_enc_block_entities }
+export {
+    ChunkEnc, chunk_enc_new, chunk_enc_free, chunk_enc_data, chunk_enc_heightmap, chunk_enc_light, chunk_enc_block_entities,
+    chunk_enc_height_prepare, chunk_enc_height_longs, chunk_enc_height_long,
+}
 
 const BLOCK_INDIRECT_MAX: u32 = 8
 const BLOCK_MIN_BITS: u32 = 4
-const GLOBAL_BITS: u32 = 15
+const MAP_ENTRIES: usize = 65536
 const BIOME_INDIRECT_MAX: u32 = 3
 const LIGHT_BYTES: usize = 2048
 const NONE16: u16 = 65535
@@ -21,13 +24,16 @@ struct ChunkEnc {
     pal: u64,
     tops: u64,
     biome_bits: u32,
+    global_bits: u32,
+    nolen: bool,
+    fluid: bool,
 }
 
-fn chunk_enc_new(biome_count: i32) -> ChunkEnc {
-    var e: ChunkEnc = ChunkEnc { map: rt.heap_alloc(65536), pal: rt.heap_alloc(8192), tops: rt.heap_alloc(512),
-        biome_bits: ceil_log2(biome_count as u32) }
+fn chunk_enc_new(biome_count: i32, global_bits: u32, nolen: bool, fluid: bool) -> ChunkEnc {
+    var e: ChunkEnc = ChunkEnc { map: rt.heap_alloc(MAP_ENTRIES * 2), pal: rt.heap_alloc(8192), tops: rt.heap_alloc(512),
+        biome_bits: ceil_log2(biome_count as u32), global_bits: global_bits, nolen: nolen, fluid: fluid }
     var i: usize = 0
-    while i < 32768 {
+    while i < MAP_ENTRIES {
         rt.st16(e.map, i, NONE16)
         i = i + 1
     }
@@ -35,7 +41,7 @@ fn chunk_enc_new(biome_count: i32) -> ChunkEnc {
 }
 
 fn chunk_enc_free(e: *mut ChunkEnc) {
-    rt.heap_free((*e).map, 65536)
+    rt.heap_free((*e).map, MAP_ENTRIES * 2)
     rt.heap_free((*e).pal, 8192)
     rt.heap_free((*e).tops, 512)
 }
@@ -61,7 +67,7 @@ fn put_container(e: *mut ChunkEnc, out: *mut bytes.Bytes, ids: u64, cells: usize
     if n == 1 {
         bytes.put_u8(out, 0 as u8)
         bytes.put_varint(out, rt.ld16((*e).pal, 0) as i32)
-        bytes.put_varint(out, 0)
+        if !(*e).nolen { bytes.put_varint(out, 0) }
     } else {
         var bits: u32 = ceil_log2(n as u32)
         if bits < min_bits { bits = min_bits }
@@ -80,7 +86,7 @@ fn put_container(e: *mut ChunkEnc, out: *mut bytes.Bytes, ids: u64, cells: usize
         }
         let per: usize = (64 as u32 / bits) as usize
         let longs: usize = (cells + per - 1) / per
-        bytes.put_varint(out, longs as i32)
+        if !(*e).nolen { bytes.put_varint(out, longs as i32) }
         var l: usize = 0
         while l < longs {
             var v: u64 = 0
@@ -114,7 +120,8 @@ fn chunk_enc_data(e: *mut ChunkEnc, col: *mut sv_world.Column, nsec: usize, out:
             i = i + 1
         }
         bytes.put_i16(out, count as i16)
-        put_container(e, out, base, 4096, BLOCK_MIN_BITS, BLOCK_INDIRECT_MAX, GLOBAL_BITS)
+        if (*e).fluid { bytes.put_i16(out, 0 as i16) }
+        put_container(e, out, base, 4096, BLOCK_MIN_BITS, BLOCK_INDIRECT_MAX, (*e).global_bits)
         put_container(e, out, (*col).biomes + (s * 128) as u64, 64, 1, BIOME_INDIRECT_MAX, (*e).biome_bits)
         s = s + 1
     }
@@ -129,16 +136,38 @@ fn top_of(blocks: u64, nsec: usize, col: usize) -> i32 {
     return 0 - 1
 }
 
-fn chunk_enc_heightmap(e: *mut ChunkEnc, blocks: u64, nsec: usize, out: *mut bytes.Bytes) {
-    let height: u32 = (nsec * 16) as u32
-    let bits: u32 = ceil_log2(height + 1)
-    let per: usize = (64 as u32 / bits) as usize
-    let longs: usize = (256 + per - 1) / per
+fn chunk_enc_height_prepare(e: *mut ChunkEnc, blocks: u64, nsec: usize) {
     var col: usize = 0
     while col < 256 {
         rt.st16((*e).tops, col, (top_of(blocks, nsec, col) + 1) as u16)
         col = col + 1
     }
+}
+
+fn height_bits(nsec: usize) -> u32 {
+    return ceil_log2((nsec * 16) as u32 + 1)
+}
+
+fn chunk_enc_height_longs(nsec: usize) -> usize {
+    let per: usize = (64 as u32 / height_bits(nsec)) as usize
+    return (256 + per - 1) / per
+}
+
+fn chunk_enc_height_long(e: *mut ChunkEnc, nsec: usize, l: usize) -> u64 {
+    let bits: u32 = height_bits(nsec)
+    let per: usize = (64 as u32 / bits) as usize
+    var v: u64 = 0
+    var j: usize = 0
+    while j < per && l * per + j < 256 {
+        v = v | ((rt.ld16((*e).tops, l * per + j) as u64) << ((j as u32 * bits) as u64))
+        j = j + 1
+    }
+    return v
+}
+
+fn chunk_enc_heightmap(e: *mut ChunkEnc, blocks: u64, nsec: usize, out: *mut bytes.Bytes) {
+    chunk_enc_height_prepare(e, blocks, nsec)
+    let longs: usize = chunk_enc_height_longs(nsec)
     bytes.put_u8(out, 10 as u8)
     bytes.put_u16(out, 0 as u16)
     bytes.put_u8(out, 12 as u8)
@@ -148,13 +177,7 @@ fn chunk_enc_heightmap(e: *mut ChunkEnc, blocks: u64, nsec: usize, out: *mut byt
     bytes.put_i32(out, longs as i32)
     var l: usize = 0
     while l < longs {
-        var v: u64 = 0
-        var j: usize = 0
-        while j < per && l * per + j < 256 {
-            v = v | ((rt.ld16((*e).tops, l * per + j) as u64) << ((j as u32 * bits) as u64))
-            j = j + 1
-        }
-        bytes.put_u64(out, v)
+        bytes.put_u64(out, chunk_enc_height_long(e, nsec, l))
         l = l + 1
     }
     bytes.put_u8(out, 0 as u8)
@@ -207,7 +230,25 @@ fn light_from_heights(e: *mut ChunkEnc, col: *mut sv_world.Column, nsec: usize) 
     }
 }
 
-fn emit_mask(vals: *mut rt.Buf, name: str, mask: u64) {
+fn emit_mask_bytes(vals: *mut rt.Buf, name: str, mask: u64) {
+    var n: usize = 0
+    while n < 8 && (mask >> ((n * 8) as u64)) != 0 as u64 { n = n + 1 }
+    mc_encode.vals_key(vals, name)
+    rt.buf_push(vals, 35)
+    rt.buf_push_dec_u64(vals, n as u64)
+    rt.buf_push(vals, 10)
+    var i: usize = 0
+    while i < n {
+        push_line_i(vals, name, i, "]=", ((mask >> ((i * 8) as u64)) & (255 as u64)) as i64)
+        i = i + 1
+    }
+}
+
+fn emit_mask(vals: *mut rt.Buf, name: str, mask: u64, as_bytes: bool) {
+    if as_bytes {
+        emit_mask_bytes(vals, name, mask)
+        return
+    }
     if mask == 0 as u64 {
         mc_encode.vals_raw(vals, name, "#0")
         return
@@ -256,13 +297,13 @@ fn emit_arrays(vals: *mut rt.Buf, col: *mut sv_world.Column, name: str, sky: boo
     }
 }
 
-fn chunk_enc_light(e: *mut ChunkEnc, col: *mut sv_world.Column, nsec: usize, vals: *mut rt.Buf) {
+fn chunk_enc_light(e: *mut ChunkEnc, col: *mut sv_world.Column, nsec: usize, vals: *mut rt.Buf, mask_bytes: bool) {
     if !(*col).has_light { light_from_heights(e, col, nsec) }
     let layers: usize = nsec + 2
-    emit_mask(vals, "skyLightMask", (*col).sky_mask)
-    emit_mask(vals, "blockLightMask", (*col).blk_mask)
-    emit_mask(vals, "emptySkyLightMask", (*col).sky_empty)
-    emit_mask(vals, "emptyBlockLightMask", (*col).blk_empty)
+    emit_mask(vals, "skyLightMask", (*col).sky_mask, mask_bytes)
+    emit_mask(vals, "blockLightMask", (*col).blk_mask, mask_bytes)
+    emit_mask(vals, "emptySkyLightMask", (*col).sky_empty, mask_bytes)
+    emit_mask(vals, "emptyBlockLightMask", (*col).blk_empty, mask_bytes)
     emit_arrays(vals, col, "skyLight", true, (*col).sky_mask, layers)
     emit_arrays(vals, col, "blockLight", false, (*col).blk_mask, layers)
 }

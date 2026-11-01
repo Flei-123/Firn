@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.opus
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_state
+import media.audio.opus.silk_dec
+import media.audio.opus.silk_resamp
+import media.audio.opus.silk_stereo
+
+export { SilkStream, silk_stream_new, silk_stream_free, silk_stream_reset, silk_stream_begin, silk_stream_read_header, silk_stream_frame }
+
+struct SilkStream {
+    ch0: silk_state.SilkDec,
+    ch1: silk_state.SilkDec,
+    rs0: silk_resamp.Resamp,
+    rs1: silk_resamp.Resamp,
+    st: silk_stereo.StereoState,
+    pred: u64,
+    rs_out: u64,
+    api_hz0: i32,
+    api_hz1: i32,
+    api_hz: i32,
+    n_api: i32,
+    n_internal: i32,
+    prev_n_api: i32,
+    prev_n_internal: i32,
+    prev_mid_only: i32,
+    stereo_to_mono: i32,
+    frames_done: i32,
+}
+
+fn silk_stream_new() -> SilkStream {
+    var s: SilkStream = SilkStream {
+        ch0: silk_state.silk_dec_new(), ch1: silk_state.silk_dec_new(),
+        rs0: silk_resamp.resamp_new(), rs1: silk_resamp.resamp_new(), st: silk_stereo.stereo_new(),
+        pred: rt.heap_alloc(8), rs_out: rt.heap_alloc(2048),
+        api_hz0: 0, api_hz1: 0, api_hz: 0, n_api: 1, n_internal: 1, prev_n_api: 0, prev_n_internal: 0,
+        prev_mid_only: 0, stereo_to_mono: 0, frames_done: 0 }
+    celt_fix.st32(s.pred, 0, 0)
+    celt_fix.st32(s.pred, 1, 0)
+    return s
+}
+
+fn silk_stream_reset(s: *mut SilkStream) {
+    silk_state.silk_dec_reset(&(*s).ch0)
+    silk_state.silk_dec_reset(&(*s).ch1)
+    silk_stereo.stereo_reset_all(&(*s).st)
+    (*s).prev_mid_only = 0
+}
+
+fn chan(s: *mut SilkStream, n: i32) -> *mut silk_state.SilkDec {
+    if n == 0 { return &(*s).ch0 }
+    return &(*s).ch1
+}
+
+fn resampler(s: *mut SilkStream, n: i32) -> *mut silk_resamp.Resamp {
+    if n == 0 { return &(*s).rs0 }
+    return &(*s).rs1
+}
+
+fn set_channel_fs(s: *mut SilkStream, n: i32, fs_khz: i32) {
+    let d: *mut silk_state.SilkDec = chan(s, n)
+    var api: i32 = (*s).api_hz0
+    if n == 1 { api = (*s).api_hz1 }
+    if (*d).fs_khz != fs_khz || api != (*s).api_hz {
+        silk_resamp.resamp_init(resampler(s, n), fs_khz * 1000, (*s).api_hz)
+        if n == 0 { (*s).api_hz0 = (*s).api_hz } else { (*s).api_hz1 = (*s).api_hz }
+    }
+    silk_state.silk_dec_set_fs(d, fs_khz)
+}
+
+fn silk_stream_begin(s: *mut SilkStream, payload_ms: i32, fs_khz: i32, n_internal: i32, n_api: i32, api_hz: i32) {
+    (*s).frames_done = 0
+    (*s).n_internal = n_internal
+    (*s).n_api = n_api
+    (*s).api_hz = api_hz
+    if n_internal > (*s).prev_n_internal {
+        silk_state.silk_dec_reset(&(*s).ch1)
+        (*s).api_hz1 = 0
+    }
+    (*s).stereo_to_mono = 0
+    if n_internal == 1 && (*s).prev_n_internal == 2 && fs_khz * 1000 == (*s).ch0.fs_khz * 1000 {
+        (*s).stereo_to_mono = 1
+    }
+    var n: i32 = 0
+    while n < n_internal {
+        silk_dec.silk_dec_setup(chan(s, n), payload_ms)
+        set_channel_fs(s, n, fs_khz)
+        n = n + 1
+    }
+    if n_api == 2 && n_internal == 2 && ((*s).prev_n_api == 1 || (*s).prev_n_internal == 1) {
+        silk_stereo.stereo_reset_pred(&(*s).st)
+        silk_resamp.resamp_copy_state(&(*s).rs1, &(*s).rs0)
+    }
+    (*s).prev_n_api = n_api
+    (*s).prev_n_internal = n_internal
+}
+
+fn silk_stream_read_header(s: *mut SilkStream, e: *mut opus.Ec) {
+    let ni: i32 = (*s).n_internal
+    var n: i32 = 0
+    while n < ni {
+        silk_dec.silk_dec_read_vad(chan(s, n), e)
+        n = n + 1
+    }
+    n = 0
+    while n < ni {
+        silk_dec.silk_dec_read_lbrr_flags(chan(s, n), e)
+        n = n + 1
+    }
+    var i: i32 = 0
+    while i < (*s).ch0.frames_per_packet {
+        n = 0
+        while n < ni {
+            let d: *mut silk_state.SilkDec = chan(s, n)
+            if celt_fix.ld32((*d).lbrr_flags, i) != 0 {
+                if ni == 2 && n == 0 {
+                    silk_stereo.stereo_decode_pred(e, (*s).pred)
+                    if celt_fix.ld32((*s).ch1.lbrr_flags, i) == 0 {
+                        silk_stereo.stereo_decode_mid_only(e)
+                    }
+                }
+                silk_dec.silk_dec_skip_lbrr(d, e, i)
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+}
+
+fn resample_channel(s: *mut SilkStream, n: i32, src: u64, fl: i32, out: u64, stride: i32, offset: i32, n_out: i32) {
+    var dst: u64 = out
+    if stride == 2 { dst = (*s).rs_out }
+    silk_resamp.resamp_run(resampler(s, n), dst, src + 2, fl)
+    if stride == 2 {
+        var i: i32 = 0
+        while i < n_out {
+            celt_fix.st16(out, offset + 2 * i, celt_fix.ld16(dst, i))
+            i = i + 1
+        }
+    }
+}
+
+fn silk_stream_frame(s: *mut SilkStream, e: *mut opus.Ec, out: u64) -> i32 {
+    let f: i32 = (*s).frames_done
+    let ni: i32 = (*s).n_internal
+    var mid_only: i32 = 0
+    if ni == 2 {
+        silk_stereo.stereo_decode_pred(e, (*s).pred)
+        if celt_fix.ld32((*s).ch1.vad_flags, f) == 0 {
+            mid_only = silk_stereo.stereo_decode_mid_only(e)
+        }
+    }
+    if ni == 2 && mid_only == 0 && (*s).prev_mid_only == 1 {
+        silk_state.silk_dec_reset_side(&(*s).ch1)
+    }
+    var fl: i32 = (*s).ch0.frame_length
+    var n: i32 = 0
+    while n < ni {
+        let d: *mut silk_state.SilkDec = chan(s, n)
+        if n == 0 || mid_only == 0 {
+            var cond: i32 = silk_state.CODE_CONDITIONALLY
+            if f <= 0 {
+                cond = silk_state.CODE_INDEPENDENTLY
+            } else if n > 0 && (*s).prev_mid_only == 1 {
+                cond = silk_state.CODE_INDEPENDENTLY_NO_LTP_SCALING
+            }
+            fl = silk_dec.silk_dec_decode(d, e, f, cond)
+        } else {
+            var i: i32 = 0
+            while i < fl {
+                celt_fix.st16((*d).frame_buf, 2 + i, 0)
+                i = i + 1
+            }
+        }
+        n = n + 1
+    }
+    let x1: u64 = (*s).ch0.frame_buf
+    let x2: u64 = (*s).ch1.frame_buf
+    if (*s).n_api == 2 && ni == 2 {
+        silk_stereo.stereo_ms_to_lr(&(*s).st, x1, x2, (*s).pred, (*s).ch0.fs_khz, fl)
+    } else {
+        silk_stereo.stereo_buffer_mid(&(*s).st, x1, fl)
+    }
+    let n_out: i32 = fl * ((*s).api_hz / 1000) / (*s).ch0.fs_khz
+    var stride: i32 = 1
+    if (*s).n_api == 2 { stride = 2 }
+    let lim: i32 = ni
+    var cnt: i32 = (*s).n_api
+    if lim < cnt { cnt = lim }
+    n = 0
+    while n < cnt {
+        var src: u64 = x1
+        if n == 1 { src = x2 }
+        resample_channel(s, n, src, fl, out, stride, n, n_out)
+        n = n + 1
+    }
+    if (*s).n_api == 2 && ni == 1 {
+        if (*s).stereo_to_mono == 1 {
+            resample_channel(s, 1, x1, fl, out, stride, 1, n_out)
+        } else {
+            var i: i32 = 0
+            while i < n_out {
+                celt_fix.st16(out, 1 + 2 * i, celt_fix.ld16(out, 2 * i))
+                i = i + 1
+            }
+        }
+    }
+    (*s).stereo_to_mono = 0
+    (*s).prev_mid_only = mid_only
+    (*s).frames_done = f + 1
+    return n_out
+}
+
+fn silk_stream_free(s: *mut SilkStream) {
+    silk_state.silk_dec_free(&(*s).ch0)
+    silk_state.silk_dec_free(&(*s).ch1)
+    silk_resamp.resamp_free(&(*s).rs0)
+    silk_resamp.resamp_free(&(*s).rs1)
+    silk_stereo.stereo_free(&(*s).st)
+    rt.heap_free((*s).pred, 8)
+    rt.heap_free((*s).rs_out, 2048)
+}

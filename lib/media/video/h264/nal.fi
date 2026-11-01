@@ -1,0 +1,328 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.video.h264.marking
+import media.video.h264.params
+import media.video.h264.picture
+import media.video.h264.raw
+import media.video.h264.slice
+import media.video.h264.types
+
+export {
+    h264_config_avcc, h264_decode, h264_err_site, h264_extend_pic, h264_flush, h264_out_pts, h264_output,
+    h264_parse_only, h264_pending, h264_reset, h264_set_hold, h264_set_in_pts, h264_set_parse_only,
+    h264_take_dropped, h264_usable, h264_waiting_idr,
+}
+
+fn unescape(d: *mut params.H264, p: u64, n: usize) -> usize {
+    if (*d).rbsp_cap < n + 64 {
+        if (*d).rbsp != 0 {
+            rt.heap_free((*d).rbsp, (*d).rbsp_cap)
+        }
+        (*d).rbsp_cap = n + 4096
+        (*d).rbsp = rt.heap_alloc((*d).rbsp_cap)
+    }
+    let o: u64 = (*d).rbsp
+    var j: usize = 0
+    var i: usize = 0
+    var zeros: i32 = 0
+    while i < n {
+        let b: i32 = raw.ldu8(p, i)
+        if zeros >= 2 && b == 3 {
+            zeros = 0
+        } else {
+            raw.stb(o, j, b)
+            j = j + 1
+            if b == 0 {
+                zeros = zeros + 1
+            } else {
+                zeros = 0
+            }
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < 8 {
+        raw.stb(o, j + k, 0)
+        k = k + 1
+    }
+    return j
+}
+
+fn ps_note(d: *mut params.H264, rc: i32, site: i32) -> i32 {
+    if rc != 0 {
+        (*d).err_site = site
+    }
+    return rc
+}
+
+fn decode_nal(d: *mut params.H264, p: u64, n: usize) -> i32 {
+    if n < 2 {
+        return 0
+    }
+    let h: i32 = raw.ldu8(p, 0)
+    if (h & 0x80) != 0 {
+        (*d).err_site = 9
+        return 2
+    }
+    let ref_idc: i32 = (h >> 5) & 3
+    let ty: i32 = h & 31
+    if ty == 1 || ty == 5 || ty == 7 || ty == 8 {
+        let m: usize = unescape(d, p + 1, n - 1)
+        (*d).br.buf = (*d).rbsp
+        (*d).br.pos = 0
+        (*d).br.end = (m * 8) as i32
+        if ty == 7 {
+            return ps_note(d, params.parse_sps(d, &(*d).br), 11)
+        }
+        if ty == 8 {
+            return ps_note(d, params.parse_pps(d, &(*d).br), 12)
+        }
+        return slice.decode_slice(d, ty, ref_idc)
+    }
+    if ty == 2 || ty == 3 || ty == 4 {
+        return 1
+    }
+    return 0
+}
+
+fn find_start(p: u64, n: usize, from: usize) -> usize {
+    var i: usize = from
+    while i + 3 <= n {
+        if raw.ldu8(p, i) == 0 && raw.ldu8(p, i + 1) == 0 && raw.ldu8(p, i + 2) == 1 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn h264_decode(d: *mut params.H264, p: u64, n: usize) -> i32 {
+    release_pins(d)
+    var first_err: i32 = 0
+    if (*d).nal_len > 0 {
+        var pos: usize = 0
+        let ll: usize = (*d).nal_len as usize
+        while pos + ll <= n {
+            var len: usize = 0
+            var k: usize = 0
+            while k < ll {
+                len = (len << 8) | (raw.ldu8(p, pos + k) as usize)
+                k = k + 1
+            }
+            pos = pos + ll
+            if len == 0 || pos + len > n {
+                if first_err == 0 {
+                    first_err = 2
+                    (*d).err_site = 10
+                }
+                pos = n
+            } else {
+                let rc: i32 = decode_nal(d, p + pos as u64, len)
+                if rc != 0 && first_err == 0 {
+                    first_err = rc
+                }
+                pos = pos + len
+            }
+        }
+    } else {
+        var s: usize = find_start(p, n, 0)
+        while s < n {
+            let body: usize = s + 3
+            var e: usize = find_start(p, n, body)
+            var end: usize = e
+            while end > body && raw.ldu8(p, end - 1) == 0 {
+                end = end - 1
+            }
+            if end > body {
+                let rc: i32 = decode_nal(d, p + body as u64, end - body)
+                if rc != 0 && first_err == 0 {
+                    first_err = rc
+                }
+            }
+            s = e
+        }
+    }
+    if (*d).hold == 0 {
+        picture.finish_picture(d)
+    }
+    return first_err
+}
+
+fn h264_set_hold(d: *mut params.H264, v: i32) {
+    (*d).hold = v
+}
+
+fn h264_set_parse_only(d: *mut params.H264, v: i32) {
+    (*d).parse_only = v
+}
+
+fn h264_parse_only(d: *mut params.H264) -> i32 {
+    return (*d).parse_only
+}
+
+fn h264_err_site(d: *mut params.H264) -> i32 {
+    return (*d).err_site
+}
+
+fn h264_waiting_idr(d: *mut params.H264) -> i32 {
+    return (*d).need_idr
+}
+
+fn h264_extend_pic(d: *mut params.H264, i: i32) {
+    if i >= 0 && i < 18 && (*d).dpb[i as usize].y != 0 as u64 {
+        picture.extend_edges(d, i as usize)
+    }
+}
+
+fn h264_config_avcc(d: *mut params.H264, p: u64, n: usize) -> i32 {
+    if n < 7 || raw.ldu8(p, 0) != 1 {
+        return 2
+    }
+    (*d).nal_len = (raw.ldu8(p, 4) & 3) + 1
+    var pos: usize = 5
+    let ns: i32 = raw.ldu8(p, pos) & 31
+    pos = pos + 1
+    var rc0: i32 = 0
+    var i: i32 = 0
+    while i < ns {
+        if pos + 2 > n {
+            return 2
+        }
+        let l: usize = ((raw.ldu8(p, pos) << 8) | raw.ldu8(p, pos + 1)) as usize
+        pos = pos + 2
+        if pos + l > n {
+            return 2
+        }
+        let rc: i32 = decode_nal(d, p + pos as u64, l)
+        if rc != 0 && rc0 == 0 {
+            rc0 = rc
+        }
+        pos = pos + l
+        i = i + 1
+    }
+    if pos >= n {
+        return rc0
+    }
+    let np: i32 = raw.ldu8(p, pos)
+    pos = pos + 1
+    i = 0
+    while i < np {
+        if pos + 2 > n {
+            return 2
+        }
+        let l2: usize = ((raw.ldu8(p, pos) << 8) | raw.ldu8(p, pos + 1)) as usize
+        pos = pos + 2
+        if pos + l2 > n {
+            return 2
+        }
+        let rc2: i32 = decode_nal(d, p + pos as u64, l2)
+        if rc2 != 0 && rc0 == 0 {
+            rc0 = rc2
+        }
+        pos = pos + l2
+        i = i + 1
+    }
+    return rc0
+}
+
+fn release_pins(d: *mut params.H264) {
+    var k: i32 = 0
+    while k < 18 {
+        (*d).dpb[k as usize].pin = 0
+        k = k + 1
+    }
+    var q: i32 = 0
+    while q < (*d).out_n {
+        (*d).dpb[(*d).out_q[q as usize] as usize].pin = 1
+        q = q + 1
+    }
+}
+
+fn h264_flush(d: *mut params.H264) {
+    picture.finish_picture(d)
+    marking.flush_output(d)
+}
+
+fn h264_reset(d: *mut params.H264) {
+    (*d).have_pic = 0
+    (*d).cur = -1
+    var i: usize = 0
+    while i < 18 {
+        (*d).dpb[i].ref_mark = 0
+        (*d).dpb[i].needs_output = 0
+        (*d).dpb[i].pin = 0
+        i = i + 1
+    }
+    (*d).out_n = 0
+    (*d).need_idr = 1
+    (*d).prev_poc_msb = 0
+    (*d).prev_poc_lsb = 0
+    (*d).prev_fn_offset = 0
+    (*d).prev_frame_num = 0
+    (*d).prev_ref_frame_num = 0
+}
+
+fn h264_output(d: *mut params.H264, f: *mut types.Frame) -> i32 {
+    if (*d).out_n == 0 {
+        return 0
+    }
+    let i: i32 = (*d).out_q[0]
+    var k: i32 = 1
+    while k < (*d).out_n {
+        (*d).out_q[(k - 1) as usize] = (*d).out_q[k as usize]
+        k = k + 1
+    }
+    (*d).out_n = (*d).out_n - 1
+    let p: *mut types.Pic = &(*d).dpb[i as usize]
+    let sy: i32 = (*d).stride_y
+    let sc: i32 = (*d).stride_c
+    (*f).y = (*p).y + ((*d).crop_t * sy + (*d).crop_l) as u64
+    (*f).u = (*p).u + (((*d).crop_t / 2) * sc + (*d).crop_l / 2) as u64
+    (*f).v = (*p).v + (((*d).crop_t / 2) * sc + (*d).crop_l / 2) as u64
+    (*f).w = (*d).width
+    (*f).h = (*d).height
+    (*f).stride_y = sy
+    (*f).stride_c = sc
+    (*f).poc = (*p).poc
+    (*d).out_pts = (*p).upts
+    (*p).pin = 1
+    (*d).frames_out = (*d).frames_out + 1
+    return 1
+}
+
+fn h264_usable(d: *mut params.H264) -> i32 {
+    var i: usize = 0
+    while i < 8 {
+        if (*d).sps[i].valid != 0 && (*d).sps[i].unsupported == 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn h264_set_in_pts(d: *mut params.H264, v: i64) {
+    (*d).in_pts = v
+}
+
+fn h264_out_pts(d: *mut params.H264) -> i64 {
+    return (*d).out_pts
+}
+
+fn h264_take_dropped(d: *mut params.H264) -> i32 {
+    let n: i32 = (*d).out_drop
+    (*d).out_drop = 0
+    return n
+}
+
+fn h264_pending(d: *mut params.H264) -> i32 {
+    var n: i32 = (*d).out_n
+    var i: usize = 0
+    while i < 18 {
+        if (*d).dpb[i].needs_output != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}

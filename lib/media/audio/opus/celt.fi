@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.opus
+import media.audio.opus.celt_tables
+
+export { celt_get_pulses, celt_bits2pulses, celt_pulses2bits, celt_compute_allocation, celt_laplace_decode, celt_unquant_coarse, celt_unquant_fine, celt_unquant_finalise, celt_decode_pulses, CELT_NBANDS }
+
+const CELT_NBANDS: i32 = 21
+const CELT_MAX_FINE_BITS: i32 = 8
+
+fn ld_i16(p: u64, i: i32) -> i32 {
+    return (*((p +% (i as% u64) *% 2) as *mut i16)) as% i32
+}
+
+fn st_i16(p: u64, i: i32, v: i32) {
+    *((p +% (i as% u64) *% 2) as *mut i16) = v as% i16
+}
+
+fn ld_i32(p: u64, i: i32) -> i32 {
+    return *((p +% (i as% u64) *% 4) as *mut i32)
+}
+
+fn ld_u32(p: u64, i: u32) -> u32 {
+    return *((p +% (i as% u64) *% 4) as *mut u32)
+}
+
+fn st_u32(p: u64, i: u32, v: u32) {
+    *((p +% (i as% u64) *% 4) as *mut u32) = v
+}
+
+fn pshr(a: i32, s: i32) -> i32 {
+    return (a + (1 << (s - 1))) >> s
+}
+
+fn laplace_freq1(fs0: u32, decay: i32) -> u32 {
+    let ft: u32 = 32768 - 32 - fs0
+    return (ft *% ((16384 - decay) as% u32)) >> 15
+}
+
+fn celt_laplace_decode(e: *mut opus.Ec, fs0: u32, decay: i32) -> i32 {
+    var fs: u32 = fs0
+    var val: i32 = 0
+    let fm: u32 = opus.ec_decode_bin(e, 15)
+    var fl: u32 = 0
+    if fm >= fs {
+        val = 1
+        fl = fs
+        fs = laplace_freq1(fs, decay) + 1
+        while fs > 1 && fm >= fl + 2 * fs {
+            fs = fs * 2
+            fl = fl + fs
+            fs = (((fs - 2) *% (decay as% u32)) >> 15) + 1
+            val = val + 1
+        }
+        if fs <= 1 {
+            let di: u32 = (fm - fl) >> 1
+            val = val + (di as% i32)
+            fl = fl + 2 * di
+        }
+        if fm < fl + fs {
+            val = 0 - val
+        } else {
+            fl = fl + fs
+        }
+    }
+    var hi: u32 = fl + fs
+    if hi > 32768 {
+        hi = 32768
+    }
+    opus.ec_update(e, fl, hi, 32768)
+    return val
+}
+
+fn celt_unquant_coarse(e: *mut opus.Ec, start: i32, end: i32, old: u64, intra: i32, C: i32, LM: i32) {
+    var coef: i32 = 0
+    var beta: i32 = 4915
+    if intra == 0 {
+
+        if LM == 0 { coef = 29440; beta = 30147 }
+        if LM == 1 { coef = 26112; beta = 22282 }
+        if LM == 2 { coef = 21248; beta = 12124 }
+        if LM == 3 { coef = 16384; beta = 6554 }
+    }
+    let pm: usize = ((LM * 2 + intra) * 42) as% usize
+    let budget: i32 = (*e).storage * 8
+    var prev: [i32; 2] = [0, 0]
+    var i: i32 = start
+    while i < end {
+        var c: i32 = 0
+        while c < C {
+            var qi: i32 = 0
+            let tell: i32 = opus.ec_tell(e)
+            if budget - tell >= 15 {
+                var pi: i32 = i
+                if pi > 20 { pi = 20 }
+                pi = pi * 2
+                let p0: u32 = celt_tables.celt_prob(pm + (pi as% usize)) as% u32
+                let p1: u32 = celt_tables.celt_prob(pm + (pi as% usize) + 1) as% u32
+                qi = celt_laplace_decode(e, p0 << 7, (p1 << 6) as% i32)
+            } else if budget - tell >= 2 {
+                let small: [u8; 3] = [2, 1, 0]
+                qi = opus.ec_icdf(e, (&small[0]) as u64, 2)
+                qi = (qi >> 1) ^ (0 - (qi & 1))
+            } else if budget - tell >= 1 {
+                qi = 0 - opus.ec_bit_logp(e, 1)
+            } else {
+                qi = 0 - 1
+            }
+            let q: i32 = qi << 10
+            var o: i32 = ld_i16(old, i + c * CELT_NBANDS)
+            if o < 0 - 9216 { o = 0 - 9216 }
+            var tmp: i32 = pshr(coef * o, 8) + prev[c as% usize] + (q << 7)
+            if tmp < 0 - 3670016 { tmp = 0 - 3670016 }
+            st_i16(old, i + c * CELT_NBANDS, pshr(tmp, 7))
+            prev[c as% usize] = prev[c as% usize] + (q << 7) - beta * pshr(q, 8)
+            c = c + 1
+        }
+        i = i + 1
+    }
+}
+
+fn celt_unquant_fine(e: *mut opus.Ec, start: i32, end: i32, old: u64, fine_quant: u64, C: i32) {
+    var i: i32 = start
+    while i < end {
+        let fq: i32 = ld_i32(fine_quant, i)
+        if fq > 0 {
+            var c: i32 = 0
+            while c < C {
+                let q2: i32 = opus.ec_bits(e, fq) as% i32
+                let off: i32 = ((((q2 << 10) + 512) >> fq)) - 512
+                st_i16(old, i + c * CELT_NBANDS, ld_i16(old, i + c * CELT_NBANDS) + off)
+                c = c + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn celt_unquant_finalise(e: *mut opus.Ec, start: i32, end: i32, old: u64, fine_quant: u64, fine_priority: u64, bits_left0: i32, C: i32) {
+    var bits_left: i32 = bits_left0
+    var prio: i32 = 0
+    while prio < 2 {
+        var i: i32 = start
+        while i < end && bits_left >= C {
+            let fq: i32 = ld_i32(fine_quant, i)
+            if fq < CELT_MAX_FINE_BITS && ld_i32(fine_priority, i) == prio {
+                var c: i32 = 0
+                while c < C {
+                    let q2: i32 = opus.ec_bits(e, 1) as% i32
+                    let off: i32 = ((q2 << 10) - 512) >> (fq + 1)
+                    st_i16(old, i + c * CELT_NBANDS, ld_i16(old, i + c * CELT_NBANDS) + off)
+                    bits_left = bits_left - 1
+                    c = c + 1
+                }
+            }
+            i = i + 1
+        }
+        prio = prio + 1
+    }
+}
+
+fn unext(ui: u64, len: u32, ui0_in: u32) {
+    var ui0: u32 = ui0_in
+    var j: u32 = 1
+    while j < len {
+        let ui1: u32 = ld_u32(ui, j) +% ld_u32(ui, j - 1) +% ui0
+        st_u32(ui, j - 1, ui0)
+        ui0 = ui1
+        j = j + 1
+    }
+    st_u32(ui, j - 1, ui0)
+}
+
+fn uprev(ui: u64, n: u32, ui0_in: u32) {
+    var ui0: u32 = ui0_in
+    var j: u32 = 1
+    while j < n {
+        let ui1: u32 = ld_u32(ui, j) -% ld_u32(ui, j - 1) -% ui0
+        st_u32(ui, j - 1, ui0)
+        ui0 = ui1
+        j = j + 1
+    }
+    st_u32(ui, j - 1, ui0)
+}
+
+fn ncwrs_urow(n: u32, k: u32, u: u64) -> u32 {
+    let len: u32 = k + 2
+    st_u32(u, 0, 0)
+    st_u32(u, 1, 1)
+    var kk: u32 = 2
+    while kk < len {
+        st_u32(u, kk, (kk << 1) - 1)
+        kk = kk + 1
+    }
+    kk = 2
+    while kk < n {
+        unext(u + 4, k + 1, 1)
+        kk = kk + 1
+    }
+    return ld_u32(u, k) +% ld_u32(u, k + 1)
+}
+
+fn cwrsi(n: i32, k0: i32, i0: u32, y: u64, u: u64) -> i32 {
+    var k: u32 = k0 as% u32
+    var idx: u32 = i0
+    var yy: i32 = 0
+    var j: i32 = 0
+    while j < n {
+        var p: u32 = ld_u32(u, k + 1)
+        var s: i32 = 0
+        if idx >= p { s = 0 - 1 }
+        if idx >= p { idx = idx - p }
+        var yj: i32 = k as% i32
+        p = ld_u32(u, k)
+        while p > idx {
+            k = k - 1
+            p = ld_u32(u, k)
+        }
+        idx = idx - p
+        yj = yj - (k as% i32)
+        var val: i32 = (yj + s) ^ s
+        *((y +% (j as% u64) *% 4) as *mut i32) = val
+        yy = yy + val * val
+        uprev(u, k + 2, 0)
+        j = j + 1
+    }
+    return yy
+}
+
+fn celt_decode_pulses(e: *mut opus.Ec, y: u64, n: i32, k: i32) -> i32 {
+    var u: [u32; 160] = [0; 160]
+    let nc: u32 = ncwrs_urow(n as% u32, k as% u32, (&u[0]) as u64)
+    let idx: u32 = opus.ec_uint(e, nc)
+    return cwrsi(n, k, idx, y, (&u[0]) as u64)
+}
+
+const CELT_BITRES: i32 = 3
+const CELT_ALLOC_STEPS: i32 = 6
+
+fn st_i32(p: u64, i: i32, v: i32) {
+    *((p +% (i as% u64) *% 4) as *mut i32) = v
+}
+
+fn eb(i: i32) -> i32 {
+    return celt_tables.celt_ebands(i as% usize) as% i32
+}
+
+fn imin(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+fn imax(a: i32, b: i32) -> i32 {
+    if a > b { return a }
+    return b
+}
+
+fn celt_get_pulses(i: i32) -> i32 {
+    if i < 8 { return i }
+    return (8 + (i & 7)) << ((i >> 3) - 1)
+}
+
+fn cache_at(band: i32, LM: i32) -> usize {
+    return celt_tables.celt_cindex(((LM + 1) * CELT_NBANDS + band) as% usize) as% usize
+}
+
+fn celt_bits2pulses(band: i32, LM: i32, bits0: i32) -> i32 {
+    let base: usize = cache_at(band, LM)
+    var lo: i32 = 0
+    var hi: i32 = celt_tables.celt_cbits(base) as% i32
+    let bits: i32 = bits0 - 1
+    var i: i32 = 0
+    while i < 6 {
+        let mid: i32 = (lo + hi + 1) >> 1
+        if (celt_tables.celt_cbits(base + (mid as% usize)) as% i32) >= bits {
+            hi = mid
+        } else {
+            lo = mid
+        }
+        i = i + 1
+    }
+    var cl: i32 = 0 - 1
+    if lo != 0 { cl = celt_tables.celt_cbits(base + (lo as% usize)) as% i32 }
+    if bits - cl <= (celt_tables.celt_cbits(base + (hi as% usize)) as% i32) - bits {
+        return lo
+    }
+    return hi
+}
+
+fn celt_pulses2bits(band: i32, LM: i32, pulses: i32) -> i32 {
+    if pulses == 0 { return 0 }
+    return (celt_tables.celt_cbits(cache_at(band, LM) + (pulses as% usize)) as% i32) + 1
+}
+
+fn log2_frac_table(i: i32) -> i32 {
+    let t: [u8; 24] = [0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37]
+    return t[i as% usize] as% i32
+}
+
+fn celt_compute_allocation(e: *mut opus.Ec, start: i32, end: i32, offsets: u64, cap: u64, alloc_trim: i32, intensity: *mut i32,
+        dual_stereo: *mut i32, total0: i32, balance_out: *mut i32, pulses: u64, ebits: u64, fine_priority: u64, C: i32, LM: i32) -> i32 {
+    var total: i32 = imax(total0, 0)
+    var skip_start: i32 = start
+    var skip_rsv: i32 = 0
+    if total >= (1 << CELT_BITRES) { skip_rsv = 1 << CELT_BITRES }
+    total = total - skip_rsv
+    var intensity_rsv: i32 = 0
+    var dual_stereo_rsv: i32 = 0
+    if C == 2 {
+        intensity_rsv = log2_frac_table(end - start)
+        if intensity_rsv > total {
+            intensity_rsv = 0
+        } else {
+            total = total - intensity_rsv
+            if total >= (1 << CELT_BITRES) { dual_stereo_rsv = 1 << CELT_BITRES }
+            total = total - dual_stereo_rsv
+        }
+    }
+    var bits1: [i32; 21] = [0; 21]
+    var bits2: [i32; 21] = [0; 21]
+    var thresh: [i32; 21] = [0; 21]
+    var trim_offset: [i32; 21] = [0; 21]
+    var j: i32 = start
+    while j < end {
+        let w: i32 = eb(j + 1) - eb(j)
+        thresh[j as% usize] = imax(C << CELT_BITRES, (((3 * w) << LM) << CELT_BITRES) >> 4)
+        trim_offset[j as% usize] = (C * w * (alloc_trim - 5 - LM) * (end - j - 1) * (1 << (LM + CELT_BITRES))) >> 6
+        if (w << LM) == 1 {
+            trim_offset[j as% usize] = trim_offset[j as% usize] - (C << CELT_BITRES)
+        }
+        j = j + 1
+    }
+    var lo: i32 = 1
+    var hi: i32 = 10
+    while lo <= hi {
+        var done: i32 = 0
+        var psum: i32 = 0
+        let mid: i32 = (lo + hi) >> 1
+        j = end
+        while j > start {
+            j = j - 1
+            let n: i32 = eb(j + 1) - eb(j)
+            var bitsj: i32 = (((C * n) * (celt_tables.celt_alloc((mid * CELT_NBANDS + j) as% usize) as% i32)) << LM) >> 2
+            if bitsj > 0 { bitsj = imax(0, bitsj + trim_offset[j as% usize]) }
+            bitsj = bitsj + ld_i32(offsets, j)
+            if bitsj >= thresh[j as% usize] || done != 0 {
+                done = 1
+                psum = psum + imin(bitsj, ld_i32(cap, j))
+            } else if bitsj >= (C << CELT_BITRES) {
+                psum = psum + (C << CELT_BITRES)
+            }
+        }
+        if psum > total {
+            hi = mid - 1
+        } else {
+            lo = mid + 1
+        }
+    }
+    hi = lo
+    lo = lo - 1
+    j = start
+    while j < end {
+        let n: i32 = eb(j + 1) - eb(j)
+        var bits1j: i32 = (((C * n) * (celt_tables.celt_alloc((lo * CELT_NBANDS + j) as% usize) as% i32)) << LM) >> 2
+        var bits2j: i32 = 0
+        if hi >= 11 {
+            bits2j = ld_i32(cap, j)
+        } else {
+            bits2j = (((C * n) * (celt_tables.celt_alloc((hi * CELT_NBANDS + j) as% usize) as% i32)) << LM) >> 2
+        }
+        if bits1j > 0 { bits1j = imax(0, bits1j + trim_offset[j as% usize]) }
+        if bits2j > 0 { bits2j = imax(0, bits2j + trim_offset[j as% usize]) }
+        if lo > 0 { bits1j = bits1j + ld_i32(offsets, j) }
+        bits2j = bits2j + ld_i32(offsets, j)
+        if ld_i32(offsets, j) > 0 { skip_start = j }
+        bits2j = imax(0, bits2j - bits1j)
+        bits1[j as% usize] = bits1j
+        bits2[j as% usize] = bits2j
+        j = j + 1
+    }
+
+    let alloc_floor: i32 = C << CELT_BITRES
+    let stereo: i32 = C - 1
+    let logM: i32 = LM << CELT_BITRES
+    var psum: i32 = 0
+    var done: i32 = 0
+    lo = 0
+    hi = 1 << CELT_ALLOC_STEPS
+    var it: i32 = 0
+    while it < CELT_ALLOC_STEPS {
+        let mid: i32 = (lo + hi) >> 1
+        psum = 0
+        done = 0
+        j = end
+        while j > start {
+            j = j - 1
+            let tmp: i32 = bits1[j as% usize] + ((mid * bits2[j as% usize]) >> CELT_ALLOC_STEPS)
+            if tmp >= thresh[j as% usize] || done != 0 {
+                done = 1
+                psum = psum + imin(tmp, ld_i32(cap, j))
+            } else if tmp >= alloc_floor {
+                psum = psum + alloc_floor
+            }
+        }
+        if psum > total {
+            hi = mid
+        } else {
+            lo = mid
+        }
+        it = it + 1
+    }
+    psum = 0
+    done = 0
+    j = end
+    while j > start {
+        j = j - 1
+        var tmp: i32 = bits1[j as% usize] + ((lo * bits2[j as% usize]) >> CELT_ALLOC_STEPS)
+        if tmp < thresh[j as% usize] && done == 0 {
+            if tmp >= alloc_floor {
+                tmp = alloc_floor
+            } else {
+                tmp = 0
+            }
+        } else {
+            done = 1
+        }
+        tmp = imin(tmp, ld_i32(cap, j))
+        st_i32(pulses, j, tmp)
+        psum = psum + tmp
+    }
+    var coded: i32 = end
+    var go: i32 = 1
+    while go != 0 {
+        j = coded - 1
+        if j <= skip_start {
+            total = total + skip_rsv
+            go = 0
+        } else {
+            var left: i32 = total - psum
+            let span: i32 = eb(coded) - eb(start)
+            let percoeff: i32 = left / span
+            left = left - span * percoeff
+            let rem: i32 = imax(left - (eb(j) - eb(start)), 0)
+            let band_width: i32 = eb(coded) - eb(j)
+            var band_bits: i32 = ld_i32(pulses, j) + percoeff * band_width + rem
+            var stop: i32 = 0
+            if band_bits >= imax(thresh[j as% usize], alloc_floor + (1 << CELT_BITRES)) {
+                if opus.ec_bit_logp(e, 1) != 0 {
+                    stop = 1
+                } else {
+                    psum = psum + (1 << CELT_BITRES)
+                    band_bits = band_bits - (1 << CELT_BITRES)
+                }
+            }
+            if stop != 0 {
+                go = 0
+            } else {
+                psum = psum - (ld_i32(pulses, j) + intensity_rsv)
+                if intensity_rsv > 0 { intensity_rsv = log2_frac_table(j - start) }
+                psum = psum + intensity_rsv
+                if band_bits >= alloc_floor {
+                    psum = psum + alloc_floor
+                    st_i32(pulses, j, alloc_floor)
+                } else {
+                    st_i32(pulses, j, 0)
+                }
+                coded = coded - 1
+            }
+        }
+    }
+    if intensity_rsv > 0 {
+        *intensity = start + (opus.ec_uint(e, (coded + 1 - start) as% u32) as% i32)
+    } else {
+        *intensity = 0
+    }
+    if *intensity <= start {
+        total = total + dual_stereo_rsv
+        dual_stereo_rsv = 0
+    }
+    if dual_stereo_rsv > 0 {
+        *dual_stereo = opus.ec_bit_logp(e, 1)
+    } else {
+        *dual_stereo = 0
+    }
+    var left2: i32 = total - psum
+    let span2: i32 = eb(coded) - eb(start)
+    let percoeff2: i32 = left2 / span2
+    left2 = left2 - span2 * percoeff2
+    j = start
+    while j < coded {
+        st_i32(pulses, j, ld_i32(pulses, j) + percoeff2 * (eb(j + 1) - eb(j)))
+        j = j + 1
+    }
+    j = start
+    while j < coded {
+        let t: i32 = imin(left2, eb(j + 1) - eb(j))
+        st_i32(pulses, j, ld_i32(pulses, j) + t)
+        left2 = left2 - t
+        j = j + 1
+    }
+    var balance: i32 = 0
+    j = start
+    while j < coded {
+        let n0: i32 = eb(j + 1) - eb(j)
+        let n: i32 = n0 << LM
+        let bit: i32 = ld_i32(pulses, j) + balance
+        var excess: i32 = 0
+        if n > 1 {
+            excess = imax(bit - ld_i32(cap, j), 0)
+            st_i32(pulses, j, bit - excess)
+            var den: i32 = C * n
+            if C == 2 && n > 2 && *dual_stereo == 0 && j < *intensity { den = den + 1 }
+            let nclogn: i32 = den * ((celt_tables.celt_logn(j as% usize) as% i32) + logM)
+            var offset: i32 = (nclogn >> 1) - den * 21
+            if n == 2 { offset = offset + ((den << CELT_BITRES) >> 2) }
+            if ld_i32(pulses, j) + offset < ((den * 2) << CELT_BITRES) {
+                offset = offset + (nclogn >> 2)
+            } else if ld_i32(pulses, j) + offset < ((den * 3) << CELT_BITRES) {
+                offset = offset + (nclogn >> 3)
+            }
+            var eb_j: i32 = imax(0, ld_i32(pulses, j) + offset + (den << (CELT_BITRES - 1)))
+            eb_j = (eb_j / den) >> CELT_BITRES
+            if C * eb_j > (ld_i32(pulses, j) >> CELT_BITRES) {
+                eb_j = (ld_i32(pulses, j) >> stereo) >> CELT_BITRES
+            }
+            eb_j = imin(eb_j, CELT_MAX_FINE_BITS)
+            st_i32(ebits, j, eb_j)
+            var fpri: i32 = 0
+            if eb_j * (den << CELT_BITRES) >= ld_i32(pulses, j) + offset { fpri = 1 }
+            st_i32(fine_priority, j, fpri)
+            st_i32(pulses, j, ld_i32(pulses, j) - ((C * eb_j) << CELT_BITRES))
+        } else {
+            excess = imax(0, bit - (C << CELT_BITRES))
+            st_i32(pulses, j, bit - excess)
+            st_i32(ebits, j, 0)
+            st_i32(fine_priority, j, 1)
+        }
+        if excess > 0 {
+            let extra_fine: i32 = imin(excess >> (stereo + CELT_BITRES), CELT_MAX_FINE_BITS - ld_i32(ebits, j))
+            st_i32(ebits, j, ld_i32(ebits, j) + extra_fine)
+            let extra_bits: i32 = (extra_fine * C) << CELT_BITRES
+            var fp2: i32 = 0
+            if extra_bits >= excess - balance { fp2 = 1 }
+            st_i32(fine_priority, j, fp2)
+            excess = excess - extra_bits
+        }
+        balance = excess
+        j = j + 1
+    }
+    *balance_out = balance
+    while j < end {
+        st_i32(ebits, j, (ld_i32(pulses, j) >> stereo) >> CELT_BITRES)
+        st_i32(pulses, j, 0)
+        var fp3: i32 = 0
+        if ld_i32(ebits, j) < 1 { fp3 = 1 }
+        st_i32(fine_priority, j, fp3)
+        j = j + 1
+    }
+    return coded
+}

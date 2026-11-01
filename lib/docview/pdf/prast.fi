@@ -1,0 +1,606 @@
+// SPDX-License-Identifier: MPL-2.0
+// path filling with the nonzero and even-odd rules, stroking and clip masks for PDF rendering.
+import html.mem
+import paint.canvas
+import font.raster
+
+export {
+    PRast, Mask,
+    pr_new, pr_init, pr_free, pr_reset,
+    pr_move, pr_line, pr_cubic, pr_close, pr_edges,
+    pr_fill, pr_fill_mask, pr_stroke,
+    pr_blend_raster,
+    mask_new, mask_free, mask_at, mask_all,
+    RULE_NZ, RULE_EO,
+}
+
+const RULE_NZ: u32 = 0
+const RULE_EO: u32 = 1
+const SUB: usize = 4
+const MAX_EDGES: usize = 200000
+const WORK_BUDGET: usize = 2000000
+
+struct Mask {
+    p: *mut u8,
+    w: usize,
+    h: usize,
+}
+
+struct PRast {
+    e: *mut f64,
+    dir: *mut i8,
+    ne: usize,
+    ecap: usize,
+    sx: f64,
+    sy: f64,
+    cx: f64,
+    cy: f64,
+    started: bool,
+    cov: *mut f64,
+    w: usize,
+    h: usize,
+    xs: *mut f64,
+    ds: *mut i8,
+    xcap: usize,
+    miny: f64,
+    maxy: f64,
+    minx: f64,
+    maxx: f64,
+    ok: usize,
+}
+
+#[no_gc]
+fn fill_bytes(p: *mut u8, v: u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((p as u64 + i as u64) as *mut u8) = v
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn ldf(p: u64, i: usize) -> f64 {
+    return *((p + (i * 8) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i * 8) as u64) as *mut f64) = v
+}
+
+#[no_gc]
+fn pr_new() -> PRast {
+    return PRast { e: 0 as *mut f64, dir: 0 as *mut i8, ne: 0, ecap: 0,
+        sx: 0.0, sy: 0.0, cx: 0.0, cy: 0.0, started: false,
+        cov: 0 as *mut f64, w: 0, h: 0,
+        xs: 0 as *mut f64, ds: 0 as *mut i8, xcap: 0,
+        miny: 0.0, maxy: 0.0, minx: 0.0, maxx: 0.0, ok: 0 }
+}
+
+#[no_gc]
+fn pr_init(r: *mut PRast, w: usize, h: usize) -> bool {
+    (*r).w = w
+    (*r).h = h
+    (*r).ecap = 4096
+    (*r).e = mem.heap_alloc((*r).ecap * 32) as *mut f64
+    (*r).dir = mem.heap_alloc((*r).ecap) as *mut i8
+    (*r).cov = mem.heap_alloc((w + 2) * 8) as *mut f64
+    (*r).xcap = 1024
+    (*r).xs = mem.heap_alloc((*r).xcap * 8) as *mut f64
+    (*r).ds = mem.heap_alloc((*r).xcap) as *mut i8
+    if (*r).e as usize == 0 || (*r).cov as usize == 0 ||
+    (*r).xs as usize == 0 || (*r).dir as usize == 0 ||
+    (*r).ds as usize == 0 {
+        return false
+    }
+    (*r).ok = 1
+    pr_reset(r)
+    return true
+}
+
+#[no_gc]
+fn pr_free(r: *mut PRast) {
+    mem.heap_free((*r).e as *mut u8, (*r).ecap * 32)
+    mem.heap_free((*r).dir as *mut u8, (*r).ecap)
+    mem.heap_free((*r).cov as *mut u8, ((*r).w + 2) * 8)
+    mem.heap_free((*r).xs as *mut u8, (*r).xcap * 8)
+    mem.heap_free((*r).ds as *mut u8, (*r).xcap)
+    (*r).ok = 0
+    (*r).ecap = 0
+    (*r).xcap = 0
+}
+
+#[no_gc]
+fn pr_reset(r: *mut PRast) {
+    (*r).ne = 0
+    (*r).started = false
+    (*r).miny = 1.0e30
+    (*r).maxy = 0.0 - 1.0e30
+    (*r).minx = 1.0e30
+    (*r).maxx = 0.0 - 1.0e30
+}
+
+#[no_gc]
+fn pr_edges(r: *mut PRast) -> usize {
+    return (*r).ne
+}
+
+#[no_gc]
+fn grow_edges(r: *mut PRast) -> bool {
+    if (*r).ne < (*r).ecap {
+        return true
+    }
+    if (*r).ecap >= MAX_EDGES {
+        return false
+    }
+    let nc: usize = (*r).ecap * 2
+    let ne: *mut u8 = mem.heap_alloc(nc * 32)
+    let nd: *mut u8 = mem.heap_alloc(nc)
+    if ne as usize == 0 || nd as usize == 0 {
+        return false
+    }
+    mem.mem_copy(ne, (*r).e as *mut u8, (*r).ne * 32)
+    mem.mem_copy(nd, (*r).dir as *mut u8, (*r).ne)
+    mem.heap_free((*r).e as *mut u8, (*r).ecap * 32)
+    mem.heap_free((*r).dir as *mut u8, (*r).ecap)
+    (*r).e = ne as *mut f64
+    (*r).dir = nd as *mut i8
+    (*r).ecap = nc
+    return true
+}
+
+#[no_gc]
+fn add_edge(r: *mut PRast, x0: f64, y0: f64, x1: f64, y1: f64) {
+    if x0 != x0 || y0 != y0 || x1 != x1 || y1 != y1 {
+        return
+    }
+    if !grow_edges(r) {
+        return
+    }
+    let i: usize = (*r).ne
+    let base: u64 = (*r).e as u64 + (i * 32) as u64
+    if y0 < y1 {
+        stf(base, 0, x0)
+        stf(base, 1, y0)
+        stf(base, 2, x1)
+        stf(base, 3, y1)
+        *(((*r).dir as u64 + i as u64) as *mut i8) = 1 as i8
+    } else {
+        stf(base, 0, x1)
+        stf(base, 1, y1)
+        stf(base, 2, x0)
+        stf(base, 3, y0)
+        *(((*r).dir as u64 + i as u64) as *mut i8) = -1 as i8
+    }
+    (*r).ne = i + 1
+    if y0 < (*r).miny {
+        (*r).miny = y0
+    }
+    if y1 < (*r).miny {
+        (*r).miny = y1
+    }
+    if y0 > (*r).maxy {
+        (*r).maxy = y0
+    }
+    if y1 > (*r).maxy {
+        (*r).maxy = y1
+    }
+    if x0 < (*r).minx {
+        (*r).minx = x0
+    }
+    if x1 < (*r).minx {
+        (*r).minx = x1
+    }
+    if x0 > (*r).maxx {
+        (*r).maxx = x0
+    }
+    if x1 > (*r).maxx {
+        (*r).maxx = x1
+    }
+}
+
+#[no_gc]
+fn pr_move(r: *mut PRast, x: f64, y: f64) {
+    if (*r).started {
+        add_edge(r, (*r).cx, (*r).cy, (*r).sx, (*r).sy)
+    }
+    (*r).sx = x
+    (*r).sy = y
+    (*r).cx = x
+    (*r).cy = y
+    (*r).started = true
+}
+
+#[no_gc]
+fn pr_line(r: *mut PRast, x: f64, y: f64) {
+    if !(*r).started {
+        pr_move(r, x, y)
+        return
+    }
+    add_edge(r, (*r).cx, (*r).cy, x, y)
+    (*r).cx = x
+    (*r).cy = y
+}
+
+#[no_gc]
+fn pr_cubic(r: *mut PRast, x1: f64, y1: f64, x2: f64, y2: f64,
+    x3: f64, y3: f64) {
+    let x0: f64 = (*r).cx
+    let y0: f64 = (*r).cy
+    var d: f64 = fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) +
+    fabs(y2 - y1) + fabs(x3 - x2) + fabs(y3 - y2)
+    var n: usize = (d / 3.0) as usize + 2
+    if n > 96 {
+        n = 96
+    }
+    var i: usize = 1
+    while i <= n {
+        let t: f64 = (i as f64) / (n as f64)
+        let mt: f64 = 1.0 - t
+        let a: f64 = mt * mt * mt
+        let b: f64 = 3.0 * mt * mt * t
+        let c: f64 = 3.0 * mt * t * t
+        let e: f64 = t * t * t
+        pr_line(r, a * x0 + b * x1 + c * x2 + e * x3,
+            a * y0 + b * y1 + c * y2 + e * y3)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+#[no_gc]
+fn pr_close(r: *mut PRast) {
+    if (*r).started {
+        add_edge(r, (*r).cx, (*r).cy, (*r).sx, (*r).sy)
+        (*r).cx = (*r).sx
+        (*r).cy = (*r).sy
+    }
+}
+
+#[no_gc]
+fn seal(r: *mut PRast) {
+    if (*r).started {
+        add_edge(r, (*r).cx, (*r).cy, (*r).sx, (*r).sy)
+        (*r).started = false
+    }
+}
+
+#[no_gc]
+fn mask_new(w: usize, h: usize, fill: u8) -> Mask {
+    let p: *mut u8 = mem.heap_alloc(w * h)
+    if p as usize != 0 && fill != 0 as u8 {
+        fill_bytes(p, fill, w * h)
+    }
+    return Mask { p: p, w: w, h: h }
+}
+
+#[no_gc]
+fn mask_free(m: *mut Mask) {
+    mem.heap_free((*m).p, (*m).w * (*m).h)
+    (*m).p = 0 as *mut u8
+}
+
+#[no_gc]
+fn mask_at(m: *mut Mask, x: usize, y: usize) -> f64 {
+    if (*m).p as usize == 0 {
+        return 1.0
+    }
+    if x >= (*m).w || y >= (*m).h {
+        return 0.0
+    }
+    let b: u8 = *(((*m).p as u64 + (y * (*m).w + x) as u64) as *mut u8)
+    return (b as f64) / 255.0
+}
+
+#[no_gc]
+fn mask_all(m: *mut Mask) -> bool {
+    return (*m).p as usize == 0
+}
+
+#[no_gc]
+fn crossings(r: *mut PRast, sy: f64) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*r).ne {
+        let base: u64 = (*r).e as u64 + (i * 32) as u64
+        let y0: f64 = ldf(base, 1)
+        let y1: f64 = ldf(base, 3)
+        if sy >= y0 && sy < y1 {
+            let x0: f64 = ldf(base, 0)
+            let x1: f64 = ldf(base, 2)
+            let x: f64 = x0 + (x1 - x0) * (sy - y0) / (y1 - y0)
+            if n < (*r).xcap {
+                var k: usize = n
+                while k > 0 && ldf((*r).xs as u64, k - 1) > x {
+                    stf((*r).xs as u64, k, ldf((*r).xs as u64, k - 1))
+                    *(((*r).ds as u64 + k as u64) as *mut i8) =
+                    *(((*r).ds as u64 + (k - 1) as u64) as *mut i8)
+                    k = k - 1
+                }
+                stf((*r).xs as u64, k, x)
+                *(((*r).ds as u64 + k as u64) as *mut i8) =
+                *(((*r).dir as u64 + i as u64) as *mut i8)
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+#[no_gc]
+fn span(r: *mut PRast, xa: f64, xb: f64, wt: f64) {
+    var a: f64 = xa
+    var b: f64 = xb
+    if a < 0.0 {
+        a = 0.0
+    }
+    if b > (*r).w as f64 {
+        b = (*r).w as f64
+    }
+    if b <= a {
+        return
+    }
+    let ia: usize = a as usize
+    let ib: usize = b as usize
+    if ia == ib {
+        stf((*r).cov as u64, ia, ldf((*r).cov as u64, ia) + (b - a) * wt)
+        return
+    }
+    stf((*r).cov as u64, ia,
+        ldf((*r).cov as u64, ia) + (((ia + 1) as f64) - a) * wt)
+    var x: usize = ia + 1
+    while x < ib {
+        stf((*r).cov as u64, x, ldf((*r).cov as u64, x) + wt)
+        x = x + 1
+    }
+    if ib < (*r).w {
+        stf((*r).cov as u64, ib,
+            ldf((*r).cov as u64, ib) + (b - (ib as f64)) * wt)
+    }
+}
+
+#[no_gc]
+fn row_coverage(r: *mut PRast, y: usize, rule: u32, sub: usize) -> bool {
+    var x: usize = 0
+    while x < (*r).w {
+        stf((*r).cov as u64, x, 0.0)
+        x = x + 1
+    }
+    let wt: f64 = 1.0 / (sub as f64)
+    var any: bool = false
+    var s: usize = 0
+    while s < sub {
+        let sy: f64 = (y as f64) + ((s as f64) + 0.5) / (sub as f64)
+        let n: usize = crossings(r, sy)
+        if n >= 2 {
+            var wind: i32 = 0
+            var k: usize = 0
+            while k + 1 <= n - 1 {
+                if rule == RULE_NZ {
+                    let dv: i8 = *(((*r).ds as u64 + k as u64) as *mut i8)
+                    wind = wind + (dv as i32)
+                } else {
+                    wind = wind + 1
+                }
+                var inside: bool = false
+                if rule == RULE_NZ {
+                    inside = wind != 0
+                } else {
+                    inside = (wind % 2) != 0
+                }
+                if inside {
+                    span(r, ldf((*r).xs as u64, k),
+                        ldf((*r).xs as u64, k + 1), wt)
+                    any = true
+                }
+                k = k + 1
+            }
+        }
+        s = s + 1
+    }
+    return any
+}
+
+#[no_gc]
+fn budget_sub(ne: usize, rows: i64) -> usize {
+    if rows <= 0 {
+        return 0
+    }
+    let r: usize = rows as usize
+    var sub: usize = SUB
+    while sub > 1 && ne * r * sub > WORK_BUDGET {
+        sub = sub / 2
+    }
+    if ne * r * sub > WORK_BUDGET {
+        return 0
+    }
+    return sub
+}
+
+#[no_gc]
+fn clampi(v: f64, lo: i64, hi: i64) -> i64 {
+    if v != v {
+        return lo
+    }
+    if v < (lo as f64) {
+        return lo
+    }
+    if v > (hi as f64) {
+        return hi
+    }
+    return v as i64
+}
+
+#[no_gc]
+fn pr_fill(r: *mut PRast, cv: *mut canvas.Canvas, col: u32, alpha: f64,
+    rule: u32, clip: *mut Mask) {
+    seal(r)
+    if (*r).ne == 0 || (*r).ok == 0 {
+        return
+    }
+    let y0: i64 = clampi((*r).miny, 0, (*r).h as i64)
+    let y1: i64 = clampi((*r).maxy + 1.0, 0, (*r).h as i64)
+    let sub: usize = budget_sub((*r).ne, y1 - y0)
+    if sub == 0 {
+        return
+    }
+    var y: i64 = y0
+    while y < y1 {
+        if row_coverage(r, y as usize, rule, sub) {
+            let xa: i64 = clampi((*r).minx, 0, (*r).w as i64)
+            let xb: i64 = clampi((*r).maxx + 1.0, 0, (*r).w as i64)
+            var x: i64 = xa
+            while x < xb {
+                var c: f64 = ldf((*r).cov as u64, x as usize)
+                if c > 0.0016 {
+                    if c > 1.0 {
+                        c = 1.0
+                    }
+                    c = c * alpha * mask_at(clip, x as usize, y as usize)
+                    if c > 0.0016 {
+                        canvas.canvas_blend(cv, x as usize, y as usize,
+                            col, c)
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+#[no_gc]
+fn pr_fill_mask(r: *mut PRast, out: *mut Mask, old: *mut Mask, rule: u32) {
+    seal(r)
+    if (*out).p as usize == 0 {
+        return
+    }
+    fill_bytes((*out).p, 0 as u8, (*out).w * (*out).h)
+    if (*r).ne == 0 {
+        return
+    }
+    let y0: i64 = clampi((*r).miny, 0, (*r).h as i64)
+    let y1: i64 = clampi((*r).maxy + 1.0, 0, (*r).h as i64)
+    let sub: usize = budget_sub((*r).ne, y1 - y0)
+    if sub == 0 {
+        return
+    }
+    var y: i64 = y0
+    while y < y1 {
+        if row_coverage(r, y as usize, rule, sub) {
+            var x: usize = 0
+            while x < (*r).w {
+                var c: f64 = ldf((*r).cov as u64, x)
+                if c > 0.0 {
+                    if c > 1.0 {
+                        c = 1.0
+                    }
+                    c = c * mask_at(old, x, y as usize)
+                    *(((*out).p as u64 +
+                        ((y as usize) * (*out).w + x) as u64) as *mut u8) =
+                    (c * 255.0 + 0.5) as u8
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+#[no_gc]
+fn pr_stroke(r: *mut PRast, cv: *mut canvas.Canvas, col: u32, alpha: f64,
+    width: f64, clip: *mut Mask, tmp: *mut PRast) {
+    seal(r)
+    if (*r).ne == 0 {
+        return
+    }
+    var w: f64 = width
+    if w < 0.9 {
+        w = 0.9
+    }
+    let hw: f64 = w * 0.5
+    pr_reset(tmp)
+    var i: usize = 0
+    while i < (*r).ne {
+        let base: u64 = (*r).e as u64 + (i * 32) as u64
+        let x0: f64 = ldf(base, 0)
+        let y0: f64 = ldf(base, 1)
+        let x1: f64 = ldf(base, 2)
+        let y1: f64 = ldf(base, 3)
+        var dx: f64 = x1 - x0
+        var dy: f64 = y1 - y0
+        let len: f64 = sqrt_(dx * dx + dy * dy)
+        if len > 0.0 {
+            dx = dx / len
+            dy = dy / len
+            let nx: f64 = 0.0 - dy * hw
+            let ny: f64 = dx * hw
+            pr_move(tmp, x0 + nx, y0 + ny)
+            pr_line(tmp, x1 + nx, y1 + ny)
+            pr_line(tmp, x1 - nx, y1 - ny)
+            pr_line(tmp, x0 - nx, y0 - ny)
+            pr_close(tmp)
+            if w > 1.6 {
+                pr_move(tmp, x1 - hw, y1 - hw)
+                pr_line(tmp, x1 + hw, y1 - hw)
+                pr_line(tmp, x1 + hw, y1 + hw)
+                pr_line(tmp, x1 - hw, y1 + hw)
+                pr_close(tmp)
+            }
+        }
+        i = i + 1
+    }
+    pr_fill(tmp, cv, col, alpha, RULE_NZ, clip)
+}
+
+#[no_gc]
+fn sqrt_(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var x: f64 = v
+    var i: usize = 0
+    while i < 24 {
+        x = 0.5 * (x + v / x)
+        i = i + 1
+    }
+    return x
+}
+
+#[no_gc]
+fn pr_blend_raster(cv: *mut canvas.Canvas, rr: *mut raster.Raster,
+    ox: i64, oy: i64, col: u32, alpha: f64, clip: *mut Mask) {
+    let rh: usize = raster.raster_height(rr)
+    let rw: usize = raster.raster_width(rr)
+    var y: usize = 0
+    while y < rh {
+        let cy: i64 = oy + (y as i64)
+        if cy >= 0 {
+            var x: usize = 0
+            while x < rw {
+                let cx: i64 = ox + (x as i64)
+                if cx >= 0 {
+                    var v: f64 = raster.raster_cov(rr, x, y)
+                    if v > 0.0016 {
+                        v = v * alpha * mask_at(clip, cx as usize,
+                            cy as usize)
+                        if v > 0.0016 {
+                            canvas.canvas_blend(cv, cx as usize,
+                                cy as usize, col, v)
+                        }
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}

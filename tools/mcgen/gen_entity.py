@@ -12,7 +12,9 @@ A layout is a text program of 2-character tokens (role, type):
   role   E entity id           U uuid           T entity/object type      X Y Z absolute position
          x y z relative move   W yaw            P pitch                   G on ground
          M velocity (type V)   R relative flags (type i)   -  skipped field  A array of entity ids (type v), always alone
-  type   v varint  b i8  B u8  s i16  i i32  d f64  f f32  u uuid(16)  o bool  V vec3i16 (6 octets)  L lpVec3 (1.21.9+, skipped only)
+  type   p packed varint (bit 0 on ground, rest = step count)  D step path of i16 deltas (x y z, summed)
+         Q position path (varint path type, f64 x y z; X Y Z)
+         v varint  b i8  B u8  s i16  i i32  d f64  f f32  u uuid(16)  o bool  V vec3i16 (6 octets)  L lpVec3 (1.21.9+, skipped only)
 
 Reading stops after the last wanted role: trailing fields (metadata, head pitch, object data)
 are never touched. The interpreter gives the types their meaning:
@@ -42,9 +44,38 @@ ROLE = {
     "entityId": "E", "objectUUID": "U", "entityUUID": "U", "playerUUID": "U", "type": "T",
     "x": "X", "y": "Y", "z": "Z", "yaw": "W", "pitch": "P", "onGround": "G",
 }
+VARIABLE_LAYOUT_PACKETS = ("rel_entity_move", "entity_move_look", "sync_entity_position")
 ROLE_REL = {"dX": "x", "dY": "y", "dZ": "z"}
+PACKED_STEP_FIELDS = ("ticks", "dX", "dY", "dZ")
 TYPE = {"varint": "v", "i8": "b", "u8": "B", "i16": "s", "i32": "i", "f64": "d", "f32": "f",
         "UUID": "u", "bool": "o", "vec3i16": "V", "lpVec3": "L"}
+
+
+def check_delta_switch(fn, ft):
+    assert ft[0] == "switch" and ft[1]["compareTo"] == "packed", "delta layout changed: " + fn
+    cases = ft[1]["fields"]
+    for key, spec in cases.items():
+        steps = int(key) >> 1
+        names = [f["name"] for f in spec[1]]
+        if steps == 0:
+            want = ["dX", "dY", "dZ"]
+        else:
+            want = []
+            for i in range(steps):
+                want += ["ticks%d" % i, "dX%d" % i, "dY%d" % i, "dZ%d" % i]
+        assert names == want, "packed delta case %s changed: %s" % (key, names)
+        assert all(f["type"] == ("varint" if f["name"].startswith("ticks") else "i16") for f in spec[1]), key
+    assert sorted(int(k) for k in cases) == list(range(len(cases))), "packed delta cases not contiguous"
+
+
+def check_position_path(ft):
+    assert ft[0] == "switch" and ft[1]["compareTo"] == "pathType", "path layout changed"
+    single = ft[1]["fields"]["0"][1]
+    assert [(f["name"], f["type"]) for f in single] == [("x", "f64"), ("y", "f64"), ("z", "f64")]
+    arr = ft[1]["default"]
+    assert arr[0] == "array" and arr[1]["countType"] == "varint"
+    inner = arr[1]["type"][1]
+    assert [(f["name"], f["type"]) for f in inner] == [("x", "f64"), ("y", "f64"), ("z", "f64"), ("ticks", "varint")]
 
 
 def layout_of(proto, names, move):
@@ -70,6 +101,19 @@ def layout_of(proto, names, move):
         toks = []
         for f in fields:
             fn, ft = f["name"], f["type"]
+            if n in VARIABLE_LAYOUT_PACKETS and fn == "packed" and ft == "varint":
+                toks.append(("G", "p", fn, ft))
+                continue
+            if n in VARIABLE_LAYOUT_PACKETS and fn == "delta" and isinstance(ft, list):
+                check_delta_switch(fn, ft)
+                toks.append(("x", "D", fn, ft))
+                continue
+            if n == "sync_entity_position" and fn == "pathType" and ft == "varint":
+                toks.append(("X", "Q", fn, ft))
+                continue
+            if n == "sync_entity_position" and fn == "path":
+                check_position_path(ft)
+                continue
             role = ROLE_REL.get(fn) if move else None
             if role is None:
                 role = ROLE.get(fn, "-")
@@ -83,6 +127,8 @@ def layout_of(proto, names, move):
         out = []
         for role, ty, fn, ft in toks[: last + 1]:
             if ty is None:
+                if n in VARIABLE_LAYOUT_PACKETS:
+                    return ""
                 raise SystemExit("gen_entity: %s.%s has type %s before the last wanted field" % (n, fn, json.dumps(ft)))
             out.append(role + ty)
         return "".join(out)

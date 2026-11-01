@@ -28,9 +28,9 @@ def load_names():
 
 def load_grade(g):
     import re
+    names = load_names()
     src = open(os.path.join(LIB, "ds_icons_data%d.fi" % g)).read()
-    reg = src[src.index("fn regular"):src.index("fn filled")]
-    out = {int(i): d for i, d in re.findall(r'if id == (\d+) \{\s*return "([^"]*)"', reg)}
+    out = {names[n]: d for n, d in re.findall(r'fn r_([a-z0-9_]+)\(\) -> str \{\s*return "([^"]*)"', src)}
     core = open(os.path.join(LIB, "ds_icons_core.fi")).read()
     a = core.index("fn regular%d" % g)
     b = core.index("fn filled%d" % g)

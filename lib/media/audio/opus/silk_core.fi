@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_math
+import media.audio.opus.silk_tables
+import media.audio.opus.silk_state
+
+export { silk_decode_core }
+
+fn lpc_analysis_filter(out: u64, inp: u64, b: u64, len: i32, d: i32) {
+    var ix: i32 = d
+    while ix < len {
+        var acc: i32 = silk_math.smulbb(celt_fix.ld16(inp, ix - 1), celt_fix.ld16(b, 0))
+        var j: i32 = 1
+        while j < d {
+            acc = silk_math.smlabb(acc, celt_fix.ld16(inp, ix - 1 - j), celt_fix.ld16(b, j))
+            j = j + 1
+        }
+        let q12: i32 = (celt_fix.ld16(inp, ix) << 12) -% acc
+        celt_fix.st16(out, ix, silk_math.sat16(silk_math.rshift_round(q12, 12)))
+        ix = ix + 1
+    }
+    var z: i32 = 0
+    while z < d {
+        celt_fix.st16(out, z, 0)
+        z = z + 1
+    }
+}
+
+fn build_excitation(d: *mut silk_state.SilkDec) {
+    let offset_q10: i32 = silk_tables.silk_quant_offsets((((*d).signal_type >> 1) * 2 + (*d).quant_offset_type) as% usize) as% i32
+    var rand_seed: i32 = (*d).seed
+    var i: i32 = 0
+    while i < (*d).frame_length {
+        rand_seed = silk_math.rand_next(rand_seed)
+        let p: i32 = celt_fix.ld16((*d).pulses, i)
+        var e: i32 = silk_math.shl32(p, 14)
+        if e > 0 {
+            e = e - 1280
+        } else if e < 0 {
+            e = e + 1280
+        }
+        e = e + (offset_q10 << 4)
+        if rand_seed < 0 { e = 0 -% e }
+        celt_fix.st32((*d).exc, i, e)
+        rand_seed = rand_seed +% p
+        i = i + 1
+    }
+}
+
+fn silk_decode_core(d: *mut silk_state.SilkDec, xq: u64) {
+    build_excitation(d)
+    let sub: i32 = (*d).subfr_length
+    let order: i32 = (*d).lpc_order
+    let ltp_mem: i32 = (*d).ltp_mem_length
+    var interp_flag: i32 = 0
+    if (*d).nlsf_interp_coef_q2 < 4 { interp_flag = 1 }
+    let sltp: u64 = (*d).ltp_s16
+    let q15: u64 = (*d).ltp_q15
+    let lpc: u64 = (*d).lpc_q14
+    var i: i32 = 0
+    while i < 16 {
+        celt_fix.st32(lpc, i, celt_fix.ld32((*d).lpc_buf, i))
+        i = i + 1
+    }
+    var buf_idx: i32 = ltp_mem
+    var lag: i32 = 0
+    var k: i32 = 0
+    while k < (*d).nb_subfr {
+        let a_q12: u64 = (*d).pred_coef +% (((k >> 1) *% 32) as% u64)
+        let b_q14: u64 = (*d).ltp_coef +% ((k *% 10) as% u64)
+        let gain_q16: i32 = celt_fix.ld32((*d).gains_q16, k)
+        let gain_q10: i32 = gain_q16 >> 6
+        var inv_gain_q31: i32 = silk_math.inverse32_varq(gain_q16, 47)
+        var gain_adj_q16: i32 = 65536
+        if gain_q16 != (*d).prev_gain_q16 {
+            gain_adj_q16 = silk_math.div32_varq((*d).prev_gain_q16, gain_q16, 16)
+            i = 0
+            while i < 16 {
+                celt_fix.st32(lpc, i, silk_math.smulww(gain_adj_q16, celt_fix.ld32(lpc, i)))
+                i = i + 1
+            }
+        }
+        (*d).prev_gain_q16 = gain_q16
+        var voiced: i32 = 0
+        if (*d).signal_type == silk_state.TYPE_VOICED { voiced = 1 }
+        if voiced != 0 {
+            lag = celt_fix.ld32((*d).pitch_l, k)
+            if k == 0 || (k == 2 && interp_flag != 0) {
+                let start_idx: i32 = ltp_mem - lag - order - 2
+                if k == 2 {
+                    i = 0
+                    while i < 2 * sub {
+                        celt_fix.st16((*d).out_buf, ltp_mem + i, celt_fix.ld16(xq, i))
+                        i = i + 1
+                    }
+                }
+                lpc_analysis_filter(sltp +% ((start_idx *% 2) as% u64), (*d).out_buf +% (((start_idx + k *% sub) *% 2) as% u64), a_q12, ltp_mem - start_idx, order)
+                if k == 0 {
+                    inv_gain_q31 = silk_math.shl32(silk_math.smulwb(inv_gain_q31, (*d).ltp_scale_q14), 2)
+                }
+                i = 0
+                while i < lag + 2 {
+                    celt_fix.st32(q15, buf_idx - i - 1, silk_math.smulwb(inv_gain_q31, celt_fix.ld16(sltp, ltp_mem - i - 1)))
+                    i = i + 1
+                }
+            } else if gain_adj_q16 != 65536 {
+                i = 0
+                while i < lag + 2 {
+                    celt_fix.st32(q15, buf_idx - i - 1, silk_math.smulww(gain_adj_q16, celt_fix.ld32(q15, buf_idx - i - 1)))
+                    i = i + 1
+                }
+            }
+        }
+        var pres: u64 = (*d).exc +% ((k *% sub *% 4) as% u64)
+        if voiced != 0 {
+            let pred_idx: i32 = buf_idx - lag + 2
+            i = 0
+            while i < sub {
+                var p13: i32 = 2
+                var j: i32 = 0
+                while j < 5 {
+                    p13 = silk_math.smlawb(p13, celt_fix.ld32(q15, pred_idx + i - j), celt_fix.ld16(b_q14, j))
+                    j = j + 1
+                }
+                let r: i32 = celt_fix.ld32(pres, i) +% silk_math.shl32(p13, 1)
+                celt_fix.st32((*d).res_q14, i, r)
+                celt_fix.st32(q15, buf_idx, silk_math.shl32(r, 1))
+                buf_idx = buf_idx + 1
+                i = i + 1
+            }
+            pres = (*d).res_q14
+        }
+        i = 0
+        while i < sub {
+            var pred: i32 = order >> 1
+            var j: i32 = 1
+            while j <= order {
+                pred = silk_math.smlawb(pred, celt_fix.ld32(lpc, 16 + i - j), celt_fix.ld16(a_q12, j - 1))
+                j = j + 1
+            }
+            let s: i32 = silk_math.add_sat32(celt_fix.ld32(pres, i), silk_math.lshift_sat32(pred, 4))
+            celt_fix.st32(lpc, 16 + i, s)
+            celt_fix.st16(xq, k * sub + i, silk_math.sat16(silk_math.rshift_round(silk_math.smulww(s, gain_q10), 8)))
+            i = i + 1
+        }
+        i = 0
+        while i < 16 {
+            celt_fix.st32(lpc, i, celt_fix.ld32(lpc, sub + i))
+            i = i + 1
+        }
+        k = k + 1
+    }
+    i = 0
+    while i < 16 {
+        celt_fix.st32((*d).lpc_buf, i, celt_fix.ld32(lpc, i))
+        i = i + 1
+    }
+}

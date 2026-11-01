@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mc.gen.wgdf_graph
+import mc.gen.wgft_def
+import mc.gen.wgft_tscratch
+import mc.gen.wgdf_widen
+
+export {
+    Region, SIDE, region_new, region_reset, region_free, region_load, block_at, set_block, can_write, floor_open, height_of, biome_at,
+    present_mask, vis_begin, vis_test_set,
+}
+
+const SIDE: i32 = 5
+const AIR: u16 = 65
+const VIS_SLOTS: usize = 32768
+const UNSET_HEIGHT: i32 = 2147483647
+
+struct Region {
+    ft: *wgft_def.FtDef,
+    cx: i32,
+    cz: i32,
+    nx: i32,
+    nz: i32,
+    min_y: i32,
+    height: i32,
+    chunk_bytes: usize,
+    stride: u64,
+    ox: i32,
+    oz: i32,
+    blocks: u64,
+    bios: [u64; 25],
+    bio_bytes: usize,
+    hm: [i32; 25600],
+    vis: u64,
+    vis_gen: u32,
+    pts: [f64; 256],
+    scratch: u64,
+}
+
+fn region_new(ft: *wgft_def.FtDef, chunk_bytes: usize, bio_bytes: usize) -> *mut Region {
+    let r: *mut Region = rt.heap_alloc(wgdf_graph.wg_size_of[Region]()) as *mut Region
+    rt.mem_set(r as u64, 0 as u8, wgdf_graph.wg_size_of[Region]())
+    (*r).ft = ft
+    (*r).min_y = (*ft).min_y
+    (*r).height = (*ft).height
+    (*r).chunk_bytes = chunk_bytes
+    (*r).stride = (chunk_bytes as u64) * 2
+    (*r).bio_bytes = bio_bytes
+    (*r).blocks = rt.heap_alloc(chunk_bytes * 50)
+    (*r).vis = rt.heap_alloc(VIS_SLOTS * 4)
+    rt.mem_set((*r).vis, 0 as u8, VIS_SLOTS * 4)
+    if (*ft).ntrees > 0 { (*r).scratch = wgft_tscratch.scratch_new() as u64 }
+    region_reset(r)
+    return r
+}
+
+fn region_reset(r: *mut Region) {
+    var i: usize = 0
+    while i < 25600 {
+        (*r).hm[i] = UNSET_HEIGHT
+        i = i + 1
+    }
+}
+
+fn region_free(r: *mut Region) {
+    rt.heap_free((*r).blocks, (*r).chunk_bytes * 50)
+    rt.heap_free((*r).vis, VIS_SLOTS * 4)
+    if (*r).scratch != 0 { wgft_tscratch.scratch_free((*r).scratch as *mut wgft_tscratch.TreeScratch) }
+    rt.heap_free(r as u64, wgdf_graph.wg_size_of[Region]())
+}
+
+#[inline]
+fn slot_index(r: *Region, cx: i32, cz: i32) -> i32 {
+    let ix: i32 = cx - (*r).ox
+    let iz: i32 = cz - (*r).oz
+    if ix < 0 || ix >= SIDE || iz < 0 || iz >= SIDE { return 0 - 1 }
+    return iz * SIDE + ix
+}
+
+fn region_load(r: *mut Region, cx: i32, cz: i32, idx: i32, blocks: u64, bio: u64) {
+    (*r).cx = cx
+    (*r).cz = cz
+    (*r).ox = cx - 2
+    (*r).oz = cz - 2
+    wgdf_widen.widen_codes((*r).blocks + ((idx as u64) * ((*r).chunk_bytes as u64) * 2), blocks, (*r).chunk_bytes)
+    (*r).bios[idx as usize] = bio
+}
+
+#[inline]
+fn cell_addr(r: *Region, x: i32, y: i32, z: i32) -> u64 {
+    let ix: i32 = (x >> 4) - (*r).ox
+    let iz: i32 = (z >> 4) - (*r).oz
+    let ly: i32 = y - (*r).min_y
+    if ix < 0 || ix >= SIDE || iz < 0 || iz >= SIDE || ly < 0 || ly >= (*r).height { return 0 }
+    return (*r).blocks + (((iz * SIDE + ix) as u64) * (*r).stride) + (((ly * 256 + (z & 15) * 16 + (x & 15)) as u64) << 1)
+}
+
+#[inline]
+fn block_at(r: *Region, x: i32, y: i32, z: i32) -> u16 {
+    let a: u64 = cell_addr(r, x, y, z)
+    if a == 0 { return AIR }
+    return *(a as *u16)
+}
+
+#[inline]
+fn hm_pred(ft: *wgft_def.FtDef, kind: usize, code: u16) -> bool {
+    if kind == wgft_def.HM_FLOOR { return (*ft).motion[code as usize] }
+    if kind == wgft_def.HM_SURFACE { return !(*ft).air[code as usize] }
+    if kind == wgft_def.HM_MOTION { return (*ft).motion[code as usize] || (*ft).fluid[code as usize] }
+    return ((*ft).motion[code as usize] || (*ft).fluid[code as usize]) && !(*ft).leaves[code as usize]
+}
+
+#[inline]
+fn hm_update(r: *mut Region, kind: usize, cell: usize, x: i32, y: i32, z: i32, code: u16) {
+    let at: usize = kind * 6400 + cell
+    let cur: i32 = (*r).hm[at]
+    if cur == UNSET_HEIGHT || y <= cur - 2 { return }
+    if hm_pred((*r).ft, kind, code) {
+        if y >= cur { (*r).hm[at] = y + 1 }
+    } else if cur - 1 == y {
+        var j: i32 = y - 1
+        while j >= (*r).min_y && !hm_pred((*r).ft, kind, block_at(r, x, j, z)) {
+            j = j - 1
+        }
+        (*r).hm[at] = j + 1
+    }
+}
+
+fn set_block(r: *mut Region, x: i32, y: i32, z: i32, code: u16) {
+    let a: u64 = cell_addr(r, x, y, z)
+    if a == 0 { return }
+    *(a as *mut u16) = code
+    let cell: usize = (slot_index(r, x >> 4, z >> 4) as usize) * 256 + ((z & 15) * 16 + (x & 15)) as usize
+    var k: usize = 0
+    while k < wgft_def.HM_KINDS {
+        hm_update(r, k, cell, x, y, z, code)
+        k = k + 1
+    }
+}
+
+fn can_write(r: *Region, x: i32, z: i32) -> bool {
+    let dx: i32 = (x >> 4) - (*r).nx
+    let dz: i32 = (z >> 4) - (*r).nz
+    return dx >= 0 - 1 && dx <= 1 && dz >= 0 - 1 && dz <= 1
+}
+
+#[inline]
+fn height_of(r: *mut Region, kind: usize, x: i32, z: i32) -> i32 {
+    let s: i32 = slot_index(r, x >> 4, z >> 4)
+    if s < 0 { return (*r).min_y }
+    let at: usize = kind * 6400 + (s as usize) * 256 + ((z & 15) * 16 + (x & 15)) as usize
+    if (*r).hm[at] != UNSET_HEIGHT { return (*r).hm[at] }
+    var y: i32 = (*r).min_y + (*r).height - 1
+    while y >= (*r).min_y && !hm_pred((*r).ft, kind, block_at(r, x, y, z)) {
+        y = y - 1
+    }
+    (*r).hm[at] = y + 1
+    return y + 1
+}
+
+fn floor_open(r: *mut Region, x: i32, z: i32) -> i32 {
+    return height_of(r, wgft_def.HM_FLOOR, x, z)
+}
+
+fn biome_at(r: *Region, qx: i32, qy: i32, qz: i32) -> i32 {
+    let s: i32 = slot_index(r, qx >> 2, qz >> 2)
+    if s < 0 { return 0 }
+    let lo: i32 = (*r).min_y >> 2
+    let hi: i32 = lo + (*r).height / 4 - 1
+    var cy: i32 = qy
+    if cy < lo { cy = lo }
+    if cy > hi { cy = hi }
+    let iy: i32 = cy - lo
+    let off: usize = ((iy / 4) as usize) * 64 + ((iy % 4) as usize) * 16 + ((qz & 3) as usize) * 4 + ((qx & 3) as usize)
+    return rt.ld8((*r).bios[s as usize], off) as i32
+}
+
+fn present_mask(r: *Region, cx: i32, cz: i32, out: *mut [u64; 2]) {
+    let s: i32 = slot_index(r, cx, cz)
+    if s < 0 { return }
+    var seen_lo: u64 = 0 as u64
+    var seen_hi: u64 = 0 as u64
+    var i: usize = 0
+    while i < (*r).bio_bytes {
+        let b: u64 = rt.ld8((*r).bios[s as usize], i) as u64
+        if b < (64 as u64) {
+            if (seen_lo & ((1 as u64) << b)) == (0 as u64) {
+                seen_lo = seen_lo | ((1 as u64) << b)
+                (*out)[0] = (*out)[0] | (*(*r).ft).bmask[b as usize][0]
+                (*out)[1] = (*out)[1] | (*(*r).ft).bmask[b as usize][1]
+            }
+        } else if b < (96 as u64) {
+            if (seen_hi & ((1 as u64) << (b - (64 as u64)))) == (0 as u64) {
+                seen_hi = seen_hi | ((1 as u64) << (b - (64 as u64)))
+                (*out)[0] = (*out)[0] | (*(*r).ft).bmask[b as usize][0]
+                (*out)[1] = (*out)[1] | (*(*r).ft).bmask[b as usize][1]
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn vis_begin(r: *mut Region) {
+    (*r).vis_gen = (*r).vis_gen + 1
+}
+
+fn vis_test_set(r: *mut Region, idx: i32) -> bool {
+    if idx < 0 || idx >= (VIS_SLOTS as i32) { return false }
+    let p: *mut u32 = ((*r).vis + ((idx as u64) * 4)) as *mut u32
+    if *p == (*r).vis_gen { return true }
+    *p = (*r).vis_gen
+    return false
+}

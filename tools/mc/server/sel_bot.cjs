@@ -17,7 +17,9 @@ const current = () => {
   return i >= 0 && i < events.length ? events[i] : null
 }
 const c = mc.createClient({ host, port: parseInt(port, 10), username: name, auth: 'offline', version: '1.20.1', hideErrors: true })
-c.on('system_chat', (p) => { const s = current(); if (s) s.chat.push(flat(p.content)) })
+const presenceRe = /^\S+ (joined|left) the game$/
+const presence = []
+c.on('system_chat', (p) => { const t = flat(p.content); if (presenceRe.test(t)) { presence.push(t); return } const s = current(); if (s) s.chat.push(t) })
 c.on('player_chat', (p) => { const s = current(); if (s) s.chat.push('[' + flat(p.networkName) + '] ' + (p.plainMessage || '')) })
 c.on('position', (p) => { const s = current(); if (s) s.pos.push([p.x, p.y, p.z, p.yaw, p.pitch, p.flags]); c.write('teleport_confirm', { teleportId: p.teleportId }) })
 c.on('game_state_change', (p) => { const s = current(); if (s && p.reason === 3) s.modes.push(p.gameMode) })
@@ -26,7 +28,17 @@ c.on('tab_complete', (p) => {
   if (e) e.tab = { start: p.start, length: p.length, matches: p.matches.map((m) => m.match) }
 })
 c.on('error', (e) => console.error(String(e.message).slice(0, 300)))
-const done = () => { fs.writeFileSync(outPath, JSON.stringify({ name, events })); process.exit(0) }
+const writeOut = () => fs.writeFileSync(outPath, JSON.stringify({ name, events, presence: presence.slice().sort() }))
+const finMark = path.join(barrier, 'fin_OpBot')
+const done = () => {
+  if (name === 'OpBot') { writeOut(); fs.writeFileSync(finMark, '1'); process.exit(0) }
+  const started = Date.now()
+  const wait = setInterval(() => {
+    if (!fs.existsSync(finMark) && Date.now() - started < 20000) return
+    clearInterval(wait)
+    setTimeout(() => { writeOut(); process.exit(0) }, 1500)
+  }, 100)
+}
 const bothReady = () => ['OpBot', 'NoBot'].every((n) => fs.existsSync(path.join(barrier, 'ready_' + n)))
 c.on('login', () => {
   setTimeout(() => {

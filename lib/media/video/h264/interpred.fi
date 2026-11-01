@@ -1,0 +1,718 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.video.h264.params
+import media.video.h264.raw
+import media.video.h264.types
+
+export {
+    PR_L0, PR_L1, SW_32, SW_M16, ld64u, mc_chroma, mc_luma, st64u, sw_avg8,
+}
+
+const PR_L0: usize = 0
+
+const PR_L1: usize = 512
+
+const PR_EMU: usize = 1024
+
+const PR_MID: usize = 2048
+
+fn ptr_off(p: u64, off: i64) -> u64 {
+    if off >= 0 {
+        return p + (off as u64)
+    }
+    return p - ((0 - off) as u64)
+}
+
+fn at(src: u64, ss: usize, x: i32, y: i32) -> u64 {
+    return ptr_off(src, (y as i64) * (ss as i64) + (x as i64))
+}
+
+fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
+    return a - 5 * b + 20 * c + 20 * d - 5 * e + f
+}
+
+fn half_h(src: u64, ss: usize, x: i32, y: i32) -> i32 {
+    let p: u64 = at(src, ss, x, y)
+    return raw.clip255((tap6(raw.ldu8(p - 2, 0), raw.ldu8(p - 1, 0), raw.ldu8(p, 0), raw.ldu8(p + 1, 0), raw.ldu8(p + 2, 0), raw.ldu8(p + 3, 0)) + 16) >> 5)
+}
+
+fn half_v(src: u64, ss: usize, x: i32, y: i32) -> i32 {
+    let p: u64 = at(src, ss, x, y)
+    return raw.clip255((tap6(raw.ldu8(p - (2 * ss) as u64, 0), raw.ldu8(p - ss as u64, 0), raw.ldu8(p, 0), raw.ldu8(p + ss as u64, 0),
+        raw.ldu8(p + (2 * ss) as u64, 0), raw.ldu8(p + (3 * ss) as u64, 0)) + 16) >> 5)
+}
+
+fn px(src: u64, ss: usize, x: i32, y: i32) -> i32 {
+    return raw.ldu8(at(src, ss, x, y), 0)
+}
+
+fn raw_h(src: u64, ss: usize, x: i32, y: i32) -> i32 {
+    let p: u64 = at(src, ss, x, y)
+    return tap6(raw.ldu8(p - 2, 0), raw.ldu8(p - 1, 0), raw.ldu8(p, 0), raw.ldu8(p + 1, 0), raw.ldu8(p + 2, 0), raw.ldu8(p + 3, 0))
+}
+
+fn mc_luma(d: *mut params.H264, dst: u64, dstride: usize, plane: u64, stride: usize, pw: i32, ph: i32, ix: i32, iy: i32, fx: i32, fy: i32, w: i32, h: i32) {
+    var src: u64 = at(plane, stride, ix, iy)
+    var ss: usize = stride
+    let pad: i32 = types.PAD as i32
+    if ix - 2 < 0 - pad || ix + w + 3 > pw + pad || iy - 2 < 0 - pad || iy + h + 3 > ph + pad {
+        let emu: u64 = (*d).pred + PR_EMU as u64
+        var yy: i32 = 0
+        while yy < h + 5 {
+            var xx: i32 = 0
+            let sy: i32 = raw.clip3(0, ph - 1, iy - 2 + yy)
+            while xx < w + 5 {
+                let sx: i32 = raw.clip3(0, pw - 1, ix - 2 + xx)
+                raw.stb(emu, (yy * 32 + xx) as usize, raw.ldu8(plane, (sy as usize) * stride + (sx as usize)))
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        src = emu + 2 * 32 + 2
+        ss = 32
+    }
+    if fx == 0 && fy == 0 {
+        copy_rows(dst, dstride, src, ss, w, h)
+        return
+    }
+    if w >= 8 {
+        if fy == 0 {
+            mck_h8(dst, dstride, src, ss, w, h, fx)
+            return
+        }
+        if fx == 0 {
+            mck_v8(dst, dstride, src, ss, w, h, fy)
+            return
+        }
+        if fx != 2 && fy != 2 {
+            mck_d8(dst, dstride, src, ss, w, h, fx, fy)
+            return
+        }
+        mck_c8(dst, dstride, src, ss, w, h, fx, fy, (*d).pred + PR_MID as u64)
+        return
+    }
+    if fy == 0 {
+        mck_h(dst, dstride, src, ss, w, h, fx)
+        return
+    }
+    if fx == 0 {
+        mck_v(dst, dstride, src, ss, w, h, fy)
+        return
+    }
+    if fx != 2 && fy != 2 {
+        mck_d(dst, dstride, src, ss, w, h, fx, fy)
+        return
+    }
+    mck_c(dst, dstride, src, ss, w, h, fx, fy, (*d).pred + PR_MID as u64)
+}
+
+const SW_M16: u64 = 0x00FF00FF00FF00FF
+
+const SW_ONE: u64 = 0x0001000100010001
+
+const SW_7F: u64 = 0x7F7F7F7F7F7F7F7F
+
+const SW_07FF: u64 = 0x07FF07FF07FF07FF
+
+const SW_B0: u64 = 0x00B000B000B000B0
+
+const SW_K: u64 = 0x0A100A100A100A10
+
+const SW_32: u64 = 0x0020002000200020
+
+fn ld64u(p: u64) -> u64 {
+    return *(p as *mut u64)
+}
+
+fn st64u(p: u64, v: u64) {
+    *(p as *mut u64) = v
+}
+
+fn sw_tap4(a: u64, b: u64, c: u64, e: u64, f: u64, g: u64) -> u64 {
+    let ce: u64 = c + e
+    let bf: u64 = b + f
+    let s: u64 = a + g + (ce << 4) + (ce << 2) + SW_K - ((bf << 2) + bf)
+    let q: u64 = (s >> 5) & SW_07FF
+    let w: u64 = q + SW_B0
+    let over: u64 = (w >> 9) & SW_ONE
+    let nz: u64 = ((w >> 8) & SW_ONE) | over
+    return (w & SW_M16 & (nz * 255)) | (over * 255)
+}
+
+fn sw_tap8(la: u64, lb: u64, lc: u64, le: u64, lf: u64, lg: u64, mode: i32) -> u64 {
+    var ve: u64 = sw_tap4(la & SW_M16, lb & SW_M16, lc & SW_M16, le & SW_M16, lf & SW_M16, lg & SW_M16)
+    var vo: u64 = sw_tap4((la >> 8) & SW_M16, (lb >> 8) & SW_M16, (lc >> 8) & SW_M16, (le >> 8) & SW_M16,
+        (lf >> 8) & SW_M16, (lg >> 8) & SW_M16)
+    if mode == 1 {
+        ve = ((ve + (lc & SW_M16) + SW_ONE) >> 1) & SW_M16
+        vo = ((vo + ((lc >> 8) & SW_M16) + SW_ONE) >> 1) & SW_M16
+    } else if mode == 3 {
+        ve = ((ve + (le & SW_M16) + SW_ONE) >> 1) & SW_M16
+        vo = ((vo + ((le >> 8) & SW_M16) + SW_ONE) >> 1) & SW_M16
+    }
+    return ve | (vo << 8)
+}
+
+fn sw_avg8(a: u64, b: u64) -> u64 {
+    return (a | b) - (((a ^ b) >> 1) & SW_7F)
+}
+
+fn mck_h8(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32) {
+    var mode: i32 = 0
+    if fx == 1 {
+        mode = 1
+    } else if fx == 3 {
+        mode = 3
+    }
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var y: usize = 0
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64
+        let o: u64 = dst + (y * dstride) as u64
+        var x: usize = 0
+        while x < wn {
+            let q: u64 = p + x as u64
+            st64u(o + x as u64, sw_tap8(ld64u(q - 2), ld64u(q - 1), ld64u(q), ld64u(q + 1), ld64u(q + 2), ld64u(q + 3), mode))
+            x = x + 8
+        }
+        y = y + 1
+    }
+}
+
+fn mck_v8(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fy: i32) {
+    var mode: i32 = 0
+    if fy == 1 {
+        mode = 1
+    } else if fy == 3 {
+        mode = 3
+    }
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var x: usize = 0
+    while x < wn {
+        let q0: u64 = src + x as u64
+        var la: u64 = ld64u(q0 - (2 * ss) as u64)
+        var lb: u64 = ld64u(q0 - ss as u64)
+        var lc: u64 = ld64u(q0)
+        var le: u64 = ld64u(q0 + ss as u64)
+        var lf: u64 = ld64u(q0 + (2 * ss) as u64)
+        var q: u64 = q0 + (3 * ss) as u64
+        var o: u64 = dst + x as u64
+        var y: usize = 0
+        while y < hn {
+            let lg: u64 = ld64u(q)
+            st64u(o, sw_tap8(la, lb, lc, le, lf, lg, mode))
+            la = lb
+            lb = lc
+            lc = le
+            le = lf
+            lf = lg
+            q = q + ss as u64
+            o = o + dstride as u64
+            y = y + 1
+        }
+        x = x + 8
+    }
+}
+
+fn mck_d8(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32, fy: i32) {
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var hoff: usize = 0
+    if fy == 3 {
+        hoff = ss
+    }
+    var voff: usize = 0
+    if fx == 3 {
+        voff = 1
+    }
+    var x: usize = 0
+    while x < wn {
+        let q0: u64 = src + (x + voff) as u64
+        var va: u64 = ld64u(q0 - (2 * ss) as u64)
+        var vb: u64 = ld64u(q0 - ss as u64)
+        var vc: u64 = ld64u(q0)
+        var ve: u64 = ld64u(q0 + ss as u64)
+        var vf: u64 = ld64u(q0 + (2 * ss) as u64)
+        var vq: u64 = q0 + (3 * ss) as u64
+        var y: usize = 0
+        while y < hn {
+            let vg: u64 = ld64u(vq)
+            let hp: u64 = src + (y * ss + hoff + x) as u64
+            let hv: u64 = sw_tap8(ld64u(hp - 2), ld64u(hp - 1), ld64u(hp), ld64u(hp + 1), ld64u(hp + 2), ld64u(hp + 3), 0)
+            let vv: u64 = sw_tap8(va, vb, vc, ve, vf, vg, 0)
+            st64u(dst + (y * dstride + x) as u64, sw_avg8(hv, vv))
+            va = vb
+            vb = vc
+            vc = ve
+            ve = vf
+            vf = vg
+            vq = vq + ss as u64
+            y = y + 1
+        }
+        x = x + 8
+    }
+}
+
+fn sw_bil8(a: u64, b: u64, c: u64, d: u64, wa: u64, wb: u64, wc: u64, wd: u64) -> u64 {
+    let ve: u64 = (((a & SW_M16) * wa + (b & SW_M16) * wb + (c & SW_M16) * wc + (d & SW_M16) * wd + SW_32) >> 6) & SW_M16
+    let vo: u64 = ((((a >> 8) & SW_M16) * wa + ((b >> 8) & SW_M16) * wb + ((c >> 8) & SW_M16) * wc
+        + ((d >> 8) & SW_M16) * wd + SW_32) >> 6) & SW_M16
+    return ve | (vo << 8)
+}
+
+fn mcc8(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, wa: i32, wb: i32, wc: i32, wd: i32) {
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    let a1: u64 = wa as u64
+    let b1: u64 = wb as u64
+    let c1: u64 = wc as u64
+    let d1: u64 = wd as u64
+    var y: usize = 0
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64
+        let q: u64 = p + ss as u64
+        let o: u64 = dst + (y * dstride) as u64
+        var x: usize = 0
+        while x < wn {
+            st64u(o + x as u64, sw_bil8(ld64u(p + x as u64), ld64u(p + (x + 1) as u64), ld64u(q + x as u64),
+                ld64u(q + (x + 1) as u64), a1, b1, c1, d1))
+            x = x + 8
+        }
+        y = y + 1
+    }
+}
+
+fn mcc4(dst: u64, dstride: usize, src: u64, ss: usize, h: i32, wa: i32, wb: i32, wc: i32, wd: i32) {
+    let hn: usize = h as usize
+    let a1: u64 = wa as u64
+    let b1: u64 = wb as u64
+    let c1: u64 = wc as u64
+    let d1: u64 = wd as u64
+    var y: usize = 0
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64
+        let q: u64 = p + ss as u64
+        let v: u64 = sw_bil8((*(p as *mut u32)) as u64, (*((p + 1) as *mut u32)) as u64, (*(q as *mut u32)) as u64,
+            (*((q + 1) as *mut u32)) as u64, a1, b1, c1, d1)
+        *((dst + (y * dstride) as u64) as *mut u32) = v as u32
+        y = y + 1
+    }
+}
+
+fn copy_rows(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32) {
+    let hn: usize = h as usize
+    var y: usize = 0
+    if w == 16 {
+        while y < hn {
+            let s0: u64 = src + (y * ss) as u64
+            let d0: u64 = dst + (y * dstride) as u64
+            st64u(d0, ld64u(s0))
+            st64u(d0 + 8, ld64u(s0 + 8))
+            y = y + 1
+        }
+    } else if w == 8 {
+        while y < hn {
+            st64u(dst + (y * dstride) as u64, ld64u(src + (y * ss) as u64))
+            y = y + 1
+        }
+    } else if w == 4 {
+        while y < hn {
+            *((dst + (y * dstride) as u64) as *mut u32) = *((src + (y * ss) as u64) as *mut u32)
+            y = y + 1
+        }
+    } else {
+        while y < hn {
+            rt.mem_copy(dst + (y * dstride) as u64, src + (y * ss) as u64, w as usize)
+            y = y + 1
+        }
+    }
+}
+
+fn mck_h(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32) {
+    let wn: usize = w as usize
+    var y: usize = 0
+    let hn: usize = h as usize
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64
+        let o: u64 = dst + (y * dstride) as u64
+        var a: i32 = raw.ldu8(p - 2, 0)
+        var b: i32 = raw.ldu8(p - 1, 0)
+        var c: i32 = raw.ldu8(p, 0)
+        var e: i32 = raw.ldu8(p, 1)
+        var f: i32 = raw.ldu8(p, 2)
+        var x: usize = 0
+        while x < wn {
+            let g: i32 = raw.ldu8(p, x + 3)
+            var v: i32 = raw.clip255((a - 5 * b + 20 * c + 20 * e - 5 * f + g + 16) >> 5)
+            if fx == 1 {
+                v = (v + c + 1) >> 1
+            }
+            if fx == 3 {
+                v = (v + e + 1) >> 1
+            }
+            *((o + x as u64) as *mut u8) = v as u8
+            a = b
+            b = c
+            c = e
+            e = f
+            f = g
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn mck_v(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fy: i32) {
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var x: usize = 0
+    while x < wn {
+        let q0: u64 = src + x as u64
+        var a: i32 = raw.ldu8(q0 - (2 * ss) as u64, 0)
+        var b: i32 = raw.ldu8(q0 - ss as u64, 0)
+        var c: i32 = raw.ldu8(q0, 0)
+        var e: i32 = raw.ldu8(q0 + ss as u64, 0)
+        var f: i32 = raw.ldu8(q0 + (2 * ss) as u64, 0)
+        var y: usize = 0
+        var q: u64 = q0 + (3 * ss) as u64
+        var o: u64 = dst + x as u64
+        while y < hn {
+            let g: i32 = raw.ldu8(q, 0)
+            var v: i32 = raw.clip255((a - 5 * b + 20 * c + 20 * e - 5 * f + g + 16) >> 5)
+            if fy == 1 {
+                v = (v + c + 1) >> 1
+            }
+            if fy == 3 {
+                v = (v + e + 1) >> 1
+            }
+            *(o as *mut u8) = v as u8
+            a = b
+            b = c
+            c = e
+            e = f
+            f = g
+            q = q + ss as u64
+            o = o + dstride as u64
+            y = y + 1
+        }
+        x = x + 1
+    }
+}
+
+fn mck_d(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32, fy: i32) {
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var hoff: usize = 0
+    if fy == 3 {
+        hoff = ss
+    }
+    var voff: usize = 0
+    if fx == 3 {
+        voff = 1
+    }
+    var y: usize = 0
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64 + hoff as u64
+        let o: u64 = dst + (y * dstride) as u64
+        let qv: u64 = src + (y * ss) as u64 + voff as u64
+        var a: i32 = raw.ldu8(p - 2, 0)
+        var b: i32 = raw.ldu8(p - 1, 0)
+        var c: i32 = raw.ldu8(p, 0)
+        var e: i32 = raw.ldu8(p, 1)
+        var f: i32 = raw.ldu8(p, 2)
+        var x: usize = 0
+        while x < wn {
+            let g: i32 = raw.ldu8(p, x + 3)
+            let hv: i32 = raw.clip255((a - 5 * b + 20 * c + 20 * e - 5 * f + g + 16) >> 5)
+            let q: u64 = qv + x as u64
+            let vv: i32 = raw.clip255((raw.ldu8(q - (2 * ss) as u64, 0) - 5 * raw.ldu8(q - ss as u64, 0) + 20 * raw.ldu8(q, 0)
+                + 20 * raw.ldu8(q + ss as u64, 0) - 5 * raw.ldu8(q + (2 * ss) as u64, 0) + raw.ldu8(q + (3 * ss) as u64, 0) + 16) >> 5)
+            *((o + x as u64) as *mut u8) = ((hv + vv + 1) >> 1) as u8
+            a = b
+            b = c
+            c = e
+            e = f
+            f = g
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+const SW_BI: u64 = 0x5000500050005000
+
+const SW_M32: u64 = 0x0000FFFF0000FFFF
+
+const SW_512: u64 = 0x0000020000000200
+
+const SW_7FF32: u64 = 0x000007FF000007FF
+
+const SW_128: u64 = 0x0000008000000080
+
+const SW_FF32: u64 = 0x000000FF000000FF
+
+const SW_ONE32: u64 = 0x0000000100000001
+
+const SW_0180: u64 = 0x0180018001800180
+
+const SW_16: u64 = 0x0010001000100010
+
+fn sw_v32(a: u64, b: u64, c: u64, e: u64, f: u64, g: u64) -> u64 {
+    let ce: u64 = c + e
+    let bf: u64 = b + f
+    let s: u64 = a + g + (ce << 4) + (ce << 2) + SW_512 - ((bf << 2) + bf)
+    let w: u64 = ((s >> 10) & SW_7FF32) - SW_128
+    let b9: u64 = (w >> 9) & SW_ONE32
+    let b8: u64 = (w >> 8) & SW_ONE32
+    return (w & SW_FF32 & (b9 * 255)) | ((b9 & b8) * 255)
+}
+
+fn sw_v16(a: u64, b: u64, c: u64, e: u64, f: u64, g: u64) -> u64 {
+    let lo: u64 = sw_v32(a & SW_M32, b & SW_M32, c & SW_M32, e & SW_M32, f & SW_M32, g & SW_M32)
+    let hi: u64 = sw_v32((a >> 16) & SW_M32, (b >> 16) & SW_M32, (c >> 16) & SW_M32, (e >> 16) & SW_M32,
+        (f >> 16) & SW_M32, (g >> 16) & SW_M32)
+    return lo | (hi << 16)
+}
+
+fn sw_hclip(c: u64) -> u64 {
+    let w: u64 = (((c + SW_16) >> 5) & SW_07FF) - SW_0180
+    let over: u64 = (w >> 9) & SW_ONE
+    let nz: u64 = ((w >> 8) & SW_ONE) | over
+    return (w & SW_M16 & (nz * 255)) | (over * 255)
+}
+
+fn mck_c8(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32, fy: i32, mid: u64) {
+    let nstr: usize = (w >> 3) as usize
+    let hn: usize = h as usize
+    var r: usize = 0
+    while r < hn + 5 {
+        let rp: u64 = ptr_off(src, ((r as i64) - 2) * (ss as i64))
+        var si: usize = 0
+        while si < nstr {
+            let q: u64 = rp + (si * 8) as u64
+            let la: u64 = ld64u(q - 2)
+            let lb: u64 = ld64u(q - 1)
+            let lc: u64 = ld64u(q)
+            let le: u64 = ld64u(q + 1)
+            let lf: u64 = ld64u(q + 2)
+            let lg: u64 = ld64u(q + 3)
+            let ce0: u64 = (lc & SW_M16) + (le & SW_M16)
+            let bf0: u64 = (lb & SW_M16) + (lf & SW_M16)
+            let ie: u64 = (la & SW_M16) + (lg & SW_M16) + (ce0 << 4) + (ce0 << 2) + SW_BI - ((bf0 << 2) + bf0)
+            let ce1: u64 = ((lc >> 8) & SW_M16) + ((le >> 8) & SW_M16)
+            let bf1: u64 = ((lb >> 8) & SW_M16) + ((lf >> 8) & SW_M16)
+            let io: u64 = ((la >> 8) & SW_M16) + ((lg >> 8) & SW_M16) + (ce1 << 4) + (ce1 << 2) + SW_BI - ((bf1 << 2) + bf1)
+            let m: u64 = mid + (((r * nstr + si) * 2) * 8) as u64
+            st64u(m, ie)
+            st64u(m + 8, io)
+            si = si + 1
+        }
+        r = r + 1
+    }
+    var cx: usize = 0
+    if fx == 3 {
+        cx = 1
+    }
+    var si2: usize = 0
+    while si2 < nstr {
+        var y: usize = 0
+        var va: u64 = 0
+        var vb: u64 = 0
+        var vc: u64 = 0
+        var ve: u64 = 0
+        var vf: u64 = 0
+        var vq: u64 = 0
+        if fy == 2 && fx != 2 {
+            let q0: u64 = src + (si2 * 8 + cx) as u64
+            va = ld64u(q0 - (2 * ss) as u64)
+            vb = ld64u(q0 - ss as u64)
+            vc = ld64u(q0)
+            ve = ld64u(q0 + ss as u64)
+            vf = ld64u(q0 + (2 * ss) as u64)
+            vq = q0 + (3 * ss) as u64
+        }
+        while y < hn {
+            var rows: [u64; 12] = [0; 12]
+            var k: usize = 0
+            while k < 6 {
+                let m: u64 = mid + ((((y + k) * nstr + si2) * 2) * 8) as u64
+                rows[k * 2] = ld64u(m)
+                rows[k * 2 + 1] = ld64u(m + 8)
+                k = k + 1
+            }
+            let je: u64 = sw_v16(rows[0], rows[2], rows[4], rows[6], rows[8], rows[10])
+            let jo: u64 = sw_v16(rows[1], rows[3], rows[5], rows[7], rows[9], rows[11])
+            var res: u64 = je | (jo << 8)
+            if fx == 2 && fy == 1 {
+                let hv: u64 = sw_hclip(rows[4]) | (sw_hclip(rows[5]) << 8)
+                res = sw_avg8(res, hv)
+            } else if fx == 2 && fy == 3 {
+                let hv2: u64 = sw_hclip(rows[6]) | (sw_hclip(rows[7]) << 8)
+                res = sw_avg8(res, hv2)
+            } else if fy == 2 && fx != 2 {
+                let vg: u64 = ld64u(vq)
+                res = sw_avg8(res, sw_tap8(va, vb, vc, ve, vf, vg, 0))
+                va = vb
+                vb = vc
+                vc = ve
+                ve = vf
+                vf = vg
+                vq = vq + ss as u64
+            }
+            st64u(dst + (y * dstride + si2 * 8) as u64, res)
+            y = y + 1
+        }
+        si2 = si2 + 1
+    }
+}
+
+fn mck_c(dst: u64, dstride: usize, src: u64, ss: usize, w: i32, h: i32, fx: i32, fy: i32, mid: u64) {
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    var y: usize = 0
+    while y < hn + 5 {
+        let p: u64 = ptr_off(src, ((y as i64) - 2) * (ss as i64))
+        var a: i32 = raw.ldu8(p - 2, 0)
+        var b: i32 = raw.ldu8(p - 1, 0)
+        var c: i32 = raw.ldu8(p, 0)
+        var e: i32 = raw.ldu8(p, 1)
+        var f: i32 = raw.ldu8(p, 2)
+        var x: usize = 0
+        var m: u64 = mid + (y * 64) as u64
+        while x < wn {
+            let g: i32 = raw.ldu8(p, x + 3)
+            *(m as *mut i32) = a - 5 * b + 20 * c + 20 * e - 5 * f + g
+            m = m + 4
+            a = b
+            b = c
+            c = e
+            e = f
+            f = g
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var x2: usize = 0
+    while x2 < wn {
+        var m0: u64 = mid + (x2 * 4) as u64
+        var a: i32 = *(m0 as *mut i32)
+        var b: i32 = *((m0 + 64) as *mut i32)
+        var c: i32 = *((m0 + 128) as *mut i32)
+        var e: i32 = *((m0 + 192) as *mut i32)
+        var f: i32 = *((m0 + 256) as *mut i32)
+        m0 = m0 + 320
+        var qa: i32 = 0
+        var qb: i32 = 0
+        var qc: i32 = 0
+        var qe: i32 = 0
+        var qf: i32 = 0
+        var qp: u64 = 0
+        if fy == 2 && fx != 2 {
+            var cx: usize = x2
+            if fx == 3 {
+                cx = x2 + 1
+            }
+            let q0: u64 = src + cx as u64
+            qa = raw.ldu8(q0 - (2 * ss) as u64, 0)
+            qb = raw.ldu8(q0 - ss as u64, 0)
+            qc = raw.ldu8(q0, 0)
+            qe = raw.ldu8(q0 + ss as u64, 0)
+            qf = raw.ldu8(q0 + (2 * ss) as u64, 0)
+            qp = q0 + (3 * ss) as u64
+        }
+        var o: u64 = dst + x2 as u64
+        var y: usize = 0
+        while y < hn {
+            let g: i32 = *(m0 as *mut i32)
+            let j: i32 = raw.clip255((a - 5 * b + 20 * c + 20 * e - 5 * f + g + 512) >> 10)
+            var v: i32 = j
+            if fx == 2 && fy == 1 {
+                v = (j + raw.clip255((c + 16) >> 5) + 1) >> 1
+            }
+            if fx == 2 && fy == 3 {
+                v = (j + raw.clip255((e + 16) >> 5) + 1) >> 1
+            }
+            if fy == 2 && fx != 2 {
+                let qg: i32 = raw.ldu8(qp, 0)
+                let vv: i32 = raw.clip255((qa - 5 * qb + 20 * qc + 20 * qe - 5 * qf + qg + 16) >> 5)
+                v = (j + vv + 1) >> 1
+                qa = qb
+                qb = qc
+                qc = qe
+                qe = qf
+                qf = qg
+                qp = qp + ss as u64
+            }
+            *(o as *mut u8) = v as u8
+            a = b
+            b = c
+            c = e
+            e = f
+            f = g
+            m0 = m0 + 64
+            o = o + dstride as u64
+            y = y + 1
+        }
+        x2 = x2 + 1
+    }
+}
+
+fn mc_chroma(d: *mut params.H264, dst: u64, dstride: usize, plane: u64, stride: usize, cw: i32, ch: i32, ix: i32, iy: i32, fx: i32, fy: i32, w: i32, h: i32) {
+    let pad: i32 = (types.PAD / 2) as i32
+    var src: u64 = at(plane, stride, ix, iy)
+    var ss: usize = stride
+    if ix < 0 - pad || ix + w + 1 > cw + pad || iy < 0 - pad || iy + h + 1 > ch + pad {
+        let emu: u64 = (*d).pred + PR_EMU as u64
+        var yy: i32 = 0
+        while yy < h + 1 {
+            var xx: i32 = 0
+            let sy: i32 = raw.clip3(0, ch - 1, iy + yy)
+            while xx < w + 1 {
+                let sx: i32 = raw.clip3(0, cw - 1, ix + xx)
+                raw.stb(emu, (yy * 32 + xx) as usize, raw.ldu8(plane, (sy as usize) * stride + (sx as usize)))
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        src = emu
+        ss = 32
+    }
+    let wn: usize = w as usize
+    let hn: usize = h as usize
+    if fx == 0 && fy == 0 {
+        copy_rows(dst, dstride, src, ss, w, h)
+        return
+    }
+    let wa: i32 = (8 - fx) * (8 - fy)
+    let wb: i32 = fx * (8 - fy)
+    let wc: i32 = (8 - fx) * fy
+    let wd: i32 = fx * fy
+    if w >= 8 {
+        mcc8(dst, dstride, src, ss, w, h, wa, wb, wc, wd)
+        return
+    }
+    if w == 4 {
+        mcc4(dst, dstride, src, ss, h, wa, wb, wc, wd)
+        return
+    }
+    var y: usize = 0
+    while y < hn {
+        let p: u64 = src + (y * ss) as u64
+        let q: u64 = p + ss as u64
+        let o: u64 = dst + (y * dstride) as u64
+        var a: i32 = raw.ldu8(p, 0)
+        var c: i32 = raw.ldu8(q, 0)
+        var x: usize = 0
+        while x < wn {
+            let b: i32 = raw.ldu8(p, x + 1)
+            let e: i32 = raw.ldu8(q, x + 1)
+            *((o + x as u64) as *mut u8) = ((wa * a + wb * b + wc * c + wd * e + 32) >> 6) as u8
+            a = b
+            c = e
+            x = x + 1
+        }
+        y = y + 1
+    }
+}

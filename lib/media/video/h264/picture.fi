@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.video.h264.deblock
+import media.video.h264.marking
+import media.video.h264.params
+import media.video.h264.pics
+import media.video.h264.raw
+import media.video.h264.reflist
+import media.video.h264.slicehdr
+import media.video.h264.types
+
+export {
+    extend_edges, finish_picture, start_picture,
+}
+
+fn extend_edges(d: *mut params.H264, i: usize) {
+    let p: *mut types.Pic = &(*d).dpb[i]
+    let sy: usize = (*d).stride_y as usize
+    let sc: usize = (*d).stride_c as usize
+    let w: usize = ((*d).mb_w * 16) as usize
+    let h: usize = ((*d).mb_h * 16) as usize
+    extend_plane((*p).y, sy, w, h, types.PAD)
+    extend_plane((*p).u, sc, w / 2, h / 2, types.PAD / 2)
+    extend_plane((*p).v, sc, w / 2, h / 2, types.PAD / 2)
+}
+
+fn extend_plane(base: u64, stride: usize, w: usize, h: usize, pad: usize) {
+    var y: usize = 0
+    while y < h {
+        let row: u64 = base + (y * stride) as u64
+        let l: i32 = raw.ldu8(row, 0)
+        let r: i32 = raw.ldu8(row, w - 1)
+        var x: usize = 1
+        while x <= pad {
+            *((row - x as u64) as *mut u8) = l as u8
+            *((row + (w - 1 + x) as u64) as *mut u8) = r as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var k: usize = 1
+    while k <= pad {
+        rt.mem_copy(base - (k * stride) as u64 - pad as u64, base - pad as u64, w + 2 * pad)
+        rt.mem_copy(base + ((h - 1 + k) * stride) as u64 - pad as u64, base + ((h - 1) * stride) as u64 - pad as u64, w + 2 * pad)
+        k = k + 1
+    }
+}
+
+fn conceal(d: *mut params.H264) {
+    let cur: *mut types.Pic = &(*d).dpb[(*d).cur as usize]
+    var src: i32 = -1
+    var best: i32 = -1
+    var i: i32 = 0
+    while i < 18 {
+        if i != (*d).cur && (*d).dpb[i as usize].ref_mark != 0 && (*d).dpb[i as usize].id > best {
+            best = (*d).dpb[i as usize].id
+            src = i
+        }
+        i = i + 1
+    }
+    var mb: i32 = 0
+    while mb < (*d).mbs {
+        if raw.ldi32((*d).mbslice, mb as usize) < 0 {
+            let mx: i32 = mb % (*d).mb_w
+            let my: i32 = mb / (*d).mb_w
+            var yy: i32 = 0
+            while yy < 16 {
+                let o: usize = ((my * 16 + yy) * (*d).stride_y + mx * 16) as usize
+                if src >= 0 {
+                    rt.mem_copy((*cur).y + o as u64, (*d).dpb[src as usize].y + o as u64, 16)
+                } else {
+                    rt.mem_set((*cur).y + o as u64, 128 as u8, 16)
+                }
+                yy = yy + 1
+            }
+            yy = 0
+            while yy < 8 {
+                let oc: usize = ((my * 8 + yy) * (*d).stride_c + mx * 8) as usize
+                if src >= 0 {
+                    rt.mem_copy((*cur).u + oc as u64, (*d).dpb[src as usize].u + oc as u64, 8)
+                    rt.mem_copy((*cur).v + oc as u64, (*d).dpb[src as usize].v + oc as u64, 8)
+                } else {
+                    rt.mem_set((*cur).u + oc as u64, 128 as u8, 8)
+                    rt.mem_set((*cur).v + oc as u64, 128 as u8, 8)
+                }
+                yy = yy + 1
+            }
+            raw.sti32((*d).mbslice, mb as usize, (*d).nslices)
+            raw.stb((*d).mbt, mb as usize, types.MB_P)
+            raw.stb((*cur).intra, mb as usize, 0)
+        }
+        mb = mb + 1
+    }
+}
+
+fn finish_picture(d: *mut params.H264) {
+    if (*d).have_pic == 0 {
+        return
+    }
+    (*d).have_pic = 0
+    let ci: i32 = (*d).cur
+    let saved: types.Sh = (*d).sh
+    (*d).sh = (*d).psh
+    let sh: *mut types.Sh = &(*d).sh
+    if (*d).parse_only == 0 {
+        conceal(d)
+        deblock.deblock_picture(d)
+    }
+    let cur: *mut types.Pic = &(*d).dpb[ci as usize]
+    (*d).mmco5 = 0
+    if (*sh).nal_ref_idc != 0 {
+        reflist.update_wraps(d)
+        if (*sh).idr != 0 {
+            marking.unmark_all(d)
+            if (*sh).long_term_ref != 0 {
+                (*cur).ref_mark = 2
+                (*cur).long_idx = 0
+                (*d).max_long_idx = 0
+            } else {
+                (*cur).ref_mark = 1
+                (*d).max_long_idx = -1
+            }
+        } else {
+            (*cur).ref_mark = 1
+            if (*sh).adaptive != 0 {
+                marking.run_mmco(d)
+            } else {
+                marking.sliding_window(d, ci)
+            }
+        }
+        (*cur).frame_num = (*sh).frame_num
+        (*d).prev_ref_frame_num = (*sh).frame_num
+        if (*d).parse_only == 0 {
+            extend_edges(d, ci as usize)
+        }
+    } else {
+        (*cur).ref_mark = 0
+    }
+    if (*d).mmco5 != 0 {
+        let keep: i32 = (*cur).needs_output
+        (*cur).needs_output = 0
+        marking.flush_output(d)
+        (*cur).needs_output = keep
+        let t: i32 = raw.imin((*d).poc_top, (*d).poc_bottom)
+        (*cur).poc = (*cur).poc - t
+        (*d).poc_top = (*d).poc_top - t
+        (*d).poc_bottom = (*d).poc_bottom - t
+        (*d).prev_poc_msb = 0
+        (*d).prev_poc_lsb = (*d).poc_top
+        (*d).prev_frame_num = 0
+        (*d).prev_fn_offset = 0
+        (*d).prev_ref_frame_num = 0
+        (*cur).frame_num = 0
+    }
+    types.dbg("pic poc", (*cur).poc as i64)
+    types.dbg("pic frame_num", (*sh).frame_num as i64)
+    (*cur).is_ref_pic = (*sh).nal_ref_idc
+    (*cur).needs_output = 1
+    (*d).pic_count = (*d).pic_count + 1
+    marking.bump(d)
+    (*d).cur = -1
+    (*d).sh = saved
+}
+
+fn fill_frame_num_gap(d: *mut params.H264) {
+    let mf: i32 = reflist.max_frame_num(d)
+    var fnum: i32 = ((*d).prev_ref_frame_num + 1) % mf
+    var guard: i32 = 0
+    while fnum != (*d).sh.frame_num && guard < 32 {
+        guard = guard + 1
+        let s: i32 = marking.get_slot(d)
+        if s < 0 {
+            return
+        }
+        pics.alloc_pic(d, s as usize)
+        (*d).dpb[s as usize].upts = -1
+        update_wraps_for(d, fnum)
+        marking.sliding_window(d, s)
+        let p: *mut types.Pic = &(*d).dpb[s as usize]
+        var src: i32 = -1
+        var best: i32 = -1
+        var i: i32 = 0
+        while i < 18 {
+            if i != s && (*d).dpb[i as usize].ref_mark != 0 && (*d).dpb[i as usize].id > best {
+                best = (*d).dpb[i as usize].id
+                src = i
+            }
+            i = i + 1
+        }
+        if src >= 0 {
+            let sy: usize = (*d).stride_y as usize
+            let sc: usize = (*d).stride_c as usize
+            rt.mem_copy((*p).base_y, (*d).dpb[src as usize].base_y, sy * (((*d).mb_h * 16) as usize + 2 * types.PAD))
+            rt.mem_copy((*p).base_u, (*d).dpb[src as usize].base_u, sc * (((*d).mb_h * 8) as usize + types.PAD))
+            rt.mem_copy((*p).base_v, (*d).dpb[src as usize].base_v, sc * (((*d).mb_h * 8) as usize + types.PAD))
+            rt.mem_copy((*p).mv, (*d).dpb[src as usize].mv, ((*d).mbs as usize) * 128)
+            rt.mem_copy((*p).refid, (*d).dpb[src as usize].refid, ((*d).mbs as usize) * 16)
+            rt.mem_copy((*p).refix, (*d).dpb[src as usize].refix, ((*d).mbs as usize) * 8)
+            rt.mem_copy((*p).intra, (*d).dpb[src as usize].intra, (*d).mbs as usize)
+            (*p).poc = (*d).dpb[src as usize].poc
+        } else {
+            rt.mem_set((*p).base_y, 128 as u8, (*d).stride_y as usize * (((*d).mb_h * 16) as usize + 2 * types.PAD))
+            rt.mem_set((*p).base_u, 128 as u8, (*d).stride_c as usize * (((*d).mb_h * 8) as usize + types.PAD))
+            rt.mem_set((*p).base_v, 128 as u8, (*d).stride_c as usize * (((*d).mb_h * 8) as usize + types.PAD))
+            rt.mem_set((*p).mv, 0 as u8, ((*d).mbs as usize) * 128)
+            rt.mem_set((*p).intra, 1 as u8, (*d).mbs as usize)
+            (*p).poc = 0
+        }
+        (*p).id = (*d).next_id
+        (*d).next_id = (*d).next_id + 1
+        (*p).frame_num = fnum
+        (*p).frame_num_wrap = fnum
+        (*p).ref_mark = 1
+        (*p).needs_output = 0
+        (*p).non_existing = 1
+        (*d).prev_ref_frame_num = fnum
+        (*d).prev_frame_num = fnum
+        fnum = (fnum + 1) % mf
+    }
+}
+
+fn update_wraps_for(d: *mut params.H264, fnum: i32) {
+    let mf: i32 = reflist.max_frame_num(d)
+    var i: usize = 0
+    while i < 18 {
+        let p: *mut types.Pic = &(*d).dpb[i]
+        if (*p).ref_mark == 1 {
+            if (*p).frame_num > fnum {
+                (*p).frame_num_wrap = (*p).frame_num - mf
+            } else {
+                (*p).frame_num_wrap = (*p).frame_num
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn start_picture(d: *mut params.H264) -> i32 {
+    let sh: *mut types.Sh = &(*d).sh
+    if (*sh).idr != 0 {
+        if (*sh).no_output_prior != 0 {
+            var i: usize = 0
+            while i < 18 {
+                (*d).dpb[i].needs_output = 0
+                i = i + 1
+            }
+        } else {
+            marking.flush_output(d)
+        }
+        marking.unmark_all(d)
+        (*d).prev_ref_frame_num = 0
+    } else {
+        let mf: i32 = reflist.max_frame_num(d)
+        if (*sh).frame_num != (*d).prev_ref_frame_num && (*sh).frame_num != ((*d).prev_ref_frame_num + 1) % mf {
+            fill_frame_num_gap(d)
+        }
+    }
+    let s: i32 = marking.get_slot(d)
+    if s < 0 {
+        return 2
+    }
+    pics.alloc_pic(d, s as usize)
+    (*d).dpb[s as usize].upts = (*d).in_pts
+    slicehdr.compute_poc(d)
+    let p: *mut types.Pic = &(*d).dpb[s as usize]
+    (*p).id = (*d).next_id
+    (*d).next_id = (*d).next_id + 1
+    (*p).poc = (*d).poc
+    (*p).frame_num = (*sh).frame_num
+    (*p).frame_num_wrap = (*sh).frame_num
+    (*p).ref_mark = 0
+    (*p).needs_output = 0
+    (*p).non_existing = 0
+    (*p).pin = 0
+    (*p).long_idx = 0
+    (*d).cur = s
+    var m: usize = 0
+    let n: usize = (*d).mbs as usize
+    while m < n {
+        raw.sti32((*d).mbslice, m, -1)
+        m = m + 1
+    }
+    rt.mem_set((*d).mbt, 0 as u8, n)
+    rt.mem_set((*p).intra, 0 as u8, n)
+    rt.mem_set((*p).mv, 0 as u8, n * 128)
+    rt.mem_set((*p).refid, 255 as u8, n * 16)
+    rt.mem_set((*p).refix, 255 as u8, n * 8)
+    (*d).nslices = 0
+    (*d).have_pic = 1
+    (*d).psh = (*d).sh
+    return 0
+}

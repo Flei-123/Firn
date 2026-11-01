@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import zip.zip
+import docview.office.ooxml
+
+export {
+    Package, Rels, Rel,
+    pkg_new, pkg_open, pkg_free, pkg_ok, pkg_has, pkg_read, pkg_read_xml, pkg_main_part,
+    pkg_content_type_is,
+    rels_new, rels_free, rels_load, rels_count, rels_id, rels_type, rels_target, rels_external,
+    rels_find_id, rels_find_type,
+    part_dir, resolve_target,
+    XML_PART_MAX, ENTRY_MAX, TOTAL_MAX, ENTRIES_MAX,
+}
+
+const XML_PART_MAX: usize = 25165824
+const ENTRY_MAX: u64 = 67108864
+const TOTAL_MAX: u64 = 268435456
+const ENTRIES_MAX: usize = 20000
+
+struct Package {
+    bytes: rt.Buf,
+    zr: zip.ZipReader,
+    open: bool,
+}
+
+struct Rel {
+    id_off: u32,
+    id_n: u32,
+    type_off: u32,
+    type_n: u32,
+    target_off: u32,
+    target_n: u32,
+    external: bool,
+}
+
+struct Rels {
+    items: Vec[Rel],
+    pool: rt.Buf,
+}
+
+fn pkg_new() -> Package {
+    return Package { bytes: rt.buf_new(), zr: zip.zip_reader_empty(), open: false }
+}
+
+fn pkg_free(p: *mut Package) {
+    if (*p).open {
+        zip.zip_reader_free(&(*p).zr)
+    }
+    rt.buf_free(&(*p).bytes)
+    (*p).open = false
+}
+
+fn pkg_ok(p: *mut Package) -> bool {
+    return (*p).open
+}
+
+fn limits() -> zip.ZipLimits {
+    return zip.ZipLimits { max_entries: ENTRIES_MAX, max_entry_size: ENTRY_MAX, max_total_size: TOTAL_MAX }
+}
+
+fn open_fail(e: ZipError) -> zip.ZipReader {
+    return zip.zip_reader_empty()
+}
+
+fn pkg_open(p: *mut Package, data: u64, n: usize) -> bool {
+    if (*p).open {
+        return false
+    }
+    rt.buf_push_bytes(&(*p).bytes, data, n)
+    if rt.buf_len(&(*p).bytes) != n {
+        return false
+    }
+    var failed: bool = false
+    let z: zip.ZipReader = zip.zip_reader_open_limits(rt.buf_ptr(&(*p).bytes), n, limits()) catch | e | (open_fail(e))
+    if zip.zip_entry_count(&z) == 0 {
+        failed = true
+    }
+    if failed {
+        return false
+    }
+    (*p).zr = z
+    (*p).open = true
+    return true
+}
+
+fn norm_name(name: str) -> str {
+    if name.n > 0 && rt.ld8(name.p as u64, 0) == 47 as u8 {
+        return str { p: rt.ptr_of((name.p as u64) + 1), n: name.n - 1 }
+    }
+    return name
+}
+
+fn pkg_find(p: *mut Package, name: str) -> i64 {
+    if !(*p).open {
+        return -1
+    }
+    return zip.zip_find(&(*p).zr, norm_name(name))
+}
+
+fn pkg_has(p: *mut Package, name: str) -> bool {
+    return pkg_find(p, name) >= 0
+}
+
+fn pkg_read(p: *mut Package, name: str, out: *mut rt.Buf, max: usize) -> bool {
+    let i: i64 = pkg_find(p, name)
+    if i < 0 {
+        return false
+    }
+    if zip.zip_entry_size(&(*p).zr, i as usize) > (max as u64) {
+        return false
+    }
+    var bad: bool = false
+    let got: usize = zip.zip_extract(&(*p).zr, i as usize, out) catch | e | (extract_fail(&bad))
+    if bad {
+        return false
+    }
+    return true
+}
+
+fn extract_fail(bad: *mut bool) -> usize {
+    *bad = true
+    return 0
+}
+
+fn pkg_read_xml(p: *mut Package, name: str, raw: *mut rt.Buf, d: *mut xml.Doc) -> bool {
+    rt.buf_clear(raw)
+    if !pkg_read(p, name, raw, XML_PART_MAX) {
+        return false
+    }
+    var bad: bool = false
+    let r: bool = xml.parse(d, rt.buf_ptr(raw), rt.buf_len(raw)) catch false
+    if !r {
+        return false
+    }
+    return xml.valid(d)
+}
+
+fn rels_new() -> Rels {
+    return Rels { items: vec_new[Rel](), pool: rt.buf_new() }
+}
+
+fn rels_free(r: *mut Rels) {
+    vec_free[Rel](&(*r).items)
+    rt.buf_free(&(*r).pool)
+}
+
+fn rels_count(r: *mut Rels) -> usize {
+    return vec_len[Rel](&(*r).items)
+}
+
+fn pool_str(r: *mut Rels, off: u32, n: u32) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*r).pool) + (off as u64)), n: n as usize }
+}
+
+fn rels_id(r: *mut Rels, i: usize) -> str {
+    let e: *mut Rel = vec_elem_ptr[Rel](&(*r).items, i)
+    return pool_str(r, (*e).id_off, (*e).id_n)
+}
+
+fn rels_type(r: *mut Rels, i: usize) -> str {
+    let e: *mut Rel = vec_elem_ptr[Rel](&(*r).items, i)
+    return pool_str(r, (*e).type_off, (*e).type_n)
+}
+
+fn rels_target(r: *mut Rels, i: usize) -> str {
+    let e: *mut Rel = vec_elem_ptr[Rel](&(*r).items, i)
+    return pool_str(r, (*e).target_off, (*e).target_n)
+}
+
+fn rels_external(r: *mut Rels, i: usize) -> bool {
+    return (*vec_elem_ptr[Rel](&(*r).items, i)).external
+}
+
+fn rels_find_id(r: *mut Rels, id: str) -> i64 {
+    var i: usize = 0
+    let n: usize = rels_count(r)
+    while i < n {
+        if rels_id(r, i) == id {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn rels_find_type(r: *mut Rels, suffix: str) -> i64 {
+    var i: usize = 0
+    let n: usize = rels_count(r)
+    while i < n {
+        if ooxml.ends_with(rels_type(r, i), suffix) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn part_dir(part: str) -> str {
+    var i: usize = part.n
+    while i > 0 {
+        if rt.ld8(part.p as u64, i - 1) == 47 as u8 {
+            return str { p: part.p, n: i }
+        }
+        i = i - 1
+    }
+    return str { p: part.p, n: 0 }
+}
+
+fn resolve_target(base_part: str, target: str, out: *mut rt.Buf) {
+    var start: usize = rt.buf_len(out)
+    var rest: str = target
+    if rest.n > 0 && rt.ld8(rest.p as u64, 0) == 47 as u8 {
+        rest = str { p: rt.ptr_of((rest.p as u64) + 1), n: rest.n - 1 }
+    } else {
+        let dir: str = part_dir(base_part)
+        rt.buf_push_bytes(out, dir.p as u64, dir.n)
+    }
+    var i: usize = 0
+    while i < rest.n {
+        var j: usize = i
+        while j < rest.n && rt.ld8(rest.p as u64, j) != 47 as u8 {
+            j = j + 1
+        }
+        let seg: str = str { p: rt.ptr_of((rest.p as u64) + (i as u64)), n: j - i }
+        if seg == ".." {
+            var k: usize = rt.buf_len(out)
+            if k > start {
+                k = k - 1
+                while k > start && rt.buf_at(out, k - 1) != 47 as u8 {
+                    k = k - 1
+                }
+                rt.buf_set_len(out, k)
+            }
+        } else if seg == "." {
+        } else {
+            rt.buf_push_bytes(out, seg.p as u64, seg.n)
+            if j < rest.n {
+                rt.buf_push(out, 47 as u8)
+            }
+        }
+        i = j + 1
+    }
+}
+
+fn pool_put(r: *mut Rels, s: str) -> u32 {
+    let off: usize = rt.buf_len(&(*r).pool)
+    rt.buf_push_bytes(&(*r).pool, s.p as u64, s.n)
+    return off as u32
+}
+
+fn rels_part_name(source_part: str, out: *mut rt.Buf) {
+    let dir: str = part_dir(source_part)
+    rt.buf_push_bytes(out, dir.p as u64, dir.n)
+    rt.buf_push_bytes(out, str_lit_rels_dir().p as u64, str_lit_rels_dir().n)
+    let base: str = str { p: rt.ptr_of((source_part.p as u64) + (dir.n as u64)), n: source_part.n - dir.n }
+    rt.buf_push_bytes(out, base.p as u64, base.n)
+    rt.buf_push_bytes(out, str_lit_rels_ext().p as u64, str_lit_rels_ext().n)
+}
+
+fn str_lit_rels_dir() -> str {
+    return "_rels/"
+}
+
+fn str_lit_rels_ext() -> str {
+    return ".rels"
+}
+
+fn rels_load(pk: *mut Package, source_part: str, r: *mut Rels) -> bool {
+    var name: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&name)
+    rels_part_name(norm_name(source_part), &name)
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var d: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&d)
+    if !pkg_read_xml(pk, rt.buf_str(&name), &raw, &d) {
+        return false
+    }
+    let root: u32 = xml.root(&d)
+    var c: u32 = ooxml.first_el(&d, root)
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    while c != xml.NONE {
+        if ooxml.is_el(&d, c, "Relationship") && vec_len[Rel](&(*r).items) < 100000 {
+            let id: str = ooxml.attr_l(&d, c, "Id")
+            let ty: str = ooxml.attr_l(&d, c, "Type")
+            let tg: str = ooxml.attr_l(&d, c, "Target")
+            let ext: bool = ooxml.attr_l(&d, c, "TargetMode") == "External"
+            rt.buf_clear(&tmp)
+            if ext {
+                rt.buf_push_bytes(&tmp, tg.p as u64, tg.n)
+            } else {
+                resolve_target(norm_name(source_part), tg, &tmp)
+            }
+            let tstr: str = rt.buf_str(&tmp)
+            let e: Rel = Rel { id_off: pool_put(r, id), id_n: id.n as u32, type_off: pool_put(r, ty), type_n: ty.n as u32,
+                target_off: pool_put(r, tstr), target_n: tstr.n as u32, external: ext }
+            vec_push[Rel](&(*r).items, e)
+        }
+        c = ooxml.next_el(&d, c)
+    }
+    return true
+}
+
+fn pkg_main_part(pk: *mut Package, out: *mut rt.Buf) -> bool {
+    var rl: Rels = rels_new()
+    defer rels_free(&rl)
+    if !rels_load(pk, "", &rl) {
+        return false
+    }
+    let i: i64 = rels_find_type(&rl, "/officeDocument")
+    if i < 0 {
+        return false
+    }
+    let t: str = rels_target(&rl, i as usize)
+    rt.buf_push_bytes(out, t.p as u64, t.n)
+    return true
+}
+
+fn pkg_content_type_is(pk: *mut Package, part: str, needle: str) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var d: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&d)
+    if !pkg_read_xml(pk, "[Content_Types].xml", &raw, &d) {
+        return false
+    }
+    let want: str = norm_name(part)
+    var c: u32 = ooxml.first_el(&d, xml.root(&d))
+    while c != xml.NONE {
+        if ooxml.is_el(&d, c, "Override") {
+            let pn: str = norm_name(ooxml.attr_l(&d, c, "PartName"))
+            if pn == want {
+                let ct: str = ooxml.attr_l(&d, c, "ContentType")
+                return contains(ct, needle)
+            }
+        }
+        c = ooxml.next_el(&d, c)
+    }
+    return false
+}
+
+fn contains(s: str, needle: str) -> bool {
+    if needle.n > s.n {
+        return false
+    }
+    var i: usize = 0
+    while i + needle.n <= s.n {
+        if rt.mem_eq((s.p as u64) + (i as u64), needle.p as u64, needle.n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

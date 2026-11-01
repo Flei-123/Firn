@@ -9,8 +9,13 @@ import mc.mc_sem
 import mc.mc_version
 import mc.server.sv_state
 import mc.server.sv_send
+import mc.server.sv_presence
+import mc.server.sv_ver
 import mc.server.sv_chunks
 import mc.server.sv_dig
+import mc.server.sv_gen_state
+import mc.server.ent.ent_inv
+import mc.server.inv.sv_health
 
 export {
     play_join, play_handle, play_keepalive, play_time_all, play_broadcast_chat, send_time,
@@ -26,15 +31,12 @@ fn valid_coord(v: f64) -> bool {
 }
 
 fn send_time(srv: *mut sv_state.Server, s: *mut sv_state.Session) -> bool {
-    var v: rt.Buf = rt.buf_new()
-    mc_encode.vals_i64(&v, "age", (*srv).game_time)
-    mc_encode.vals_i64(&v, "time", (*srv).day_time)
-    let ok: bool = sv_send.send_vals(srv, s, mc_version.ST_PLAY, mc_sem.SEM_PLAY_S2C_UPDATE_TIME, &v)
-    rt.buf_free(&v)
-    return ok
+    let send: fn(*mut sv_state.Server, *mut sv_state.Session) -> bool = (*sv_ver.adapter_of(srv)).send_time
+    return send(srv, s)
 }
 
-fn log_joined(s: *mut sv_state.Session) {
+fn log_joined(srv: *mut sv_state.Server, s: *mut sv_state.Session) {
+    if (*srv).cfg.quiet_joins { return }
     var line: rt.Buf = rt.buf_new()
     rt.buf_push_bytes(&line, (&(*s).name[0]) as u64, (*s).name_n)
     rt.buf_push_bytes(&line, " joined the game".p as u64, 16)
@@ -53,16 +55,27 @@ fn play_join(srv: *mut sv_state.Server, s: *mut sv_state.Session, now_ms: i64) -
     (*s).cz = sv_chunks.chunk_of((*s).z)
     (*s).ka_next = now_ms + (*srv).cfg.keepalive_interval_ms
     (*s).gamemode = (*srv).cfg.game_mode
+    let restored: bool = (*srv).gen_world && sv_gen_state.gen_state_load_player(srv, s)
+    if restored {
+        (*s).cx = sv_chunks.chunk_of((*s).x)
+        (*s).cz = sv_chunks.chunk_of((*s).z)
+    }
     sv_chunks.chunks_init(srv, s)
-    if !(*srv).join(srv, s) {
+    let join: fn(*mut sv_state.Server, *mut sv_state.Session) -> bool = (*sv_ver.adapter_of(srv)).join
+    if !join(srv, s) {
         (*s).closing = true
         return false
     }
-    let announce: fn(*mut sv_state.Server, *mut sv_state.Session) = (*srv).on_join
-    announce(srv, s)
+    if (*sv_ver.adapter_of(srv)).declare_commands {
+        let announce: fn(*mut sv_state.Server, *mut sv_state.Session) = (*srv).on_join
+        announce(srv, s)
+    }
     sv_chunks.chunks_send_center(srv, s)
+    if restored { ent_inv.inv_push_all(srv, s) }
+    sv_health.send_health(srv, s)
     (*s).joined = true
-    log_joined(s)
+    log_joined(srv, s)
+    sv_presence.announce_joined(srv, s)
     (*srv).online = (*srv).online + 1
     return !(*s).closing
 }
@@ -96,7 +109,12 @@ fn handle_position(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32,
         if sv_send.field_f32(srv, mc_version.ST_PLAY, id, "pitch", body, &pitch) && pitch == pitch { (*s).pitch = pitch }
     }
     var og: bool = false
-    if sv_send.field_bool(srv, mc_version.ST_PLAY, id, "onGround", body, &og) { (*s).on_ground = og }
+    var flags: u8 = 0 as u8
+    if sv_send.field_bool(srv, mc_version.ST_PLAY, id, "onGround", body, &og) {
+        (*s).on_ground = og
+    } else if sv_send.field_u8(srv, mc_version.ST_PLAY, id, "flags", body, &flags) {
+        (*s).on_ground = (flags & (1 as u8)) != (0 as u8)
+    }
 }
 
 fn play_broadcast_chat(srv: *mut sv_state.Server, p: u64, n: usize) {
@@ -144,6 +162,17 @@ fn handle_tab_complete(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: 
     run(srv, s, txn, p, n)
 }
 
+fn packet_named(srv: *mut sv_state.Server, id: i32, want: str) -> bool {
+    let p: u64 = (*srv).ver.name_of(mc_version.ST_PLAY, mc_version.DIR_C2S, id)
+    if p == 0 { return false }
+    var i: usize = 0
+    while i < want.n {
+        if rt.ld8(p, i) != rt.ld8(want.p as u64, i) { return false }
+        i = i + 1
+    }
+    return rt.ld8(p, want.n) == 0
+}
+
 fn play_handle(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, body: *mut bytes.Bytes) {
     let st: i32 = mc_version.ST_PLAY
     if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) {
@@ -168,6 +197,8 @@ fn play_handle(srv: *mut sv_state.Server, s: *mut sv_state.Session, id: i32, bod
         handle_chat_command(srv, s, id, body)
     } else if sv_send.sem_is(srv, id, mc_sem.SEM_PLAY_C2S_TAB_COMPLETE) {
         handle_tab_complete(srv, s, id, body)
+    } else if packet_named(srv, id, "chat_command_signed") {
+        handle_chat_command(srv, s, id, body)
     } else {
         sv_dig.dig_handle(srv, s, id, body)
     }

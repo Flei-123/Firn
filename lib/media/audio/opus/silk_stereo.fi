@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.opus.opus
+import media.audio.opus.celt_fix
+import media.audio.opus.silk_math
+import media.audio.opus.silk_tables
+
+export { StereoState, stereo_new, stereo_free, stereo_reset_pred, stereo_reset_all, stereo_decode_pred, stereo_decode_mid_only, stereo_buffer_mid, stereo_ms_to_lr }
+
+const INTERP_LEN_MS: i32 = 8
+const SUB_STEP_Q16: i32 = 6554
+
+struct StereoState {
+    pred_prev: u64,
+    smid: u64,
+    sside: u64,
+}
+
+fn stereo_new() -> StereoState {
+    var s: StereoState = StereoState { pred_prev: rt.heap_alloc(8), smid: rt.heap_alloc(4), sside: rt.heap_alloc(4) }
+    celt_fix.st32(s.pred_prev, 0, 0)
+    celt_fix.st32(s.pred_prev, 1, 0)
+    celt_fix.st16(s.smid, 0, 0)
+    celt_fix.st16(s.smid, 1, 0)
+    stereo_reset_side(&s)
+    return s
+}
+
+fn stereo_reset_side(s: *mut StereoState) {
+    celt_fix.st16((*s).sside, 0, 0)
+    celt_fix.st16((*s).sside, 1, 0)
+}
+
+fn stereo_reset_pred(s: *mut StereoState) {
+    celt_fix.st32((*s).pred_prev, 0, 0)
+    celt_fix.st32((*s).pred_prev, 1, 0)
+    stereo_reset_side(s)
+}
+
+fn stereo_reset_all(s: *mut StereoState) {
+    stereo_reset_pred(s)
+    celt_fix.st16((*s).smid, 0, 0)
+    celt_fix.st16((*s).smid, 1, 0)
+}
+
+fn dequant_pred(ix0: i32, ix1: i32, ix2: i32) -> i32 {
+    let i: i32 = ix0 + 3 * ix2
+    let low: i32 = silk_tables.silk_stereo_quant(i as% usize) as% i32
+    let step: i32 = silk_math.smulwb((silk_tables.silk_stereo_quant((i + 1) as% usize) as% i32) - low, SUB_STEP_Q16)
+    return silk_math.smlabb(low, step, 2 * ix1 + 1)
+}
+
+fn stereo_decode_pred(e: *mut opus.Ec, pred: u64) {
+    let n: i32 = opus.ec_icdf(e, silk_tables.silk_stereo_joint_icdf_addr(), 8)
+    let hi0: i32 = n / 5
+    let hi1: i32 = n - 5 * hi0
+    let a0: i32 = opus.ec_icdf(e, silk_tables.silk_uniform3_icdf_addr(), 8)
+    let a1: i32 = opus.ec_icdf(e, silk_tables.silk_uniform5_icdf_addr(), 8)
+    let b0: i32 = opus.ec_icdf(e, silk_tables.silk_uniform3_icdf_addr(), 8)
+    let b1: i32 = opus.ec_icdf(e, silk_tables.silk_uniform5_icdf_addr(), 8)
+    let p0: i32 = dequant_pred(a0, a1, hi0)
+    let p1: i32 = dequant_pred(b0, b1, hi1)
+    celt_fix.st32(pred, 0, p0 - p1)
+    celt_fix.st32(pred, 1, p1)
+}
+
+fn stereo_decode_mid_only(e: *mut opus.Ec) -> i32 {
+    return opus.ec_icdf(e, silk_tables.silk_stereo_mid_icdf_addr(), 8)
+}
+
+fn stereo_buffer_mid(s: *mut StereoState, x1: u64, fl: i32) {
+    celt_fix.st16(x1, 0, celt_fix.ld16((*s).smid, 0))
+    celt_fix.st16(x1, 1, celt_fix.ld16((*s).smid, 1))
+    celt_fix.st16((*s).smid, 0, celt_fix.ld16(x1, fl))
+    celt_fix.st16((*s).smid, 1, celt_fix.ld16(x1, fl + 1))
+}
+
+fn side_sample(x1: u64, x2: u64, n: i32, p0: i32, p1: i32) -> i32 {
+    var sum: i32 = ((celt_fix.ld16(x1, n) + celt_fix.ld16(x1, n + 2) + (celt_fix.ld16(x1, n + 1) << 1)) << 9)
+    sum = silk_math.smlawb(celt_fix.ld16(x2, n + 1) << 8, sum, p0)
+    sum = silk_math.smlawb(sum, celt_fix.ld16(x1, n + 1) << 11, p1)
+    return silk_math.sat16(silk_math.rshift_round(sum, 8))
+}
+
+fn stereo_ms_to_lr(s: *mut StereoState, x1: u64, x2: u64, pred: u64, fs_khz: i32, fl: i32) {
+    stereo_buffer_mid(s, x1, fl)
+    celt_fix.st16(x2, 0, celt_fix.ld16((*s).sside, 0))
+    celt_fix.st16(x2, 1, celt_fix.ld16((*s).sside, 1))
+    celt_fix.st16((*s).sside, 0, celt_fix.ld16(x2, fl))
+    celt_fix.st16((*s).sside, 1, celt_fix.ld16(x2, fl + 1))
+    var p0: i32 = celt_fix.ld32((*s).pred_prev, 0)
+    var p1: i32 = celt_fix.ld32((*s).pred_prev, 1)
+    let n0: i32 = celt_fix.ld32(pred, 0)
+    let n1: i32 = celt_fix.ld32(pred, 1)
+    let denom: i32 = 65536 / (INTERP_LEN_MS * fs_khz)
+    let d0: i32 = silk_math.rshift_round(silk_math.smulbb(n0 - p0, denom), 16)
+    let d1: i32 = silk_math.rshift_round(silk_math.smulbb(n1 - p1, denom), 16)
+    let interp: i32 = INTERP_LEN_MS * fs_khz
+    var n: i32 = 0
+    while n < interp {
+        p0 = p0 + d0
+        p1 = p1 + d1
+        celt_fix.st16(x2, n + 1, side_sample(x1, x2, n, p0, p1))
+        n = n + 1
+    }
+    while n < fl {
+        celt_fix.st16(x2, n + 1, side_sample(x1, x2, n, n0, n1))
+        n = n + 1
+    }
+    celt_fix.st32((*s).pred_prev, 0, n0)
+    celt_fix.st32((*s).pred_prev, 1, n1)
+    n = 0
+    while n < fl {
+        let m: i32 = celt_fix.ld16(x1, n + 1)
+        let sd: i32 = celt_fix.ld16(x2, n + 1)
+        celt_fix.st16(x1, n + 1, silk_math.sat16(m + sd))
+        celt_fix.st16(x2, n + 1, silk_math.sat16(m - sd))
+        n = n + 1
+    }
+}
+
+fn stereo_free(s: *mut StereoState) {
+    rt.heap_free((*s).pred_prev, 8)
+    rt.heap_free((*s).smid, 4)
+    rt.heap_free((*s).sside, 4)
+}

@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.aac.aac_bits
+import media.audio.aac.aac_dequant
+import media.audio.aac.aac_fb
+import media.audio.aac.aac_sect
+import media.audio.aac.aac_spec
+import media.audio.aac.aac_state
+import media.audio.aac.aac_stereo
+import media.audio.aac.aac_tns
+
+export { aac_decode }
+
+fn write_pcm(d: *mut aac_state.Aac, c: usize, ch_total: u32, pcm: u64, src: u64) {
+    var n: usize = 0
+    while n < 1024 {
+        var v: f32 = aac_state.ldf(src, n)
+        if v > 32767.0 {
+            v = 32767.0
+        }
+        if v < -32768.0 {
+            v = -32768.0
+        }
+        var iv: i32 = 0
+        if v >= 0.0 {
+            iv = (v + 0.5) as i32
+        } else {
+            iv = (v - 0.5) as i32
+        }
+        *((pcm + (((n * (ch_total as% usize)) + c) * 2) as% u64) as *mut i16) = iv as% i16
+        n = n + 1
+    }
+}
+
+fn process_sce(d: *mut aac_state.Aac, pcm: u64, first: i32) -> i32 {
+    let r: i32 = aac_spec.read_ics(d, 0, 0)
+    if r != 0 {
+        return r
+    }
+    aac_dequant.dequant(d, 0)
+    aac_tns.tns(d, 0)
+    let out: u64 = (*d).tmp + 32768
+    aac_fb.filterbank(d, 0, out)
+    if first != 0 {
+        write_pcm(d, 0, (*d).ch, pcm, out)
+        if (*d).ch == 2 {
+            write_pcm(d, 1, 2, pcm, out)
+        }
+    }
+    return 0
+}
+
+fn process_cpe(d: *mut aac_state.Aac, pcm: u64, first: i32) -> i32 {
+    let common: u32 = aac_bits.br_get1(&(*d).br)
+    (*d).ms_present = 0
+    if common != 0 {
+        let r0: i32 = aac_sect.read_ics_info(d, 0)
+        if r0 != 0 {
+            return r0
+        }
+
+        (*d).ics[1].seq = (*d).ics[0].seq
+        (*d).ics[1].shape = (*d).ics[0].shape
+        (*d).ics[1].max_sfb = (*d).ics[0].max_sfb
+        (*d).ics[1].ngroups = (*d).ics[0].ngroups
+        (*d).ics[1].nwin = (*d).ics[0].nwin
+        (*d).ics[1].nswb = (*d).ics[0].nswb
+        var i: usize = 0
+        while i < 8 {
+            (*d).ics[1].glen[i] = (*d).ics[0].glen[i]
+            i = i + 1
+        }
+        (*d).ms_present = aac_bits.br_get(&(*d).br, 2)
+        if (*d).ms_present == 3 {
+            return 1
+        }
+        i = 0
+        while i < 512 {
+            (*d).ics[0].ms[i] = 0 as% u8
+            i = i + 1
+        }
+        if (*d).ms_present == 1 {
+            var g: u32 = 0
+            while g < (*d).ics[0].ngroups {
+                var s: u32 = 0
+                while s < (*d).ics[0].max_sfb {
+                    (*d).ics[0].ms[(g * 64 + s) as% usize] = aac_bits.br_get1(&(*d).br) as% u8
+                    s = s + 1
+                }
+                g = g + 1
+            }
+        }
+    }
+    let r1: i32 = aac_spec.read_ics(d, 0, common as% i32)
+    if r1 != 0 {
+        return r1
+    }
+    let r2: i32 = aac_spec.read_ics(d, 1, common as% i32)
+    if r2 != 0 {
+        return r2
+    }
+    aac_dequant.dequant(d, 0)
+    aac_dequant.dequant(d, 1)
+    if common != 0 {
+        aac_stereo.stereo(d)
+    }
+    aac_tns.tns(d, 0)
+    aac_tns.tns(d, 1)
+    let out0: u64 = (*d).tmp + 32768
+    let out1: u64 = (*d).tmp + 32768 + 8192
+    aac_fb.filterbank(d, 0, out0)
+    aac_fb.filterbank(d, 1, out1)
+    if first != 0 {
+        if (*d).ch == 2 {
+            write_pcm(d, 0, 2, pcm, out0)
+            write_pcm(d, 1, 2, pcm, out1)
+        } else {
+
+            var n: usize = 0
+            while n < 1024 {
+                aac_state.stf(out0, n, (aac_state.ldf(out0, n) + aac_state.ldf(out1, n)) * 0.5)
+                n = n + 1
+            }
+            write_pcm(d, 0, 1, pcm, out0)
+        }
+    }
+    return 0
+}
+
+fn aac_decode(d: *mut aac_state.Aac, data: u64, n: usize, pcm: u64) -> i32 {
+    if (*d).ready == 0 {
+        return 0
+    }
+    (*d).br.buf = data
+    (*d).br.pos = 0
+    (*d).br.end = (n * 8) as% i32
+    rt.mem_set(pcm, 0 as% u8, 1024 * ((*d).ch as% usize) * 2)
+    var elems: i32 = 0
+    var err: i32 = 0
+    var go: i32 = 1
+    while go != 0 {
+        if aac_bits.br_left(&(*d).br) < 3 {
+            go = 0
+        } else {
+            let id: u32 = aac_bits.br_get(&(*d).br, 3)
+            if id == aac_state.ID_END {
+                go = 0
+            } else {
+                if id == aac_state.ID_SCE || id == aac_state.ID_LFE {
+                    aac_bits.br_get(&(*d).br, 4)
+                    var first: i32 = 0
+                    if elems == 0 {
+                        first = 1
+                    }
+                    err = process_sce(d, pcm, first)
+                    elems = elems + 1
+                } else {
+                    if id == aac_state.ID_CPE {
+                        aac_bits.br_get(&(*d).br, 4)
+                        var first2: i32 = 0
+                        if elems == 0 {
+                            first2 = 1
+                        }
+                        err = process_cpe(d, pcm, first2)
+                        elems = elems + 1
+                    } else {
+                        if id == aac_state.ID_DSE {
+                            aac_bits.br_get(&(*d).br, 4)
+                            let align: u32 = aac_bits.br_get1(&(*d).br)
+                            var cnt: u32 = aac_bits.br_get(&(*d).br, 8)
+                            if cnt == 255 {
+                                cnt = cnt + aac_bits.br_get(&(*d).br, 8)
+                            }
+                            if align != 0 {
+                                (*d).br.pos = ((*d).br.pos + 7) & (0 - 8)
+                            }
+                            (*d).br.pos = (*d).br.pos + ((cnt * 8) as% i32)
+                        } else {
+                            if id == aac_state.ID_FIL {
+                                var cnt2: u32 = aac_bits.br_get(&(*d).br, 4)
+                                if cnt2 == 15 {
+                                    cnt2 = cnt2 + aac_bits.br_get(&(*d).br, 8) - 1
+                                }
+                                (*d).br.pos = (*d).br.pos + ((cnt2 * 8) as% i32)
+                            } else {
+
+                                err = 1
+                            }
+                        }
+                    }
+                }
+                if err != 0 {
+                    go = 0
+                }
+            }
+        }
+    }
+    if err != 0 || elems == 0 {
+
+        rt.mem_set(pcm, 0 as% u8, 1024 * ((*d).ch as% usize) * 2)
+        return 0
+    }
+    return 1024
+}

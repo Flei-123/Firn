@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.audio.opus.celt_fix
+import media.audio.opus.celt_math
+import media.audio.opus.opus
+import media.audio.opus.celt
+
+export { exp_rotation, alg_unquant, renormalise_vector, lcg_rand, inner_prod }
+
+fn lcg_rand(seed: u32) -> u32 {
+    return (1664525 as% u32 *% seed) +% (1013904223 as% u32)
+}
+
+fn inner_prod(x: u64, y: u64, n: i32) -> i32 {
+    var sum: i32 = 0
+    var i: i32 = 0
+    while i < n {
+        sum = sum +% celt_fix.mul16_16(celt_fix.ld16(x, i), celt_fix.ld16(y, i))
+        i = i + 1
+    }
+    return sum
+}
+
+fn exp_rotation1(x: u64, len: i32, stride: i32, c: i32, s: i32) {
+    let ms: i32 = celt_fix.i16c(0 - s)
+    var i: i32 = 0
+    while i < len - stride {
+        let x1: i32 = celt_fix.ld16(x, i)
+        let x2: i32 = celt_fix.ld16(x, i + stride)
+        celt_fix.st16(x, i + stride, celt_fix.pshr32(celt_fix.mul16_16(c, x2) +% celt_fix.mul16_16(s, x1), 15))
+        celt_fix.st16(x, i, celt_fix.pshr32(celt_fix.mul16_16(c, x1) +% celt_fix.mul16_16(ms, x2), 15))
+        i = i + 1
+    }
+    i = len - 2 * stride - 1
+    while i >= 0 {
+        let x1: i32 = celt_fix.ld16(x, i)
+        let x2: i32 = celt_fix.ld16(x, i + stride)
+        celt_fix.st16(x, i + stride, celt_fix.pshr32(celt_fix.mul16_16(c, x2) +% celt_fix.mul16_16(s, x1), 15))
+        celt_fix.st16(x, i, celt_fix.pshr32(celt_fix.mul16_16(c, x1) +% celt_fix.mul16_16(ms, x2), 15))
+        i = i - 1
+    }
+}
+
+fn exp_rotation(x: u64, len0: i32, dir: i32, stride: i32, k: i32, spread: i32) {
+    if 2 * k >= len0 || spread == 0 { return }
+    var factor: i32 = 15
+    if spread == 2 { factor = 10 }
+    if spread == 3 { factor = 5 }
+    let gain: i32 = celt_math.celt_div(celt_fix.mul16_16(32767, len0), len0 + factor * k)
+    let theta: i32 = celt_fix.mul16_16_q15(gain, gain) >> 1
+    let c: i32 = celt_math.celt_cos_norm(theta)
+    let s: i32 = celt_math.celt_cos_norm(32767 - theta)
+    var stride2: i32 = 0
+    if len0 >= 8 * stride {
+        stride2 = 1
+        while (stride2 * stride2 + stride2) * stride + (stride >> 2) < len0 {
+            stride2 = stride2 + 1
+        }
+    }
+    let len: i32 = len0 / stride
+    var i: i32 = 0
+    while i < stride {
+        let xp: u64 = x +% ((i *% len) as% u64) *% 2
+        if dir < 0 {
+            if stride2 != 0 { exp_rotation1(xp, len, stride2, s, c) }
+            exp_rotation1(xp, len, 1, c, s)
+        } else {
+            exp_rotation1(xp, len, 1, c, celt_fix.i16c(0 - s))
+            if stride2 != 0 { exp_rotation1(xp, len, stride2, s, celt_fix.i16c(0 - c)) }
+        }
+        i = i + 1
+    }
+}
+
+fn normalise_residual(iy: u64, x: u64, n: i32, ryy: i32, gain: i32) {
+    let k: i32 = celt_math.celt_ilog2(ryy) >> 1
+    let t: i32 = celt_math.vshr32(ryy, 2 * (k - 7))
+    let g: i32 = celt_fix.mul16_16_p15(celt_math.celt_rsqrt_norm(t), gain)
+    var i: i32 = 0
+    while i < n {
+        celt_fix.st16(x, i, celt_fix.pshr32(celt_fix.mul16_16(g, celt_fix.ld32(iy, i)), k + 1))
+        i = i + 1
+    }
+}
+
+fn extract_collapse_mask(iy: u64, n: i32, b: i32) -> i32 {
+    if b <= 1 { return 1 }
+    let n0: i32 = n / b
+    var mask: i32 = 0
+    var i: i32 = 0
+    while i < b {
+        var tmp: i32 = 0
+        var j: i32 = 0
+        while j < n0 {
+            tmp = tmp | celt_fix.ld32(iy, i * n0 + j)
+            j = j + 1
+        }
+        if tmp != 0 { mask = mask | (1 << i) }
+        i = i + 1
+    }
+    return mask
+}
+
+fn alg_unquant(x: u64, n: i32, k: i32, spread: i32, b: i32, e: *mut opus.Ec, gain: i32) -> i32 {
+    var iy: [i32; 200] = [0; 200]
+    let ip: u64 = (&iy[0]) as u64
+    let ryy: i32 = celt.celt_decode_pulses(e, ip, n, k)
+    normalise_residual(ip, x, n, ryy, gain)
+    exp_rotation(x, n, 0 - 1, b, k, spread)
+    return extract_collapse_mask(ip, n, b)
+}
+
+fn renormalise_vector(x: u64, n: i32, gain: i32) {
+    let e: i32 = 1 +% inner_prod(x, x, n)
+    let k: i32 = celt_math.celt_ilog2(e) >> 1
+    let t: i32 = celt_math.vshr32(e, 2 * (k - 7))
+    let g: i32 = celt_fix.mul16_16_p15(celt_math.celt_rsqrt_norm(t), gain)
+    var i: i32 = 0
+    while i < n {
+        celt_fix.st16(x, i, celt_fix.pshr32(celt_fix.mul16_16(g, celt_fix.ld16(x, i)), k + 1))
+        i = i + 1
+    }
+}

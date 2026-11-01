@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import highlight.highlight
+import docview.obj
+import fui.painter
+import fui.render
+import fui.kit
+import fui.style
+import fui.theme
+import fui.syntaxcolor
+import fui.kitscroll
+import fui.kitmd_measure
+import fui.kitmd_types
+
+export {
+    CodeView, code_new, code_free, code_set, code_draw, code_wheel, code_line_count, code_height,
+    code_line_start, code_line_end, code_set_numbers, code_set_size, CODE_MAX_HIGHLIGHT_BYTES,
+}
+
+const CODE_MAX_HIGHLIGHT_BYTES: usize = 2097152
+
+struct CodeView {
+    text: rt.Buf,
+    lang: u32,
+    spans: Vec[highlight.HlSpan],
+    starts: Vec[usize],
+    scroll: kitscroll.Scroll,
+    size: f64,
+    numbers: bool,
+}
+
+fn code_new() -> CodeView {
+    return CodeView { text: rt.buf_new(), lang: 0 as u32, spans: vec_new[highlight.HlSpan](), starts: vec_new[usize](),
+        scroll: kitscroll.scroll_new(), size: 13.0, numbers: true }
+}
+
+fn code_free(v: *mut CodeView) {
+    rt.buf_free(&(*v).text)
+    vec_free[highlight.HlSpan](&(*v).spans)
+    vec_free[usize](&(*v).starts)
+}
+
+fn code_set_numbers(v: *mut CodeView, on: bool) {
+    (*v).numbers = on
+}
+
+fn code_set_size(v: *mut CodeView, size: f64) {
+    if size >= 6.0 && size <= 64.0 {
+        (*v).size = size
+    }
+}
+
+fn index_lines(v: *mut CodeView) {
+    vec_clear[usize](&(*v).starts)
+    vec_push[usize](&(*v).starts, 0)
+    let n: usize = rt.buf_len(&(*v).text)
+    let p: u64 = rt.buf_ptr(&(*v).text)
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 10 as u8 {
+            vec_push[usize](&(*v).starts, i + 1)
+        }
+        i++
+    }
+}
+
+fn tokenize(v: *mut CodeView) {
+    vec_clear[highlight.HlSpan](&(*v).spans)
+    let n: usize = rt.buf_len(&(*v).text)
+    if (*v).lang == highlight.HL_NONE || n == 0 || n > CODE_MAX_HIGHLIGHT_BYTES {
+        return
+    }
+    let raw: u64 = obj.obj_alloc[highlight.Highlighter]()
+    if raw == 0 {
+        return
+    }
+    let h: *mut highlight.Highlighter = raw as *mut highlight.Highlighter
+    *h = highlight.hl_new()
+    if !highlight.hl_tokenize(h, (*v).lang, rt.buf_ptr(&(*v).text), n, &(*v).spans) {
+        vec_clear[highlight.HlSpan](&(*v).spans)
+    }
+    highlight.hl_free(h)
+    obj.obj_free[highlight.Highlighter](raw)
+}
+
+fn code_set(v: *mut CodeView, p: u64, n: usize, lang: u32) {
+    rt.buf_clear(&(*v).text)
+    rt.buf_push_bytes(&(*v).text, p, n)
+    (*v).lang = lang
+    (*v).scroll = kitscroll.scroll_new()
+    index_lines(v)
+    tokenize(v)
+}
+
+fn code_line_count(v: *mut CodeView) -> usize {
+    return vec_len[usize](&(*v).starts)
+}
+
+fn code_line_start(v: *mut CodeView, line: usize) -> usize {
+    if line >= vec_len[usize](&(*v).starts) {
+        return rt.buf_len(&(*v).text)
+    }
+    return *vec_elem_ptr[usize](&(*v).starts, line)
+}
+
+fn code_line_end(v: *mut CodeView, line: usize) -> usize {
+    var e: usize = rt.buf_len(&(*v).text)
+    if line + 1 < vec_len[usize](&(*v).starts) {
+        e = *vec_elem_ptr[usize](&(*v).starts, line + 1) - 1
+    }
+    return e
+}
+
+fn line_height(v: *mut CodeView) -> f64 {
+    return (*v).size * 1.5
+}
+
+fn code_height(v: *mut CodeView) -> f64 {
+    return (code_line_count(v) as f64) * line_height(v)
+}
+
+fn code_wheel(v: *mut CodeView, dy: f64) -> bool {
+    return kitscroll.scroll_by(&(*v).scroll, dy)
+}
+
+fn span_index_at(v: *mut CodeView, pos: usize) -> usize {
+    var lo: usize = 0
+    var hi: usize = vec_len[highlight.HlSpan](&(*v).spans)
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let s: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](&(*v).spans, mid)
+        if (*s).start + (*s).len <= pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+fn digits_of(n: usize) -> usize {
+    var d: usize = 1
+    var v: usize = n
+    while v >= 10 {
+        v = v / 10
+        d++
+    }
+    return d
+}
+
+fn draw_piece(c: *mut render.Ctx, z: *mut painter.Painter, v: *mut CodeView, kind: u32, ground: u32, from: usize, to: usize,
+    x: f64, base: f64, limit: f64) -> f64 {
+    if to <= from {
+        return x
+    }
+    var r: painter.TextRun = kitmd_measure.run_of(kitmd_types.F_CODE, (*v).size)
+    let col: u32 = theme.opaque(syntaxcolor.syntax_color(render.ctx_theme(c), kind, ground))
+    let p: u64 = rt.buf_ptr(&(*v).text) + from as u64
+    let w: f64 = painter.run_width(z, &r, p, to - from)
+    if x < limit {
+        painter.run_draw(z, &r, x, base, limit - x, col, p, to - from, painter.TEXT_L)
+    }
+    return x + w
+}
+
+fn draw_line(c: *mut render.Ctx, z: *mut painter.Painter, v: *mut CodeView, line: usize, ground: u32, x: f64, base: f64, limit: f64) {
+    let ls: usize = code_line_start(v, line)
+    let le: usize = code_line_end(v, line)
+    var cur: f64 = x
+    var pos: usize = ls
+    let nspans: usize = vec_len[highlight.HlSpan](&(*v).spans)
+    var si: usize = span_index_at(v, ls)
+    while pos < le && si < nspans {
+        let s: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](&(*v).spans, si)
+        if (*s).start >= le {
+            break
+        }
+        var a: usize = (*s).start
+        if a < pos { a = pos }
+        var b: usize = (*s).start + (*s).len
+        if b > le { b = le }
+        if a > pos {
+            cur = draw_piece(c, z, v, highlight.TK_PLAIN, ground, pos, a, cur, base, limit)
+        }
+        cur = draw_piece(c, z, v, (*s).kind, ground, a, b, cur, base, limit)
+        pos = b
+        si++
+    }
+    if pos < le {
+        draw_piece(c, z, v, highlight.TK_PLAIN, ground, pos, le, cur, base, limit)
+    }
+}
+
+fn draw_number(c: *mut render.Ctx, z: *mut painter.Painter, v: *mut CodeView, line: usize, right: f64, base: f64) {
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&tmp, (line + 1) as u64)
+    var r: painter.TextRun = kitmd_measure.run_of(kitmd_types.F_CODE, (*v).size)
+    let w: f64 = painter.run_width(z, &r, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    painter.run_draw(z, &r, right - w, base, w + 2.0, kit.tokc(c, style.TOK_TEXT_MUTED), rt.buf_ptr(&tmp), rt.buf_len(&tmp), painter.TEXT_L)
+    rt.buf_free(&tmp)
+}
+
+fn code_draw(c: *mut render.Ctx, v: *mut CodeView, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let ground_full: u32 = kit.tokc(c, style.TOK_FIELD)
+    let ground: u32 = ground_full & 16777215 as u32
+    painter.surface(z, x, y, w, h, ground_full)
+    let lh: f64 = line_height(v)
+    kitscroll.scroll_fit(&(*v).scroll, code_height(v), h, lh * 3.0)
+    let old: u64 = kitmd_measure.font_enter(z, kitmd_types.F_CODE)
+    var r: painter.TextRun = kitmd_measure.run_of(kitmd_types.F_CODE, (*v).size)
+    let cw: f64 = painter.run_width(z, &r, "0".p as u64, 1)
+    var gutter: f64 = 8.0
+    if (*v).numbers {
+        gutter = (digits_of(code_line_count(v)) as f64) * cw + 20.0
+    }
+    let first: usize = ((*v).scroll.pos / lh) as usize
+    var line: usize = first
+    let total: usize = code_line_count(v)
+    while line < total {
+        let ly: f64 = y + (line as f64) * lh - (*v).scroll.pos
+        if ly >= y + h {
+            break
+        }
+        let base: f64 = painter.text_baseline_mid(z, ly, lh, (*v).size)
+        if (*v).numbers {
+            draw_number(c, z, v, line, x + gutter - 12.0, base)
+        }
+        draw_line(c, z, v, line, ground, x + gutter, base, x + w - 4.0)
+        line++
+    }
+    kitmd_measure.font_leave(z, old)
+}

@@ -74,10 +74,10 @@ def main():
     if code != 1 or any(line.split(": ")[1:2] not in ([], ["PAGING"]) for line in out.splitlines() if ".fi:" in line):
         failures.append("cli: --rules filter")
 
-    for app, want in (("bad_app", 1), ("good_app", 0), ("core_app", 0)):
+    for app, want in (("bad_app", 1), ("good_app", 0), ("core_app", 0), ("set_app", 0), ("stale_set", 1)):
         checks += 1
         code, out = run_cli(["--no-allow", os.path.join(HERE, "icon_install", app)])
-        if code != want or (want == 1 and "ICON_NOT_INSTALLED" not in out):
+        if code != want or (want == 1 and "ICON_NOT_INSTALLED" not in out and "ICON_SET_STALE" not in out):
             failures.append("icon_install/%s: exit %d, output %s" % (app, code, out.strip()))
 
     for f in failures:

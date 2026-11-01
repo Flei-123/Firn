@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_lay
+import docview.office.dx_prim
+import docview.office.dx_play
+import docview.office.dx_tlay
+import docview.office.dx_view
+
+export { paginate, hf_prims, MAX_PAGES }
+
+const MAX_PAGES: usize = 20000
+
+struct Pg {
+    v: *mut dx_view.DocView,
+    sect: u32,
+    open: bool,
+    y: f64,
+    top: f64,
+    bottom: f64,
+    left: f64,
+    width: f64,
+    pw: f64,
+    ph: f64,
+    sect_pages: u32,
+    force_new: bool,
+    full: bool,
+}
+
+fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn sect_geom(pg: *mut Pg) {
+    let s: *mut dx_model.Sect = dx_model.sect_at(&(*(*pg).v).d, (*pg).sect)
+    (*pg).pw = clampf(((*s).w as f64) / 15.0, 60.0, 20000.0)
+    (*pg).ph = clampf(((*s).h as f64) / 15.0, 60.0, 20000.0)
+    (*pg).left = clampf(((*s).ml as f64) / 15.0, 0.0, (*pg).pw - 40.0)
+    (*pg).width = clampf((*pg).pw - (*pg).left - ((*s).mr as f64) / 15.0, 40.0, (*pg).pw)
+}
+
+fn hf_height(pg: *mut Pg, idx: i32) -> f64 {
+    if idx < 0 {
+        return 0.0
+    }
+    let v: *mut dx_view.DocView = (*pg).v
+    while vec_len[f64](&(*v).hf_h) <= (idx as usize) {
+        vec_push[f64](&(*v).hf_h, -1.0)
+    }
+    let slot: *mut f64 = vec_elem_ptr[f64](&(*v).hf_h, idx as usize)
+    if *slot < 0.0 {
+        var tmp: Vec[dx_prim.Prim] = vec_new[dx_prim.Prim]()
+        *slot = dx_tlay.lay_flow(&(*v).lay, &(*dx_model.hf_at(&(*v).d, idx as u32)).blocks, 0.0, (*pg).width, &tmp, 0 as u32)
+        vec_free[dx_prim.Prim](&tmp)
+    }
+    return *slot
+}
+
+fn end_page(pg: *mut Pg) {
+    if !(*pg).open {
+        return
+    }
+    let v: *mut dx_view.DocView = (*pg).v
+    let n: usize = vec_len[dx_view.PageRec](&(*v).pages)
+    let rec: *mut dx_view.PageRec = dx_view.page_at(v, n - 1)
+    (*rec).count = (vec_len[dx_prim.Prim](&(*v).prims) as u32) - (*rec).first
+    (*pg).open = false
+}
+
+fn begin_page(pg: *mut Pg) {
+    let v: *mut dx_view.DocView = (*pg).v
+    if vec_len[dx_view.PageRec](&(*v).pages) >= MAX_PAGES {
+        (*pg).full = true
+        (*pg).open = true
+        return
+    }
+    sect_geom(pg)
+    let s: *mut dx_model.Sect = dx_model.sect_at(&(*v).d, (*pg).sect)
+    var hdr: i32 = (*s).hdr_default
+    var ftr: i32 = (*s).ftr_default
+    if (*s).title_pg && (*pg).sect_pages == 0 as u32 {
+        hdr = (*s).hdr_first
+        ftr = (*s).ftr_first
+    }
+    let hh: f64 = hf_height(pg, hdr)
+    let fh: f64 = hf_height(pg, ftr)
+    var top: f64 = ((*s).mt as f64) / 15.0
+    if hdr >= 0 {
+        let t2: f64 = ((*s).header_dist as f64) / 15.0 + hh
+        if t2 > top { top = t2 }
+    }
+    var bottom: f64 = (*pg).ph - ((*s).mb as f64) / 15.0
+    if ftr >= 0 {
+        let b2: f64 = (*pg).ph - ((*s).footer_dist as f64) / 15.0 - fh
+        if b2 < bottom { bottom = b2 }
+    }
+    top = clampf(top, 0.0, (*pg).ph - 60.0)
+    if bottom < top + 40.0 { bottom = top + 40.0 }
+    (*pg).top = top
+    (*pg).bottom = bottom
+    (*pg).y = top
+    vec_push[dx_view.PageRec](&(*v).pages, dx_view.PageRec { first: vec_len[dx_prim.Prim](&(*v).prims) as u32, count: 0 as u32,
+        sect: (*pg).sect, hdr: hdr, ftr: ftr, w: (*pg).pw, h: (*pg).ph, left: (*pg).left, width: (*pg).width })
+    (*pg).sect_pages = (*pg).sect_pages + (1 as u32)
+    (*pg).open = true
+    (*pg).force_new = false
+}
+
+fn ensure_page(pg: *mut Pg) {
+    if !(*pg).open {
+        begin_page(pg)
+    }
+}
+
+fn new_page(pg: *mut Pg) {
+    end_page(pg)
+    begin_page(pg)
+}
+
+fn drop_if_empty(pg: *mut Pg) -> bool {
+    if !(*pg).open {
+        return true
+    }
+    let v: *mut dx_view.DocView = (*pg).v
+    let n: usize = vec_len[dx_view.PageRec](&(*v).pages)
+    if n > 0 && (*dx_view.page_at(v, n - 1)).first == (vec_len[dx_prim.Prim](&(*v).prims) as u32) {
+        vec_shorten[dx_view.PageRec](&(*v).pages, n - 1)
+        (*pg).open = false
+        (*pg).sect_pages = (*pg).sect_pages - (1 as u32)
+        return true
+    }
+    return false
+}
+
+fn first_piece(pg: *mut Pg, blk: u32) -> f64 {
+    let v: *mut dx_view.DocView = (*pg).v
+    let l: *mut dx_lay.Lay = &(*v).lay
+    let b: *mut dx_model.Block = dx_model.block_at(&(*v).d, blk)
+    if (*b).kind == dx_model.B_PARA {
+        let pa: *mut dx_model.Para = dx_model.para_at(&(*v).d, (*b).idx)
+        dx_play.para_break(l, (*b).idx, (*pg).width)
+        if vec_len[dx_lay.LineRec](&(*l).lines) == 0 {
+            return 0.0
+        }
+        return ((*pa).pp.before as f64) / 15.0 + (*vec_elem_ptr[dx_lay.LineRec](&(*l).lines, 0)).h
+    }
+    var g: dx_tlay.Geo = dx_tlay.geo_new()
+    defer dx_tlay.geo_free(&g)
+    dx_tlay.table_geo(l, (*b).idx, (*pg).left, (*pg).width, &g)
+    let r: u32 = (*dx_model.table_at(&(*v).d, (*b).idx)).rows_head
+    if r == dx_model.NIL {
+        return 0.0
+    }
+    var tmp: Vec[dx_prim.Prim] = vec_new[dx_prim.Prim]()
+    defer vec_free[dx_prim.Prim](&tmp)
+    return dx_tlay.lay_row(l, (*b).idx, r, &g, 0.0, &tmp, 0 as u32, true, false)
+}
+
+fn place_para(pg: *mut Pg, bi: u32) {
+    let v: *mut dx_view.DocView = (*pg).v
+    let d: *mut dx_model.Docx = &(*v).d
+    let l: *mut dx_lay.Lay = &(*v).lay
+    let blk: *mut dx_model.Block = dx_model.block_at(d, bi)
+    let pi: u32 = (*blk).idx
+    let pp: *mut dx_props.ParaProps = &(*dx_model.para_at(d, pi)).pp
+    if (*pp).page_break_before != 0 && (*pg).open && (*pg).y > (*pg).top + 0.5 {
+        new_page(pg)
+    }
+    if (*pg).force_new {
+        new_page(pg)
+    }
+    ensure_page(pg)
+    if (*pg).full {
+        return
+    }
+    let before: f64 = ((*pp).before as f64) / 15.0
+    let after: f64 = ((*pp).after as f64) / 15.0
+    var next_min: f64 = 0.0
+    if (*pp).keep_next != 0 && (*blk).next != dx_model.NIL {
+        next_min = first_piece(pg, (*blk).next)
+    }
+    let h: f64 = dx_play.para_break(l, pi, (*pg).width)
+    let nl: usize = vec_len[dx_lay.LineRec](&(*l).lines)
+    var y: f64 = (*pg).y
+    var at_top: bool = y <= (*pg).top + 0.01
+    if !(at_top && vec_len[dx_view.PageRec](&(*v).pages) > 1) {
+        y = y + before
+    }
+    if (*pp).keep_next != 0 && !at_top && y + h + after + next_min > (*pg).bottom + 0.01 && h + next_min < (*pg).bottom - (*pg).top {
+        new_page(pg)
+        y = (*pg).top
+        at_top = true
+    }
+    var from: usize = 0
+    var guard: usize = 0
+    while from < nl && guard < 100000 {
+        guard = guard + 1
+        let base_y: f64 = (*vec_elem_ptr[dx_lay.LineRec](&(*l).lines, from)).y
+        let avail: f64 = (*pg).bottom - y
+        var k: usize = from
+        var forced: bool = false
+        while k < nl {
+            let ln: *mut dx_lay.LineRec = vec_elem_ptr[dx_lay.LineRec](&(*l).lines, k)
+            if (*ln).y + (*ln).h - base_y > avail + 0.01 {
+                break
+            }
+            k = k + 1
+            if (*ln).pbreak {
+                forced = true
+                break
+            }
+        }
+        if k >= nl || forced {
+            if k > from {
+                dx_play.para_emit(l, pi, (*pg).left, (*pg).width, from, k, y, &(*v).prims, 0 as u32)
+            }
+            if k >= nl {
+                let lastl: *mut dx_lay.LineRec = vec_elem_ptr[dx_lay.LineRec](&(*l).lines, nl - 1)
+                y = y + (*lastl).y + (*lastl).h - base_y
+                if forced && (*l).pbreak_last {
+                    (*pg).force_new = true
+                }
+                from = nl
+            } else {
+                new_page(pg)
+                y = (*pg).top
+                from = k
+            }
+        } else {
+            let remaining: usize = nl - from
+            var kk: usize = k
+            let keep: bool = (*pp).keep_lines != 0 && from == 0 && h <= (*pg).bottom - (*pg).top
+            if remaining >= 4 {
+                if nl - kk < 2 {
+                    kk = nl - 2
+                }
+                if kk < from + 2 {
+                    kk = from
+                }
+            } else {
+                kk = from
+            }
+            if keep {
+                kk = from
+            }
+            if kk == from {
+                if y > (*pg).top + 0.5 {
+                    new_page(pg)
+                    y = (*pg).top
+                    continue
+                }
+                kk = k
+                if kk == from {
+                    kk = from + 1
+                }
+            }
+            dx_play.para_emit(l, pi, (*pg).left, (*pg).width, from, kk, y, &(*v).prims, 0 as u32)
+            new_page(pg)
+            y = (*pg).top
+            from = kk
+        }
+    }
+    (*pg).y = y + after
+}
+
+fn place_header_rows(pg: *mut Pg, ti: u32, g: *mut dx_tlay.Geo, upto: u32) {
+    let v: *mut dx_view.DocView = (*pg).v
+    var r: u32 = (*dx_model.table_at(&(*v).d, ti)).rows_head
+    while r != dx_model.NIL && r != upto && (*dx_model.row_at(&(*v).d, r)).header {
+        var tmp: Vec[dx_prim.Prim] = vec_new[dx_prim.Prim]()
+        let h: f64 = dx_tlay.lay_row(&(*v).lay, ti, r, g, 0.0, &tmp, dx_prim.F_HF, false, false)
+        dx_prim.prims_move(&(*v).prims, &tmp, 0, vec_len[dx_prim.Prim](&tmp), 0.0, (*pg).y)
+        vec_free[dx_prim.Prim](&tmp)
+        (*pg).y = (*pg).y + h
+        r = (*dx_model.row_at(&(*v).d, r)).next
+    }
+}
+
+fn place_table(pg: *mut Pg, bi: u32) {
+    let v: *mut dx_view.DocView = (*pg).v
+    let d: *mut dx_model.Docx = &(*v).d
+    let ti: u32 = (*dx_model.block_at(d, bi)).idx
+    if (*pg).force_new {
+        new_page(pg)
+    }
+    ensure_page(pg)
+    if (*pg).full {
+        return
+    }
+    var g: dx_tlay.Geo = dx_tlay.geo_new()
+    defer dx_tlay.geo_free(&g)
+    dx_tlay.table_geo(&(*v).lay, ti, (*pg).left, (*pg).width, &g)
+    var r: u32 = (*dx_model.table_at(d, ti)).rows_head
+    var first: bool = true
+    while r != dx_model.NIL {
+        if vec_len[dx_prim.Prim](&(*v).prims) >= dx_prim.MAX_PRIMS {
+            break
+        }
+        let nx: u32 = (*dx_model.row_at(d, r)).next
+        var tmp: Vec[dx_prim.Prim] = vec_new[dx_prim.Prim]()
+        var h: f64 = dx_tlay.lay_row(&(*v).lay, ti, r, &g, 0.0, &tmp, 0 as u32, first, nx == dx_model.NIL)
+        if (*pg).y + h > (*pg).bottom + 0.01 && (*pg).y > (*pg).top + 0.5 {
+            new_page(pg)
+            if (*pg).full {
+                vec_free[dx_prim.Prim](&tmp)
+                return
+            }
+            if !(*dx_model.row_at(d, r)).header {
+                place_header_rows(pg, ti, &g, r)
+            }
+        }
+        dx_prim.prims_move(&(*v).prims, &tmp, 0, vec_len[dx_prim.Prim](&tmp), 0.0, (*pg).y)
+        vec_free[dx_prim.Prim](&tmp)
+        (*pg).y = (*pg).y + h
+        first = false
+        r = nx
+    }
+}
+
+fn paginate(v: *mut dx_view.DocView) {
+    var pg: Pg = Pg { v: v, sect: dx_model.NIL, open: false, y: 0.0, top: 0.0, bottom: 0.0, left: 0.0, width: 0.0, pw: 0.0,
+        ph: 0.0, sect_pages: 0 as u32, force_new: false, full: false }
+    let d: *mut dx_model.Docx = &(*v).d
+    var b: u32 = (*d).body.head
+    while b != dx_model.NIL && !pg.full {
+        if vec_len[dx_prim.Prim](&(*v).prims) >= dx_prim.MAX_PRIMS {
+            (*d).truncated = true
+            break
+        }
+        let blk: *mut dx_model.Block = dx_model.block_at(d, b)
+        if (*blk).sect != pg.sect && (*blk).sect < (vec_len[dx_model.Sect](&(*d).sects) as u32) {
+            let ns: u32 = (*blk).sect
+            let newp: bool = (*dx_model.sect_at(d, ns)).new_page
+            if pg.sect == dx_model.NIL {
+                pg.sect = ns
+            } else {
+                if newp {
+                    if !drop_if_empty(&pg) {
+                        end_page(&pg)
+                    }
+                    pg.sect_pages = 0 as u32
+                }
+                pg.sect = ns
+                if pg.open {
+                    sect_geom(&pg)
+                }
+            }
+        }
+        if pg.sect == dx_model.NIL {
+            pg.sect = 0 as u32
+        }
+        if (*blk).kind == dx_model.B_PARA {
+            place_para(&pg, b)
+        } else {
+            place_table(&pg, b)
+        }
+        b = (*dx_model.block_at(d, b)).next
+    }
+    if vec_len[dx_view.PageRec](&(*v).pages) == 0 && !pg.full {
+        if pg.sect == dx_model.NIL {
+            pg.sect = 0 as u32
+        }
+        begin_page(&pg)
+    }
+    end_page(&pg)
+    (*v).lay.total = vec_len[dx_view.PageRec](&(*v).pages) as i64
+}
+
+fn hf_prims(v: *mut dx_view.DocView, pi: usize, out: *mut Vec[dx_prim.Prim]) {
+    let rec: *mut dx_view.PageRec = dx_view.page_at(v, pi)
+    let s: *mut dx_model.Sect = dx_model.sect_at(&(*v).d, (*rec).sect)
+    (*v).lay.cur_page = (pi as i64) + 1
+    (*v).lay.total = vec_len[dx_view.PageRec](&(*v).pages) as i64
+    if (*rec).hdr >= 0 {
+        let n0: usize = vec_len[dx_prim.Prim](out)
+        dx_tlay.lay_flow(&(*v).lay, &(*dx_model.hf_at(&(*v).d, (*rec).hdr as u32)).blocks, (*rec).left, (*rec).width, out, dx_prim.F_HF)
+        dx_prim.prims_shift(out, n0, 0.0, ((*s).header_dist as f64) / 15.0)
+    }
+    if (*rec).ftr >= 0 {
+        let n1: usize = vec_len[dx_prim.Prim](out)
+        let h: f64 = dx_tlay.lay_flow(&(*v).lay, &(*dx_model.hf_at(&(*v).d, (*rec).ftr as u32)).blocks, (*rec).left, (*rec).width, out, dx_prim.F_HF)
+        dx_prim.prims_shift(out, n1, 0.0, (*rec).h - ((*s).footer_dist as f64) / 15.0 - h)
+    }
+}

@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.audio.pktplay
+import media.audio.opus.opus
+import media.audio.opus.opus_dec
+
+export { OpusPlay, play_new, play_open, play_free, play_set_packet, play_start, play_start_trim, OPUS_RATE }
+
+const OPUS_RATE: u32 = 48000 as u32
+const MAX_FRAME: i32 = 5760
+const PREROLL: u64 = 9600 as u64
+
+struct OpusPlay {
+    head: opus.Opus,
+    dec: opus_dec.OpusDec,
+    pp: pktplay.PktPlay,
+    sum: u64,
+    ptrs: u64,
+}
+
+fn play_new() -> OpusPlay {
+    return OpusPlay { head: opus.opus_new(), dec: opus_dec.opus_dec_new(1), pp: pktplay.pp_new(), sum: 0 as u64, ptrs: 0 as u64 }
+}
+
+fn new_decoder(p: *mut OpusPlay) {
+    (*p).dec = opus_dec.opus_dec_new((*p).head.channels)
+    opus_dec.opus_dec_set_gain(&(*p).dec, (*p).head.gain_q8)
+}
+
+fn play_free(p: *mut OpusPlay) {
+    opus_dec.opus_dec_free(&(*p).dec)
+    pktplay.pp_free(&(*p).pp)
+}
+
+fn do_decode(c: u64, ptr: u64, n: usize, pcm: u64, cap: i32) -> i32 {
+    let p: *mut OpusPlay = c as *mut OpusPlay
+    return opus_dec.opus_decode(&(*p).dec, ptr, n as i32, pcm, cap)
+}
+
+fn do_reset(c: u64) {
+    let p: *mut OpusPlay = c as *mut OpusPlay
+    opus_dec.opus_dec_free(&(*p).dec)
+    new_decoder(p)
+}
+
+fn play_open(p: *mut OpusPlay, head: u64, head_len: usize, count: usize) -> bool {
+    if opus.opus_head_parse(&(*p).head, head, head_len) != 0 {
+        return false
+    }
+    opus_dec.opus_dec_free(&(*p).dec)
+    new_decoder(p)
+    return pktplay.pp_alloc(&(*p).pp, count, (*p).head.channels, MAX_FRAME, p as u64, do_decode, do_reset, PREROLL)
+}
+
+fn play_set_packet(p: *mut OpusPlay, i: usize, ptr: u64, len: usize) {
+    pktplay.pp_set(&(*p).pp, i, ptr, len, 0 as u64)
+}
+
+fn packet_samples(ptr: u64, len: usize) -> u64 {
+    if len < 1 {
+        return 0 as u64
+    }
+    var pk: opus.OpusPacket = opus.opus_packet_new()
+    if opus.opus_toc(ptr, len, &pk) < 0 {
+        return 0 as u64
+    }
+    return ((pk.frame_samples * pk.n) as u64)
+}
+
+fn play_start(p: *mut OpusPlay, last_granule: i64) {
+    var acc: u64 = 0 as u64
+    var i: usize = 0
+    while i < (*p).pp.n {
+        let ptr: u64 = rt.ld64((*p).pp.ptrs, i)
+        let len: usize = rt.ld64((*p).pp.lens, i) as usize
+        pktplay.pp_set(&(*p).pp, i, ptr, len, acc)
+        acc = acc + packet_samples(ptr, len)
+        i = i + 1
+    }
+    let skip: u64 = (*p).head.pre_skip as u64
+    var end: u64 = acc
+    if last_granule > 0 && (last_granule as u64) <= acc {
+        end = last_granule as u64
+    }
+    var total: u64 = 0 as u64
+    if end > skip {
+        total = end - skip
+    }
+    pktplay.pp_finish(&(*p).pp, skip, total)
+}
+
+fn play_start_trim(p: *mut OpusPlay, discard_ns: i64) {
+    play_start(p, 0 - 1)
+    if discard_ns <= 0 {
+        return
+    }
+    let cut: u64 = (discard_ns as u64) * 48 as u64 / 1000000 as u64
+    if cut < (*p).pp.total {
+        (*p).pp.total = (*p).pp.total - cut
+    }
+}

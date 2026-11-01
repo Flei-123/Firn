@@ -864,6 +864,7 @@ build ds_tpl_logic
 "$W/ds_tpl_logic"
 build ds_store_touch
 "$W/ds_store_touch"
+python3 -I tools/fui/ds_icons_set.py --check examples/fui_apps/tpl_settings examples/fui_apps/tpl_wizard examples/fui_apps/tpl_store examples/fui_apps/tpl_files
 echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
 FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
 echo "== DS4 GALLERY (r577): every page light + dark vs goldens, design lint clean =="
@@ -1321,7 +1322,7 @@ for f in lib/fui/*.fi; do
         # std.vec is used through its GENERIC names (`Vec[T]`, `vec_push[T]`):
         # Firn cannot qualify a generic with its module, so no "vec." can stand
         if [ "$mod" = "vec" ] && grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
-            | grep -q 'Vec\['; then
+            | grep -qE 'Vec\[|vec_[a-z_]+\['; then
             continue
         fi
         # std.str is used through METHOD syntax (`s.length()`, `s.chars(i)`), which
