@@ -13,10 +13,11 @@ run_case() {
   shift 6
   local w=${size%x*} h=${size#*x} bps=1 ssx=1 ssy=1
   case $pix in
-    *10le) bps=2 ;;
+    *10le|*12le) bps=2 ;;
   esac
   case $pix in
     yuv444*) ssx=0; ssy=0 ;;
+    yuv422*) ssy=0 ;;
   esac
   ffmpeg -nostdin -v error -y -f lavfi -i "$src=size=$size:rate=25" -frames:v $frames -pix_fmt $pix -c:v libaom-av1 -g 1 -cpu-used 8 -aom-params "$params" "$@" "$D/$name.ivf" >/dev/null 2>&1 || { echo "SKIP $name (encode)"; return; }
   ffmpeg -nostdin -v error -y -c:v libdav1d -i "$D/$name.ivf" -f rawvideo -pix_fmt $pix "$D/$name.ref" >/dev/null 2>&1
@@ -59,5 +60,26 @@ run_case lf_444 testsrc2 96x64 yuv444p 1 "$NOPF" -crf 40 -b:v 0
 run_case lf_deltaq testsrc2 192x112 yuv420p 1 "$NOPF:deltaq-mode=1:delta-lf-mode=1" -crf 30 -b:v 0
 run_case lf_aq testsrc2 192x112 yuv420p 1 "$NOPF" -aq-mode 1 -crf 40 -b:v 0
 run_case lf_multi testsrc2 128x96 yuv420p 4 "$NOPF" -crf 40 -b:v 0
+FLT="enable-palette=0:enable-intrabc=0"
+for s in testsrc2:128x96 mandelbrot:200x130 testsrc2:352x288 testsrc2:17x13 testsrc2:704x144; do
+  src=${s%%:*}; size=${s#*:}
+  run_case cdef_${src}_$size $src $size yuv420p 1 "$FLT:enable-restoration=0" -crf 30 -b:v 0
+  run_case cdefhq_${src}_$size $src $size yuv420p 1 "$FLT:enable-restoration=0" -crf 10 -b:v 0
+  run_case lr_${src}_$size $src $size yuv420p 1 "$FLT:enable-cdef=0" -cpu-used 2 -crf 40 -b:v 0
+  run_case flt_${src}_$size $src $size yuv420p 1 "$FLT" -cpu-used 2 -crf 35 -b:v 0
+done
+for sg in 1 2 4; do
+  run_case lrw_blur$sg testsrc2 320x240 yuv420p 1 "$FLT" -cpu-used 1 -crf 50 -b:v 0 -vf "gblur=sigma=$sg,noise=alls=8"
+done
+run_case lrw_blur10 testsrc2 160x128 yuv420p10le 1 "$FLT" -cpu-used 1 -crf 50 -b:v 0 -vf "gblur=sigma=2,noise=alls=8"
+run_case flt_10 testsrc2 96x64 yuv420p10le 1 "$FLT" -cpu-used 2 -crf 30 -b:v 0
+run_case flt_12 testsrc2 96x64 yuv420p12le 1 "$FLT" -cpu-used 2 -crf 40 -b:v 0 -strict -2
+run_case flt_444 testsrc2 96x64 yuv444p 1 "$FLT" -cpu-used 2 -crf 30 -b:v 0
+run_case flt_422 testsrc2 96x64 yuv422p 1 "$FLT" -cpu-used 2 -crf 40 -b:v 0 -strict -2
+run_case flt_gray testsrc2 96x64 gray 1 "$FLT" -cpu-used 2 -crf 40 -b:v 0
+run_case flt_sb128 testsrc2 256x160 yuv420p 1 "$FLT:sb-size=128" -cpu-used 2 -crf 40 -b:v 0
+run_case flt_tiles testsrc2 704x144 yuv420p 1 "$FLT" -cpu-used 2 -crf 40 -b:v 0 -tile-columns 2 -tile-rows 1
+run_case flt_multi testsrc2 128x96 yuv420p 4 "$FLT" -cpu-used 2 -crf 40 -b:v 0
+run_case flt_noise testsrc2 320x240 yuv420p 1 "$FLT" -cpu-used 2 -crf 45 -b:v 0 -vf noise=alls=20
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]

@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1blkst
+import media.video.av1.av1fhdr
+import media.video.av1.av1frame
+import media.video.av1.av1ipm
+import media.video.av1.av1cdefdir
+
+export { cdef_frame, cdef_active }
+
+static DIRS: [i8; 32] = [
+    -1, 1, -2, 2, 0, 1, -1, 2, 0, 1, 0, 2, 0, 1, 1, 2,
+    1, 1, 2, 2, 1, 0, 2, 1, 1, 0, 2, 0, 1, 0, 2, -1
+]
+static UV_DIR: [u8; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 2, 2, 3, 4, 6, 0,
+    7, 0, 2, 4, 5, 6, 6, 6, 0, 1, 2, 3, 4, 5, 6, 7
+]
+static PRI_TAPS: [u8; 4] = [4, 2, 3, 3]
+static SEC_TAPS: [u8; 2] = [2, 1]
+
+fn cdef_active(td: *mut av1blkst.TileDec) -> bool {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    return (*(*td).seq).enable_cdef != 0 && (*fh).coded_lossless == 0 && (*fh).allow_intrabc == 0
+}
+
+fn floor_log2(x: i64) -> i64 {
+    var n: i64 = 0
+    var v: i64 = x
+    while v > 1 {
+        v = v >> 1
+        n = n + 1
+    }
+    return n
+}
+
+fn constrain(diff: i64, threshold: i64, damping: i64) -> i64 {
+    if threshold == 0 {
+        return 0
+    }
+    var adj: i64 = damping - floor_log2(threshold)
+    if adj < 0 {
+        adj = 0
+    }
+    var a: i64 = diff
+    if a < 0 {
+        a = 0 - a
+    }
+    var m: i64 = threshold - (a >> (adj as u64))
+    if m < 0 {
+        m = 0
+    }
+    if m > a {
+        m = a
+    }
+    if diff < 0 {
+        return 0 - m
+    }
+    return m
+}
+
+struct Ctx {
+    td: *mut av1blkst.TileDec,
+    src: *mut av1frame.Frame,
+    dst: *mut av1frame.Frame,
+    scr: u64,
+}
+
+fn inside(c: *mut Ctx, plane: i64, x: i64, y: i64) -> bool {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*(*c).td).ss_x
+        sy = (*(*c).td).ss_y
+    }
+    if x < 0 || y < 0 {
+        return false
+    }
+    let r: i64 = (y << (sy as u64)) >> 2
+    let col: i64 = (x << (sx as u64)) >> 2
+    return r < (*(*c).td).mi_rows && col < (*(*c).td).mi_cols
+}
+
+fn filter_block(c: *mut Ctx, plane: i64, r: i64, col: i64, pri: i64, sec: i64, damping: i64, dir: i64) {
+    let td: *mut av1blkst.TileDec = (*c).td
+    let shift: i64 = (*td).bit_depth - 8
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    let x0: i64 = (col * 4) >> (sx as u64)
+    let y0: i64 = (r * 4) >> (sy as u64)
+    let w: i64 = 8 >> (sx as u64)
+    let h: i64 = 8 >> (sy as u64)
+    let buf: u64 = (*(*c).src).planes[plane as usize]
+    let out: u64 = (*(*c).dst).planes[plane as usize]
+    let stride: i64 = (*(*c).src).strides[plane as usize]
+    let tap_set: i64 = (pri >> (shift as u64)) & 1
+    var i: i64 = 0
+    while i < h {
+        var j: i64 = 0
+        while j < w {
+            let x: i64 = av1ipm.ld(buf, (y0 + i) * stride + x0 + j)
+            var sum: i64 = 0
+            var mx: i64 = x
+            var mn: i64 = x
+            var k: i64 = 0
+            while k < 2 {
+                var sign: i64 = -1
+                while sign <= 1 {
+                    let dy: i64 = sign * (DIRS[(dir * 4 + k * 2) as usize] as i64)
+                    let dx: i64 = sign * (DIRS[(dir * 4 + k * 2 + 1) as usize] as i64)
+                    if inside(c, plane, x0 + j + dx, y0 + i + dy) {
+                        let p: i64 = av1ipm.ld(buf, (y0 + i + dy) * stride + x0 + j + dx)
+                        sum = sum + (PRI_TAPS[(tap_set * 2 + k) as usize] as i64) * constrain(p - x, pri, damping)
+                        mx = av1ipm.imax(p, mx)
+                        mn = av1ipm.imin(p, mn)
+                    }
+                    var off: i64 = -2
+                    while off <= 2 {
+                        let d2: i64 = (dir + off) & 7
+                        let ey: i64 = sign * (DIRS[(d2 * 4 + k * 2) as usize] as i64)
+                        let ex: i64 = sign * (DIRS[(d2 * 4 + k * 2 + 1) as usize] as i64)
+                        if inside(c, plane, x0 + j + ex, y0 + i + ey) {
+                            let s: i64 = av1ipm.ld(buf, (y0 + i + ey) * stride + x0 + j + ex)
+                            sum = sum + (SEC_TAPS[k as usize] as i64) * constrain(s - x, sec, damping)
+                            mx = av1ipm.imax(s, mx)
+                            mn = av1ipm.imin(s, mn)
+                        }
+                        off = off + 4
+                    }
+                    sign = sign + 2
+                }
+                k = k + 1
+            }
+            var neg: i64 = 0
+            if sum < 0 {
+                neg = 1
+            }
+            let v: i64 = x + ((8 + sum - neg) >> 4)
+            av1ipm.st(out, (y0 + i) * stride + x0 + j, av1ipm.imin(mx, av1ipm.imax(mn, v)))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn skipped(td: *mut av1blkst.TileDec, r: i64, col: i64) -> bool {
+    return av1blkst.mi_get(td, (*td).skip_a, r, col) != 0 && av1blkst.mi_get(td, (*td).skip_a, r + 1, col) != 0 && av1blkst.mi_get(td, (*td).skip_a, r, col + 1) != 0 && av1blkst.mi_get(td, (*td).skip_a, r + 1, col + 1) != 0
+}
+
+fn cdef_block(c: *mut Ctx, r: i64, col: i64, idx: i64) {
+    let td: *mut av1blkst.TileDec = (*c).td
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let shift: i64 = (*td).bit_depth - 8
+    let ydir: i64 = av1cdefdir.cdef_find_dir((*c).scr, (*(*c).src).planes[0], (*(*c).src).strides[0], col * 4, r * 4, (*td).bit_depth)
+    let var_: i64 = ydir >> 3
+    let dir: i64 = ydir & 7
+    var pri: i64 = (*fh).cdef_y_pri_strength[idx as usize] << (shift as u64)
+    var sec: i64 = (*fh).cdef_y_sec_strength[idx as usize] << (shift as u64)
+    var ldir: i64 = 0
+    if pri != 0 {
+        ldir = dir
+    }
+    var var_str: i64 = 0
+    if (var_ >> 6) != 0 {
+        var_str = av1ipm.imin(floor_log2(var_ >> 6), 12)
+    }
+    if var_ != 0 {
+        pri = (pri * (4 + var_str) + 8) >> 4
+    } else {
+        pri = 0
+    }
+    let damping: i64 = (*fh).cdef_damping + shift
+    filter_block(c, 0, r, col, pri, sec, damping, ldir)
+    if (*td).num_planes == 1 {
+        return
+    }
+    pri = (*fh).cdef_uv_pri_strength[idx as usize] << (shift as u64)
+    sec = (*fh).cdef_uv_sec_strength[idx as usize] << (shift as u64)
+    var cdir: i64 = 0
+    if pri != 0 {
+        cdir = UV_DIR[(((*td).ss_x * 2 + (*td).ss_y) * 8 + dir) as usize] as i64
+    }
+    filter_block(c, 1, r, col, pri, sec, damping - 1, cdir)
+    filter_block(c, 2, r, col, pri, sec, damping - 1, cdir)
+}
+
+fn cdef_frame(td: *mut av1blkst.TileDec, src: *mut av1frame.Frame, dst: *mut av1frame.Frame) {
+    var ctx: Ctx = Ctx { td: td, src: src, dst: dst, scr: vp9mem.alloc(av1cdefdir.CDEF_SCRATCH_BYTES) }
+    var r: i64 = 0
+    while r < (*td).mi_rows {
+        var col: i64 = 0
+        while col < (*td).mi_cols {
+            let idx: i64 = av1blkst.ld((*td).cdef_a, (r >> 4) * (*td).cdef_stride + (col >> 4))
+            if idx != 255 && !skipped(td, r, col) {
+                cdef_block(&ctx, r, col, idx)
+            }
+            col = col + 2
+        }
+        r = r + 2
+    }
+    vp9mem.free(ctx.scr, av1cdefdir.CDEF_SCRATCH_BYTES)
+}
