@@ -147,7 +147,6 @@ def chat_row(i):
             "fav": i % 11 == 0, "parent": None if i % 4 else "o1"}
 
 def sidebar_chats():
-    # FAKE_SIDEBAR=1: the chats of the web sidebar reference (AKTIV / HEUTE / GESTERN, sub-workers under OrientOS, a Workers tab)
     now = int(time.time() * 1000)
     if os.environ.get("FAKE_STABLE_CHATS") == "1": now = now // 3600000 * 3600000  # a61: same list body across requests / restarts (ETag tests)
     h = 3600000

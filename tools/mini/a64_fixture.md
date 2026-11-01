@@ -1,22 +1,22 @@
-Ich habe `check` ausgeführt und das Ergebnis geprüft. Hier eine **fette** Zeile, ein [Link](https://example.com) und etwas längerer Text, damit der Umbruch sichtbar wird und die Breite stimmt.
+I ran `check` and verified the result. Here is a **bold** line, a [link](https://example.com) and somewhat longer text so that the wrapping becomes visible and the width fits.
 
-## Überschrift zwei
+## Heading two
 
-- Punkt eins mit `inline code`
-- Punkt zwei
-- Punkt drei
+- Item one with `inline code`
+- Item two
+- Item three
 
-1. Erstens
-2. Zweitens
+1. First
+2. Second
 
-### Überschrift drei
+### Heading three
 
 ```js
 const a = 1
 console.log(a + 2)
 ```
 
-> Zitat Zeile
+> Quote line
 
 | Name | Wert |
 |---|---|
