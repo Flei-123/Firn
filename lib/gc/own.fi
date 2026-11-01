@@ -56,30 +56,82 @@ fn __own_free_masked(p: *mut u8, mask: u32) {
         return
     }
     let st: u64 = __gc_state() as u64
+    let multi: u64 = (*((st + S_MULTI) as *mut u64))
     let class: u64 = (*((c + 40) as *mut u64))
+    var base: u64 = 0
+    if class < CLASSES && (*((st + S_PHASE) as *mut u64)) == 0 {
+        base = __own_list_base(st, multi)
+    }
+    if base == 0 {
+        __own_bump((&OWN_DEFERRED) as u64, 1, multi)
+        if multi != 0 {
+            return
+        }
+        *((b) as *mut u32) = 0
+        *((b + 8) as *mut u64) = 0
+        return
+    }
     *((b) as *mut u32) = 0
     *((b + 8) as *mut u64) = 0
-    if class >= CLASSES {
-        OWN_DEFERRED = OWN_DEFERRED + 1
-        return
-    }
-    if (*((st + S_PHASE) as *mut u64)) != 0 {
-        OWN_DEFERRED = OWN_DEFERRED + 1
-        return
-    }
-    if (*((st + S_MULTI) as *mut u64)) != 0 {
-        return
-    }
     *((b + 4) as *mut u32) = 0
-    let header: u64 = st + S_FREE + class * 8
+    let header: u64 = base + class * 8
     *((b + HEADER) as *mut u64) = (*((header) as *mut u64))
     *((header) as *mut u64) = b
-    let step: u64 = (*((c + 16) as *mut u64))
-    let since: u64 = (*((st + S_SINCE) as *mut u64))
-    if since >= step {
-        *((st + S_SINCE) as *mut u64) = since - step
+    __own_listed(base, 1, multi)
+    __own_since_sub(st, (*((c + 16) as *mut u64)), multi)
+    __own_bump((&OWN_FREED) as u64, 1, multi)
+}
+
+fn __own_list_base(st: u64, multi: u64) -> u64 {
+    if multi == 0 {
+        return st + S_FREE
     }
-    OWN_FREED = OWN_FREED + 1
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return 0
+    }
+    return tcb + FT_FREE
+}
+
+fn __own_listed(base: u64, n: u64, multi: u64) {
+    if multi == 0 || n == 0 {
+        return
+    }
+    let at: u64 = base - FT_FREE + FT_FREIN
+    *((at) as *mut u64) = (*((at) as *mut u64)) + n
+}
+
+fn __own_bump(cell: u64, n: u64, multi: u64) -> u64 {
+    if multi == 0 {
+        let v: u64 = (*((cell) as *mut u64)) + n
+        *((cell) as *mut u64) = v
+        return v
+    }
+    return __atomic_add(cell as *mut u64, n) + n
+}
+
+fn __own_since_sub(st: u64, n: u64, multi: u64) {
+    let at: u64 = st + S_SINCE
+    var since: u64 = (*((at) as *mut u64))
+    if multi == 0 {
+        if since >= n {
+            *((at) as *mut u64) = since - n
+        } else {
+            *((at) as *mut u64) = 0
+        }
+        return
+    }
+    while since != 0 {
+        var want: u64 = 0
+        if since >= n {
+            want = since - n
+        }
+        let seen: u64 = __atomic_swap(at as *mut u64, since, want)
+        if seen == since {
+            return
+        }
+        since = seen
+    }
 }
 
 fn __own_poison_quiet(p: *mut u8) -> u64 {
@@ -113,8 +165,8 @@ fn __own_poison_masked(p: *mut u8, mask: u32) -> u64 {
         i = i + 8
     }
     *((b + 4) as *mut u32) = zw | OWN_POISON
-    OWN_POISONED = OWN_POISONED + 1
-    return OWN_POISONED
+    let st: u64 = __gc_state() as u64
+    return __own_bump((&OWN_POISONED) as u64, 1, (*((st + S_MULTI) as *mut u64)))
 }
 
 fn __gc_poison_block(p: *mut u8) {
@@ -194,6 +246,9 @@ fn __own_verify_block(b: u64, tab: u64) {
 fn gc_own_verify() {
     let st: u64 = __gc_state() as u64
     if (*((st + S_INIT) as *mut u64)) != 1 {
+        return
+    }
+    if (*((st + S_MULTI) as *mut u64)) != 0 && (*((st + S_PHASE) as *mut u64)) != 0 {
         return
     }
     let tab: u64 = (*((st + S_TABLE) as *mut u64))
@@ -319,16 +374,15 @@ fn __own_cx_enter(cx: u64, a: u64) -> bool {
     *((cx + 16) as *mut u64) = lo
     *((cx + 24) as *mut u64) = lo + step * (*((c + 24) as *mut u64))
     *((cx + 40) as *mut u64) = step
-    if class >= CLASSES {
+    if class >= CLASSES || (*((cx + 8) as *mut u64)) == 0 {
         *((cx + 32) as *mut u64) = 0
     } else {
-        *((cx + 32) as *mut u64) = (*((cx) as *mut u64)) + S_FREE + class * 8
+        *((cx + 32) as *mut u64) = (*((cx + 8) as *mut u64)) + class * 8
     }
     return true
 }
 
-fn __own_drop_loop(root: u64, t: u64, offs: u64, n: u64, cx: u64, check: u64) {
-    let stk: u64 = (&OWN_STACK) as u64
+fn __own_drop_loop(root: u64, t: u64, offs: u64, n: u64, cx: u64, check: u64, stk: u64, cap: u64) {
     *((stk) as *mut u64) = root
     var sp: u64 = 1
     var lo: u64 = 0
@@ -362,7 +416,7 @@ fn __own_drop_loop(root: u64, t: u64, offs: u64, n: u64, cx: u64, check: u64) {
         var i: u64 = 0
         while i < n {
             let child: u64 = (*((a + (*((offs + i * 8) as *mut u64))) as *mut u64))
-            if child != 0 && sp < OWN_STACK_CAP {
+            if child != 0 && sp < cap {
                 *((stk + sp * 8) as *mut u64) = child
                 sp = sp + 1
             }
@@ -396,13 +450,13 @@ fn __own_drop_run(p: u64, check: u64) {
     if tab == 0 {
         return
     }
-    if check == 0 {
-        if (*((st + S_PHASE) as *mut u64)) != 0 {
-            return
-        }
-        if (*((st + S_MULTI) as *mut u64)) != 0 {
-            return
-        }
+    let multi: u64 = (*((st + S_MULTI) as *mut u64))
+    var base: u64 = 0
+    if (*((st + S_PHASE) as *mut u64)) == 0 {
+        base = __own_list_base(st, multi)
+    }
+    if check == 0 && base == 0 {
+        return
     }
     let b: u64 = __own_block(p)
     if b == 0 {
@@ -413,21 +467,26 @@ fn __own_drop_run(p: u64, check: u64) {
         return
     }
     let entry: u64 = tab + 8 + (t - 1) * 64
-    var cx: [u64; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var cx: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
     let at: u64 = (&cx) as u64
     *((at) as *mut u64) = st
-    __own_drop_loop(p, t, (*((entry + 24) as *mut u64)), (*((entry + 16) as *mut u64)), at, check)
+    *((at + 8) as *mut u64) = base
+    if multi == 0 {
+        __own_drop_loop(p, t, (*((entry + 24) as *mut u64)), (*((entry + 16) as *mut u64)), at, check, (&OWN_STACK) as u64, OWN_STACK_CAP)
+    } else {
+        __own_drop_local(p, t, entry, at, check)
+    }
     let freed: u64 = (*((at + 48) as *mut u64))
     if freed != 0 {
-        OWN_FREED = OWN_FREED + freed
-        let bytes: u64 = (*((at + 56) as *mut u64))
-        let since: u64 = (*((st + S_SINCE) as *mut u64))
-        if since >= bytes {
-            *((st + S_SINCE) as *mut u64) = since - bytes
-        } else {
-            *((st + S_SINCE) as *mut u64) = 0
-        }
+        __own_listed(base, freed, multi)
+        __own_bump((&OWN_FREED) as u64, freed, multi)
+        __own_since_sub(st, (*((at + 56) as *mut u64)), multi)
     }
+}
+
+fn __own_drop_local(p: u64, t: u64, entry: u64, at: u64, check: u64) {
+    var stk: [u64; 256] = [0; 256]
+    __own_drop_loop(p, t, (*((entry + 24) as *mut u64)), (*((entry + 16) as *mut u64)), at, check, (&stk) as u64, 256)
 }
 
 fn __own_drop_tree(p: u64) {
@@ -436,8 +495,8 @@ fn __own_drop_tree(p: u64) {
 
 fn __own_drop_tree_check(p: u64) {
     __own_drop_run(p, 1)
-    OWN_DROPS = OWN_DROPS + 1
-    let n: u64 = OWN_DROPS
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __own_bump((&OWN_DROPS) as u64, 1, (*((st + S_MULTI) as *mut u64)))
     if (n & (n - 1)) == 0 {
         gc_own_verify()
     }
