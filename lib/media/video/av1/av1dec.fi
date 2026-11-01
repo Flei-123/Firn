@@ -8,6 +8,8 @@ import media.video.av1.av1seq
 import media.video.av1.av1fhdr
 import media.video.av1.av1frh
 import media.video.av1.av1ref
+import media.video.av1.av1mfbuf
+import media.video.av1.av1mfmv
 import media.video.av1.av1cdfctx
 import media.video.av1.av1blkst
 import media.video.av1.av1tile
@@ -36,6 +38,8 @@ struct Decoder {
     rc: *mut av1recon.Recon,
     slots: [u64; 8],
     cur: u64,
+    cur_mf: u64,
+    mfld: u64,
     have_seq: bool,
     frames_out: i64,
     frames_decoded: i64,
@@ -72,6 +76,7 @@ fn dec_free(d: *mut Decoder) {
     if (*d).cur != 0 {
         av1frame.frame_release((*d).cur as *mut av1frame.Frame)
     }
+    drop_motion(d)
     av1recon.recon_free((*d).rc)
     av1blkst.td_free((*d).td)
     av1cdfctx.cdfs_free(&(*d).cdfs)
@@ -79,6 +84,37 @@ fn dec_free(d: *mut Decoder) {
     av1fhdr.fhdr_free((*d).fh)
     av1seq.seq_free((*d).seq)
     av1mem.av1_zfree[Decoder](d)
+}
+
+fn drop_motion(d: *mut Decoder) {
+    if (*d).cur_mf != 0 {
+        av1mfbuf.mfbuf_release((*d).cur_mf as *mut av1mfbuf.MfBuf)
+        (*d).cur_mf = 0
+    }
+    if (*d).mfld != 0 {
+        av1mfmv.mfld_free((*d).mfld as *mut av1mfmv.MotionField)
+        (*d).mfld = 0
+    }
+}
+
+fn begin_motion(d: *mut Decoder) {
+    let fh: *mut av1fhdr.FrameHdr = (*d).fh
+    drop_motion(d)
+    (*d).cur_mf = av1mfbuf.mfbuf_new((*fh).mi_rows, (*fh).mi_cols) as u64
+    if (*fh).use_ref_frame_mvs == 1 {
+        let m: *mut av1mfmv.MotionField = av1mfmv.mfld_new((*fh).mi_rows, (*fh).mi_cols)
+        av1mfmv.mfld_estimate(m, fh, (*d).seq, (*d).st)
+        (*d).mfld = m as u64
+    }
+}
+
+fn end_motion(d: *mut Decoder) {
+    let fh: *mut av1fhdr.FrameHdr = (*d).fh
+    let mf: *mut av1mfbuf.MfBuf = (*d).cur_mf as *mut av1mfbuf.MfBuf
+    if (*fh).frame_is_intra == 0 {
+        av1mfbuf.mf_save_mvs(mf, (*(*d).td).ref_a, (*(*d).td).mv_a, fh, (*d).seq)
+    }
+    av1mfbuf.mf_save_segids(mf, (*(*d).td).seg_a, fh, av1ref.ref_prev_segment_ids((*d).st, fh))
 }
 
 fn fail(d: *mut Decoder, code: i64) {
@@ -116,6 +152,7 @@ fn begin_frame(d: *mut Decoder) -> bool {
     }
     let f: *mut av1frame.Frame = av1frame.frame_new((*fh).upscaled_width, (*fh).frame_height, 2 * (((*fh).upscaled_width + 7) >> 3), (*fh).mi_rows, (*seq).subsampling_x, (*seq).subsampling_y, (*seq).num_planes, (*seq).bit_depth)
     (*d).cur = f as u64
+    begin_motion(d)
     av1blkst.td_setup_frame((*d).td, seq, fh)
     av1recon.recon_begin_frame((*d).rc, (*d).td, f)
     let none: bool = (*fh).primary_ref_frame == av1fhdr.PRIMARY_REF_NONE
@@ -141,6 +178,8 @@ fn finish_frame(d: *mut Decoder, out: *mut rt.Buf) {
     av1cdfctx.cdfs_end_frame(&(*d).cdfs, (*fh).disable_frame_end_update_cdf != 0)
     let f: *mut av1frame.Frame = (*d).cur as *mut av1frame.Frame
     av1post.post_frame((*d).td, f)
+    end_motion(d)
+    av1ref.ref_update((*d).st, fh, (*d).seq, (*d).cur_mf)
     var i: usize = 0
     while i < 8 {
         if (((*fh).refresh_frame_flags >> (i as u64)) & 1) != 0 {
@@ -153,6 +192,8 @@ fn finish_frame(d: *mut Decoder, out: *mut rt.Buf) {
         i = i + 1
     }
     (*d).frames_decoded = (*d).frames_decoded + 1
+    av1mfbuf.mfbuf_release((*d).cur_mf as *mut av1mfbuf.MfBuf)
+    (*d).cur_mf = 0
     if (*fh).show_frame != 0 {
         emit(d, f, out)
     }
@@ -225,7 +266,6 @@ fn do_frame(d: *mut Decoder, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
         show_existing(d, out)
         return
     }
-    av1ref.ref_update((*d).st, (*d).fh, (*d).seq)
     (*(*d).st).seen_frame_header = 1
     if !begin_frame(d) {
         fail(d, DEC_ERR_CDF)
