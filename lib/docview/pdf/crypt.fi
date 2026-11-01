@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.md5
+import std.crypto.aes
+import rt.rt
+
+export {
+    Crypt,
+    crypt_new, crypt_derive, crypt_active,
+    crypt_stream, crypt_string,
+    MODE_NONE, MODE_RC4, MODE_AES,
+}
+
+const MODE_NONE: u32 = 0
+const MODE_RC4: u32 = 1
+const MODE_AES: u32 = 2
+
+const MAX_ID: usize = 64
+
+static mut PAD: [u8; 32] = [40, 191, 78, 94, 78, 117, 138, 65, 100, 0, 78, 86, 255, 250, 1, 8,
+    46, 46, 0, 182, 208, 104, 62, 128, 47, 12, 169, 254, 100, 83, 105, 122]
+
+struct Crypt {
+    stm_mode: u32,
+    str_mode: u32,
+    klen: u32,
+    key: [u8; 16],
+    ready: bool,
+}
+
+#[no_gc]
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn crypt_new() -> Crypt {
+    return Crypt { stm_mode: MODE_NONE, str_mode: MODE_NONE, klen: 0, key: [0 as u8; 16], ready: false }
+}
+
+fn crypt_active(c: *mut Crypt) -> bool {
+    return (*c).ready
+}
+
+fn rc4_init(st: *mut [u8; 256], key: u64, klen: usize) {
+    var i: usize = 0
+    while i < 256 {
+        (*st)[i] = i as u8
+        i = i + 1
+    }
+    var j: usize = 0
+    i = 0
+    while i < 256 {
+        j = (j + ((*st)[i] as usize) + (ld8(key, i % klen) as usize)) & 255
+        let t: u8 = (*st)[i]
+        (*st)[i] = (*st)[j]
+        (*st)[j] = t
+        i = i + 1
+    }
+}
+
+fn rc4_apply(key: u64, klen: usize, src: u64, n: usize, out: *mut rt.Buf) {
+    var st: [u8; 256] = [0 as u8; 256]
+    rc4_init(&st, key, klen)
+    var a: usize = 0
+    var b: usize = 0
+    var k: usize = 0
+    while k < n {
+        a = (a + 1) & 255
+        b = (b + (st[a] as usize)) & 255
+        let t: u8 = st[a]
+        st[a] = st[b]
+        st[b] = t
+        let ks: u8 = st[((st[a] as usize) + (st[b] as usize)) & 255]
+        rt.buf_push(out, ld8(src, k) ^ ks)
+        k = k + 1
+    }
+}
+
+fn rc4_block16(key: u64, klen: usize, src: u64, dst: *mut [u8; 16]) {
+    var tmp: rt.Buf = rt.buf_new()
+    rc4_apply(key, klen, src, 16, &tmp)
+    var i: usize = 0
+    while i < 16 {
+        (*dst)[i] = rt.buf_at(&tmp, i)
+        i = i + 1
+    }
+    rt.buf_free(&tmp)
+}
+
+fn put(buf: *mut [u8; 256], at: usize, p: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        (*buf)[at + i] = ld8(p, i)
+        i = i + 1
+    }
+    return at + n
+}
+
+fn pad_prefix(buf: *mut [u8; 256]) -> usize {
+    return put(buf, 0, (&PAD[0]) as u64, 32)
+}
+
+fn compute_key(buf: *mut [u8; 256], r: u32, klen: usize, p: u32, o: u64,
+    id: u64, idn: usize, encmeta: bool, pw: u64, pwn: usize, key: *mut [u8; 16]) {
+    var pl: usize = pwn
+    if pl > 32 {
+        pl = 32
+    }
+    var at: usize = put(buf, 0, pw, pl)
+    at = put(buf, at, (&PAD[0]) as u64, 32 - pl)
+    at = put(buf, at, o, 32)
+    (*buf)[at] = (p & 255) as u8
+    (*buf)[at + 1] = ((p >> 8) & 255) as u8
+    (*buf)[at + 2] = ((p >> 16) & 255) as u8
+    (*buf)[at + 3] = ((p >> 24) & 255) as u8
+    at = at + 4
+    at = put(buf, at, id, idn)
+    if r >= 4 && !encmeta {
+        (*buf)[at] = 255 as u8
+        (*buf)[at + 1] = 255 as u8
+        (*buf)[at + 2] = 255 as u8
+        (*buf)[at + 3] = 255 as u8
+        at = at + 4
+    }
+    var h: [u8; 16] = [0 as u8; 16]
+    md5.md5((&(*buf)[0]) as u64, at, (&h[0]) as u64)
+    if r >= 3 {
+        var round: usize = 0
+        while round < 50 {
+            var h2: [u8; 16] = [0 as u8; 16]
+            md5.md5((&h[0]) as u64, klen, (&h2[0]) as u64)
+            h = h2
+            round = round + 1
+        }
+    }
+    var i: usize = 0
+    while i < klen {
+        (*key)[i] = h[i]
+        i = i + 1
+    }
+}
+
+fn verify_user(buf: *mut [u8; 256], r: u32, klen: usize, key: *mut [u8; 16],
+    u: u64, id: u64, idn: usize) -> bool {
+    var i: usize = 0
+    if r == 2 {
+        var tmp: rt.Buf = rt.buf_new()
+        rc4_apply((&(*key)[0]) as u64, klen, (&PAD[0]) as u64, 32, &tmp)
+        var same: bool = true
+        while i < 32 {
+            if rt.buf_at(&tmp, i) != ld8(u, i) {
+                same = false
+            }
+            i = i + 1
+        }
+        rt.buf_free(&tmp)
+        return same
+    }
+    var at: usize = pad_prefix(buf)
+    at = put(buf, at, id, idn)
+    var m: [u8; 16] = [0 as u8; 16]
+    md5.md5((&(*buf)[0]) as u64, at, (&m[0]) as u64)
+    var cur: [u8; 16] = [0 as u8; 16]
+    rc4_block16((&(*key)[0]) as u64, klen, (&m[0]) as u64, &cur)
+    var pass: usize = 1
+    while pass < 20 {
+        var xk: [u8; 16] = [0 as u8; 16]
+        i = 0
+        while i < klen {
+            xk[i] = (*key)[i] ^ (pass as u8)
+            i = i + 1
+        }
+        var nx: [u8; 16] = [0 as u8; 16]
+        rc4_block16((&xk[0]) as u64, klen, (&cur[0]) as u64, &nx)
+        cur = nx
+        pass = pass + 1
+    }
+    i = 0
+    while i < 16 {
+        if cur[i] != ld8(u, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn crypt_derive(c: *mut Crypt, v: u32, r: u32, lenbits: u32, p: u32,
+    o: u64, on: usize, u: u64, un: usize, id: u64, idn: usize,
+    encmeta: bool, pw: u64, pwn: usize, stm: u32, strm: u32) -> bool {
+    if v >= 5 || r < 2 || r > 4 || on < 32 || un < 32 {
+        return false
+    }
+    var klen: usize = 5
+    if v >= 2 {
+        klen = (lenbits / 8) as usize
+    }
+    if v == 4 {
+        klen = 16
+    }
+    if klen < 5 {
+        klen = 5
+    }
+    if klen > 16 {
+        klen = 16
+    }
+    var idc: usize = idn
+    if idc > MAX_ID {
+        idc = MAX_ID
+    }
+    var buf: [u8; 256] = [0 as u8; 256]
+    var key: [u8; 16] = [0 as u8; 16]
+    compute_key(&buf, r, klen, p, o, id, idc, encmeta, pw, pwn, &key)
+    if !verify_user(&buf, r, klen, &key, u, id, idc) {
+        return false
+    }
+    (*c).klen = klen as u32
+    (*c).key = key
+    (*c).stm_mode = stm
+    (*c).str_mode = strm
+    (*c).ready = true
+    return true
+}
+
+fn object_key(c: *mut Crypt, num: usize, gen: usize, aes_mode: bool,
+    out: *mut [u8; 16]) -> usize {
+    var inb: [u8; 32] = [0 as u8; 32]
+    let klen: usize = (*c).klen as usize
+    var at: usize = 0
+    while at < klen {
+        inb[at] = (*c).key[at]
+        at = at + 1
+    }
+    inb[at] = (num & 255) as u8
+    inb[at + 1] = ((num >> 8) & 255) as u8
+    inb[at + 2] = ((num >> 16) & 255) as u8
+    inb[at + 3] = (gen & 255) as u8
+    inb[at + 4] = ((gen >> 8) & 255) as u8
+    at = at + 5
+    if aes_mode {
+        inb[at] = 115 as u8
+        inb[at + 1] = 65 as u8
+        inb[at + 2] = 108 as u8
+        inb[at + 3] = 84 as u8
+        at = at + 4
+    }
+    md5.md5((&inb[0]) as u64, at, (&(*out)[0]) as u64)
+    var okl: usize = klen + 5
+    if okl > 16 {
+        okl = 16
+    }
+    return okl
+}
+
+fn decrypt_with(c: *mut Crypt, mode: u32, num: usize, gen: usize,
+    src: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if mode == MODE_NONE {
+        rt.buf_push_bytes(out, src, n)
+        return true
+    }
+    var h: [u8; 16] = [0 as u8; 16]
+    let okl: usize = object_key(c, num, gen, mode == MODE_AES, &h)
+    if mode == MODE_RC4 {
+        rc4_apply((&h[0]) as u64, okl, src, n, out)
+        return true
+    }
+    if n < 32 || (n % 16) != 0 {
+        return false
+    }
+    let body: usize = n - 16
+    let start: usize = rt.buf_len(out)
+    rt.buf_push_bytes(out, src + 16, body)
+    var iv: [u8; 16] = [0 as u8; 16]
+    var i: usize = 0
+    while i < 16 {
+        iv[i] = ld8(src, i)
+        i = i + 1
+    }
+    var ctx: aes.Aes = aes.aes128_new_soft((&h[0]) as u64)
+    let at: u64 = rt.buf_ptr(out) + start as u64
+    if !aes.aes_cbc_decrypt_soft(&ctx, (&iv[0]) as u64, at, body, at) {
+        rt.buf_set_len(out, start)
+        return false
+    }
+    let padn: usize = ld8(at, body - 1) as usize
+    var plain: usize = body
+    if padn >= 1 && padn <= 16 {
+        plain = body - padn
+    }
+    rt.buf_set_len(out, start + plain)
+    return true
+}
+
+fn crypt_stream(c: *mut Crypt, num: usize, gen: usize, src: u64, n: usize,
+    out: *mut rt.Buf) -> bool {
+    return decrypt_with(c, (*c).stm_mode, num, gen, src, n, out)
+}
+
+fn crypt_string(c: *mut Crypt, num: usize, gen: usize, src: u64, n: usize,
+    out: *mut rt.Buf) -> bool {
+    return decrypt_with(c, (*c).str_mode, num, gen, src, n, out)
+}

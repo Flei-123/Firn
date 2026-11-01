@@ -42,6 +42,10 @@ fi
 if [ -z "${FEAT_SKIP_TREES:-}" ]; then
     run_dim overworld ${FEAT_TREES:-$TREE_DEFAULT}
 fi
+LUSH_DEFAULT="3:-6:-32 3:-48:24 3:-28:46 3:-22:42 3:-10:-16"
+if [ -z "${FEAT_SKIP_LUSH:-}" ]; then
+    run_dim overworld ${FEAT_LUSH:-$LUSH_DEFAULT}
+fi
 run_dim nether ${FEAT_NETHER:-7:0:0 7:3:-2 12:-5:4}
 [ $ERR = 0 ] && echo "mc/wgen features: all ok" || echo "mc/wgen features: FAILED"
 exit $ERR
