@@ -2,7 +2,7 @@
 
 Goal: the compiler infers ownership and lifetimes of heap objects by itself — no annotations, no borrow checker — and frees deterministically at the last use or reuses the memory in place. Whatever it cannot prove (cycles, unclear aliases) stays with the tracing GC (`docs/GC.md`). The prototype lives behind a flag and changes nothing while the flag is off.
 
-Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r1325 a), gc class objects (r1325 b) and GcVec/GcMap/closure records (r1325 c) in `compiler/src/own/fir/`, check mode clean, default off.
+Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r1325 a), gc class objects (r1325 b) GcVec/GcMap/closure records (r1325 c) and in-place reuse (r1328) in `compiler/src/own/fir/`, check mode clean, default off.
 
 ### FIR stage (r1325 a)
 - Hook: `opt::optimize_with`; `prepare` before the optimizer (renames `__str_concat`/`3`/`4` -> `__own_str_concat2`/`3`/`4`, producers `inline_hint=false`), `run` after it: producer calls without a free are renamed back and inlined (`inline::inline_requested_tracked`), touched functions are re-optimized. Only on/check, level != dev, native targets, not kernel; `FIRN_OWN_NO_FIR=1` disables it.
@@ -104,6 +104,14 @@ Like `escape.rs`: decidable cases are decided, everything else is `unknown` = GC
 2. **Interprocedural summaries** per function, fixed point over the call graph (same driver shape as `escape.rs`): per GC parameter `{borrows, stores, returns}`; per function `returns_fresh`. Recursion converges because the lattice is finite. Indirect calls and `extern` = `stores` for every argument.
 3. **Last use**: backward liveness per function over FIR blocks for `owned` values. The free goes after the last use on every path; on paths where the value is dead at a branch, the free goes to the start of the successor that no longer uses it (classic "kill at edge"). Values live around a loop back edge are not freed inside the loop.
 4. **Uniqueness of structures (phase C)**: a tree whose every child pointer was stored only from `fresh` values of the same function family and never loaded out to an `unknown` place is unique; a drop of the root may then free recursively (drop specialization).
+
+### FIR stage, in-place reuse (r1328, C)
+- `reuse.rs` plans, `reuse_apply.rs` rewrites; only `--ownership=on` (check mode keeps poison + normal allocation), `FIRN_OWN_NO_REUSE=1` turns it off. `FIRN_OWN_STATS=1` prints `N reuses` (a reused free is not counted in `frees`).
+- Candidates: a `Drop::Block` value site whose defs all have the same compile-time size class (fast path head offset or `__gc_alloc_raw` with a constant size), and an allocation of that class reachable from the free point through at most 8 blocks without any call (no allocation, no GC, no safepoint, no thread start in between). Each allocation takes at most one free; paths never cross another rewritten head.
+- Blocks with several predecessors on the path get a phi (handle on the path edge, null elsewhere), so a free at the end of a loop body reaches the allocation of the next iteration. Paths that leave the chain leak the block to the GC (safe, one object per exit).
+- Inline fast path: the head block is split before the free-list load; `h != 0` and no flag bits besides the mark (`F_FIN`, `F_WART`, `F_GETAN`, `F_SLOTS`, poison) -> a clone of the take block with `b = h - 16`, no unhook, `S_SINCE` unchanged (free + alloc net zero). The guards before (INIT, MULTI == 0, PHASE == 0, SINCE < LIMIT) still decide; the slow block frees `h` first when all its predecessors see `h`.
+- Allocation calls: `__gc_alloc_raw(tid, size)` -> `__own_reuse_alloc(h, tid, size)` in `lib/gc/own.fi` (same checks at run time, else `__gc_free_block` + normal allocation; counter `gc_own_reused()`).
+- Strings are not reused (the class of a concat result is not known at compile time, the next concat is a call).
 
 ### 4.3 Transformations
 

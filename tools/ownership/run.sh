@@ -53,7 +53,7 @@ same_out fir_obj_branch
 same_out fir_obj_field
 same_out fir_obj_factory
 same_out fir_obj_escape
-expect_rc fir_obj_freed on 0
+FIRN_OWN_NO_REUSE=1 expect_rc fir_obj_freed on 0
 expect_rc fir_obj_freed check 0
 same_out fir_vec_loop
 same_out fir_vec_ret
@@ -67,7 +67,7 @@ expect_rc fir_map_freed check 0
 expect_rc fir_vec_poison check 86
 same_out fir_clo_local
 same_out fir_clo_stored
-expect_rc fir_clo_freed on 0
+FIRN_OWN_NO_REUSE=1 expect_rc fir_clo_freed on 0
 expect_rc fir_clo_freed check 0
 has_reuse() {
   case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
