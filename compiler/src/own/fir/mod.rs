@@ -50,10 +50,13 @@ pub(crate) fn prepare(m: &mut Module) {
 }
 
 pub(crate) fn run(m: &mut Module) -> Vec<usize> {
-    let free_fn = registry::free_fn(super::mode());
+    let mode = super::mode();
+    let free_fn = registry::free_fn(mode);
     if !m.funcs.iter().any(|f| f.name == free_fn) {
         return Vec::new();
     }
+    let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
+    let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
     let t0 = std::time::Instant::now();
     let (mut sites, mut frees) = (0usize, 0usize);
     let base: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
@@ -69,7 +72,7 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     for &fi in roots.iter() {
         let f = &mut m.funcs[fi];
         let mut kept: crate::fx::HashSet<(usize, usize)> = crate::fx::HashSet::default();
-        let mut pending: Option<(slots::Slots, Vec<live::Free>)> = None;
+        let mut pending: Option<(slots::Slots, Vec<live::Free>, Vec<&str>)> = None;
         if !summary::skipped(f) {
             let ix = index::Index::build(f);
             let sl = slots::Slots::build(f, &ix);
@@ -82,14 +85,15 @@ pub(crate) fn run(m: &mut Module) -> Vec<usize> {
                         kept.insert(at);
                     }
                 }
-                pending = Some((sl, d));
+                let fns: Vec<&str> = fl.drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
+                pending = Some((sl, d, fns));
             }
         }
         if revert_calls(f, &kept, &defined) {
             reverted.push(fi);
         }
-        if let Some((sl, d)) = pending {
-            frees += insert::apply(f, &sl, d, free_fn);
+        if let Some((sl, d, fns)) = pending {
+            frees += insert::apply(f, &sl, d, &fns);
         }
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {

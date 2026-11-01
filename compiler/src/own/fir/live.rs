@@ -1,4 +1,5 @@
 use super::flow::{Borrows, CellVal, Flow};
+use super::registry::Drop;
 use super::index::{term_uses, Bits, Index};
 use super::sites::Site;
 use super::slots::Slots;
@@ -16,6 +17,7 @@ pub(crate) struct Free {
     pub block: usize,
     pub pos: usize,
     pub handle: Handle,
+    pub site: usize,
 }
 
 struct Items {
@@ -274,7 +276,7 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             let defines = is_site || inst.dst.map_or(false, |d| cx.items.val.contains_key(&d));
             if (before || defines) && !after {
                 if let Some(h) = handle(&cx, fl, inst, is_site, &states[ii + 1]) {
-                    frees.push(Free { block: bi, pos: ii + 1, handle: h });
+                    frees.push(Free { block: bi, pos: ii + 1, handle: h, site: cx.site });
                 }
             }
             live = before_live;
@@ -297,7 +299,7 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
                 break;
             }
         }
-        if h.is_none() {
+        if h.is_none() && cell_handles(fl, cx.site) {
             for (&c, &i) in cx.items.cell.iter() {
                 if outs[p].get(i) && cx.must_cell(pend, c) {
                     h = Some(Handle::Cell(c));
@@ -306,17 +308,16 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             }
         }
         if let Some(h) = h {
-            frees.push(Free { block: bi, pos: 0, handle: h });
+            frees.push(Free { block: bi, pos: 0, handle: h, site: cx.site });
         }
     }
-    let _ = cx.site;
     Some(frees)
 }
 
 fn handle(cx: &Ctx, fl: &Flow, inst: &Inst, is_site: bool, after: &[CellVal]) -> Option<Handle> {
     if is_site {
         if let Site::Pair { cell_p, .. } = fl.sites[cx.site] {
-            return cx.must_cell(after, cell_p).then_some(Handle::Cell(cell_p));
+            return (cell_handles(fl, cx.site) && cx.must_cell(after, cell_p)).then_some(Handle::Cell(cell_p));
         }
     }
     let mut u = Vec::new();
@@ -334,6 +335,7 @@ fn base_of(cx: &Ctx, fl: &Flow, mut v: Val) -> Option<Val> {
     for _ in 0..8 {
         match cx.ix.op(cx.f, v)? {
             Op::PtrAdd { base, .. } => v = *base,
+            Op::Load { addr } if fl.owner_bits.get(cx.seed) => v = fl.zero_add.get(addr).copied().unwrap_or(*addr),
             _ => return None,
         }
         if fl.must(v) == Some(cx.seed) {
@@ -341,4 +343,8 @@ fn base_of(cx: &Ctx, fl: &Flow, mut v: Val) -> Option<Val> {
         }
     }
     None
+}
+
+fn cell_handles(fl: &Flow, site: usize) -> bool {
+    fl.drops[site] != Drop::SlotsOwner
 }

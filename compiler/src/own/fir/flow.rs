@@ -1,4 +1,5 @@
 use super::index::{Bits, Index};
+use super::registry::Drop;
 use super::sites::{self, Site};
 use super::slots::Slots;
 use crate::fir::{Func, Inst, Op, Term, Val};
@@ -23,6 +24,7 @@ pub(crate) struct Flow {
     pub nseeds: usize,
     pub nparams: usize,
     pub sites: Vec<Site>,
+    pub drops: Vec<Drop>,
     pub site_at: HashMap<(usize, usize), usize>,
     pub may: Vec<Bits>,
     pub derived: Vec<bool>,
@@ -31,6 +33,9 @@ pub(crate) struct Flow {
     pub ret_may: Bits,
     pub ret_derived: bool,
     other_bits: Bits,
+    pub owner_bits: Bits,
+    pub zero_add: HashMap<Val, Val>,
+    code_of: HashMap<Val, Val>,
     scratch: Bits,
     uses: Vec<Val>,
 }
@@ -54,17 +59,37 @@ impl Flow {
 
     pub fn build(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows, with_sites: bool) -> Flow {
         let nparams = f.params.len();
-        let (sites, site_at) = if with_sites {
+        let (sites, site_at, drops) = if with_sites {
             let found = sites::find(f, ix, sl, br);
-            (found.sites, found.site_at)
+            (found.sites, found.site_at, found.drops)
         } else {
-            (Vec::new(), HashMap::default())
+            (Vec::new(), HashMap::default(), Vec::new())
         };
         let nseeds = 1 + nparams + sites.len();
+        let mut owner_bits = Bits::new(nseeds);
+        let mut zero_add = HashMap::default();
+        for (k, d) in drops.iter().enumerate() {
+            if *d == Drop::SlotsOwner {
+                owner_bits.set(1 + nparams + k);
+            }
+        }
+        let code_of = code_loads(f);
+        if owner_bits.count() > 0 {
+            for b in f.blocks.iter() {
+                for inst in b.insts.iter() {
+                    if let (Op::PtrAdd { base, off }, Some(d)) = (&inst.op, inst.dst) {
+                        if ix.const_of(f, *off) == Some(0) {
+                            zero_add.insert(d, *base);
+                        }
+                    }
+                }
+            }
+        }
         let mut fl = Flow {
             nseeds,
             nparams,
             sites,
+            drops,
             site_at,
             may: vec![Bits::new(nseeds); ix.nvals],
             derived: vec![false; ix.nvals],
@@ -73,6 +98,9 @@ impl Flow {
             ret_may: Bits::new(nseeds),
             ret_derived: false,
             other_bits: Bits::single(nseeds, OTHER),
+            owner_bits,
+            zero_add,
+            code_of,
             scratch: Bits::new(nseeds),
             uses: Vec::new(),
         };
@@ -133,6 +161,26 @@ impl Flow {
         fl
     }
 
+    fn owner_field_load(&self, addr: Val, bytes: u64, acc: &mut Bits) -> bool {
+        if bytes != 8 || self.owner_bits.count() == 0 {
+            return false;
+        }
+        let base = self.zero_add.get(&addr).copied().unwrap_or(addr);
+        let mut hit = false;
+        for v in [addr, base] {
+            if self.derived[v as usize] {
+                continue;
+            }
+            for s in self.may[v as usize].iter() {
+                if self.owner_bits.get(s) {
+                    acc.set(s);
+                    hit = true;
+                }
+            }
+        }
+        hit
+    }
+
     fn put(&mut self, v: Val, m: &Bits, d: bool) -> bool {
         let i = v as usize;
         let mut ch = self.may[i].union(m);
@@ -191,12 +239,11 @@ impl Flow {
                 }
                 der = true;
             }
-            Op::Const(0) => {}
+            Op::Const(0) | Op::FnRef { .. } => {}
             Op::Cmp { .. }
             | Op::Const(_)
             | Op::Alloca { .. }
             | Op::GlobalAddr { .. }
-            | Op::FnRef { .. }
             | Op::VtabAddr { .. }
             | Op::GcAddr { .. }
             | Op::ThreadSelf => acc.assign(&self.other_bits),
@@ -205,7 +252,10 @@ impl Flow {
                     acc.assign(&cells[a.cell].may);
                     der = cells[a.cell].derived || inst.ty.bytes() < 8;
                 }
-                None => acc.assign(&self.other_bits),
+                None => {
+                    acc.assign(&self.other_bits);
+                    der |= self.owner_field_load(*addr, inst.ty.bytes(), &mut acc);
+                }
             },
             Op::Store { addr, val } => match sl.access(*addr, inst.ty) {
                 Some(a) => {
@@ -235,6 +285,16 @@ impl Flow {
                         continue;
                     }
                     self.sink(*v);
+                }
+                acc.assign(&self.other_bits);
+            }
+            Op::CallIndirect { target, args } => {
+                let env = self.code_of.get(target).copied().filter(|e| args.last() == Some(e) && !self.derived[*e as usize]);
+                self.sink(*target);
+                for v in args.iter() {
+                    if Some(*v) != env {
+                        self.sink(*v);
+                    }
                 }
                 acc.assign(&self.other_bits);
             }
@@ -268,4 +328,29 @@ fn join(a: &mut [CellVal], b: &[CellVal]) {
         x.may.union(&y.may);
         x.derived |= y.derived;
     }
+}
+
+fn code_loads(f: &Func) -> HashMap<Val, Val> {
+    let mut targets: crate::fx::HashSet<Val> = Default::default();
+    for b in f.blocks.iter() {
+        for inst in b.insts.iter() {
+            if let Op::CallIndirect { target, .. } = &inst.op {
+                targets.insert(*target);
+            }
+        }
+    }
+    let mut out = HashMap::default();
+    if targets.is_empty() {
+        return out;
+    }
+    for b in f.blocks.iter() {
+        for inst in b.insts.iter() {
+            if let (Op::Load { addr }, Some(d)) = (&inst.op, inst.dst) {
+                if targets.contains(&d) {
+                    out.insert(d, *addr);
+                }
+            }
+        }
+    }
+    out
 }
