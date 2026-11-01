@@ -459,16 +459,22 @@ const firnTag = document.currentScript;
         .map((f) => fetch(f).then((r) => r.arrayBuffer()));
     const assetAsked = ((firnTag.dataset.assets || '').match(/[^\s,]+/g) || [])
         .map((f) => fetch(f).then((r) => r.arrayBuffer()).then((b) => [f.split('/').pop(), new Uint8Array(b)]));
-    await new Promise((done) => {
+    const loadScript = (name) => new Promise((done) => {
         const tag = document.createElement('script');
-        tag.src = new URL('webaudio.js', firnTag.src || location.href).href;
+        tag.src = new URL(name, firnTag.src || location.href).href;
         tag.onload = tag.onerror = () => done();
         document.head.appendChild(tag);
     });
+    await Promise.all([loadScript('webaudio.js'), loadScript('webfaces.js')]);
     const audioNames = ['open', 'room', 'push', 'queued', 'pause', 'flush', 'close', 'state', 'mode', 'played', 'latency'];
     Object.assign(env, window.firnWebAudio
         ? window.firnWebAudio(() => mem, q.get('audio') === 'script')
         : Object.fromEntries(audioNames.map((n) => ['firn_web_audio_' + n, () => 0])));
+    const facesUrl = new URL(q.get('faces') || firnTag.dataset.faces || 'pdffonts.pack', firnTag.src || location.href).href;
+    Object.assign(env, window.firnWebFaces
+        ? window.firnWebFaces(() => mem, facesUrl)
+        : { firn_web_face_size: () => 0, firn_web_face_read: () => 0 });
+    if (window.firnFacesPrefetch && firnTag.dataset.facesPrefetch === 'yes') window.firnFacesPrefetch();
     const wasmAsked = fetch(wasm);
     let instance;
     const resp = await wasmAsked;
