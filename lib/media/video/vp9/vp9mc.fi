@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9ftab
+import media.video.vp9.vp9scale
+
+export { Mc, RefPlane, McPos, mc_new, mc_release, mc_ready, mcpos_set, mc_predict, mc_build, WIN_STRIDE }
+
+const WIN_STRIDE: i64 = 160
+const WIN_BYTES: usize = 25600
+const TMP_STRIDE: i64 = 64
+const TMP_BYTES: usize = 9216
+
+struct Mc {
+    win: u64,
+    tmp: u64,
+}
+
+struct RefPlane {
+    p: u64,
+    stride: i64,
+    cw: i64,
+    ch: i64,
+}
+
+struct McPos {
+    mi_x: i64,
+    mi_y: i64,
+    to_left: i64,
+    to_right: i64,
+    to_top: i64,
+    to_bottom: i64,
+    kernel: i64,
+}
+
+fn mc_new() -> Mc {
+    return Mc { win: vp9mem.alloc(WIN_BYTES), tmp: vp9mem.alloc(TMP_BYTES) }
+}
+
+fn mc_ready(mc: *Mc) -> bool {
+    return (*mc).win != 0 && (*mc).tmp != 0
+}
+
+fn mc_release(mc: *mut Mc) {
+    vp9mem.free((*mc).win, WIN_BYTES)
+    vp9mem.free((*mc).tmp, TMP_BYTES)
+    (*mc).win = 0
+    (*mc).tmp = 0
+}
+
+fn mcpos_set(p: *mut McPos, mi_row: i64, mi_col: i64, bw8: i64, bh8: i64, mi_rows: i64, mi_cols: i64, kernel: i64) {
+    (*p).mi_x = mi_col * 8
+    (*p).mi_y = mi_row * 8
+    (*p).to_left = 0 - mi_col * 64
+    (*p).to_right = (mi_cols - bw8 - mi_col) * 64
+    (*p).to_top = 0 - mi_row * 64
+    (*p).to_bottom = (mi_rows - bh8 - mi_row) * 64
+    (*p).kernel = kernel
+}
+
+fn pofs(p: u64, off: i64) -> u64 {
+    return ((p as i64) + off) as u64
+}
+
+fn put_px(drow: u64, x: i64, v: i64, avg: bool) {
+    if avg {
+        vp9mem.st8(drow, x as usize, (vp9mem.ld8(drow, x as usize) + v + 1) >> 1)
+        return
+    }
+    vp9mem.st8(drow, x as usize, v)
+}
+
+fn copy_block(src: u64, ss: i64, dst: u64, ds: i64, w: i64, h: i64, avg: bool) {
+    var y: i64 = 0
+    while y < h {
+        let srow: u64 = pofs(src, y * ss)
+        let drow: u64 = pofs(dst, y * ds)
+        var x: i64 = 0
+        while x < w {
+            put_px(drow, x, vp9mem.ld8(srow, x as usize), avg)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn conv_h(src: u64, ss: i64, dst: u64, ds: i64, kernel: i64, x0q4: i64, xs: i64, w: i64, h: i64, avg: bool) {
+    let ft: u64 = vp9ftab.filt_addr()
+    var y: i64 = 0
+    while y < h {
+        let srow: u64 = pofs(src, y * ss)
+        let drow: u64 = pofs(dst, y * ds)
+        var xq: i64 = x0q4
+        var x: i64 = 0
+        while x < w {
+            let sx: i64 = (xq >> 4) - 3
+            let fb: usize = ((kernel * 16 + (xq & 15)) * 8) as usize
+            var sum: i64 = 0
+            var k: usize = 0
+            while k < 8 {
+                sum = sum + vp9mem.ld8o(srow, sx + k as i64) * (vp9mem.ld16(ft, fb + k) - 128)
+                k = k + 1
+            }
+            put_px(drow, x, vp9mem.clip255((sum + 64) >> 7), avg)
+            xq = xq + xs
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn conv_v(src: u64, ss: i64, dst: u64, ds: i64, kernel: i64, y0q4: i64, ys: i64, w: i64, h: i64, avg: bool) {
+    let ft: u64 = vp9ftab.filt_addr()
+    var x: i64 = 0
+    while x < w {
+        var yq: i64 = y0q4
+        var y: i64 = 0
+        while y < h {
+            let sy: i64 = (yq >> 4) - 3
+            let fb: usize = ((kernel * 16 + (yq & 15)) * 8) as usize
+            var sum: i64 = 0
+            var k: usize = 0
+            while k < 8 {
+                sum = sum + vp9mem.ld8o(src, (sy + k as i64) * ss + x) * (vp9mem.ld16(ft, fb + k) - 128)
+                k = k + 1
+            }
+            put_px(pofs(dst, y * ds), x, vp9mem.clip255((sum + 64) >> 7), avg)
+            yq = yq + ys
+            y = y + 1
+        }
+        x = x + 1
+    }
+}
+
+fn convolve(mc: *Mc, src: u64, ss: i64, dst: u64, ds: i64, kernel: i64, sx: i64, xs: i64, sy: i64, ys: i64, w: i64, h: i64, avg: bool) {
+    let hz: bool = xs != 16 || sx != 0
+    let vt: bool = ys != 16 || sy != 0
+    if !hz && !vt {
+        copy_block(src, ss, dst, ds, w, h, avg)
+        return
+    }
+    if !vt {
+        conv_h(src, ss, dst, ds, kernel, sx, xs, w, h, avg)
+        return
+    }
+    if !hz {
+        conv_v(src, ss, dst, ds, kernel, sy, ys, w, h, avg)
+        return
+    }
+    let ih: i64 = (((h - 1) * ys + sy) >> 4) + 8
+    conv_h(pofs(src, 0 - 3 * ss), ss, (*mc).tmp, TMP_STRIDE, kernel, sx, xs, w, ih, false)
+    conv_v(pofs((*mc).tmp, 3 * TMP_STRIDE), TMP_STRIDE, dst, ds, kernel, sy, ys, w, h, avg)
+}
+
+fn clamp_i(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn mc_predict(mc: *Mc, rp: *RefPlane, x0: i64, y0: i64, sx: i64, sy: i64, xs: i64, ys: i64, w: i64, h: i64, kernel: i64, dst: u64, ds: i64, avg: bool) {
+    let hz: bool = xs != 16 || sx != 0
+    let vt: bool = ys != 16 || sy != 0
+    var mx0: i64 = 0
+    var mx1: i64 = 0
+    var my0: i64 = 0
+    var my1: i64 = 0
+    if hz {
+        mx0 = 3
+        mx1 = 4
+    }
+    if vt {
+        my0 = 3
+        my1 = 4
+    }
+    let xa: i64 = x0 - mx0
+    let ya: i64 = y0 - my0
+    let xb: i64 = x0 + (((w - 1) * xs + sx) >> 4) + mx1
+    let yb: i64 = y0 + (((h - 1) * ys + sy) >> 4) + my1
+    if xa >= 0 && ya >= 0 && xb < (*rp).cw && yb < (*rp).ch {
+        convolve(mc, pofs((*rp).p, y0 * (*rp).stride + x0), (*rp).stride, dst, ds, kernel, sx, xs, sy, ys, w, h, avg)
+        return
+    }
+    let bw: i64 = xb - xa + 1
+    let bh: i64 = yb - ya + 1
+    var j: i64 = 0
+    while j < bh {
+        let sr: u64 = pofs((*rp).p, clamp_i(ya + j, 0, (*rp).ch - 1) * (*rp).stride)
+        let wr: u64 = pofs((*mc).win, j * WIN_STRIDE)
+        var i: i64 = 0
+        while i < bw {
+            vp9mem.st8(wr, i as usize, vp9mem.ld8(sr, clamp_i(xa + i, 0, (*rp).cw - 1) as usize))
+            i = i + 1
+        }
+        j = j + 1
+    }
+    convolve(mc, pofs((*mc).win, (y0 - ya) * WIN_STRIDE + (x0 - xa)), WIN_STRIDE, dst, ds, kernel, sx, xs, sy, ys, w, h, avg)
+}
+
+fn mc_build(mc: *Mc, sf: *vp9scale.Scale, rp: *RefPlane, pos: *McPos, dst: u64, ds: i64, ss_x: i64, ss_y: i64, bw: i64, bh: i64, x: i64, y: i64, w: i64, h: i64, mv_row: i64, mv_col: i64, avg: bool) {
+    let xstart: i64 = (*pos).mi_x >> (ss_x as u64)
+    let ystart: i64 = (*pos).mi_y >> (ss_y as u64)
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var smv_col: i64 = 0
+    var smv_row: i64 = 0
+    var xs: i64 = 16
+    var ys: i64 = 16
+    if (*sf).scaled {
+        let qc: i64 = vp9scale.clamp_mv_col(mv_col, ss_x, bw, (*pos).to_left, (*pos).to_right)
+        let qr: i64 = vp9scale.clamp_mv_row(mv_row, ss_y, bh, (*pos).to_top, (*pos).to_bottom)
+        x0 = vp9scale.scale_x(sf, xstart + x)
+        y0 = vp9scale.scale_y(sf, ystart + y)
+        smv_col = vp9scale.scale_mv_col(sf, qc, (*pos).mi_x + x)
+        smv_row = vp9scale.scale_mv_row(sf, qr, (*pos).mi_y + y)
+        xs = (*sf).xstep
+        ys = (*sf).ystep
+    } else {
+        x0 = xstart + x
+        y0 = ystart + y
+        smv_col = mv_col * (1 << ((1 - ss_x) as u64))
+        smv_row = mv_row * (1 << ((1 - ss_y) as u64))
+    }
+    let sx: i64 = smv_col & 15
+    let sy: i64 = smv_row & 15
+    x0 = x0 + (smv_col >> 4)
+    y0 = y0 + (smv_row >> 4)
+    mc_predict(mc, rp, x0, y0, sx, sy, xs, ys, w, h, (*pos).kernel, pofs(dst, y * ds + x), ds, avg)
+}
