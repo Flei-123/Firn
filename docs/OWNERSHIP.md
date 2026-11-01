@@ -2,7 +2,7 @@
 
 Goal: the compiler infers ownership and lifetimes of heap objects by itself — no annotations, no borrow checker — and frees deterministically at the last use or reuses the memory in place. Whatever it cannot prove (cycles, unclear aliases) stays with the tracing GC (`docs/GC.md`). The prototype lives behind a flag and changes nothing while the flag is off.
 
-Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r1325 a) and gc class objects (r1325 b) in `compiler/src/own/fir/`, check mode clean, default off.
+Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r1325 a), gc class objects (r1325 b) and GcVec/GcMap/closure records (r1325 c) in `compiler/src/own/fir/`, check mode clean, default off.
 
 ### FIR stage (r1325 a)
 - Hook: `opt::optimize_with`; `prepare` before the optimizer (rename `__str_concat` -> `__own_str_concat2`, producers `inline_hint=false`), `run` after it. Only on/check, level != dev, native targets, not kernel; `FIRN_OWN_NO_FIR=1` disables it.
@@ -19,6 +19,14 @@ Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r13
 - `summary.rs`: returns_fresh = every `ret` value carries only own value sites that reach no other sink (least fixpoint over the call graph, borrow summaries are extended to new callers on the fly). A call of such a function is a value site in the caller.
 - `registry::ESCAPES` (`__gc_weak_raw`, `__gc_as_raw`, `gc_finalizer_*`, `gc_root_*`) always sink: objects with a weak ref, a finalizer or a root registration are never freed. Stores of the object into any non-private memory sink it; its children are never freed here.
 - AST tree drop calls (`__own_drop_tree*`) are in `CONSUMES`, so an object dropped by the AST stage is never freed twice. `FIRN_OWN_NO_AST=1` turns the AST tree drop off (measurement of the FIR stage alone).
+
+### FIR stage, containers and closures (r1325 c)
+- `registry::Drop` picks the free function per site: `Block` (`__gc_free_block` / `__gc_poison_block`) or `SlotsOwner` (`__own_drop_slots_owner[_check]` in `lib/gc/own.fi`: frees or poisons the slot buffer at word 0, checked by the slots type id, then the header). Slot buffers carry `F_SLOTS`, so they use `__own_free_masked` / `__own_poison_masked` with `OWN_MASK_SLOTS`.
+- Producers `gcvec_new`, `gcvec_new_raw`, `gcmap_new` (`Shape::SlotsOwner`) return `AllocError!Gc[..]` through an sret union: the site is a pair site on the result cells (value at +8, tag at +0). Owner sites never use cell handles (a stale cell after an error result must not be freed), only loaded values.
+- Loads of word 0 of an owner site (the buffer pointer, also through `ptradd x, 0`) carry the site as a derived value: buffer uses keep the container alive, a buffer that reaches a sink sinks the container, and `base_of` walks such a load back to the header for the free.
+- Elements stay with the GC: storing an object into a container is a heap store and sinks the element.
+- Closures: the record is a plain gc allocation (value site). `calli (load x)(..., x)` borrows `x` (the record is only read by its own body), so records called in place and passed to borrowing callers (`apply(f, x)`) are freed; stored or returned records sink. `FnRef` carries no seed (static record, free is a no-op), so a `catch` fallback phi keeps the must-handle.
+- Known gap: a closure stored in a gc class field is not traced by the collector (segfault after `gc_collect`, also with ownership off) -- roadmap.
 
 ## 1. Prior art
 
