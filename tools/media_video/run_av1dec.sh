@@ -33,6 +33,7 @@ run_case() {
 }
 run_screen() {
   local name=$1 w=$2 h=$3 pix=$4 seed=$5 params=$6
+  [ -z "$ONLY" ] || [[ $name == $ONLY ]] || return 0
   shift 6
   local bps=1 ssx=1 ssy=1
   case $pix in
@@ -56,6 +57,7 @@ run_screen() {
 }
 run_svt() {
   local name=$1 size=$2 pix=$3 denom=$4
+  [ -z "$ONLY" ] || [[ $name == $ONLY ]] || return 0
   shift 4
   local w=${size%x*} h=${size#*x} bps=1
   case $pix in

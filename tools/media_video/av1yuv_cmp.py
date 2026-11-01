@@ -6,6 +6,13 @@ def main():
     ref = open(sys.argv[2], "rb").read()
     w = int(sys.argv[3])
     h = int(sys.argv[4])
+    if w == 0:
+        if got == ref:
+            sys.exit(0)
+        n = min(len(got), len(ref))
+        off = next((i for i in range(n) if got[i] != ref[i]), n)
+        print("raw diff at byte %d got_len=%d ref_len=%d" % (off, len(got), len(ref)))
+        sys.exit(1)
     bps = int(sys.argv[5]) if len(sys.argv) > 5 else 1
     ssx = int(sys.argv[6]) if len(sys.argv) > 6 else 1
     ssy = int(sys.argv[7]) if len(sys.argv) > 7 else 1
