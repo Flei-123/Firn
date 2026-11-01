@@ -42,7 +42,7 @@ fi
 if [ -z "${FEAT_SKIP_TREES:-}" ]; then
     run_dim overworld ${FEAT_TREES:-$TREE_DEFAULT}
 fi
-LUSH_DEFAULT="3:-48:24 3:-28:46 3:-22:42 3:-10:-16"
+LUSH_DEFAULT="3:-6:-32 3:-48:24 3:-28:46 3:-22:42 3:-10:-16"
 if [ -z "${FEAT_SKIP_LUSH:-}" ]; then
     run_dim overworld ${FEAT_LUSH:-$LUSH_DEFAULT}
 fi
