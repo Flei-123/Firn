@@ -1,0 +1,597 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1br
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+import media.video.av1.av1fg
+import media.video.av1.av1gm
+import media.video.av1.av1ref
+import media.video.av1.av1frp
+import media.video.vp9.vp9mem
+
+export { fh_parse, fh_reset, FH_OK, FH_SHOW_EXISTING, FH_ERR, FH_COPY, tg_parse, TgInfo }
+
+const FH_OK: i64 = 0
+const FH_SHOW_EXISTING: i64 = 1
+const FH_ERR: i64 = 0 - 1
+const FH_COPY: i64 = 2
+
+struct TgInfo {
+    tile_start_and_end_present_flag: i64,
+    tg_start: i64,
+    tg_end: i64,
+    header_bytes: i64,
+    frame_done: i64,
+}
+
+fn rel_dist(s: *mut av1seq.SeqHdr, a: i64, b: i64) -> i64 {
+    if (*s).enable_order_hint == 0 {
+        return 0
+    }
+    var diff: i64 = a - b
+    let m: i64 = 1 << (((*s).order_hint_bits - 1) as u64)
+    diff = (diff & (m - 1)) - (diff & m)
+    return diff
+}
+
+fn fh_reset(f: *mut av1fhdr.FrameHdr) {
+    av1fhdr.fhdr_zero(f)
+}
+
+fn set_frame_refs(f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState) {
+    var i: usize = 0
+    while i < 7 {
+        (*f).ref_frame_idx[i] = 0 - 1
+        i = i + 1
+    }
+    (*f).ref_frame_idx[0] = (*f).last_frame_idx
+    (*f).ref_frame_idx[3] = (*f).gold_frame_idx
+    var used: [i64; 8] = [0; 8]
+    var shifted: [i64; 8] = [0; 8]
+    used[(*f).last_frame_idx as usize] = 1
+    used[(*f).gold_frame_idx as usize] = 1
+    let cur_hint: i64 = 1 << (((*s).order_hint_bits - 1) as u64)
+    i = 0
+    while i < 8 {
+        shifted[i] = cur_hint + rel_dist(s, (*st).slots[i].order_hint, (*f).order_hint)
+        i = i + 1
+    }
+    var round: i64 = 0
+    while round < 3 {
+        var rf: i64 = 0 - 1
+        var best: i64 = 0
+        i = 0
+        while i < 8 {
+            let hint: i64 = shifted[i]
+            if used[i] == 0 && hint >= cur_hint {
+                if round == 0 {
+                    if rf < 0 || hint >= best {
+                        rf = i as i64
+                        best = hint
+                    }
+                } else if rf < 0 || hint < best {
+                    rf = i as i64
+                    best = hint
+                }
+            }
+            i = i + 1
+        }
+        if rf >= 0 {
+            var slot: usize = 7
+            if round == 1 {
+                slot = 4
+            } else if round == 2 {
+                slot = 5
+            }
+            if round == 0 {
+                slot = 6
+            }
+            (*f).ref_frame_idx[slot] = rf
+            used[rf as usize] = 1
+        }
+        round = round + 1
+    }
+    var li: usize = 0
+    while li < 5 {
+        var slot2: usize = 1
+        if li == 1 {
+            slot2 = 2
+        } else if li == 2 {
+            slot2 = 4
+        } else if li == 3 {
+            slot2 = 5
+        } else if li == 4 {
+            slot2 = 6
+        }
+        if (*f).ref_frame_idx[slot2] < 0 {
+            var rf2: i64 = 0 - 1
+            var best2: i64 = 0
+            i = 0
+            while i < 8 {
+                let hint2: i64 = shifted[i]
+                if used[i] == 0 && hint2 < cur_hint {
+                    if rf2 < 0 || hint2 >= best2 {
+                        rf2 = i as i64
+                        best2 = hint2
+                    }
+                }
+                i = i + 1
+            }
+            if rf2 >= 0 {
+                (*f).ref_frame_idx[slot2] = rf2
+                used[rf2 as usize] = 1
+            }
+        }
+        li = li + 1
+    }
+    var rf3: i64 = 0 - 1
+    var best3: i64 = 0
+    i = 0
+    while i < 8 {
+        if rf3 < 0 || shifted[i] < best3 {
+            rf3 = i as i64
+            best3 = shifted[i]
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 7 {
+        if (*f).ref_frame_idx[i] < 0 {
+            (*f).ref_frame_idx[i] = rf3
+        }
+        i = i + 1
+    }
+}
+
+fn superres_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    (*f).use_superres = 0
+    if (*s).enable_superres == 1 {
+        (*f).use_superres = av1br.rd_bit(r, "use_superres")
+    }
+    if (*f).use_superres == 1 {
+        (*f).superres_denom = av1br.rd(r, 3, "coded_denom") + 9
+    } else {
+        (*f).superres_denom = 8
+    }
+    (*f).upscaled_width = (*f).frame_width
+    (*f).frame_width = ((*f).upscaled_width * 8 + ((*f).superres_denom / 2)) / (*f).superres_denom
+}
+
+fn compute_image_size(f: *mut av1fhdr.FrameHdr) {
+    (*f).mi_cols = 2 * (((*f).frame_width + 7) >> 3)
+    (*f).mi_rows = 2 * (((*f).frame_height + 7) >> 3)
+}
+
+fn frame_size(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    if (*f).frame_size_override_flag == 1 {
+        (*f).frame_width = av1br.rd(r, (*s).frame_width_bits_minus_1 + 1, "frame_width_minus_1") + 1
+        (*f).frame_height = av1br.rd(r, (*s).frame_height_bits_minus_1 + 1, "frame_height_minus_1") + 1
+    } else {
+        (*f).frame_width = (*s).max_frame_width_minus_1 + 1
+        (*f).frame_height = (*s).max_frame_height_minus_1 + 1
+    }
+    superres_params(r, f, s)
+    compute_image_size(f)
+}
+
+fn render_size(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr) {
+    if av1br.rd_bit(r, "render_and_frame_size_different") == 1 {
+        (*f).render_width = av1br.rd(r, 16, "render_width_minus_1") + 1
+        (*f).render_height = av1br.rd(r, 16, "render_height_minus_1") + 1
+    } else {
+        (*f).render_width = (*f).upscaled_width
+        (*f).render_height = (*f).frame_height
+    }
+}
+
+fn frame_size_with_refs(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState) {
+    var found: i64 = 0
+    var i: usize = 0
+    while i < 7 {
+        found = av1br.rd_bit(r, "found_ref")
+        if found == 1 {
+            let sl: usize = (*f).ref_frame_idx[i] as usize
+            (*f).upscaled_width = (*st).slots[sl].upscaled_width
+            (*f).frame_width = (*f).upscaled_width
+            (*f).frame_height = (*st).slots[sl].frame_height
+            (*f).render_width = (*st).slots[sl].render_width
+            (*f).render_height = (*st).slots[sl].render_height
+            break
+        }
+        i = i + 1
+    }
+    if found == 0 {
+        frame_size(r, f, s)
+        render_size(r, f)
+    } else {
+        superres_params(r, f, s)
+        compute_image_size(f)
+    }
+}
+
+fn load_previous(f: *mut av1fhdr.FrameHdr, st: *mut av1ref.RefState) {
+    let sl: usize = (*f).ref_frame_idx[(*f).primary_ref_frame as usize] as usize
+    var k: usize = 0
+    while k < 48 {
+        (*f).prev_gm_params[k] = (*st).slots[sl].gm_params[k]
+        k = k + 1
+    }
+    k = 0
+    while k < 8 {
+        (*f).loop_filter_ref_deltas[k] = (*st).slots[sl].lf_ref_deltas[k]
+        k = k + 1
+    }
+    (*f).loop_filter_mode_deltas[0] = (*st).slots[sl].lf_mode_deltas[0]
+    (*f).loop_filter_mode_deltas[1] = (*st).slots[sl].lf_mode_deltas[1]
+    k = 0
+    while k < 64 {
+        (*f).feature_enabled[k] = (*st).slots[sl].feature_enabled[k]
+        (*f).feature_data[k] = (*st).slots[sl].feature_data[k]
+        k = k + 1
+    }
+}
+
+fn past_independence(f: *mut av1fhdr.FrameHdr) {
+    var k: usize = 0
+    while k < 64 {
+        (*f).feature_enabled[k] = 0
+        (*f).feature_data[k] = 0
+        k = k + 1
+    }
+    av1gm.gm_defaults(&(*f).prev_gm_params)
+    (*f).loop_filter_delta_enabled = 1
+    (*f).loop_filter_ref_deltas[0] = 1
+    (*f).loop_filter_ref_deltas[1] = 0
+    (*f).loop_filter_ref_deltas[2] = 0
+    (*f).loop_filter_ref_deltas[3] = 0
+    (*f).loop_filter_ref_deltas[4] = 0 - 1
+    (*f).loop_filter_ref_deltas[5] = 0
+    (*f).loop_filter_ref_deltas[6] = 0 - 1
+    (*f).loop_filter_ref_deltas[7] = 0 - 1
+    (*f).loop_filter_mode_deltas[0] = 0
+    (*f).loop_filter_mode_deltas[1] = 0
+}
+
+fn mark_ref_frames(f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState, id_len: i64) {
+    let diff_len: i64 = (*s).delta_frame_id_length_minus_2 + 2
+    var i: usize = 0
+    while i < 8 {
+        let rid: i64 = (*st).slots[i].frame_id
+        if (*f).current_frame_id > (1 << (diff_len as u64)) {
+            if rid > (*f).current_frame_id || rid < (*f).current_frame_id - (1 << (diff_len as u64)) {
+                (*st).slots[i].valid = 0
+            }
+        } else if rid > (*f).current_frame_id && rid < (1 << (id_len as u64)) + (*f).current_frame_id - (1 << (diff_len as u64)) {
+            (*st).slots[i].valid = 0
+        }
+        i = i + 1
+    }
+}
+
+fn skip_mode_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState) {
+    var allowed: i64 = 0
+    if (*f).frame_is_intra == 0 && (*f).reference_select == 1 && (*s).enable_order_hint == 1 {
+        var fwd_idx: i64 = 0 - 1
+        var bwd_idx: i64 = 0 - 1
+        var fwd_hint: i64 = 0
+        var bwd_hint: i64 = 0
+        var i: usize = 0
+        while i < 7 {
+            let hint: i64 = (*st).slots[(*f).ref_frame_idx[i] as usize].order_hint
+            if rel_dist(s, hint, (*f).order_hint) < 0 {
+                if fwd_idx < 0 || rel_dist(s, hint, fwd_hint) > 0 {
+                    fwd_idx = i as i64
+                    fwd_hint = hint
+                }
+            } else if rel_dist(s, hint, (*f).order_hint) > 0 {
+                if bwd_idx < 0 || rel_dist(s, hint, bwd_hint) < 0 {
+                    bwd_idx = i as i64
+                    bwd_hint = hint
+                }
+            }
+            i = i + 1
+        }
+        if fwd_idx >= 0 {
+            if bwd_idx >= 0 {
+                allowed = 1
+                (*f).skip_mode_frame[0] = 1 + vp9mem.imin(fwd_idx, bwd_idx)
+                (*f).skip_mode_frame[1] = 1 + vp9mem.imax(fwd_idx, bwd_idx)
+            } else {
+                var snd_idx: i64 = 0 - 1
+                var snd_hint: i64 = 0
+                i = 0
+                while i < 7 {
+                    let hint2: i64 = (*st).slots[(*f).ref_frame_idx[i] as usize].order_hint
+                    if rel_dist(s, hint2, fwd_hint) < 0 {
+                        if snd_idx < 0 || rel_dist(s, hint2, snd_hint) > 0 {
+                            snd_idx = i as i64
+                            snd_hint = hint2
+                        }
+                    }
+                    i = i + 1
+                }
+                if snd_idx >= 0 {
+                    allowed = 1
+                    (*f).skip_mode_frame[0] = 1 + vp9mem.imin(fwd_idx, snd_idx)
+                    (*f).skip_mode_frame[1] = 1 + vp9mem.imax(fwd_idx, snd_idx)
+                }
+            }
+        }
+    }
+    if allowed == 1 {
+        (*f).skip_mode_present = av1br.rd_bit(r, "skip_mode_present")
+    } else {
+        (*f).skip_mode_present = 0
+    }
+}
+
+fn inter_refs(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState, id_len: i64) {
+    if (*s).enable_order_hint == 0 {
+        (*f).frame_refs_short_signaling = 0
+    } else {
+        (*f).frame_refs_short_signaling = av1br.rd_bit(r, "frame_refs_short_signaling")
+        if (*f).frame_refs_short_signaling == 1 {
+            (*f).last_frame_idx = av1br.rd(r, 3, "last_frame_idx")
+            (*f).gold_frame_idx = av1br.rd(r, 3, "gold_frame_idx")
+            set_frame_refs(f, s, st)
+        }
+    }
+    var i: usize = 0
+    while i < 7 {
+        if (*f).frame_refs_short_signaling == 0 {
+            (*f).ref_frame_idx[i] = av1br.rd(r, 3, "ref_frame_idx")
+        }
+        if (*s).frame_id_numbers_present_flag == 1 {
+            av1br.rd(r, (*s).delta_frame_id_length_minus_2 + 2, "delta_frame_id_minus_1")
+        }
+        i = i + 1
+    }
+    if (*f).frame_size_override_flag == 1 && (*f).error_resilient_mode == 0 {
+        frame_size_with_refs(r, f, s, st)
+    } else {
+        frame_size(r, f, s)
+        render_size(r, f)
+    }
+    if (*f).force_integer_mv == 1 {
+        (*f).allow_high_precision_mv = 0
+    } else {
+        (*f).allow_high_precision_mv = av1br.rd_bit(r, "allow_high_precision_mv")
+    }
+    if av1br.rd_bit(r, "is_filter_switchable") == 1 {
+        (*f).interpolation_filter = 4
+    } else {
+        (*f).interpolation_filter = av1br.rd(r, 2, "interpolation_filter")
+    }
+    (*f).is_motion_mode_switchable = av1br.rd_bit(r, "is_motion_mode_switchable")
+    if (*f).error_resilient_mode == 1 || (*s).enable_ref_frame_mvs == 0 {
+        (*f).use_ref_frame_mvs = 0
+    } else {
+        (*f).use_ref_frame_mvs = av1br.rd_bit(r, "use_ref_frame_mvs")
+    }
+    i = 0
+    while i < 7 {
+        let hint: i64 = (*st).slots[(*f).ref_frame_idx[i] as usize].order_hint
+        (*f).order_hints[i + 1] = hint
+        if (*s).enable_order_hint == 0 {
+            (*f).ref_frame_sign_bias[i + 1] = 0
+        } else if rel_dist(s, hint, (*f).order_hint) > 0 {
+            (*f).ref_frame_sign_bias[i + 1] = 1
+        } else {
+            (*f).ref_frame_sign_bias[i + 1] = 0
+        }
+        i = i + 1
+    }
+}
+
+fn fh_parse(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr, st: *mut av1ref.RefState, tid: i64, sid: i64) -> i64 {
+    fh_reset(f)
+    var id_len: i64 = 0
+    if (*s).frame_id_numbers_present_flag == 1 {
+        id_len = (*s).additional_frame_id_length_minus_1 + (*s).delta_frame_id_length_minus_2 + 3
+    }
+    let all_frames: i64 = 255
+    if (*s).reduced_still_picture_header == 1 {
+        (*f).show_existing_frame = 0
+        (*f).frame_type = av1fhdr.KEY_FRAME
+        (*f).frame_is_intra = 1
+        (*f).show_frame = 1
+        (*f).showable_frame = 0
+        (*f).error_resilient_mode = 1
+    } else {
+        (*f).show_existing_frame = av1br.rd_bit(r, "show_existing_frame")
+        if (*f).show_existing_frame == 1 {
+            (*f).frame_to_show_map_idx = av1br.rd(r, 3, "frame_to_show_map_idx")
+            if (*s).decoder_model_info_present_flag == 1 && (*s).equal_picture_interval == 0 {
+                av1br.rd(r, (*s).frame_presentation_time_length_minus_1 + 1, "frame_presentation_time")
+            }
+            (*f).refresh_frame_flags = 0
+            if (*s).frame_id_numbers_present_flag == 1 {
+                (*f).display_frame_id = av1br.rd(r, id_len, "display_frame_id")
+            }
+            (*f).frame_type = (*st).slots[(*f).frame_to_show_map_idx as usize].frame_type
+            if (*f).frame_type == av1fhdr.KEY_FRAME {
+                (*f).refresh_frame_flags = all_frames
+            }
+            if (*s).film_grain_params_present == 1 {
+                (*f).film_grain = (*st).slots[(*f).frame_to_show_map_idx as usize].film_grain
+            }
+            if !av1br.br_ok(r) {
+                return FH_ERR
+            }
+            return FH_SHOW_EXISTING
+        }
+        (*f).frame_type = av1br.rd(r, 2, "frame_type")
+        if (*f).frame_type == av1fhdr.INTRA_ONLY_FRAME || (*f).frame_type == av1fhdr.KEY_FRAME {
+            (*f).frame_is_intra = 1
+        }
+        (*f).show_frame = av1br.rd_bit(r, "show_frame")
+        if (*f).show_frame == 1 && (*s).decoder_model_info_present_flag == 1 && (*s).equal_picture_interval == 0 {
+            av1br.rd(r, (*s).frame_presentation_time_length_minus_1 + 1, "frame_presentation_time")
+        }
+        if (*f).show_frame == 1 {
+            if (*f).frame_type != av1fhdr.KEY_FRAME {
+                (*f).showable_frame = 1
+            }
+        } else {
+            (*f).showable_frame = av1br.rd_bit(r, "showable_frame")
+        }
+        if (*f).frame_type == av1fhdr.SWITCH_FRAME || ((*f).frame_type == av1fhdr.KEY_FRAME && (*f).show_frame == 1) {
+            (*f).error_resilient_mode = 1
+        } else {
+            (*f).error_resilient_mode = av1br.rd_bit(r, "error_resilient_mode")
+        }
+    }
+    if (*f).frame_type == av1fhdr.KEY_FRAME && (*f).show_frame == 1 {
+        av1ref.ref_invalidate_all(st)
+    }
+    (*f).disable_cdf_update = av1br.rd_bit(r, "disable_cdf_update")
+    if (*s).seq_force_screen_content_tools == av1seq.SELECT_SCREEN_CONTENT_TOOLS {
+        (*f).allow_screen_content_tools = av1br.rd_bit(r, "allow_screen_content_tools")
+    } else {
+        (*f).allow_screen_content_tools = (*s).seq_force_screen_content_tools
+    }
+    if (*f).allow_screen_content_tools == 1 {
+        if (*s).seq_force_integer_mv == av1seq.SELECT_INTEGER_MV {
+            (*f).force_integer_mv = av1br.rd_bit(r, "force_integer_mv")
+        } else {
+            (*f).force_integer_mv = (*s).seq_force_integer_mv
+        }
+    } else {
+        (*f).force_integer_mv = 0
+    }
+    if (*s).frame_id_numbers_present_flag == 1 {
+        (*f).current_frame_id = av1br.rd(r, id_len, "current_frame_id")
+        mark_ref_frames(f, s, st, id_len)
+    }
+    if (*f).frame_type == av1fhdr.SWITCH_FRAME {
+        (*f).frame_size_override_flag = 1
+    } else if (*s).reduced_still_picture_header == 1 {
+        (*f).frame_size_override_flag = 0
+    } else {
+        (*f).frame_size_override_flag = av1br.rd_bit(r, "frame_size_override_flag")
+    }
+    (*f).order_hint = av1br.rd(r, (*s).order_hint_bits, "order_hint")
+    if (*f).frame_is_intra == 1 || (*f).error_resilient_mode == 1 {
+        (*f).primary_ref_frame = av1fhdr.PRIMARY_REF_NONE
+    } else {
+        (*f).primary_ref_frame = av1br.rd(r, 3, "primary_ref_frame")
+    }
+    if (*s).decoder_model_info_present_flag == 1 {
+        (*f).buffer_removal_time_present_flag = av1br.rd_bit(r, "buffer_removal_time_present_flag")
+        if (*f).buffer_removal_time_present_flag == 1 {
+            var op: i64 = 0
+            while op <= (*s).operating_points_cnt_minus_1 {
+                if (*s).decoder_model_present_for_this_op[op as usize] == 1 {
+                    let idc: i64 = (*s).operating_point_idc[op as usize]
+                    let in_t: i64 = (idc >> (tid as u64)) & 1
+                    let in_s: i64 = (idc >> ((sid + 8) as u64)) & 1
+                    if idc == 0 || (in_t == 1 && in_s == 1) {
+                        av1br.rd(r, (*s).buffer_removal_time_length_minus_1 + 1, "buffer_removal_time")
+                    }
+                }
+                op = op + 1
+            }
+        }
+    }
+    if (*f).frame_type == av1fhdr.SWITCH_FRAME || ((*f).frame_type == av1fhdr.KEY_FRAME && (*f).show_frame == 1) {
+        (*f).refresh_frame_flags = all_frames
+    } else {
+        (*f).refresh_frame_flags = av1br.rd(r, 8, "refresh_frame_flags")
+    }
+    if (*f).frame_is_intra == 0 || (*f).refresh_frame_flags != all_frames {
+        if (*f).error_resilient_mode == 1 && (*s).enable_order_hint == 1 {
+            var i: usize = 0
+            while i < 8 {
+                (*f).ref_order_hint[i] = av1br.rd(r, (*s).order_hint_bits, "ref_order_hint")
+                if (*f).ref_order_hint[i] != (*st).slots[i].order_hint {
+                    (*st).slots[i].valid = 0
+                    (*st).slots[i].order_hint = (*f).ref_order_hint[i]
+                }
+                i = i + 1
+            }
+        }
+    }
+    if (*f).frame_type == av1fhdr.KEY_FRAME || (*f).frame_type == av1fhdr.INTRA_ONLY_FRAME {
+        frame_size(r, f, s)
+        render_size(r, f)
+        if (*f).allow_screen_content_tools == 1 && (*f).upscaled_width == (*f).frame_width {
+            (*f).allow_intrabc = av1br.rd_bit(r, "allow_intrabc")
+        }
+    } else {
+        inter_refs(r, f, s, st, id_len)
+    }
+    if (*s).reduced_still_picture_header == 1 || (*f).disable_cdf_update == 1 {
+        (*f).disable_frame_end_update_cdf = 1
+    } else {
+        (*f).disable_frame_end_update_cdf = av1br.rd_bit(r, "disable_frame_end_update_cdf")
+    }
+    if (*f).primary_ref_frame == av1fhdr.PRIMARY_REF_NONE {
+        past_independence(f)
+    } else {
+        load_previous(f, st)
+    }
+    if !av1br.br_ok(r) {
+        return FH_ERR
+    }
+    if av1frp.tile_info(r, f, s) < 0 {
+        return FH_ERR
+    }
+    av1frp.quant_params(r, f, s)
+    av1frp.seg_params(r, f)
+    av1frp.delta_params(r, f)
+    av1frp.lossless_params(f)
+    av1frp.lf_params(r, f, s)
+    av1frp.cdef_params(r, f, s)
+    av1frp.lr_params(r, f, s)
+    av1frp.tx_and_ref_mode(r, f)
+    skip_mode_params(r, f, s, st)
+    if (*f).frame_is_intra == 1 || (*f).error_resilient_mode == 1 || (*s).enable_warped_motion == 0 {
+        (*f).allow_warped_motion = 0
+    } else {
+        (*f).allow_warped_motion = av1br.rd_bit(r, "allow_warped_motion")
+    }
+    (*f).reduced_tx_set = av1br.rd_bit(r, "reduced_tx_set")
+    av1gm.gm_parse(r, f)
+    let fg_rc: i64 = av1fg.fg_parse(r, &(*f).film_grain, s, (*f).frame_type, (*f).show_frame, (*f).showable_frame)
+    if fg_rc < 0 {
+        return FH_ERR
+    }
+    if fg_rc == 1 {
+        let seed: i64 = (*f).film_grain.grain_seed
+        let ridx: i64 = (*f).film_grain.film_grain_params_ref_idx
+        (*f).film_grain = (*st).slots[(*f).film_grain.film_grain_params_ref_idx as usize].film_grain
+        (*f).film_grain.grain_seed = seed
+        (*f).film_grain.film_grain_params_ref_idx = ridx
+    }
+    (*f).header_bits = av1br.br_pos(r)
+    if !av1br.br_ok(r) {
+        return FH_ERR
+    }
+    return FH_OK
+}
+
+fn tg_parse(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, t: *mut TgInfo, sz: i64) -> i64 {
+    let num_tiles: i64 = (*f).tile_cols * (*f).tile_rows
+    let start_bit: i64 = av1br.br_pos(r)
+    (*t).tile_start_and_end_present_flag = 0
+    if num_tiles > 1 {
+        (*t).tile_start_and_end_present_flag = av1br.rd_bit(r, "tile_start_and_end_present_flag")
+    }
+    if num_tiles == 1 || (*t).tile_start_and_end_present_flag == 0 {
+        (*t).tg_start = 0
+        (*t).tg_end = num_tiles - 1
+    } else {
+        let tile_bits: i64 = (*f).tile_cols_log2 + (*f).tile_rows_log2
+        (*t).tg_start = av1br.rd(r, tile_bits, "tg_start")
+        (*t).tg_end = av1br.rd(r, tile_bits, "tg_end")
+    }
+    av1br.br_align(r)
+    (*t).header_bytes = (av1br.br_pos(r) - start_bit) >> 3
+    (*t).frame_done = 0
+    if (*t).tg_end == num_tiles - 1 {
+        (*t).frame_done = 1
+    }
+    if !av1br.br_ok(r) || (*t).tg_end < (*t).tg_start || (*t).tg_end >= num_tiles {
+        return 0 - 1
+    }
+    return 0
+}

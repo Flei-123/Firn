@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import media.video.vp9.vp9mem
+import media.video.av1.av1br
+import media.video.av1.av1obu
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+import media.video.av1.av1frh
+import media.video.av1.av1ref
+
+struct Ctx {
+    seq: *mut av1seq.SeqHdr,
+    fh: *mut av1fhdr.FrameHdr,
+    st: *mut av1ref.RefState,
+    have_seq: bool,
+    errs: i64,
+    first_err: i64,
+}
+
+fn put(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+fn put_kv(out: *mut rt.Buf, k: str, v: i64) {
+    put(out, "# ")
+    put(out, k)
+    rt.buf_push(out, 61 as u8)
+    rt.buf_push_dec_i64(out, v)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn fail(c: *mut Ctx, code: i64) {
+    (*c).errs = (*c).errs + 1
+    if (*c).first_err == 0 {
+        (*c).first_err = code
+    }
+}
+
+fn dump_frame_info(out: *mut rt.Buf, f: *mut av1fhdr.FrameHdr) {
+    put_kv(out, "frame_type", (*f).frame_type)
+    put_kv(out, "frame_width", (*f).frame_width)
+    put_kv(out, "frame_height", (*f).frame_height)
+    put_kv(out, "upscaled_width", (*f).upscaled_width)
+    put_kv(out, "base_q_idx", (*f).base_q_idx)
+    put_kv(out, "tile_cols", (*f).tile_cols)
+    put_kv(out, "tile_rows", (*f).tile_rows)
+    put_kv(out, "coded_lossless", (*f).coded_lossless)
+    put_kv(out, "skip_mode_present", (*f).skip_mode_present)
+    put_kv(out, "header_bits", (*f).header_bits)
+}
+
+fn do_seq(c: *mut Ctx, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
+    var r: av1br.BR = av1br.br_new(data + (*o).pay_off as u64, (*o).pay_len)
+    av1br.br_trace(&r, out as u64)
+    put(out, "@SEQ\n")
+    if av1seq.seq_parse(&r, (*c).seq) != av1seq.SEQ_OK {
+        fail(c, 11)
+        return
+    }
+    (*c).have_seq = true
+}
+
+fn do_frame(c: *mut Ctx, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
+    if !(*c).have_seq {
+        fail(c, 12)
+        return
+    }
+    let is_frame: bool = (*o).kind == av1obu.OBU_FRAME
+    if (*o).kind == av1obu.OBU_REDUNDANT_HDR || ((*o).kind == av1obu.OBU_FRAME_HDR && (*(*c).st).seen_frame_header == 1) {
+        put(out, "@FRAMEHDR_COPY\n")
+        return
+    }
+    var r: av1br.BR = av1br.br_new(data + (*o).pay_off as u64, (*o).pay_len)
+    av1br.br_trace(&r, out as u64)
+    if is_frame {
+        put(out, "@FRAME\n")
+    } else {
+        put(out, "@FRAMEHDR\n")
+    }
+    let rc: i64 = av1frh.fh_parse(&r, (*c).fh, (*c).seq, (*c).st, (*o).tid, (*o).sid)
+    if rc == av1frh.FH_ERR {
+        fail(c, 13)
+        return
+    }
+    if rc == av1frh.FH_SHOW_EXISTING {
+        av1ref.ref_show_existing((*c).st, (*c).fh)
+        (*(*c).st).seen_frame_header = 0
+        put_kv(out, "show_existing_frame", (*(*c).fh).frame_to_show_map_idx)
+        return
+    }
+    dump_frame_info(out, (*c).fh)
+    av1ref.ref_update((*c).st, (*c).fh, (*c).seq)
+    (*(*c).st).seen_frame_header = 1
+    if is_frame {
+        av1br.br_align(&r)
+        var t: av1frh.TgInfo = av1frh.TgInfo { tile_start_and_end_present_flag: 0, tg_start: 0, tg_end: 0, header_bytes: 0, frame_done: 0 }
+        if av1frh.tg_parse(&r, (*c).fh, &t, 0) < 0 {
+            fail(c, 14)
+            return
+        }
+        if t.frame_done == 1 {
+            (*(*c).st).seen_frame_header = 0
+        }
+    }
+}
+
+fn do_tilegroup(c: *mut Ctx, out: *mut rt.Buf, data: u64, o: *mut av1obu.Obu) {
+    if (*(*c).st).seen_frame_header == 0 {
+        fail(c, 15)
+        return
+    }
+    var r: av1br.BR = av1br.br_new(data + (*o).pay_off as u64, (*o).pay_len)
+    av1br.br_trace(&r, out as u64)
+    put(out, "@TILEGRP\n")
+    var t: av1frh.TgInfo = av1frh.TgInfo { tile_start_and_end_present_flag: 0, tg_start: 0, tg_end: 0, header_bytes: 0, frame_done: 0 }
+    if av1frh.tg_parse(&r, (*c).fh, &t, (*o).pay_len as i64) < 0 {
+        fail(c, 14)
+        return
+    }
+    if t.frame_done == 1 {
+        (*(*c).st).seen_frame_header = 0
+    }
+}
+
+fn do_chunk(c: *mut Ctx, out: *mut rt.Buf, data: u64, size: usize) {
+    var pos: usize = 0
+    while pos < size {
+        var o: av1obu.Obu = av1obu.Obu { kind: 0, has_ext: false, tid: 0, sid: 0, has_size: false, pay_off: 0, pay_len: 0, total: 0 }
+        if av1obu.obu_parse(data, size, pos, &o) != av1obu.OBU_OK {
+            fail(c, 10)
+            return
+        }
+        var drop: bool = false
+        if o.kind != av1obu.OBU_SEQ && o.kind != av1obu.OBU_TD && o.has_ext && (*c).have_seq {
+            let idc: i64 = (*(*c).seq).operating_point_idc_sel
+            if idc != 0 {
+                let in_t: i64 = (idc >> (o.tid as u64)) & 1
+                let in_s: i64 = (idc >> ((o.sid + 8) as u64)) & 1
+                if in_t == 0 || in_s == 0 {
+                    drop = true
+                }
+            }
+        }
+        if !drop {
+            if o.kind == av1obu.OBU_SEQ {
+                do_seq(c, out, data, &o)
+            } else if o.kind == av1obu.OBU_FRAME || o.kind == av1obu.OBU_FRAME_HDR || o.kind == av1obu.OBU_REDUNDANT_HDR {
+                do_frame(c, out, data, &o)
+            } else if o.kind == av1obu.OBU_TILE_GROUP {
+                do_tilegroup(c, out, data, &o)
+            } else if o.kind == av1obu.OBU_TD {
+                put(out, "@TD\n")
+                (*(*c).st).seen_frame_header = 0
+            }
+        }
+        pos = pos + o.total
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 64
+    }
+    var data: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 1), &data) {
+        return 2
+    }
+    var out: rt.Buf = rt.buf_new()
+    var c: Ctx = Ctx { seq: av1seq.seq_new(), fh: av1fhdr.fhdr_new(), st: av1ref.ref_state_new(), have_seq: false, errs: 0, first_err: 0 }
+    let n: usize = rt.buf_len(&data)
+    if n >= 32 && vp9mem.ld8(data.ptr, 0) == 68 && vp9mem.ld8(data.ptr, 1) == 75 && vp9mem.ld8(data.ptr, 2) == 73 && vp9mem.ld8(data.ptr, 3) == 70 {
+        var pos: usize = vp9mem.ld16(data.ptr, 3) as usize * 2
+        while pos + 12 <= n {
+            let fsz: usize = vp9mem.ld32(data.ptr, (pos >> 2)) as usize
+            if (pos & 3) != 0 || pos + 12 + fsz > n {
+                break
+            }
+            do_chunk(&c, &out, data.ptr + pos as u64 + 12, fsz)
+            pos = pos + 12 + fsz
+        }
+    } else {
+        do_chunk(&c, &out, data.ptr, n)
+    }
+    if !rt.write_file(rt.arg_ptr(start, 2), rt.buf_ptr(&out), rt.buf_len(&out)) {
+        return 6
+    }
+    if c.errs > 0 {
+        return c.first_err as i32
+    }
+    return 0
+}
