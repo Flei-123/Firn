@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8bool
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9state
+import media.video.vp9.vp9defp
+import media.video.vp9.vp9cnt
+import media.video.vp9.vp9blk
+import media.video.vp9.vp9mode
+import media.video.vp9.vp9mvdef
+import media.video.vp9.vp9mvmi
+import media.video.vp9.vp9mvref
+import media.video.vp9.vp9mvread
+import media.video.vp9.vp9pred
+
+export { read_inter_frame_info, ERR_NONE, ERR_SEG_SKIP_SMALL, ERR_BAD_MV }
+
+const ERR_NONE: i64 = 0
+const ERR_SEG_SKIP_SMALL: i64 = 1
+const ERR_BAD_MV: i64 = 2
+
+static SIZE_GROUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3]
+
+fn read_inter_segment_id(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, x_mis: i64, y_mis: i64, above_mi: u64, left_mi: u64) -> i64 {
+    if !(*f).seg_on {
+        return 0
+    }
+    let stride: i64 = (*f).sb_cols * 8
+    var pred: i64 = 255
+    var y: i64 = 0
+    while y < y_mis {
+        var x: i64 = 0
+        while x < x_mis {
+            pred = vp9mem.imin(pred, vp9mem.ld8((*f).seg_last, ((row + y) * stride + col + x) as usize))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var seg: i64 = pred
+    if (*f).seg_map {
+        if (*f).seg_temporal {
+            let ctx: i64 = vp9pred.seg_pred_ctx(above_mi, left_mi)
+            let flag: i64 = vp8bool.bd_get(&(*f).td, (*f).seg_pred[ctx as usize])
+            vp9mem.st8(mi, vp9mvdef.MI_SEGPRED, flag)
+            if flag == 0 {
+                seg = vp9mode.read_segment_id(f)
+            }
+        } else {
+            seg = vp9mode.read_segment_id(f)
+        }
+    }
+    y = 0
+    while y < y_mis {
+        var x: i64 = 0
+        while x < x_mis {
+            let idx: usize = ((row + y) * stride + col + x) as usize
+            if (*f).seg_map {
+                vp9mem.st8((*f).seg_cur, idx, seg)
+            } else {
+                vp9mem.st8((*f).seg_cur, idx, vp9mem.ld8((*f).seg_last, idx))
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return seg
+}
+
+fn read_is_inter(f: *mut vp9state.Vp9, seg: i64, above_mi: u64, left_mi: u64) -> i64 {
+    if (*f).seg_on && (*f).seg_en[(seg * 4 + 2) as usize] == 1 {
+        if (*f).seg_data[(seg * 4 + 2) as usize] != 0 {
+            return 1
+        }
+        return 0
+    }
+    let ctx: i64 = vp9pred.intra_inter_ctx(above_mi, left_mi)
+    let v: i64 = vp8bool.bd_get(&(*f).td, vp9mem.ld8((*f).fc, vp9defp.P_INTRA_INTER + ctx as usize))
+    if !(*f).parallel {
+        vp9mode.cnt_add(f, vp9cnt.N_INTRA_INTER + (ctx * 2 + v) as usize)
+    }
+    return v
+}
+
+fn read_ref_frames(f: *mut vp9state.Vp9, mi: u64, seg: i64, above_mi: u64, left_mi: u64) {
+    let d: *mut vp8bool.BD = &(*f).td
+    let fc: u64 = (*f).fc
+    if (*f).seg_on && (*f).seg_en[(seg * 4 + 2) as usize] == 1 {
+        vp9mem.st8(mi, vp9state.MI_REF0, (*f).seg_data[(seg * 4 + 2) as usize])
+        vp9mem.st8(mi, vp9state.MI_REF1, 0)
+        return
+    }
+    var mode: i64 = (*f).ref_mode
+    if mode == 2 {
+        let ctx: i64 = vp9pred.comp_inter_ctx(f, above_mi, left_mi)
+        mode = vp8bool.bd_get(d, vp9mem.ld8(fc, vp9defp.P_COMP_INTER + ctx as usize))
+        if !(*f).parallel {
+            vp9mode.cnt_add(f, vp9cnt.N_COMP_INTER + (ctx * 2 + mode) as usize)
+        }
+    }
+    if mode == 1 {
+        let idx: i64 = (*f).sign_bias[(*f).comp_fixed as usize]
+        let ctx: i64 = vp9pred.comp_ref_ctx(f, above_mi, left_mi)
+        let bit: i64 = vp8bool.bd_get(d, vp9mem.ld8(fc, vp9defp.P_COMP_REF + ctx as usize))
+        if !(*f).parallel {
+            vp9mode.cnt_add(f, vp9cnt.N_COMP_REF + (ctx * 2 + bit) as usize)
+        }
+        var var_ref: i64 = (*f).comp_var0
+        if bit != 0 {
+            var_ref = (*f).comp_var1
+        }
+        if idx == 0 {
+            vp9mem.st8(mi, vp9state.MI_REF0, (*f).comp_fixed)
+            vp9mem.st8(mi, vp9state.MI_REF1, var_ref)
+        } else {
+            vp9mem.st8(mi, vp9state.MI_REF1, (*f).comp_fixed)
+            vp9mem.st8(mi, vp9state.MI_REF0, var_ref)
+        }
+        return
+    }
+    let ctx0: i64 = vp9pred.single_ref_p1_ctx(above_mi, left_mi)
+    let bit0: i64 = vp8bool.bd_get(d, vp9mem.ld8(fc, vp9defp.P_SINGLE_REF + (ctx0 * 2) as usize))
+    if !(*f).parallel {
+        vp9mode.cnt_add(f, vp9cnt.N_SINGLE_REF + (ctx0 * 4 + bit0) as usize)
+    }
+    var r0: i64 = 1
+    if bit0 != 0 {
+        let ctx1: i64 = vp9pred.single_ref_p2_ctx(above_mi, left_mi)
+        let bit1: i64 = vp8bool.bd_get(d, vp9mem.ld8(fc, vp9defp.P_SINGLE_REF + (ctx1 * 2 + 1) as usize))
+        if !(*f).parallel {
+            vp9mode.cnt_add(f, vp9cnt.N_SINGLE_REF + (ctx1 * 4 + 2 + bit1) as usize)
+        }
+        r0 = 2 + bit1
+    }
+    vp9mem.st8(mi, vp9state.MI_REF0, r0)
+    vp9mem.st8(mi, vp9state.MI_REF1, 0)
+}
+
+fn best_ref_mv(f: *mut vp9state.Vp9, out: *mut vp9mvref.MvRefs, row: i64, col: i64, bsize: i64, ref_frame: i64, mode: i64) {
+    vp9mvref.find_mv_refs(f, out, row, col, bsize, ref_frame, 0 - 1)
+    if mode == 11 {
+        (*out).r0 = (*out).r1
+        (*out).c0 = (*out).c1
+    }
+    vp9mvref.lower_mv_precision(out, (*f).allow_hp, 0)
+}
+
+fn assign_mv(f: *mut vp9state.Vp9, mode: i64, out: *mut vp9mvmi.Mv, ref_r: i64, ref_c: i64, near_r: i64, near_c: i64) -> bool {
+    if mode == 13 {
+        return vp9mvread.read_mv(f, out, ref_r, ref_c)
+    }
+    if mode == 10 || mode == 11 {
+        (*out).row = near_r
+        (*out).col = near_c
+        return true
+    }
+    (*out).row = 0
+    (*out).col = 0
+    return true
+}
+
+fn read_inter_block(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, bsize: i64, seg: i64, above_mi: u64, left_mi: u64) -> i64 {
+    read_ref_frames(f, mi, seg, above_mi, left_mi)
+    let ref0: i64 = vp9mem.ld8(mi, vp9state.MI_REF0)
+    let ref1: i64 = vp9mem.ld8(mi, vp9state.MI_REF1)
+    var ncomp: i64 = 1
+    if ref1 > 0 {
+        ncomp = 2
+    }
+    let mctx: i64 = vp9mvref.mode_context(f, row, col, bsize)
+    var mode: i64 = 0
+    if (*f).seg_on && (*f).seg_en[(seg * 4 + 3) as usize] == 1 {
+        mode = 12
+        if bsize < 3 {
+            return ERR_SEG_SKIP_SMALL
+        }
+    } else if bsize >= 3 {
+        mode = vp9mvread.read_inter_mode_tree(f, mctx)
+    }
+    var filter: i64 = (*f).interp
+    if filter == 4 {
+        filter = vp9mvread.read_interp_tree(f, vp9pred.interp_ctx(above_mi, left_mi))
+    }
+    vp9mem.st8(mi, vp9state.MI_FILTER, filter)
+    var b0: vp9mvref.MvRefs = vp9mvref.mvrefs_new()
+    var b1: vp9mvref.MvRefs = vp9mvref.mvrefs_new()
+    var s0: vp9mvref.MvRefs = vp9mvref.mvrefs_new()
+    var s1: vp9mvref.MvRefs = vp9mvref.mvrefs_new()
+    var m0: vp9mvmi.Mv = vp9mvmi.mv_new()
+    var m1: vp9mvmi.Mv = vp9mvmi.mv_new()
+    if bsize < 3 {
+        let w4: i64 = vp9blk.bw4(bsize)
+        let h4: i64 = vp9blk.bh4(bsize)
+        var got_new: bool = false
+        var b_mode: i64 = 0
+        var idy: i64 = 0
+        while idy < 2 {
+            var idx: i64 = 0
+            while idx < 2 {
+                let j: i64 = idy * 2 + idx
+                b_mode = vp9mvread.read_inter_mode_tree(f, mctx)
+                if b_mode == 10 || b_mode == 11 {
+                    vp9mvref.append_sub8x8(f, mi, &s0, row, col, bsize, b_mode, j, 0, ref0)
+                    if ncomp == 2 {
+                        vp9mvref.append_sub8x8(f, mi, &s1, row, col, bsize, b_mode, j, 1, ref1)
+                    }
+                } else if b_mode == 13 && !got_new {
+                    best_ref_mv(f, &b0, row, col, bsize, ref0, 13)
+                    if ncomp == 2 {
+                        best_ref_mv(f, &b1, row, col, bsize, ref1, 13)
+                    }
+                    got_new = true
+                }
+                var ok: bool = assign_mv(f, b_mode, &m0, b0.r0, b0.c0, s0.r0, s0.c0)
+                if ncomp == 2 {
+                    ok = assign_mv(f, b_mode, &m1, b1.r0, b1.c0, s1.r0, s1.c0) && ok
+                }
+                if !ok {
+                    return ERR_BAD_MV
+                }
+                var fill: i64 = 0
+                while fill < 4 {
+                    let by: i64 = fill / 2
+                    let bx: i64 = fill % 2
+                    if by >= idy && by < idy + h4 && bx >= idx && bx < idx + w4 {
+                        vp9mvmi.set_bmi(mi, fill, 0, m0.row, m0.col)
+                        vp9mvmi.set_bmi(mi, fill, 1, m1.row, m1.col)
+                    }
+                    fill = fill + 1
+                }
+                idx = idx + w4
+            }
+            idy = idy + h4
+        }
+        vp9mem.st8(mi, vp9state.MI_MODE, b_mode)
+        vp9mvmi.set_mv(mi, 0, vp9mvmi.bmi_row(mi, 3, 0), vp9mvmi.bmi_col(mi, 3, 0))
+        vp9mvmi.set_mv(mi, 1, vp9mvmi.bmi_row(mi, 3, 1), vp9mvmi.bmi_col(mi, 3, 1))
+        return ERR_NONE
+    }
+    vp9mem.st8(mi, vp9state.MI_MODE, mode)
+    if mode != 12 {
+        best_ref_mv(f, &b0, row, col, bsize, ref0, mode)
+        if ncomp == 2 {
+            best_ref_mv(f, &b1, row, col, bsize, ref1, mode)
+        }
+    }
+    var ok: bool = assign_mv(f, mode, &m0, b0.r0, b0.c0, b0.r0, b0.c0)
+    if ncomp == 2 {
+        ok = assign_mv(f, mode, &m1, b1.r0, b1.c0, b1.r0, b1.c0) && ok
+    }
+    vp9mvmi.set_mv(mi, 0, m0.row, m0.col)
+    vp9mvmi.set_mv(mi, 1, m1.row, m1.col)
+    if !ok {
+        return ERR_BAD_MV
+    }
+    return ERR_NONE
+}
+
+fn read_intra_block(f: *mut vp9state.Vp9, mi: u64, bsize: i64) {
+    let d: *mut vp8bool.BD = &(*f).td
+    let fc: u64 = (*f).fc
+    if bsize >= 3 {
+        let sg: i64 = SIZE_GROUP[bsize as usize] as i64
+        let m: i64 = vp9mode.read_intra_mode(d, fc + (vp9defp.P_YMODE + (sg * 9) as usize) as u64)
+        if !(*f).parallel {
+            vp9mode.cnt_add(f, vp9cnt.N_YMODE + (sg * 10 + m) as usize)
+        }
+        var i: usize = 0
+        while i < 4 {
+            vp9mem.st8(mi, vp9state.MI_YMODE + i, m)
+            i = i + 1
+        }
+        vp9mem.st8(mi, vp9state.MI_MODE, m)
+    } else {
+        let w4: i64 = vp9blk.bw4(bsize)
+        let h4: i64 = vp9blk.bh4(bsize)
+        var last: i64 = 0
+        var idy: i64 = 0
+        while idy < 2 {
+            var idx: i64 = 0
+            while idx < 2 {
+                let b: i64 = idy * 2 + idx
+                let m: i64 = vp9mode.read_intra_mode(d, fc + (vp9defp.P_YMODE) as u64)
+                if !(*f).parallel {
+                    vp9mode.cnt_add(f, vp9cnt.N_YMODE + m as usize)
+                }
+                vp9mem.st8(mi, vp9state.MI_YMODE + b as usize, m)
+                if h4 == 2 {
+                    vp9mem.st8(mi, vp9state.MI_YMODE + (b + 2) as usize, m)
+                }
+                if w4 == 2 {
+                    vp9mem.st8(mi, vp9state.MI_YMODE + (b + 1) as usize, m)
+                }
+                last = m
+                idx = idx + w4
+            }
+            idy = idy + h4
+        }
+        vp9mem.st8(mi, vp9state.MI_MODE, last)
+    }
+    let ym: i64 = vp9mem.ld8(mi, vp9state.MI_MODE)
+    let uv: i64 = vp9mode.read_intra_mode(d, fc + (vp9defp.P_UVMODE + (ym * 9) as usize) as u64)
+    if !(*f).parallel {
+        vp9mode.cnt_add(f, vp9cnt.N_UVMODE + (ym * 10 + uv) as usize)
+    }
+    vp9mem.st8(mi, vp9state.MI_UV, uv)
+    vp9mem.st8(mi, vp9state.MI_FILTER, 3)
+    vp9mem.st8(mi, vp9state.MI_REF0, 0)
+    vp9mem.st8(mi, vp9state.MI_REF1, 0)
+}
+
+fn read_inter_frame_info(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, bsize: i64, x_mis: i64, y_mis: i64) -> i64 {
+    let have_above: bool = row > 0
+    let have_left: bool = col > (*f).tile_c0
+    var above_mi: u64 = 0
+    var left_mi: u64 = 0
+    if have_above {
+        above_mi = vp9state.mi_ptr(f, row - 1, col)
+    }
+    if have_left {
+        left_mi = vp9state.mi_ptr(f, row, col - 1)
+    }
+    let seg: i64 = read_inter_segment_id(f, mi, row, col, x_mis, y_mis, above_mi, left_mi)
+    let skip: i64 = vp9mode.read_skip(f, seg, above_mi, left_mi)
+    let inter: i64 = read_is_inter(f, seg, above_mi, left_mi)
+    var tx: i64 = 0
+    if skip == 0 || inter == 0 {
+        tx = vp9mode.read_tx_size(f, above_mi, left_mi, have_above, have_left, bsize)
+    } else {
+        tx = vp9mem.imin(vp9blk.max_tx(bsize), vp9mem.imin((*f).tx_mode, 3))
+    }
+    vp9mem.st8(mi, vp9state.MI_BSIZE, bsize)
+    vp9mem.st8(mi, vp9state.MI_TX, tx)
+    vp9mem.st8(mi, vp9state.MI_SKIP, skip)
+    vp9mem.st8(mi, vp9state.MI_SEG, seg)
+    if inter != 0 {
+        return read_inter_block(f, mi, row, col, bsize, seg, above_mi, left_mi)
+    }
+    read_intra_block(f, mi, bsize)
+    return ERR_NONE
+}
