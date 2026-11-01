@@ -30,6 +30,9 @@ pub(crate) struct Flow {
     pub derived: Vec<bool>,
     pub cin: Vec<Option<Vec<CellVal>>>,
     pub escaped: Bits,
+    other_bits: Bits,
+    scratch: Bits,
+    uses: Vec<Val>,
 }
 
 impl Flow {
@@ -38,9 +41,7 @@ impl Flow {
     }
 
     pub fn other(&self) -> CellVal {
-        let mut may = Bits::new(self.nseeds);
-        may.set(OTHER);
-        CellVal { may, derived: false }
+        CellVal { may: self.other_bits.clone(), derived: false }
     }
 
     pub fn must(&self, v: Val) -> Option<usize> {
@@ -51,11 +52,11 @@ impl Flow {
         m.iter().next().filter(|s| *s > self.nparams)
     }
 
-    pub fn build(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows) -> Flow {
+    pub fn build(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows, with_sites: bool) -> Flow {
         let nparams = f.params.len();
         let mut sites = Vec::new();
         let mut site_at = HashMap::default();
-        for &bi in ix.rpo.iter() {
+        for &bi in ix.rpo.iter().filter(|_| with_sites) {
             for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
                 if let Op::Call { name, args } = &inst.op {
                     if registry::producer(name).map_or(false, |p| p.shape == registry::Shape::SretPair) && !args.is_empty() {
@@ -77,6 +78,9 @@ impl Flow {
             derived: vec![false; ix.nvals],
             cin: vec![None; f.blocks.len()],
             escaped: Bits::new(nseeds),
+            other_bits: Bits::single(nseeds, OTHER),
+            scratch: Bits::new(nseeds),
+            uses: Vec::new(),
         };
         for i in 0..nparams.min(ix.nvals) {
             fl.may[i].set(1 + i);
@@ -144,16 +148,16 @@ impl Flow {
     }
 
     fn sink(&mut self, v: Val) {
-        let m = self.may[v as usize].clone();
-        self.escaped.union(&m);
+        let Flow { may, escaped, .. } = self;
+        escaped.union(&may[v as usize]);
     }
 
     pub fn transfer(&mut self, f: &Func, sl: &Slots, br: &dyn Borrows, cells: &mut [CellVal], inst: &Inst, at: (usize, usize), vals: bool) -> bool {
-        let mut other = Bits::new(self.nseeds);
-        other.set(OTHER);
-        let mut acc = Bits::new(self.nseeds);
+        let mut acc = std::mem::take(&mut self.scratch);
+        acc.reset();
         let mut der = false;
-        let mut uses: Vec<Val> = Vec::new();
+        let mut uses = std::mem::take(&mut self.uses);
+        uses.clear();
         match &inst.op {
             Op::Phi { incoming } => {
                 for (_, v) in incoming.iter() {
@@ -174,7 +178,7 @@ impl Flow {
                 acc.union(&self.may[*b as usize]);
                 der = self.derived[*a as usize] || self.derived[*b as usize];
             }
-            Op::PtrAdd { .. } if inst.dst.map_or(false, |d| sl.is_addr(d)) => acc = other.clone(),
+            Op::PtrAdd { .. } if inst.dst.map_or(false, |d| sl.is_addr(d)) => acc.assign(&self.other_bits),
             Op::PtrAdd { .. }
             | Op::Bin(..)
             | Op::BinWrapSat { .. }
@@ -185,7 +189,7 @@ impl Flow {
             | Op::CheckedIdx { .. }
             | Op::CheckedIdxV { .. } => {
                 inst.op.uses(&mut uses);
-                acc = other.clone();
+                acc.set(OTHER);
                 for v in uses.iter() {
                     acc.union(&self.may[*v as usize]);
                 }
@@ -198,13 +202,13 @@ impl Flow {
             | Op::FnRef { .. }
             | Op::VtabAddr { .. }
             | Op::GcAddr { .. }
-            | Op::ThreadSelf => acc = other.clone(),
+            | Op::ThreadSelf => acc.assign(&self.other_bits),
             Op::Load { addr } => match sl.access(*addr, inst.ty) {
                 Some(a) => {
-                    acc = cells[a.cell].may.clone();
+                    acc.assign(&cells[a.cell].may);
                     der = cells[a.cell].derived || inst.ty.bytes() < 8;
                 }
-                None => acc = other.clone(),
+                None => acc.assign(&self.other_bits),
             },
             Op::Store { addr, val } => match sl.access(*addr, inst.ty) {
                 Some(a) => {
@@ -224,10 +228,8 @@ impl Flow {
                 if let Some(k) = site {
                     let s = self.seed_of_site(k);
                     let (cp, cn) = (self.sites[k].cell_p, self.sites[k].cell_n);
-                    let mut m = Bits::new(self.nseeds);
-                    m.set(s);
-                    cells[cp] = CellVal { may: m, derived: false };
-                    cells[cn] = CellVal { may: other.clone(), derived: false };
+                    cells[cp] = CellVal { may: Bits::single(self.nseeds, s), derived: false };
+                    cells[cn] = CellVal { may: self.other_bits.clone(), derived: false };
                 }
                 for (k, v) in args.iter().enumerate() {
                     if (site.is_some() && k == 0) || br.borrows(name, k) {
@@ -235,20 +237,23 @@ impl Flow {
                     }
                     self.sink(*v);
                 }
-                acc = other.clone();
+                acc.assign(&self.other_bits);
             }
             _ => {
                 inst.op.uses(&mut uses);
                 for v in uses.iter() {
                     self.sink(*v);
                 }
-                acc = other.clone();
+                acc.assign(&self.other_bits);
             }
         }
-        match (vals, inst.dst) {
+        let ch = match (vals, inst.dst) {
             (true, Some(d)) => self.put(d, &acc, der),
             _ => false,
-        }
+        };
+        self.scratch = acc;
+        self.uses = uses;
+        ch
     }
 }
 

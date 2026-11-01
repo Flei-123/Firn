@@ -1,40 +1,7 @@
 use crate::fir::{Func, Op, Val};
 use crate::fx::HashMap;
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub(crate) struct Bits {
-    w: Vec<u64>,
-}
-
-impl Bits {
-    pub fn new(n: usize) -> Bits {
-        Bits { w: vec![0; (n + 63) / 64] }
-    }
-    pub fn set(&mut self, i: usize) {
-        self.w[i / 64] |= 1 << (i % 64);
-    }
-    pub fn clear(&mut self, i: usize) {
-        self.w[i / 64] &= !(1 << (i % 64));
-    }
-    pub fn get(&self, i: usize) -> bool {
-        self.w.get(i / 64).map_or(false, |x| x & (1 << (i % 64)) != 0)
-    }
-    pub fn union(&mut self, o: &Bits) -> bool {
-        let mut ch = false;
-        for (a, b) in self.w.iter_mut().zip(o.w.iter()) {
-            let n = *a | *b;
-            ch |= n != *a;
-            *a = n;
-        }
-        ch
-    }
-    pub fn count(&self) -> u32 {
-        self.w.iter().map(|x| x.count_ones()).sum()
-    }
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.w.iter().enumerate().flat_map(|(k, x)| (0..64).filter(move |b| x & (1 << b) != 0).map(move |b| k * 64 + b))
-    }
-}
+pub(crate) use super::bits::Bits;
 
 pub(crate) struct Index {
     pub nvals: usize,

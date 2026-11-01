@@ -21,6 +21,8 @@ struct Items {
     val: HashMap<Val, usize>,
     cell: HashMap<usize, usize>,
     n: usize,
+    valmask: Bits,
+    touch: Vec<bool>,
 }
 
 struct Ctx<'a> {
@@ -55,6 +57,7 @@ fn items_for(f: &Func, sl: &Slots, fl: &Flow, seed: usize, site: usize) -> Items
             n += 1;
         }
     }
+    let nv = n;
     let mut cell = HashMap::default();
     cell.insert(fl.sites[site].cell_p, n);
     n += 1;
@@ -70,11 +73,34 @@ fn items_for(f: &Func, sl: &Slots, fl: &Flow, seed: usize, site: usize) -> Items
             }
         }
     }
-    Items { val, cell, n }
+    let mut valmask = Bits::new(n);
+    (0..nv).for_each(|i| valmask.set(i));
+    let mut touch = vec![false; f.blocks.len()];
+    let mut buf = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        let mut t = buf.iter().any(|v| val.contains_key(v));
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if t {
+                break;
+            }
+            buf.clear();
+            inst.op.uses(&mut buf);
+            t = inst.dst.map_or(false, |d| val.contains_key(&d)) || buf.iter().any(|v| val.contains_key(v)) || fl.site_at.contains_key(&(bi, ii));
+            if !t {
+                if let Op::Load { addr } | Op::Store { addr, .. } = &inst.op {
+                    t = sl.access(*addr, inst.ty).map_or(false, |a| cell.contains_key(&a.cell));
+                }
+            }
+        }
+        touch[bi] = t;
+    }
+    Items { val, cell, n, valmask, touch }
 }
 
 impl<'a> Ctx<'a> {
-    fn back(&self, fl: &Flow, inst: &Inst, at: (usize, usize), live: &mut Bits) {
+    fn back(&self, fl: &Flow, inst: &Inst, at: (usize, usize), live: &mut Bits, u: &mut Vec<Val>) {
         if let Some(d) = inst.dst {
             if let Some(&i) = self.items.val.get(&d) {
                 live.clear(i);
@@ -111,17 +137,17 @@ impl<'a> Ctx<'a> {
         if matches!(inst.op, Op::Phi { .. }) {
             return;
         }
-        let mut u = Vec::new();
-        inst.op.uses(&mut u);
-        for v in u {
-            if let Some(&i) = self.items.val.get(&v) {
+        u.clear();
+        inst.op.uses(u);
+        for v in u.iter() {
+            if let Some(&i) = self.items.val.get(v) {
                 live.set(i);
             }
         }
     }
 
     fn carried(&self, live: &Bits, cells: &[CellVal]) -> bool {
-        if self.items.val.values().any(|&i| live.get(i)) {
+        if live.intersects(&self.items.valmask) {
             return true;
         }
         self.items.cell.iter().any(|(&c, &i)| live.get(i) && cells[c].may.get(self.seed))
@@ -134,6 +160,9 @@ impl<'a> Ctx<'a> {
 
     fn live_in(&self, fl: &Flow, bi: usize, out: &Bits) -> Bits {
         let mut live = out.clone();
+        if !self.items.touch[bi] {
+            return live;
+        }
         let b = &self.f.blocks[bi];
         let mut u = Vec::new();
         term_uses(&b.term, &mut u);
@@ -142,8 +171,9 @@ impl<'a> Ctx<'a> {
                 live.set(i);
             }
         }
+        let mut buf = Vec::new();
         for (ii, inst) in b.insts.iter().enumerate().rev() {
-            self.back(fl, inst, (bi, ii), &mut live);
+            self.back(fl, inst, (bi, ii), &mut live, &mut buf);
         }
         live
     }
@@ -200,7 +230,11 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
     }
     let mut frees = Vec::new();
     let mut ends: Vec<Option<Vec<CellVal>>> = vec![None; nb];
+    let mut buf = Vec::new();
     for &bi in ix.rpo.iter() {
+        if !cx.items.touch[bi] {
+            continue;
+        }
         let cin = fl.cin[bi].clone()?;
         let b = &f.blocks[bi];
         let mut states: Vec<Vec<CellVal>> = Vec::with_capacity(b.insts.len() + 1);
@@ -224,7 +258,7 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             let inst = &b.insts[ii];
             let after = cx.carried(&live, &states[ii + 1]);
             let mut before_live = live.clone();
-            cx.back(fl, inst, (bi, ii), &mut before_live);
+            cx.back(fl, inst, (bi, ii), &mut before_live, &mut buf);
             let before = cx.carried(&before_live, &states[ii]);
             let is_site = fl.site_at.get(&(bi, ii)) == Some(&site);
             if is_site && before {
@@ -245,7 +279,7 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             continue;
         }
         let p = ix.preds[bi][0];
-        let (Some(pend), Some(cin)) = (ends[p].as_ref(), fl.cin[bi].as_ref()) else { continue };
+        let (Some(pend), Some(cin)) = (ends[p].as_ref().or(fl.cin[p].as_ref()), fl.cin[bi].as_ref()) else { continue };
         if !cx.carried(&outs[p], pend) || cx.carried(&ins[bi], cin) {
             continue;
         }

@@ -6,6 +6,7 @@ use crate::fir::{Func, Module, Op};
 use crate::fx::HashMap;
 
 pub(crate) const MAX_INSTS: usize = 40000;
+pub(crate) const MAX_SITE_WORK: usize = 200_000;
 
 pub(crate) struct Summaries {
     map: HashMap<String, Vec<bool>>,
@@ -28,13 +29,16 @@ pub(crate) fn analyzable(f: &Func) -> bool {
 }
 
 fn param_borrows(f: &Func, s: &Summaries) -> Vec<bool> {
+    if f.params.is_empty() {
+        return Vec::new();
+    }
     let ix = Index::build(f);
     let sl = Slots::build(f, &ix);
-    let fl = Flow::build(f, &ix, &sl, s);
+    let fl = Flow::build(f, &ix, &sl, s, false);
     (0..f.params.len()).map(|i| !fl.escaped.get(1 + i)).collect()
 }
 
-pub(crate) fn compute(m: &Module) -> Summaries {
+pub(crate) fn compute(m: &Module, roots: &[usize]) -> Summaries {
     let n = m.funcs.len();
     let mut s = Summaries { map: HashMap::default() };
     let mut idx: HashMap<&str, usize> = HashMap::default();
@@ -43,25 +47,29 @@ pub(crate) fn compute(m: &Module) -> Summaries {
         s.map.insert(f.name.clone(), vec![analyzable(f); f.params.len()]);
     }
     let mut callers: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, f) in m.funcs.iter().enumerate() {
-        for b in f.blocks.iter() {
+    let mut reach = vec![false; n];
+    let mut stack: Vec<usize> = roots.to_vec();
+    roots.iter().for_each(|&r| reach[r] = true);
+    while let Some(i) = stack.pop() {
+        for b in m.funcs[i].blocks.iter() {
             for inst in b.insts.iter() {
                 if let Op::Call { name, .. } = &inst.op {
                     if let Some(&j) = idx.get(name.as_str()) {
                         if callers[j].last() != Some(&i) {
                             callers[j].push(i);
                         }
+                        if !reach[j] {
+                            reach[j] = true;
+                            stack.push(j);
+                        }
                     }
                 }
             }
         }
     }
-    let mut queued = vec![true; n];
-    let mut work: std::collections::VecDeque<usize> = (0..n).filter(|&i| analyzable(&m.funcs[i])).collect();
-    for i in 0..n {
-        queued[i] = analyzable(&m.funcs[i]);
-    }
-    let mut budget = 8 * n + 1000;
+    let mut queued: Vec<bool> = (0..n).map(|i| reach[i] && analyzable(&m.funcs[i])).collect();
+    let mut work: std::collections::VecDeque<usize> = (0..n).filter(|&i| queued[i]).collect();
+    let mut budget = 8 * work.len() + 1000;
     while let Some(i) = work.pop_front() {
         queued[i] = false;
         if budget == 0 {
