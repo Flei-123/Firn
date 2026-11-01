@@ -88,7 +88,6 @@ import fui.viewport
 import fui.anim
 import paint.gl
 import fui.gpu
-import plat.webgl
 
 export {
     Web, web_page, web_scene, web_sheet, web_ctx, web_theme, web_canvas,
@@ -103,7 +102,7 @@ export {
     web_on_demand, web_want_frame, web_wake_in, web_damage, web_damage_all,
     FRAME_PAINTED, FRAME_AGAIN,
     // THE GPU (see "ON THE GPU" below)
-    web_use_gpu, web_gpu_on, web_gpu,
+    web_use_gpu, web_gpu_on, web_gpu, web_set_gpu_backend,
     web_fetch, web_stream_open, web_stream_close, web_navigate,
     web_keyboard, web_location, web_store_get, web_store_set, web_cursor,
     web_tz_offset,
@@ -336,6 +335,13 @@ struct Web {
     gpu_on: bool,
     gl: gl.GlApi,
     gp: gpu.Gpu,
+    gx_gl_open: fn(*mut gl.GlApi) -> bool,
+    gx_open: fn(*mut gpu.Gpu, *mut gl.GlApi) -> bool,
+    gx_attach: fn(*mut gpu.Gpu, *mut canvas.Canvas) -> bool,
+    gx_clear: fn(*mut gpu.Gpu, u32),
+    gx_present: fn(*mut gpu.Gpu),
+    gx_begin: fn(*mut gpu.Gpu, i32, i32),
+    gx_size: fn(usize, usize),
 }
 
 // The answer of firn_web_frame, bits: a picture went to the host, and the
@@ -353,6 +359,35 @@ fn build_none(ud: u64, w: *mut Web) -> bool {
 
 fn event_none(ud: u64, w: *mut Web, e: *mut WebEvent) -> bool {
     return false
+}
+
+fn stub_gl_open(t: *mut gl.GlApi) -> bool { return false }
+fn stub_open(g: *mut gpu.Gpu, a: *mut gl.GlApi) -> bool { return false }
+fn stub_attach(g: *mut gpu.Gpu, cv: *mut canvas.Canvas) -> bool { return false }
+fn stub_clear(g: *mut gpu.Gpu, col: u32) {}
+fn stub_present(g: *mut gpu.Gpu) {}
+fn stub_begin(g: *mut gpu.Gpu, sw: i32, sh: i32) {}
+fn stub_size(w: usize, h: usize) {}
+
+fn web_set_gpu_backend(
+    gl_open: fn(*mut gl.GlApi) -> bool,
+    open: fn(*mut gpu.Gpu, *mut gl.GlApi) -> bool,
+    attach: fn(*mut gpu.Gpu, *mut canvas.Canvas) -> bool,
+    clear: fn(*mut gpu.Gpu, u32),
+    present: fn(*mut gpu.Gpu),
+    begin: fn(*mut gpu.Gpu, i32, i32),
+    size: fn(usize, usize)) {
+    if G_WEB == 0 {
+        return
+    }
+    let w: *mut Web = the_web()
+    (*w).gx_gl_open = gl_open
+    (*w).gx_open = open
+    (*w).gx_attach = attach
+    (*w).gx_clear = clear
+    (*w).gx_present = present
+    (*w).gx_begin = begin
+    (*w).gx_size = size
 }
 
 fn web_blank() -> Web {
@@ -373,6 +408,8 @@ fn web_blank() -> Web {
         dmg_n: 0, dx0: 0, dy0: 0, dx1: 0, dy1: 0,
         gpu_want: false, gpu_tried: false, gpu_on: false,
         gl: gl.gl_api_new(), gp: gpu.gpu_new(),
+        gx_gl_open: stub_gl_open, gx_open: stub_open, gx_attach: stub_attach, gx_clear: stub_clear,
+        gx_present: stub_present, gx_begin: stub_begin, gx_size: stub_size,
     }
 }
 
@@ -1341,17 +1378,17 @@ fn gpu_start(w: *mut Web) {
         if !(*w).gpu_want {
             return
         }
-        if !webgl.webgl_open(&(*w).gl) {
+        if !(*w).gx_gl_open(&(*w).gl) {
             return
         }
-        if !gpu.gpu_open(&(*w).gp, &(*w).gl) {
+        if !(*w).gx_open(&(*w).gp, &(*w).gl) {
             return
         }
         (*w).gpu_on = true
     }
     if (*w).gpu_on {
-        webgl.webgl_size((*w).w, (*w).h)
-        if !gpu.gpu_attach(&(*w).gp, &(*w).cv) {
+        (*w).gx_size((*w).w, (*w).h)
+        if !(*w).gx_attach(&(*w).gp, &(*w).cv) {
             (*w).gpu_on = false
         }
     }
@@ -1380,7 +1417,7 @@ fn stray_note(w: *mut Web) {
 // The canvas cleared to its ground, in memory or on the GPU.
 fn clear_canvas(w: *mut Web, col: u32) {
     if (*w).gpu_on {
-        gpu.gpu_clear(&(*w).gp, col)
+        (*w).gx_clear(&(*w).gp, col)
         return
     }
     canvas.canvas_clear(&(*w).cv, col)
@@ -1399,11 +1436,11 @@ fn firn_web_gl_restored() -> u32 {
     if !(*w).gpu_on {
         return 0 as u32
     }
-    if !gpu.gpu_open(&(*w).gp, &(*w).gl) || !gpu.gpu_attach(&(*w).gp, &(*w).cv) {
+    if !(*w).gx_open(&(*w).gp, &(*w).gl) || !(*w).gx_attach(&(*w).gp, &(*w).cv) {
         (*w).gpu_on = false
         return 0 as u32
     }
-    webgl.webgl_size((*w).w, (*w).h)
+    (*w).gx_size((*w).w, (*w).h)
     if (*w).app && (*w).built {
         // the application hears of it as of a new size: it paints all
         var e: WebEvent = event_blank(WE_RESIZE)
@@ -1419,7 +1456,7 @@ fn firn_web_gl_restored() -> u32 {
 fn show(w: *mut Web) {
     if (*w).gpu_on {
         stray_note(w)
-        gpu.gpu_present(&(*w).gp)
+        (*w).gx_present(&(*w).gp)
         (*w).dmg_n = 0
         (*w).frames = (*w).frames + 1
         return
@@ -1458,7 +1495,7 @@ fn firn_web_frame(ms: f64) -> u32 {
             render.ctx_set_time(&(*w).c, now)
             let fa: *mut theme.Colors = theme.theme_colors(&(*w).m)
             if (*w).gpu_on {
-                gpu.gpu_frame_begin(&(*w).gp, (*w).w as i32, (*w).h as i32)
+                (*w).gx_begin(&(*w).gp, (*w).w as i32, (*w).h as i32)
             }
             if !(*w).keep {
                 clear_canvas(w, theme.opaque((*fa).base))
@@ -1513,7 +1550,7 @@ fn firn_web_frame(ms: f64) -> u32 {
     (*w).dirty = 0 as u32
     render.ctx_set_time(&(*w).c, now)
     if (*w).gpu_on {
-        gpu.gpu_frame_begin(&(*w).gp, (*w).w as i32, (*w).h as i32)
+        (*w).gx_begin(&(*w).gp, (*w).w as i32, (*w).h as i32)
     }
     let f: *mut theme.Colors = theme.theme_colors(&(*w).m)
     clear_canvas(w, theme.opaque((*f).base))
