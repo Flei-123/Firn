@@ -91,12 +91,20 @@ impl Graph {
     }
 }
 
+pub(crate) struct Stats {
+    pub borrow_evals: usize,
+    pub fresh_evals: usize,
+    pub waves: usize,
+}
+
 struct Borrow<'a> {
     m: &'a Module,
     g: &'a Graph,
     reach: Vec<bool>,
     budget: usize,
     exhausted: bool,
+    evals: usize,
+    waves: usize,
 }
 
 impl<'a> Borrow<'a> {
@@ -120,17 +128,16 @@ impl<'a> Borrow<'a> {
         }
         let n = self.m.funcs.len();
         let mut queued = vec![false; n];
-        let mut work: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut work: Vec<usize> = Vec::new();
         for i in fresh_reach {
             if analyzable(&self.m.funcs[i]) {
                 queued[i] = true;
-                work.push_back(i);
+                work.push(i);
             }
         }
         self.budget += 8 * work.len();
-        while let Some(i) = work.pop_front() {
-            queued[i] = false;
-            if self.budget == 0 {
+        while !work.is_empty() {
+            if self.budget < work.len() {
                 for v in s.map.values_mut() {
                     v.iter_mut().for_each(|b| *b = false);
                 }
@@ -138,15 +145,26 @@ impl<'a> Borrow<'a> {
                 self.exhausted = true;
                 return;
             }
-            self.budget -= 1;
-            let f = &self.m.funcs[i];
-            let new = param_borrows(f, s);
-            if s.map.get(&f.name) != Some(&new) {
-                s.map.insert(f.name.clone(), new);
-                for &c in self.g.callers[i].iter() {
-                    if self.reach[c] && !queued[c] {
-                        queued[c] = true;
-                        work.push_back(c);
+            self.budget -= work.len();
+            self.evals += work.len();
+            self.waves += 1;
+            let mut batch = std::mem::take(&mut work);
+            batch.sort_unstable();
+            batch.iter().for_each(|&i| queued[i] = false);
+            let m = self.m;
+            let res = {
+                let sr: &Summaries = s;
+                crate::parfn::map_slice(&batch, |&i| param_borrows(&m.funcs[i], sr))
+            };
+            for (&i, new) in batch.iter().zip(res) {
+                let name = &self.m.funcs[i].name;
+                if s.map.get(name) != Some(&new) {
+                    s.map.insert(name.clone(), new);
+                    for &c in self.g.callers[i].iter() {
+                        if self.reach[c] && !queued[c] {
+                            queued[c] = true;
+                            work.push(c);
+                        }
                     }
                 }
             }
@@ -154,47 +172,66 @@ impl<'a> Borrow<'a> {
     }
 }
 
-pub(crate) fn compute(m: &Module, base: &[usize]) -> (Summaries, Vec<usize>) {
+pub(crate) fn compute(m: &Module, base: &[usize]) -> (Summaries, Vec<usize>, Stats) {
     let n = m.funcs.len();
     let mut s = Summaries { map: HashMap::default(), fresh: HashSet::default() };
     for f in m.funcs.iter() {
         s.map.insert(f.name.clone(), vec![analyzable(f); f.params.len()]);
     }
     let g = Graph::build(m);
-    let mut bw = Borrow { m, g: &g, reach: vec![false; n], budget: 1000, exhausted: false };
+    let mut bw = Borrow { m, g: &g, reach: vec![false; n], budget: 1000, exhausted: false, evals: 0, waves: 0 };
+    let mut fresh_evals = 0;
     bw.extend(&mut s, base);
+    let stats = |bw: &Borrow, fe: usize| Stats { borrow_evals: bw.evals, fresh_evals: fe, waves: bw.waves };
     if bw.exhausted {
-        return (s, base.to_vec());
+        return (s, base.to_vec(), stats(&bw, fresh_evals));
     }
     let mut is_root = vec![false; n];
     base.iter().for_each(|&r| is_root[r] = true);
     let mut queued = is_root.clone();
-    let mut work: std::collections::VecDeque<usize> = base.iter().copied().collect();
+    let mut work: Vec<usize> = base.to_vec();
     let mut budget = 4 * n + 1000;
-    while let Some(i) = work.pop_front() {
-        queued[i] = false;
-        if budget == 0 {
-            break;
+    while !work.is_empty() && budget > 0 {
+        let mut batch = std::mem::take(&mut work);
+        batch.sort_unstable();
+        if batch.len() > budget {
+            batch.split_off(budget);
         }
-        budget -= 1;
-        let f = &m.funcs[i];
-        if s.fresh.contains(&f.name) || !returns_fresh(f, &s) {
+        budget -= batch.len();
+        batch.iter().for_each(|&i| queued[i] = false);
+        let cand: Vec<usize> = batch.into_iter().filter(|&i| !s.fresh.contains(&m.funcs[i].name)).collect();
+        fresh_evals += cand.len();
+        let res = {
+            let sr: &Summaries = &s;
+            crate::parfn::map_slice(&cand, |&i| returns_fresh(&m.funcs[i], sr))
+        };
+        let newly: Vec<usize> = cand.iter().zip(res).filter(|(_, ok)| *ok).map(|(&i, _)| i).collect();
+        if newly.is_empty() {
             continue;
         }
-        s.fresh.insert(f.name.clone());
-        let new: Vec<usize> = g.callers[i].iter().copied().filter(|&c| !is_root[c]).collect();
-        new.iter().for_each(|&c| is_root[c] = true);
+        let mut new: Vec<usize> = Vec::new();
+        for &i in newly.iter() {
+            s.fresh.insert(m.funcs[i].name.clone());
+            for &c in g.callers[i].iter() {
+                if !is_root[c] {
+                    is_root[c] = true;
+                    new.push(c);
+                }
+            }
+        }
         bw.extend(&mut s, &new);
         if bw.exhausted {
-            return (s, base.to_vec());
+            return (s, base.to_vec(), stats(&bw, fresh_evals));
         }
-        for &c in g.callers[i].iter() {
-            if !queued[c] {
-                queued[c] = true;
-                work.push_back(c);
+        for &i in newly.iter() {
+            for &c in g.callers[i].iter() {
+                if !queued[c] {
+                    queued[c] = true;
+                    work.push(c);
+                }
             }
         }
     }
     let roots = (0..n).filter(|&i| is_root[i]).collect();
-    (s, roots)
+    (s, roots, stats(&bw, fresh_evals))
 }

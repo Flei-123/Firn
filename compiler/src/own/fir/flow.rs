@@ -131,7 +131,7 @@ impl Flow {
                         None => continue,
                     }
                 };
-                if fl.cin[bi].as_ref() != Some(&cells) {
+                if with_sites && fl.cin[bi].as_ref() != Some(&cells) {
                     fl.cin[bi] = Some(cells.clone());
                     changed = true;
                 }
