@@ -8,7 +8,7 @@ pub(crate) mod reuse;
 pub(crate) mod shape;
 pub(crate) mod walk;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mode {
@@ -18,7 +18,9 @@ pub(crate) enum Mode {
     Strict,
 }
 
-static MODE: AtomicU8 = AtomicU8::new(0);
+static MODE: AtomicU8 = AtomicU8::new(1);
+
+static EXPLICIT: AtomicBool = AtomicBool::new(false);
 
 const RUNTIME: &str = include_str!("../../../lib/gc/own.fi");
 
@@ -64,6 +66,7 @@ pub(crate) fn set_mode(m: Mode) {
         Mode::Strict => 3,
     };
     MODE.store(v, Ordering::Relaxed);
+    EXPLICIT.store(true, Ordering::Relaxed);
 }
 
 pub(crate) fn mode_name() -> &'static str {
@@ -88,9 +91,15 @@ pub(crate) fn apply_env() -> Result<(), String> {
     }
 }
 
+fn default_applies() -> bool {
+    EXPLICIT.load(Ordering::Relaxed)
+        || (matches!(crate::target::active(), crate::target::Target::X86_64 | crate::target::Target::Aarch64)
+            && !crate::prof::is_kernel())
+}
+
 pub(crate) fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
-        1 => Mode::On,
+        1 if default_applies() => Mode::On,
         2 => Mode::Check,
         3 => Mode::Strict,
         _ => Mode::Off,

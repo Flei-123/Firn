@@ -331,7 +331,7 @@ fn usage() -> String {
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
-         --ownership=<m>    off | on | check (automatic ownership, default off)\n  \
+         --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
