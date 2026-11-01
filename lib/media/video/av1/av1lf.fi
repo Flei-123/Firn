@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1fhdr
+import media.video.av1.av1frame
+import media.video.av1.av1ipm
+
+export { lf_frame, lf_active }
+
+fn iabs(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn lf_active(fh: *mut av1fhdr.FrameHdr) -> bool {
+    return (*fh).loop_filter_level[0] != 0 || (*fh).loop_filter_level[1] != 0
+}
+
+fn px(buf: u64, base: i64, step: i64, k: i64) -> i64 {
+    return av1ipm.ld(buf, base + k * step)
+}
+
+fn put_px(buf: u64, base: i64, step: i64, k: i64, v: i64) {
+    av1ipm.st(buf, base + k * step, v)
+}
+
+fn clamp4(bd: i64, v: i64) -> i64 {
+    return clip3(0 - (1 << ((bd - 1) as u64)), (1 << ((bd - 1) as u64)) - 1, v)
+}
+
+fn narrow_filter(buf: u64, base: i64, step: i64, hev: bool, bd: i64) {
+    let off: i64 = 128 << ((bd - 8) as u64)
+    let ps1: i64 = px(buf, base, step, 0 - 2) - off
+    let ps0: i64 = px(buf, base, step, 0 - 1) - off
+    let qs0: i64 = px(buf, base, step, 0) - off
+    let qs1: i64 = px(buf, base, step, 1) - off
+    var filter: i64 = 0
+    if hev {
+        filter = clamp4(bd, ps1 - qs1)
+    }
+    filter = clamp4(bd, filter + 3 * (qs0 - ps0))
+    let filter1: i64 = clamp4(bd, filter + 4) >> 3
+    let filter2: i64 = clamp4(bd, filter + 3) >> 3
+    put_px(buf, base, step, 0, clamp4(bd, qs0 - filter1) + off)
+    put_px(buf, base, step, 0 - 1, clamp4(bd, ps0 + filter2) + off)
+    if !hev {
+        let f: i64 = (filter1 + 1) >> 1
+        put_px(buf, base, step, 1, clamp4(bd, qs1 - f) + off)
+        put_px(buf, base, step, 0 - 2, clamp4(bd, ps1 + f) + off)
+    }
+}
+
+fn wide_filter(buf: u64, base: i64, step: i64, log2_size: i64, plane: i64, tmp: u64) {
+    var n: i64 = 6
+    if log2_size != 4 {
+        n = 2
+        if plane == 0 {
+            n = 3
+        }
+    }
+    var n2: i64 = 1
+    if log2_size == 3 && plane == 0 {
+        n2 = 0
+    }
+    var i: i64 = 0 - n
+    while i < n {
+        var t: i64 = 0
+        var j: i64 = 0 - n
+        while j <= n {
+            let p: i64 = clip3(0 - (n + 1), n, i + j)
+            var tap: i64 = 1
+            if iabs(j) <= n2 {
+                tap = 2
+            }
+            t = t + px(buf, base, step, p) * tap
+            j = j + 1
+        }
+        av1ipm.st(tmp, i + n, (t + (1 << ((log2_size - 1) as u64))) >> (log2_size as u64))
+        i = i + 1
+    }
+    i = 0 - n
+    while i < n {
+        put_px(buf, base, step, i, av1ipm.ld(tmp, i + n))
+        i = i + 1
+    }
+}
+
+fn sample_filter(buf: u64, base: i64, step: i64, size: i64, plane: i64, limit: i64, blimit: i64, thresh: i64, bd: i64, tmp: u64) {
+    let sh: u64 = (bd - 8) as u64
+    let lim: i64 = limit << sh
+    let blim: i64 = blimit << sh
+    let thr: i64 = thresh << sh
+    let p1: i64 = px(buf, base, step, 0 - 2)
+    let p0: i64 = px(buf, base, step, 0 - 1)
+    let q0: i64 = px(buf, base, step, 0)
+    let q1: i64 = px(buf, base, step, 1)
+    let hev: bool = iabs(p1 - p0) > thr || iabs(q1 - q0) > thr
+    var flen: i64 = 4
+    if size != 4 {
+        if plane != 0 {
+            flen = 6
+        } else if size == 8 {
+            flen = 8
+        } else {
+            flen = 16
+        }
+    }
+    var mask: bool = iabs(p1 - p0) <= lim && iabs(q1 - q0) <= lim && iabs(p0 - q0) * 2 + (iabs(p1 - q1) >> 1) <= blim
+    if flen >= 6 {
+        let p2: i64 = px(buf, base, step, 0 - 3)
+        let q2: i64 = px(buf, base, step, 2)
+        mask = mask && iabs(p2 - p1) <= lim && iabs(q2 - q1) <= lim
+    }
+    if flen >= 8 {
+        let p3: i64 = px(buf, base, step, 0 - 4)
+        let q3: i64 = px(buf, base, step, 3)
+        let p2: i64 = px(buf, base, step, 0 - 3)
+        let q2: i64 = px(buf, base, step, 2)
+        mask = mask && iabs(p3 - p2) <= lim && iabs(q3 - q2) <= lim
+    }
+    if !mask {
+        return
+    }
+    var flat: bool = false
+    if size >= 8 {
+        let one: i64 = 1 << sh
+        let p2: i64 = px(buf, base, step, 0 - 3)
+        let q2: i64 = px(buf, base, step, 2)
+        flat = iabs(p1 - p0) <= one && iabs(q1 - q0) <= one && iabs(p2 - p0) <= one && iabs(q2 - q0) <= one
+        if flen >= 8 {
+            let p3: i64 = px(buf, base, step, 0 - 4)
+            let q3: i64 = px(buf, base, step, 3)
+            flat = flat && iabs(p3 - p0) <= one && iabs(q3 - q0) <= one
+        }
+    }
+    var flat2: bool = false
+    if size >= 16 {
+        let one: i64 = 1 << sh
+        flat2 = true
+        var k: i64 = 4
+        while k <= 6 {
+            if iabs(px(buf, base, step, 0 - 1 - k) - p0) > one || iabs(px(buf, base, step, k) - q0) > one {
+                flat2 = false
+            }
+            k = k + 1
+        }
+    }
+    if size == 4 || !flat {
+        narrow_filter(buf, base, step, hev, bd)
+    } else if size == 8 || !flat2 {
+        wide_filter(buf, base, step, 3, plane, tmp)
+    } else {
+        wide_filter(buf, base, step, 4, plane, tmp)
+    }
+}
+
+fn signed8(v: i64) -> i64 {
+    if v > 127 {
+        return v - 256
+    }
+    return v
+}
+
+fn filter_level(td: *mut av1blkst.TileDec, row: i64, col: i64, plane: i64, pass: i64) -> i64 {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let seg: i64 = av1blkst.mi_get(td, (*td).seg_a, row, col)
+    var i: i64 = pass
+    if plane > 0 {
+        i = plane + 1
+    }
+    var dl_idx: i64 = 0
+    if (*fh).delta_lf_multi != 0 {
+        dl_idx = i
+    }
+    let delta_lf: i64 = signed8(av1blkst.ld((*td).dlf_a, (row * (*td).mi_cols + col) * 4 + dl_idx))
+    var lvl: i64 = clip3(0, 63, delta_lf + (*fh).loop_filter_level[i as usize])
+    let feat: usize = (seg * 8 + 1 + i) as usize
+    if (*fh).segmentation_enabled != 0 && (*fh).feature_enabled[feat] != 0 {
+        lvl = clip3(0, 63, lvl + (*fh).feature_data[feat])
+    }
+    if (*fh).loop_filter_delta_enabled != 0 {
+        let n_shift: u64 = (lvl >> 5) as u64
+        lvl = lvl + ((*fh).loop_filter_ref_deltas[0] << n_shift)
+        lvl = clip3(0, 63, lvl)
+    }
+    return lvl
+}
+
+fn limit_for(lvl: i64, sharp: i64) -> i64 {
+    var shift: i64 = 0
+    if sharp > 4 {
+        shift = 2
+    } else if sharp > 0 {
+        shift = 1
+    }
+    if sharp > 0 {
+        return clip3(1, 9 - sharp, lvl >> (shift as u64))
+    }
+    var l: i64 = lvl >> (shift as u64)
+    if l < 1 {
+        l = 1
+    }
+    return l
+}
+
+fn lftx(td: *mut av1blkst.TileDec, plane: i64, row: i64, col: i64) -> i64 {
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    return av1blkst.ld((*td).lftx_a, (((row >> (sy as u64)) * (*td).mi_cols) + (col >> (sx as u64))) * 3 + plane)
+}
+
+fn edge(td: *mut av1blkst.TileDec, f: *mut av1frame.Frame, plane: i64, pass: i64, row_in: i64, col_in: i64, tmp: u64) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if plane > 0 {
+        sx = (*td).ss_x
+        sy = (*td).ss_y
+    }
+    var dx: i64 = 0
+    var dy: i64 = 0
+    if pass == 0 {
+        dx = 1
+    } else {
+        dy = 1
+    }
+    let x: i64 = col_in * 4
+    let y: i64 = row_in * 4
+    let row: i64 = row_in | sy
+    let col: i64 = col_in | sx
+    if x >= (*fh).frame_width || y >= (*fh).frame_height {
+        return
+    }
+    if (pass == 0 && x == 0) || (pass == 1 && y == 0) {
+        return
+    }
+    let xp: i64 = x >> (sx as u64)
+    let yp: i64 = y >> (sy as u64)
+    let prev_row: i64 = row - (dy << (sy as u64))
+    let prev_col: i64 = col - (dx << (sx as u64))
+    let mi_size: i64 = av1blkst.mi_get(td, (*td).mi_size_a, row, col)
+    let tx_sz: i64 = lftx(td, plane, row, col)
+    var plane_size: i64 = mi_size
+    if plane > 0 {
+        plane_size = av1blkdat.subsampled_size(mi_size, sx, sy)
+    }
+    let skip: i64 = av1blkst.mi_get(td, (*td).skip_a, row, col)
+    let is_intra: bool = av1blkst.mi_get(td, (*td).inter_a, row, col) == 0
+    let prev_tx: i64 = lftx(td, plane, prev_row, prev_col)
+    var is_block_edge: bool = false
+    var is_tx_edge: bool = false
+    var base_size: i64 = 0
+    if pass == 0 {
+        is_block_edge = xp % av1blkdat.bw_px(plane_size) == 0
+        is_tx_edge = xp % av1blkdat.tx_w(tx_sz) == 0
+        base_size = av1blkdat.tx_w(prev_tx)
+        if av1blkdat.tx_w(tx_sz) < base_size {
+            base_size = av1blkdat.tx_w(tx_sz)
+        }
+    } else {
+        is_block_edge = yp % av1blkdat.bh_px(plane_size) == 0
+        is_tx_edge = yp % av1blkdat.tx_h(tx_sz) == 0
+        base_size = av1blkdat.tx_h(prev_tx)
+        if av1blkdat.tx_h(tx_sz) < base_size {
+            base_size = av1blkdat.tx_h(tx_sz)
+        }
+    }
+    if !is_tx_edge {
+        return
+    }
+    if !(is_block_edge || skip == 0 || is_intra) {
+        return
+    }
+    var max_size: i64 = 8
+    if plane == 0 {
+        max_size = 16
+    }
+    var filter_size: i64 = base_size
+    if filter_size > max_size {
+        filter_size = max_size
+    }
+    var lvl: i64 = filter_level(td, row, col, plane, pass)
+    if lvl == 0 {
+        lvl = filter_level(td, prev_row, prev_col, plane, pass)
+    }
+    if lvl == 0 {
+        return
+    }
+    let limit: i64 = limit_for(lvl, (*fh).loop_filter_sharpness)
+    let blimit: i64 = 2 * (lvl + 2) + limit
+    let thresh: i64 = lvl >> 4
+    let p: usize = plane as usize
+    let stride: i64 = (*f).strides[p]
+    var step: i64 = 1
+    var along: i64 = stride
+    if pass == 1 {
+        step = stride
+        along = 1
+    }
+    var i: i64 = 0
+    while i < 4 {
+        let base: i64 = yp * stride + xp + i * along
+        sample_filter((*f).planes[p], base, step, filter_size, plane, limit, blimit, thresh, (*td).bit_depth, tmp)
+        i = i + 1
+    }
+}
+
+fn lf_frame(td: *mut av1blkst.TileDec, f: *mut av1frame.Frame) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    if !lf_active(fh) {
+        return
+    }
+    let tmp: u64 = vp9mem.alloc(128)
+    var plane: i64 = 0
+    while plane < (*td).num_planes {
+        if plane == 0 || (*fh).loop_filter_level[(1 + plane) as usize] != 0 {
+            var pass: i64 = 0
+            while pass < 2 {
+                var row_step: i64 = 1
+                var col_step: i64 = 1
+                if plane > 0 {
+                    row_step = 1 << ((*td).ss_y as u64)
+                    col_step = 1 << ((*td).ss_x as u64)
+                }
+                var row: i64 = 0
+                while row < (*td).mi_rows {
+                    var col: i64 = 0
+                    while col < (*td).mi_cols {
+                        edge(td, f, plane, pass, row, col, tmp)
+                        col = col + col_step
+                    }
+                    row = row + row_step
+                }
+                pass = pass + 1
+            }
+        }
+        plane = plane + 1
+    }
+    vp9mem.free(tmp, 128)
+}

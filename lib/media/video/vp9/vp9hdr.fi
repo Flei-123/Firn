@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8bool
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9defp
+import media.video.vp9.vp9entp
+import media.video.vp9.vp9qtab
+import media.video.vp9.vp9state
+
+export { hdr_parse, hdr_compressed, hdr_dequant, HDR_OK, HDR_SHOW_EXISTING, HDR_ERR, HDR_UNSUPPORTED, reset_probs }
+
+const HDR_OK: i64 = 0
+const HDR_SHOW_EXISTING: i64 = 1
+const HDR_ERR: i64 = 0 - 1
+const HDR_UNSUPPORTED: i64 = 0 - 2
+
+struct BR {
+    p: u64,
+    bit: i64,
+    nbits: i64,
+}
+
+fn br_bit(r: *mut BR) -> i64 {
+    if (*r).bit >= (*r).nbits {
+        (*r).bit = (*r).bit + 1
+        return 0
+    }
+    let byte: i64 = vp9mem.ld8((*r).p, ((*r).bit >> 3) as usize)
+    let v: i64 = (byte >> ((7 - ((*r).bit & 7)) as u64)) & 1
+    (*r).bit = (*r).bit + 1
+    return v
+}
+
+fn br_lit(r: *mut BR, n: i64) -> i64 {
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        v = (v << 1) | br_bit(r)
+        i = i + 1
+    }
+    return v
+}
+
+fn br_su(r: *mut BR, n: i64) -> i64 {
+    let v: i64 = br_lit(r, n)
+    if br_bit(r) == 1 {
+        return 0 - v
+    }
+    return v
+}
+
+fn br_delta_q(r: *mut BR) -> i64 {
+    if br_bit(r) == 1 {
+        return br_su(r, 4)
+    }
+    return 0
+}
+
+fn reset_probs(f: *mut vp9state.Vp9) {
+    var i: usize = 0
+    let src: u64 = vp9defp.default_probs_addr()
+    while i < vp9defp.P_TOTAL {
+        vp9mem.st8((*f).fc, i, vp9mem.ld8(src, i))
+        i = i + 1
+    }
+}
+
+fn past_independence(f: *mut vp9state.Vp9) {
+    var i: usize = 0
+    while i < 32 {
+        (*f).seg_en[i] = 0
+        (*f).seg_data[i] = 0
+        i = i + 1
+    }
+    (*f).seg_abs = false
+    vp9mem.zero((*f).seg_last, (*f).seg_bytes)
+    (*f).ref_delta[0] = 1
+    (*f).ref_delta[1] = 0
+    (*f).ref_delta[2] = 0 - 1
+    (*f).ref_delta[3] = 0 - 1
+    (*f).mode_delta[0] = 0
+    (*f).mode_delta[1] = 0
+    reset_probs(f)
+    if (*f).key || (*f).error_res || (*f).reset_ctx == 3 {
+        i = 0
+        while i < 4 {
+            vp9mem.copy((*f).saved + (i * vp9state.PROB_LEN) as u64, (*f).fc, vp9state.PROB_LEN)
+            i = i + 1
+        }
+    } else if (*f).reset_ctx == 2 {
+        vp9mem.copy((*f).saved + ((*f).ctx_idx as usize * vp9state.PROB_LEN) as u64, (*f).fc, vp9state.PROB_LEN)
+    }
+    vp9mem.zero((*f).prev_mi, (*f).mi_bytes)
+    (*f).ctx_idx = 0
+}
+
+fn read_frame_size(f: *mut vp9state.Vp9, r: *mut BR) -> bool {
+    let w: i64 = br_lit(r, 16) + 1
+    let h: i64 = br_lit(r, 16) + 1
+    return size_change(f, w, h)
+}
+
+fn size_change(f: *mut vp9state.Vp9, w: i64, h: i64) -> bool {
+    if w != (*f).w || h != (*f).h || !(*f).ready {
+        if !vp9state.vp9_setup(f, w, h) {
+            return false
+        }
+    }
+    return true
+}
+
+fn read_render_size(r: *mut BR) {
+    if br_bit(r) == 1 {
+        br_lit(r, 32)
+    }
+}
+
+fn color_config(f: *mut vp9state.Vp9, r: *mut BR, prof: i64) -> bool {
+    if prof >= 2 {
+        br_bit(r)
+        return false
+    }
+    let cs: i64 = br_lit(r, 3)
+    if cs != 7 {
+        br_bit(r)
+        if prof == 1 || prof == 3 {
+            let sx: i64 = br_bit(r)
+            let sy: i64 = br_bit(r)
+            br_bit(r)
+            return sx == 1 && sy == 1
+        }
+        return true
+    }
+    return false
+}
+
+fn hdr_parse(f: *mut vp9state.Vp9, data: u64, size: usize, hdr_end: *mut i64) -> i64 {
+    var r: BR = BR { p: data, bit: 0, nbits: (size as i64) * 8 }
+    if br_lit(&r, 2) != 2 {
+        return HDR_ERR
+    }
+    let pl: i64 = br_bit(&r)
+    let ph: i64 = br_bit(&r)
+    let prof: i64 = ph * 2 + pl
+    if prof == 3 {
+        br_bit(&r)
+    }
+    if prof != 0 {
+        return HDR_UNSUPPORTED
+    }
+    if br_bit(&r) == 1 {
+        (*f).show_existing = br_lit(&r, 3)
+        return HDR_SHOW_EXISTING
+    }
+    (*f).show_existing = 0 - 1
+    (*f).last_show = (*f).show
+    (*f).last_intra_only = (*f).intra_only
+    let key: bool = br_bit(&r) == 0
+    (*f).key = key
+    (*f).show = br_bit(&r) == 1
+    (*f).error_res = br_bit(&r) == 1
+    (*f).intra_only = false
+    (*f).reset_ctx = 0
+    (*f).last_w = (*f).w
+    (*f).last_h = (*f).h
+    if key {
+        if br_lit(&r, 24) != 4817730 {
+            return HDR_ERR
+        }
+        if !color_config(f, &r, prof) {
+            return HDR_UNSUPPORTED
+        }
+        if !read_frame_size(f, &r) {
+            return HDR_ERR
+        }
+        read_render_size(&r)
+        (*f).refresh_flags = 255
+    } else {
+        if !(*f).show {
+            (*f).intra_only = br_bit(&r) == 1
+        }
+        if !(*f).error_res {
+            (*f).reset_ctx = br_lit(&r, 2)
+        }
+        if (*f).intra_only {
+            if br_lit(&r, 24) != 4817730 {
+                return HDR_ERR
+            }
+            (*f).refresh_flags = br_lit(&r, 8)
+            if !read_frame_size(f, &r) {
+                return HDR_ERR
+            }
+            read_render_size(&r)
+        } else {
+            (*f).refresh_flags = br_lit(&r, 8)
+            var i: usize = 0
+            while i < 3 {
+                (*f).ref_idx[i] = br_lit(&r, 3)
+                (*f).sign_bias[i + 1] = br_bit(&r)
+                i = i + 1
+            }
+            var found: bool = false
+            i = 0
+            while i < 3 && !found {
+                if br_bit(&r) == 1 {
+                    let slot: i64 = (*f).slot[(*f).ref_idx[i] as usize]
+                    if slot < 0 {
+                        return HDR_ERR
+                    }
+                    let rb: *mut vp9state.Buf9 = &(*f).pool[slot as usize]
+                    if !size_change(f, (*rb).w, (*rb).h) {
+                        return HDR_ERR
+                    }
+                    found = true
+                }
+                i = i + 1
+            }
+            if !found {
+                if !read_frame_size(f, &r) {
+                    return HDR_ERR
+                }
+            }
+            read_render_size(&r)
+            (*f).allow_hp = br_bit(&r) == 1
+            if br_bit(&r) == 1 {
+                (*f).interp = 4
+            } else {
+                let lit: i64 = br_lit(&r, 2)
+                if lit == 0 {
+                    (*f).interp = 1
+                } else if lit == 1 {
+                    (*f).interp = 0
+                } else if lit == 2 {
+                    (*f).interp = 2
+                } else {
+                    (*f).interp = 3
+                }
+            }
+        }
+    }
+    if !(*f).error_res {
+        (*f).refresh_ctx = br_bit(&r) == 1
+        (*f).parallel = br_bit(&r) == 1
+    } else {
+        (*f).refresh_ctx = false
+        (*f).parallel = true
+    }
+    (*f).ctx_idx = br_lit(&r, 2)
+    if key || (*f).intra_only || (*f).error_res {
+        past_independence(f)
+    }
+    vp9mem.copy((*f).fc, (*f).saved + ((*f).ctx_idx as usize * vp9state.PROB_LEN) as u64, vp9state.PROB_LEN)
+    (*f).lf_level = br_lit(&r, 6)
+    (*f).lf_sharp = br_lit(&r, 3)
+    (*f).lf_delta_en = br_bit(&r) == 1
+    if (*f).lf_delta_en {
+        if br_bit(&r) == 1 {
+            var i: usize = 0
+            while i < 4 {
+                if br_bit(&r) == 1 {
+                    (*f).ref_delta[i] = br_su(&r, 6)
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < 2 {
+                if br_bit(&r) == 1 {
+                    (*f).mode_delta[i] = br_su(&r, 6)
+                }
+                i = i + 1
+            }
+        }
+    }
+    (*f).base_q = br_lit(&r, 8)
+    (*f).dq_ydc = br_delta_q(&r)
+    (*f).dq_uvdc = br_delta_q(&r)
+    (*f).dq_uvac = br_delta_q(&r)
+    (*f).lossless = (*f).base_q == 0 && (*f).dq_ydc == 0 && (*f).dq_uvdc == 0 && (*f).dq_uvac == 0
+    (*f).seg_map = false
+    (*f).seg_temporal = false
+    (*f).seg_on = br_bit(&r) == 1
+    if (*f).seg_on {
+        (*f).seg_map = br_bit(&r) == 1
+        if (*f).seg_map {
+            var i: usize = 0
+            while i < 7 {
+                if br_bit(&r) == 1 {
+                    (*f).seg_tree[i] = br_lit(&r, 8)
+                } else {
+                    (*f).seg_tree[i] = 255
+                }
+                i = i + 1
+            }
+            (*f).seg_temporal = br_bit(&r) == 1
+            i = 0
+            while i < 3 {
+                (*f).seg_pred[i] = 255
+                if (*f).seg_temporal {
+                    if br_bit(&r) == 1 {
+                        (*f).seg_pred[i] = br_lit(&r, 8)
+                    }
+                }
+                i = i + 1
+            }
+        }
+        if br_bit(&r) == 1 {
+            (*f).seg_abs = br_bit(&r) == 1
+            var i: usize = 0
+            while i < 32 {
+                (*f).seg_en[i] = 0
+                (*f).seg_data[i] = 0
+                i = i + 1
+            }
+            i = 0
+            while i < 8 {
+                var j: usize = 0
+                while j < 4 {
+                    if br_bit(&r) == 1 {
+                        (*f).seg_en[i * 4 + j] = 1
+                        var bits: i64 = 8
+                        var mx: i64 = 255
+                        if j == 1 {
+                            bits = 6
+                            mx = 63
+                        } else if j == 2 {
+                            bits = 2
+                            mx = 3
+                        } else if j == 3 {
+                            bits = 0
+                            mx = 0
+                        }
+                        var v: i64 = br_lit(&r, bits)
+                        if v > mx {
+                            v = mx
+                        }
+                        if (j == 0 || j == 1) && br_bit(&r) == 1 {
+                            v = 0 - v
+                        }
+                        (*f).seg_data[i * 4 + j] = v
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    var min_log2: i64 = 0
+    while ((64 << (min_log2 as u64)) < (*f).sb_cols) && min_log2 < 6 {
+        min_log2 = min_log2 + 1
+    }
+    var max_log2: i64 = 1
+    while (((*f).sb_cols >> (max_log2 as u64)) >= 4) {
+        max_log2 = max_log2 + 1
+    }
+    max_log2 = max_log2 - 1
+    (*f).tile_cols_log2 = min_log2
+    while (*f).tile_cols_log2 < max_log2 {
+        if br_bit(&r) == 1 {
+            (*f).tile_cols_log2 = (*f).tile_cols_log2 + 1
+        } else {
+            break
+        }
+    }
+    (*f).tile_rows_log2 = br_bit(&r)
+    if (*f).tile_rows_log2 == 1 {
+        (*f).tile_rows_log2 = 1 + br_bit(&r)
+    }
+    (*f).hdr_size = br_lit(&r, 16)
+    if r.bit > r.nbits {
+        return HDR_ERR
+    }
+    *hdr_end = (r.bit + 7) >> 3
+    hdr_dequant(f)
+    return HDR_OK
+}
+
+fn qidx(f: *mut vp9state.Vp9, seg: i64) -> i64 {
+    var q: i64 = (*f).base_q
+    if (*f).seg_on && (*f).seg_en[(seg * 4) as usize] == 1 {
+        let d: i64 = (*f).seg_data[(seg * 4) as usize]
+        if (*f).seg_abs {
+            q = d
+        } else {
+            q = q + d
+        }
+        q = vp9mem.imax(0, vp9mem.imin(255, q))
+    }
+    return q
+}
+
+fn qlook(tab: u64, q: i64) -> i64 {
+    return vp9mem.ld16(tab, vp9mem.imax(0, vp9mem.imin(255, q)) as usize)
+}
+
+fn hdr_dequant(f: *mut vp9state.Vp9) {
+    var s: i64 = 0
+    while s < 8 {
+        let q: i64 = qidx(f, s)
+        (*f).dq[(s * 4) as usize] = qlook(vp9qtab.dc_q_addr(), q + (*f).dq_ydc)
+        (*f).dq[(s * 4 + 1) as usize] = qlook(vp9qtab.ac_q_addr(), q)
+        (*f).dq[(s * 4 + 2) as usize] = qlook(vp9qtab.dc_q_addr(), q + (*f).dq_uvdc)
+        (*f).dq[(s * 4 + 3) as usize] = qlook(vp9qtab.ac_q_addr(), q + (*f).dq_uvac)
+        s = s + 1
+    }
+}
+
+fn inv_recenter(v: i64, m: i64) -> i64 {
+    if v > 2 * m {
+        return v
+    }
+    if (v & 1) == 1 {
+        return m - ((v + 1) >> 1)
+    }
+    return m + (v >> 1)
+}
+
+fn inv_remap(v: i64, m0: i64) -> i64 {
+    let vv: i64 = vp9mem.ld8(vp9entp.invmap_addr(), v as usize)
+    let m: i64 = m0 - 1
+    if (m << 1) <= 255 {
+        return 1 + inv_recenter(vv, m)
+    }
+    return 255 - inv_recenter(vv, 254 - m)
+}
+
+fn term_subexp(d: *mut vp8bool.BD) -> i64 {
+    if vp8bool.bd_bit(d) == 0 {
+        return vp8bool.bd_uint(d, 4)
+    }
+    if vp8bool.bd_bit(d) == 0 {
+        return vp8bool.bd_uint(d, 4) + 16
+    }
+    if vp8bool.bd_bit(d) == 0 {
+        return vp8bool.bd_uint(d, 5) + 32
+    }
+    let v: i64 = vp8bool.bd_uint(d, 7)
+    if v < 65 {
+        return v + 64
+    }
+    let b: i64 = vp8bool.bd_bit(d)
+    return (v << 1) - 1 + b
+}
+
+fn diff_update(d: *mut vp8bool.BD, p: u64) {
+    if vp8bool.bd_get(d, 252) == 1 {
+        let delta: i64 = term_subexp(d)
+        vp9mem.st8(p, 0, inv_remap(delta, vp9mem.ld8(p, 0)))
+    }
+}
+
+fn diff_range(d: *mut vp8bool.BD, base: usize, n: usize, fc: u64) {
+    var i: usize = 0
+    while i < n {
+        diff_update(d, fc + (base + i) as u64)
+        i = i + 1
+    }
+}
+
+fn mv_update(d: *mut vp8bool.BD, p: u64) {
+    if vp8bool.bd_get(d, 252) == 1 {
+        vp9mem.st8(p, 0, (vp8bool.bd_uint(d, 7) << 1) | 1)
+    }
+}
+
+fn mv_range(d: *mut vp8bool.BD, base: usize, n: usize, fc: u64) {
+    var i: usize = 0
+    while i < n {
+        mv_update(d, fc + (base + i) as u64)
+        i = i + 1
+    }
+}
+
+fn hdr_compressed(f: *mut vp9state.Vp9, data: u64, size: usize) -> bool {
+    let d: *mut vp8bool.BD = &(*f).d0
+    vp8bool.bd_init(d, data, size)
+    if vp8bool.bd_bit(d) != 0 {
+        return false
+    }
+    let fc: u64 = (*f).fc
+    if (*f).lossless {
+        (*f).tx_mode = 0
+    } else {
+        (*f).tx_mode = vp8bool.bd_uint(d, 2)
+        if (*f).tx_mode == 3 {
+            (*f).tx_mode = (*f).tx_mode + vp8bool.bd_uint(d, 1)
+        }
+    }
+    if (*f).tx_mode == 4 {
+        diff_range(d, vp9defp.P_TX8, 2, fc)
+        diff_range(d, vp9defp.P_TX16, 4, fc)
+        diff_range(d, vp9defp.P_TX32, 6, fc)
+    }
+    var big: i64 = (*f).tx_mode
+    if big > 3 {
+        big = 3
+    }
+    var tx: i64 = 0
+    while tx <= big {
+        if vp8bool.bd_bit(d) == 1 {
+            var i: usize = 0
+            while i < 4 {
+                var k: usize = 0
+                while k < 6 {
+                    let nctx: usize = if_band(k)
+                    var l: usize = 0
+                    while l < nctx {
+                        diff_range(d, vp9defp.P_COEF + ((tx as usize) * 432 + i * 108 + k * 18 + l * 3), 3, fc)
+                        l = l + 1
+                    }
+                    k = k + 1
+                }
+                i = i + 1
+            }
+        }
+        tx = tx + 1
+    }
+    diff_range(d, vp9defp.P_SKIP, 3, fc)
+    if !(*f).key && !(*f).intra_only {
+        diff_range(d, vp9defp.P_INTER_MODE, 21, fc)
+        if (*f).interp == 4 {
+            diff_range(d, vp9defp.P_INTERP, 8, fc)
+        }
+        diff_range(d, vp9defp.P_INTRA_INTER, 4, fc)
+        var comp_allowed: bool = false
+        if (*f).sign_bias[2] != (*f).sign_bias[1] || (*f).sign_bias[3] != (*f).sign_bias[1] {
+            comp_allowed = true
+        }
+        (*f).ref_mode = 0
+        if comp_allowed {
+            if vp8bool.bd_bit(d) == 1 {
+                if vp8bool.bd_bit(d) == 1 {
+                    (*f).ref_mode = 2
+                } else {
+                    (*f).ref_mode = 1
+                }
+            }
+        }
+        setup_comp_refs(f)
+        if (*f).ref_mode == 2 {
+            diff_range(d, vp9defp.P_COMP_INTER, 5, fc)
+        }
+        if (*f).ref_mode != 1 {
+            diff_range(d, vp9defp.P_SINGLE_REF, 10, fc)
+        }
+        if (*f).ref_mode != 0 {
+            diff_range(d, vp9defp.P_COMP_REF, 5, fc)
+        }
+        diff_range(d, vp9defp.P_YMODE, 36, fc)
+        diff_range(d, vp9defp.P_PART, 48, fc)
+        mv_range(d, vp9defp.P_MV_JOINT, 3, fc)
+        var c: usize = 0
+        while c < 2 {
+            let b: usize = if_mvbase(c)
+            mv_range(d, b, 1, fc)
+            mv_range(d, b + 1, 10, fc)
+            mv_range(d, b + 11, 1, fc)
+            mv_range(d, b + 12, 10, fc)
+            c = c + 1
+        }
+        c = 0
+        while c < 2 {
+            let b: usize = if_mvbase(c)
+            mv_range(d, b + 22, 6, fc)
+            mv_range(d, b + 28, 3, fc)
+            c = c + 1
+        }
+        if (*f).allow_hp {
+            c = 0
+            while c < 2 {
+                let b: usize = if_mvbase(c)
+                mv_range(d, b + 31, 1, fc)
+                mv_range(d, b + 32, 1, fc)
+                c = c + 1
+            }
+        }
+    }
+    return true
+}
+
+fn if_band(k: usize) -> usize {
+    if k == 0 {
+        return 3
+    }
+    return 6
+}
+
+fn if_mvbase(c: usize) -> usize {
+    if c == 0 {
+        return vp9defp.P_MV_COMP0
+    }
+    return vp9defp.P_MV_COMP1
+}
+
+fn setup_comp_refs(f: *mut vp9state.Vp9) {
+    if (*f).sign_bias[1] == (*f).sign_bias[2] {
+        (*f).comp_fixed = 3
+        (*f).comp_var0 = 1
+        (*f).comp_var1 = 2
+    } else if (*f).sign_bias[1] == (*f).sign_bias[3] {
+        (*f).comp_fixed = 2
+        (*f).comp_var0 = 1
+        (*f).comp_var1 = 3
+    } else {
+        (*f).comp_fixed = 1
+        (*f).comp_var0 = 2
+        (*f).comp_var1 = 3
+    }
+}

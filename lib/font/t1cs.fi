@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: MPL-2.0
+// Type 1 charstring interpreter: turns a Type 1 glyph into a cubic path.
+import rt.rt
+import font.type1
+import font.gpath
+
+export {
+    t1cs_outline,
+}
+
+const STACK_MAX: usize = 48
+const MAX_DEPTH: usize = 10
+const MAX_STEPS: usize = 200000
+
+struct Cs {
+    f: *mut type1.T1Font,
+    g: *mut gpath.GPath,
+    st: [f64; 48],
+    n: usize,
+    ps: [f64; 48],
+    nps: usize,
+    x: f64,
+    y: f64,
+    sbx: f64,
+    tx: f64,
+    ty: f64,
+    open: bool,
+    flex: bool,
+    fpx: [f64; 8],
+    fpy: [f64; 8],
+    nf: usize,
+    steps: usize,
+    done: bool,
+    fail: bool,
+}
+
+fn push(s: *mut Cs, v: f64) {
+    if (*s).n < STACK_MAX {
+        (*s).st[(*s).n] = v
+        (*s).n = (*s).n + 1
+    } else {
+        (*s).fail = true
+    }
+}
+
+fn pop(s: *mut Cs) -> f64 {
+    if (*s).n == 0 {
+        return 0.0
+    }
+    (*s).n = (*s).n - 1
+    return (*s).st[(*s).n]
+}
+
+fn move_by(s: *mut Cs, dx: f64, dy: f64) {
+    (*s).x = (*s).x + dx
+    (*s).y = (*s).y + dy
+    if (*s).flex {
+        return
+    }
+    if (*s).open {
+        gpath.gp_close((*s).g)
+    }
+    gpath.gp_move((*s).g, (*s).x + (*s).tx, (*s).y + (*s).ty)
+    (*s).open = true
+}
+
+fn ensure_open(s: *mut Cs) {
+    if !(*s).open {
+        gpath.gp_move((*s).g, (*s).x + (*s).tx, (*s).y + (*s).ty)
+        (*s).open = true
+    }
+}
+
+fn line_by(s: *mut Cs, dx: f64, dy: f64) {
+    ensure_open(s)
+    (*s).x = (*s).x + dx
+    (*s).y = (*s).y + dy
+    gpath.gp_line((*s).g, (*s).x + (*s).tx, (*s).y + (*s).ty)
+}
+
+fn curve_by(s: *mut Cs, d1x: f64, d1y: f64, d2x: f64, d2y: f64, d3x: f64,
+    d3y: f64) {
+    ensure_open(s)
+    let x1: f64 = (*s).x + d1x
+    let y1: f64 = (*s).y + d1y
+    let x2: f64 = x1 + d2x
+    let y2: f64 = y1 + d2y
+    let x3: f64 = x2 + d3x
+    let y3: f64 = y2 + d3y
+    gpath.gp_curve((*s).g, x1 + (*s).tx, y1 + (*s).ty, x2 + (*s).tx,
+        y2 + (*s).ty, x3 + (*s).tx, y3 + (*s).ty)
+    (*s).x = x3
+    (*s).y = y3
+}
+
+fn end_flex(s: *mut Cs) {
+    if (*s).nf >= 7 {
+        ensure_open(s)
+        gpath.gp_curve((*s).g, (*s).fpx[1] + (*s).tx, (*s).fpy[1] + (*s).ty,
+            (*s).fpx[2] + (*s).tx, (*s).fpy[2] + (*s).ty,
+            (*s).fpx[3] + (*s).tx, (*s).fpy[3] + (*s).ty)
+        gpath.gp_curve((*s).g, (*s).fpx[4] + (*s).tx, (*s).fpy[4] + (*s).ty,
+            (*s).fpx[5] + (*s).tx, (*s).fpy[5] + (*s).ty,
+            (*s).fpx[6] + (*s).tx, (*s).fpy[6] + (*s).ty)
+    }
+    (*s).flex = false
+    (*s).nf = 0
+}
+
+fn other_subr(s: *mut Cs) {
+    let which: i64 = pop(s) as i64
+    var cnt: i64 = pop(s) as i64
+    if cnt < 0 {
+        cnt = 0
+    }
+    if cnt > 16 {
+        cnt = 16
+    }
+    var args: [f64; 16] = [0.0; 16]
+    var k: i64 = 0
+    while k < cnt {
+        args[k as usize] = pop(s)
+        k = k + 1
+    }
+    if which == 1 {
+        (*s).flex = true
+        (*s).nf = 0
+        return
+    }
+    if which == 2 {
+        if (*s).nf < 8 {
+            (*s).fpx[(*s).nf] = (*s).x
+            (*s).fpy[(*s).nf] = (*s).y
+            (*s).nf = (*s).nf + 1
+        }
+        return
+    }
+    if which == 0 {
+        end_flex(s)
+        (*s).nps = 0
+        (*s).ps[0] = (*s).y
+        (*s).ps[1] = (*s).x
+        (*s).nps = 2
+        return
+    }
+    (*s).nps = 0
+    var j: i64 = cnt
+    while j > 0 {
+        j = j - 1
+        if (*s).nps < 48 {
+            (*s).ps[(*s).nps] = args[j as usize]
+            (*s).nps = (*s).nps + 1
+        }
+    }
+    if which == 3 && cnt == 0 {
+        (*s).ps[0] = 3.0
+        (*s).nps = 1
+    }
+}
+
+fn do_seac(s: *mut Cs, depth: usize) {
+    if depth >= MAX_DEPTH || (*s).n < 5 {
+        return
+    }
+    let asb: f64 = (*s).st[0]
+    let adx: f64 = (*s).st[1]
+    let ady: f64 = (*s).st[2]
+    let bch: u32 = ((*s).st[3] as i64) as u32
+    let ach: u32 = ((*s).st[4] as i64) as u32
+    let bg: u32 = type1.t1_std_code_gid((*s).f, bch)
+    let ag: u32 = type1.t1_std_code_gid((*s).f, ach)
+    if (*s).open {
+        gpath.gp_close((*s).g)
+        (*s).open = false
+    }
+    let comp_sbx: f64 = (*s).sbx
+    let stx: f64 = (*s).tx
+    let sty: f64 = (*s).ty
+    var k: usize = 0
+    while k < 2 {
+        var gid: u32 = bg
+        var ox: f64 = stx
+        var oy: f64 = sty
+        if k == 1 {
+            gid = ag
+            ox = stx + comp_sbx - asb + adx
+            oy = sty + ady
+        }
+        if gid != 0 as u32 {
+            (*s).n = 0
+            (*s).nps = 0
+            (*s).tx = ox
+            (*s).ty = oy
+            (*s).done = false
+            (*s).flex = false
+            run_glyph(s, gid, depth + 1)
+            if (*s).open {
+                gpath.gp_close((*s).g)
+                (*s).open = false
+            }
+        }
+        k = k + 1
+    }
+    (*s).tx = stx
+    (*s).ty = sty
+    (*s).done = true
+}
+
+fn run_glyph(s: *mut Cs, gid: u32, depth: usize) {
+    var off: usize = 0
+    var len: usize = 0
+    if !type1.t1_charstring((*s).f, gid, &off, &len) {
+        (*s).fail = true
+        return
+    }
+    run(s, off, len, depth)
+}
+
+fn call_subr(s: *mut Cs, depth: usize) {
+    let idx: f64 = pop(s)
+    if idx < 0.0 {
+        (*s).fail = true
+        return
+    }
+    var off: usize = 0
+    var len: usize = 0
+    if !type1.t1_subr((*s).f, idx as usize, &off, &len) {
+        (*s).fail = true
+        return
+    }
+    run(s, off, len, depth + 1)
+}
+
+fn run(s: *mut Cs, start: usize, len: usize, depth: usize) {
+    if depth > MAX_DEPTH {
+        (*s).fail = true
+        return
+    }
+    let dp: u64 = type1.t1_data((*s).f)
+    var i: usize = start
+    let end: usize = start + len
+    while i < end && !(*s).done && !(*s).fail {
+        (*s).steps = (*s).steps + 1
+        if (*s).steps > MAX_STEPS {
+            (*s).fail = true
+            return
+        }
+        let b0: u32 = rt.ld8(dp, i) as u32
+        i = i + 1
+        if b0 >= 32 && b0 <= 246 {
+            push(s, (b0 as f64) - 139.0)
+            continue
+        }
+        if b0 >= 247 && b0 <= 250 {
+            push(s, ((b0 as f64) - 247.0) * 256.0 + (rt.ld8(dp, i) as f64) + 108.0)
+            i = i + 1
+            continue
+        }
+        if b0 >= 251 && b0 <= 254 {
+            push(s, 0.0 - ((b0 as f64) - 251.0) * 256.0 - (rt.ld8(dp, i) as f64) - 108.0)
+            i = i + 1
+            continue
+        }
+        if b0 == 255 {
+            var w: i64 = (((rt.ld8(dp, i) as u32) << 24) | ((rt.ld8(dp, i + 1) as u32) << 16) |
+                ((rt.ld8(dp, i + 2) as u32) << 8) | (rt.ld8(dp, i + 3) as u32)) as i64
+            if w >= 2147483648 {
+                w = w - 4294967296
+            }
+            push(s, w as f64)
+            i = i + 4
+            continue
+        }
+        if b0 == 13 {
+            if (*s).n >= 1 {
+                (*s).sbx = (*s).st[0]
+                (*s).x = (*s).st[0]
+                (*s).y = 0.0
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 1 || b0 == 3 {
+            (*s).n = 0
+            continue
+        }
+        if b0 == 21 {
+            if (*s).n >= 2 {
+                move_by(s, (*s).st[(*s).n - 2], (*s).st[(*s).n - 1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 22 {
+            if (*s).n >= 1 {
+                move_by(s, (*s).st[(*s).n - 1], 0.0)
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 4 {
+            if (*s).n >= 1 {
+                move_by(s, 0.0, (*s).st[(*s).n - 1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 5 {
+            if (*s).n >= 2 {
+                line_by(s, (*s).st[0], (*s).st[1])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 6 {
+            if (*s).n >= 1 {
+                line_by(s, (*s).st[0], 0.0)
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 7 {
+            if (*s).n >= 1 {
+                line_by(s, 0.0, (*s).st[0])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 8 {
+            if (*s).n >= 6 {
+                curve_by(s, (*s).st[0], (*s).st[1], (*s).st[2], (*s).st[3],
+                    (*s).st[4], (*s).st[5])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 30 {
+            if (*s).n >= 4 {
+                curve_by(s, 0.0, (*s).st[0], (*s).st[1], (*s).st[2],
+                    (*s).st[3], 0.0)
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 31 {
+            if (*s).n >= 4 {
+                curve_by(s, (*s).st[0], 0.0, (*s).st[1], (*s).st[2], 0.0,
+                    (*s).st[3])
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 9 {
+            if (*s).open {
+                gpath.gp_close((*s).g)
+                (*s).open = false
+            }
+            (*s).n = 0
+            continue
+        }
+        if b0 == 10 {
+            call_subr(s, depth)
+            continue
+        }
+        if b0 == 11 {
+            return
+        }
+        if b0 == 14 {
+            (*s).done = true
+            continue
+        }
+        if b0 == 12 {
+            let sub: u32 = rt.ld8(dp, i) as u32
+            i = i + 1
+            if sub == 6 {
+                do_seac(s, depth)
+                continue
+            }
+            if sub == 7 {
+                if (*s).n >= 2 {
+                    (*s).sbx = (*s).st[0]
+                    (*s).x = (*s).st[0]
+                    (*s).y = (*s).st[1]
+                }
+                (*s).n = 0
+                continue
+            }
+            if sub == 12 {
+                let b: f64 = pop(s)
+                let a: f64 = pop(s)
+                if b == 0.0 {
+                    push(s, 0.0)
+                } else {
+                    push(s, a / b)
+                }
+                continue
+            }
+            if sub == 16 {
+                other_subr(s)
+                continue
+            }
+            if sub == 17 {
+                if (*s).nps > 0 {
+                    (*s).nps = (*s).nps - 1
+                    push(s, (*s).ps[(*s).nps])
+                } else {
+                    push(s, 0.0)
+                }
+                continue
+            }
+            (*s).n = 0
+            continue
+        }
+        (*s).n = 0
+    }
+}
+
+fn t1cs_outline(f: *mut type1.T1Font, gid: u32, g: *mut gpath.GPath) -> bool {
+    if !type1.t1_ok(f) {
+        return false
+    }
+    var s: Cs = Cs { f: f, g: g, st: [0.0; 48], n: 0, ps: [0.0; 48], nps: 0,
+        x: 0.0, y: 0.0, sbx: 0.0, tx: 0.0, ty: 0.0, open: false, flex: false,
+        fpx: [0.0; 8], fpy: [0.0; 8], nf: 0, steps: 0, done: false, fail: false }
+    run_glyph(&s, gid, 0)
+    if s.open {
+        gpath.gp_close(g)
+    }
+    return !s.fail && gpath.gp_ok(g)
+}

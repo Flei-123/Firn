@@ -116,9 +116,9 @@ Note: llvmpipe = software GL, NOT a real GPU. Vanilla NOT measured.
 Mesher (915 sections, p50): naive+AO 823 us, naive without AO 780 us, greedy+AO 807 us (CPU run). Upload/Free p50 130 us/section.
 Radius 32 (v1, PERF_FRAMES=30, 3 Laeufe, reports/perf_20261014-085359_cpu_r32.tsv + perf_20261014-085901_gl_r32.tsv):
 * Scaling CPU p50: r8 336 -> r16 1040 (3.1x) -> r32 3453 ms (3.3x); GL p50: 86 -> 347 (4.0x) -> 1235 ms (3.6x). Tris/frame 0.46M -> 2.0M -> 7.4M, sections 485 -> 2185 -> 8088: time ~ linear in tris, no culling/LOD gain visible.
-* GL r32 Streuung gross (p50 max 1552, p99 max 2695): Server-Load lief 16-24 (r8/r16: 13-17) -> r32 GL-Zahl pessimistisch/verrauscht. CPU r32 stabiler (+-3%).
-* Weltaufbau r32: load_e2e CPU 144 s, GL 118 s (5329 Chunks, 76670 Sektionen), RSS-Peak 1.6-1.7 GB (r16: 0.46-0.63 GB, r8: 0.15-0.3 GB).
-* Wiederholung 26.10. (r148, GL llvmpipe r32, 3 Laeufe, reports/perf_20261026-035402_gl_r32.tsv): p50 1167 ms (1081-1239), p95 1445, p99 1542 (vorher 1235/p99 bis 2695). Load 11 vor, 27 waehrend/nach dem Lauf (andere Worker) -> NICHT <15, als verrauscht gekennzeichnet; Streuung der 3 Laeufe aber klein (+-7%). Weiter ~linear in Tris (7.43M), keine GPU.
+* GL r32 spread large (p50 max 1552, p99 max 2695): server load was 16-24 (r8/r16: 13-17) -> r32 GL number pessimistic/noisy. CPU r32 more stable (+-3%).
+* World build r32: load_e2e CPU 144 s, GL 118 s (5329 chunks, 76670 sections), RSS peak 1.6-1.7 GB (r16: 0.46-0.63 GB, r8: 0.15-0.3 GB).
+* Repeat 26.10. (r148, GL llvmpipe r32, 3 runs, reports/perf_20261026-035402_gl_r32.tsv): p50 1167 ms (1081-1239), p95 1445, p99 1542 (before: 1235/p99 up to 2695). Load 11 before, 27 during/after the run (other workers) -> NOT <15, marked as noisy; spread of the 3 runs is small though (+-7%). Still ~linear in tris (7.43M), no GPU.
 * Classification: llvmpipe/CPU, NOT a real GPU, vanilla NOT measured. No statement about vanilla/a real GPU is possible.
 
 ## g1 (14.10.): CPU path -- mesher, snapshot + submit, worker scaling

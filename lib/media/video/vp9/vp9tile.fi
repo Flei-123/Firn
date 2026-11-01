@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8bool
+import media.video.vp9.vp9mem
+import media.video.vp9.vp9state
+import media.video.vp9.vp9blk
+import media.video.vp9.vp9mode
+import media.video.vp9.vp9tok
+import media.video.vp9.vp9edge
+import media.video.vp9.vp9itx
+import media.video.vp9.vp9inter
+import media.video.vp9.vp9mcblk
+
+export { decode_tiles }
+
+static PART_ABOVE: [u8; 13] = [15, 15, 14, 14, 14, 12, 12, 12, 8, 8, 8, 0, 0]
+static PART_LEFT: [u8; 13] = [15, 14, 15, 14, 12, 14, 12, 8, 12, 8, 0, 8, 0]
+
+fn ctx_flag(p: u64, n: i64) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        if vp9mem.ld8(p, i as usize) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ctx_set(p: u64, n: i64, valid: i64, v: i64) {
+    var i: i64 = 0
+    while i < n {
+        if i < valid {
+            vp9mem.st8(p, i as usize, v)
+        } else {
+            vp9mem.st8(p, i as usize, 0)
+        }
+        i = i + 1
+    }
+}
+
+fn plane_ss(plane: usize) -> i64 {
+    if plane > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn above_ptr(f: *mut vp9state.Vp9, plane: usize, x4: i64) -> u64 {
+    return (*f).above_nz + (plane * (*f).above_bytes) as u64 + x4 as u64
+}
+
+fn left_ptr(f: *mut vp9state.Vp9, plane: usize, y4: i64) -> u64 {
+    let mask: i64 = if plane > 0 { 7 } else { 15 }
+    return (*f).left_nz + (plane * 16) as u64 + (y4 & mask) as u64
+}
+
+fn reset_skip_ctx(f: *mut vp9state.Vp9, row: i64, col: i64, bw: i64, bh: i64) {
+    var plane: usize = 0
+    while plane < 3 {
+        let ss: i64 = plane_ss(plane)
+        let x4: i64 = (col * 2) / (1 << (ss as u64))
+        let y4: i64 = (row * 2) / (1 << (ss as u64))
+        let nw: i64 = (bw * 2) / (1 << (ss as u64))
+        let nh: i64 = (bh * 2) / (1 << (ss as u64))
+        ctx_set(above_ptr(f, plane, x4), nw, 0, 0)
+        ctx_set(left_ptr(f, plane, y4), nh, 0, 0)
+        plane = plane + 1
+    }
+}
+
+fn plane_base(f: *mut vp9state.Vp9, plane: usize) -> u64 {
+    let b: *mut vp9state.Buf9 = &(*f).pool[(*f).cur as usize]
+    if plane == 0 {
+        return (*b).y
+    }
+    if plane == 1 {
+        return (*b).u
+    }
+    return (*b).v
+}
+
+fn plane_stride(f: *mut vp9state.Vp9, plane: usize) -> i64 {
+    let b: *mut vp9state.Buf9 = &(*f).pool[(*f).cur as usize]
+    if plane == 0 {
+        return (*b).ys
+    }
+    return (*b).uvs
+}
+
+fn residual_block(f: *mut vp9state.Vp9, plane: usize, is_inter: usize, tx: i64, tt: i64, col: i64, row: i64, c: i64, r: i64, mbw: i64, mbh: i64, dq0: i64, dq1: i64, base: u64, stride: i64) -> i64 {
+    let sh: u64 = plane_ss(plane) as u64
+    let step: i64 = 1 << (tx as u64)
+    let x0: i64 = (col * 8) / (1 << sh) + c * 4
+    let y0: i64 = (row * 8) / (1 << sh) + r * 4
+    let ap: u64 = above_ptr(f, plane, (col * 2) / (1 << sh) + c)
+    let lp: u64 = left_ptr(f, plane, (row * 2) / (1 << sh) + r)
+    let ctx: i64 = ctx_flag(ap, step) + ctx_flag(lp, step)
+    let eob: i64 = vp9tok.tok_block(f, plane, is_inter, tx, tt, ctx, dq0, dq1, !(*f).parallel)
+    var nz: i64 = 0
+    if eob > 0 {
+        nz = 1
+    }
+    ctx_set(ap, step, vp9mem.imin(step, mbw - c), nz)
+    ctx_set(lp, step, vp9mem.imin(step, mbh - r), nz)
+    if eob > 0 {
+        let dst: u64 = ((base as i64) + y0 * stride + x0) as u64
+        if (*f).lossless {
+            vp9itx.iwht_add((*f).coefs, dst, stride, (*f).scratch)
+        } else {
+            vp9itx.itx_add((*f).coefs, dst, stride, tx, tt, (*f).scratch)
+        }
+        vp9mem.zero((*f).coefs, ((16 << ((tx * 2) as u64)) * 4) as usize)
+    }
+    return eob
+}
+
+fn recon_inter(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, bw: i64, bh: i64) -> i64 {
+    let seg: i64 = vp9mem.ld8(mi, vp9state.MI_SEG)
+    var total: i64 = 0
+    var plane: usize = 0
+    while plane < 3 {
+        let sh: u64 = plane_ss(plane) as u64
+        let tx: i64 = vp9blk.plane_tx(mi, plane)
+        let step: i64 = 1 << (tx as u64)
+        let n4w: i64 = (bw * 2) / (1 << sh)
+        let n4h: i64 = (bh * 2) / (1 << sh)
+        var mbw: i64 = n4w
+        var mbh: i64 = n4h
+        let edge_w: i64 = (*f).mi_cols - col - bw
+        let edge_h: i64 = (*f).mi_rows - row - bh
+        if edge_w < 0 {
+            mbw = n4w + (edge_w * 2) / (1 << sh)
+        }
+        if edge_h < 0 {
+            mbh = n4h + (edge_h * 2) / (1 << sh)
+        }
+        let base: u64 = plane_base(f, plane)
+        let stride: i64 = plane_stride(f, plane)
+        let dq0: i64 = (*f).dq[(seg * 4) as usize + (if plane > 0 { 2 } else { 0 })]
+        let dq1: i64 = (*f).dq[(seg * 4) as usize + (if plane > 0 { 3 } else { 1 })]
+        var r: i64 = 0
+        while r < mbh {
+            var c: i64 = 0
+            while c < mbw {
+                total = total + residual_block(f, plane, 1, tx, 0, col, row, c, r, mbw, mbh, dq0, dq1, base, stride)
+                c = c + step
+            }
+            r = r + step
+        }
+        plane = plane + 1
+    }
+    return total
+}
+
+fn recon_intra(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, bsize: i64, bw: i64, bh: i64) {
+    let skip: bool = vp9mem.ld8(mi, vp9state.MI_SKIP) != 0
+    let seg: i64 = vp9mem.ld8(mi, vp9state.MI_SEG)
+    let bwl: i64 = vp9blk.ilog2(vp9mem.imax(vp9blk.bw4(bsize), 2))
+    var plane: usize = 0
+    while plane < 3 {
+        let ss: i64 = plane_ss(plane)
+        let sh: u64 = ss as u64
+        let tx: i64 = vp9blk.plane_tx(mi, plane)
+        let step: i64 = 1 << (tx as u64)
+        let n4w: i64 = (bw * 2) / (1 << sh)
+        let n4h: i64 = (bh * 2) / (1 << sh)
+        var mbw: i64 = n4w
+        var mbh: i64 = n4h
+        let edge_w: i64 = (*f).mi_cols - col - bw
+        let edge_h: i64 = (*f).mi_rows - row - bh
+        if edge_w < 0 {
+            mbw = n4w + (edge_w * 2) / (1 << sh)
+        }
+        if edge_h < 0 {
+            mbh = n4h + (edge_h * 2) / (1 << sh)
+        }
+        let base: u64 = plane_base(f, plane)
+        let stride: i64 = plane_stride(f, plane)
+        let fw: i64 = ((*f).mi_cols * 8) / (1 << sh)
+        let fh: i64 = ((*f).mi_rows * 8) / (1 << sh)
+        let dq0: i64 = (*f).dq[(seg * 4) as usize + (if plane > 0 { 2 } else { 0 })]
+        let dq1: i64 = (*f).dq[(seg * 4) as usize + (if plane > 0 { 3 } else { 1 })]
+        let pbwl: i64 = bwl - ss
+        var r: i64 = 0
+        while r < mbh {
+            var c: i64 = 0
+            while c < mbw {
+                var mode: i64 = vp9mem.ld8(mi, vp9state.MI_UV)
+                if plane == 0 {
+                    if bsize < 3 {
+                        mode = vp9mem.ld8(mi, vp9state.MI_YMODE + (r * 2 + c) as usize)
+                    } else {
+                        mode = vp9mem.ld8(mi, vp9state.MI_MODE)
+                    }
+                }
+                let x0: i64 = (col * 8) / (1 << sh) + c * 4
+                let y0: i64 = (row * 8) / (1 << sh) + r * 4
+                let have_top: bool = r > 0 || row > 0
+                let have_left: bool = c > 0 || col > (*f).tile_c0
+                let have_right: bool = (c + step) < (1 << (pbwl as u64))
+                vp9edge.predict_intra(f, base, stride, mode, tx, x0, y0, have_left, have_top, have_right, fw, fh)
+                if !skip {
+                    var tt: i64 = 0
+                    if plane == 0 && !(*f).lossless && tx < 3 {
+                        tt = vp9blk.tx_for_mode(mode)
+                    }
+                    residual_block(f, plane, 0, tx, tt, col, row, c, r, mbw, mbh, dq0, dq1, base, stride)
+                }
+                c = c + step
+            }
+            r = r + step
+        }
+        plane = plane + 1
+    }
+}
+
+fn fill_mi(f: *mut vp9state.Vp9, mi: u64, row: i64, col: i64, x_mis: i64, y_mis: i64) {
+    var y: i64 = 0
+    while y < y_mis {
+        var x: i64 = 0
+        while x < x_mis {
+            if x != 0 || y != 0 {
+                vp9mem.copy(vp9state.mi_ptr(f, row + y, col + x), mi, vp9state.MI_SIZE)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn set_skip_all(f: *mut vp9state.Vp9, row: i64, col: i64, x_mis: i64, y_mis: i64) {
+    var y: i64 = 0
+    while y < y_mis {
+        var x: i64 = 0
+        while x < x_mis {
+            vp9mem.st8(vp9state.mi_ptr(f, row + y, col + x), vp9state.MI_SKIP, 1)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn decode_block(f: *mut vp9state.Vp9, row: i64, col: i64, bsize: i64) {
+    if (*f).err != 0 {
+        return
+    }
+    let bw: i64 = vp9blk.bw8(bsize)
+    let bh: i64 = vp9blk.bh8(bsize)
+    let x_mis: i64 = vp9mem.imin(bw, (*f).mi_cols - col)
+    let y_mis: i64 = vp9mem.imin(bh, (*f).mi_rows - row)
+    let mi: u64 = vp9state.mi_ptr(f, row, col)
+    vp9mem.zero(mi, vp9state.MI_SIZE)
+    var inter_frame: bool = false
+    if !(*f).key && !(*f).intra_only {
+        inter_frame = true
+        let e: i64 = vp9inter.read_inter_frame_info(f, mi, row, col, bsize, x_mis, y_mis)
+        if e != 0 {
+            (*f).err = 20 + e
+            return
+        }
+    } else {
+        vp9mode.read_intra_frame_info(f, mi, row, col, bsize, x_mis, y_mis)
+    }
+    fill_mi(f, mi, row, col, x_mis, y_mis)
+    let skip: bool = vp9mem.ld8(mi, vp9state.MI_SKIP) != 0
+    if skip {
+        reset_skip_ctx(f, row, col, bw, bh)
+    }
+    if inter_frame && vp9mem.ld8(mi, vp9state.MI_REF0) > 0 {
+        if !vp9mcblk.mc_inter_block(&(*f).mc, f, row, col) {
+            (*f).err = 23
+            return
+        }
+        if !skip {
+            let total: i64 = recon_inter(f, mi, row, col, bw, bh)
+            if bsize >= 3 && total == 0 {
+                set_skip_all(f, row, col, x_mis, y_mis)
+            }
+        }
+        return
+    }
+    recon_intra(f, mi, row, col, bsize, bw, bh)
+}
+
+fn update_part_ctx(f: *mut vp9state.Vp9, row: i64, col: i64, sub: i64, n8: i64) {
+    let a: i64 = PART_ABOVE[sub as usize] as i64
+    let l: i64 = PART_LEFT[sub as usize] as i64
+    var i: i64 = 0
+    while i < n8 {
+        vp9mem.st8((*f).above_part, (col + i) as usize, a)
+        vp9mem.st8((*f).left_part, ((row & 7) + i) as usize, l)
+        i = i + 1
+    }
+}
+
+fn decode_partition(f: *mut vp9state.Vp9, row: i64, col: i64, bsize: i64, n4l2: i64) {
+    if (*f).err != 0 {
+        return
+    }
+    if row >= (*f).mi_rows || col >= (*f).mi_cols {
+        return
+    }
+    let n8l2: i64 = n4l2 - 1
+    let n8: i64 = 1 << (n8l2 as u64)
+    let hbs: i64 = n8 / 2
+    let has_rows: bool = row + hbs < (*f).mi_rows
+    let has_cols: bool = col + hbs < (*f).mi_cols
+    let part: i64 = vp9mode.read_partition(f, row, col, has_rows, has_cols, n8l2)
+    let sub: i64 = vp9blk.sub_size(bsize, part)
+    if hbs == 0 || part == 0 {
+        decode_block(f, row, col, sub)
+    } else if part == 1 {
+        decode_block(f, row, col, sub)
+        if has_rows {
+            decode_block(f, row + hbs, col, sub)
+        }
+    } else if part == 2 {
+        decode_block(f, row, col, sub)
+        if has_cols {
+            decode_block(f, row, col + hbs, sub)
+        }
+    } else {
+        decode_partition(f, row, col, sub, n8l2)
+        decode_partition(f, row, col + hbs, sub, n8l2)
+        decode_partition(f, row + hbs, col, sub, n8l2)
+        decode_partition(f, row + hbs, col + hbs, sub, n8l2)
+    }
+    if bsize >= 3 && (bsize == 3 || part != 3) {
+        update_part_ctx(f, row, col, sub, n8)
+    }
+}
+
+fn tile_offset(idx: i64, mis: i64, log2: i64) -> i64 {
+    let sbs: i64 = (mis + 7) / 8
+    let off: i64 = ((idx * sbs) / (1 << (log2 as u64))) * 8
+    return vp9mem.imin(off, mis)
+}
+
+fn decode_tile(f: *mut vp9state.Vp9, tile_row: i64, tile_col: i64, data: u64, size: usize) -> bool {
+    let d: *mut vp8bool.BD = &(*f).td
+    vp8bool.bd_init(d, data, size)
+    if vp8bool.bd_bit(d) != 0 {
+        return false
+    }
+    let r0: i64 = tile_offset(tile_row, (*f).mi_rows, (*f).tile_rows_log2)
+    let r1: i64 = tile_offset(tile_row + 1, (*f).mi_rows, (*f).tile_rows_log2)
+    (*f).tile_c0 = tile_offset(tile_col, (*f).mi_cols, (*f).tile_cols_log2)
+    (*f).tile_c1 = tile_offset(tile_col + 1, (*f).mi_cols, (*f).tile_cols_log2)
+    var mi_row: i64 = r0
+    while mi_row < r1 {
+        vp9mem.zero((*f).left_part, 16)
+        vp9mem.zero((*f).left_nz, 48)
+        var mi_col: i64 = (*f).tile_c0
+        while mi_col < (*f).tile_c1 {
+            decode_partition(f, mi_row, mi_col, 12, 4)
+            mi_col = mi_col + 8
+        }
+        mi_row = mi_row + 8
+    }
+    return true
+}
+
+fn decode_tiles(f: *mut vp9state.Vp9, data: u64, size: usize) -> bool {
+    (*f).err = 0
+    vp9mem.zero((*f).above_part, (*f).above_bytes)
+    vp9mem.zero((*f).above_nz, (*f).above_bytes * 3)
+    vp9mem.zero((*f).above_seg, (*f).above_bytes)
+    let cols: i64 = 1 << ((*f).tile_cols_log2 as u64)
+    let rows: i64 = 1 << ((*f).tile_rows_log2 as u64)
+    var pos: usize = 0
+    var tr: i64 = 0
+    while tr < rows {
+        var tc: i64 = 0
+        while tc < cols {
+            var sz: usize = size - pos
+            if !(tr == rows - 1 && tc == cols - 1) {
+                if pos + 4 > size {
+                    return false
+                }
+                sz = (vp9mem.ld8(data, pos) << 24 | vp9mem.ld8(data, pos + 1) << 16 | vp9mem.ld8(data, pos + 2) << 8 | vp9mem.ld8(data, pos + 3)) as usize
+                pos = pos + 4
+                if sz > size - pos {
+                    return false
+                }
+            }
+            if !decode_tile(f, tr, tc, data + pos as u64, sz) || (*f).err != 0 {
+                return false
+            }
+            pos = pos + sz
+            tc = tc + 1
+        }
+        tr = tr + 1
+    }
+    return true
+}

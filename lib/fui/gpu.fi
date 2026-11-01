@@ -74,7 +74,7 @@ export {
     gpu_frame_begin, gpu_present, gpu_present_at, gpu_flush, gpu_read, gpu_finish, gpu_target_bind,
     gpu_clear, gpu_fill_raster,
     gpu_rect, gpu_mask_at, gpu_rrect_fast, gpu_rrect_shadow, gpu_ramp,
-    gpu_veil, gpu_glow, gpu_round, gpu_frost, gpu_frost_many,
+    gpu_veil, gpu_glow, gpu_melt, gpu_round, gpu_frost, gpu_frost_many,
     gpu_sw_begin, gpu_sw_end, gpu_upload_band, gpu_stray,
     Target, target_new, gpu_target_make, gpu_target_free, gpu_target_ok, gpu_copy,
     gpu_draw_target, gpu_draw_pixels, gpu_draw_image, gpu_draw_photo, gpu_draw_photo_mode, gpu_draw_photo_straight, gpu_photo_kept, gpu_slot_find, gpu_draw_photo_slot, gpu_main, gpu_clear_rows, gpu_tmp,
@@ -102,6 +102,8 @@ const K_BOX2H: f64 = 13.0
 const K_BOX2V: f64 = 14.0
 const K_TINT: f64 = 15.0
 const K_PHOTO: f64 = 16.0
+const K_MELT: f64 = 17.0
+const MELT_MAX: usize = 16
 
 // One quad: 32 floats (f32), see VS/FS below.
 const INST_F: usize = 32
@@ -229,6 +231,7 @@ struct Gpu {
     u_src: u32,
     u_nspot: u32,
     u_spot: [u32; 8],
+    u_shape: [u32; 32],
     // THE PHOTO'S OWN PROGRAM (gpu_draw_photo): the same vertex shader and a fragment shader
     // of one fetch; 0 when it did not build (kind 16 of the big one draws the photo then)
     pprog: u32,
@@ -306,7 +309,7 @@ fn gpu_new() -> Gpu {
         api: 0 as u64 as *mut gl.GlApi, ok: false, gen: 0 as u32, prog: 0 as u32,
         u_size: 0 as u32, u_srcsize: 0 as u32, u_atlas: 0 as u32,
         u_stream: 0 as u32, u_src: 0 as u32, u_nspot: 0 as u32,
-        u_spot: [0 as u32; 8], pprog: 0 as u32, pu_size: 0 as u32, pu_srcsize: 0 as u32,
+        u_spot: [0 as u32; 8], u_shape: [0 as u32; 32], pprog: 0 as u32, pu_size: 0 as u32, pu_srcsize: 0 as u32,
         pu_src: 0 as u32, vao: 0 as u32, quad: 0 as u32, ibuf: 0 as u32,
         inst: 0, n: 0, tgt: 0 as u64 as *mut Target, blend: true,
         src: 0 as u32, src_w: 0, src_h: 0, spots: false,
@@ -509,6 +512,11 @@ fn gpu_open(g: *mut Gpu, api: *mut gl.GlApi) -> bool {
         (*g).u_spot[i] = uloc(g, names[i])
         i = i + 1
     }
+    i = 0
+    while i < MELT_MAX * 2 {
+        (*g).u_shape[i] = uloc(g, shape_name(i))
+        i = i + 1
+    }
     // the unit quad, and the quads of a batch as instances
     (*g).vao = x_create_vertex_array(api)
     x_bind_vertex_array(api, (*g).vao)
@@ -546,6 +554,10 @@ fn gpu_open(g: *mut Gpu, api: *mut gl.GlApi) -> bool {
     atlas_reset(g)
     (*g).ok = true
     return true
+}
+
+fn shape_name(i: usize) -> str {
+    return "u_shape[" + dec_i(i as i64) + "]"
 }
 
 fn uloc(g: *mut Gpu, s: str) -> u32 {
@@ -1154,6 +1166,50 @@ fn gpu_round(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, r: f64, st: f64,
     if grad {
         stf(p, 29, 1.0)
     }
+}
+
+// merge.fi on the GPU: `data` is n x 8 f64 (cx, cy, hw, hh, radius, 256 r + g, 256 b + a, unused);
+// the box (x0, y0, x1, y1) is where the group may touch; `col` is the one colour unless `multi`
+fn gpu_melt(g: *mut Gpu, x0: f64, y0: f64, x1: f64, y1: f64, n: usize, mode: u32,
+    reach: f64, multi: bool, col: u32, data: u64) {
+    if n == 0 || n > MELT_MAX {
+        return
+    }
+    let cv: *mut canvas.Canvas = cvp(g)
+    var c: [f64; 4] = [0.0; 4]
+    clip4(cv, &c[0])
+    var b: [f64; 4] = [x0, y0, x1, y1]
+    if b[0] < c[0] { b[0] = c[0] }
+    if b[1] < c[1] { b[1] = c[1] }
+    if b[2] > c[2] { b[2] = c[2] }
+    if b[3] > c[3] { b[3] = c[3] }
+    if b[2] <= b[0] || b[3] <= b[1] {
+        return
+    }
+    gpu_flush(g)
+    want(g, &(*g).main, true, 0 as u32, 0, 0)
+    if !cut(&(*g).main, &b[0]) {
+        return
+    }
+    let api: *mut gl.GlApi = a(g)
+    x_use_program(api, (*g).prog)
+    var i: usize = 0
+    while i < n {
+        let q: u64 = data + (i * 64) as u64
+        x_uniform4f(api, (*g).u_shape[i * 2], *(q as *mut f64), *((q + 8) as *mut f64),
+            *((q + 16) as *mut f64), *((q + 24) as *mut f64))
+        x_uniform4f(api, (*g).u_shape[i * 2 + 1], *((q + 32) as *mut f64),
+            *((q + 40) as *mut f64), *((q + 48) as *mut f64), *((q + 56) as *mut f64))
+        i = i + 1
+    }
+    let p: u64 = quad(g, K_MELT, b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3])
+    col4(p, 4, col)
+    var mf: f64 = 0.0
+    if multi {
+        mf = 1.0
+    }
+    v4(p, 16, n as f64, mode as f64, reach, mf)
+    gpu_flush(g)
 }
 
 // ============================================================ THE GLASS

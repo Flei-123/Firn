@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1itxm
+import media.video.av1.av1itxln
+
+export { itx_add, iwht_add, ITX_SCRATCH }
+
+const ITX_SCRATCH: usize = 17408
+
+static W_LOG2: [i64; 19] = [2, 3, 4, 5, 6, 2, 3, 3, 4, 4, 5, 5, 6, 2, 4, 3, 5, 4, 6]
+static H_LOG2: [i64; 19] = [2, 3, 4, 5, 6, 3, 2, 4, 3, 5, 4, 6, 5, 4, 2, 5, 3, 6, 4]
+static ROW_SHIFT: [i64; 19] = [0, 1, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]
+static COL_KIND: [i64; 16] = [0, 1, 0, 1, 2, 0, 2, 1, 2, 3, 0, 3, 1, 3, 2, 3]
+static ROW_KIND: [i64; 16] = [0, 0, 1, 1, 0, 2, 2, 2, 1, 3, 3, 0, 3, 1, 3, 2]
+
+#[no_gc]
+fn clip_pixel(v: i64, bd: i64) -> i64 {
+    let hi: i64 = (1 << (bd as u64)) - 1
+    if v < 0 {
+        return 0
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+#[no_gc]
+fn ld16(p: u64, i: usize) -> i64 {
+    return (*((p + (i * 2) as u64) as *mut u16)) as i64
+}
+
+#[no_gc]
+fn st16(p: u64, i: usize, v: i64) {
+    *((p + (i * 2) as u64) as *mut u16) = v as% u16
+}
+
+fn row_is_zero(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if av1itxm.li(p, i) != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn clamp_line(p: u64, n: usize, bits: i64) {
+    var i: usize = 0
+    while i < n {
+        av1itxm.si(p, i, av1itxm.cl(av1itxm.li(p, i), bits))
+        i = i + 1
+    }
+}
+
+fn plain_kind(k: i64) -> i64 {
+    if k == 2 {
+        return 1
+    }
+    return k
+}
+
+fn itx_add(coefs: u64, dest: u64, stride: i64, tx_size: i64, tx_type: i64, bd: i64, scr: u64) {
+    let wl: i64 = W_LOG2[tx_size as usize]
+    let hl: i64 = H_LOG2[tx_size as usize]
+    let w: usize = (1 << (wl as u64)) as usize
+    let h: usize = (1 << (hl as u64)) as usize
+    let rk: i64 = ROW_KIND[tx_type as usize]
+    let ck: i64 = COL_KIND[tx_type as usize]
+    let row_kind: i64 = plain_kind(rk)
+    let col_kind: i64 = plain_kind(ck)
+    let ud_flip: bool = tx_type == 4 || tx_type == 6 || tx_type == 8 || tx_type == 14
+    let lr_flip: bool = tx_type == 5 || tx_type == 6 || tx_type == 7 || tx_type == 15
+    var row_range: i64 = 16
+    var col_range: i64 = 16
+    if bd == 10 {
+        row_range = 18
+    }
+    if bd == 12 {
+        row_range = 20
+        col_range = 18
+    }
+    let rs0: i64 = ROW_SHIFT[tx_size as usize]
+    let rect: i64 = wl - hl
+    let tin: u64 = scr
+    let tout: u64 = scr + 256
+    let stp: u64 = scr + 512
+    let buf: u64 = scr + 768
+    var r: usize = 0
+    while r < h {
+        let dst: u64 = buf + (r * w * 4) as u64
+        let src: u64 = coefs + (r * w * 4) as u64
+        if row_is_zero(src, w) {
+            var z: usize = 0
+            while z < w {
+                av1itxm.si(dst, z, 0)
+                z = z + 1
+            }
+        } else {
+            var c: usize = 0
+            while c < w {
+                var v: i64 = av1itxm.li(src, c)
+                if rect == 1 || rect == -1 {
+                    v = av1itxm.rsh(v * 2896, 12)
+                }
+                av1itxm.si(tin, c, v)
+                c = c + 1
+            }
+            clamp_line(tin, w, bd + 8)
+            av1itxln.line_1d(row_kind, wl, tin, dst, stp, row_range)
+            c = 0
+            while c < w {
+                av1itxm.si(dst, c, av1itxm.rsh(av1itxm.li(dst, c), rs0))
+                c = c + 1
+            }
+        }
+        r = r + 1
+    }
+    var cc: usize = 0
+    while cc < w {
+        var rr: usize = 0
+        var sc: usize = cc
+        if lr_flip {
+            sc = w - cc - 1
+        }
+        while rr < h {
+            av1itxm.si(tin, rr, av1itxm.li(buf, rr * w + sc))
+            rr = rr + 1
+        }
+        clamp_line(tin, h, col_range)
+        av1itxln.line_1d(col_kind, hl, tin, tout, stp, col_range)
+        rr = 0
+        while rr < h {
+            var sr: usize = rr
+            if ud_flip {
+                sr = h - rr - 1
+            }
+            let a: usize = ((rr as i64) * stride) as usize + cc
+            st16(dest, a, clip_pixel(ld16(dest, a) + av1itxm.rsh(av1itxm.li(tout, sr), 4), bd))
+            rr = rr + 1
+        }
+        cc = cc + 1
+    }
+}
+
+fn wht_pass(a: i64, c: i64, d: i64, b: i64, out: u64, base: usize, step: usize) {
+    var a1: i64 = a + c
+    var d1: i64 = d - b
+    let e1: i64 = (a1 - d1) >> 1
+    var b1: i64 = e1 - b
+    var c1: i64 = e1 - c
+    a1 = a1 - b1
+    d1 = d1 + c1
+    av1itxm.si(out, base, a1)
+    av1itxm.si(out, base + step, b1)
+    av1itxm.si(out, base + step * 2, c1)
+    av1itxm.si(out, base + step * 3, d1)
+}
+
+fn iwht_add(coefs: u64, dest: u64, stride: i64, bd: i64, scr: u64) {
+    var i: usize = 0
+    while i < 4 {
+        wht_pass(
+            av1itxm.li(coefs, i * 4) >> 2,
+            av1itxm.li(coefs, i * 4 + 1) >> 2,
+            av1itxm.li(coefs, i * 4 + 2) >> 2,
+            av1itxm.li(coefs, i * 4 + 3) >> 2,
+            scr, i, 4)
+        i = i + 1
+    }
+    i = 0
+    let tmp: u64 = scr + 128
+    while i < 4 {
+        wht_pass(
+            av1itxm.li(scr, i * 4),
+            av1itxm.li(scr, i * 4 + 1),
+            av1itxm.li(scr, i * 4 + 2),
+            av1itxm.li(scr, i * 4 + 3),
+            tmp, 0, 1)
+        var k: usize = 0
+        while k < 4 {
+            let a: usize = ((k as i64) * stride) as usize + i
+            st16(dest, a, clip_pixel(ld16(dest, a) + av1itxm.li(tmp, k), bd))
+            k = k + 1
+        }
+        i = i + 1
+    }
+}

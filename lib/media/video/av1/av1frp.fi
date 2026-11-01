@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1br
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+
+export { tile_info, quant_params, seg_params, delta_params, lf_params, cdef_params, lr_params, lossless_params, tx_and_ref_mode }
+
+static SEG_BITS: [u8; 8] = [8, 6, 6, 6, 6, 3, 0, 0]
+static SEG_SIGNED: [u8; 8] = [1, 1, 1, 1, 1, 0, 0, 0]
+static SEG_MAX: [u8; 8] = [255, 63, 63, 63, 63, 7, 0, 0]
+static REMAP_LR: [u8; 4] = [0, 3, 1, 2]
+
+fn tile_log2(blk: i64, target: i64) -> i64 {
+    var k: i64 = 0
+    while (blk << (k as u64)) < target {
+        k = k + 1
+    }
+    return k
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn tile_info(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) -> i64 {
+    var sb_cols: i64 = ((*f).mi_cols + 15) >> 4
+    var sb_rows: i64 = ((*f).mi_rows + 15) >> 4
+    var sb_shift: i64 = 4
+    if (*s).use_128x128_superblock == 1 {
+        sb_cols = ((*f).mi_cols + 31) >> 5
+        sb_rows = ((*f).mi_rows + 31) >> 5
+        sb_shift = 5
+    }
+    let sb_size: i64 = sb_shift + 2
+    let max_tile_width_sb: i64 = 4096 >> (sb_size as u64)
+    var max_tile_area_sb: i64 = (4096 * 2304) >> ((2 * sb_size) as u64)
+    let min_log2_tile_cols: i64 = tile_log2(max_tile_width_sb, sb_cols)
+    let max_log2_tile_cols: i64 = tile_log2(1, imin(sb_cols, 64))
+    let max_log2_tile_rows: i64 = tile_log2(1, imin(sb_rows, 64))
+    let min_log2_tiles: i64 = imax(min_log2_tile_cols, tile_log2(max_tile_area_sb, sb_rows * sb_cols))
+    let uniform: i64 = av1br.rd_bit(r, "uniform_tile_spacing_flag")
+    if uniform == 1 {
+        (*f).tile_cols_log2 = min_log2_tile_cols
+        while (*f).tile_cols_log2 < max_log2_tile_cols {
+            if av1br.rd_bit(r, "increment_tile_cols_log2") == 1 {
+                (*f).tile_cols_log2 = (*f).tile_cols_log2 + 1
+            } else {
+                break
+            }
+        }
+        let tw: i64 = (sb_cols + (1 << ((*f).tile_cols_log2 as u64)) - 1) >> ((*f).tile_cols_log2 as u64)
+        var i: i64 = 0
+        var start: i64 = 0
+        while start < sb_cols {
+            (*f).mi_col_starts[i as usize] = start << (sb_shift as u64)
+            i = i + 1
+            start = start + tw
+        }
+        (*f).mi_col_starts[i as usize] = (*f).mi_cols
+        (*f).tile_cols = i
+        let min_log2_tile_rows: i64 = imax(min_log2_tiles - (*f).tile_cols_log2, 0)
+        (*f).tile_rows_log2 = min_log2_tile_rows
+        while (*f).tile_rows_log2 < max_log2_tile_rows {
+            if av1br.rd_bit(r, "increment_tile_rows_log2") == 1 {
+                (*f).tile_rows_log2 = (*f).tile_rows_log2 + 1
+            } else {
+                break
+            }
+        }
+        let th: i64 = (sb_rows + (1 << ((*f).tile_rows_log2 as u64)) - 1) >> ((*f).tile_rows_log2 as u64)
+        i = 0
+        start = 0
+        while start < sb_rows {
+            (*f).mi_row_starts[i as usize] = start << (sb_shift as u64)
+            i = i + 1
+            start = start + th
+        }
+        (*f).mi_row_starts[i as usize] = (*f).mi_rows
+        (*f).tile_rows = i
+    } else {
+        var widest: i64 = 0
+        var start: i64 = 0
+        var i: i64 = 0
+        while start < sb_cols {
+            if i >= 64 {
+                return 0 - 1
+            }
+            (*f).mi_col_starts[i as usize] = start << (sb_shift as u64)
+            let max_width: i64 = imin(sb_cols - start, max_tile_width_sb)
+            let size_sb: i64 = av1br.rd_ns(r, max_width, "width_in_sbs_minus_1") + 1
+            widest = imax(size_sb, widest)
+            start = start + size_sb
+            i = i + 1
+        }
+        (*f).mi_col_starts[i as usize] = (*f).mi_cols
+        (*f).tile_cols = i
+        (*f).tile_cols_log2 = tile_log2(1, i)
+        if min_log2_tiles > 0 {
+            max_tile_area_sb = (sb_rows * sb_cols) >> ((min_log2_tiles + 1) as u64)
+        } else {
+            max_tile_area_sb = sb_rows * sb_cols
+        }
+        let max_tile_height_sb: i64 = imax(max_tile_area_sb / widest, 1)
+        start = 0
+        i = 0
+        while start < sb_rows {
+            if i >= 64 {
+                return 0 - 1
+            }
+            (*f).mi_row_starts[i as usize] = start << (sb_shift as u64)
+            let max_height: i64 = imin(sb_rows - start, max_tile_height_sb)
+            let size_sb: i64 = av1br.rd_ns(r, max_height, "height_in_sbs_minus_1") + 1
+            start = start + size_sb
+            i = i + 1
+        }
+        (*f).mi_row_starts[i as usize] = (*f).mi_rows
+        (*f).tile_rows = i
+        (*f).tile_rows_log2 = tile_log2(1, i)
+    }
+    if (*f).tile_cols_log2 > 0 || (*f).tile_rows_log2 > 0 {
+        (*f).context_update_tile_id = av1br.rd(r, (*f).tile_rows_log2 + (*f).tile_cols_log2, "context_update_tile_id")
+        (*f).tile_size_bytes = av1br.rd(r, 2, "tile_size_bytes_minus_1") + 1
+    } else {
+        (*f).context_update_tile_id = 0
+    }
+    return 0
+}
+
+fn read_delta_q(r: *mut av1br.BR, name: str) -> i64 {
+    if av1br.rd_bit(r, "delta_coded") == 1 {
+        return av1br.rd_su(r, 7, name)
+    }
+    return 0
+}
+
+fn quant_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    (*f).base_q_idx = av1br.rd(r, 8, "base_q_idx")
+    (*f).delta_q_y_dc = read_delta_q(r, "delta_q")
+    var diff_uv_delta: i64 = 0
+    if (*s).num_planes > 1 {
+        if (*s).separate_uv_delta_q == 1 {
+            diff_uv_delta = av1br.rd_bit(r, "diff_uv_delta")
+        }
+        (*f).delta_q_u_dc = read_delta_q(r, "delta_q")
+        (*f).delta_q_u_ac = read_delta_q(r, "delta_q")
+        if diff_uv_delta == 1 {
+            (*f).delta_q_v_dc = read_delta_q(r, "delta_q")
+            (*f).delta_q_v_ac = read_delta_q(r, "delta_q")
+        } else {
+            (*f).delta_q_v_dc = (*f).delta_q_u_dc
+            (*f).delta_q_v_ac = (*f).delta_q_u_ac
+        }
+    }
+    (*f).using_qmatrix = av1br.rd_bit(r, "using_qmatrix")
+    if (*f).using_qmatrix == 1 {
+        (*f).qm_y = av1br.rd(r, 4, "qm_y")
+        (*f).qm_u = av1br.rd(r, 4, "qm_u")
+        if (*s).separate_uv_delta_q == 0 {
+            (*f).qm_v = (*f).qm_u
+        } else {
+            (*f).qm_v = av1br.rd(r, 4, "qm_v")
+        }
+    }
+}
+
+fn seg_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr) {
+    (*f).segmentation_enabled = av1br.rd_bit(r, "segmentation_enabled")
+    if (*f).segmentation_enabled == 1 {
+        if (*f).primary_ref_frame == av1fhdr.PRIMARY_REF_NONE {
+            (*f).segmentation_update_map = 1
+            (*f).segmentation_temporal_update = 0
+            (*f).segmentation_update_data = 1
+        } else {
+            (*f).segmentation_update_map = av1br.rd_bit(r, "segmentation_update_map")
+            if (*f).segmentation_update_map == 1 {
+                (*f).segmentation_temporal_update = av1br.rd_bit(r, "segmentation_temporal_update")
+            } else {
+                (*f).segmentation_temporal_update = 0
+            }
+            (*f).segmentation_update_data = av1br.rd_bit(r, "segmentation_update_data")
+        }
+        if (*f).segmentation_update_data == 1 {
+            var i: usize = 0
+            while i < 8 {
+                var j: usize = 0
+                while j < 8 {
+                    let en: i64 = av1br.rd_bit(r, "feature_enabled")
+                    (*f).feature_enabled[i * 8 + j] = en
+                    var clipped: i64 = 0
+                    if en == 1 {
+                        let bits: i64 = SEG_BITS[j] as i64
+                        let limit: i64 = SEG_MAX[j] as i64
+                        if SEG_SIGNED[j] == 1 {
+                            let v: i64 = av1br.rd_su(r, 1 + bits, "feature_value")
+                            clipped = imax(0 - limit, imin(limit, v))
+                        } else {
+                            let v: i64 = av1br.rd(r, bits, "feature_value")
+                            clipped = imax(0, imin(limit, v))
+                        }
+                    }
+                    (*f).feature_data[i * 8 + j] = clipped
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+    } else {
+        var k: usize = 0
+        while k < 64 {
+            (*f).feature_enabled[k] = 0
+            (*f).feature_data[k] = 0
+            k = k + 1
+        }
+    }
+    (*f).seg_id_pre_skip = 0
+    (*f).last_active_seg_id = 0
+    var i2: usize = 0
+    while i2 < 8 {
+        var j2: usize = 0
+        while j2 < 8 {
+            if (*f).feature_enabled[i2 * 8 + j2] == 1 {
+                (*f).last_active_seg_id = i2 as i64
+                if j2 >= 5 {
+                    (*f).seg_id_pre_skip = 1
+                }
+            }
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+}
+
+fn delta_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr) {
+    (*f).delta_q_res = 0
+    (*f).delta_q_present = 0
+    if (*f).base_q_idx > 0 {
+        (*f).delta_q_present = av1br.rd_bit(r, "delta_q_present")
+    }
+    if (*f).delta_q_present == 1 {
+        (*f).delta_q_res = av1br.rd(r, 2, "delta_q_res")
+    }
+    (*f).delta_lf_present = 0
+    (*f).delta_lf_res = 0
+    (*f).delta_lf_multi = 0
+    if (*f).delta_q_present == 1 {
+        if (*f).allow_intrabc == 0 {
+            (*f).delta_lf_present = av1br.rd_bit(r, "delta_lf_present")
+        }
+        if (*f).delta_lf_present == 1 {
+            (*f).delta_lf_res = av1br.rd(r, 2, "delta_lf_res")
+            (*f).delta_lf_multi = av1br.rd_bit(r, "delta_lf_multi")
+        }
+    }
+}
+
+fn lossless_params(f: *mut av1fhdr.FrameHdr) {
+    (*f).coded_lossless = 1
+    var seg: usize = 0
+    while seg < 8 {
+        var q: i64 = (*f).base_q_idx
+        if (*f).segmentation_enabled == 1 && (*f).feature_enabled[seg * 8] == 1 {
+            q = imax(0, imin(255, (*f).base_q_idx + (*f).feature_data[seg * 8]))
+        }
+        var ll: i64 = 0
+        if q == 0 && (*f).delta_q_y_dc == 0 && (*f).delta_q_u_ac == 0 && (*f).delta_q_u_dc == 0 && (*f).delta_q_v_ac == 0 && (*f).delta_q_v_dc == 0 {
+            ll = 1
+        }
+        (*f).lossless_array[seg] = ll
+        if ll == 0 {
+            (*f).coded_lossless = 0
+        }
+        seg = seg + 1
+    }
+    (*f).all_lossless = 0
+    if (*f).coded_lossless == 1 && (*f).frame_width == (*f).upscaled_width {
+        (*f).all_lossless = 1
+    }
+}
+
+fn lf_defaults(f: *mut av1fhdr.FrameHdr) {
+    (*f).loop_filter_ref_deltas[0] = 1
+    (*f).loop_filter_ref_deltas[1] = 0
+    (*f).loop_filter_ref_deltas[2] = 0
+    (*f).loop_filter_ref_deltas[3] = 0
+    (*f).loop_filter_ref_deltas[4] = 0 - 1
+    (*f).loop_filter_ref_deltas[5] = 0
+    (*f).loop_filter_ref_deltas[6] = 0 - 1
+    (*f).loop_filter_ref_deltas[7] = 0 - 1
+    (*f).loop_filter_mode_deltas[0] = 0
+    (*f).loop_filter_mode_deltas[1] = 0
+}
+
+fn lf_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    if (*f).coded_lossless == 1 || (*f).allow_intrabc == 1 {
+        (*f).loop_filter_level[0] = 0
+        (*f).loop_filter_level[1] = 0
+        lf_defaults(f)
+        return
+    }
+    (*f).loop_filter_level[0] = av1br.rd(r, 6, "loop_filter_level")
+    (*f).loop_filter_level[1] = av1br.rd(r, 6, "loop_filter_level")
+    if (*s).num_planes > 1 {
+        if (*f).loop_filter_level[0] != 0 || (*f).loop_filter_level[1] != 0 {
+            (*f).loop_filter_level[2] = av1br.rd(r, 6, "loop_filter_level")
+            (*f).loop_filter_level[3] = av1br.rd(r, 6, "loop_filter_level")
+        }
+    }
+    (*f).loop_filter_sharpness = av1br.rd(r, 3, "loop_filter_sharpness")
+    (*f).loop_filter_delta_enabled = av1br.rd_bit(r, "loop_filter_delta_enabled")
+    if (*f).loop_filter_delta_enabled == 1 {
+        if av1br.rd_bit(r, "loop_filter_delta_update") == 1 {
+            var i: usize = 0
+            while i < 8 {
+                if av1br.rd_bit(r, "update_ref_delta") == 1 {
+                    (*f).loop_filter_ref_deltas[i] = av1br.rd_su(r, 7, "loop_filter_ref_deltas")
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < 2 {
+                if av1br.rd_bit(r, "update_mode_delta") == 1 {
+                    (*f).loop_filter_mode_deltas[i] = av1br.rd_su(r, 7, "loop_filter_mode_deltas")
+                }
+                i = i + 1
+            }
+        }
+    }
+}
+
+fn cdef_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    if (*f).coded_lossless == 1 || (*f).allow_intrabc == 1 || (*s).enable_cdef == 0 {
+        (*f).cdef_bits = 0
+        (*f).cdef_y_pri_strength[0] = 0
+        (*f).cdef_y_sec_strength[0] = 0
+        (*f).cdef_uv_pri_strength[0] = 0
+        (*f).cdef_uv_sec_strength[0] = 0
+        (*f).cdef_damping = 3
+        return
+    }
+    (*f).cdef_damping = av1br.rd(r, 2, "cdef_damping_minus_3") + 3
+    (*f).cdef_bits = av1br.rd(r, 2, "cdef_bits")
+    var i: usize = 0
+    while (i as i64) < (1 << ((*f).cdef_bits as u64)) {
+        (*f).cdef_y_pri_strength[i] = av1br.rd(r, 4, "cdef_y_pri_strength")
+        var sec: i64 = av1br.rd(r, 2, "cdef_y_sec_strength")
+        if sec == 3 {
+            sec = 4
+        }
+        (*f).cdef_y_sec_strength[i] = sec
+        if (*s).num_planes > 1 {
+            (*f).cdef_uv_pri_strength[i] = av1br.rd(r, 4, "cdef_uv_pri_strength")
+            var usec: i64 = av1br.rd(r, 2, "cdef_uv_sec_strength")
+            if usec == 3 {
+                usec = 4
+            }
+            (*f).cdef_uv_sec_strength[i] = usec
+        }
+        i = i + 1
+    }
+}
+
+fn lr_params(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    (*f).uses_lr = 0
+    (*f).frame_restoration_type[0] = 0
+    (*f).frame_restoration_type[1] = 0
+    (*f).frame_restoration_type[2] = 0
+    if (*f).all_lossless == 1 || (*f).allow_intrabc == 1 || (*s).enable_restoration == 0 {
+        return
+    }
+    var uses_chroma: i64 = 0
+    var i: usize = 0
+    while (i as i64) < (*s).num_planes {
+        let t: i64 = av1br.rd(r, 2, "lr_type")
+        (*f).frame_restoration_type[i] = REMAP_LR[t as usize] as i64
+        if (*f).frame_restoration_type[i] != 0 {
+            (*f).uses_lr = 1
+            if i > 0 {
+                uses_chroma = 1
+            }
+        }
+        i = i + 1
+    }
+    if (*f).uses_lr == 1 {
+        var shift: i64 = 0
+        if (*s).use_128x128_superblock == 1 {
+            shift = av1br.rd_bit(r, "lr_unit_shift") + 1
+        } else {
+            shift = av1br.rd_bit(r, "lr_unit_shift")
+            if shift == 1 {
+                shift = shift + av1br.rd_bit(r, "lr_unit_extra_shift")
+            }
+        }
+        (*f).loop_restoration_size[0] = 256 >> ((2 - shift) as u64)
+        var uv_shift: i64 = 0
+        if (*s).subsampling_x == 1 && (*s).subsampling_y == 1 && uses_chroma == 1 {
+            uv_shift = av1br.rd_bit(r, "lr_uv_shift")
+        }
+        (*f).loop_restoration_size[1] = (*f).loop_restoration_size[0] >> (uv_shift as u64)
+        (*f).loop_restoration_size[2] = (*f).loop_restoration_size[0] >> (uv_shift as u64)
+    }
+}
+
+fn tx_and_ref_mode(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr) {
+    if (*f).coded_lossless == 1 {
+        (*f).tx_mode = 0
+    } else if av1br.rd_bit(r, "tx_mode_select") == 1 {
+        (*f).tx_mode = 2
+    } else {
+        (*f).tx_mode = 1
+    }
+    if (*f).frame_is_intra == 1 {
+        (*f).reference_select = 0
+    } else {
+        (*f).reference_select = av1br.rd_bit(r, "reference_select")
+    }
+}

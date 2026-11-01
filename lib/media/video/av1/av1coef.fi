@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1sym
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1cdfidx
+import media.video.av1.av1fhdr
+import media.video.av1.av1tabscan
+import media.video.av1.av1coefctx
+import media.video.av1.av1coefdq
+
+export { coef_read, golomb_read, tx_set_for, read_tx_type, plane_tx_type, tx_type_in_set }
+
+static INV_SET1: [u8; 7] = [9, 0, 10, 11, 3, 1, 2]
+static INV_SET2: [u8; 5] = [9, 0, 3, 1, 2]
+
+fn golomb_read(sym: *mut av1sym.Sym) -> i64 {
+    var len: i64 = 0
+    var bit: i64 = 0
+    while bit == 0 {
+        bit = av1sym.sym_literal(sym, 1)
+        len = len + 1
+        if len > 20 {
+            return 0 - 1
+        }
+    }
+    var x: i64 = 1
+    var i: i64 = 0
+    while i < len - 1 {
+        x = x * 2 + av1sym.sym_literal(sym, 1)
+        i = i + 1
+    }
+    return x - 1
+}
+
+fn tx_set_for(td: *mut av1blkst.TileDec, tx_size: i64) -> i64 {
+    let sqr: i64 = av1blkdat.tx_sqr(tx_size)
+    let sqr_up: i64 = av1blkdat.tx_sqr_up(tx_size)
+    let reduced: bool = (*(*td).fh).reduced_tx_set != 0
+    if sqr_up > av1blkdat.TX_32X32 {
+        return 0
+    }
+    if (*td).is_inter != 0 {
+        if reduced || sqr_up == av1blkdat.TX_32X32 {
+            return 3
+        }
+        if sqr == av1blkdat.TX_16X16 {
+            return 2
+        }
+        return 1
+    }
+    if sqr_up == av1blkdat.TX_32X32 {
+        return 0
+    }
+    if reduced || sqr == av1blkdat.TX_16X16 {
+        return 2
+    }
+    return 1
+}
+
+fn tx_type_in_set(set: i64, t: i64) -> bool {
+    if t == 0 {
+        return true
+    }
+    if set == 0 {
+        return false
+    }
+    if t >= 1 && t <= 3 {
+        return true
+    }
+    if t == 9 {
+        return true
+    }
+    if set == 1 && (t == 10 || t == 11) {
+        return true
+    }
+    return false
+}
+
+fn store_tx_type(td: *mut av1blkst.TileDec, x4: i64, y4: i64, tx_size: i64, t: i64) {
+    let w4: i64 = av1blkdat.tx_w(tx_size) >> 2
+    let h4: i64 = av1blkdat.tx_h(tx_size) >> 2
+    var j: i64 = 0
+    while j < h4 {
+        var i: i64 = 0
+        while i < w4 {
+            if y4 + j < (*td).mi_rows && x4 + i < (*td).mi_cols {
+                av1blkst.mi_set(td, (*td).txtype_a, y4 + j, x4 + i, t)
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+fn read_tx_type(td: *mut av1blkst.TileDec, x4: i64, y4: i64, tx_size: i64) -> i64 {
+    let set: i64 = tx_set_for(td, tx_size)
+    var t: i64 = 0
+    if set > 0 && av1coefdq.get_qidx(td, true) > 0 {
+        if (*td).is_inter != 0 {
+            return av1blkst.TD_UNSUPPORTED
+        }
+        var dir: i64 = (*td).y_mode
+        if (*td).use_filter_intra != 0 {
+            dir = av1blkdat.filter_intra_dir((*td).filter_intra_mode)
+        }
+        let off: i64 = av1cdfidx.CDF_INTRA_EXT_TX as i64 + set * 416 + av1blkdat.tx_sqr(tx_size) * 104 + dir * 8
+        if set == 1 {
+            t = INV_SET1[av1blkst.rd_sym(td, off as usize, 7) as usize] as i64
+        } else {
+            t = INV_SET2[av1blkst.rd_sym(td, off as usize, 5) as usize] as i64
+        }
+    }
+    store_tx_type(td, x4, y4, tx_size, t)
+    return t
+}
+
+fn plane_tx_type(td: *mut av1blkst.TileDec, plane: i64, x4: i64, y4: i64, tx_size: i64) -> i64 {
+    if (*td).lossless != 0 || av1blkdat.tx_sqr_up(tx_size) > av1blkdat.TX_32X32 {
+        return 0
+    }
+    let set: i64 = tx_set_for(td, tx_size)
+    var t: i64 = 0
+    if plane == 0 {
+        t = av1blkst.mi_get(td, (*td).txtype_a, y4, x4)
+    } else {
+        t = av1blkdat.mode_to_txfm((*td).uv_mode)
+    }
+    if !tx_type_in_set(set, t) {
+        return 0
+    }
+    return t
+}
+
+fn write_ctx(arr: u64, start: i64, n: i64, v: i64) {
+    var i: i64 = 0
+    while i < n {
+        av1blkst.st(arr, start + i, v)
+        i = i + 1
+    }
+}
+
+fn coef_read(tdp: u64, plane: i64, x4: i64, y4: i64, tx_size: i64) -> i64 {
+    let td: *mut av1blkst.TileDec = tdp as *mut av1blkst.TileDec
+    if (*td).is_inter != 0 {
+        return av1blkst.TD_UNSUPPORTED
+    }
+    let p: usize = plane as usize
+    let w: i64 = av1blkdat.tx_w(tx_size)
+    let h: i64 = av1blkdat.tx_h(tx_size)
+    let w4: i64 = w >> 2
+    let h4: i64 = h >> 2
+    let adj: i64 = av1blkdat.tx_adjusted(tx_size)
+    let aw: i64 = av1blkdat.tx_w(adj)
+    let ah: i64 = av1blkdat.tx_h(adj)
+    let bhl: i64 = av1blkdat.tx_h_log2(adj)
+    let sz_ctx: i64 = (av1blkdat.tx_sqr(tx_size) + av1blkdat.tx_sqr_up(tx_size) + 1) >> 1
+    var ptype: i64 = 0
+    var max_x4: i64 = (*td).mi_cols
+    var max_y4: i64 = (*td).mi_rows
+    var pb: i64 = (*td).mi_size
+    if plane > 0 {
+        ptype = 1
+        max_x4 = (max_x4 + (*td).ss_x) >> ((*td).ss_x as u64)
+        max_y4 = (max_y4 + (*td).ss_y) >> ((*td).ss_y as u64)
+        pb = av1blkdat.subsampled_size(pb, (*td).ss_x, (*td).ss_y)
+    }
+    let bw: i64 = av1blkdat.bw_px(pb)
+    let bh: i64 = av1blkdat.bh_px(pb)
+    var zctx: i64 = 0
+    if plane == 0 {
+        zctx = av1coefctx.txb_skip_ctx_luma((*td).above_level[p], (*td).left_level[p], x4, y4, w4, h4, max_x4, max_y4, bw == w && bh == h)
+    } else {
+        zctx = av1coefctx.txb_skip_ctx_chroma((*td).above_level[p], (*td).above_dc[p], (*td).left_level[p], (*td).left_dc[p], x4, y4, w4, h4, max_x4, max_y4, bw * bh > w * h)
+    }
+    let all_zero: i64 = av1blkst.rd_sym(td, (av1cdfidx.CDF_TXB_SKIP as i64 + sz_ctx * 39 + zctx * 3) as usize, 2)
+    let q: u64 = (*td).quant
+    let dqb: u64 = (*td).dequant
+    vp9mem.zero(q, (aw * ah * 4) as usize)
+    vp9mem.zero(dqb, (w * h * 4) as usize)
+    var eob: i64 = 0
+    var cul: i64 = 0
+    var dcc: i64 = 0
+    (*td).ev_tx_type = 0
+    if all_zero == 1 {
+        if plane == 0 {
+            store_tx_type(td, x4, y4, tx_size, 0)
+        }
+    } else {
+        if plane == 0 {
+            let r: i64 = read_tx_type(td, x4, y4, tx_size)
+            if r < 0 {
+                return r
+            }
+        }
+        let tx_type: i64 = plane_tx_type(td, plane, x4, y4, tx_size)
+        (*td).ev_tx_type = tx_type
+        let cls: i64 = av1blkdat.tx_class(tx_type)
+        let scan: u64 = av1tabscan.scan_for(tx_size, tx_type)
+        if scan == 0 {
+            return av1blkst.TD_ERR
+        }
+        var ms: i64 = av1blkdat.tx_w_log2(tx_size)
+        if ms > 5 {
+            ms = 5
+        }
+        var mh: i64 = av1blkdat.tx_h_log2(tx_size)
+        if mh > 5 {
+            mh = 5
+        }
+        let multi: i64 = ms + mh - 4
+        var eob_cdf: i64 = 0
+        var eob_n: i64 = 0
+        var s0: i64 = 0
+        var s1: i64 = 0
+        if multi == 0 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI16 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI16_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI16_S1 as i64
+        }
+        if multi == 1 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI32 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI32_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI32_S1 as i64
+        }
+        if multi == 2 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI64 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI64_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI64_S1 as i64
+        }
+        if multi == 3 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI128 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI128_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI128_S1 as i64
+        }
+        if multi == 4 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI256 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI256_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI256_S1 as i64
+        }
+        if multi == 5 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI512 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI512_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI512_S1 as i64
+        }
+        if multi >= 6 {
+            eob_cdf = av1cdfidx.CDF_EOB_MULTI1024 as i64
+            s0 = av1cdfidx.CDF_EOB_MULTI1024_S0 as i64
+            s1 = av1cdfidx.CDF_EOB_MULTI1024_S1 as i64
+        }
+        eob_n = multi + 5
+        if multi > 6 {
+            eob_n = 11
+        }
+        var ectx: i64 = 0
+        if cls != 0 {
+            ectx = 1
+        }
+        let eob_pt: i64 = av1blkst.rd_sym(td, (eob_cdf + ptype * s0 + ectx * s1) as usize, eob_n) + 1
+        eob = eob_pt
+        if eob_pt >= 2 {
+            eob = (1 << ((eob_pt - 2) as u64)) + 1
+        }
+        if eob_pt >= 3 {
+            let bits: i64 = eob_pt - 2
+            let ex: i64 = av1blkst.rd_sym(td, (av1cdfidx.CDF_EOB_EXTRA as i64 + sz_ctx * 54 + ptype * 27 + (eob_pt - 3) * 3) as usize, 2)
+            if ex == 1 {
+                eob = eob + (1 << ((bits - 1) as u64))
+            }
+            var i: i64 = 1
+            while i < bits {
+                if av1sym.sym_literal(&(*td).sym, 1) == 1 {
+                    eob = eob + (1 << ((bits - 1 - i) as u64))
+                }
+                i = i + 1
+            }
+        }
+        var c: i64 = eob - 1
+        while c >= 0 {
+            let pos: i64 = vp9mem.ld16(scan, c as usize)
+            var lvl: i64 = 0
+            if c == eob - 1 {
+                let bc: i64 = av1coefctx.base_eob_ctx(ah, aw, c)
+                lvl = av1blkst.rd_sym(td, (av1cdfidx.CDF_COEFF_BASE_EOB_MULTI as i64 + sz_ctx * 32 + ptype * 16 + bc * 4) as usize, 3) + 1
+            } else {
+                let bc: i64 = av1coefctx.base_ctx(q, ah, aw, bhl, pos, cls, w, h)
+                lvl = av1blkst.rd_sym(td, (av1cdfidx.CDF_COEFF_BASE_MULTI as i64 + sz_ctx * 420 + ptype * 210 + bc * 5) as usize, 4)
+            }
+            if lvl > 2 {
+                var tc: i64 = sz_ctx
+                if tc > 3 {
+                    tc = 3
+                }
+                let brc: i64 = av1coefctx.br_ctx(q, ah, aw, bhl, pos, cls)
+                let off: i64 = av1cdfidx.CDF_COEFF_LPS_MULTI as i64 + tc * 210 + ptype * 105 + brc * 5
+                var idx: i64 = 0
+                while idx < 4 {
+                    let v: i64 = av1blkst.rd_sym(td, off as usize, 4)
+                    lvl = lvl + v
+                    if v < 3 {
+                        break
+                    }
+                    idx = idx + 1
+                }
+            }
+            av1coefctx.lv_set(q, pos, lvl)
+            c = c - 1
+        }
+        let dcq: i64 = av1coefdq.dc_quant(td, plane)
+        let acq: i64 = av1coefdq.ac_quant(td, plane)
+        let qm: u64 = av1coefdq.qm_addr(td, plane, tx_size, tx_type)
+        let shift: i64 = av1coefdq.dq_shift(tx_size)
+        c = 0
+        while c < eob {
+            let pos: i64 = vp9mem.ld16(scan, c as usize)
+            var lvl: i64 = av1coefctx.lv(q, pos)
+            if lvl != 0 {
+                var sign: i64 = 0
+                if c == 0 {
+                    let dctx: i64 = av1coefctx.dc_sign_ctx((*td).above_dc[p], (*td).left_dc[p], x4, y4, w4, h4, max_x4, max_y4)
+                    sign = av1blkst.rd_sym(td, (av1cdfidx.CDF_DC_SIGN as i64 + ptype * 9 + dctx * 3) as usize, 2)
+                } else {
+                    sign = av1sym.sym_literal(&(*td).sym, 1)
+                }
+                if lvl > 14 {
+                    let g: i64 = golomb_read(&(*td).sym)
+                    if g < 0 {
+                        return av1blkst.TD_ERR
+                    }
+                    lvl = lvl + g
+                }
+                if pos == 0 {
+                    dcc = 2
+                    if sign == 1 {
+                        dcc = 1
+                    }
+                }
+                lvl = lvl & 1048575
+                cul = cul + lvl
+                let row: i64 = pos & (ah - 1)
+                let col: i64 = pos >> (bhl as u64)
+                av1coefctx.lv_set(dqb, row * w + col, av1coefdq.dq_value(lvl, sign == 1, pos, dcq, acq, qm, shift, (*td).bit_depth))
+            }
+            c = c + 1
+        }
+        if cul > 63 {
+            cul = 63
+        }
+    }
+    write_ctx((*td).above_level[p], x4, w4, cul)
+    write_ctx((*td).above_dc[p], x4, w4, dcc)
+    write_ctx((*td).left_level[p], y4, h4, cul)
+    write_ctx((*td).left_dc[p], y4, h4, dcc)
+    (*td).ev_eob = eob
+    (*td).n_tx = (*td).n_tx + 1
+    (*td).n_eob_sum = (*td).n_eob_sum + eob
+    return eob
+}

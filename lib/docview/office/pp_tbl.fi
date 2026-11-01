@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.ooxml
+import docview.office.dx_model
+import docview.office.dx_props
+import docview.office.dx_drawutil
+import docview.office.pp_color
+import docview.office.pp_ctx
+import docview.office.pp_text
+
+export { find_tbl, build_table, MAX_COLS }
+
+const MAX_COLS: usize = 64
+const MAX_ROWS: usize = 400
+
+struct Cols {
+    tw: [i32; 64],
+    n: usize,
+    vrem: [i32; 64],
+    vspan: [i32; 64],
+}
+
+struct Look {
+    styled: bool,
+    first_row: bool,
+    band_row: bool,
+}
+
+fn find_tbl(x: *mut xml.Doc, gf: u32) -> u32 {
+    return dx_drawutil.find_desc(x, gf, "tbl", 0)
+}
+
+fn border_of(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tcpr: u32, tag: str, out: *mut dx_props.Border) {
+    let ln: u32 = ooxml.child_l(x, tcpr, tag)
+    if ln == xml.NONE {
+        return
+    }
+    if ooxml.child_l(x, ln, "noFill") != xml.NONE {
+        *out = dx_props.border_none()
+        return
+    }
+    let sf: u32 = ooxml.child_l(x, ln, "solidFill")
+    if sf == xml.NONE {
+        return
+    }
+    let col: u32 = pp_color.color_in(&(*c).pal, x, sf)
+    if col == 0 as u32 {
+        return
+    }
+    var sz: i32 = ((ooxml.attr_i64(x, ln, "w", 12700) * 8) / 12700) as i32
+    if sz < 2 { sz = 2 }
+    if sz > 24 { sz = 24 }
+    *out = dx_props.Border { sz: sz, color: col }
+}
+
+fn cell_fill(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tcpr: u32, row: usize, look: *mut Look) -> u32 {
+    if tcpr != xml.NONE {
+        if ooxml.child_l(x, tcpr, "noFill") != xml.NONE {
+            return 0 as u32
+        }
+        let sf: u32 = ooxml.child_l(x, tcpr, "solidFill")
+        if sf != xml.NONE {
+            return pp_color.color_in(&(*c).pal, x, sf)
+        }
+    }
+    if !(*look).styled {
+        return 0 as u32
+    }
+    let acc: u32 = (*c).pal.th.c[4]
+    if row == 0 && (*look).first_row {
+        return acc
+    }
+    if (*look).band_row {
+        var k: usize = row
+        if (*look).first_row {
+            k = row - 1
+        }
+        if k % 2 == 0 {
+            return pp_color.tint_of(acc, 0.4)
+        }
+        return pp_color.tint_of(acc, 0.2)
+    }
+    return pp_color.tint_of(acc, 0.2)
+}
+
+fn emit_cell(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tc: u32, ri: u32, k: usize, cs: usize, vmerge: i32, row: usize, cols: *mut Cols,
+    look: *mut Look) {
+    let d: *mut dx_model.Docx = (*c).d
+    let ci: u32 = dx_model.new_cell(d, ri)
+    var w: i32 = 0
+    var j: usize = 0
+    while j < cs && k + j < (*cols).n {
+        w = w + (*cols).tw[k + j]
+        j = j + 1
+    }
+    var bl: dx_model.BList = dx_model.blist_new()
+    var tcpr: u32 = xml.NONE
+    if tc != xml.NONE {
+        tcpr = ooxml.child_l(x, tc, "tcPr")
+    }
+    let fill: u32 = cell_fill(c, x, tcpr, row, look)
+    var bt: dx_props.Border = dx_props.border_unset()
+    var bb: dx_props.Border = dx_props.border_unset()
+    var bl_: dx_props.Border = dx_props.border_unset()
+    var br: dx_props.Border = dx_props.border_unset()
+    if (*look).styled {
+        let wb: dx_props.Border = dx_props.Border { sz: 8, color: (*c).pal.th.c[0] }
+        bt = wb
+        bb = wb
+        bl_ = wb
+        br = wb
+    }
+    border_of(c, x, tcpr, "lnT", &bt)
+    border_of(c, x, tcpr, "lnB", &bb)
+    border_of(c, x, tcpr, "lnL", &bl_)
+    border_of(c, x, tcpr, "lnR", &br)
+    (*c).font_color = 0 as u32
+    (*c).force_bold = false
+    if (*look).styled && row == 0 && (*look).first_row {
+        (*c).font_color = (*c).pal.th.c[0]
+        (*c).force_bold = true
+    }
+    var emitted: bool = false
+    if tc != xml.NONE && vmerge != 2 {
+        let tx: u32 = ooxml.child_l(x, tc, "txBody")
+        if tx != xml.NONE {
+            var ch: pp_ctx.Chain = pp_ctx.Chain { items: [pp_ctx.Link { x: x, n: xml.NONE }; 8], count: 0 }
+            pp_ctx.chain_push(&ch, x, ooxml.child_l(x, tx, "lstStyle"))
+            if (*c).m_styles != xml.NONE {
+                pp_ctx.chain_push(&ch, (*c).mx, ooxml.child_l((*c).mx, (*c).m_styles, "otherStyle"))
+            }
+            pp_ctx.chain_push(&ch, (*c).px, (*c).defaults)
+            (*c).font_scale = 1.0
+            pp_text.emit_body(c, x, tx, &ch, &bl)
+            emitted = bl.head != dx_model.NIL
+        }
+    }
+    (*c).font_color = 0 as u32
+    (*c).force_bold = false
+    if !emitted {
+        pp_text.emit_empty(c, &bl)
+    }
+    let ce: *mut dx_model.Cell = dx_model.cell_at(d, ci)
+    (*ce).span = cs as i32
+    (*ce).width = w
+    (*ce).vmerge = vmerge
+    (*ce).shade = fill
+    (*ce).bt = bt
+    (*ce).bb = bb
+    (*ce).bl = bl_
+    (*ce).br = br
+    (*ce).blocks = bl
+}
+
+fn emit_row(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tr: u32, t: u32, row: usize, cols: *mut Cols, look: *mut Look) {
+    let d: *mut dx_model.Docx = (*c).d
+    let ri: u32 = dx_model.new_row(d, t)
+    let h: i64 = ooxml.attr_i64(x, tr, "h", 0) / 635
+    if h > 0 && h < 100000 {
+        (*dx_model.row_at(d, ri)).height = h as i32
+    }
+    var k: usize = 0
+    var tc: u32 = ooxml.child_l(x, tr, "tc")
+    while k < (*cols).n {
+        if (*cols).vrem[k] > 0 && (*cols).vspan[k] > 0 {
+            let sp: usize = (*cols).vspan[k] as usize
+            emit_cell(c, x, tc, ri, k, sp, 2, row, cols, look)
+            var j: usize = 0
+            while j < sp && k + j < (*cols).n {
+                (*cols).vrem[k + j] = (*cols).vrem[k + j] - 1
+                j = j + 1
+            }
+            if (*cols).vrem[k] <= 0 {
+                (*cols).vspan[k] = 0
+            }
+            var q: usize = 0
+            while q < sp && tc != xml.NONE {
+                tc = ooxml.next_l(x, tc, "tc")
+                q = q + 1
+            }
+            k = k + sp
+        } else {
+            if tc == xml.NONE {
+                emit_cell(c, x, xml.NONE, ri, k, 1, 0, row, cols, look)
+                k = k + 1
+            } else {
+                var cs: usize = 1
+                let gs: i64 = ooxml.attr_i64(x, tc, "gridSpan", 1)
+                if gs > 1 {
+                    cs = gs as usize
+                }
+                if k + cs > (*cols).n {
+                    cs = (*cols).n - k
+                }
+                var vm: i32 = 0
+                let rs: i64 = ooxml.attr_i64(x, tc, "rowSpan", 1)
+                if rs > 1 {
+                    vm = 1
+                    var j2: usize = 0
+                    while j2 < cs {
+                        (*cols).vrem[k + j2] = (rs - 1) as i32
+                        j2 = j2 + 1
+                    }
+                    (*cols).vspan[k] = cs as i32
+                }
+                emit_cell(c, x, tc, ri, k, cs, vm, row, cols, look)
+                k = k + cs
+                var q2: usize = 0
+                while q2 < cs && tc != xml.NONE {
+                    tc = ooxml.next_l(x, tc, "tc")
+                    q2 = q2 + 1
+                }
+            }
+        }
+    }
+}
+
+fn build_table(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tbl: u32, width_px: f64, bl: *mut dx_model.BList) {
+    let d: *mut dx_model.Docx = (*c).d
+    var cols: Cols = Cols { tw: [0 as i32; 64], n: 0, vrem: [0 as i32; 64], vspan: [0 as i32; 64] }
+    let grid: u32 = ooxml.child_l(x, tbl, "tblGrid")
+    var g: u32 = ooxml.first_el(x, grid)
+    while g != xml.NONE && cols.n < MAX_COLS {
+        if ooxml.is_el(x, g, "gridCol") {
+            var w: i32 = (ooxml.attr_i64(x, g, "w", 914400) / 635) as i32
+            if w < 60 { w = 60 }
+            cols.tw[cols.n] = w
+            cols.n = cols.n + 1
+        }
+        g = ooxml.next_el(x, g)
+    }
+    if cols.n == 0 {
+        return
+    }
+    var look: Look = Look { styled: false, first_row: false, band_row: false }
+    let pr: u32 = ooxml.child_l(x, tbl, "tblPr")
+    if pr != xml.NONE {
+        look.first_row = ooxml.attr_l(x, pr, "firstRow") == "1"
+        look.band_row = ooxml.attr_l(x, pr, "bandRow") == "1"
+        let sid: u32 = ooxml.child_l(x, pr, "tableStyleId")
+        if sid != xml.NONE && xml.text(x, sid) == "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" {
+            look.styled = true
+        }
+    }
+    var tp: dx_props.TblProps = dx_props.tbl_unset()
+    tp.mar_left = 108
+    tp.mar_right = 108
+    tp.mar_top = 54
+    tp.mar_bottom = 54
+    tp.align = dx_props.ALIGN_LEFT
+    let ti: u32 = dx_model.new_table(d, tp)
+    var i: usize = 0
+    while i < cols.n {
+        vec_push[i32](&(*d).grid, cols.tw[i])
+        i = i + 1
+    }
+    (*dx_model.table_at(d, ti)).gn = cols.n as u32
+    dx_model.block_add(d, bl, dx_model.B_TABLE, ti, (*c).sect)
+    var row: usize = 0
+    var tr: u32 = ooxml.child_l(x, tbl, "tr")
+    while tr != xml.NONE && row < MAX_ROWS && vec_len[dx_model.Cell](&(*d).cells) < dx_model.MAX_CELLS {
+        emit_row(c, x, tr, ti, row, &cols, &look)
+        row = row + 1
+        tr = ooxml.next_l(x, tr, "tr")
+    }
+}

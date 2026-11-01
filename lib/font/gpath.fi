@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: MPL-2.0
+// Glyph path buffer: cubic outlines from CFF and Type 1 charstrings, with bounds and replay into the rasteriser.
+import font.raster
+import rt.rt
+
+export {
+    GPath,
+    gp_new, gp_attach, gp_clear, gp_ok, gp_count,
+    gp_move, gp_line, gp_curve, gp_close,
+    gp_bounds, gp_emit, gp_dump,
+}
+
+const GP_REC: usize = 7
+const OP_MOVE: f64 = 1.0
+const OP_LINE: f64 = 2.0
+const OP_CURVE: f64 = 3.0
+const OP_CLOSE: f64 = 4.0
+
+struct GPath {
+    pool: u64,
+    cap: usize,
+    n: usize,
+    full: u32,
+}
+
+fn gp_new() -> GPath {
+    return GPath { pool: 0, cap: 0, n: 0, full: 0 }
+}
+
+fn gp_attach(g: *mut GPath, p: u64, bytes: usize) {
+    (*g).pool = p
+    (*g).cap = bytes / (GP_REC * 8)
+    (*g).n = 0
+    (*g).full = 0
+}
+
+fn gp_clear(g: *mut GPath) {
+    (*g).n = 0
+    (*g).full = 0
+}
+
+fn gp_ok(g: *mut GPath) -> bool {
+    return (*g).full == 0 as u32 && (*g).pool != 0
+}
+
+fn gp_count(g: *mut GPath) -> usize {
+    return (*g).n
+}
+
+fn gp_ld(g: *mut GPath, rec: usize, i: usize) -> f64 {
+    return *(((*g).pool + ((rec * GP_REC + i) * 8) as u64) as *mut f64)
+}
+
+fn gp_st(g: *mut GPath, rec: usize, i: usize, v: f64) {
+    *(((*g).pool + ((rec * GP_REC + i) * 8) as u64) as *mut f64) = v
+}
+
+fn gp_push(g: *mut GPath, op: f64, x1: f64, y1: f64, x2: f64, y2: f64,
+    x3: f64, y3: f64) {
+    if (*g).n >= (*g).cap {
+        (*g).full = 1
+        return
+    }
+    let k: usize = (*g).n
+    gp_st(g, k, 0, op)
+    gp_st(g, k, 1, x1)
+    gp_st(g, k, 2, y1)
+    gp_st(g, k, 3, x2)
+    gp_st(g, k, 4, y2)
+    gp_st(g, k, 5, x3)
+    gp_st(g, k, 6, y3)
+    (*g).n = k + 1
+}
+
+fn gp_move(g: *mut GPath, x: f64, y: f64) {
+    gp_push(g, OP_MOVE, x, y, 0.0, 0.0, 0.0, 0.0)
+}
+
+fn gp_line(g: *mut GPath, x: f64, y: f64) {
+    gp_push(g, OP_LINE, x, y, 0.0, 0.0, 0.0, 0.0)
+}
+
+fn gp_curve(g: *mut GPath, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64,
+    y3: f64) {
+    gp_push(g, OP_CURVE, x1, y1, x2, y2, x3, y3)
+}
+
+fn gp_close(g: *mut GPath) {
+    gp_push(g, OP_CLOSE, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+}
+
+fn gp_bounds(g: *mut GPath, x0: *mut f64, y0: *mut f64, x1: *mut f64,
+    y1: *mut f64) -> bool {
+    var any: bool = false
+    var lx: f64 = 0.0
+    var ly: f64 = 0.0
+    var hx: f64 = 0.0
+    var hy: f64 = 0.0
+    var k: usize = 0
+    while k < (*g).n {
+        let op: f64 = gp_ld(g, k, 0)
+        var pts: usize = 0
+        if op == OP_MOVE || op == OP_LINE {
+            pts = 1
+        }
+        if op == OP_CURVE {
+            pts = 3
+        }
+        var j: usize = 0
+        while j < pts {
+            let x: f64 = gp_ld(g, k, 1 + j * 2)
+            let y: f64 = gp_ld(g, k, 2 + j * 2)
+            if !any {
+                lx = x
+                hx = x
+                ly = y
+                hy = y
+                any = true
+            }
+            if x < lx {
+                lx = x
+            }
+            if x > hx {
+                hx = x
+            }
+            if y < ly {
+                ly = y
+            }
+            if y > hy {
+                hy = y
+            }
+            j = j + 1
+        }
+        k = k + 1
+    }
+    *x0 = lx
+    *y0 = ly
+    *x1 = hx
+    *y1 = hy
+    return any
+}
+
+fn gp_dx(px: f64, py: f64, ox: f64, m00: f64, m10: f64) -> f64 {
+    return ox + px * m00 + py * m10
+}
+
+fn gp_dy(px: f64, py: f64, oy: f64, m01: f64, m11: f64) -> f64 {
+    return oy - (px * m01 + py * m11)
+}
+
+fn gp_emit(g: *mut GPath, r: *mut raster.Raster, ox: f64, oy: f64,
+    m00: f64, m01: f64, m10: f64, m11: f64) {
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var open: bool = false
+    var k: usize = 0
+    while k < (*g).n {
+        let op: f64 = gp_ld(g, k, 0)
+        if op == OP_MOVE {
+            if open {
+                raster.raster_line(r, cx, cy, sx, sy)
+            }
+            sx = gp_dx(gp_ld(g, k, 1), gp_ld(g, k, 2), ox, m00, m10)
+            sy = gp_dy(gp_ld(g, k, 1), gp_ld(g, k, 2), oy, m01, m11)
+            cx = sx
+            cy = sy
+            open = true
+        }
+        if op == OP_LINE {
+            let x: f64 = gp_dx(gp_ld(g, k, 1), gp_ld(g, k, 2), ox, m00, m10)
+            let y: f64 = gp_dy(gp_ld(g, k, 1), gp_ld(g, k, 2), oy, m01, m11)
+            raster.raster_line(r, cx, cy, x, y)
+            cx = x
+            cy = y
+        }
+        if op == OP_CURVE {
+            let x1: f64 = gp_dx(gp_ld(g, k, 1), gp_ld(g, k, 2), ox, m00, m10)
+            let y1: f64 = gp_dy(gp_ld(g, k, 1), gp_ld(g, k, 2), oy, m01, m11)
+            let x2: f64 = gp_dx(gp_ld(g, k, 3), gp_ld(g, k, 4), ox, m00, m10)
+            let y2: f64 = gp_dy(gp_ld(g, k, 3), gp_ld(g, k, 4), oy, m01, m11)
+            let x3: f64 = gp_dx(gp_ld(g, k, 5), gp_ld(g, k, 6), ox, m00, m10)
+            let y3: f64 = gp_dy(gp_ld(g, k, 5), gp_ld(g, k, 6), oy, m01, m11)
+            raster.raster_cubic(r, cx, cy, x1, y1, x2, y2, x3, y3)
+            cx = x3
+            cy = y3
+        }
+        if op == OP_CLOSE {
+            if open {
+                raster.raster_line(r, cx, cy, sx, sy)
+                cx = sx
+                cy = sy
+            }
+        }
+        k = k + 1
+    }
+    if open {
+        raster.raster_line(r, cx, cy, sx, sy)
+    }
+}
+
+fn gp_dump(g: *mut GPath, b: *mut rt.Buf) {
+    var k: usize = 0
+    while k < (*g).n {
+        let op: f64 = gp_ld(g, k, 0)
+        rt.buf_push(b, 32 as u8)
+        var pts: usize = 0
+        if op == OP_MOVE {
+            rt.buf_push(b, 77 as u8)
+            pts = 1
+        }
+        if op == OP_LINE {
+            rt.buf_push(b, 76 as u8)
+            pts = 1
+        }
+        if op == OP_CURVE {
+            rt.buf_push(b, 67 as u8)
+            pts = 3
+        }
+        if op == OP_CLOSE {
+            rt.buf_push(b, 90 as u8)
+        }
+        var j: usize = 0
+        while j < pts * 2 {
+            rt.buf_push(b, 32 as u8)
+            var s: f64 = gp_ld(g, k, 1 + j) * 100.0
+            if s < 0.0 {
+                s = s - 0.5
+            } else {
+                s = s + 0.5
+            }
+            rt.buf_push_dec_i64(b, s as i64)
+            j = j + 1
+        }
+        k = k + 1
+    }
+}

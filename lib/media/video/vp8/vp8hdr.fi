@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp8.vp8bool
+import media.video.vp8.vp8mem
+import media.video.vp8.vp8state
+import media.video.vp8.vp8tabs
+
+export { hdr_parse, ent_defaults, HDR_OK, HDR_BAD, HDR_NOT_KEY_FIRST }
+
+const HDR_OK: i64 = 0
+const HDR_BAD: i64 = 1
+const HDR_NOT_KEY_FIRST: i64 = 2
+
+static MV_UPDATE_ROW: [u8; 19] = [237, 246, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 250, 250, 252, 254, 254]
+
+static MV_UPDATE_COL: [u8; 19] = [231, 243, 245, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 251, 251, 254, 254, 254]
+
+static MV_DEFAULT_ROW: [u8; 19] = [162, 128, 225, 146, 172, 147, 214, 39, 156, 128, 129, 132, 75, 145, 178, 206, 239, 254, 254]
+
+static MV_DEFAULT_COL: [u8; 19] = [164, 128, 204, 170, 119, 235, 140, 230, 228, 128, 130, 130, 74, 148, 180, 203, 236, 254, 254]
+
+static YMODE_DEFAULT: [u8; 4] = [112, 86, 140, 37]
+
+static UVMODE_DEFAULT: [u8; 3] = [162, 101, 204]
+
+fn le24(p: u64, i: usize) -> i64 {
+    return vp8mem.ld8(p, i) | (vp8mem.ld8(p, i + 1) << 8) | (vp8mem.ld8(p, i + 2) << 16)
+}
+
+fn ent_defaults(f: *mut vp8state.Vp8) {
+    let e: u64 = (*f).ent
+    let def: u64 = vp8tabs.vp8_coef_default_addr()
+    var i: usize = 0
+    while i < 1056 {
+        vp8mem.st8(e, vp8state.ENT_COEF + i, vp8mem.ld8(def, i))
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        vp8mem.st8(e, vp8state.ENT_Y + i, YMODE_DEFAULT[i] as i64)
+        i = i + 1
+    }
+    i = 0
+    while i < 3 {
+        vp8mem.st8(e, vp8state.ENT_UV + i, UVMODE_DEFAULT[i] as i64)
+        i = i + 1
+    }
+    i = 0
+    while i < 19 {
+        vp8mem.st8(e, vp8state.ENT_MV + i, MV_DEFAULT_ROW[i] as i64)
+        vp8mem.st8(e, vp8state.ENT_MV + 19 + i, MV_DEFAULT_COL[i] as i64)
+        i = i + 1
+    }
+}
+
+fn copy_ent(dst: u64, src: u64) {
+    var i: usize = 0
+    while i < vp8state.ENT_LEN {
+        vp8mem.st8(dst, i, vp8mem.ld8(src, i))
+        i = i + 1
+    }
+}
+
+fn clamp_q(q: i64) -> i64 {
+    if q < 0 {
+        return 0
+    }
+    if q > 127 {
+        return 127
+    }
+    return q
+}
+
+fn read_signed_delta(d: *mut vp8bool.BD, old: i64) -> i64 {
+    if vp8bool.bd_bit(d) == 0 {
+        return old
+    }
+    return vp8bool.bd_int(d, 6)
+}
+
+fn read_segmentation(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    (*f).seg_on = vp8bool.bd_bit(d)
+    (*f).seg_map = 0
+    if (*f).seg_on == 0 {
+        return
+    }
+    (*f).seg_map = vp8bool.bd_bit(d)
+    let upd_data: i64 = vp8bool.bd_bit(d)
+    var k: usize = 0
+    if upd_data == 1 {
+        (*f).seg_abs = vp8bool.bd_bit(d)
+        while k < 4 {
+            (*f).seg_q[k] = vp8bool.bd_maybe_int(d, 7)
+            k = k + 1
+        }
+        k = 0
+        while k < 4 {
+            (*f).seg_lf[k] = vp8bool.bd_maybe_int(d, 6)
+            k = k + 1
+        }
+    }
+    if (*f).seg_map == 1 {
+        k = 0
+        while k < 3 {
+            (*f).seg_p[k] = 255
+            if vp8bool.bd_bit(d) == 1 {
+                (*f).seg_p[k] = vp8bool.bd_uint(d, 8)
+            }
+            k = k + 1
+        }
+    }
+}
+
+fn read_loop_filter(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    (*f).lf_simple = vp8bool.bd_bit(d)
+    (*f).lf_level = vp8bool.bd_uint(d, 6)
+    (*f).lf_sharp = vp8bool.bd_uint(d, 3)
+    (*f).lf_delta = vp8bool.bd_bit(d)
+    if (*f).lf_delta == 1 && vp8bool.bd_bit(d) == 1 {
+        var k: usize = 0
+        while k < 4 {
+            (*f).ref_delta[k] = read_signed_delta(d, (*f).ref_delta[k])
+            k = k + 1
+        }
+        k = 0
+        while k < 4 {
+            (*f).mode_delta[k] = read_signed_delta(d, (*f).mode_delta[k])
+            k = k + 1
+        }
+    }
+}
+
+fn setup_partitions(f: *mut vp8state.Vp8, d: *mut vp8bool.BD, src: u64, n: usize, start: i64) -> bool {
+    let np: i64 = 1 << (vp8bool.bd_uint(d, 2) as u64)
+    (*f).nparts = np
+    let pstart: i64 = start
+    let rest: i64 = (n as i64) - pstart
+    if rest < 3 * (np - 1) {
+        return false
+    }
+    var pdata: i64 = pstart + 3 * (np - 1)
+    var left: i64 = (n as i64) - pdata
+    var pi: i64 = 0
+    while pi < np {
+        var psz: i64 = left
+        if pi < np - 1 {
+            psz = le24(src, (pstart + 3 * pi) as usize)
+        }
+        if psz > left {
+            psz = left
+        }
+        vp8bool.bd_init(&(*f).parts[pi as usize], src + pdata as u64, psz as usize)
+        pdata = pdata + psz
+        left = left - psz
+        pi = pi + 1
+    }
+    return true
+}
+
+fn read_quant(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    let qi: i64 = vp8bool.bd_uint(d, 7)
+    (*f).qi = qi
+    let y1dc: i64 = vp8bool.bd_maybe_int(d, 4)
+    let y2dc: i64 = vp8bool.bd_maybe_int(d, 4)
+    let y2ac: i64 = vp8bool.bd_maybe_int(d, 4)
+    let uvdc: i64 = vp8bool.bd_maybe_int(d, 4)
+    let uvac: i64 = vp8bool.bd_maybe_int(d, 4)
+    var sg: i64 = 0
+    while sg < 4 {
+        var q: i64 = qi
+        if (*f).seg_on == 1 {
+            if (*f).seg_abs == 1 {
+                q = (*f).seg_q[sg as usize]
+            } else {
+                q = q + (*f).seg_q[sg as usize]
+            }
+        }
+        let o: usize = (sg * 6) as usize
+        (*f).dq[o] = vp8tabs.vp8_dc_q(clamp_q(q + y1dc))
+        (*f).dq[o + 1] = vp8tabs.vp8_ac_q(clamp_q(q))
+        (*f).dq[o + 2] = vp8tabs.vp8_dc_q(clamp_q(q + y2dc)) * 2
+        var y2a: i64 = vp8tabs.vp8_ac_q(clamp_q(q + y2ac)) * 155 / 100
+        if y2a < 8 {
+            y2a = 8
+        }
+        (*f).dq[o + 3] = y2a
+        var uvd: i64 = vp8tabs.vp8_dc_q(clamp_q(q + uvdc))
+        if uvd > 132 {
+            uvd = 132
+        }
+        (*f).dq[o + 4] = uvd
+        (*f).dq[o + 5] = vp8tabs.vp8_ac_q(clamp_q(q + uvac))
+        sg = sg + 1
+    }
+}
+
+fn read_reference_flags(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    if (*f).keyframe {
+        (*f).refresh_gf = 1
+        (*f).refresh_arf = 1
+        (*f).copy_gf = 0
+        (*f).copy_arf = 0
+        (*f).sign_bias[2] = 0
+        (*f).sign_bias[3] = 0
+        (*f).refresh_entropy = vp8bool.bd_bit(d)
+        (*f).refresh_last = 1
+        return
+    }
+    (*f).refresh_gf = vp8bool.bd_bit(d)
+    (*f).refresh_arf = vp8bool.bd_bit(d)
+    (*f).copy_gf = 0
+    (*f).copy_arf = 0
+    if (*f).refresh_gf == 0 {
+        (*f).copy_gf = vp8bool.bd_uint(d, 2)
+    }
+    if (*f).refresh_arf == 0 {
+        (*f).copy_arf = vp8bool.bd_uint(d, 2)
+    }
+    (*f).sign_bias[2] = vp8bool.bd_bit(d)
+    (*f).sign_bias[3] = vp8bool.bd_bit(d)
+    (*f).refresh_entropy = vp8bool.bd_bit(d)
+    (*f).refresh_last = vp8bool.bd_bit(d)
+}
+
+fn read_coef_updates(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    let upd: u64 = vp8tabs.vp8_coef_update_addr()
+    let e: u64 = (*f).ent
+    var i: usize = 0
+    while i < 1056 {
+        if vp8bool.bd_get(d, vp8mem.ld8(upd, i)) == 1 {
+            vp8mem.st8(e, vp8state.ENT_COEF + i, vp8bool.bd_uint(d, 8))
+        }
+        i = i + 1
+    }
+}
+
+fn read_mv_updates(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    let e: u64 = (*f).ent
+    var i: usize = 0
+    while i < 19 {
+        if vp8bool.bd_get(d, MV_UPDATE_ROW[i] as i64) == 1 {
+            let x: i64 = vp8bool.bd_uint(d, 7)
+            var v: i64 = 1
+            if x != 0 {
+                v = x << 1
+            }
+            vp8mem.st8(e, vp8state.ENT_MV + i, v)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < 19 {
+        if vp8bool.bd_get(d, MV_UPDATE_COL[i] as i64) == 1 {
+            let x: i64 = vp8bool.bd_uint(d, 7)
+            var v: i64 = 1
+            if x != 0 {
+                v = x << 1
+            }
+            vp8mem.st8(e, vp8state.ENT_MV + 19 + i, v)
+        }
+        i = i + 1
+    }
+}
+
+fn read_inter_probs(f: *mut vp8state.Vp8, d: *mut vp8bool.BD) {
+    (*f).prob_inter = vp8bool.bd_uint(d, 8)
+    (*f).prob_last = vp8bool.bd_uint(d, 8)
+    (*f).prob_gf = vp8bool.bd_uint(d, 8)
+    let e: u64 = (*f).ent
+    var i: usize = 0
+    if vp8bool.bd_bit(d) == 1 {
+        while i < 4 {
+            vp8mem.st8(e, vp8state.ENT_Y + i, vp8bool.bd_uint(d, 8))
+            i = i + 1
+        }
+    }
+    if vp8bool.bd_bit(d) == 1 {
+        i = 0
+        while i < 3 {
+            vp8mem.st8(e, vp8state.ENT_UV + i, vp8bool.bd_uint(d, 8))
+            i = i + 1
+        }
+    }
+    read_mv_updates(f, d)
+}
+
+fn reset_key_state(f: *mut vp8state.Vp8) {
+    (*f).seg_abs = 0
+    var k: usize = 0
+    while k < 4 {
+        (*f).seg_q[k] = 0
+        (*f).seg_lf[k] = 0
+        (*f).ref_delta[k] = 0
+        (*f).mode_delta[k] = 0
+        (*f).sign_bias[k] = 0
+        k = k + 1
+    }
+    (*f).seg_p[0] = 255
+    (*f).seg_p[1] = 255
+    (*f).seg_p[2] = 255
+    ent_defaults(f)
+}
+
+fn hdr_parse(f: *mut vp8state.Vp8, src: u64, n: usize) -> i64 {
+    if n < 3 {
+        return HDR_BAD
+    }
+    let tag: i64 = le24(src, 0)
+    let key: bool = (tag & 1) == 0
+    var version: i64 = (tag >> 1) & 7
+    if version > 3 {
+        version = 3
+    }
+    (*f).version = version
+    (*f).show = ((tag >> 4) & 1) == 1
+    let part0: i64 = (tag >> 5) & 524287
+    var start: i64 = 3
+    if key {
+        if n < 10 {
+            return HDR_BAD
+        }
+        if vp8mem.ld8(src, 3) != 157 || vp8mem.ld8(src, 4) != 1 || vp8mem.ld8(src, 5) != 42 {
+            return HDR_BAD
+        }
+        let w: i64 = (vp8mem.ld8(src, 6) | (vp8mem.ld8(src, 7) << 8)) & 16383
+        let h: i64 = (vp8mem.ld8(src, 8) | (vp8mem.ld8(src, 9) << 8)) & 16383
+        if w == 0 || h == 0 {
+            return HDR_BAD
+        }
+        if !(*f).ready || w != (*f).w || h != (*f).h {
+            if !vp8state.vp8_setup(f, w, h) {
+                return HDR_BAD
+            }
+        }
+        start = 10
+    } else {
+        if !(*f).ready {
+            return HDR_NOT_KEY_FIRST
+        }
+    }
+    if start + part0 > n as i64 {
+        return HDR_BAD
+    }
+    (*f).keyframe = key
+    if key {
+        reset_key_state(f)
+    }
+    vp8bool.bd_init(&(*f).d0, src + start as u64, part0 as usize)
+    let d: *mut vp8bool.BD = &(*f).d0
+    if key {
+        let cs: i64 = vp8bool.bd_uint(d, 2)
+        if cs < 0 {
+            return HDR_BAD
+        }
+    }
+    read_segmentation(f, d)
+    read_loop_filter(f, d)
+    if !setup_partitions(f, d, src, n, start + part0) {
+        return HDR_BAD
+    }
+    read_quant(f, d)
+    read_reference_flags(f, d)
+    if (*f).refresh_entropy == 0 {
+        copy_ent((*f).saved, (*f).ent)
+    }
+    read_coef_updates(f, d)
+    (*f).skip_on = vp8bool.bd_bit(d)
+    (*f).skip_p = 0
+    if (*f).skip_on == 1 {
+        (*f).skip_p = vp8bool.bd_uint(d, 8)
+    }
+    if !key {
+        read_inter_probs(f, d)
+    }
+    return HDR_OK
+}

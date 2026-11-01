@@ -124,6 +124,9 @@ rc=$?
 t5=$(date +%s%N)
 [ $rc -eq 0 ] || fail "pack.fi stopped with $rc"
 echo "   time for the packing: $(( (t5 - t4) / 1000000 )) ms"
+python3 -I tools/ucd/blobpack.py "$WORK/table.fi" > "$WORK/table_blob.fi" \
+    || fail "blobpack.py failed"
+cp "$WORK/table_blob.fi" "$WORK/table.fi"
 
 # ------------------------------------------------------------ 5. firnfmt
 echo
@@ -173,7 +176,7 @@ echo "     level 2             : $L2 blocks x 64 octets = $((L2 * 64)) octets"
 echo "     level 3             : $L3 blocks x 16 octets = $((L3 * 16)) octets"
 echo "     case mappings       : $UPR + $LOR runs x 8 octets = $(((UPR + LOR) * 8)) octets, plus 2 x 256 octets index"
 echo "   the generated source  : $(stat -c%s "$OUT") octets, $(wc -l < "$OUT") lines"
-echo "   words written         : $(grep -c '^    w(p, ' "$OUT") of $((BYTES / 8)) (the zero words come from mmap)"
+echo "   blob size             : $(grep -o 'const BLOB: str = "[^"]*"' "$OUT" | wc -c) octets of base64 for $BYTES octets"
 
 echo
 echo "OK: $OUT built out of the Unicode Character Database $UVER."

@@ -864,6 +864,8 @@ build ds_tpl_logic
 "$W/ds_tpl_logic"
 build ds_store_touch
 "$W/ds_store_touch"
+build ds_tpl_touch
+"$W/ds_tpl_touch"
 python3 -I tools/fui/ds_icons_set.py --check examples/fui_apps/tpl_settings examples/fui_apps/tpl_wizard examples/fui_apps/tpl_store examples/fui_apps/tpl_files
 echo "== DS3b PAGE TEMPLATES (r576): settings + wizard vs HTML reference, SSIM >= 0.95 =="
 FIRNC="$FIRNC" bash tools/fui/ds_ref/tpl_gate.sh
@@ -993,6 +995,8 @@ build ripplewire
 "$W/ripplewire" | tail -n 1 | grep -q "RIPPLEWIRE PASSED"
 build splitnode
 "$W/splitnode" | tail -n 1 | grep -q "SPLITNODE PASSED"
+build kpview
+"$W/kpview" | tail -n 1 | grep -q "KPVIEW PASSED"
 # wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
 build wave6
 "$W/wave6" | tail -n 3
@@ -1197,7 +1201,13 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   tools/android/build.sh -- so it cannot silently stop building either.
 for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
-        "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+        if ! "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null 2>"$W/android_build.err"; then
+            cat "$W/android_build.err"
+            if grep -q "unknown section .data.rel.ro" "$W/android_build.err"; then
+                echo "  $FIRNC is older than the .data.rel.ro assembler support (5ea96f364): rebuild it with 'heavy cargo build --release' in compiler/"
+            fi
+            exit 1
+        fi
     elif grep -q '^import gpu\.wgl' "$f"; then
         # A Windows-only program (lib/gpu/wgl.windows.fi has no Linux twin;
         # tools/fui/uiacom.sh runs it under Wine): built for x86_64-windows.

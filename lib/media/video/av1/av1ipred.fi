@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1ipm
+import media.video.av1.av1ippl
+import media.video.av1.av1ipdir
+import media.video.av1.av1ipfilt
+
+export { predict_intra, IPRED_SCRATCH }
+
+const IPRED_SCRATCH: usize = 4096
+
+static ANGLE: [i64; 14] = [0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0, 0]
+
+fn pred_plain(buf: u64, stride: i64, x: i64, y: i64, w: i64, h: i64, mode: i64, n_top: i64, n_left: i64, bd: i64, scr: u64) {
+    let dst: u64 = buf + ((y * stride + x) * 2) as u64
+    let base: i64 = 128 << ((bd - 8) as u64)
+    let above: u64 = scr + 32
+    let left: u64 = scr + 400
+    let aref: u64 = (((buf as i64) + (((y - 1) * stride + x) * 2)) as u64)
+    let lref: u64 = (((buf as i64) + ((y * stride + x - 1) * 2)) as u64)
+    av1ipm.fill_px(scr, 0, 176, base - 1)
+    av1ipm.fill_px(scr + 368, 0, 176, base + 1)
+    var i: i64 = 0
+    if n_left > 0 {
+        while i < n_left {
+            av1ipm.st(left, i, av1ipm.ld(lref, i * stride))
+            i = i + 1
+        }
+        if i < h {
+            av1ipm.fill_px(left, i, h - i, av1ipm.ld(left, i - 1))
+        }
+    } else {
+        if n_top > 0 {
+            av1ipm.fill_px(left, 0, h, av1ipm.ld(aref, 0))
+        }
+    }
+    if n_top > 0 {
+        i = 0
+        while i < n_top {
+            av1ipm.st(above, i, av1ipm.ld(aref, i))
+            i = i + 1
+        }
+        if i < w {
+            av1ipm.fill_px(above, i, w - i, av1ipm.ld(above, i - 1))
+        }
+    } else {
+        if n_left > 0 {
+            av1ipm.fill_px(above, 0, w, av1ipm.ld(lref, 0))
+        }
+    }
+    var tl: i64 = base
+    if n_top > 0 && n_left > 0 {
+        tl = av1ipm.ld(aref, 0 - 1)
+    } else {
+        if n_top > 0 {
+            tl = av1ipm.ld(aref, 0)
+        } else {
+            if n_left > 0 {
+                tl = av1ipm.ld(lref, 0)
+            }
+        }
+    }
+    av1ipm.st(above, 0 - 1, tl)
+    av1ipm.st(left, 0 - 1, tl)
+    if mode == 0 {
+        av1ippl.pred_dc(dst, stride, w, h, above, left, n_left > 0, n_top > 0, bd)
+    }
+    if mode == 9 {
+        av1ippl.pred_smooth(dst, stride, w, h, above, left)
+    }
+    if mode == 10 {
+        av1ippl.pred_smooth_v(dst, stride, w, h, above, left)
+    }
+    if mode == 11 {
+        av1ippl.pred_smooth_h(dst, stride, w, h, above, left)
+    }
+    if mode == 12 {
+        av1ippl.pred_paeth(dst, stride, w, h, above, left)
+    }
+}
+
+fn predict_intra(buf: u64, stride: i64, x: i64, y: i64, w: i64, h: i64, mode: i64, angle_delta: i64, filter_mode: i64, have_left: bool, have_above: bool, have_above_right: bool, have_below_left: bool, xr: i64, yd: i64, edge_type: i64, edge_filter: bool, bd: i64, scr: u64) {
+    var n_top: i64 = 0
+    var n_left: i64 = 0
+    if have_above {
+        n_top = av1ipm.imin(w, xr + w)
+    }
+    if have_left {
+        n_left = av1ipm.imin(h, yd + h)
+    }
+    let use_filter: bool = filter_mode >= 0
+    let is_dr: bool = mode >= 1 && mode <= 8
+    if !use_filter && !is_dr {
+        pred_plain(buf, stride, x, y, w, h, mode, n_top, n_left, bd, scr)
+        return
+    }
+    let dst: u64 = buf + ((y * stride + x) * 2) as u64
+    let base: i64 = 128 << ((bd - 8) as u64)
+    let above: u64 = scr + 32
+    let left: u64 = scr + 400
+    let tmp: u64 = scr + 800
+    let fbuf: u64 = scr + 1200
+    let aref: u64 = (((buf as i64) + (((y - 1) * stride + x) * 2)) as u64)
+    let lref: u64 = (((buf as i64) + ((y * stride + x - 1) * 2)) as u64)
+    var p_angle: i64 = 0
+    var need_above: bool = true
+    var need_left: bool = true
+    var need_tr: bool = false
+    var need_bl: bool = false
+    if is_dr {
+        p_angle = ANGLE[mode as usize] + angle_delta * 3
+        need_above = p_angle < 180
+        need_left = p_angle > 90
+        need_tr = p_angle < 90
+        need_bl = p_angle > 180
+    }
+    if use_filter {
+        need_above = true
+        need_left = true
+        need_tr = false
+        need_bl = false
+    }
+    var n_tr: i64 = 0 - 1
+    var n_bl: i64 = 0 - 1
+    if need_tr {
+        n_tr = 0
+        if have_above_right {
+            n_tr = av1ipm.imax(0, av1ipm.imin(xr, w))
+        }
+    }
+    if need_bl {
+        n_bl = 0
+        if have_below_left {
+            n_bl = av1ipm.imax(0, av1ipm.imin(yd, h))
+        }
+    }
+    av1ipm.fill_px(scr, 0, 176, base - 1)
+    av1ipm.fill_px(scr + 368, 0, 176, base + 1)
+    if (!need_above && n_left == 0) || (!need_left && n_top == 0) {
+        var v: i64 = base - 1
+        if need_left {
+            v = base + 1
+            if n_top > 0 {
+                v = av1ipm.ld(aref, 0)
+            }
+        } else {
+            if n_left > 0 {
+                v = av1ipm.ld(lref, 0)
+            }
+        }
+        av1ippl.pred_const(dst, stride, w, h, v)
+        return
+    }
+    var i: i64 = 0
+    if need_left {
+        var need_n: i64 = h
+        if n_bl >= 0 {
+            need_n = h + w
+        }
+        if n_left > 0 {
+            while i < n_left {
+                av1ipm.st(left, i, av1ipm.ld(lref, i * stride))
+                i = i + 1
+            }
+            if n_bl > 0 {
+                while i < h + n_bl {
+                    av1ipm.st(left, i, av1ipm.ld(lref, i * stride))
+                    i = i + 1
+                }
+            }
+            if i < need_n {
+                av1ipm.fill_px(left, i, need_n - i, av1ipm.ld(left, i - 1))
+            }
+        } else {
+            if n_top > 0 {
+                av1ipm.fill_px(left, 0, need_n, av1ipm.ld(aref, 0))
+            }
+        }
+    }
+    if need_above {
+        var need_n: i64 = w
+        if n_tr >= 0 {
+            need_n = w + h
+        }
+        if n_top > 0 {
+            i = 0
+            while i < n_top {
+                av1ipm.st(above, i, av1ipm.ld(aref, i))
+                i = i + 1
+            }
+            if n_tr > 0 {
+                var k: i64 = 0
+                while k < n_tr {
+                    av1ipm.st(above, w + k, av1ipm.ld(aref, w + k))
+                    k = k + 1
+                }
+                i = i + n_tr
+            }
+            if i < need_n {
+                av1ipm.fill_px(above, i, need_n - i, av1ipm.ld(above, i - 1))
+            }
+        } else {
+            if n_left > 0 {
+                av1ipm.fill_px(above, 0, need_n, av1ipm.ld(lref, 0))
+            }
+        }
+    }
+    var tl: i64 = base
+    if n_top > 0 && n_left > 0 {
+        tl = av1ipm.ld(aref, 0 - 1)
+    } else {
+        if n_top > 0 {
+            tl = av1ipm.ld(aref, 0)
+        } else {
+            if n_left > 0 {
+                tl = av1ipm.ld(lref, 0)
+            }
+        }
+    }
+    av1ipm.st(above, 0 - 1, tl)
+    av1ipm.st(left, 0 - 1, tl)
+    if use_filter {
+        av1ipfilt.pred_filter_intra(dst, stride, w, h, above, left, filter_mode, bd, fbuf)
+        return
+    }
+    var up_a: i64 = 0
+    var up_l: i64 = 0
+    if edge_filter {
+        if p_angle != 90 && p_angle != 180 {
+            if need_above && need_left && w + h >= 24 {
+                av1ipdir.filter_corner(above, left)
+            }
+            if need_above && n_top > 0 {
+                let s: i64 = av1ipdir.edge_strength(w, h, p_angle - 90, edge_type)
+                var n_px: i64 = n_top + 1
+                if need_tr {
+                    n_px = n_px + h
+                }
+                av1ipdir.filter_edge(above - 2, n_px, s, tmp)
+            }
+            if need_left && n_left > 0 {
+                let s: i64 = av1ipdir.edge_strength(h, w, p_angle - 180, edge_type)
+                var n_px: i64 = n_left + 1
+                if need_bl {
+                    n_px = n_px + w
+                }
+                av1ipdir.filter_edge(left - 2, n_px, s, tmp)
+            }
+        }
+        if av1ipdir.use_upsample(w, h, p_angle - 90, edge_type) {
+            up_a = 1
+            if need_above {
+                var n_px: i64 = w
+                if need_tr {
+                    n_px = n_px + h
+                }
+                av1ipdir.upsample_edge(above, n_px, bd, tmp)
+            }
+        }
+        if av1ipdir.use_upsample(h, w, p_angle - 180, edge_type) {
+            up_l = 1
+            if need_left {
+                var n_px: i64 = h
+                if need_bl {
+                    n_px = n_px + w
+                }
+                av1ipdir.upsample_edge(left, n_px, bd, tmp)
+            }
+        }
+    }
+    if p_angle == 90 {
+        av1ippl.pred_v(dst, stride, w, h, above)
+        return
+    }
+    if p_angle == 180 {
+        av1ippl.pred_h(dst, stride, w, h, left)
+        return
+    }
+    av1ipdir.dr_pred(dst, stride, w, h, above, left, up_a, up_l, p_angle)
+}

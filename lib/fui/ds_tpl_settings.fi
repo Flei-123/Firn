@@ -3,9 +3,11 @@ import std.rt
 import paint.canvas
 import fui.ds_iconbtn
 import fui.ds_navview
+import fui.ds_scroller
 import fui.ds_settings
 import fui.ds_swatch
 import fui.ds_tokens
+import fui.ds_touchpan
 import fui.editor
 import fui.kit
 import fui.kitcolor
@@ -13,6 +15,7 @@ import fui.kitform
 import fui.painter
 import fui.render
 import fui.screen
+import fui.screenext
 import fui.style
 import fui.theme
 import plat.fuiwirt
@@ -54,8 +57,11 @@ struct Tpl {
     opened: bool,
     seen: [i64; 48],
     rev: u64,
-    scroll: f64,
+    rows: ds_scroller.Scroller,
+    lscroll: ds_scroller.Scroller,
+    pan: ds_touchpan.Pan,
     content_h: f64,
+    list_h: f64,
     view_y: f64,
     view_h: f64,
     stacked: bool,
@@ -114,8 +120,16 @@ fn new(title: str, apply: fn(u64, usize, i64), fire: fn(u64, usize), ud: u64) ->
     (*t).page = 0
     (*t).opened = false
     (*t).rev = 0
-    (*t).scroll = 0.0
+    ds_scroller.scroller_init(&(*t).rows)
+    ds_scroller.scroller_init(&(*t).lscroll)
+    (*t).pan = ds_touchpan.pan_new()
+    let ra: *mut ds_scroller.Scroller = &(*t).rows
+    let rb: *mut ds_scroller.Scroller = &(*t).lscroll
+    ds_touchpan.attach(&(*t).pan, ds_touchpan.R_A, ra as u64)
+    ds_touchpan.attach(&(*t).pan, ds_touchpan.R_B, rb as u64)
+    ds_touchpan.forward_x(&(*t).pan, true)
     (*t).content_h = 0.0
+    (*t).list_h = 0.0
     (*t).view_y = 0.0
     (*t).view_h = 0.0
     (*t).stacked = false
@@ -298,10 +312,7 @@ fn draw_rows(t: *mut Tpl, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, px
     (*t).swatch_on = false
     (*t).view_y = y
     (*t).view_h = h
-    var room: f64 = (*t).content_h - h
-    if room < 0.0 { room = 0.0 }
-    if (*t).scroll > room { (*t).scroll = room }
-    if (*t).scroll < 0.0 { (*t).scroll = 0.0 }
+    ds_scroller.fit(&(*t).rows, x, y, w, h, (*t).content_h)
     let cv: *mut canvas.Canvas = painter.painter_canvas(render.ctx_painter(c))
     let pushed: bool = canvas.clip_push_rect(cv, x - kit.ln(c, 8), y, x + w + kit.ln(c, 8), y + h)
     var vx: f64 = px
@@ -310,7 +321,7 @@ fn draw_rows(t: *mut Tpl, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, px
         vx = 0.0 - 1.0
         vy = 0.0 - 1.0
     }
-    let top: f64 = y - (*t).scroll
+    let top: f64 = y - ds_scroller.offset(&(*t).rows)
     ds_settings.begin(p, c, x, top, w, vx, vy)
     var i: usize = 0
     while i < (*t).n {
@@ -322,6 +333,7 @@ fn draw_rows(t: *mut Tpl, c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, px
         ds_settings.advance(p, kit.ln(c, 36))
     }
     (*t).content_h = ds_settings.y_end(p) - top + kit.ln(c, 24)
+    ds_scroller.fit(&(*t).rows, x, y, w, h, (*t).content_h)
     if pushed { canvas.clip_pop(cv) }
     ds_settings.end(p, c)
 }
@@ -365,12 +377,27 @@ fn paint_list(t: *mut Tpl, c: *mut render.Ctx, ox: f64, oy: f64, w: f64, h: f64,
         return
     }
     let lp: *mut ds_settings.Panel = list_of(t)
-    ds_settings.begin(lp, c, ox + pad, top, w - pad * 2.0, px, py)
+    let lh: f64 = oy + h - top
+    (*t).view_y = top
+    ds_scroller.fit(&(*t).lscroll, ox + pad, top, w - pad * 2.0, lh, (*t).list_h)
+    let cv: *mut canvas.Canvas = painter.painter_canvas(render.ctx_painter(c))
+    let clipped: bool = ds_scroller.limit(&(*t).lscroll) > 0.0
+    var pushed: bool = false
+    var vy: f64 = py
+    if clipped {
+        pushed = canvas.clip_push_rect(cv, ox, top, ox + w, top + lh)
+        if py < top || py >= top + lh { vy = 0.0 - 1.0 }
+    }
+    let first: f64 = top - ds_scroller.offset(&(*t).lscroll)
+    ds_settings.begin(lp, c, ox + pad, first, w - pad * 2.0, px, vy)
     var i: usize = 0
     while i < (*t).pages {
         ds_settings.row_chevron(lp, c, i, (*t).picon[i], ds_navview.label_at(nav_of(t), i), "")
         i = i + 1
     }
+    (*t).list_h = ds_settings.y_end(lp) - first
+    ds_scroller.fit(&(*t).lscroll, ox + pad, top, w - pad * 2.0, lh, (*t).list_h)
+    if pushed { canvas.clip_pop(cv) }
     ds_settings.end(lp, c)
 }
 
@@ -385,11 +412,29 @@ fn paint_page(t: *mut Tpl, c: *mut render.Ctx, ox: f64, oy: f64, w: f64, h: f64,
     draw_rows(t, c, ox + pad, top, w - pad * 2.0, oy + h - top, px, py)
 }
 
+fn set_regions(t: *mut Tpl, ox: f64, oy: f64, w: f64, h: f64) {
+    let pn: *mut ds_touchpan.Pan = &(*t).pan
+    ds_touchpan.region(pn, ds_touchpan.R_NAV, 0.0, 0.0, 0.0, 0.0)
+    ds_touchpan.region(pn, ds_touchpan.R_A, 0.0, 0.0, 0.0, 0.0)
+    ds_touchpan.region(pn, ds_touchpan.R_B, 0.0, 0.0, 0.0, 0.0)
+    if (*t).stacked {
+        if (*t).opened || searching(t) { ds_touchpan.region(pn, ds_touchpan.R_A, ox, oy, w, h) } else { ds_touchpan.region(pn, ds_touchpan.R_B, ox, oy, w, h) }
+        return
+    }
+    let v: *mut ds_navview.NavView = nav_of(t)
+    ds_touchpan.attach(pn, ds_touchpan.R_NAV, v as u64)
+    let cx: f64 = ds_navview.content_x(v)
+    ds_touchpan.region(pn, ds_touchpan.R_NAV, ox, oy, cx - ox, h)
+    ds_touchpan.region(pn, ds_touchpan.R_A, cx, oy, ox + w - cx, h)
+}
+
 fn paint_in(ud: u64, c: *mut render.Ctx, ox: f64, oy: f64, w: f64, h: f64, px: f64, py: f64) {
     let t: *mut Tpl = tp(ud)
     (*t).ctx = c as u64
     painter.surface(render.ctx_painter(c), ox, oy, w, h, kit.tokc(c, style.TOK_BASE))
     (*t).stacked = w < kit.ln(c, 641)
+    ds_touchpan.frame(&(*t).pan, c)
+    set_regions(t, ox, oy, w, h)
     if !(*t).stacked {
         paint_wide(t, c, ox, oy, w, h, px, py)
         return
@@ -443,7 +488,7 @@ fn sync_swatch(t: *mut Tpl) {
 fn open_page(t: *mut Tpl, i: usize) {
     (*t).page = i
     (*t).opened = true
-    (*t).scroll = 0.0
+    ds_scroller.reset(&(*t).rows)
     (*t).content_h = 0.0
     ds_settings.reset(panel_of(t))
 }
@@ -451,7 +496,7 @@ fn open_page(t: *mut Tpl, i: usize) {
 fn close_page(t: *mut Tpl) -> bool {
     if !(*t).opened { return false }
     (*t).opened = false
-    (*t).scroll = 0.0
+    ds_scroller.reset(&(*t).rows)
     (*t).content_h = 0.0
     ds_settings.reset(panel_of(t))
     return true
@@ -463,7 +508,7 @@ fn press(ud: u64, x: f64, y: f64) {
     let s: *mut kit.Search = search_of(t)
     let hit: bool = kitform.field_box_press(c, s, (*t).sx, (*t).sy, (*t).sw, (*t).sh, x, y, 0 as u64)
     if hit {
-        (*t).scroll = 0.0
+        ds_scroller.reset(&(*t).rows)
         return
     }
     kit.search_focus(s, false)
@@ -471,7 +516,7 @@ fn press(ud: u64, x: f64, y: f64) {
         if (*t).opened {
             if ds_iconbtn.press(back_of(t), x, y) != NONE { return }
         } else if !searching(t) {
-            ds_settings.press(list_of(t), x, y)
+            if y >= (*t).view_y { ds_settings.press(list_of(t), x, y) }
             return
         }
     } else {
@@ -479,7 +524,7 @@ fn press(ud: u64, x: f64, y: f64) {
         let ev: u32 = ds_navview.press(v, x, y)
         if ev == ds_navview.EV_SELECT {
             (*t).page = ds_navview.selected(v)
-            (*t).scroll = 0.0
+            ds_scroller.reset(&(*t).rows)
             (*t).content_h = 0.0
             ds_settings.reset(panel_of(t))
             return
@@ -527,7 +572,7 @@ fn key(ud: u64, k: u32, mods: u32) -> bool {
     if kit.search_has_focus(s) {
         if k == editor.KEY_ESC && kit.search_text_len(s) == 0 { kit.search_focus(s, false) }
         else { kit.search_key(s, k, mods) }
-        (*t).scroll = 0.0
+        ds_scroller.reset(&(*t).rows)
         return true
     }
     if (*t).stacked && !(*t).opened && !searching(t) {
@@ -554,7 +599,7 @@ fn key(ud: u64, k: u32, mods: u32) -> bool {
         let ev: u32 = ds_navview.key(v, k, mods)
         if ev == ds_navview.EV_SELECT {
             (*t).page = ds_navview.selected(v)
-            (*t).scroll = 0.0
+            ds_scroller.reset(&(*t).rows)
             (*t).content_h = 0.0
             return true
         }
@@ -567,7 +612,7 @@ fn text(ud: u64, cp: u32, mods: u32) -> bool {
     let s: *mut kit.Search = search_of(t)
     if kit.search_has_focus(s) {
         kit.search_char(s, cp, mods)
-        (*t).scroll = 0.0
+        ds_scroller.reset(&(*t).rows)
         return true
     }
     if (*t).swatch_on && ds_swatch.foc(swatch_of(t)) >= 0 as i64 {
@@ -585,9 +630,43 @@ fn text(ud: u64, cp: u32, mods: u32) -> bool {
 fn wheel(ud: u64, px: f64, py: f64, dx: f64, dy: f64) -> bool {
     let t: *mut Tpl = tp(ud)
     if ds_navview.wheel(nav_of(t), px, py, dy) { return true }
-    (*t).scroll = (*t).scroll + dy * kit.ln(ctx(t), 48)
+    let step: f64 = dy * kit.ln(ctx(t), 48)
+    if (*t).stacked && !(*t).opened && !searching(t) { ds_scroller.wheel_by(&(*t).lscroll, step) } else { ds_scroller.wheel_by(&(*t).rows, step) }
     return true
 }
+
+fn touch_down(ud: u64, x: f64, y: f64, us: i64) {
+    ds_touchpan.down(&(*tp(ud)).pan, x, y, us)
+}
+
+fn touch_move(ud: u64, x: f64, y: f64, us: i64) -> bool {
+    let t: *mut Tpl = tp(ud)
+    let r: u32 = ds_touchpan.move(&(*t).pan, ctx(t), x, y, us)
+    if r == ds_touchpan.MV_FWD_START { press(ud, ds_touchpan.press_x(&(*t).pan), ds_touchpan.press_y(&(*t).pan)) }
+    if r == ds_touchpan.MV_FWD_START || r == ds_touchpan.MV_FWD { pointer(ud, fuiwirt.HOOK_MOVE, x, y) }
+    return r != ds_touchpan.MV_NONE
+}
+
+fn touch_up(ud: u64, x: f64, y: f64, us: i64) -> bool {
+    let t: *mut Tpl = tp(ud)
+    let r: u32 = ds_touchpan.up(&(*t).pan, ctx(t), us)
+    if r == ds_touchpan.UP_TAP {
+        press(ud, ds_touchpan.press_x(&(*t).pan), ds_touchpan.press_y(&(*t).pan))
+        pointer(ud, fuiwirt.HOOK_UP, x, y)
+    }
+    if r == ds_touchpan.UP_FWD { pointer(ud, fuiwirt.HOOK_UP, x, y) }
+    return r != ds_touchpan.UP_NONE
+}
+
+fn touch_pointer(ud: u64, kind: u32, id: u32, ptype: u32, x: f64, y: f64, pressure: f64) -> bool {
+    let t: *mut Tpl = tp(ud)
+    return ds_touchpan.record(&(*t).pan, ctx(t), kind, id, ptype, x, y, touch_down, touch_move, touch_up, ud)
+}
+
+fn tick(ud: u64, ms: i64) -> bool { return ds_touchpan.tick(&(*tp(ud)).pan, ms) }
+fn moving(ud: u64) -> bool { return ds_touchpan.moving(&(*tp(ud)).pan) }
+fn rows_scroll_y(ud: u64) -> f64 { return ds_scroller.position(&(*tp(ud)).rows) }
+fn list_scroll_y(ud: u64) -> f64 { return ds_scroller.position(&(*tp(ud)).lscroll) }
 
 fn skin(m: *mut theme.Theme, dark: bool) {
     ds_tokens.apply(m, dark, ACCENT)
@@ -607,5 +686,5 @@ fn run(start: u64, t: *mut Tpl, w: usize, h: usize) -> i32 {
         while rt.ld8(a, n) != 0 as u8 { n = n + 1 }
         kit.search_set_text(search_of(t), str { p: a as *mut u8, n: n })
     }
-    return screen.run_full(start, (*t).title, w, h, t as u64, paint, press, key, text, wheel, pointer, skin)
+    return screen.run_ext(start, (*t).title, w, h, t as u64, paint, press, key, text, wheel, pointer, screenext.extras_pointers(screenext.extras_blank(), touch_pointer), skin)
 }

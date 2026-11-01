@@ -5,16 +5,16 @@
 # arithmetic of every quad kind is identical on all backends; only the interface lines are rewritten for Vulkan:
 #   #version 300 es      -> #version 450
 #   precision ...;       -> dropped
-#   uniform vec2/int/... -> one std140 block `P` at set 0 binding 0 (u_size, u_srcsize, u_nspot, u_spot[8]; 160 octets)
+#   uniform vec2/int/... -> one std140 block `P` at set 0 binding 0 (u_size, u_srcsize, u_nspot, u_spot[8], u_shape[32]; 672 octets)
 #   uniform sampler2D    -> set 0 binding 1 (u_atlas), 2 (u_stream), 3 (u_src)
 #   flat in/out vec4 v_x -> explicit locations 0..6 (c0 c1 g p t clip k), out vec4 o -> location 0
 # The .spv files are committed; the tests do not need the tools. Needs glslangValidator + spirv-val.
 set -e
 cd "$(dirname "$0")"
 conv() {
-    sed -e 's/^#version 300 es/#version 450\nlayout(set = 0, binding = 0, std140) uniform P { vec2 u_size; vec2 u_srcsize; int u_nspot; vec4 u_spot[8]; };/' \
+    sed -e 's/^#version 300 es/#version 450\nlayout(set = 0, binding = 0, std140) uniform P { vec2 u_size; vec2 u_srcsize; int u_nspot; vec4 u_spot[8]; vec4 u_shape[32]; };/' \
         -e '/^precision /d' \
-        -e '/^uniform vec2 u_size;/d' -e '/^uniform vec2 u_srcsize;/d' -e '/^uniform vec4 u_spot\[8\];/d' -e '/^uniform int u_nspot;/d' \
+        -e '/^uniform vec2 u_size;/d' -e '/^uniform vec2 u_srcsize;/d' -e '/^uniform vec4 u_spot\[8\];/d' -e '/^uniform int u_nspot;/d' -e '/^uniform vec4 u_shape\[32\];/d' \
         -e 's/^uniform sampler2D u_atlas;/layout(set = 0, binding = 1) uniform sampler2D u_atlas;/' \
         -e 's/^uniform sampler2D u_stream;/layout(set = 0, binding = 2) uniform sampler2D u_stream;/' \
         -e 's/^uniform sampler2D u_src;/layout(set = 0, binding = 3) uniform sampler2D u_src;/' \

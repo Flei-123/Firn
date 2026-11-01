@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: MPL-2.0
+import rt.rt
+import docview.pdf.pobj
+import docview.pdf.pdoc
+import font.ttf
+import font.cff
+import font.cffcs
+import font.type1
+import font.t1cs
+import font.gpath
+import docview.pdf.std14_data
+
+export {
+    EmbFont,
+    emb_new, emb_free, emb_load, emb_ok, emb_font, emb_gid,
+    emb_is_path, emb_upem, emb_outline,
+}
+
+struct EmbFont {
+    font: ttf.Font,
+    data: rt.Buf,
+    gids: rt.Buf,
+    ok: u32,
+    cid: u32,
+    symbolic: u32,
+    named: u32,
+    kind: u32,
+    cf: cff.CffFont,
+    t1: type1.T1Font,
+    dn: [u32; 256],
+    names: rt.Buf,
+    dl: [u32; 256],
+}
+
+fn emb_new() -> EmbFont {
+    return EmbFont { font: ttf.font_new(), data: rt.buf_new(),
+        gids: rt.buf_new(), ok: 0, cid: 0, symbolic: 0, named: 0, kind: 0,
+        cf: cff.cff_new(), t1: type1.t1_new(), dn: [0 as u32; 256], names: rt.buf_new(), dl: [0 as u32; 256] }
+}
+
+fn emb_free(e: *mut EmbFont) {
+    if (*e).ok != 0 as u32 && (*e).kind == 0 as u32 {
+        ttf.font_kern_release(&(*e).font)
+    }
+    cff.cff_free(&(*e).cf)
+    type1.t1_free(&(*e).t1)
+    rt.buf_free(&(*e).names)
+    rt.buf_free(&(*e).data)
+    rt.buf_free(&(*e).gids)
+    (*e).ok = 0
+}
+
+#[no_gc]
+fn emb_ok(e: *mut EmbFont) -> bool {
+    return (*e).ok != 0 as u32
+}
+
+#[no_gc]
+fn emb_font(e: *mut EmbFont) -> *mut ttf.Font {
+    return &(*e).font
+}
+
+fn emb_load(d: *mut pdoc.Doc, dict: u32, e: *mut EmbFont) {
+    emb_free(e)
+    *e = emb_new()
+    let ar: *mut pobj.PdfArena = &(*d).ar
+    if pobj.o_kind(ar, dict) != pobj.T_DICT {
+        return
+    }
+    var work: u32 = dict
+    var stn: [u8; 7] = "Subtype"
+    var t0: [u8; 5] = "Type0"
+    let st: u32 = pdoc.doc_dict_get(d, dict, (&stn[0]) as u64, 7)
+    if pobj.o_name_eq(ar, st, (&t0[0]) as u64, 5) {
+        (*e).cid = 1
+        var dfn: [u8; 15] = "DescendantFonts"
+        let df: u32 = pdoc.doc_dict_get(d, dict, (&dfn[0]) as u64, 15)
+        if pobj.o_kind(ar, df) != pobj.T_ARR || pobj.o_arr_len(ar, df) == 0 {
+            return
+        }
+        work = pdoc.doc_resolve(d, pobj.o_arr_at(ar, df, 0))
+        if pobj.o_kind(ar, work) != pobj.T_DICT {
+            return
+        }
+    }
+    var fdn: [u8; 14] = "FontDescriptor"
+    let fd: u32 = pdoc.doc_dict_get(d, work, (&fdn[0]) as u64, 14)
+    if pobj.o_kind(ar, fd) != pobj.T_DICT {
+        return
+    }
+    var ffn: [u8; 9] = "FontFile2"
+    var f3n: [u8; 9] = "FontFile3"
+    var f1n: [u8; 8] = "FontFile"
+    let ff: u32 = pdoc.doc_dict_get(d, fd, (&ffn[0]) as u64, 9)
+    let ff3: u32 = pdoc.doc_dict_get(d, fd, (&f3n[0]) as u64, 9)
+    let ff1: u32 = pdoc.doc_dict_get(d, fd, (&f1n[0]) as u64, 8)
+    if pobj.o_kind(ar, ff) == pobj.T_STREAM {
+        if !load_ttf(d, ff, e) {
+            return
+        }
+    } else if pobj.o_kind(ar, ff3) == pobj.T_STREAM {
+        if !load_cff(d, ff3, e) {
+            return
+        }
+    } else if pobj.o_kind(ar, ff1) == pobj.T_STREAM {
+        if !load_t1(d, ff1, e) {
+            return
+        }
+    } else {
+        return
+    }
+    var fl: [u8; 5] = "Flags"
+    let flags: i64 = pdoc.doc_int(d, fd, (&fl[0]) as u64, 5, 0)
+    if (flags & 4) != 0 {
+        (*e).symbolic = 1
+    }
+    var enn: [u8; 8] = "Encoding"
+    let enc: u32 = pdoc.doc_dict_get(d, dict, (&enn[0]) as u64, 8)
+    if enc != 0 as u32 {
+        (*e).named = 1
+    }
+    if (*e).kind != 0 as u32 && (*e).cid == 0 as u32 {
+        load_diffs(d, dict, e)
+    }
+    if (*e).cid != 0 as u32 && (*e).kind == 0 as u32 {
+        var cgn: [u8; 11] = "CIDToGIDMap"
+        let cg: u32 = pdoc.doc_dict_get(d, work, (&cgn[0]) as u64, 11)
+        if pobj.o_kind(ar, cg) == pobj.T_STREAM {
+            pdoc.doc_stream(d, cg, &(*e).gids)
+        }
+    }
+    (*e).ok = 1
+}
+
+fn be32(p: u64, at: usize) -> u32 {
+    return ((rt.ld8(p, at) as u32) << 24) | ((rt.ld8(p, at + 1) as u32) << 16) |
+        ((rt.ld8(p, at + 2) as u32) << 8) | (rt.ld8(p, at + 3) as u32)
+}
+
+fn is_otto(p: u64, n: usize) -> bool {
+    return n >= 12 && be32(p, 0) == 0x4F54544F as u32
+}
+
+fn sfnt_table(p: u64, n: usize, tag: u32, off: *mut usize, len: *mut usize) -> bool {
+    let cnt: usize = (((rt.ld8(p, 4) as u32) << 8) | (rt.ld8(p, 5) as u32)) as usize
+    var i: usize = 0
+    while i < cnt {
+        let at: usize = 12 + i * 16
+        if at + 16 > n {
+            return false
+        }
+        if be32(p, at) == tag {
+            let o: usize = be32(p, at + 8) as usize
+            let l: usize = be32(p, at + 12) as usize
+            if o >= n || l > n - o || l < 8 {
+                return false
+            }
+            *off = o
+            *len = l
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn load_ttf(d: *mut pdoc.Doc, ff: u32, e: *mut EmbFont) -> bool {
+    if !pdoc.doc_stream(d, ff, &(*e).data) || rt.buf_len(&(*e).data) < 12 {
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    if is_otto(rt.buf_ptr(&(*e).data), rt.buf_len(&(*e).data)) {
+        rt.buf_free(&(*e).data)
+        return load_cff(d, ff, e)
+    }
+    if !ttf.font_init(&(*e).font, rt.buf_ptr(&(*e).data) as *mut u8,
+        rt.buf_len(&(*e).data)) {
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    return true
+}
+
+fn load_cff(d: *mut pdoc.Doc, ff: u32, e: *mut EmbFont) -> bool {
+    if !pdoc.doc_stream(d, ff, &(*e).data) || rt.buf_len(&(*e).data) < 8 {
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    var base: u64 = rt.buf_ptr(&(*e).data)
+    var len: usize = rt.buf_len(&(*e).data)
+    if is_otto(base, len) {
+        var toff: usize = 0
+        var tlen: usize = 0
+        if !sfnt_table(base, len, 0x43464620 as u32, &toff, &tlen) {
+            rt.buf_free(&(*e).data)
+            return false
+        }
+        base = base + (toff as u64)
+        len = tlen
+    }
+    if !cff.cff_init(&(*e).cf, base, len) {
+        cff.cff_free(&(*e).cf)
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    (*e).kind = 1
+    return true
+}
+
+fn load_t1(d: *mut pdoc.Doc, ff: u32, e: *mut EmbFont) -> bool {
+    if !pdoc.doc_stream(d, ff, &(*e).data) || rt.buf_len(&(*e).data) < 16 {
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    if !type1.t1_init(&(*e).t1, rt.buf_ptr(&(*e).data), rt.buf_len(&(*e).data)) {
+        type1.t1_free(&(*e).t1)
+        rt.buf_free(&(*e).data)
+        return false
+    }
+    (*e).kind = 2
+    return true
+}
+
+fn load_diffs(d: *mut pdoc.Doc, dict: u32, e: *mut EmbFont) {
+    let ar: *mut pobj.PdfArena = &(*d).ar
+    var enn: [u8; 8] = "Encoding"
+    let enc: u32 = pdoc.doc_dict_get(d, dict, (&enn[0]) as u64, 8)
+    if pobj.o_kind(ar, enc) != pobj.T_DICT {
+        return
+    }
+    var dfn: [u8; 11] = "Differences"
+    let df: u32 = pdoc.doc_dict_get(d, enc, (&dfn[0]) as u64, 11)
+    if pobj.o_kind(ar, df) != pobj.T_ARR {
+        return
+    }
+    var bn: [u8; 12] = "BaseEncoding"
+    if pdoc.doc_dict_get(d, enc, (&bn[0]) as u64, 12) == 0 as u32 {
+        (*e).named = 0
+    }
+    var cur: i64 = 0
+    var i: usize = 0
+    let n: usize = pobj.o_arr_len(ar, df)
+    while i < n {
+        let it: u32 = pdoc.doc_resolve(d, pobj.o_arr_at(ar, df, i))
+        if pobj.o_is_num(ar, it) {
+            cur = pobj.o_int(ar, it)
+        } else if pobj.o_kind(ar, it) == pobj.T_NAME {
+            if cur >= 0 && cur < 256 {
+                (*e).dn[cur as usize] = rt.buf_len(&(*e).names) as u32
+                (*e).dl[cur as usize] = pobj.o_str_len(ar, it) as u32
+                rt.buf_push_bytes(&(*e).names, pobj.o_str_ptr(ar, it),
+                    pobj.o_str_len(ar, it))
+            }
+            cur = cur + 1
+        }
+        i = i + 1
+    }
+}
+
+fn emb_is_path(e: *mut EmbFont) -> bool {
+    return (*e).ok != 0 as u32 && (*e).kind != 0 as u32
+}
+
+fn emb_upem(e: *mut EmbFont) -> f64 {
+    if (*e).kind == 1 as u32 {
+        return cff.cff_upem(&(*e).cf)
+    }
+    return type1.t1_upem(&(*e).t1)
+}
+
+fn emb_outline(e: *mut EmbFont, gid: u32, g: *mut gpath.GPath) -> bool {
+    if (*e).kind == 1 as u32 {
+        return cffcs.cffcs_outline(&(*e).cf, gid, g)
+    }
+    return t1cs.t1cs_outline(&(*e).t1, gid, g)
+}
+
+fn path_by_name(e: *mut EmbFont, p: u64, n: usize) -> u32 {
+    if (*e).kind == 1 as u32 {
+        return cff.cff_gid_for_name(&(*e).cf, p, n)
+    }
+    return type1.t1_gid_for_name(&(*e).t1, p, n)
+}
+
+fn path_by_code(e: *mut EmbFont, code: u32) -> u32 {
+    if (*e).kind == 1 as u32 {
+        return cff.cff_gid_for_code(&(*e).cf, code)
+    }
+    return type1.t1_gid_for_code(&(*e).t1, code)
+}
+
+fn path_by_uni(e: *mut EmbFont, uni: u32) -> u32 {
+    var count: usize = type1.t1_glyph_count(&(*e).t1)
+    if (*e).kind == 1 as u32 {
+        count = cff.cff_glyph_count(&(*e).cf)
+    }
+    if count > 700 || uni == 0 as u32 {
+        return 0
+    }
+    var nm: [u8; 64] = [0 as u8; 64]
+    var g: usize = 1
+    while g < count {
+        var nl: usize = 0
+        if (*e).kind == 1 as u32 {
+            nl = cff.cff_name_copy(&(*e).cf, g as u32, &nm[0], 64)
+        } else {
+            nl = type1.t1_name_copy(&(*e).t1, g as u32, &nm[0], 64)
+        }
+        if nl > 0 {
+            let k: i32 = std14_data.std14_name_index((&nm[0]) as u64, nl)
+            if k >= 0 && std14_data.std14_name_unicode(k as usize) == uni {
+                return g as u32
+            }
+        }
+        g = g + 1
+    }
+    return 0
+}
+
+fn path_gid(e: *mut EmbFont, code: u32, uni: u32) -> u32 {
+    if (*e).cid != 0 as u32 {
+        if (*e).kind == 1 as u32 {
+            return cff.cff_gid_for_cid(&(*e).cf, code)
+        }
+        return 0
+    }
+    var gid: u32 = 0
+    if code < 256 as u32 && (*e).dl[code as usize] != 0 as u32 {
+        gid = path_by_name(e, rt.buf_ptr(&(*e).names) + ((*e).dn[code as usize] as u64),
+            (*e).dl[code as usize] as usize)
+        if gid != 0 as u32 {
+            return gid
+        }
+    }
+    if (*e).named != 0 as u32 {
+        gid = path_by_uni(e, uni)
+        if gid != 0 as u32 {
+            return gid
+        }
+    }
+    gid = path_by_code(e, code)
+    if gid != 0 as u32 {
+        return gid
+    }
+    return path_by_uni(e, uni)
+}
+
+fn emb_gid(e: *mut EmbFont, code: u32, uni: u32) -> u32 {
+    if (*e).ok == 0 as u32 {
+        return 0
+    }
+    if (*e).kind != 0 as u32 {
+        return path_gid(e, code, uni)
+    }
+    let f: *mut ttf.Font = &(*e).font
+    if (*e).cid != 0 as u32 {
+        let n: usize = rt.buf_len(&(*e).gids)
+        if n == 0 {
+            return code
+        }
+        let at: usize = (code as usize) * 2
+        if at + 1 >= n {
+            return 0
+        }
+        let p: u64 = rt.buf_ptr(&(*e).gids)
+        return ((rt.ld8(p, at) as u32) << 8) | (rt.ld8(p, at + 1) as u32)
+    }
+    var gid: u32 = 0
+    if (*e).symbolic != 0 as u32 && (*e).named == 0 as u32 {
+        gid = ttf.font_glyph_for(f, 0xF000 + code)
+        if gid == 0 as u32 {
+            gid = ttf.font_glyph_for(f, code)
+        }
+        if gid != 0 as u32 {
+            return gid
+        }
+    }
+    if uni != 0 as u32 {
+        gid = ttf.font_glyph_for(f, uni)
+    }
+    if gid == 0 as u32 {
+        gid = ttf.font_glyph_for(f, 0xF000 + code)
+    }
+    if gid == 0 as u32 && (*e).symbolic != 0 as u32 {
+        gid = ttf.font_glyph_for(f, code)
+    }
+    return gid
+}

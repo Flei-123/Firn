@@ -224,6 +224,12 @@ for f in $(grep '^SAME' "$W/results.tsv" | cut -f2); do
     # native reference.
     lvl=dev-fast
     head -5 "$f" | grep -q '^// only_mode: opt$' && lvl=release-fast
+    if [ ! -f "$W/$id.$lvl.nrc" ]; then
+        "$FIRNC" --opt-level=$lvl -o "$W/$id.$lvl.nat" "$f" > /dev/null 2>&1 || { bad="$bad $f"; continue; }
+        timeout "$RUN_TIMEOUT" "$W/$id.$lvl.nat" < /dev/null > "$W/$id.$lvl.nout" 2> "$W/$id.$lvl.nerr"
+        echo $? > "$W/$id.$lvl.nrc"
+        rm -f "$W/$id.$lvl.nat"
+    fi
     FIRN_WASM_DISPATCH=1 "$FIRNC" --opt-level=$lvl --target=wasm32-browser -o "$W/$id.disp.wasm" "$f" 2>/dev/null || { bad="$bad $f"; continue; }
     n=$((n + 1))
     timeout "$RUN_TIMEOUT" node --stack-size=7800 tools/wasm/run.mjs "$W/$id.disp.wasm" < /dev/null > "$W/$id.dout" 2> "$W/$id.derr"

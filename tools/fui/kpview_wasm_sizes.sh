@@ -14,3 +14,18 @@ for opt in release-fast release-safe; do
         fi
     done
 done
+E=$(mktemp -d)
+trap 'rm -rf "$D" "$E"' EXIT
+bash tools/docview/embedded_toolchain.sh "$E"
+for opt in release-fast release-safe; do
+    if "$FIRNC" --target=wasm32-browser --opt-level=$opt -o "$D/office.wasm" tools/fui/kpview_wasm_office.fi > "$D/office.log" 2>&1; then
+        echo "$opt kpview_wasm_office $(stat -c %s "$D/office.wasm")"
+    else
+        echo "$opt kpview_wasm_office BUILD FAIL"; grep -v RWX "$D/office.log" | head -3
+    fi
+    if FIRNLIB="$E/lib" "$E/compiler/target/release/firnc" --target=wasm32-browser --opt-level=$opt -o "$D/officee.wasm" tools/fui/kpview_wasm_office.fi > "$D/officee.log" 2>&1; then
+        echo "$opt kpview_wasm_office_embedded_fonts $(stat -c %s "$D/officee.wasm")"
+    else
+        echo "$opt kpview_wasm_office_embedded_fonts BUILD FAIL"; grep -v RWX "$D/officee.log" | head -3
+    fi
+done

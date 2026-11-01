@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: MPL-2.0
+// Adobe Type 1 font programs (PFA, PFB, PDF FontFile): eexec, charstring and subroutine tables, encoding.
+import html.mem
+import rt.rt
+import font.cff_data
+
+export {
+    T1Font,
+    t1_new, t1_init, t1_free, t1_ok,
+    t1_glyph_count, t1_upem,
+    t1_gid_for_name, t1_gid_for_code, t1_std_code_gid,
+    t1_name_copy, t1_charstring, t1_subr, t1_data,
+}
+
+const MAX_GLYPHS: usize = 20000
+const MAX_SUBRS: usize = 16384
+
+struct T1Font {
+    src: rt.Buf,
+    dec: rt.Buf,
+    ok: u32,
+    leniv: i32,
+    upem: f64,
+    ng: usize,
+    ns: usize,
+    glyphs: u64,
+    subrs: u64,
+    enc: [u32; 256],
+}
+
+fn t1_new() -> T1Font {
+    return T1Font { src: rt.buf_new(), dec: rt.buf_new(), ok: 0, leniv: 4,
+        upem: 1000.0, ng: 0, ns: 0, glyphs: 0, subrs: 0, enc: [0 as u32; 256] }
+}
+
+fn t1_free(f: *mut T1Font) {
+    rt.buf_free(&(*f).src)
+    rt.buf_free(&(*f).dec)
+    if (*f).glyphs != 0 {
+        mem.heap_free((*f).glyphs as *mut u8, MAX_GLYPHS * 16)
+    }
+    if (*f).subrs != 0 {
+        mem.heap_free((*f).subrs as *mut u8, MAX_SUBRS * 8)
+    }
+    *f = t1_new()
+}
+
+fn t1_ok(f: *mut T1Font) -> bool {
+    return (*f).ok != 0 as u32
+}
+
+fn t1_glyph_count(f: *mut T1Font) -> usize {
+    return (*f).ng + 1
+}
+
+fn t1_upem(f: *mut T1Font) -> f64 {
+    return (*f).upem
+}
+
+fn is_space(c: u8) -> bool {
+    return c == 32 as u8 || c == 10 as u8 || c == 13 as u8 || c == 9 as u8 ||
+        c == 12 as u8 || c == 0 as u8
+}
+
+fn is_delim(c: u8) -> bool {
+    return c == 47 as u8 || c == 91 as u8 || c == 93 as u8 || c == 123 as u8 ||
+        c == 125 as u8 || c == 40 as u8 || c == 41 as u8 || c == 60 as u8 ||
+        c == 62 as u8 || c == 37 as u8
+}
+
+fn next_token(p: u64, n: usize, at: *mut usize, s: *mut usize, l: *mut usize) -> bool {
+    var i: usize = *at
+    while i < n && is_space(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    if i >= n {
+        *at = n
+        return false
+    }
+    let st: usize = i
+    let c: u8 = rt.ld8(p, i)
+    i = i + 1
+    if c == 37 as u8 {
+        while i < n && rt.ld8(p, i) != 10 as u8 && rt.ld8(p, i) != 13 as u8 {
+            i = i + 1
+        }
+        *at = i
+        *s = st
+        *l = 0
+        return true
+    }
+    if c == 47 as u8 || !is_delim(c) {
+        while i < n && !is_space(rt.ld8(p, i)) && !is_delim(rt.ld8(p, i)) {
+            i = i + 1
+        }
+    }
+    *at = i
+    *s = st
+    *l = i - st
+    return true
+}
+
+fn tok_is(p: u64, s: usize, l: usize, lit: u64, n: usize) -> bool {
+    if l != n {
+        return false
+    }
+    return rt.mem_eq(p + s as u64, lit, n)
+}
+
+fn tok_int(p: u64, s: usize, l: usize, out: *mut i64) -> bool {
+    if l == 0 || l > 10 {
+        return false
+    }
+    var i: usize = 0
+    var neg: bool = false
+    if rt.ld8(p, s) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    if i >= l {
+        return false
+    }
+    var v: i64 = 0
+    while i < l {
+        let c: u8 = rt.ld8(p, s + i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 + (((c as u32) - 48) as i64)
+        i = i + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    *out = v
+    return true
+}
+
+fn find_lit(p: u64, n: usize, from: usize, lit: u64, ln: usize) -> i64 {
+    if n < ln {
+        return -1
+    }
+    var i: usize = from
+    while i + ln <= n {
+        if rt.ld8(p, i) == rt.ld8(lit, 0) && rt.mem_eq(p + i as u64, lit, ln) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c as i32) - 48
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c as i32) - 87
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c as i32) - 55
+    }
+    return -1
+}
+
+fn flatten_pfb(src: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i + 6 <= n && rt.ld8(src, i) == 128 as u8 {
+        let kind: u8 = rt.ld8(src, i + 1)
+        if kind == 3 as u8 {
+            break
+        }
+        let sz: usize = (rt.ld8(src, i + 2) as usize) | ((rt.ld8(src, i + 3) as usize) << 8) |
+            ((rt.ld8(src, i + 4) as usize) << 16) | ((rt.ld8(src, i + 5) as usize) << 24)
+        var take: usize = sz
+        if i + 6 + take > n {
+            take = n - i - 6
+        }
+        rt.buf_push_bytes(out, src + (i + 6) as u64, take)
+        i = i + 6 + take
+    }
+    return rt.buf_len(out) > 0
+}
+
+fn eexec_decrypt(src: u64, n: usize, from: usize, out: *mut rt.Buf) {
+    var i: usize = from
+    while i < n && (rt.ld8(src, i) == 32 as u8 || rt.ld8(src, i) == 10 as u8 ||
+        rt.ld8(src, i) == 13 as u8 || rt.ld8(src, i) == 9 as u8) {
+        i = i + 1
+    }
+    var hex: bool = i + 4 <= n
+    var k: usize = 0
+    while k < 4 && i + 4 <= n {
+        if hexv(rt.ld8(src, i + k)) < 0 {
+            hex = false
+        }
+        k = k + 1
+    }
+    var r: u32 = 55665
+    var skipped: usize = 0
+    var hi: i32 = -1
+    while i < n {
+        var c: u32 = rt.ld8(src, i) as u32
+        i = i + 1
+        if hex {
+            let h: i32 = hexv(c as u8)
+            if h < 0 {
+                continue
+            }
+            if hi < 0 {
+                hi = h
+                continue
+            }
+            c = ((hi as u32) << 4) | (h as u32)
+            hi = -1
+        }
+        let plain: u32 = c ^ (r >> 8)
+        r = (((c + r) & 65535) * 52845 + 22719) & 65535
+        if skipped < 4 {
+            skipped = skipped + 1
+        } else {
+            rt.buf_push(out, plain as u8)
+        }
+    }
+}
+
+fn decrypt_in_place(p: u64, off: usize, len: usize) {
+    var r: u32 = 4330
+    var i: usize = 0
+    while i < len {
+        let c: u32 = rt.ld8(p, off + i) as u32
+        rt.st8(p, off + i, (c ^ (r >> 8)) as u8)
+        r = (((c + r) & 65535) * 52845 + 22719) & 65535
+        i = i + 1
+    }
+}
+
+fn parse_binary(p: u64, n: usize, at: *mut usize, off: *mut usize, len: *mut usize) -> bool {
+    var s: usize = 0
+    var l: usize = 0
+    var cnt: i64 = 0
+    if !next_token(p, n, at, &s, &l) || !tok_int(p, s, l, &cnt) {
+        return false
+    }
+    if !next_token(p, n, at, &s, &l) {
+        return false
+    }
+    let start: usize = *at + 1
+    if cnt < 0 || start + (cnt as usize) > n {
+        return false
+    }
+    *off = start
+    *len = cnt as usize
+    *at = start + (cnt as usize)
+    return true
+}
+
+fn load_subrs(f: *mut T1Font, p: u64, n: usize, from: usize) -> usize {
+    var at: usize = from
+    var s: usize = 0
+    var l: usize = 0
+    var cn: [u8; 12] = "/CharStrings"
+    var dup: [u8; 3] = "dup"
+    var cnt: i64 = 0
+    if next_token(p, n, &at, &s, &l) && tok_int(p, s, l, &cnt) {
+        var pos: usize = at
+        while next_token(p, n, &pos, &s, &l) {
+            if tok_is(p, s, l, (&cn[0]) as u64, 12) {
+                return s
+            }
+            if tok_is(p, s, l, (&dup[0]) as u64, 3) {
+                var idx: i64 = 0
+                if !next_token(p, n, &pos, &s, &l) || !tok_int(p, s, l, &idx) {
+                    continue
+                }
+                var off: usize = 0
+                var len: usize = 0
+                if !parse_binary(p, n, &pos, &off, &len) {
+                    continue
+                }
+                if idx >= 0 && (idx as usize) < MAX_SUBRS {
+                    if (*f).leniv >= 0 {
+                        if len >= ((*f).leniv as usize) {
+                            decrypt_in_place(p, off, len)
+                            rt.st32((*f).subrs, (idx as usize) * 2, (off + ((*f).leniv as usize)) as u32)
+                            rt.st32((*f).subrs, (idx as usize) * 2 + 1, (len - ((*f).leniv as usize)) as u32)
+                        }
+                    } else {
+                        rt.st32((*f).subrs, (idx as usize) * 2, off as u32)
+                        rt.st32((*f).subrs, (idx as usize) * 2 + 1, len as u32)
+                    }
+                    if (idx as usize) + 1 > (*f).ns {
+                        (*f).ns = (idx as usize) + 1
+                    }
+                }
+            }
+        }
+    }
+    return n
+}
+
+fn load_chars(f: *mut T1Font, p: u64, n: usize, from: usize) {
+    var at: usize = from
+    var s: usize = 0
+    var l: usize = 0
+    var endl: [u8; 3] = "end"
+    var cnt: i64 = 0
+    if !next_token(p, n, &at, &s, &l) {
+        return
+    }
+    while next_token(p, n, &at, &s, &l) {
+        if tok_is(p, s, l, (&endl[0]) as u64, 3) && (*f).ng > 0 {
+            break
+        }
+        if l > 1 && rt.ld8(p, s) == 47 as u8 && (*f).ng < MAX_GLYPHS {
+            let ns: usize = s + 1
+            let nl: usize = l - 1
+            var off: usize = 0
+            var len: usize = 0
+            if !parse_binary(p, n, &at, &off, &len) {
+                continue
+            }
+            var coff: usize = off
+            var clen: usize = len
+            if (*f).leniv >= 0 {
+                if len < ((*f).leniv as usize) {
+                    continue
+                }
+                decrypt_in_place(p, off, len)
+                coff = off + ((*f).leniv as usize)
+                clen = len - ((*f).leniv as usize)
+            }
+            let k: usize = (*f).ng
+            rt.st32((*f).glyphs, k * 4, ns as u32)
+            rt.st32((*f).glyphs, k * 4 + 1, nl as u32)
+            rt.st32((*f).glyphs, k * 4 + 2, coff as u32)
+            rt.st32((*f).glyphs, k * 4 + 3, clen as u32)
+            (*f).ng = k + 1
+        }
+    }
+}
+
+fn parse_real(p: u64, s: usize, l: usize) -> f64 {
+    var i: usize = 0
+    var neg: bool = false
+    var v: f64 = 0.0
+    var scale: f64 = 1.0
+    var dot: bool = false
+    if l > 0 && rt.ld8(p, s) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    while i < l {
+        let c: u8 = rt.ld8(p, s + i)
+        if c == 46 as u8 {
+            dot = true
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            if dot {
+                scale = scale / 10.0
+                v = v + (((c as u32) - 48) as f64) * scale
+            } else {
+                v = v * 10.0 + (((c as u32) - 48) as f64)
+            }
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    if neg {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn load_matrix(f: *mut T1Font, p: u64, n: usize) {
+    var lit: [u8; 11] = "/FontMatrix"
+    let at0: i64 = find_lit(p, n, 0, (&lit[0]) as u64, 11)
+    if at0 < 0 {
+        return
+    }
+    var at: usize = (at0 as usize) + 11
+    var s: usize = 0
+    var l: usize = 0
+    var guard: usize = 0
+    while next_token(p, n, &at, &s, &l) && guard < 4 {
+        guard = guard + 1
+        if l > 0 && (rt.ld8(p, s) == 45 as u8 || rt.ld8(p, s) == 46 as u8 ||
+            (rt.ld8(p, s) >= 48 as u8 && rt.ld8(p, s) <= 57 as u8)) {
+            let v: f64 = parse_real(p, s, l)
+            if v > 0.0 {
+                (*f).upem = 1.0 / v
+            }
+            return
+        }
+    }
+}
+
+fn load_encoding(f: *mut T1Font, p: u64, n: usize) {
+    var lit: [u8; 9] = "/Encoding"
+    var stdl: [u8; 16] = "StandardEncoding"
+    var dup: [u8; 3] = "dup"
+    var put: [u8; 3] = "put"
+    var def: [u8; 3] = "def"
+    let at0: i64 = find_lit(p, n, 0, (&lit[0]) as u64, 9)
+    if at0 < 0 {
+        return
+    }
+    var at: usize = (at0 as usize) + 9
+    var s: usize = 0
+    var l: usize = 0
+    if !next_token(p, n, &at, &s, &l) {
+        return
+    }
+    if tok_is(p, s, l, (&stdl[0]) as u64, 16) {
+        var c: usize = 0
+        while c < 256 {
+            let sid: u32 = cff_data.cff_std_encoding_sid(c)
+            if sid != 0 as u32 {
+                var nm: [u8; 32] = [0 as u8; 32]
+                let nl: usize = cff_data.cff_std_string_copy(sid as usize, &nm[0], 32)
+                (*f).enc[c] = t1_gid_for_name(f, (&nm[0]) as u64, nl)
+            }
+            c = c + 1
+        }
+        return
+    }
+    var guard: usize = 0
+    while next_token(p, n, &at, &s, &l) && guard < 4000 {
+        guard = guard + 1
+        if tok_is(p, s, l, (&def[0]) as u64, 3) {
+            break
+        }
+        if tok_is(p, s, l, (&dup[0]) as u64, 3) {
+            var code: i64 = 0
+            var s2: usize = 0
+            var l2: usize = 0
+            var pos: usize = at
+            if next_token(p, n, &pos, &s2, &l2) && tok_int(p, s2, l2, &code) {
+                if next_token(p, n, &pos, &s2, &l2) && l2 > 1 && rt.ld8(p, s2) == 47 as u8 {
+                    if code >= 0 && code < 256 {
+                        (*f).enc[code as usize] = t1_gid_for_name(f, p + (s2 + 1) as u64, l2 - 1)
+                    }
+                    at = pos
+                }
+            }
+        }
+    }
+}
+
+fn t1_init(f: *mut T1Font, data: u64, len: usize) -> bool {
+    *f = t1_new()
+    if len < 16 {
+        return false
+    }
+    var p: u64 = data
+    var n: usize = len
+    if rt.ld8(data, 0) == 128 as u8 {
+        if !flatten_pfb(data, len, &(*f).src) {
+            return false
+        }
+        p = rt.buf_ptr(&(*f).src)
+        n = rt.buf_len(&(*f).src)
+    }
+    var ee: [u8; 5] = "eexec"
+    let at: i64 = find_lit(p, n, 0, (&ee[0]) as u64, 5)
+    if at < 0 {
+        return false
+    }
+    eexec_decrypt(p, n, (at as usize) + 5, &(*f).dec)
+    let dp: u64 = rt.buf_ptr(&(*f).dec)
+    let dn: usize = rt.buf_len(&(*f).dec)
+    if dn < 16 {
+        return false
+    }
+    (*f).glyphs = mem.heap_alloc(MAX_GLYPHS * 16) as u64
+    (*f).subrs = mem.heap_alloc(MAX_SUBRS * 8) as u64
+    if (*f).glyphs == 0 || (*f).subrs == 0 {
+        return false
+    }
+    var li: [u8; 6] = "/lenIV"
+    let lat: i64 = find_lit(dp, dn, 0, (&li[0]) as u64, 6)
+    if lat >= 0 {
+        var pos: usize = (lat as usize) + 6
+        var s: usize = 0
+        var l: usize = 0
+        var v: i64 = 0
+        if next_token(dp, dn, &pos, &s, &l) && tok_int(dp, s, l, &v) && v >= -1 && v <= 16 {
+            (*f).leniv = v as i32
+        }
+    }
+    var sb: [u8; 6] = "/Subrs"
+    var cs: [u8; 12] = "/CharStrings"
+    var cpos: usize = 0
+    let sat: i64 = find_lit(dp, dn, 0, (&sb[0]) as u64, 6)
+    let cat: i64 = find_lit(dp, dn, 0, (&cs[0]) as u64, 12)
+    if cat < 0 {
+        return false
+    }
+    cpos = cat as usize
+    if sat >= 0 && sat < cat {
+        cpos = load_subrs(f, dp, dn, (sat as usize) + 6)
+    }
+    if cpos >= dn {
+        return false
+    }
+    load_chars(f, dp, dn, cpos + 12)
+    if (*f).ng == 0 {
+        return false
+    }
+    load_matrix(f, p, n)
+    load_encoding(f, p, n)
+    (*f).ok = 1
+    return true
+}
+
+fn t1_charstring(f: *mut T1Font, gid: u32, off: *mut usize, len: *mut usize) -> bool {
+    if gid == 0 as u32 || (gid as usize) > (*f).ng {
+        return false
+    }
+    let k: usize = (gid as usize) - 1
+    *off = rt.ld32((*f).glyphs, k * 4 + 2) as usize
+    *len = rt.ld32((*f).glyphs, k * 4 + 3) as usize
+    return true
+}
+
+fn t1_subr(f: *mut T1Font, idx: usize, off: *mut usize, len: *mut usize) -> bool {
+    if idx >= (*f).ns {
+        return false
+    }
+    *off = rt.ld32((*f).subrs, idx * 2) as usize
+    *len = rt.ld32((*f).subrs, idx * 2 + 1) as usize
+    return *len > 0
+}
+
+fn t1_gid_for_name(f: *mut T1Font, p: u64, n: usize) -> u32 {
+    if n == 0 {
+        return 0
+    }
+    let dp: u64 = rt.buf_ptr(&(*f).dec)
+    var k: usize = 0
+    while k < (*f).ng {
+        if (rt.ld32((*f).glyphs, k * 4 + 1) as usize) == n {
+            let no: usize = rt.ld32((*f).glyphs, k * 4) as usize
+            if rt.mem_eq(dp + no as u64, p, n) {
+                return (k as u32) + 1
+            }
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn t1_gid_for_code(f: *mut T1Font, code: u32) -> u32 {
+    if code > 255 {
+        return 0
+    }
+    return (*f).enc[code as usize]
+}
+
+fn t1_std_code_gid(f: *mut T1Font, code: u32) -> u32 {
+    let sid: u32 = cff_data.cff_std_encoding_sid(code as usize)
+    if sid == 0 as u32 {
+        return 0
+    }
+    var nm: [u8; 32] = [0 as u8; 32]
+    let nl: usize = cff_data.cff_std_string_copy(sid as usize, &nm[0], 32)
+    return t1_gid_for_name(f, (&nm[0]) as u64, nl)
+}
+
+fn t1_name_copy(f: *mut T1Font, gid: u32, out: *mut u8, cap: usize) -> usize {
+    if gid == 0 as u32 || (gid as usize) > (*f).ng {
+        return 0
+    }
+    let k: usize = (gid as usize) - 1
+    let no: usize = rt.ld32((*f).glyphs, k * 4) as usize
+    var nl: usize = rt.ld32((*f).glyphs, k * 4 + 1) as usize
+    if nl > cap {
+        nl = cap
+    }
+    rt.mem_copy(out as u64, rt.buf_ptr(&(*f).dec) + no as u64, nl)
+    return nl
+}
+
+fn t1_data(f: *mut T1Font) -> u64 {
+    return rt.buf_ptr(&(*f).dec)
+}

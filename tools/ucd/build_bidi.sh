@@ -90,6 +90,10 @@ rc=$?
 cat "$WORK/pack.log"
 [ $rc -eq 0 ] || fail "pack_bidi endete mit $rc (die Rueckgabewerte stehen in pack_bidi.fi)"
 
+python3 -I tools/ucd/blobpack.py "$WORK/table.fi" > "$WORK/table_blob.fi" \
+    || fail "blobpack.py schlaegt an"
+cp "$WORK/table_blob.fi" "$WORK/table.fi"
+
 echo
 echo "-- 2. firnfmt: die erzeugte Datei hat die kanonische Form --"
 if [ ! -x "$FIRNFMT" ]; then

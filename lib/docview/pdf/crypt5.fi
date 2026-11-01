@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: MPL-2.0
+// PDF standard security handler revisions 5 and 6: password check and file key recovery (AES-256).
+import std.crypto.aes
+import std.crypto.sha256
+import std.crypto.sha512
+import rt.rt
+
+export {
+    c5_derive,
+}
+
+const C5_MAX_PW: usize = 127
+
+#[no_gc]
+fn c5_ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn c5_hash2b(pw: u64, pwn: usize, salt: u64, ud: u64, udn: usize,
+    out: *mut [u8; 32]) {
+    var inp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&inp, pw, pwn)
+    rt.buf_push_bytes(&inp, salt, 8)
+    rt.buf_push_bytes(&inp, ud, udn)
+    var k: [u8; 64] = [0 as u8; 64]
+    sha256.sha256(rt.buf_ptr(&inp), rt.buf_len(&inp), (&k[0]) as u64)
+    rt.buf_free(&inp)
+    var kl: usize = 32
+    var round: usize = 0
+    var lastb: usize = 0
+    var go: bool = true
+    while go {
+        var data: rt.Buf = rt.buf_new()
+        var rep: usize = 0
+        while rep < 64 {
+            rt.buf_push_bytes(&data, pw, pwn)
+            rt.buf_push_bytes(&data, (&k[0]) as u64, kl)
+            rt.buf_push_bytes(&data, ud, udn)
+            rep = rep + 1
+        }
+        let total: usize = rt.buf_len(&data)
+        var ctx: aes.Aes = aes.aes128_new_soft((&k[0]) as u64)
+        aes.aes_cbc_encrypt_soft(&ctx, ((&k[0]) as u64) + 16, rt.buf_ptr(&data),
+            total, rt.buf_ptr(&data))
+        var sum: usize = 0
+        var i: usize = 0
+        while i < 16 {
+            sum = sum + (rt.buf_at(&data, i) as usize)
+            i = i + 1
+        }
+        lastb = rt.buf_at(&data, total - 1) as usize
+        let which: usize = sum % 3
+        if which == 0 {
+            sha256.sha256(rt.buf_ptr(&data), total, (&k[0]) as u64)
+            kl = 32
+        }
+        if which == 1 {
+            sha512.sha384(rt.buf_ptr(&data), total, (&k[0]) as u64)
+            kl = 48
+        }
+        if which == 2 {
+            sha512.sha512(rt.buf_ptr(&data), total, (&k[0]) as u64)
+            kl = 64
+        }
+        rt.buf_free(&data)
+        round = round + 1
+        go = round < 64 || lastb + 32 > round
+    }
+    var j: usize = 0
+    while j < 32 {
+        (*out)[j] = k[j]
+        j = j + 1
+    }
+}
+
+fn c5_hash(r: u32, pw: u64, pwn: usize, salt: u64, ud: u64, udn: usize,
+    out: *mut [u8; 32]) {
+    if r >= 6 {
+        c5_hash2b(pw, pwn, salt, ud, udn, out)
+        return
+    }
+    var inp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&inp, pw, pwn)
+    rt.buf_push_bytes(&inp, salt, 8)
+    rt.buf_push_bytes(&inp, ud, udn)
+    sha256.sha256(rt.buf_ptr(&inp), rt.buf_len(&inp), (&(*out)[0]) as u64)
+    rt.buf_free(&inp)
+}
+
+fn c5_same(a: *mut [u8; 32], b: u64) -> bool {
+    var i: usize = 0
+    var same: bool = true
+    while i < 32 {
+        if (*a)[i] != c5_ld8(b, i) {
+            same = false
+        }
+        i = i + 1
+    }
+    return same
+}
+
+fn c5_unwrap(r: u32, pw: u64, pwn: usize, salt: u64, ud: u64, udn: usize,
+    wrapped: u64, key: *mut [u8; 32]) -> bool {
+    var ik: [u8; 32] = [0 as u8; 32]
+    c5_hash(r, pw, pwn, salt, ud, udn, &ik)
+    var ctx: aes.Aes = aes.aes256_new_soft((&ik[0]) as u64)
+    var iv: [u8; 16] = [0 as u8; 16]
+    return aes.aes_cbc_decrypt_soft(&ctx, (&iv[0]) as u64, wrapped, 32,
+        (&(*key)[0]) as u64)
+}
+
+fn c5_derive(r: u32, pw0: u64, pwn0: usize, u: u64, un: usize, o: u64,
+    on: usize, ue: u64, uen: usize, oe: u64, oen: usize,
+    key: *mut [u8; 32]) -> bool {
+    if un < 48 || on < 48 || uen < 32 || oen < 32 {
+        return false
+    }
+    var pwn: usize = pwn0
+    if pwn > C5_MAX_PW {
+        pwn = C5_MAX_PW
+    }
+    var h: [u8; 32] = [0 as u8; 32]
+    c5_hash(r, pw0, pwn, u + 32, 0, 0, &h)
+    if c5_same(&h, u) {
+        return c5_unwrap(r, pw0, pwn, u + 40, 0, 0, ue, key)
+    }
+    c5_hash(r, pw0, pwn, o + 32, u, 48, &h)
+    if c5_same(&h, o) {
+        return c5_unwrap(r, pw0, pwn, o + 40, u, 48, oe, key)
+    }
+    return false
+}

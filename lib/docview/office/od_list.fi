@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.ooxml
+import docview.office.dx_utf8
+import docview.office.od_units
+
+export { Lists, LvInfo, LV_BULLET, LV_NUMBER, MAX_LEVELS, lists_new, lists_free, lists_load, lists_find, level_info, label_text }
+
+const LV_BULLET: i32 = 0
+const LV_NUMBER: i32 = 1
+const MAX_LEVELS: usize = 10
+const MAX_LEVEL_ENTRIES: usize = 20000
+
+struct LvInfo {
+    name_off: u32,
+    name_n: u32,
+    level: i32,
+    kind: i32,
+    ch: u32,
+    fmt: u8,
+    pre_off: u32,
+    pre_n: u32,
+    suf_off: u32,
+    suf_n: u32,
+    disp: i32,
+    start: i32,
+    left: i32,
+    hang: i32,
+}
+
+struct Lists {
+    items: Vec[LvInfo],
+    pool: rt.Buf,
+}
+
+fn lists_new() -> Lists {
+    return Lists { items: vec_new[LvInfo](), pool: rt.buf_new() }
+}
+
+fn lists_free(l: *mut Lists) {
+    vec_free[LvInfo](&(*l).items)
+    rt.buf_free(&(*l).pool)
+}
+
+fn put(l: *mut Lists, s: str) -> u32 {
+    let off: usize = rt.buf_len(&(*l).pool)
+    rt.buf_push_bytes(&(*l).pool, s.p as u64, s.n)
+    return off as u32
+}
+
+fn get(l: *mut Lists, off: u32, n: u32) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*l).pool) + (off as u64)), n: n as usize }
+}
+
+fn first_cp(s: str) -> u32 {
+    if s.n == 0 {
+        return 0x2022 as u32
+    }
+    var len: usize = 0
+    return dx_utf8.next_cp(s.p as u64, s.n, 0, &len)
+}
+
+fn read_level(l: *mut Lists, x: *mut xml.Doc, n: u32, name: str, bullet: bool) {
+    if vec_len[LvInfo](&(*l).items) >= MAX_LEVEL_ENTRIES {
+        return
+    }
+    var lv: i64 = ooxml.attr_i64(x, n, "level", 1)
+    lv = od_units.clamp_i(lv, 1, 10)
+    var info: LvInfo = LvInfo { name_off: put(l, name), name_n: name.n as u32, level: (lv - 1) as i32, kind: LV_BULLET,
+        ch: 0x2022 as u32, fmt: 49 as u8, pre_off: 0 as u32, pre_n: 0 as u32, suf_off: 0 as u32, suf_n: 0 as u32,
+        disp: 1, start: 1, left: 360 * (lv as i32), hang: 360 }
+    if bullet {
+        info.ch = first_cp(ooxml.attr_l(x, n, "bullet-char"))
+    } else {
+        info.kind = LV_NUMBER
+        let nf: str = ooxml.attr_l(x, n, "num-format")
+        if nf.n > 0 {
+            info.fmt = rt.ld8(nf.p as u64, 0)
+        } else {
+            info.fmt = 0 as u8
+        }
+        let pre: str = ooxml.attr_l(x, n, "num-prefix")
+        info.pre_off = put(l, pre)
+        info.pre_n = pre.n as u32
+        let suf: str = ooxml.attr_l(x, n, "num-suffix")
+        info.suf_off = put(l, suf)
+        info.suf_n = suf.n as u32
+        info.disp = od_units.clamp_i(ooxml.attr_i64(x, n, "display-levels", 1), 1, 10) as i32
+        info.start = od_units.clamp_i(ooxml.attr_i64(x, n, "start-value", 1), 0, 100000) as i32
+    }
+    let pr: u32 = ooxml.child_l(x, n, "list-level-properties")
+    if pr != xml.NONE {
+        let la: u32 = ooxml.child_l(x, pr, "list-level-label-alignment")
+        if la != xml.NONE {
+            info.left = od_units.clamp_i(od_units.len_tw(ooxml.attr_l(x, la, "margin-left"), 0), 0, 20000) as i32
+            let ti: i64 = od_units.len_tw(ooxml.attr_l(x, la, "text-indent"), 0)
+            info.hang = od_units.clamp_i(0 - ti, 0, 20000) as i32
+        } else {
+            let sb: i64 = od_units.len_tw(ooxml.attr_l(x, pr, "space-before"), 0)
+            let mw: i64 = od_units.len_tw(ooxml.attr_l(x, pr, "min-label-width"), 360)
+            info.left = od_units.clamp_i(sb + mw, 0, 20000) as i32
+            info.hang = od_units.clamp_i(mw, 0, 20000) as i32
+        }
+    }
+    vec_push[LvInfo](&(*l).items, info)
+}
+
+fn lists_load(l: *mut Lists, x: *mut xml.Doc, parent: u32) {
+    if parent == xml.NONE {
+        return
+    }
+    var c: u32 = ooxml.first_el(x, parent)
+    while c != xml.NONE {
+        if ooxml.is_el(x, c, "list-style") {
+            let name: str = ooxml.attr_l(x, c, "name")
+            var lv: u32 = ooxml.first_el(x, c)
+            while lv != xml.NONE {
+                let nm: str = ooxml.local_name(xml.name(x, lv))
+                if nm == "list-level-style-bullet" || nm == "list-level-style-image" {
+                    read_level(l, x, lv, name, true)
+                } else if nm == "list-level-style-number" {
+                    read_level(l, x, lv, name, false)
+                }
+                lv = ooxml.next_el(x, lv)
+            }
+        }
+        c = ooxml.next_el(x, c)
+    }
+}
+
+fn lists_find(l: *mut Lists, name: str, level: i32) -> *mut LvInfo {
+    var i: usize = vec_len[LvInfo](&(*l).items)
+    while i > 0 {
+        i = i - 1
+        let it: *mut LvInfo = vec_elem_ptr[LvInfo](&(*l).items, i)
+        if (*it).level == level && get(l, (*it).name_off, (*it).name_n) == name {
+            return it
+        }
+    }
+    return 0 as *mut LvInfo
+}
+
+fn level_info(l: *mut Lists, name: str, level: i32) -> *mut LvInfo {
+    var lv: i32 = level
+    while lv >= 0 {
+        let it: *mut LvInfo = lists_find(l, name, lv)
+        if (it as u64) != 0 {
+            return it
+        }
+        lv = lv - 1
+    }
+    return 0 as *mut LvInfo
+}
+
+fn push_alpha(out: *mut rt.Buf, v: i32, upper: bool) {
+    var n: i32 = v
+    if n < 1 { n = 1 }
+    var tmp: [u8; 16] = [0 as u8; 16]
+    var k: usize = 0
+    while n > 0 && k < 16 {
+        n = n - 1
+        var ch: u8 = (97 as u8) + ((n % 26) as u8)
+        if upper { ch = ch - (32 as u8) }
+        tmp[k] = ch
+        k = k + 1
+        n = n / 26
+    }
+    while k > 0 {
+        k = k - 1
+        rt.buf_push(out, tmp[k])
+    }
+}
+
+fn push_roman(out: *mut rt.Buf, v: i32, upper: bool) {
+    var n: i32 = v
+    if n < 1 || n > 3999 {
+        rt.buf_push_dec_u64(out, v as u64)
+        return
+    }
+    let vals: [i32; 13] = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    let syms: [str; 13] = ["m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"]
+    var i: usize = 0
+    while i < 13 {
+        while n >= vals[i] {
+            var s: str = syms[i]
+            var k: usize = 0
+            while k < s.n {
+                var ch: u8 = rt.ld8(s.p as u64, k)
+                if upper { ch = ch - (32 as u8) }
+                rt.buf_push(out, ch)
+                k = k + 1
+            }
+            n = n - vals[i]
+        }
+        i = i + 1
+    }
+}
+
+fn push_number(out: *mut rt.Buf, v: i32, fmt: u8) {
+    if fmt == (97 as u8) {
+        push_alpha(out, v, false)
+    } else if fmt == (65 as u8) {
+        push_alpha(out, v, true)
+    } else if fmt == (105 as u8) {
+        push_roman(out, v, false)
+    } else if fmt == (73 as u8) {
+        push_roman(out, v, true)
+    } else if fmt == (0 as u8) {
+        return
+    } else {
+        rt.buf_push_dec_u64(out, v as u64)
+    }
+}
+
+fn label_text(l: *mut Lists, it: *mut LvInfo, counters: *mut [i32; 10], name: str, out: *mut rt.Buf) {
+    if (*it).kind == LV_BULLET {
+        dx_utf8.push_cp(out, (*it).ch)
+        return
+    }
+    let pre: str = get(l, (*it).pre_off, (*it).pre_n)
+    rt.buf_push_bytes(out, pre.p as u64, pre.n)
+    var from: i32 = (*it).level - (*it).disp + 1
+    if from < 0 { from = 0 }
+    var k: i32 = from
+    while k <= (*it).level {
+        var fmt: u8 = (*it).fmt
+        if k != (*it).level {
+            let lo: *mut LvInfo = lists_find(l, name, k)
+            if (lo as u64) != 0 {
+                fmt = (*lo).fmt
+            }
+        }
+        push_number(out, (*counters)[k as usize], fmt)
+        if k < (*it).level {
+            rt.buf_push(out, 46 as u8)
+        }
+        k = k + 1
+    }
+    let suf: str = get(l, (*it).suf_off, (*it).suf_n)
+    rt.buf_push_bytes(out, suf.p as u64, suf.n)
+}

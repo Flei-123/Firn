@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+
+export { lpf_edge }
+
+fn sclamp(t: i64) -> i64 {
+    if t < 0 - 128 {
+        return 0 - 128
+    }
+    if t > 127 {
+        return 127
+    }
+    return t
+}
+
+fn px(s: u64, off: i64) -> i64 {
+    return vp9mem.ld8o(s, off)
+}
+
+fn put(s: u64, off: i64, v: i64) {
+    let a: u64 = ((s as i64) + off) as u64
+    vp9mem.st8(a, 0, v)
+}
+
+fn filter4(s: u64, a: i64, thresh: i64) {
+    let p1: i64 = px(s, 0 - 2 * a)
+    let p0: i64 = px(s, 0 - a)
+    let q0: i64 = px(s, 0)
+    let q1: i64 = px(s, a)
+    let ps1: i64 = p1 - 128
+    let ps0: i64 = p0 - 128
+    let qs0: i64 = q0 - 128
+    let qs1: i64 = q1 - 128
+    var hev: bool = false
+    if vp9mem.iabs(p1 - p0) > thresh || vp9mem.iabs(q1 - q0) > thresh {
+        hev = true
+    }
+    var filter: i64 = 0
+    if hev {
+        filter = sclamp(ps1 - qs1)
+    }
+    filter = sclamp(filter + 3 * (qs0 - ps0))
+    let f1: i64 = sclamp(filter + 4) >> 3
+    let f2: i64 = sclamp(filter + 3) >> 3
+    put(s, 0, sclamp(qs0 - f1) + 128)
+    put(s, 0 - a, sclamp(ps0 + f2) + 128)
+    if !hev {
+        let f3: i64 = (f1 + 1) >> 1
+        put(s, a, sclamp(qs1 - f3) + 128)
+        put(s, 0 - 2 * a, sclamp(ps1 + f3) + 128)
+    }
+}
+
+fn smooth(w: *mut [i64; 16], half: i64, center: i64, lo: i64, hi: i64, shift: i64) -> i64 {
+    var sum: i64 = (*w)[center as usize]
+    var k: i64 = center - half
+    while k <= center + half {
+        var idx: i64 = k
+        if idx < lo {
+            idx = lo
+        }
+        if idx > hi {
+            idx = hi
+        }
+        sum = sum + (*w)[idx as usize]
+        k = k + 1
+    }
+    return (sum + (1 << ((shift - 1) as u64))) >> (shift as u64)
+}
+
+fn lpf_one(s: u64, a: i64, kind: i64, limit: i64, blimit: i64, thresh: i64) {
+    let p3: i64 = px(s, 0 - 4 * a)
+    let p2: i64 = px(s, 0 - 3 * a)
+    let p1: i64 = px(s, 0 - 2 * a)
+    let p0: i64 = px(s, 0 - a)
+    let q0: i64 = px(s, 0)
+    let q1: i64 = px(s, a)
+    let q2: i64 = px(s, 2 * a)
+    let q3: i64 = px(s, 3 * a)
+    if vp9mem.iabs(p3 - p2) > limit || vp9mem.iabs(p2 - p1) > limit || vp9mem.iabs(p1 - p0) > limit
+    || vp9mem.iabs(q1 - q0) > limit || vp9mem.iabs(q2 - q1) > limit || vp9mem.iabs(q3 - q2) > limit
+    || vp9mem.iabs(p0 - q0) * 2 + vp9mem.iabs(p1 - q1) / 2 > blimit {
+        return
+    }
+    if kind == 4 {
+        filter4(s, a, thresh)
+        return
+    }
+    var flat: bool = true
+    if vp9mem.iabs(p1 - p0) > 1 || vp9mem.iabs(q1 - q0) > 1 || vp9mem.iabs(p2 - p0) > 1
+    || vp9mem.iabs(q2 - q0) > 1 || vp9mem.iabs(p3 - p0) > 1 || vp9mem.iabs(q3 - q0) > 1 {
+        flat = false
+    }
+    if !flat {
+        filter4(s, a, thresh)
+        return
+    }
+    var flat2: bool = false
+    if kind == 16 {
+        flat2 = true
+        var k: i64 = 1
+        while k <= 4 {
+            if vp9mem.iabs(px(s, 0 - (k + 4) * a) - p0) > 1 || vp9mem.iabs(px(s, (k + 3) * a) - q0) > 1 {
+                flat2 = false
+            }
+            k = k + 1
+        }
+    }
+    var w: [i64; 16] = [0; 16]
+    if flat2 {
+        var j: i64 = 0
+        while j < 16 {
+            w[j as usize] = px(s, (j - 8) * a)
+            j = j + 1
+        }
+        j = 1
+        while j <= 14 {
+            put(s, (j - 8) * a, smooth(&w, 7, j, 0, 15, 4))
+            j = j + 1
+        }
+    } else {
+        w[0] = p3
+        w[1] = p2
+        w[2] = p1
+        w[3] = p0
+        w[4] = q0
+        w[5] = q1
+        w[6] = q2
+        w[7] = q3
+        var j: i64 = 1
+        while j <= 6 {
+            put(s, (j - 4) * a, smooth(&w, 3, j, 0, 7, 3))
+            j = j + 1
+        }
+    }
+}
+
+fn lpf_edge(s: u64, across: i64, along: i64, kind: i64, lvl: i64, sharp: i64) {
+    var blk: i64 = lvl
+    if sharp > 0 {
+        blk = blk >> 1
+    }
+    if sharp > 4 {
+        blk = blk >> 1
+    }
+    if sharp > 0 && blk > 9 - sharp {
+        blk = 9 - sharp
+    }
+    if blk < 1 {
+        blk = 1
+    }
+    let blimit: i64 = 2 * (lvl + 2) + blk
+    let thresh: i64 = lvl >> 4
+    var i: i64 = 0
+    while i < 8 {
+        lpf_one(((s as i64) + i * along) as u64, across, kind, blk, blimit, thresh)
+        i = i + 1
+    }
+}

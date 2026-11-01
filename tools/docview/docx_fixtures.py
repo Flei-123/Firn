@@ -255,7 +255,8 @@ FIXTURES = [f01_plain, f02_headings, f03_runs, f04_lists, f05_table, f06_merged,
 
 def main():
     out = sys.argv[1]
-    for fn in FIXTURES:
+    from docx_fixtures_ext import FIXTURES_EXT
+    for fn in FIXTURES + FIXTURES_EXT:
         fn("%s/%s.docx" % (out, fn.__name__))
 
 

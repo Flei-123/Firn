@@ -6,7 +6,14 @@ import docview.pdf.pobj
 import docview.pdf.pdoc
 import docview.pdf.prast
 import docview.pdf.pfont
+import docview.pdf.psmask
+import docview.pdf.embfont
+import font.gpath
 import docview.pdf.pannot
+import docview.pdf.pfunc
+import docview.pdf.pshade
+import docview.pdf.pmesh
+import docview.pdf.ptile
 import paint.canvas
 import image.picture
 import font.ttf
@@ -14,10 +21,12 @@ import font.raster
 
 export {
     fonthold_new, fonthold_load,
-    page_render, page_text, page_size,
+    page_render, page_text, page_text_boxes, page_size, base_matrix_for,
 }
 
 const GSMAX: usize = 32
+const BOX_ASCENT: f64 = 0.8
+const BOX_DESCENT: f64 = 0.2
 const MASKMAX: usize = 24
 const OPBUDGET: usize = 500000
 const TIME_LIMIT_US: u64 = 15000000
@@ -45,6 +54,8 @@ struct GS {
     spal: u32,
     fbase: u32,
     sbase: u32,
+    fpat: u32,
+    spat: u32,
     fslot: i32,
     fsize: f64,
     tc: f64,
@@ -71,6 +82,8 @@ struct Run {
     t0: u64,
     stop: bool,
     fonts: [pfont.PFont; 6],
+    emb: [embfont.EmbFont; 6],
+    gp: gpath.GPath,
     fkey: [u64; 6],
     nfont: usize,
     ops: usize,
@@ -80,12 +93,26 @@ struct Run {
     imgfail: usize,
     fontmiss: usize,
     txt: u64,
+    bx: u64,
+    bm: [f64; 6],
     ras: raster.Raster,
     scratch: *mut u8,
     racc: *mut u8,
     lastx: f64,
     lasty: f64,
+    ex: f64,
+    ey: f64,
+    smdepth: usize,
     lasth: f64,
+    pbase: [f64; 6],
+    patdepth: usize,
+    pmask: prast.Mask,
+    tcell: canvas.Canvas,
+    tc_pat: u32,
+    tc_col: u32,
+    tc_w: usize,
+    tc_h: usize,
+    tc_ok: bool,
 }
 
 #[no_gc]
@@ -164,7 +191,7 @@ fn gs_new() -> GS {
     return GS { m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         fill: 4278190080, stroke: 4278190080, fa: 1.0, sa: 1.0, lw: 1.0,
         clip: -1, fcs: CS_GRAY, scs: CS_GRAY, fpal: 0, spal: 0,
-        fbase: 1, sbase: 1,
+        fbase: 1, sbase: 1, fpat: 0, spat: 0,
         fslot: -1, fsize: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, ts: 0.0,
         tr: 0 }
 }
@@ -338,6 +365,8 @@ fn run_init(r: *mut Run, d: *mut pdoc.Doc, cv: *mut canvas.Canvas,
     (*r).stop = false
     (*r).gs[0] = gs_new()
     (*r).nmask = 0
+    (*r).patdepth = 0
+    (*r).tc_ok = false
     (*r).intext = false
     (*r).ops = 0
     (*r).glyphs = 0
@@ -373,12 +402,22 @@ fn run_free(r: *mut Run) {
         prast.mask_free(&(*r).masks[i])
         i = i + 1
     }
+    var ei: usize = 0
+    while ei < 6 {
+        embfont.emb_free(&(*r).emb[ei])
+        ei = ei + 1
+    }
+    if (*r).pmask.p as usize != 0 {
+        prast.mask_free(&(*r).pmask)
+    }
+    canvas.canvas_free(&(*r).tcell)
     mem.heap_free((*r).scratch, SCRATCH)
     mem.heap_free((*r).racc, RASTER_CAP)
 }
 
-fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
-    let ar: *mut pobj.PdfArena = &(*d).ar
+fn cs_kind(d: *mut pdoc.Doc, kar: *mut pobj.PdfArena, h: u32, pal: *mut u32,
+    base: *mut u32) -> u32 {
+    let ar: *mut pobj.PdfArena = kar
     *pal = 0
     *base = 1
     var g1: [u8; 10] = "DeviceGray"
@@ -423,7 +462,7 @@ fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
             if pobj.o_arr_len(ar, h) >= 4 {
                 var bp: u32 = 0
                 var bb: u32 = 0
-                let bk: u32 = cs_kind(d,
+                let bk: u32 = cs_kind(d, &(*d).ar,
                     pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 1)), &bp, &bb)
                 *base = bk
                 *pal = pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 3))
@@ -455,6 +494,12 @@ fn cs_kind(d: *mut pdoc.Doc, h: u32, pal: *mut u32, base: *mut u32) -> u32 {
             return CS_GRAY
         }
         if pobj.o_name_eq(ar, f, (&p1[0]) as u64, 7) {
+            if pobj.o_arr_len(ar, h) >= 2 {
+                var bp: u32 = 0
+                var bb: u32 = 0
+                *base = cs_kind(d, &(*d).ar,
+                    pdoc.doc_resolve(d, pobj.o_arr_at(ar, h, 1)), &bp, &bb)
+            }
             return CS_PATTERN
         }
         if pobj.o_name_eq(ar, f, (&cg[0]) as u64, 7) {
@@ -774,9 +819,11 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
         let v: f64 = argf(ar, st, ns, 0)
         if c0 == 103 as u8 {
             (*g).fcs = CS_GRAY
+            (*g).fpat = 0
             (*g).fill = rgb(v, v, v)
         } else {
             (*g).scs = CS_GRAY
+            (*g).spat = 0
             (*g).stroke = rgb(v, v, v)
         }
         return
@@ -787,9 +834,11 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
             argf(ar, st, ns, 2))
         if c0 == 114 as u8 {
             (*g).fcs = CS_RGB
+            (*g).fpat = 0
             (*g).fill = col
         } else {
             (*g).scs = CS_RGB
+            (*g).spat = 0
             (*g).stroke = col
         }
         return
@@ -799,34 +848,44 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
             argf(ar, st, ns, 2), argf(ar, st, ns, 3))
         if c0 == 107 as u8 {
             (*g).fcs = CS_CMYK
+            (*g).fpat = 0
             (*g).fill = col
         } else {
             (*g).scs = CS_CMYK
+            (*g).spat = 0
             (*g).stroke = col
         }
         return
     }
-    if on == 2 && (c0 == 99 as u8 || c0 == 67 as u8) && c1 == 115 as u8 {
+    if on == 2 && ((c0 == 99 as u8 && c1 == 115 as u8) ||
+    (c0 == 67 as u8 && c1 == 83 as u8)) {
         let nm: u32 = argh(st, ns, back(ns, 1))
-        var csh: u32 = resolve_cs(r, nm, res)
+        var found: bool = false
+        var csh: u32 = resolve_cs(r, ar, nm, res, &found)
         var pal: u32 = 0
         var base: u32 = 1
-        let k: u32 = cs_kind((*r).d, csh, &pal, &base)
+        var kar: *mut pobj.PdfArena = &(*(*r).d).ar
+        if !found {
+            kar = ar
+        }
+        let k: u32 = cs_kind((*r).d, kar, csh, &pal, &base)
         if c0 == 99 as u8 {
             (*g).fcs = k
+            (*g).fpat = 0
             (*g).fpal = pal
             (*g).fbase = base
             (*g).fill = default_colour(k)
         } else {
             (*g).scs = k
+            (*g).spat = 0
             (*g).spal = pal
             (*g).sbase = base
             (*g).stroke = default_colour(k)
         }
         return
     }
-    if (on == 2 || on == 3) && (c0 == 115 as u8 || c0 == 83 as u8) &&
-    c1 == 99 as u8 {
+    if (on == 2 || on == 3) && ((c0 == 115 as u8 && c1 == 99 as u8) ||
+    (c0 == 83 as u8 && c1 == 67 as u8)) {
         var v: [f64; 8] = [0.0; 8]
         var cnt: usize = 0
         var i: usize = 0
@@ -839,12 +898,28 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
             }
             i = i + 1
         }
+        var pat: u32 = 0
+        if ns > 0 && pobj.o_kind(ar, argh(st, ns, ns - 1)) == pobj.T_NAME {
+            pat = pattern_lookup(r, ar, argh(st, ns, ns - 1), res)
+        }
         if c0 == 115 as u8 {
-            (*g).fill = colour_of((*r).d, (*g).fcs, (*g).fpal, (*g).fbase,
-                (&v[0]) as *mut f64, cnt)
+            if (*g).fcs == CS_PATTERN {
+                (*g).fpat = pat
+                (*g).fill = colour_of((*r).d, (*g).fbase, 0, 1,
+                    (&v[0]) as *mut f64, cnt)
+            } else {
+                (*g).fill = colour_of((*r).d, (*g).fcs, (*g).fpal, (*g).fbase,
+                    (&v[0]) as *mut f64, cnt)
+            }
         } else {
-            (*g).stroke = colour_of((*r).d, (*g).scs, (*g).spal, (*g).sbase,
-                (&v[0]) as *mut f64, cnt)
+            if (*g).scs == CS_PATTERN {
+                (*g).spat = pat
+                (*g).stroke = colour_of((*r).d, (*g).sbase, 0, 1,
+                    (&v[0]) as *mut f64, cnt)
+            } else {
+                (*g).stroke = colour_of((*r).d, (*g).scs, (*g).spal,
+                    (*g).sbase, (&v[0]) as *mut f64, cnt)
+            }
         }
         return
     }
@@ -867,8 +942,8 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
             (*g).tw = argf(ar, st, ns, 0)
             (*g).tc = argf(ar, st, ns, 1)
         }
-        nl_mark(r)
         next_line(r, 0.0, 0.0 - (*g).tl)
+        nl_resolve(r)
         let s: u32 = argh(st, ns, back(ns, 1))
         if pobj.o_kind(ar, s) == pobj.T_STR {
             show_string(r, ar, s, res)
@@ -883,6 +958,10 @@ fn do_op(r: *mut Run, ar: *mut pobj.PdfArena, h: u32, st: *mut u32, ns: usize,
         skip_inline_image(r, lx)
         return
     }
+    if on == 2 && c0 == 115 as u8 && c1 == 104 as u8 {
+        op_shading(r, ar, argh(st, ns, back(ns, 1)), res)
+        return
+    }
 }
 
 #[no_gc]
@@ -893,16 +972,18 @@ fn default_colour(k: u32) -> u32 {
     return canvas.color_of(255, 0, 0, 0)
 }
 
-fn resolve_cs(r: *mut Run, nm: u32, res: u32) -> u32 {
+fn resolve_cs(r: *mut Run, car: *mut pobj.PdfArena, nm: u32, res: u32,
+    found: *mut bool) -> u32 {
     let d: *mut pdoc.Doc = (*r).d
     let ar: *mut pobj.PdfArena = &(*d).ar
     var csn: [u8; 10] = "ColorSpace"
     let csd: u32 = pdoc.doc_dict_get(d, res, (&csn[0]) as u64, 10)
     if pobj.o_kind(ar, csd) == pobj.T_DICT &&
-    pobj.o_kind(ar, nm) == pobj.T_NAME {
-        let e: u32 = pdoc.doc_dict_get(d, csd, pobj.o_str_ptr(ar, nm),
-            pobj.o_str_len(ar, nm))
+    pobj.o_kind(car, nm) == pobj.T_NAME {
+        let e: u32 = pdoc.doc_dict_get(d, csd, pobj.o_str_ptr(car, nm),
+            pobj.o_str_len(car, nm))
         if e != 0 as u32 {
+            *found = true
             return e
         }
     }
@@ -929,6 +1010,73 @@ fn apply_extgstate(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) {
     (*g).fa = pdoc.doc_num(d, e, (&can[0]) as u64, 2, (*g).fa)
     (*g).sa = pdoc.doc_num(d, e, (&cAn[0]) as u64, 2, (*g).sa)
     (*g).lw = pdoc.doc_num(d, e, (&lwn[0]) as u64, 2, (*g).lw)
+    var smn: [u8; 5] = "SMask"
+    let sm: u32 = pdoc.doc_dict_get(d, e, (&smn[0]) as u64, 5)
+    if pobj.o_kind(&(*d).ar, sm) == pobj.T_DICT {
+        apply_smask(r, sm)
+    }
+}
+
+#[allow_escape]
+fn apply_smask(r: *mut Run, sm: u32) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
+    if (*r).smdepth > 0 || (*r).nmask >= MASKMAX - 1 || (*r).gsp + 2 >= GSMAX {
+        return
+    }
+    var gn: [u8; 1] = "G"
+    let form: u32 = pdoc.doc_dict_get(d, sm, (&gn[0]) as u64, 1)
+    if pobj.o_kind(dar, form) != pobj.T_STREAM {
+        return
+    }
+    var sn: [u8; 1] = "S"
+    var ln: [u8; 10] = "Luminosity"
+    let kind: u32 = pdoc.doc_dict_get(d, sm, (&sn[0]) as u64, 1)
+    let luma: bool = pobj.o_name_eq(dar, kind, (&ln[0]) as u64, 10)
+    let w: usize = canvas.canvas_width((*r).cv)
+    let h: usize = canvas.canvas_height((*r).cv)
+    var tc: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&tc, w, h) {
+        canvas.canvas_free(&tc)
+        return
+    }
+    if luma {
+        canvas.canvas_clear(&tc, canvas.color_of(255, 0, 0, 0))
+    } else {
+        canvas.canvas_clear(&tc, canvas.color_of(0, 0, 0, 0))
+    }
+    let saved: *mut canvas.Canvas = (*r).cv
+    let g: *mut GS = cur(r)
+    let base: i32 = (*g).clip
+    (*r).gs[(*r).gsp + 1] = (*r).gs[(*r).gsp]
+    (*r).gsp = (*r).gsp + 1
+    let g2: *mut GS = cur(r)
+    (*g2).clip = -1
+    (*g2).fa = 1.0
+    (*g2).sa = 1.0
+    (*r).cv = &tc
+    (*r).smdepth = 1
+    var rn: [u8; 9] = "Resources"
+    var fres: u32 = pdoc.doc_dict_get(d, form, (&rn[0]) as u64, 9)
+    if pobj.o_kind(dar, fres) != pobj.T_DICT {
+        fres = 0
+    }
+    exec_form(r, form, fres, 1)
+    (*r).smdepth = 0
+    (*r).cv = saved
+    (*r).gsp = (*r).gsp - 1
+    var cm: *mut prast.Mask = &(*r).masks[MASKMAX - 1]
+    if base >= 0 {
+        cm = &(*r).masks[base as usize]
+    }
+    let k: usize = (*r).nmask
+    (*r).masks[k] = psmask.sm_build(&tc, cm, luma)
+    canvas.canvas_free(&tc)
+    if (*r).masks[k].p as usize == 0 {
+        return
+    }
+    (*r).nmask = k + 1
+    (*cur(r)).clip = k as i32
 }
 
 #[no_gc]
@@ -950,15 +1098,23 @@ fn paint_path(r: *mut Run, kind: u8, eo: bool) {
     }
     if kind == 102 as u8 || kind == 70 as u8 || kind == 66 as u8 ||
     kind == 98 as u8 {
-        prast.pr_fill(&(*r).pr, (*r).cv, (*g).fill, (*g).fa, rule,
-            clipmask(r))
+        if (*g).fcs == CS_PATTERN && (*g).fpat != 0 {
+            pattern_fill(r, g, rule)
+        } else {
+            prast.pr_fill(&(*r).pr, (*r).cv, (*g).fill, (*g).fa, rule,
+                clipmask(r))
+        }
         (*r).paths = (*r).paths + 1
     }
     if kind == 83 as u8 || kind == 115 as u8 || kind == 66 as u8 ||
     kind == 98 as u8 {
         let lw: f64 = (*g).lw * mscale((&(*g).m[0]) as *mut f64)
-        prast.pr_stroke(&(*r).pr, (*r).cv, (*g).stroke, (*g).sa, lw,
-            clipmask(r), &(*r).tmp)
+        if (*g).scs == CS_PATTERN && (*g).spat != 0 {
+            pattern_stroke(r, g, lw)
+        } else {
+            prast.pr_stroke(&(*r).pr, (*r).cv, (*g).stroke, (*g).sa, lw,
+                clipmask(r), &(*r).tmp)
+        }
         (*r).paths = (*r).paths + 1
     }
     if (*r).lasth > 0.5 {
@@ -988,9 +1144,48 @@ fn ident(m: *mut f64) {
     *((m as u64 + 40) as *mut f64) = 0.0
 }
 
-fn nl_mark(r: *mut Run) {
-    if (*r).txt != 0 {
-        mem.buf_push((*r).txt as *mut mem.Buf, 10 as u8)
+fn txt_last(b: *mut mem.Buf) -> u8 {
+    let n: usize = mem.buf_len(b)
+    if n == 0 {
+        return 10 as u8
+    }
+    return mem.buf_at(b, n - 1)
+}
+
+fn nl_resolve(r: *mut Run) {
+    if (*r).txt == 0 {
+        return
+    }
+    let b: *mut mem.Buf = (*r).txt as *mut mem.Buf
+    let g: *mut GS = cur(r)
+    let a: f64 = (*r).tm[0]
+    let c: f64 = (*r).tm[1]
+    var len: f64 = sq(a * a + c * c)
+    if len <= 0.0 {
+        len = 1.0
+    }
+    var size: f64 = (*g).fsize * len
+    if size < 0.0 {
+        size = 0.0 - size
+    }
+    let dx: f64 = (*r).tm[4] - (*r).ex
+    let dy: f64 = (*r).tm[5] - (*r).ey
+    let along: f64 = (dx * a + dy * c) / len
+    var perp: f64 = (dy * a - dx * c) / len
+    if perp < 0.0 {
+        perp = 0.0 - perp
+    }
+    let last: u8 = txt_last(b)
+    if size <= 0.0 || perp > size * 0.4 || along < 0.0 - size * 0.5 {
+        if last != 10 as u8 {
+            mem.buf_push(b, 10 as u8)
+            box_blank(r)
+        }
+        return
+    }
+    if along > size * 0.12 && last != 10 as u8 && last != 32 as u8 {
+        mem.buf_push(b, 32 as u8)
+        box_blank(r)
     }
 }
 
@@ -1019,31 +1214,31 @@ fn do_text_op(r: *mut Run, ar: *mut pobj.PdfArena, c1: u8, st: *mut u32,
         return
     }
     if c1 == 100 as u8 {
-        nl_mark(r)
         next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        nl_resolve(r)
         return
     }
     if c1 == 68 as u8 {
         (*g).tl = 0.0 - argf(ar, st, ns, 1)
-        nl_mark(r)
         next_line(r, argf(ar, st, ns, 0), argf(ar, st, ns, 1))
+        nl_resolve(r)
         return
     }
     if c1 == 109 as u8 {
         if ns >= 6 {
-            nl_mark(r)
             var i: usize = 0
             while i < 6 {
                 (*r).tm[i] = argf(ar, st, ns, back(ns, 6) + i)
                 (*r).tlm[i] = (*r).tm[i]
                 i = i + 1
             }
+            nl_resolve(r)
         }
         return
     }
     if c1 == 42 as u8 {
-        nl_mark(r)
         next_line(r, 0.0, 0.0 - (*g).tl)
+        nl_resolve(r)
         return
     }
     if c1 == 76 as u8 {
@@ -1093,6 +1288,7 @@ fn do_text_op(r: *mut Run, ar: *mut pobj.PdfArena, c1: u8, st: *mut u32,
                 let adj: f64 = 0.0 - raw / 1000.0 * (*g).fsize * (*g).th
                 if (*r).txt != 0 && raw <= 0.0 - 180.0 {
                     mem.buf_push((*r).txt as *mut mem.Buf, 32 as u8)
+                    box_blank(r)
                 }
                 advance(r, adj)
             }
@@ -1113,6 +1309,8 @@ fn advance(r: *mut Run, tx: f64) {
         (*r).tm[i] = o[i]
         i = i + 1
     }
+    (*r).ex = (*r).tm[4]
+    (*r).ey = (*r).tm[5]
 }
 
 fn font_slot(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) -> i32 {
@@ -1150,6 +1348,9 @@ fn font_slot(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) -> i32 {
         dict = pdoc.doc_dict_get(d, fd, np, nl)
     }
     pfont.pfont_load(d, dict, &(*r).fonts[slot])
+    if (*r).txt == 0 {
+        embfont.emb_load(d, dict, &(*r).emb[slot])
+    }
     (*r).fkey[slot] = key
     (*r).nfont = slot + 1
     return slot as i32
@@ -1173,7 +1374,7 @@ fn show_string(r: *mut Run, ar: *mut pobj.PdfArena, s: u32, res: u32) {
         }
         let w0: f64 = pfont.pf_width(d, pf, code) / 1000.0
         if (*r).txt != 0 {
-            emit_text(r, pf, code)
+            emit_text(r, pf, code, w0)
         } else if (*g).tr != 3 as u32 && (*g).tr != 7 as u32 {
             draw_glyph(r, pf, code)
         }
@@ -1186,7 +1387,7 @@ fn show_string(r: *mut Run, ar: *mut pobj.PdfArena, s: u32, res: u32) {
     }
 }
 
-fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
+fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32, w0: f64) {
     let b: *mut mem.Buf = (*r).txt as *mut mem.Buf
     var u: u32 = pfont.pf_unicode(pf, code)
     if u == 0 as u32 {
@@ -1207,6 +1408,80 @@ fn emit_text(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
         mem.buf_push(b, (128 + ((u >> 6) & 63 as u32)) as u8)
         mem.buf_push(b, (128 + (u & 63 as u32)) as u8)
     }
+    box_glyph(r, w0)
+}
+
+fn box_put(b: *mut mem.Buf, v: f64) {
+    var tmp: [f64; 1] = [v]
+    let q: u64 = (&tmp[0]) as u64
+    var i: usize = 0
+    while i < 8 {
+        mem.buf_push(b, ld8(q, i))
+        i = i + 1
+    }
+}
+
+fn box_blank(r: *mut Run) {
+    if (*r).bx == 0 {
+        return
+    }
+    let b: *mut mem.Buf = (*r).bx as *mut mem.Buf
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+    box_put(b, 0.0)
+}
+
+fn box_glyph(r: *mut Run, w0: f64) {
+    if (*r).bx == 0 {
+        return
+    }
+    let g: *mut GS = cur(r)
+    var ts: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ts[0] = (*g).fsize * (*g).th
+    ts[3] = (*g).fsize
+    ts[5] = (*g).ts
+    var a: [f64; 6] = [0.0; 6]
+    mmul((&ts[0]) as *mut f64, (&(*r).tm[0]) as *mut f64, (&a[0]) as *mut f64)
+    var m: [f64; 6] = [0.0; 6]
+    mmul((&a[0]) as *mut f64, (&(*g).m[0]) as *mut f64, (&m[0]) as *mut f64)
+    var dm: [f64; 6] = [0.0; 6]
+    mmul((&m[0]) as *mut f64, (&(*r).bm[0]) as *mut f64, (&dm[0]) as *mut f64)
+    var minx: f64 = 1.0e30
+    var miny: f64 = 1.0e30
+    var maxx: f64 = 0.0 - 1.0e30
+    var maxy: f64 = 0.0 - 1.0e30
+    var k: usize = 0
+    while k < 4 {
+        var px: f64 = 0.0
+        var py: f64 = 0.0 - BOX_DESCENT
+        if k == 1 || k == 3 {
+            px = w0
+        }
+        if k >= 2 {
+            py = BOX_ASCENT
+        }
+        let x: f64 = mapx((&dm[0]) as *mut f64, px, py)
+        let y: f64 = mapy((&dm[0]) as *mut f64, px, py)
+        if x < minx {
+            minx = x
+        }
+        if x > maxx {
+            maxx = x
+        }
+        if y < miny {
+            miny = y
+        }
+        if y > maxy {
+            maxy = y
+        }
+        k = k + 1
+    }
+    let b: *mut mem.Buf = (*r).bx as *mut mem.Buf
+    box_put(b, minx)
+    box_put(b, miny)
+    box_put(b, maxx - minx)
+    box_put(b, maxy - miny)
 }
 
 fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
@@ -1214,15 +1489,32 @@ fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
     if (*g).fsize == 0.0 {
         return
     }
-    let f: *mut ttf.Font = pfont.fonthold_face((*r).fh, pfont.pf_face(pf))
-    if !ttf.font_ok(f) {
-        return
+    var f: *mut ttf.Font = pfont.fonthold_face((*r).fh, pfont.pf_face(pf))
+    var gid: u32 = 0
+    var ispath: bool = false
+    let eb: *mut embfont.EmbFont = &(*r).emb[(*g).fslot as usize]
+    if embfont.emb_ok(eb) {
+        gid = embfont.emb_gid(eb, code, pfont.pf_unicode(pf, code))
+        if gid != 0 as u32 {
+            if embfont.emb_is_path(eb) {
+                ispath = true
+            } else {
+                f = embfont.emb_font(eb)
+            }
+        }
     }
-    let gid: u32 = pfont.pf_glyph((*r).fh, pf, code)
     if gid == 0 as u32 {
+        gid = pfont.pf_glyph((*r).fh, pf, code)
+    }
+    if !ispath && (!ttf.font_ok(f) || gid == 0 as u32) {
         return
     }
-    let upem: f64 = ttf.font_upem(f) as f64
+    var upem: f64 = 0.0
+    if ispath {
+        upem = embfont.emb_upem(eb)
+    } else {
+        upem = ttf.font_upem(f) as f64
+    }
     if upem <= 0.0 {
         return
     }
@@ -1239,7 +1531,26 @@ fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
     var gy0: i32 = 0
     var gx1: i32 = 0
     var gy1: i32 = 0
-    if !ttf.font_glyph_bbox(f, gid, &gx0, &gy0, &gx1, &gy1) {
+    if ispath {
+        gpath.gp_attach(&(*r).gp, (*r).scratch as u64, SCRATCH)
+        if !embfont.emb_outline(eb, gid, &(*r).gp) {
+            return
+        }
+        var bx0: f64 = 0.0
+        var by0: f64 = 0.0
+        var bx1: f64 = 0.0
+        var by1: f64 = 0.0
+        if !gpath.gp_bounds(&(*r).gp, &bx0, &by0, &bx1, &by1) {
+            return
+        }
+        if bx0 < -1.0e7 || by0 < -1.0e7 || bx1 > 1.0e7 || by1 > 1.0e7 {
+            return
+        }
+        gx0 = bx0 as i32 - 1
+        gy0 = by0 as i32 - 1
+        gx1 = bx1 as i32 + 1
+        gy1 = by1 as i32 + 1
+    } else if !ttf.font_glyph_bbox(f, gid, &gx0, &gy0, &gx1, &gy1) {
         return
     }
     var minx: f64 = 1.0e30
@@ -1306,8 +1617,13 @@ fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
     if !raster.raster_begin(&(*r).ras, ox as f64, oy as f64, ww, hh) {
         return
     }
-    ttf.font_outline_m(f, gid, &(*r).ras, m[4], m[5], 1.0,
-        m[0], 0.0 - m[1], m[2], 0.0 - m[3], (*r).scratch, SCRATCH, 0)
+    if ispath {
+        gpath.gp_emit(&(*r).gp, &(*r).ras, m[4], m[5], m[0], 0.0 - m[1], m[2],
+            0.0 - m[3])
+    } else {
+        ttf.font_outline_m(f, gid, &(*r).ras, m[4], m[5], 1.0,
+            m[0], 0.0 - m[1], m[2], 0.0 - m[3], (*r).scratch, SCRATCH, 0)
+    }
     raster.raster_finish(&(*r).ras)
     var col: u32 = (*g).fill
     var alpha: f64 = (*g).fa
@@ -1315,8 +1631,17 @@ fn draw_glyph(r: *mut Run, pf: *mut pfont.PFont, code: u32) {
         col = (*g).stroke
         alpha = (*g).sa
     }
-    prast.pr_blend_raster((*r).cv, &(*r).ras, ox, oy, col, alpha,
-        clipmask(r))
+    let strokemode: bool = (*g).tr == 1 as u32 || (*g).tr == 5 as u32
+    if !strokemode && (*g).fcs == CS_PATTERN && (*g).fpat != 0 {
+        if pattern_budget(r) && pattern_mask_ready(r) {
+            prast.pr_raster_to_mask(&(*r).ras, ox, oy, &(*r).pmask, clipmask(r))
+            pattern_paint(r, (*g).fpat, (*g).fa, (*g).fill, ox as usize,
+                oy as usize, x1 as usize, y1 as usize)
+        }
+    } else {
+        prast.pr_blend_raster((*r).cv, &(*r).ras, ox, oy, col, alpha,
+            clipmask(r))
+    }
     (*r).glyphs = (*r).glyphs + 1
 }
 
@@ -1348,6 +1673,12 @@ fn do_xobject(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32,
     if !pobj.o_name_eq(dar, st, (&fo[0]) as u64, 4) {
         return
     }
+    exec_form(r, x, res, depth)
+}
+
+fn exec_form(r: *mut Run, x: u32, res: u32, depth: usize) {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
     if (*r).gsp + 1 >= GSMAX {
         return
     }
@@ -1415,7 +1746,7 @@ fn draw_image(r: *mut Run, x: u32) {
     var base: u32 = 1
     var kind: u32 = CS_GRAY
     if !is_mask {
-        kind = cs_kind(d, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
+        kind = cs_kind(d, dar, pdoc.doc_dict_get(d, x, (&cn[0]) as u64, 10),
             &pal, &base)
     }
     var comps: usize = 1
@@ -1663,6 +1994,7 @@ fn skip_inline_image(r: *mut Run, lx: *mut pobj.Lex) {
     (*r).images = (*r).images + 1
 }
 
+#[allow_escape]
 fn page_render(d: *mut pdoc.Doc, pg: usize, zoom: f64,
     cv: *mut canvas.Canvas, fh: *mut pfont.FontHold,
     stat: *mut usize) -> bool {
@@ -1688,6 +2020,7 @@ fn page_render(d: *mut pdoc.Doc, pg: usize, zoom: f64,
     }
     base_matrix((&box_[0]) as *mut f64, zoom, rot, w, h,
         (&r.gs[0].m[0]) as *mut f64)
+    r.pbase = r.gs[0].m
     var body: rt.Buf = rt.buf_new()
     page_content(d, pg, &body)
     let res: u32 = pdoc.doc_page_res(d, pg)
@@ -1908,6 +2241,23 @@ fn fill_rect_dev(r: *mut Run, x0: f64, y0: f64, x1: f64, y1: f64,
 }
 
 fn page_text(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf) -> bool {
+    return page_text_boxes(d, pg, out, 0 as *mut mem.Buf)
+}
+
+fn base_matrix_for(d: *mut pdoc.Doc, pg: usize, zoom: f64, m: *mut f64) {
+    var box_: [f64; 4] = [0.0; 4]
+    var w: usize = 0
+    var h: usize = 0
+    page_size(d, pg, zoom, &w, &h, (&box_[0]) as *mut f64)
+    var rot: i32 = pdoc.doc_page_rotate(d, pg) % 360
+    if rot < 0 {
+        rot = rot + 360
+    }
+    base_matrix((&box_[0]) as *mut f64, zoom, rot, w, h, m)
+}
+
+fn page_text_boxes(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf,
+    boxes: *mut mem.Buf) -> bool {
     if pg >= pdoc.doc_page_count(d) {
         return false
     }
@@ -1919,6 +2269,10 @@ fn page_text(d: *mut pdoc.Doc, pg: usize, out: *mut mem.Buf) -> bool {
         return false
     }
     r.txt = out as u64
+    if boxes as u64 != 0 {
+        r.bx = boxes as u64
+        base_matrix_for(d, pg, 1.0, (&r.bm[0]) as *mut f64)
+    }
     var body: rt.Buf = rt.buf_new()
     page_content(d, pg, &body)
     let res: u32 = pdoc.doc_page_res(d, pg)
@@ -1937,10 +2291,348 @@ fn run_new() -> Run {
         tm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         tlm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         intext: false, t0: 0, stop: false,
-        fonts: [pfont.pfont_new(); 6], fkey: [0; 6],
+        fonts: [pfont.pfont_new(); 6], emb: [embfont.emb_new(); 6], gp: gpath.gp_new(), fkey: [0; 6],
         nfont: 0,
         ops: 0, glyphs: 0, paths: 0, images: 0, imgfail: 0,
-        fontmiss: 0, txt: 0,
+        fontmiss: 0, txt: 0, bx: 0, bm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         ras: raster.raster_new(), scratch: 0 as *mut u8,
-        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, lasth: 0.0 }
+        racc: 0 as *mut u8, lastx: 0.0, lasty: 0.0, ex: 0.0, ey: 0.0, smdepth: 0, lasth: 0.0,
+        pbase: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], patdepth: 0,
+        pmask: prast.Mask { p: 0 as *mut u8, w: 0, h: 0 },
+        tcell: canvas.canvas_new(), tc_pat: 0, tc_col: 0, tc_w: 0, tc_h: 0,
+        tc_ok: false }
+}
+
+fn pattern_lookup(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) -> u32 {
+    let d: *mut pdoc.Doc = (*r).d
+    var pn: [u8; 7] = "Pattern"
+    let pd: u32 = pdoc.doc_dict_get(d, res, (&pn[0]) as u64, 7)
+    if pobj.o_kind(&(*d).ar, pd) != pobj.T_DICT {
+        return 0
+    }
+    return pdoc.doc_dict_get(d, pd, pobj.o_str_ptr(ar, nm),
+        pobj.o_str_len(ar, nm))
+}
+
+fn pattern_matrix(r: *mut Run, pat: u32, out: *mut f64) {
+    var mn: [u8; 6] = "Matrix"
+    var pm: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    var tmp: [f64; 6] = [0.0; 6]
+    if pfunc.pf_nums((*r).d, pat, (&mn[0]) as u64, 6, (&tmp[0]) as *mut f64, 6) >= 6 {
+        pm = tmp
+    }
+    mmul((&pm[0]) as *mut f64, (&(*r).pbase[0]) as *mut f64, out)
+}
+
+fn pattern_mask_ready(r: *mut Run) -> bool {
+    if (*r).pmask.p as usize == 0 {
+        (*r).pmask = prast.mask_new((*r).pr.w, (*r).pr.h, 0 as u8)
+    }
+    return (*r).pmask.p as usize != 0
+}
+
+fn pattern_budget(r: *mut Run) -> bool {
+    if (*r).stop {
+        return false
+    }
+    if micros() - (*r).t0 > TIME_LIMIT_US {
+        (*r).stop = true
+        return false
+    }
+    return true
+}
+
+fn pattern_fill(r: *mut Run, g: *mut GS, rule: u32) {
+    if !pattern_budget(r) || !pattern_mask_ready(r) || (*r).pr.ok == 0 {
+        return
+    }
+    prast.pr_fill_mask(&(*r).pr, &(*r).pmask, clipmask(r), rule)
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    prast.pr_bounds(&(*r).pr, &x0, &y0, &x1, &y1)
+    pattern_paint(r, (*g).fpat, (*g).fa, (*g).fill, x0, y0, x1, y1)
+}
+
+fn pattern_stroke(r: *mut Run, g: *mut GS, lw: f64) {
+    if !pattern_budget(r) || !pattern_mask_ready(r) {
+        return
+    }
+    if !prast.pr_stroke_mask(&(*r).pr, lw, &(*r).tmp, &(*r).pmask, clipmask(r)) {
+        return
+    }
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    prast.pr_bounds(&(*r).tmp, &x0, &y0, &x1, &y1)
+    pattern_paint(r, (*g).spat, (*g).sa, (*g).stroke, x0, y0, x1, y1)
+}
+
+fn pattern_paint(r: *mut Run, pat: u32, alpha: f64, ucol: u32, x0: usize,
+    y0: usize, x1: usize, y1: usize) {
+    let d: *mut pdoc.Doc = (*r).d
+    var tn: [u8; 11] = "PatternType"
+    var sn: [u8; 7] = "Shading"
+    let pt: i64 = pdoc.doc_int(d, pat, (&tn[0]) as u64, 11, 0)
+    var m: [f64; 6] = [0.0; 6]
+    pattern_matrix(r, pat, (&m[0]) as *mut f64)
+    if pt == 2 {
+        shade_paint(r, pdoc.doc_dict_get(d, pat, (&sn[0]) as u64, 7),
+            (&m[0]) as *mut f64, &(*r).pmask, x0, y0, x1, y1, alpha, true)
+    }
+    if pt == 1 {
+        tile_paint_pattern(r, pat, (&m[0]) as *mut f64, x0, y0, x1, y1, alpha,
+            ucol)
+    }
+}
+
+fn cs_comps(kind: u32) -> usize {
+    if kind == CS_GRAY || kind == CS_INDEXED {
+        return 1
+    }
+    if kind == CS_CMYK {
+        return 4
+    }
+    return 3
+}
+
+fn shade_paint(r: *mut Run, sh: u32, m: *mut f64, mask: *mut prast.Mask,
+    x0: usize, y0: usize, x1: usize, y1: usize, alpha: f64, usebg: bool) {
+    let d: *mut pdoc.Doc = (*r).d
+    var cn: [u8; 10] = "ColorSpace"
+    var bgn: [u8; 10] = "Background"
+    var pal: u32 = 0
+    var base: u32 = 1
+    let kind: u32 = cs_kind(d, &(*d).ar,
+        pdoc.doc_dict_get(d, sh, (&cn[0]) as u64, 10), &pal, &base)
+    var s: pshade.Shade = pshade.sh_new()
+    if !pshade.sh_load(d, sh, &s, cs_comps(kind)) {
+        pshade.sh_free(&s)
+        return
+    }
+    var inv: [f64; 6] = [0.0; 6]
+    if !pshade.sh_invert(m, (&inv[0]) as *mut f64) {
+        pshade.sh_free(&s)
+        return
+    }
+    let lut: *mut u32 = mem.heap_alloc(pshade.SH_LUT * 4) as *mut u32
+    if lut as usize == 0 {
+        pshade.sh_free(&s)
+        return
+    }
+    var i: usize = 0
+    while s.lutc as usize != 0 && i < pshade.SH_LUT {
+        *((lut as u64 + (i * 4) as u64) as *mut u32) = colour_of(d, kind, pal,
+            base, ((s.lutc as u64) + (i * s.nc * 8) as u64) as *mut f64, s.nc)
+        i = i + 1
+    }
+    var bgv: [f64; 8] = [0.0; 8]
+    var bg: u32 = 0
+    var hasbg: bool = false
+    if usebg {
+        let bn: usize = pfunc.pf_nums(d, sh, (&bgn[0]) as u64, 10,
+            (&bgv[0]) as *mut f64, 8)
+        if bn > 0 {
+            bg = colour_of(d, kind, pal, base, (&bgv[0]) as *mut f64, bn)
+            hasbg = true
+        }
+    }
+    if s.stype >= 4 {
+        mesh_shade_paint(r, &s, d, kind, pal, base, mask, x0, y0, x1, y1, m, lut,
+            bg, hasbg, alpha)
+    } else {
+        pshade.sh_paint(&s, (*r).cv, mask, x0, y0, x1, y1, (&inv[0]) as *mut f64,
+            lut, bg, hasbg, alpha)
+    }
+    mem.heap_free(lut as *mut u8, pshade.SH_LUT * 4)
+    pshade.sh_free(&s)
+}
+
+fn mesh_shade_paint(r: *mut Run, s: *mut pshade.Shade, d: *mut pdoc.Doc,
+    kind: u32, pal: u32, base: u32, mask: *mut prast.Mask, x0: usize,
+    y0: usize, x1: usize, y1: usize, m: *mut f64, lut: *mut u32, bg: u32,
+    hasbg: bool, alpha: f64) {
+    let nv: usize = pmesh.mesh_vertex_count(&(*s).mesh)
+    var vcol: *mut u32 = 0 as *mut u32
+    if !(*s).hasfn {
+        vcol = mem.heap_alloc((nv + 1) * 4) as *mut u32
+        if vcol as usize == 0 {
+            return
+        }
+        var i: usize = 0
+        while i < nv {
+            let vp: *mut f64 = pmesh.mesh_vertex_ptr(&(*s).mesh, i)
+            *((vcol as u64 + (i * 4) as u64) as *mut u32) = colour_of(d, kind,
+                pal, base, ((vp as u64) + 16) as *mut f64, (*s).mesh.nc)
+            i = i + 1
+        }
+    }
+    pshade.sh_paint_mesh(s, (*r).cv, mask, x0, y0, x1, y1, m, lut, vcol, bg,
+        hasbg, alpha)
+    if vcol as usize != 0 {
+        mem.heap_free(vcol as *mut u8, (nv + 1) * 4)
+    }
+}
+
+fn op_shading(r: *mut Run, ar: *mut pobj.PdfArena, nm: u32, res: u32) {
+    let d: *mut pdoc.Doc = (*r).d
+    if pobj.o_kind(ar, nm) != pobj.T_NAME || !pattern_budget(r) {
+        return
+    }
+    var shn: [u8; 7] = "Shading"
+    let sd: u32 = pdoc.doc_dict_get(d, res, (&shn[0]) as u64, 7)
+    if pobj.o_kind(&(*d).ar, sd) != pobj.T_DICT {
+        return
+    }
+    let sh: u32 = pdoc.doc_dict_get(d, sd, pobj.o_str_ptr(ar, nm),
+        pobj.o_str_len(ar, nm))
+    let g: *mut GS = cur(r)
+    shade_paint(r, sh, (&(*g).m[0]) as *mut f64, clipmask(r), 0, 0,
+        canvas.canvas_width((*r).cv), canvas.canvas_height((*r).cv),
+        (*g).fa, false)
+}
+
+fn tile_fit(v: f64) -> usize {
+    var c: f64 = v
+    if c < 1.0 {
+        c = 1.0
+    }
+    if c > 2000.0 {
+        c = 2000.0
+    }
+    return (c + 0.999) as usize
+}
+
+fn tile_paint_pattern(r: *mut Run, pat: u32, m: *mut f64, x0: usize, y0: usize,
+    x1: usize, y1: usize, alpha: f64, ucol: u32) {
+    let d: *mut pdoc.Doc = (*r).d
+    if (*r).patdepth >= 2 {
+        return
+    }
+    var bbn: [u8; 4] = "BBox"
+    var xsn: [u8; 5] = "XStep"
+    var ysn: [u8; 5] = "YStep"
+    var ptn: [u8; 9] = "PaintType"
+    var bb: [f64; 4] = [0.0; 4]
+    if pfunc.pf_nums(d, pat, (&bbn[0]) as u64, 4, (&bb[0]) as *mut f64, 4) < 4 {
+        return
+    }
+    var xs: f64 = pdoc.doc_num(d, pat, (&xsn[0]) as u64, 5, bb[2] - bb[0])
+    var ys: f64 = pdoc.doc_num(d, pat, (&ysn[0]) as u64, 5, bb[3] - bb[1])
+    if xs < 0.0 {
+        xs = 0.0 - xs
+    }
+    if ys < 0.0 {
+        ys = 0.0 - ys
+    }
+    if xs < 0.000001 || ys < 0.000001 {
+        return
+    }
+    let sx: f64 = sq(*((m as u64) as *mut f64) * *((m as u64) as *mut f64) +
+        *((m as u64 + 8) as *mut f64) * *((m as u64 + 8) as *mut f64))
+    let sy: f64 = sq(*((m as u64 + 16) as *mut f64) * *((m as u64 + 16) as *mut f64) +
+        *((m as u64 + 24) as *mut f64) * *((m as u64 + 24) as *mut f64))
+    let cw: usize = tile_fit(xs * sx)
+    let ch: usize = tile_fit(ys * sy)
+    let paint: i64 = pdoc.doc_int(d, pat, (&ptn[0]) as u64, 9, 1)
+    var key: u32 = 0
+    if paint == 2 {
+        key = ucol
+    }
+    if !((*r).tc_ok && (*r).tc_pat == pat && (*r).tc_col == key &&
+    (*r).tc_w == cw && (*r).tc_h == ch) {
+        if !tile_render(r, pat, (&bb[0]) as *mut f64, xs, ys, cw, ch,
+            paint == 2, ucol) {
+            return
+        }
+        (*r).tc_pat = pat
+        (*r).tc_col = key
+        (*r).tc_w = cw
+        (*r).tc_h = ch
+    }
+    var inv: [f64; 6] = [0.0; 6]
+    if !pshade.sh_invert(m, (&inv[0]) as *mut f64) {
+        return
+    }
+    ptile.tile_paint(&(*r).tcell, (*r).cv, &(*r).pmask, x0, y0, x1, y1,
+        (&inv[0]) as *mut f64, bb[0], bb[1], xs, ys, alpha)
+}
+
+#[allow_escape]
+fn tile_render(r: *mut Run, pat: u32, bb: *mut f64, xs: f64, ys: f64,
+    cw: usize, ch: usize, uncoloured: bool, ucol: u32) -> bool {
+    let d: *mut pdoc.Doc = (*r).d
+    let dar: *mut pobj.PdfArena = &(*d).ar
+    (*r).tc_ok = false
+    canvas.canvas_free(&(*r).tcell)
+    (*r).tcell = canvas.canvas_new()
+    if !canvas.canvas_init(&(*r).tcell, cw, ch) {
+        return false
+    }
+    canvas.canvas_clear(&(*r).tcell, canvas.color_of(0, 0, 0, 0))
+    var cr: Run = run_new()
+    if !run_init(&cr, d, &(*r).tcell, (*r).fh, cw, ch) {
+        run_free(&cr)
+        return false
+    }
+    cr.t0 = (*r).t0
+    cr.patdepth = (*r).patdepth + 1
+    let kx: f64 = (cw as f64) / xs
+    let ky: f64 = (ch as f64) / ys
+    let bx0: f64 = *((bb as u64) as *mut f64)
+    let by0: f64 = *((bb as u64 + 8) as *mut f64)
+    let bx1: f64 = *((bb as u64 + 16) as *mut f64)
+    let by1: f64 = *((bb as u64 + 24) as *mut f64)
+    cr.gs[0].m = [kx, 0.0, 0.0, ky, 0.0 - bx0 * kx, 0.0 - by0 * ky]
+    cr.pbase = cr.gs[0].m
+    if uncoloured {
+        cr.gs[0].fill = ucol
+        cr.gs[0].stroke = ucol
+    }
+    if bx1 - bx0 < xs || by1 - by0 < ys {
+        let cm: prast.Mask = prast.mask_new(cw, ch, 0 as u8)
+        if cm.p as usize != 0 {
+            var ex: f64 = (bx1 - bx0) * kx
+            var ey: f64 = (by1 - by0) * ky
+            if ex > (cw as f64) {
+                ex = cw as f64
+            }
+            if ey > (ch as f64) {
+                ey = ch as f64
+            }
+            let ix: usize = (ex + 0.5) as usize
+            let iy: usize = (ey + 0.5) as usize
+            var yy: usize = 0
+            while yy < iy && yy < ch {
+                var xx: usize = 0
+                while xx < ix && xx < cw {
+                    *((cm.p as u64 + (yy * cw + xx) as u64) as *mut u8) = 255 as u8
+                    xx = xx + 1
+                }
+                yy = yy + 1
+            }
+            cr.masks[0] = cm
+            cr.nmask = 1
+            cr.gs[0].clip = 0
+        }
+    }
+    var rn: [u8; 9] = "Resources"
+    var fres: u32 = pdoc.doc_dict_get(d, pat, (&rn[0]) as u64, 9)
+    if pobj.o_kind(dar, fres) != pobj.T_DICT {
+        fres = 0
+    }
+    var body: rt.Buf = rt.buf_new()
+    if pdoc.doc_stream(d, pat, &body) {
+        exec_stream(&cr, rt.buf_ptr(&body), rt.buf_len(&body), fres, 0)
+    }
+    rt.buf_free(&body)
+    (*r).ops = (*r).ops + cr.ops
+    if cr.stop {
+        (*r).stop = true
+    }
+    run_free(&cr)
+    (*r).tc_ok = true
+    return true
 }

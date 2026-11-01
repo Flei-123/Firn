@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1br
+import media.video.av1.av1fhdr
+
+export { gm_parse, gm_defaults }
+
+const WARP_PREC: i64 = 16
+
+fn gm_defaults(p: *mut [i64; 48]) {
+    var r: usize = 0
+    while r < 8 {
+        var i: usize = 0
+        while i < 6 {
+            if i % 3 == 2 {
+                (*p)[r * 6 + i] = 1 << 16
+            } else {
+                (*p)[r * 6 + i] = 0
+            }
+            i = i + 1
+        }
+        r = r + 1
+    }
+}
+
+fn inverse_recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        return v
+    }
+    if (v & 1) == 1 {
+        return r - ((v + 1) >> 1)
+    }
+    return r + (v >> 1)
+}
+
+fn decode_subexp(r: *mut av1br.BR, num_syms: i64) -> i64 {
+    var i: i64 = 0
+    var mk: i64 = 0
+    let k: i64 = 3
+    while true {
+        var b2: i64 = k
+        if i != 0 {
+            b2 = k + i - 1
+        }
+        let a: i64 = 1 << (b2 as u64)
+        if num_syms <= mk + 3 * a {
+            return av1br.rd_ns(r, num_syms - mk, "subexp_final_bits") + mk
+        }
+        if av1br.rd_bit(r, "subexp_more_bits") == 1 {
+            i = i + 1
+            mk = mk + a
+        } else {
+            return av1br.rd(r, b2, "subexp_bits") + mk
+        }
+        if !av1br.br_ok(r) {
+            return 0
+        }
+    }
+    return 0
+}
+
+fn decode_unsigned_subexp_with_ref(r: *mut av1br.BR, mx: i64, rf: i64) -> i64 {
+    let v: i64 = decode_subexp(r, mx)
+    if (rf << 1) <= mx {
+        return inverse_recenter(rf, v)
+    }
+    return mx - 1 - inverse_recenter(mx - 1 - rf, v)
+}
+
+fn decode_signed_subexp_with_ref(r: *mut av1br.BR, low: i64, high: i64, rf: i64) -> i64 {
+    return decode_unsigned_subexp_with_ref(r, high - low, rf - low) + low
+}
+
+fn read_global_param(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr, gtype: i64, rf: usize, idx: usize) {
+    var abs_bits: i64 = 12
+    var prec_bits: i64 = 15
+    if idx < 2 {
+        if gtype == 1 {
+            var hp: i64 = 1
+            if (*f).allow_high_precision_mv == 1 {
+                hp = 0
+            }
+            abs_bits = 9 - hp
+            prec_bits = 3 - hp
+        } else {
+            abs_bits = 12
+            prec_bits = 6
+        }
+    }
+    let prec_diff: i64 = WARP_PREC - prec_bits
+    var round: i64 = 0
+    var sub: i64 = 0
+    if idx % 3 == 2 {
+        round = 1 << 16
+        sub = 1 << (prec_bits as u64)
+    }
+    let mx: i64 = 1 << (abs_bits as u64)
+    let rr: i64 = ((*f).prev_gm_params[rf * 6 + idx] >> (prec_diff as u64)) - sub
+    (*f).gm_params[rf * 6 + idx] = (decode_signed_subexp_with_ref(r, 0 - mx, mx + 1, rr) << (prec_diff as u64)) + round
+}
+
+fn gm_parse(r: *mut av1br.BR, f: *mut av1fhdr.FrameHdr) {
+    gm_defaults(&(*f).gm_params)
+    var i: usize = 0
+    while i < 8 {
+        (*f).gm_type[i] = 0
+        i = i + 1
+    }
+    if (*f).frame_is_intra == 1 {
+        return
+    }
+    var rf: usize = 1
+    while rf <= 7 {
+        var gtype: i64 = 0
+        if av1br.rd_bit(r, "is_global") == 1 {
+            if av1br.rd_bit(r, "is_rot_zoom") == 1 {
+                gtype = 2
+            } else if av1br.rd_bit(r, "is_translation") == 1 {
+                gtype = 1
+            } else {
+                gtype = 3
+            }
+        }
+        (*f).gm_type[rf] = gtype
+        if gtype >= 2 {
+            read_global_param(r, f, gtype, rf, 2)
+            read_global_param(r, f, gtype, rf, 3)
+            if gtype == 3 {
+                read_global_param(r, f, gtype, rf, 4)
+                read_global_param(r, f, gtype, rf, 5)
+            } else {
+                (*f).gm_params[rf * 6 + 4] = 0 - (*f).gm_params[rf * 6 + 3]
+                (*f).gm_params[rf * 6 + 5] = (*f).gm_params[rf * 6 + 2]
+            }
+        }
+        if gtype >= 1 {
+            read_global_param(r, f, gtype, rf, 0)
+            read_global_param(r, f, gtype, rf, 1)
+        }
+        if !av1br.br_ok(r) {
+            return
+        }
+        rf = rf + 1
+    }
+}

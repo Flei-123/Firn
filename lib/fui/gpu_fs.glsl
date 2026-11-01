@@ -11,6 +11,7 @@ uniform sampler2D u_stream;
 uniform sampler2D u_src;
 uniform vec4 u_spot[8];
 uniform int u_nspot;
+uniform vec4 u_shape[32];
 flat in vec4 v_c0;
 flat in vec4 v_c1;
 flat in vec4 v_g;
@@ -83,6 +84,111 @@ ivec4 src_at(ivec2 p) {
 }
 
 ivec4 lerp4(ivec4 a, ivec4 b, int t) { return (a * (256 - t) + b * t + 128) >> 8; }
+
+float melt_box(int j, vec2 p) {
+    vec4 s = u_shape[j * 2];
+    float r = u_shape[j * 2 + 1].x;
+    vec2 q = abs(p - s.xy) - s.zw + r;
+    vec2 oq = max(q, vec2(0.0));
+    return sqrt(dot(oq, oq)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float melt_box_g(int j, vec2 p, out vec2 g) {
+    vec4 s = u_shape[j * 2];
+    float r = u_shape[j * 2 + 1].x;
+    vec2 dd = p - s.xy;
+    vec2 sg = vec2(dd.x < 0.0 ? -1.0 : 1.0, dd.y < 0.0 ? -1.0 : 1.0);
+    vec2 q = abs(dd) - s.zw + r;
+    vec2 oq = max(q, vec2(0.0));
+    float l = sqrt(dot(oq, oq));
+    if (l > 0.0) { g = sg * oq / l; return l - r; }
+    if (q.x > q.y) { g = vec2(sg.x, 0.0); return q.x - r; }
+    g = vec2(0.0, sg.y);
+    return q.y - r;
+}
+
+float melt_field(vec2 p, int n, int mode, float kk) {
+    if (n == 0) return 1.0e9;
+    if (mode == 2 && kk > 0.0) {
+        float f = 0.0;
+        for (int j = 0; j < 16; j++) {
+            if (j >= n) break;
+            float d = melt_box(j, p);
+            if (d < kk) { float t = 1.0 - d / kk; f += t * t; }
+        }
+        if (f <= 0.0) return kk;
+        return kk * (1.0 - sqrt(f));
+    }
+    if (mode == 3 && kk > 0.0) {
+        vec2 ga;
+        float a = melt_box_g(0, p, ga);
+        for (int j = 1; j < 16; j++) {
+            if (j >= n) break;
+            vec2 gb;
+            float b = melt_box_g(j, p, gb);
+            float h = kk - abs(a - b);
+            float m = min(a, b);
+            if (h > 0.0) {
+                h = h / kk;
+                float w = min(1.0 - dot(ga, gb), 1.0);
+                m = m - h * h * kk * 0.25 * w;
+            }
+            if (b < a) ga = gb;
+            a = m;
+        }
+        return a;
+    }
+    float d = melt_box(0, p);
+    for (int j = 1; j < 16; j++) {
+        if (j >= n) break;
+        float e = melt_box(j, p);
+        if (kk <= 0.0 || mode == 2) { d = min(d, e); continue; }
+        float h = kk - abs(d - e);
+        float m = min(d, e);
+        if (h > 0.0) {
+            h = h / kk;
+            if (mode == 1) m = m - h * h * h * kk * (1.0 / 6.0);
+            else m = m - h * h * kk * 0.25;
+        }
+        d = m;
+    }
+    return d;
+}
+
+vec4 melt_shape_color(int j) {
+    vec4 s = u_shape[j * 2 + 1];
+    float r = floor(s.y / 256.0);
+    float b = floor(s.z / 256.0);
+    return vec4(r, s.y - r * 256.0, b, s.z - b * 256.0);
+}
+
+vec4 melt_color(vec2 p, int n, float reach) {
+    float dv[16];
+    float m = 1.0e18;
+    int jm = 0;
+    for (int j = 0; j < 16; j++) {
+        if (j >= n) break;
+        dv[j] = melt_box(j, p);
+        if (dv[j] < m) { m = dv[j]; jm = j; }
+    }
+    float sw = 0.0;
+    vec4 sc = vec4(0.0);
+    for (int j = 0; j < 16; j++) {
+        if (j >= n) break;
+        float w = 0.0;
+        if (j == jm) w = 1.0;
+        else if (reach > 0.0) {
+            float t = 1.0 - (dv[j] - m) / reach;
+            if (t > 0.0) w = t * t;
+        }
+        if (w > 0.0) {
+            vec4 c = melt_shape_color(j);
+            sw += w;
+            sc += w * vec4(c.a, c.rgb);
+        }
+    }
+    return floor(sc / sw + 0.5).yzwx;
+}
 
 void main() {
     vec2 p = vec2(gl_FragCoord.x, u_size.y - gl_FragCoord.y);
@@ -307,6 +413,16 @@ void main() {
         float a = v_c0.a / 255.0 * min(cov, 1.0);
         o = s * a;
         if (o.a <= 0.0 && o.r <= 0.0 && o.g <= 0.0 && o.b <= 0.0) discard;
+        return;
+    }
+    if (kind == 17) {
+        int n = int(v_p.x + 0.5); int mode = int(v_p.y + 0.5); float reach = v_p.z;
+        vec2 pc = vec2(i.x + 0.5, i.y + 0.5);
+        float cov = clamp(0.5 - melt_field(pc, n, mode, reach), 0.0, 1.0);
+        if (cov <= 0.0) discard;
+        vec4 c = v_c0;
+        if (v_p.w > 0.5) c = melt_color(pc, n, reach);
+        o = blendf(c, cov * clipf);
         return;
     }
     discard;

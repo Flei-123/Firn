@@ -1620,7 +1620,7 @@ fn emit_wasm(
     }
     let outlined = wasm_outline::run(module);
     let module = outlined.as_ref().unwrap_or(module);
-    let out = match codegen_wasm::emit(module) {
+    let out = match codegen_wasm::emit(module, matches!(opts.optcfg.level, opt::Level::Dev | opt::Level::DevFast) || std::env::var_os("FIRN_WASM_NAMES").is_some()) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);

@@ -2,7 +2,7 @@
 //! **ROUND WASM — the third code generator: FIR -> WebAssembly.**
 //!
 //! INTERFACE (the one the two machine backends have, with a binary result):
-//!   `pub fn emit(m: &fir::Module) -> Result<Output, String>`
+//!   `pub fn emit(m: &fir::Module, names: bool) -> Result<Output, String>`
 //!
 //! `--target=wasm32-browser` ends here. The file reads exactly the
 //! `fir::Module` the x86 and the aarch64 generators read; the frontend,
@@ -475,17 +475,17 @@ struct Refusal {
     what: String,
 }
 
-pub fn emit(m: &Module) -> Result<Output, String> {
+pub fn emit(m: &Module, names: bool) -> Result<Output, String> {
     if crate::prof::is_kernel() {
         return Err("--target=wasm32-browser does not support the kernel profile: a browser page is no bare machine".into());
     }
     if !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
-    emit_inner(m)
+    emit_inner(m, names)
 }
 
-fn emit_inner(m: &Module) -> Result<Output, String> {
+fn emit_inner(m: &Module, names: bool) -> Result<Output, String> {
     // ------------------------------------------------ 1. the data texts
     let mut img = Image::default();
     let gc_active = crate::gc::runtime_active();
@@ -711,7 +711,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     let emitted: Vec<usize> = (0..m.funcs.len()).filter(|i| seen.contains(&m.funcs[*i].name)).collect();
 
     // ------------------------------------------------ 3. function indices
-    let mut wm = w::Module { names: true, ..Default::default() };
+    let mut wm = w::Module { names, ..Default::default() };
     for (nm, ps, rs) in HOST.iter() {
         let t = wm.type_index(w::FuncType { params: ps.to_vec(), results: rs.to_vec() });
         wm.imports.push(w::Import { module: "firn".into(), name: nm.to_string(), ty: t, sym: format!("firn.{}", nm) });
