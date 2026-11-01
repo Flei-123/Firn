@@ -2,7 +2,13 @@
 
 Goal: the compiler infers ownership and lifetimes of heap objects by itself — no annotations, no borrow checker — and frees deterministically at the last use or reuses the memory in place. Whatever it cannot prove (cycles, unclear aliases) stays with the tracing GC (`docs/GC.md`). The prototype lives behind a flag and changes nothing while the flag is off.
 
-Status: design + baseline only. No compiler change yet.
+Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings in `compiler/src/own/fir/` (branch staff/firn-mvy0ebhp, not yet gated).
+
+### FIR stage (r1325 a)
+- Hook: `opt::optimize_with`; `prepare` before the optimizer (rename `__str_concat` -> `__own_str_concat2`, producers `inline_hint=false`), `run` after it. Only on/check, level != dev, native targets, not kernel; `FIRN_OWN_NO_FIR=1` disables it.
+- Modules: `registry` (producers, consumers, borrow-all, free function), `index` (CFG, defs, use counts, bitsets), `slots` (private allocas, 8-byte cells), `flow` (forward may-sets per value and per cell, escapes), `summary` (per-parameter borrow, optimistic fixpoint over the call graph), `live` (per-site liveness, death points, must-handles), `insert` (`__gc_free_block` / `__gc_poison_block`).
+- Safety rules: a site is freed only if it never reaches a sink, is not live before its own producer call, and the death point has a must-handle (value or cell that holds exactly that site). Edge deaths only into single-predecessor blocks without phis. Everything else leaks to the GC.
+- Extension points for (b) gc classes and (c) Vec/Map/closures: add a `Shape` + producer entry in `registry`, teach `slots::producer_cells`/`flow::transfer` the shape.
 
 ## 1. Prior art
 
