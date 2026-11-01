@@ -527,9 +527,16 @@ fn optimize_map(map: &mut HashMap<String, Func>, st: &mut OptStats, cfg: &OptCon
 }
 
 pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
+    let own = crate::own::fir::active(cfg.level);
+    if own {
+        crate::own::fir::prepare(m);
+    }
     crate::gtaken::install(m);
     let st = optimize_with_taken(m, cfg);
     crate::gtaken::set(None);
+    if own {
+        crate::own::fir::run(m);
+    }
     st
 }
 

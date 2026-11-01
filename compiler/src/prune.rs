@@ -86,6 +86,7 @@ pub fn root_names() -> Vec<String> {
         named.push(h);
     }
     named.extend(crate::iface::table_targets());
+    named.extend(crate::own::fir::root_names());
     named
 }
 

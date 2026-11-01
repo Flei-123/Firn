@@ -38,6 +38,12 @@ same_out tree_drop
 expect_rc tree_drop_count on 0
 expect_rc tree_drop_count check 0
 expect_rc tree_drop_bad check 86
+same_out fir_str_loop
+same_out fir_str_branch
+same_out fir_str_param
+same_out fir_str_ret
+expect_rc fir_str_freed on 0
+expect_rc fir_str_freed check 0
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]

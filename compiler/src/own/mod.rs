@@ -2,6 +2,7 @@
 
 pub(crate) mod borrow;
 pub(crate) mod concat;
+pub(crate) mod fir;
 pub(crate) mod fresh;
 pub(crate) mod reuse;
 pub(crate) mod shape;
