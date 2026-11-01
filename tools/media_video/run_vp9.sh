@@ -38,5 +38,26 @@ i_sharp testsrc2 160x96 1 -b:v 150k -sharpness 7
 i_noerr testsrc2 160x96 1 -b:v 300k -frame-parallel 1
 i_err testsrc2 160x96 1 -b:v 300k -error-resilient 1
 LIST
+run_clips "-g 30 -auto-alt-ref 0 -lag-in-frames 0" <<LIST
+p_small testsrc2 64x48 1 -b:v 300k
+p_odd testsrc2 100x62 2 -b:v 300k
+p_cif testsrc2 352x288 2 -b:v 800k
+p_mandel mandelbrot 192x112 2 -b:v 400k
+p_tile2 testsrc2 704x144 2 -b:v 800k -tile-columns 1
+p_tilerows testsrc2 256x300 2 -b:v 800k -tile-rows 1
+p_lossless testsrc2 96x64 1 -lossless 1
+p_seg mandelbrot 192x112 2 -b:v 100k -aq-mode 1
+p_aq3 testsrc2 192x112 2 -b:v 200k -aq-mode 3
+p_noerr testsrc2 160x96 1 -b:v 300k -frame-parallel 1
+p_err testsrc2 160x96 1 -b:v 300k -error-resilient 1
+p_hiq testsrc2 160x96 1 -crf 4 -b:v 0
+p_lowq testsrc2 160x96 1 -crf 55 -b:v 0
+LIST
+run_clips "-g 60 -auto-alt-ref 1 -lag-in-frames 10" <<LIST
+a_small testsrc2 128x96 2 -b:v 300k
+a_cif testsrc2 352x288 2 -b:v 800k
+a_mandel mandelbrot 192x112 3 -b:v 400k
+a_noerr testsrc2 160x96 2 -b:v 300k -frame-parallel 1
+LIST
 echo "vp9: $n clips, $bad diff"
 [ "$bad" -eq 0 ]
