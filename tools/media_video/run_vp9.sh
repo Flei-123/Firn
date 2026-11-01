@@ -52,12 +52,22 @@ p_noerr testsrc2 160x96 1 -b:v 300k -frame-parallel 1
 p_err testsrc2 160x96 1 -b:v 300k -error-resilient 1
 p_hiq testsrc2 160x96 1 -crf 4 -b:v 0
 p_lowq testsrc2 160x96 1 -crf 55 -b:v 0
+p_tiny testsrc2 17x13 2 -b:v 200k
+p_wide testsrc2 17x300 1 -b:v 300k
+p_rt mandelbrot 192x112 2 -b:v 300k -deadline realtime -cpu-used 6
+p_screen testsrc2 256x144 2 -b:v 300k -tune-content screen
+p_tile4 testsrc2 1024x96 2 -b:v 800k -tile-columns 2
+p_long testsrc2 352x288 4 -b:v 600k
 LIST
 run_clips "-g 60 -auto-alt-ref 1 -lag-in-frames 10" <<LIST
 a_small testsrc2 128x96 2 -b:v 300k
 a_cif testsrc2 352x288 2 -b:v 800k
 a_mandel mandelbrot 192x112 3 -b:v 400k
 a_noerr testsrc2 160x96 2 -b:v 300k -frame-parallel 1
+a_odd testsrc2 100x62 3 -b:v 200k
+a_tiles testsrc2 704x144 2 -b:v 800k -tile-columns 1
+a_arnr mandelbrot 192x112 3 -b:v 300k -arnr-strength 6 -arnr-maxframes 7
+a_long testsrc2 352x288 4 -b:v 600k -lag-in-frames 25
 LIST
 echo "vp9: $n clips, $bad diff"
 [ "$bad" -eq 0 ]
