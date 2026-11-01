@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.vp9.vp9mem
+import media.video.av1.av1mem
+import media.video.av1.av1seq
+import media.video.av1.av1fhdr
+import media.video.av1.av1ohint
+
+export { MfBuf, mfbuf_new, mfbuf_retain, mfbuf_release, mf_save_mvs, mf_save_segids, mf_ref_at, mf_mv_at, mf_seg_at, REFMVS_LIMIT, MI_REF_BYTES, MI_MV_BYTES }
+
+const REFMVS_LIMIT: i64 = 4095
+const MI_REF_BYTES: i64 = 2
+const MI_MV_BYTES: i64 = 8
+
+struct MfBuf {
+    refs: i64,
+    mi_rows: i64,
+    mi_cols: i64,
+    rows8: i64,
+    cols8: i64,
+    ref_frames: u64,
+    mvs: u64,
+    seg_ids: u64,
+}
+
+fn mfbuf_new(mi_rows: i64, mi_cols: i64) -> *mut MfBuf {
+    let m: *mut MfBuf = av1mem.av1_zalloc[MfBuf]()
+    (*m).refs = 1
+    (*m).mi_rows = mi_rows
+    (*m).mi_cols = mi_cols
+    (*m).rows8 = (mi_rows + 1) >> 1
+    (*m).cols8 = (mi_cols + 1) >> 1
+    let n8: usize = ((*m).rows8 * (*m).cols8) as usize
+    let n: usize = (mi_rows * mi_cols) as usize
+    (*m).ref_frames = vp9mem.alloc(n8 + 8)
+    (*m).mvs = vp9mem.alloc(n8 * 4 + 8)
+    (*m).seg_ids = vp9mem.alloc(n + 8)
+    vp9mem.zero((*m).ref_frames, n8 + 8)
+    vp9mem.zero((*m).mvs, n8 * 4 + 8)
+    vp9mem.zero((*m).seg_ids, n + 8)
+    return m
+}
+
+fn mfbuf_retain(m: *mut MfBuf) -> *mut MfBuf {
+    (*m).refs = (*m).refs + 1
+    return m
+}
+
+fn mfbuf_release(m: *mut MfBuf) {
+    (*m).refs = (*m).refs - 1
+    if (*m).refs > 0 {
+        return
+    }
+    let n8: usize = ((*m).rows8 * (*m).cols8) as usize
+    let n: usize = ((*m).mi_rows * (*m).mi_cols) as usize
+    vp9mem.free((*m).ref_frames, n8 + 8)
+    vp9mem.free((*m).mvs, n8 * 4 + 8)
+    vp9mem.free((*m).seg_ids, n + 8)
+    av1mem.av1_zfree[MfBuf](m)
+}
+
+fn signed8(v: i64) -> i64 {
+    if v > 127 {
+        return v - 256
+    }
+    return v
+}
+
+fn iabs(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn mf_ref_at(m: *mut MfBuf, y8: i64, x8: i64) -> i64 {
+    return signed8(vp9mem.ld8((*m).ref_frames, (y8 * (*m).cols8 + x8) as usize))
+}
+
+fn mf_mv_at(m: *mut MfBuf, y8: i64, x8: i64, k: i64) -> i64 {
+    return vp9mem.ldi16((*m).mvs, ((y8 * (*m).cols8 + x8) * 2 + k) as usize)
+}
+
+fn mf_seg_at(m: *mut MfBuf, row: i64, col: i64) -> i64 {
+    return vp9mem.ld8((*m).seg_ids, (row * (*m).mi_cols + col) as usize)
+}
+
+fn mf_save_mvs(m: *mut MfBuf, ref_a: u64, mv_a: u64, fh: *mut av1fhdr.FrameHdr, s: *mut av1seq.SeqHdr) {
+    var y8: i64 = 0
+    while y8 < (*m).rows8 {
+        var x8: i64 = 0
+        while x8 < (*m).cols8 {
+            let row: i64 = vp9mem.imin(2 * y8 + 1, (*m).mi_rows - 1)
+            let col: i64 = vp9mem.imin(2 * x8 + 1, (*m).mi_cols - 1)
+            let mi: i64 = row * (*m).mi_cols + col
+            let cell: usize = (y8 * (*m).cols8 + x8) as usize
+            var best: i64 = 0
+            var brow: i64 = 0
+            var bcol: i64 = 0
+            var list: i64 = 0
+            while list < 2 {
+                let r: i64 = signed8(vp9mem.ld8(ref_a, (mi * MI_REF_BYTES + list) as usize))
+                if r > 0 {
+                    let hint: i64 = (*fh).order_hints[r as usize]
+                    var skip: bool = false
+                    if (*s).enable_order_hint == 1 {
+                        if av1ohint.rel_dist(s, hint, (*fh).order_hint) >= 0 {
+                            skip = true
+                        }
+                    }
+                    if !skip {
+                        let mbase: usize = ((mi * MI_MV_BYTES) / 2 + list * 2) as usize
+                        let mr: i64 = vp9mem.ldi16(mv_a, mbase)
+                        let mc: i64 = vp9mem.ldi16(mv_a, mbase + 1)
+                        if iabs(mr) <= REFMVS_LIMIT && iabs(mc) <= REFMVS_LIMIT {
+                            best = r
+                            brow = mr
+                            bcol = mc
+                        }
+                    }
+                }
+                list = list + 1
+            }
+            vp9mem.st8((*m).ref_frames, cell, best)
+            vp9mem.sti16((*m).mvs, cell * 2, brow)
+            vp9mem.sti16((*m).mvs, cell * 2 + 1, bcol)
+            x8 = x8 + 1
+        }
+        y8 = y8 + 1
+    }
+}
+
+fn mf_save_segids(m: *mut MfBuf, seg_a: u64, fh: *mut av1fhdr.FrameHdr, prev: u64) {
+    let n: usize = ((*m).mi_rows * (*m).mi_cols) as usize
+    if (*fh).segmentation_enabled == 1 && (*fh).segmentation_update_map == 0 {
+        if prev != 0 {
+            vp9mem.copy((*m).seg_ids, prev, n)
+        } else {
+            vp9mem.zero((*m).seg_ids, n)
+        }
+    } else {
+        vp9mem.copy((*m).seg_ids, seg_a, n)
+    }
+}

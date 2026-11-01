@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1mvmi
+
+export { extra_search, mode_context, clamp_stack }
+
+const MV_BORDER: i64 = 128
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn flip_for(td: *mut av1blkst.TileDec, cand_ref: i64, target_ref: i64, v: i64) -> i64 {
+    if (*(*td).fh).ref_frame_sign_bias[cand_ref as usize] != (*(*td).fh).ref_frame_sign_bias[target_ref as usize] {
+        return 0 - v
+    }
+    return v
+}
+
+fn add_extra_compound(td: *mut av1blkst.TileDec, ms: *mut [i64; 24], row: i64, col: i64) {
+    var cand_list: i64 = 0
+    while cand_list < 2 {
+        let cand_ref: i64 = av1mvmi.ref_get(td, row, col, cand_list)
+        if cand_ref > 0 {
+            var list: i64 = 0
+            while list < 2 {
+                let mr: i64 = av1mvmi.mv_get(td, row, col, cand_list, 0)
+                let mc: i64 = av1mvmi.mv_get(td, row, col, cand_list, 1)
+                let nid: i64 = (*ms)[av1mvmi.SC_ID_COUNT + list as usize]
+                let ndf: i64 = (*ms)[av1mvmi.SC_DIFF_COUNT + list as usize]
+                if cand_ref == (*td).ref_frame[list as usize] && nid < 2 {
+                    let at: usize = av1mvmi.SC_ID_MVS + (list * 4 + nid * 2) as usize
+                    (*ms)[at] = mr
+                    (*ms)[at + 1] = mc
+                    (*ms)[av1mvmi.SC_ID_COUNT + list as usize] = nid + 1
+                } else if ndf < 2 {
+                    let at: usize = av1mvmi.SC_DIFF_MVS + (list * 4 + ndf * 2) as usize
+                    (*ms)[at] = flip_for(td, cand_ref, (*td).ref_frame[list as usize], mr)
+                    (*ms)[at + 1] = flip_for(td, cand_ref, (*td).ref_frame[list as usize], mc)
+                    (*ms)[av1mvmi.SC_DIFF_COUNT + list as usize] = ndf + 1
+                }
+                list = list + 1
+            }
+        }
+        cand_list = cand_list + 1
+    }
+}
+
+fn add_extra_single(td: *mut av1blkst.TileDec, row: i64, col: i64) {
+    var cand_list: i64 = 0
+    while cand_list < 2 {
+        let cand_ref: i64 = av1mvmi.ref_get(td, row, col, cand_list)
+        if cand_ref > 0 {
+            let mr: i64 = flip_for(td, cand_ref, (*td).ref_frame[0], av1mvmi.mv_get(td, row, col, cand_list, 0))
+            let mc: i64 = flip_for(td, cand_ref, (*td).ref_frame[0], av1mvmi.mv_get(td, row, col, cand_list, 1))
+            if av1mvmi.stack_find(td, false, mr, mc, 0, 0) < 0 {
+                let n: i64 = (*td).num_mv_found
+                (*td).stack_mv[(n * 4) as usize] = mr
+                (*td).stack_mv[(n * 4 + 1) as usize] = mc
+                (*td).stack_w[n as usize] = 2
+                (*td).num_mv_found = n + 1
+            }
+        }
+        cand_list = cand_list + 1
+    }
+}
+
+fn combined_mv(td: *mut av1blkst.TileDec, ms: *mut [i64; 24], list: i64, slot: i64, comp: i64) -> i64 {
+    let nid: i64 = (*ms)[av1mvmi.SC_ID_COUNT + list as usize]
+    let ndf: i64 = (*ms)[av1mvmi.SC_DIFF_COUNT + list as usize]
+    if slot < nid {
+        return (*ms)[av1mvmi.SC_ID_MVS + (list * 4 + slot * 2 + comp) as usize]
+    }
+    if slot - nid < ndf {
+        return (*ms)[av1mvmi.SC_DIFF_MVS + (list * 4 + (slot - nid) * 2 + comp) as usize]
+    }
+    return (*td).global_mv[(list * 2 + comp) as usize]
+}
+
+fn append_combined(td: *mut av1blkst.TileDec, ms: *mut [i64; 24], slot: i64) {
+    let n: i64 = (*td).num_mv_found
+    (*td).stack_mv[(n * 4) as usize] = combined_mv(td, ms, 0, slot, 0)
+    (*td).stack_mv[(n * 4 + 1) as usize] = combined_mv(td, ms, 0, slot, 1)
+    (*td).stack_mv[(n * 4 + 2) as usize] = combined_mv(td, ms, 1, slot, 0)
+    (*td).stack_mv[(n * 4 + 3) as usize] = combined_mv(td, ms, 1, slot, 1)
+    (*td).stack_w[n as usize] = 2
+    (*td).num_mv_found = n + 1
+}
+
+fn extra_search(td: *mut av1blkst.TileDec, ms: *mut [i64; 24]) {
+    let compound: bool = av1mvmi.td_compound(td)
+    var k: usize = av1mvmi.SC_ID_COUNT
+    while k < av1mvmi.SC_SIZE {
+        (*ms)[k] = 0
+        k = k + 1
+    }
+    var w4: i64 = (*td).bw4
+    if w4 > 16 {
+        w4 = 16
+    }
+    var h4: i64 = (*td).bh4
+    if h4 > 16 {
+        h4 = 16
+    }
+    if (*td).mi_cols - (*td).mi_col < w4 {
+        w4 = (*td).mi_cols - (*td).mi_col
+    }
+    if (*td).mi_rows - (*td).mi_row < h4 {
+        h4 = (*td).mi_rows - (*td).mi_row
+    }
+    var num4: i64 = w4
+    if h4 < num4 {
+        num4 = h4
+    }
+    var pass: i64 = 0
+    while pass < 2 && (*td).num_mv_found < 2 {
+        var idx: i64 = 0
+        while idx < num4 && (*td).num_mv_found < 2 {
+            var r: i64 = (*td).mi_row - 1
+            var c: i64 = (*td).mi_col + idx
+            if pass == 1 {
+                r = (*td).mi_row + idx
+                c = (*td).mi_col - 1
+            }
+            if !av1mvmi.is_inside(td, r, c) {
+                break
+            }
+            if compound {
+                add_extra_compound(td, ms, r, c)
+            } else {
+                add_extra_single(td, r, c)
+            }
+            let size: i64 = av1blkst.mi_get(td, (*td).mi_size_a, r, c)
+            if pass == 0 {
+                idx = idx + av1blkdat.bw4(size)
+            } else {
+                idx = idx + av1blkdat.bh4(size)
+            }
+        }
+        pass = pass + 1
+    }
+    if compound {
+        if (*td).num_mv_found == 1 {
+            if combined_mv(td, ms, 0, 0, 0) == av1mvmi.stack_row(td, 0) && combined_mv(td, ms, 0, 0, 1) == av1mvmi.stack_col(td, 0) && combined_mv(td, ms, 1, 0, 0) == av1mvmi.stack_row1(td, 0) && combined_mv(td, ms, 1, 0, 1) == av1mvmi.stack_col1(td, 0) {
+                append_combined(td, ms, 1)
+            } else {
+                append_combined(td, ms, 0)
+            }
+        } else if (*td).num_mv_found == 0 {
+            append_combined(td, ms, 0)
+            append_combined(td, ms, 1)
+        }
+    } else {
+        var i: i64 = (*td).num_mv_found
+        while i < 2 {
+            (*td).stack_mv[(i * 4) as usize] = (*td).global_mv[0]
+            (*td).stack_mv[(i * 4 + 1) as usize] = (*td).global_mv[1]
+            i = i + 1
+        }
+    }
+}
+
+fn mode_context(td: *mut av1blkst.TileDec, ms: *mut [i64; 24], above: i64, left: i64, close: i64, num_new: i64) {
+    let total: i64 = above + left
+    var new_ctx: i64 = 0
+    var ref_ctx: i64 = 0
+    var nn: i64 = num_new
+    if nn > 1 {
+        nn = 1
+    }
+    if close == 0 {
+        new_ctx = total
+        if new_ctx > 1 {
+            new_ctx = 1
+        }
+        ref_ctx = total
+    } else if close == 1 {
+        new_ctx = 3 - nn
+        ref_ctx = 2 + total
+    } else {
+        new_ctx = 5 - nn
+        ref_ctx = 5
+    }
+    (*td).mode_ctx = new_ctx | ((*ms)[av1mvmi.SC_ZERO] << 3) | (ref_ctx << 4)
+}
+
+fn clamp_stack(td: *mut av1blkst.TileDec) {
+    let top: i64 = 0 - ((*td).mi_row * 4) * 8
+    let bottom: i64 = (((*td).mi_rows - (*td).bh4 - (*td).mi_row) * 4) * 8
+    let left: i64 = 0 - ((*td).mi_col * 4) * 8
+    let right: i64 = (((*td).mi_cols - (*td).bw4 - (*td).mi_col) * 4) * 8
+    let br: i64 = MV_BORDER + (*td).bh4 * 32
+    let bc: i64 = MV_BORDER + (*td).bw4 * 32
+    var nl: i64 = 1
+    if av1mvmi.td_compound(td) {
+        nl = 2
+    }
+    var idx: i64 = 0
+    while idx < (*td).num_mv_found {
+        var l: i64 = 0
+        while l < nl {
+            let at: usize = (idx * 4 + l * 2) as usize
+            (*td).stack_mv[at] = clip3(top - br, bottom + br, (*td).stack_mv[at])
+            (*td).stack_mv[at + 1] = clip3(left - bc, right + bc, (*td).stack_mv[at + 1])
+            l = l + 1
+        }
+        idx = idx + 1
+    }
+}
