@@ -1201,7 +1201,13 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 #   tools/android/build.sh -- so it cannot silently stop building either.
 for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
-        "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+        if ! "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null 2>"$W/android_build.err"; then
+            cat "$W/android_build.err"
+            if grep -q "unknown section .data.rel.ro" "$W/android_build.err"; then
+                echo "  $FIRNC is older than the .data.rel.ro assembler support (5ea96f364): rebuild it with 'heavy cargo build --release' in compiler/"
+            fi
+            exit 1
+        fi
     elif grep -q '^import gpu\.wgl' "$f"; then
         # A Windows-only program (lib/gpu/wgl.windows.fi has no Linux twin;
         # tools/fui/uiacom.sh runs it under Wine): built for x86_64-windows.
