@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+
+export { find_mv_stack, store_mi_mv, stack_row, stack_col }
+
+const REF_CAT_LEVEL: i64 = 640
+const MV_BORDER: i64 = 128
+const MAX_STACK: i64 = 8
+
+fn load_mv_comp(td: *mut av1blkst.TileDec, row: i64, col: i64, k: i64) -> i64 {
+    let base: i64 = (row * (*td).mi_cols + col) * 4 + k * 2
+    var v: i64 = av1blkst.ld((*td).mv_a, base) + (av1blkst.ld((*td).mv_a, base + 1) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+fn store_mv_comp(td: *mut av1blkst.TileDec, row: i64, col: i64, k: i64, v: i64) {
+    let base: i64 = (row * (*td).mi_cols + col) * 4 + k * 2
+    av1blkst.st((*td).mv_a, base, v & 255)
+    av1blkst.st((*td).mv_a, base + 1, (v >> 8) & 255)
+}
+
+fn store_mi_mv(td: *mut av1blkst.TileDec, row: i64, col: i64) {
+    store_mv_comp(td, row, col, 0, (*td).mv_row)
+    store_mv_comp(td, row, col, 1, (*td).mv_col)
+    av1blkst.st((*td).wr_a, row * (*td).mi_cols + col, 1)
+}
+
+fn stack_row(td: *mut av1blkst.TileDec, idx: i64) -> i64 {
+    return (*td).stack_mv[(idx * 4) as usize]
+}
+
+fn stack_col(td: *mut av1blkst.TileDec, idx: i64) -> i64 {
+    return (*td).stack_mv[(idx * 4 + 1) as usize]
+}
+
+fn is_inside(td: *mut av1blkst.TileDec, r: i64, c: i64) -> bool {
+    return c >= (*td).mi_col_start && c < (*td).mi_col_end && r >= (*td).mi_row_start && r < (*td).mi_row_end
+}
+
+fn push_candidate(td: *mut av1blkst.TileDec, mv_r: i64, mv_c: i64, weight: i64) {
+    var idx: i64 = 0
+    while idx < (*td).num_mv_found {
+        if stack_row(td, idx) == mv_r && stack_col(td, idx) == mv_c {
+            break
+        }
+        idx = idx + 1
+    }
+    if idx < (*td).num_mv_found {
+        (*td).stack_w[idx as usize] = (*td).stack_w[idx as usize] + weight
+    } else if (*td).num_mv_found < MAX_STACK {
+        let n: i64 = (*td).num_mv_found
+        (*td).stack_mv[(n * 4) as usize] = mv_r
+        (*td).stack_mv[(n * 4 + 1) as usize] = mv_c
+        (*td).stack_w[n as usize] = weight
+        (*td).num_mv_found = n + 1
+    }
+}
+
+fn cand_matches(td: *mut av1blkst.TileDec, row: i64, col: i64) -> bool {
+    return av1blkst.mi_get(td, (*td).inter_a, row, col) != 0
+}
+
+fn add_candidate(td: *mut av1blkst.TileDec, row: i64, col: i64, weight: i64) {
+    if !cand_matches(td, row, col) {
+        return
+    }
+    push_candidate(td, load_mv_comp(td, row, col, 0), load_mv_comp(td, row, col, 1), weight)
+}
+
+fn scan_row(td: *mut av1blkst.TileDec, delta_row_in: i64) {
+    var delta_row: i64 = delta_row_in
+    var delta_col: i64 = 0
+    var end4: i64 = (*td).bw4
+    if (*td).mi_cols - (*td).mi_col < end4 {
+        end4 = (*td).mi_cols - (*td).mi_col
+    }
+    if end4 > 16 {
+        end4 = 16
+    }
+    var far: bool = false
+    if delta_row < 0 - 1 {
+        far = true
+        delta_row = delta_row + ((*td).mi_row & 1)
+        delta_col = 1 - ((*td).mi_col & 1)
+    }
+    var i: i64 = 0
+    while i < end4 {
+        let r: i64 = (*td).mi_row + delta_row
+        let c: i64 = (*td).mi_col + delta_col + i
+        if !is_inside(td, r, c) {
+            break
+        }
+        var len: i64 = av1blkdat.bw4(av1blkst.mi_get(td, (*td).mi_size_a, r, c))
+        if (*td).bw4 < len {
+            len = (*td).bw4
+        }
+        if far && len < 2 {
+            len = 2
+        }
+        if (*td).bw4 >= 16 && len < 4 {
+            len = 4
+        }
+        add_candidate(td, r, c, len * 2)
+        i = i + len
+    }
+}
+
+fn scan_col(td: *mut av1blkst.TileDec, delta_col_in: i64) {
+    var delta_col: i64 = delta_col_in
+    var delta_row: i64 = 0
+    var end4: i64 = (*td).bh4
+    if (*td).mi_rows - (*td).mi_row < end4 {
+        end4 = (*td).mi_rows - (*td).mi_row
+    }
+    if end4 > 16 {
+        end4 = 16
+    }
+    var far: bool = false
+    if delta_col < 0 - 1 {
+        far = true
+        delta_row = 1 - ((*td).mi_row & 1)
+        delta_col = delta_col + ((*td).mi_col & 1)
+    }
+    var i: i64 = 0
+    while i < end4 {
+        let r: i64 = (*td).mi_row + delta_row + i
+        let c: i64 = (*td).mi_col + delta_col
+        if !is_inside(td, r, c) {
+            break
+        }
+        var len: i64 = av1blkdat.bh4(av1blkst.mi_get(td, (*td).mi_size_a, r, c))
+        if (*td).bh4 < len {
+            len = (*td).bh4
+        }
+        if far && len < 2 {
+            len = 2
+        }
+        if (*td).bh4 >= 16 && len < 4 {
+            len = 4
+        }
+        add_candidate(td, r, c, len * 2)
+        i = i + len
+    }
+}
+
+fn scan_point(td: *mut av1blkst.TileDec, delta_row: i64, delta_col: i64) {
+    let r: i64 = (*td).mi_row + delta_row
+    let c: i64 = (*td).mi_col + delta_col
+    if is_inside(td, r, c) && av1blkst.mi_get(td, (*td).wr_a, r, c) != 0 {
+        add_candidate(td, r, c, 4)
+    }
+}
+
+fn swap_entries(td: *mut av1blkst.TileDec, a: i64, b: i64) {
+    let w: i64 = (*td).stack_w[a as usize]
+    (*td).stack_w[a as usize] = (*td).stack_w[b as usize]
+    (*td).stack_w[b as usize] = w
+    var k: i64 = 0
+    while k < 4 {
+        let v: i64 = (*td).stack_mv[(a * 4 + k) as usize]
+        (*td).stack_mv[(a * 4 + k) as usize] = (*td).stack_mv[(b * 4 + k) as usize]
+        (*td).stack_mv[(b * 4 + k) as usize] = v
+        k = k + 1
+    }
+}
+
+fn sort_range(td: *mut av1blkst.TileDec, start: i64, end_in: i64) {
+    var end: i64 = end_in
+    while end > start {
+        var new_end: i64 = start
+        var idx: i64 = start + 1
+        while idx < end {
+            if (*td).stack_w[(idx - 1) as usize] < (*td).stack_w[idx as usize] {
+                swap_entries(td, idx - 1, idx)
+                new_end = idx
+            }
+            idx = idx + 1
+        }
+        end = new_end
+    }
+}
+
+fn clip3(lo: i64, hi: i64, v: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn clamp_stack(td: *mut av1blkst.TileDec) {
+    let top: i64 = 0 - ((*td).mi_row * 4) * 8
+    let bottom: i64 = (((*td).mi_rows - (*td).bh4 - (*td).mi_row) * 4) * 8
+    let left: i64 = 0 - ((*td).mi_col * 4) * 8
+    let right: i64 = (((*td).mi_cols - (*td).bw4 - (*td).mi_col) * 4) * 8
+    let br: i64 = MV_BORDER + (*td).bh4 * 32
+    let bc: i64 = MV_BORDER + (*td).bw4 * 32
+    var idx: i64 = 0
+    while idx < (*td).num_mv_found {
+        (*td).stack_mv[(idx * 4) as usize] = clip3(top - br, bottom + br, stack_row(td, idx))
+        (*td).stack_mv[(idx * 4 + 1) as usize] = clip3(left - bc, right + bc, stack_col(td, idx))
+        idx = idx + 1
+    }
+}
+
+fn find_mv_stack(td: *mut av1blkst.TileDec) {
+    var k: usize = 0
+    while k < 32 {
+        (*td).stack_mv[k] = 0
+        k = k + 1
+    }
+    k = 0
+    while k < 8 {
+        (*td).stack_w[k] = 0
+        k = k + 1
+    }
+    (*td).num_mv_found = 0
+    scan_row(td, 0 - 1)
+    scan_col(td, 0 - 1)
+    if (*td).bw4 <= 16 && (*td).bh4 <= 16 {
+        scan_point(td, 0 - 1, (*td).bw4)
+    }
+    let nearest: i64 = (*td).num_mv_found
+    var idx: i64 = 0
+    while idx < nearest {
+        (*td).stack_w[idx as usize] = (*td).stack_w[idx as usize] + REF_CAT_LEVEL
+        idx = idx + 1
+    }
+    scan_point(td, 0 - 1, 0 - 1)
+    scan_row(td, 0 - 3)
+    scan_col(td, 0 - 3)
+    if (*td).bh4 > 1 {
+        scan_row(td, 0 - 5)
+    }
+    if (*td).bw4 > 1 {
+        scan_col(td, 0 - 5)
+    }
+    sort_range(td, 0, nearest)
+    sort_range(td, nearest, (*td).num_mv_found)
+    clamp_stack(td)
+}

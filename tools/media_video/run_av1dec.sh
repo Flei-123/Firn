@@ -140,6 +140,15 @@ run_screen pal_10 96 64 yuv420p10le 14 "$SC:$NOF" -crf 25 -b:v 0
 run_screen pal_12 96 64 yuv420p12le 15 "$SC:$NOF" -crf 30 -b:v 0 -strict -2
 run_screen pal_444 96 64 yuv444p 16 "$SC:$NOF" -crf 25 -b:v 0
 run_screen pal_422 96 64 yuv422p 17 "$SC:$NOF" -crf 25 -b:v 0 -strict -2
+BC="tune-content=screen:enable-palette=1:enable-intrabc=1"
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_192x128 192 128 yuv420p 21 "$BC:$NOF" -crf 20 -b:v 0
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_200x130 200 130 yuv420p 22 "$BC:$NOF" -crf 35 -b:v 0
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_352x288 352 288 yuv420p 23 "$BC:$NOF" -crf 10 -b:v 0
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_10 224 160 yuv420p10le 24 "$BC:$NOF" -crf 25 -b:v 0
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_12 224 160 yuv420p12le 25 "$BC:$NOF" -crf 30 -b:v 0 -strict -2
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_444 224 160 yuv444p 26 "$BC:$NOF" -crf 25 -b:v 0
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_422 224 160 yuv422p 27 "$BC:$NOF" -crf 25 -b:v 0 -strict -2
+SCREEN_CPU=1 SCREEN_REPEAT=repeat run_screen ibc_lossless 224 160 yuv420p 28 "$BC:lossless=1" -b:v 0
 run_screen pal_gray 96 64 gray 18 "$SC:$NOF" -crf 25 -b:v 0
 run_screen pal_sb128 256 160 yuv420p 19 "$SC:$NOF:sb-size=128" -crf 25 -b:v 0
 run_screen pal_17x13 17 13 yuv420p 20 "$SC:$NOF" -crf 25 -b:v 0
