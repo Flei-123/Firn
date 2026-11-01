@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1cdfidx
+import media.video.av1.av1fhdr
+import media.video.av1.av1seq
+import media.video.av1.av1interdef
+import media.video.av1.av1interctx
+import media.video.av1.av1modeinfo
+import media.video.av1.av1warpsamp
+
+export { read_interintra, read_motion_mode, read_compound_type, read_interp_filters }
+
+const GM_TRANSLATION: i64 = 1
+const FILTER_SWITCHABLE: i64 = 4
+const EIGHTTAP: i64 = 0
+
+fn min_dim_px(td: *mut av1blkst.TileDec) -> i64 {
+    var m: i64 = (*td).bw4
+    if (*td).bh4 < m {
+        m = (*td).bh4
+    }
+    return m * 4
+}
+
+fn read_interintra(td: *mut av1blkst.TileDec, is_compound: bool) {
+    (*td).interintra = 0
+    (*td).interintra_mode = 0
+    (*td).wedge_interintra = 0
+    (*td).wedge_index = 0
+    (*td).wedge_sign = 0
+    if (*td).skip_mode != 0 || (*(*td).seq).enable_interintra_compound == 0 || is_compound || !av1interdef.interintra_size_ok((*td).mi_size) {
+        return
+    }
+    let g: i64 = av1interdef.size_group((*td).mi_size)
+    (*td).interintra = av1blkst.rd_sym(td, av1cdfidx.CDF_INTERINTRA + (g * 3) as usize, 2)
+    if (*td).interintra == 0 {
+        return
+    }
+    (*td).interintra_mode = av1blkst.rd_sym(td, av1cdfidx.CDF_INTERINTRA_MODE + (g * 5) as usize, 4)
+    (*td).ref_frame[1] = av1interdef.INTRA_FRAME
+    (*td).angle_y = 0
+    (*td).angle_uv = 0
+    (*td).use_filter_intra = 0
+    (*td).wedge_interintra = av1blkst.rd_sym(td, av1cdfidx.CDF_WEDGE_INTERINTRA + ((*td).mi_size * 3) as usize, 2)
+    if (*td).wedge_interintra == 1 {
+        (*td).wedge_index = av1blkst.rd_sym(td, av1cdfidx.CDF_WEDGE_IDX + ((*td).mi_size * 17) as usize, 16)
+        (*td).wedge_sign = 0
+    }
+}
+
+fn read_motion_mode(td: *mut av1blkst.TileDec, is_compound: bool) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    (*td).motion_mode = av1interdef.MM_SIMPLE
+    (*td).num_samples = 0
+    (*td).overlappable = 0
+    if (*td).skip_mode != 0 || (*fh).is_motion_mode_switchable == 0 || min_dim_px(td) < 8 {
+        return
+    }
+    if (*fh).force_integer_mv == 0 && av1interdef.is_global_mode((*td).y_mode) {
+        if (*fh).gm_type[(*td).ref_frame[0] as usize] > GM_TRANSLATION {
+            return
+        }
+    }
+    if is_compound || (*td).ref_frame[1] == av1interdef.INTRA_FRAME || !av1warpsamp.has_overlappable_candidates(td) {
+        return
+    }
+    (*td).overlappable = 1
+    av1warpsamp.find_warp_samples(td)
+    if (*fh).force_integer_mv != 0 || (*td).num_samples == 0 || (*fh).allow_warped_motion == 0 || (*td).ref_scaled[(*td).ref_frame[0] as usize] != 0 {
+        let obmc: i64 = av1blkst.rd_sym(td, av1cdfidx.CDF_OBMC + ((*td).mi_size * 3) as usize, 2)
+        if obmc == 1 {
+            (*td).motion_mode = av1interdef.MM_OBMC
+        }
+    } else {
+        (*td).motion_mode = av1blkst.rd_sym(td, av1cdfidx.CDF_MOTION_MODE + ((*td).mi_size * 4) as usize, 3)
+    }
+}
+
+fn read_compound_type(td: *mut av1blkst.TileDec, is_compound: bool) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    (*td).comp_group_idx = 0
+    (*td).compound_idx = 1
+    (*td).mask_type = 0
+    if (*td).skip_mode != 0 {
+        (*td).compound_type = av1interdef.CT_AVERAGE
+        return
+    }
+    if !is_compound {
+        (*td).compound_type = av1interdef.CT_AVERAGE
+        if (*td).interintra != 0 {
+            (*td).compound_type = av1interdef.CT_INTRA
+            if (*td).wedge_interintra != 0 {
+                (*td).compound_type = av1interdef.CT_WEDGE
+            }
+        }
+        return
+    }
+    if (*(*td).seq).enable_masked_compound != 0 {
+        (*td).comp_group_idx = av1blkst.rd_sym(td, av1cdfidx.CDF_COMP_GROUP_IDX + (av1interctx.ctx_comp_group(td) * 3) as usize, 2)
+    }
+    if (*td).comp_group_idx == 0 {
+        (*td).compound_type = av1interdef.CT_AVERAGE
+        if (*(*td).seq).enable_jnt_comp != 0 {
+            let fwd: i64 = av1interdef.abs_i(av1interctx.rel_dist(td, (*fh).order_hints[(*td).ref_frame[0] as usize], (*fh).order_hint))
+            let bck: i64 = av1interdef.abs_i(av1interctx.rel_dist(td, (*fh).order_hints[(*td).ref_frame[1] as usize], (*fh).order_hint))
+            let ctx: i64 = av1interctx.ctx_compound_idx(td, fwd, bck)
+            (*td).compound_idx = av1blkst.rd_sym(td, av1cdfidx.CDF_COMPOUND_IDX + (ctx * 3) as usize, 2)
+            if (*td).compound_idx == 0 {
+                (*td).compound_type = av1interdef.CT_DISTANCE
+            }
+        }
+        return
+    }
+    if av1interdef.is_wedge_size((*td).mi_size) {
+        (*td).compound_type = av1blkst.rd_sym(td, av1cdfidx.CDF_COMPOUND_TYPE + ((*td).mi_size * 3) as usize, 2)
+    } else {
+        (*td).compound_type = av1interdef.CT_DIFFWTD
+    }
+    if (*td).compound_type == av1interdef.CT_WEDGE {
+        (*td).wedge_index = av1blkst.rd_sym(td, av1cdfidx.CDF_WEDGE_IDX + ((*td).mi_size * 17) as usize, 16)
+        (*td).wedge_sign = av1modeinfo.lit(td, 1)
+    } else {
+        (*td).mask_type = av1modeinfo.lit(td, 1)
+    }
+}
+
+fn needs_interp_filter(td: *mut av1blkst.TileDec) -> bool {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    let large: bool = min_dim_px(td) >= 8
+    if (*td).skip_mode != 0 || (*td).motion_mode == av1interdef.MM_LOCALWARP {
+        return false
+    }
+    if large && (*td).y_mode == av1interdef.GLOBALMV {
+        return (*fh).gm_type[(*td).ref_frame[0] as usize] == GM_TRANSLATION
+    }
+    if large && (*td).y_mode == av1interdef.GLOBAL_GLOBALMV {
+        return (*fh).gm_type[(*td).ref_frame[0] as usize] == GM_TRANSLATION || (*fh).gm_type[(*td).ref_frame[1] as usize] == GM_TRANSLATION
+    }
+    return true
+}
+
+fn read_interp_filters(td: *mut av1blkst.TileDec) {
+    let fh: *mut av1fhdr.FrameHdr = (*td).fh
+    if (*fh).interpolation_filter != FILTER_SWITCHABLE {
+        (*td).interp_filter[0] = (*fh).interpolation_filter
+        (*td).interp_filter[1] = (*fh).interpolation_filter
+        return
+    }
+    var dirs: i64 = 1
+    if (*(*td).seq).enable_dual_filter != 0 {
+        dirs = 2
+    }
+    var dir: i64 = 0
+    while dir < dirs {
+        if needs_interp_filter(td) {
+            let ctx: i64 = av1interctx.ctx_interp(td, dir)
+            (*td).interp_filter[dir as usize] = av1blkst.rd_sym(td, av1cdfidx.CDF_SWITCHABLE_INTERP + (ctx * 4) as usize, 3)
+        } else {
+            (*td).interp_filter[dir as usize] = EIGHTTAP
+        }
+        dir = dir + 1
+    }
+    if dirs == 1 {
+        (*td).interp_filter[1] = (*td).interp_filter[0]
+    }
+}
