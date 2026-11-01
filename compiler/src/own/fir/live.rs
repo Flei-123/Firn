@@ -34,18 +34,20 @@ struct Ctx<'a> {
     items: Items,
 }
 
-pub(crate) fn deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows) -> Vec<Free> {
+pub(crate) fn deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows) -> (Vec<Free>, Vec<bool>) {
     let mut out = Vec::new();
+    let mut freed = vec![false; fl.sites.len()];
     for k in 0..fl.sites.len() {
         let seed = fl.seed_of_site(k);
         if fl.escaped.get(seed) {
             continue;
         }
         if let Some(v) = site_deaths(f, ix, sl, fl, br, k) {
+            freed[k] = !v.is_empty();
             out.extend(v);
         }
     }
-    out
+    (out, freed)
 }
 
 fn items_for(f: &Func, sl: &Slots, fl: &Flow, seed: usize, site: usize) -> Items {

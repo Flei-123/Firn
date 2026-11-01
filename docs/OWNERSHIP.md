@@ -5,11 +5,11 @@ Goal: the compiler infers ownership and lifetimes of heap objects by itself — 
 Status: AST stage (concat fusion, tree drop) in main; FIR stage for strings (r1325 a) in `compiler/src/own/fir/`, check mode clean, default off.
 
 ### FIR stage (r1325 a)
-- Hook: `opt::optimize_with`; `prepare` before the optimizer (rename `__str_concat` -> `__own_str_concat2`, producers `inline_hint=false`), `run` after it. Only on/check, level != dev, native targets, not kernel; `FIRN_OWN_NO_FIR=1` disables it.
+- Hook: `opt::optimize_with`; `prepare` before the optimizer (renames `__str_concat`/`3`/`4` -> `__own_str_concat2`/`3`/`4`, producers `inline_hint=false`), `run` after it: producer calls without a free are renamed back and inlined (`inline::inline_requested_tracked`), touched functions are re-optimized. Only on/check, level != dev, native targets, not kernel; `FIRN_OWN_NO_FIR=1` disables it.
 - Modules: `registry` (producers, consumers, borrow-all, free function), `index` (CFG, defs, use counts, bitsets), `slots` (private allocas, 8-byte cells), `flow` (forward may-sets per value and per cell, escapes), `summary` (per-parameter borrow, optimistic fixpoint over the call graph), `live` (per-site liveness, death points, must-handles), `insert` (`__gc_free_block` / `__gc_poison_block`).
 - Safety rules: a site is freed only if it never reaches a sink, is not live before its own producer call, and the death point has a must-handle (value or cell that holds exactly that site). Edge deaths only into single-predecessor blocks without phis. Everything else leaks to the GC.
 - Cost guards: summaries only for the callee closure of functions with producer calls; functions over 40000 instructions or with sites x instructions > 200000 are skipped; per-site liveness skips blocks that do not touch the site. OpenPlan release-safe: pass 4.5 s (was 81 s), 2863 sites, 1184 frees; firnc1 0 sites.
-- Measured (OpenPlan derive 300, on): FIR pass +1.1 % Ir (5619M vs 5556M without FIR), alloc 117.8 vs 119.3 MB: frees are rare at run time, the cost comes from producers not being inlined (`inline_hint=false`). Next: keep inlining where no site is freed, cheaper free.
+- Measured (OpenPlan derive 300, on): without revert +1.1 % Ir (5619M vs 5556M without FIR); with revert 5597M = +0.74 %, 1184 frees unchanged. Rest: reverted bodies skip promote/unroll, `__own_str_concat2` goes through `__own_str_join`. Next: direct concat2, run the revert before promote.
 - Extension points for (b) gc classes and (c) Vec/Map/closures: add a `Shape` + producer entry in `registry`, teach `slots::producer_cells`/`flow::transfer` the shape.
 
 ## 1. Prior art

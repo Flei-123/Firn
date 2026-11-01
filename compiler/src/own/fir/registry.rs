@@ -12,11 +12,15 @@ pub(crate) struct Producer {
 
 pub(crate) const PRODUCERS: &[Producer] = &[
     Producer { name: "__own_str_concat2", shape: Shape::SretPair },
-    Producer { name: "__str_concat3", shape: Shape::SretPair },
-    Producer { name: "__str_concat4", shape: Shape::SretPair },
+    Producer { name: "__own_str_concat3", shape: Shape::SretPair },
+    Producer { name: "__own_str_concat4", shape: Shape::SretPair },
 ];
 
-pub(crate) const RENAMES: &[(&str, &str)] = &[("__str_concat", "__own_str_concat2")];
+pub(crate) const RENAMES: &[(&str, &str)] = &[
+    ("__str_concat", "__own_str_concat2"),
+    ("__str_concat3", "__own_str_concat3"),
+    ("__str_concat4", "__own_str_concat4"),
+];
 
 pub(crate) const CONSUMES: &[&str] = &[
     "__gc_free_block",
@@ -53,6 +57,7 @@ pub(crate) fn free_fn(mode: Mode) -> &'static str {
 
 pub(crate) fn root_names() -> Vec<String> {
     let mut v: Vec<String> = PRODUCERS.iter().map(|p| p.name.to_string()).collect();
+    v.extend(RENAMES.iter().map(|(from, _)| from.to_string()));
     v.push("__gc_free_block".to_string());
     v.push("__gc_poison_block".to_string());
     v

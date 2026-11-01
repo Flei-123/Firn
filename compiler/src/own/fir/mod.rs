@@ -48,40 +48,100 @@ pub(crate) fn prepare(m: &mut Module) {
     }
 }
 
-pub(crate) fn run(m: &mut Module) {
+pub(crate) fn run(m: &mut Module) -> Vec<usize> {
     let free_fn = registry::free_fn(super::mode());
     if !m.funcs.iter().any(|f| f.name == free_fn) {
-        return;
+        return Vec::new();
     }
     let t0 = std::time::Instant::now();
     let (mut sites, mut frees) = (0usize, 0usize);
     let roots: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
     if roots.is_empty() {
         report(sites, frees, t0);
-        return;
+        return Vec::new();
     }
     let ts = std::time::Instant::now();
     let sums = summary::compute(m, &roots);
     let sum_ms = ts.elapsed().as_millis();
+    let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
+    let mut reverted: Vec<usize> = Vec::new();
     for &fi in roots.iter() {
         let f = &mut m.funcs[fi];
-        if f.constant_time || f.interrupt || !summary::analyzable(f) || f.name.starts_with("__gc_") || f.name.starts_with("__own_") {
-            continue;
+        let mut kept: crate::fx::HashSet<(usize, usize)> = crate::fx::HashSet::default();
+        let mut pending: Option<(slots::Slots, Vec<live::Free>)> = None;
+        if !(f.constant_time || f.interrupt || !summary::analyzable(f) || f.name.starts_with("__gc_") || f.name.starts_with("__own_")) {
+            let ix = index::Index::build(f);
+            let sl = slots::Slots::build(f, &ix);
+            let mut fl = flow::Flow::build(f, &ix, &sl, &sums, true);
+            if !fl.sites.is_empty() && fl.sites.len().saturating_mul(f.inst_count()) <= summary::MAX_SITE_WORK {
+                sites += fl.sites.len();
+                let (d, freed) = live::deaths(f, &ix, &sl, &mut fl, &sums);
+                for (&at, &k) in fl.site_at.iter() {
+                    if freed[k] {
+                        kept.insert(at);
+                    }
+                }
+                pending = Some((sl, d));
+            }
         }
-        let ix = index::Index::build(f);
-        let sl = slots::Slots::build(f, &ix);
-        let mut fl = flow::Flow::build(f, &ix, &sl, &sums, true);
-        if fl.sites.is_empty() || fl.sites.len().saturating_mul(f.inst_count()) > summary::MAX_SITE_WORK {
-            continue;
+        if revert_calls(f, &kept, &defined) {
+            reverted.push(fi);
         }
-        sites += fl.sites.len();
-        let d = live::deaths(f, &ix, &sl, &mut fl, &sums);
-        frees += insert::apply(f, &sl, d, free_fn);
+        if let Some((sl, d)) = pending {
+            frees += insert::apply(f, &sl, d, free_fn);
+        }
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!("ownership fir: summaries {} ms", sum_ms);
     }
     report(sites, frees, t0);
+    if reverted.is_empty() {
+        return reverted;
+    }
+    let changed = inline_reverted(m);
+    if std::env::var_os("FIRN_OWN_STATS").is_some() {
+        eprintln!("ownership fir: reverted calls in {} functions, {} changed by inlining", reverted.len(), changed.len());
+    }
+    changed
+}
+
+fn revert_calls(f: &mut crate::fir::Func, kept: &crate::fx::HashSet<(usize, usize)>, defined: &crate::fx::HashSet<String>) -> bool {
+    let mut any = false;
+    for (bi, b) in f.blocks.iter_mut().enumerate() {
+        for (ii, inst) in b.insts.iter_mut().enumerate() {
+            if kept.contains(&(bi, ii)) {
+                continue;
+            }
+            if let Op::Call { name, .. } = &mut inst.op {
+                if let Some((from, _)) = registry::RENAMES.iter().find(|(_, to)| *to == name.as_str()) {
+                    if defined.contains(*from) {
+                        *name = from.to_string();
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
+    any
+}
+
+fn inline_reverted(m: &mut Module) -> Vec<usize> {
+    let mut saved: Vec<(usize, Option<bool>)> = Vec::new();
+    for (i, f) in m.funcs.iter_mut().enumerate() {
+        let mine = registry::RENAMES.iter().any(|(from, _)| *from == f.name);
+        if mine || f.inline_hint == Some(true) {
+            saved.push((i, f.inline_hint));
+            f.inline_hint = if mine { Some(true) } else { None };
+        }
+    }
+    let mut changed = Vec::new();
+    crate::inline::inline_requested_tracked(m, &mut changed);
+    for (i, h) in saved {
+        m.funcs[i].inline_hint = h;
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    changed
 }
 
 fn has_producer_call(f: &crate::fir::Func) -> bool {
