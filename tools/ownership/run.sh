@@ -9,7 +9,7 @@ trap 'rm -rf "$D"' EXIT
 fail=0
 pass=0
 build() {
-  "$FIRNC" --no-cache --ownership="$2" "$C/$1.fi" -o "$D/$1_$2" > "$D/$1_$2.log" 2>&1 || { echo "FAIL build $1 $2"; sed -n 1,5p "$D/$1_$2.log"; fail=$((fail + 1)); return 1; }
+  "$FIRNC" ${OWN_NO_CACHE---no-cache} --ownership="$2" "$C/$1.fi" -o "$D/$1_$2" > "$D/$1_$2.log" 2>&1 || { echo "FAIL build $1 $2"; sed -n 1,5p "$D/$1_$2.log"; fail=$((fail + 1)); return 1; }
 }
 run() {
   (cd "$D" && timeout 60 "./$1_$2" > "$D/$1_$2.out" 2> "$D/$1_$2.err"); echo $?
