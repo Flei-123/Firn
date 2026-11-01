@@ -14,6 +14,7 @@ EDITS = [
         }
 """, "", 1),
     ("borrow.rs", "p.refk != 0 || ", "", 1),
+    ("fir/flow.rs", "            | Op::CheckedIdx { .. }\n            | Op::CheckedIdxV { .. } => {", "            | Op::CheckedIdx { .. } => {", 1),
 ]
 
 for name, old, new, count in EDITS:

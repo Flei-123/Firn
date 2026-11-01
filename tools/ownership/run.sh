@@ -15,12 +15,14 @@ run() {
   (cd "$D" && timeout 60 "./$1_$2" > "$D/$1_$2.out" 2> "$D/$1_$2.err"); echo $?
 }
 expect_rc() {
+  case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
   build "$1" "$2" || return
   local rc
   rc=$(run "$1" "$2")
   if [ "$rc" = "$3" ]; then pass=$((pass + 1)); else echo "FAIL $1 $2: rc $rc, want $3"; fail=$((fail + 1)); fi
 }
 same_out() {
+  case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
   local ref=""
   for m in off on check; do
     build "$1" "$m" || return
@@ -43,6 +45,7 @@ same_out fir_str_branch
 same_out fir_str_param
 same_out fir_str_ret
 same_out fir_str_escape
+same_out fir_str_escape_novec
 expect_rc fir_str_freed on 0
 expect_rc fir_str_freed check 0
 same_out fir_obj_loop
