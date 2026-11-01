@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_runs
+import docview.office.pp_ctx
+import docview.office.pp_style
+
+export { emit_body, emit_paragraph, emit_empty, BodyState, body_state_new }
+
+struct BodyState {
+    counters: [i32; 9],
+    scale: f64,
+}
+
+fn body_state_new(scale: f64) -> BodyState {
+    return BodyState { counters: [0 as i32; 9], scale: scale }
+}
+
+fn scaled(rp: *mut dx_props.RunProps, scale: f64) {
+    if (*rp).size_hp > 0 && scale < 1.0 {
+        var v: i32 = (((*rp).size_hp as f64) * scale + 0.5) as i32
+        if v < 2 { v = 2 }
+        (*rp).size_hp = v
+    }
+}
+
+fn push_alpha(out: *mut rt.Buf, n: i32, upper: bool) {
+    var v: i32 = n
+    if v < 1 { v = 1 }
+    var base: u8 = 97 as u8
+    if upper { base = 65 as u8 }
+    rt.buf_push(out, base + (((v - 1) % 26) as u8))
+}
+
+fn label_text(b: *mut pp_style.Bullet, n: i32, out: *mut rt.Buf) {
+    if (*b).kind == pp_style.BK_CHAR {
+        var k: usize = 0
+        while k < (*b).chn {
+            rt.buf_push(out, (*b).ch[k])
+            k = k + 1
+        }
+        return
+    }
+    let a: i32 = (*b).auto
+    if a == 2 { rt.buf_push(out, 40 as u8) }
+    if a == 3 || a == 5 {
+        push_alpha(out, n, false)
+    } else if a == 4 || a == 6 {
+        push_alpha(out, n, true)
+    } else {
+        rt.buf_push_dec_i64(out, n as i64)
+    }
+    if a == 1 || a == 2 || a == 5 || a == 6 {
+        rt.buf_push(out, 41 as u8)
+    } else {
+        rt.buf_push(out, 46 as u8)
+    }
+}
+
+fn has_text(x: *mut xml.Doc, p: u32) -> bool {
+    var r: u32 = ooxml.first_el(x, p)
+    while r != xml.NONE {
+        if ooxml.is_el(x, r, "r") || ooxml.is_el(x, r, "fld") {
+            let t: u32 = ooxml.child_l(x, r, "t")
+            if t != xml.NONE && xml.text(x, t).n > 0 {
+                return true
+            }
+        }
+        r = ooxml.next_el(x, r)
+    }
+    return false
+}
+
+fn emit_runs(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, p: u32, para: u32, rp0: *mut dx_props.RunProps, scale: f64) {
+    let d: *mut dx_model.Docx = (*c).d
+    var n: u32 = ooxml.first_el(x, p)
+    while n != xml.NONE {
+        var rp: dx_props.RunProps = *rp0
+        if ooxml.is_el(x, n, "r") || ooxml.is_el(x, n, "fld") || ooxml.is_el(x, n, "br") {
+            pp_style.read_rpr(c, x, ooxml.child_l(x, n, "rPr"), &rp)
+            scaled(&rp, scale)
+            dx_props.rp_finish(&rp)
+        }
+        if ooxml.is_el(x, n, "r") {
+            let t: u32 = ooxml.child_l(x, n, "t")
+            if t != xml.NONE {
+                let s: str = xml.text(x, t)
+                dx_runs.emit_text(d, para, &rp, s.p as u64, s.n)
+            }
+        } else if ooxml.is_el(x, n, "fld") {
+            let ty: str = ooxml.attr_l(x, n, "type")
+            if ooxml.starts_with(ty, "slidenum") {
+                dx_runs.emit_simple(d, &rp, dx_model.R_FIELD, dx_model.FLD_PAGE, 0.0, 0.0)
+            } else {
+                let t: u32 = ooxml.child_l(x, n, "t")
+                if t != xml.NONE {
+                    let s: str = xml.text(x, t)
+                    dx_runs.emit_text(d, para, &rp, s.p as u64, s.n)
+                }
+            }
+        } else if ooxml.is_el(x, n, "br") {
+            dx_runs.emit_simple(d, &rp, dx_model.R_BREAK, dx_model.BR_LINE, 0.0, 0.0)
+        }
+        n = ooxml.next_el(x, n)
+    }
+}
+
+fn emit_paragraph(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, p: u32, ch: *mut pp_ctx.Chain, st: *mut BodyState, bl: *mut dx_model.BList) {
+    let d: *mut dx_model.Docx = (*c).d
+    if vec_len[dx_model.Para](&(*d).paras) >= dx_model.MAX_PARAS {
+        (*d).truncated = true
+        return
+    }
+    let ppr: u32 = ooxml.child_l(x, p, "pPr")
+    var lvl: i32 = ooxml.attr_i64(x, ppr, "lvl", 0) as i32
+    if lvl < 0 || lvl > 8 { lvl = 0 }
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    var bu: pp_style.Bullet = pp_style.bullet_new()
+    pp_style.chain_props(c, ch, lvl, &rp, &pp, &bu)
+    if (*c).font_color != 0 as u32 {
+        rp.color = (*c).font_color
+    }
+    if (*c).force_bold {
+        rp.bold = 1
+    }
+    pp_style.read_ppr(x, ppr, &pp)
+    pp_style.read_bullet(x, ppr, &bu)
+    pp_style.read_rpr(c, x, ooxml.child_l(x, p, "endParaRPr"), &rp)
+    if rp.size_hp <= 0 {
+        rp.size_hp = 36
+    }
+    if rp.color == 0 as u32 {
+        rp.color = (*c).pal.th.c[(*c).pal.map[1] as usize]
+    }
+    var raw: dx_props.RunProps = rp
+    scaled(&rp, (*st).scale)
+    var labeled: bool = false
+    var label: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&label)
+    var hang: i32 = 0
+    if (bu.kind == pp_style.BK_CHAR || bu.kind == pp_style.BK_AUTO) && has_text(x, p) {
+        labeled = true
+        if bu.kind == pp_style.BK_AUTO {
+            if (*st).counters[lvl as usize] == 0 {
+                (*st).counters[lvl as usize] = bu.start
+            } else {
+                (*st).counters[lvl as usize] = (*st).counters[lvl as usize] + 1
+            }
+        }
+        label_text(&bu, (*st).counters[lvl as usize], &label)
+        if pp.first != dx_props.UNSET_T && pp.first < 0 {
+            hang = 0 - pp.first
+        } else {
+            hang = 360
+        }
+        if pp.left == dx_props.UNSET_T {
+            pp.left = hang
+        }
+        pp.first = 0 - hang
+    }
+    if bu.kind != pp_style.BK_AUTO {
+        (*st).counters[lvl as usize] = 0
+    }
+    var k: usize = (lvl as usize) + 1
+    while k < 9 {
+        (*st).counters[k] = 0
+        k = k + 1
+    }
+    dx_props.pp_finish(&pp)
+    var finished: dx_props.RunProps = rp
+    dx_props.rp_finish(&finished)
+    let idx: u32 = dx_model.new_para(d, pp)
+    let pa: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pa).base_rp = finished
+    if labeled {
+        (*pa).has_label = true
+        (*pa).lab_off = dx_model.pool_add(d, rt.buf_ptr(&label), rt.buf_len(&label))
+        (*pa).lab_n = rt.buf_len(&label) as u32
+        (*pa).lab_left = pp.left
+        (*pa).lab_hang = hang
+    }
+    emit_runs(c, x, p, idx, &raw, (*st).scale)
+    let pb: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pb).rcount = (vec_len[dx_model.Run](&(*d).runs) as u32) - (*pb).rfirst
+    dx_model.block_add(d, bl, dx_model.B_PARA, idx, (*c).sect)
+}
+
+fn emit_body(c: *mut pp_ctx.Ctx, x: *mut xml.Doc, tx: u32, ch: *mut pp_ctx.Chain, bl: *mut dx_model.BList) {
+    var st: BodyState = body_state_new((*c).font_scale)
+    var p: u32 = ooxml.first_el(x, tx)
+    while p != xml.NONE {
+        if ooxml.is_el(x, p, "p") {
+            emit_paragraph(c, x, p, ch, &st, bl)
+        }
+        p = ooxml.next_el(x, p)
+    }
+}
+
+fn emit_empty(c: *mut pp_ctx.Ctx, bl: *mut dx_model.BList) {
+    let d: *mut dx_model.Docx = (*c).d
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    dx_props.pp_finish(&pp)
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    rp.size_hp = 36
+    dx_props.rp_finish(&rp)
+    let idx: u32 = dx_model.new_para(d, pp)
+    (*dx_model.para_at(d, idx)).base_rp = rp
+    dx_model.block_add(d, bl, dx_model.B_PARA, idx, (*c).sect)
+}
