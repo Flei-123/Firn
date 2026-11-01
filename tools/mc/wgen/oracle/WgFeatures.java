@@ -45,6 +45,8 @@ public class WgFeatures {
         BiomeManager bm;
         BiomeManager.NoiseBiomeSource nbs;
         RandomSource rnd = new XoroshiroRandomSource(0L);
+        boolean setOn;
+        String setFile;
 
         void set(BlockPos p, BlockState st) {
             ChunkAccess c = chunk(p.getX() >> 4, p.getZ() >> 4);
@@ -90,6 +92,12 @@ public class WgFeatures {
                 case "setBlock": {
                     BlockPos p = (BlockPos) args[0];
                     if (!r.canWrite(p)) return false;
+                    if (r.setOn) {
+                        try {
+                            java.nio.file.Files.write(java.nio.file.Paths.get(r.setFile), ("SET " + p.getX() + " " + p.getY() + " " + p.getZ() + " " + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(((BlockState) args[1]).getBlock()).getPath() + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                        } catch (java.io.IOException ex) {
+                        }
+                    }
                     r.set(p, (BlockState) args[1]);
                     return true;
                 }
@@ -248,6 +256,8 @@ public class WgFeatures {
                         try {
                             dbgOn[0] = dbgSel != null && dbgSel.equals(nx + ":" + nz + ":" + j + ":" + n);
                             dbgIdx[0] = 0;
+                            r.setOn = dbgOn[0] && System.getProperty("wg.setlog") != null;
+                            r.setFile = dbgFile;
                             if (dbgOn[0] && System.getProperty("wg.colprobe") != null) {
                                 String[] cp = System.getProperty("wg.colprobe").split(":");
                                 StringBuilder cs = new StringBuilder("COL");
@@ -259,6 +269,7 @@ public class WgFeatures {
                             }
                             pf.placeWithBiomeCheck(level, gen, rnd, origin);
                             dbgOn[0] = false;
+                            r.setOn = false;
                             if (System.getProperty("wg.cntlog") != null) {
                                 java.nio.file.Files.write(java.nio.file.Paths.get(System.getProperty("wg.cntlog")), ("CNT " + cx + " " + cz + " " + nx + " " + nz + " " + j + " " + n + " " + rnd.getCount() + " " + pfNames.get(pf) + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
                             }
