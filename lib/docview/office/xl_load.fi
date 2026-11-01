@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.xml
+import docview.office.opc
+import docview.office.ooxml
+import docview.office.dx_props
+import docview.office.dx_model
+import docview.office.dx_runs
+import docview.office.xl_pool
+import docview.office.xl_sst
+import docview.office.xl_color
+import docview.office.xl_style
+import docview.office.xl_sheet
+import docview.office.xl_build
+
+export { xlsx_load }
+
+const MARGIN_TW: i32 = 720
+const PAGE_W_TW: i32 = 16838
+const PAGE_H_TW: i32 = 11906
+const PAGE_MAX_TW: i32 = 31680
+
+struct Book {
+    pk: *mut opc.Package,
+    main: str,
+    rels: *mut opc.Rels,
+    st: xl_style.XlStyles,
+    sst: xl_pool.Pool,
+    date1904: bool,
+}
+
+fn read_related(b: *mut Book, suffix: str, raw: *mut rt.Buf, x: *mut xml.Doc) -> bool {
+    let i: i64 = opc.rels_find_type((*b).rels, suffix)
+    if i < 0 {
+        return false
+    }
+    return opc.pkg_read_xml((*b).pk, opc.rels_target((*b).rels, i as usize), raw, x)
+}
+
+fn load_book_parts(b: *mut Book) {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var xt: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&xt)
+    if read_related(b, "/theme", &raw, &xt) {
+        xl_color.theme_load(&(*b).st.theme, &xt)
+    }
+    var xs: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&xs)
+    if read_related(b, "/styles", &raw, &xs) {
+        xl_style.styles_load(&(*b).st, &xs)
+    }
+    var xh: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&xh)
+    if read_related(b, "/sharedStrings", &raw, &xh) {
+        xl_sst.sst_load(&xh, &(*b).sst)
+    }
+}
+
+fn sheet_page(s: *mut dx_model.Sect, info: *mut xl_sheet.SheetInfo, total_tw: i32) {
+    var w: i32 = PAGE_W_TW
+    var h: i32 = PAGE_H_TW
+    if !(*info).landscape {
+        w = PAGE_H_TW
+        h = PAGE_W_TW
+    }
+    let need: i32 = total_tw + 2 * MARGIN_TW
+    if need > w {
+        w = need
+        if w > PAGE_MAX_TW {
+            w = PAGE_MAX_TW
+        }
+    }
+    (*s).w = w
+    (*s).h = h
+    (*s).ml = MARGIN_TW
+    (*s).mr = MARGIN_TW
+    (*s).mt = MARGIN_TW
+    (*s).mb = MARGIN_TW
+    (*s).header_dist = MARGIN_TW
+    (*s).footer_dist = MARGIN_TW
+}
+
+fn heading(d: *mut dx_model.Docx, name: str, sect: u32, list: *mut dx_model.BList) {
+    var pp: dx_props.ParaProps = dx_props.pp_unset()
+    pp.keep_next = 1
+    pp.after = 120
+    dx_props.pp_finish(&pp)
+    var rp: dx_props.RunProps = dx_props.rp_unset()
+    rp.size_hp = 28
+    rp.bold = 1
+    dx_props.rp_finish(&rp)
+    let idx: u32 = dx_model.new_para(d, pp)
+    (*dx_model.para_at(d, idx)).base_rp = rp
+    dx_runs.emit_text(d, idx, &rp, name.p as u64, name.n)
+    let pa: *mut dx_model.Para = dx_model.para_at(d, idx)
+    (*pa).rcount = (vec_len[dx_model.Run](&(*d).runs) as u32) - (*pa).rfirst
+    dx_model.block_add(d, list, dx_model.B_PARA, idx, sect)
+}
+
+fn load_sheet(b: *mut Book, d: *mut dx_model.Docx, name: str, target: str, list: *mut dx_model.BList) -> bool {
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var x: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&x)
+    if !opc.pkg_read_xml((*b).pk, target, &raw, &x) {
+        return false
+    }
+    var info: xl_sheet.SheetInfo = xl_sheet.info_new()
+    defer xl_sheet.info_free(&info)
+    let sd: u32 = xl_sheet.info_read(&x, &info)
+    var total: i32 = 0
+    if info.has_cells {
+        var k: usize = 0
+        let n: usize = (info.c1 - info.c0 + 1) as usize
+        while k < n {
+            if !xl_sheet.col_hidden(&info, k) {
+                total = total + xl_sheet.col_tw(&info, k)
+            }
+            k = k + 1
+        }
+    }
+    let si: u32 = dx_model.new_sect(d)
+    sheet_page(dx_model.sect_at(d, si), &info, total)
+    heading(d, name, si, list)
+    var ctx: xl_build.BuildCtx = xl_build.BuildCtx { d: d, x: &x, st: &(*b).st, sst: &(*b).sst, info: &info,
+        date1904: (*b).date1904, sect: si, ti: 0 as u32 }
+    xl_build.build_table(&ctx, sd, list)
+    return true
+}
+
+fn xlsx_load(pk: *mut opc.Package, d: *mut dx_model.Docx) -> bool {
+    var main_part: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&main_part)
+    if !opc.pkg_main_part(pk, &main_part) {
+        return false
+    }
+    var rels: opc.Rels = opc.rels_new()
+    defer opc.rels_free(&rels)
+    var b: Book = Book { pk: pk, main: rt.buf_str(&main_part), rels: &rels, st: xl_style.styles_new(),
+        sst: xl_pool.pool_new(), date1904: false }
+    defer xl_style.styles_free(&b.st)
+    defer xl_pool.pool_free(&b.sst)
+    opc.rels_load(pk, b.main, &rels)
+    var raw: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&raw)
+    var wb: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&wb)
+    if !opc.pkg_read_xml(pk, b.main, &raw, &wb) {
+        return false
+    }
+    let root: u32 = xml.root(&wb)
+    let wp: u32 = ooxml.child_l(&wb, root, "workbookPr")
+    if wp != xml.NONE {
+        let v: str = ooxml.attr_l(&wb, wp, "date1904")
+        b.date1904 = v == "1" || v == "true"
+    }
+    load_book_parts(&b)
+    xl_style.styles_finish(&b.st)
+    let sheets: u32 = ooxml.child_l(&wb, root, "sheets")
+    var list: dx_model.BList = dx_model.blist_new()
+    var loaded: usize = 0
+    var sn: u32 = ooxml.first_el(&wb, sheets)
+    while sn != xml.NONE {
+        if ooxml.is_el(&wb, sn, "sheet") && loaded < 64 {
+            let state: str = ooxml.attr_l(&wb, sn, "state")
+            let ri: i64 = opc.rels_find_id(&rels, ooxml.attr_l(&wb, sn, "id"))
+            if state != "hidden" && state != "veryHidden" && ri >= 0 {
+                if load_sheet(&b, d, ooxml.attr_l(&wb, sn, "name"), opc.rels_target(&rels, ri as usize), &list) {
+                    loaded = loaded + 1
+                }
+            }
+        }
+        sn = ooxml.next_el(&wb, sn)
+    }
+    if loaded == 0 {
+        return false
+    }
+    (*d).body = list
+    return true
+}
