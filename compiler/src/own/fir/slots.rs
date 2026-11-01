@@ -143,6 +143,11 @@ impl Slots {
         Some((*self.cell_id.get(&(s, o))?, *self.cell_id.get(&(s, o + 8))?))
     }
 
+    pub fn result_cells(&self, dst: Val) -> Option<(usize, usize)> {
+        let &(s, o) = self.addr.get(&dst)?;
+        Some((*self.cell_id.get(&(s, o + 8))?, *self.cell_id.get(&(s, o))?))
+    }
+
     pub fn is_addr(&self, v: Val) -> bool {
         self.addr.contains_key(&v)
     }

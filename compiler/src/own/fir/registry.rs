@@ -3,6 +3,13 @@ use crate::own::Mode;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Shape {
     SretPair,
+    SlotsOwner,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Drop {
+    Block,
+    SlotsOwner,
 }
 
 pub(crate) struct Producer {
@@ -14,6 +21,14 @@ pub(crate) const PRODUCERS: &[Producer] = &[
     Producer { name: "__own_str_concat2", shape: Shape::SretPair },
     Producer { name: "__str_concat3", shape: Shape::SretPair },
     Producer { name: "__str_concat4", shape: Shape::SretPair },
+    Producer { name: "gcvec_new", shape: Shape::SlotsOwner },
+    Producer { name: "gcvec_new_raw", shape: Shape::SlotsOwner },
+    Producer { name: "gcmap_new", shape: Shape::SlotsOwner },
+];
+
+const DROP_FNS: &[(Drop, &str, &str)] = &[
+    (Drop::Block, "__gc_free_block", "__gc_poison_block"),
+    (Drop::SlotsOwner, "__own_drop_slots_owner", "__own_drop_slots_owner_check"),
 ];
 
 pub(crate) const RENAMES: &[(&str, &str)] = &[("__str_concat", "__own_str_concat2")];
@@ -21,6 +36,8 @@ pub(crate) const RENAMES: &[(&str, &str)] = &[("__str_concat", "__own_str_concat
 pub(crate) const CONSUMES: &[&str] = &[
     "__gc_free_block",
     "__gc_poison_block",
+    "__own_drop_slots_owner",
+    "__own_drop_slots_owner_check",
     "__own_poison_quiet",
     "__own_drop_tree",
     "__own_drop_tree_check",
@@ -62,15 +79,22 @@ pub(crate) fn borrows_all(name: &str) -> bool {
 }
 
 pub(crate) fn free_fn(mode: Mode) -> &'static str {
+    drop_fn(Drop::Block, mode)
+}
+
+pub(crate) fn drop_fn(drop: Drop, mode: Mode) -> &'static str {
+    let (_, free, poison) = DROP_FNS.iter().find(|d| d.0 == drop).copied().unwrap_or(DROP_FNS[0]);
     match mode {
-        Mode::Check => "__gc_poison_block",
-        _ => "__gc_free_block",
+        Mode::Check => poison,
+        _ => free,
     }
 }
 
 pub(crate) fn root_names() -> Vec<String> {
     let mut v: Vec<String> = PRODUCERS.iter().map(|p| p.name.to_string()).collect();
-    v.push("__gc_free_block".to_string());
-    v.push("__gc_poison_block".to_string());
+    for (_, free, poison) in DROP_FNS.iter() {
+        v.push(free.to_string());
+        v.push(poison.to_string());
+    }
     v
 }

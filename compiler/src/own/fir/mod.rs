@@ -50,10 +50,13 @@ pub(crate) fn prepare(m: &mut Module) {
 }
 
 pub(crate) fn run(m: &mut Module) {
-    let free_fn = registry::free_fn(super::mode());
+    let mode = super::mode();
+    let free_fn = registry::free_fn(mode);
     if !m.funcs.iter().any(|f| f.name == free_fn) {
         return;
     }
+    let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
+    let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
     let t0 = std::time::Instant::now();
     let (mut sites, mut frees) = (0usize, 0usize);
     let base: Vec<usize> = (0..m.funcs.len()).filter(|&i| has_producer_call(&m.funcs[i])).collect();
@@ -77,7 +80,8 @@ pub(crate) fn run(m: &mut Module) {
         }
         sites += fl.sites.len();
         let d = live::deaths(f, &ix, &sl, &mut fl, &sums);
-        frees += insert::apply(f, &sl, d, free_fn);
+        let fns: Vec<&str> = fl.drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
+        frees += insert::apply(f, &sl, d, &fns);
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!("ownership fir: summaries {} ms", sum_ms);

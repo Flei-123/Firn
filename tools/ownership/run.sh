@@ -52,6 +52,16 @@ same_out fir_obj_factory
 same_out fir_obj_escape
 expect_rc fir_obj_freed on 0
 expect_rc fir_obj_freed check 0
+same_out fir_vec_loop
+same_out fir_vec_ret
+same_out fir_vec_field
+same_out fir_vec_iter
+same_out fir_map_loop
+expect_rc fir_vec_freed on 0
+expect_rc fir_vec_freed check 0
+expect_rc fir_map_freed on 0
+expect_rc fir_map_freed check 0
+expect_rc fir_vec_poison check 86
 grep -q "use after free" "$D/poison_hit_check.err" && pass=$((pass + 1)) || { echo "FAIL poison_hit: no message"; fail=$((fail + 1)); }
 echo "ownership: $pass passed, $fail failed"
 [ "$fail" = 0 ]
