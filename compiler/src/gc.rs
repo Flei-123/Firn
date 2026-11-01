@@ -236,6 +236,10 @@ pub(crate) fn is_gc_ref(t: &Type) -> bool {
     is_gc_ptr(t) || is_gc_weak(t)
 }
 
+pub(crate) fn is_gc_traced(t: &Type) -> bool {
+    is_gc_ptr(t) || matches!(t, Type::Fn { .. })
+}
+
 /// `Gc[T]` — strong, first class pointer.
 pub(crate) fn is_gc_ptr(t: &Type) -> bool {
     match t {
@@ -770,7 +774,7 @@ fn put_out(ck: &mut Checker, i: usize) {
     if let Some(d) = ck.tcx.structs.get(sidx) {
         size = d.size;
         for f in &d.fields {
-            if is_gc_ptr(&f.ty) {
+            if is_gc_traced(&f.ty) {
                 strong.push(f.offset);
             } else if is_gc_weak(&f.ty) {
                 weak.push(f.offset);
@@ -1337,7 +1341,7 @@ pub(crate) fn declare_capture_class(
     if let Some(d) = ck.tcx.structs.get(sidx) {
         size = d.size;
         for f in &d.fields {
-            if is_gc_ptr(&f.ty) {
+            if is_gc_traced(&f.ty) {
                 strong.push(f.offset);
             }
         }
