@@ -995,6 +995,8 @@ build ripplewire
 "$W/ripplewire" | tail -n 1 | grep -q "RIPPLEWIRE PASSED"
 build splitnode
 "$W/splitnode" | tail -n 1 | grep -q "SPLITNODE PASSED"
+build kpview
+"$W/kpview" | tail -n 1 | grep -q "KPVIEW PASSED"
 # wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
 build wave6
 "$W/wave6" | tail -n 3

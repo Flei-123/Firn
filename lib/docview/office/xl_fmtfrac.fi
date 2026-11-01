@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import docview.office.xl_fmtscan
+
+export { is_fraction, format_fraction }
+
+const MAX_DEN_DIGITS: usize = 4
+
+struct FracSpec {
+    pre: rt.Buf,
+    sep: rt.Buf,
+    post: rt.Buf,
+    int_run: rt.Buf,
+    num_run: rt.Buf,
+    den_run: rt.Buf,
+    den_fixed: u64,
+}
+
+fn byte(s: str, i: usize) -> u8 {
+    return rt.ld8(s.p as u64, i)
+}
+
+fn is_ph(c: u8) -> bool {
+    return c == (48 as u8) || c == (35 as u8) || c == (63 as u8)
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= (48 as u8) && c <= (57 as u8)
+}
+
+fn is_fraction(s: str) -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    var i: usize = 0
+    while i < s.n {
+        let j: usize = xl_fmtscan.lit_item(s, i, &tmp)
+        if j != i {
+            i = j
+        } else {
+            if byte(s, i) == (47 as u8) && i > 0 && is_ph(byte(s, i - 1)) && i + 1 < s.n && (is_ph(byte(s, i + 1)) || is_digit(byte(s, i + 1))) {
+                return true
+            }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+fn spec_new() -> FracSpec {
+    return FracSpec { pre: rt.buf_new(), sep: rt.buf_new(), post: rt.buf_new(), int_run: rt.buf_new(),
+        num_run: rt.buf_new(), den_run: rt.buf_new(), den_fixed: 0 as u64 }
+}
+
+fn spec_free(sp: *mut FracSpec) {
+    rt.buf_free(&(*sp).pre)
+    rt.buf_free(&(*sp).sep)
+    rt.buf_free(&(*sp).post)
+    rt.buf_free(&(*sp).int_run)
+    rt.buf_free(&(*sp).num_run)
+    rt.buf_free(&(*sp).den_run)
+}
+
+fn parse_spec(s: str, sp: *mut FracSpec) {
+    var phase: i32 = 0
+    var i: usize = 0
+    var lit: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&lit)
+    while i < s.n {
+        rt.buf_set_len(&lit, 0)
+        let j: usize = xl_fmtscan.lit_item(s, i, &lit)
+        if j != i {
+            if phase == 1 {
+                phase = 2
+            } else if phase == 4 {
+                phase = 5
+            }
+            var target: *mut rt.Buf = &(*sp).pre
+            if phase == 2 || phase == 3 {
+                target = &(*sp).sep
+            } else if phase == 5 {
+                target = &(*sp).post
+            }
+            rt.buf_push_bytes(target, rt.buf_ptr(&lit), rt.buf_len(&lit))
+            i = j
+        } else {
+            let c: u8 = byte(s, i)
+            if is_ph(c) {
+                if phase == 0 {
+                    phase = 1
+                }
+                if phase == 2 {
+                    phase = 3
+                }
+                if phase == 1 {
+                    rt.buf_push(&(*sp).int_run, c)
+                } else if phase == 3 {
+                    rt.buf_push(&(*sp).num_run, c)
+                } else if phase == 4 {
+                    rt.buf_push(&(*sp).den_run, c)
+                } else {
+                    rt.buf_push(&(*sp).post, c)
+                }
+            } else if c == (47 as u8) && (phase == 1 || phase == 3) {
+                if phase == 1 {
+                    rt.buf_push_bytes(&(*sp).num_run, rt.buf_ptr(&(*sp).int_run), rt.buf_len(&(*sp).int_run))
+                    rt.buf_set_len(&(*sp).int_run, 0)
+                }
+                phase = 4
+            } else if is_digit(c) && phase == 4 {
+                (*sp).den_fixed = (*sp).den_fixed * (10 as u64) + ((c - (48 as u8)) as u64)
+                rt.buf_push(&(*sp).den_run, 35 as u8)
+            } else if phase == 1 {
+                phase = 2
+                rt.buf_push(&(*sp).sep, c)
+            } else if phase == 4 {
+                phase = 5
+                rt.buf_push(&(*sp).post, c)
+            } else {
+                rt.buf_push(&(*sp).pre, c)
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn abs_f(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn best_fraction(x: f64, max_den: u64, fixed: u64, num: *mut u64, den: *mut u64) {
+    if fixed > (0 as u64) {
+        *den = fixed
+        *num = (x * (fixed as f64) + 0.5) as u64
+        return
+    }
+    var best_err: f64 = 1.0e300
+    var d: u64 = 1
+    while d <= max_den {
+        let n: u64 = (x * (d as f64) + 0.5) as u64
+        let err: f64 = abs_f(x - (n as f64) / (d as f64))
+        if err < best_err - 1.0e-12 {
+            best_err = err
+            *num = n
+            *den = d
+        }
+        if err < 1.0e-12 {
+            break
+        }
+        d = d + 1
+    }
+}
+
+fn digits_of(v: u64, out: *mut rt.Buf) {
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn push_padded_left(out: *mut rt.Buf, run: *mut rt.Buf, digits: *mut rt.Buf) {
+    let width: usize = rt.buf_len(run)
+    var dn: usize = rt.buf_len(digits)
+    var k: usize = 0
+    while k + dn < width {
+        let c: u8 = rt.ld8(rt.buf_ptr(run), k)
+        if c == (63 as u8) {
+            rt.buf_push(out, 32 as u8)
+        } else if c == (48 as u8) {
+            rt.buf_push(out, 48 as u8)
+        }
+        k = k + 1
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(digits), dn)
+}
+
+fn push_padded_right(out: *mut rt.Buf, run: *mut rt.Buf, digits: *mut rt.Buf) {
+    let width: usize = rt.buf_len(run)
+    let dn: usize = rt.buf_len(digits)
+    rt.buf_push_bytes(out, rt.buf_ptr(digits), dn)
+    var k: usize = dn
+    while k < width {
+        if rt.ld8(rt.buf_ptr(run), k) == (63 as u8) {
+            rt.buf_push(out, 32 as u8)
+        }
+        k = k + 1
+    }
+}
+
+fn format_fraction(s: str, a: f64, out: *mut rt.Buf) {
+    var sp: FracSpec = spec_new()
+    defer spec_free(&sp)
+    parse_spec(s, &sp)
+    var dd: usize = rt.buf_len(&sp.den_run)
+    if dd > MAX_DEN_DIGITS {
+        dd = MAX_DEN_DIGITS
+    }
+    var max_den: u64 = 1
+    var k: usize = 0
+    while k < dd {
+        max_den = max_den * (10 as u64)
+        k = k + 1
+    }
+    max_den = max_den - (1 as u64)
+    if max_den < (1 as u64) {
+        max_den = 1
+    }
+    let has_int: bool = rt.buf_len(&sp.int_run) > 0
+    var ip: u64 = 0
+    var x: f64 = a
+    if has_int {
+        ip = a as u64
+        x = a - (ip as f64)
+    }
+    var n: u64 = 0
+    var d: u64 = 1
+    best_fraction(x, max_den, sp.den_fixed, &n, &d)
+    if has_int && n >= d {
+        ip = ip + 1
+        n = 0
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&sp.pre), rt.buf_len(&sp.pre))
+    if has_int {
+        var ib: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&ib)
+        if ip > (0 as u64) || n == (0 as u64) {
+            digits_of(ip, &ib)
+        }
+        push_padded_left(out, &sp.int_run, &ib)
+    }
+    if has_int && n == (0 as u64) {
+        var w: usize = rt.buf_len(&sp.sep) + rt.buf_len(&sp.num_run) + 1 + rt.buf_len(&sp.den_run)
+        while w > 0 {
+            rt.buf_push(out, 32 as u8)
+            w = w - 1
+        }
+    } else {
+        rt.buf_push_bytes(out, rt.buf_ptr(&sp.sep), rt.buf_len(&sp.sep))
+        var nb: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&nb)
+        digits_of(n, &nb)
+        push_padded_left(out, &sp.num_run, &nb)
+        rt.buf_push(out, 47 as u8)
+        var db: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&db)
+        digits_of(d, &db)
+        push_padded_right(out, &sp.den_run, &db)
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&sp.post), rt.buf_len(&sp.post))
+}

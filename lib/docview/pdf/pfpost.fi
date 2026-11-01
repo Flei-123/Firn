@@ -1,0 +1,610 @@
+// SPDX-License-Identifier: MPL-2.0
+// PDF type 4 functions: PostScript calculator compiler and interpreter.
+import std.math
+
+export {
+    PP_ERR,
+    pp_compile, pp_run,
+}
+
+const PP_ERR: usize = 4294967295
+const PP_NONE: usize = 4294967295
+const PP_STACK: usize = 100
+const PP_MAXDEPTH: usize = 16
+const OP_NUM: usize = 40
+const OP_JZ: usize = 41
+const OP_JMP: usize = 42
+
+#[no_gc]
+fn pp_ld(p: *mut f64, i: usize) -> f64 {
+    return *((p as u64 + (i * 8) as u64) as *mut f64)
+}
+
+#[no_gc]
+fn pp_st(p: *mut f64, i: usize, v: f64) {
+    *((p as u64 + (i * 8) as u64) as *mut f64) = v
+}
+
+#[no_gc]
+fn pp_byte(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn pp_is_space(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8 ||
+        c == 12 as u8 || c == 0 as u8
+}
+
+fn pp_op_of(p: u64, n: usize) -> usize {
+    var tbl: [u8; 180] = "abs add atan ceiling cos cvi cvr div exp floor idiv ln log mod mul neg round sin sqrt sub truncate and bitshift eq ge gt le lt ne not or xor copy dup exch index pop roll true false"
+    var idx: usize = 0
+    var i: usize = 0
+    while i < 180 {
+        var j: usize = i
+        while j < 180 && tbl[j] != 32 as u8 {
+            j = j + 1
+        }
+        if j - i == n {
+            var same: bool = true
+            var k: usize = 0
+            while k < n {
+                if tbl[i + k] != pp_byte(p, k) {
+                    same = false
+                }
+                k = k + 1
+            }
+            if same {
+                return idx
+            }
+        }
+        idx = idx + 1
+        i = j + 1
+    }
+    return PP_ERR
+}
+
+fn pp_number(p: u64, n: usize, out: *mut f64) -> bool {
+    var i: usize = 0
+    var neg: bool = false
+    if n > 0 && (pp_byte(p, 0) == 45 as u8 || pp_byte(p, 0) == 43 as u8) {
+        neg = pp_byte(p, 0) == 45 as u8
+        i = 1
+    }
+    var v: f64 = 0.0
+    var digits: usize = 0
+    while i < n && pp_byte(p, i) >= 48 as u8 && pp_byte(p, i) <= 57 as u8 {
+        v = v * 10.0 + ((pp_byte(p, i) - 48 as u8) as f64)
+        digits = digits + 1
+        i = i + 1
+    }
+    if i < n && pp_byte(p, i) == 46 as u8 {
+        i = i + 1
+        var sc: f64 = 0.1
+        while i < n && pp_byte(p, i) >= 48 as u8 && pp_byte(p, i) <= 57 as u8 {
+            v = v + ((pp_byte(p, i) - 48 as u8) as f64) * sc
+            sc = sc * 0.1
+            digits = digits + 1
+            i = i + 1
+        }
+    }
+    if digits == 0 {
+        return false
+    }
+    if i < n && (pp_byte(p, i) == 101 as u8 || pp_byte(p, i) == 69 as u8) {
+        i = i + 1
+        var eneg: bool = false
+        if i < n && (pp_byte(p, i) == 45 as u8 || pp_byte(p, i) == 43 as u8) {
+            eneg = pp_byte(p, i) == 45 as u8
+            i = i + 1
+        }
+        var ev: i64 = 0
+        var ed: usize = 0
+        while i < n && pp_byte(p, i) >= 48 as u8 && pp_byte(p, i) <= 57 as u8 && ed < 4 {
+            ev = ev * 10 + ((pp_byte(p, i) - 48 as u8) as i64)
+            ed = ed + 1
+            i = i + 1
+        }
+        if eneg {
+            ev = 0 - ev
+        }
+        v = v * math.powf(10.0, ev as f64)
+    }
+    if i != n {
+        return false
+    }
+    if neg {
+        v = 0.0 - v
+    }
+    *out = v
+    return true
+}
+
+fn pp_emit(out: *mut f64, np: usize, cap: usize, op: usize, arg: f64) -> bool {
+    if np + 2 > cap {
+        return false
+    }
+    pp_st(out, np, op as f64)
+    pp_st(out, np + 1, arg)
+    return true
+}
+
+fn pp_compile(src: u64, n: usize, out: *mut f64, cap: usize) -> usize {
+    var pos: usize = 0
+    var np: usize = 0
+    var depth: usize = 0
+    var ojz: [usize; 16] = [0; 16]
+    var ojmp: [usize; 16] = [0; 16]
+    var cjz: usize = PP_NONE
+    var cjmp: usize = PP_NONE
+    var closed: bool = false
+    var started: bool = false
+    while pos < n {
+        let c: u8 = pp_byte(src, pos)
+        if pp_is_space(c) {
+            pos = pos + 1
+            continue
+        }
+        if c == 37 as u8 {
+            while pos < n && pp_byte(src, pos) != 10 as u8 && pp_byte(src, pos) != 13 as u8 {
+                pos = pos + 1
+            }
+            continue
+        }
+        if c == 123 as u8 {
+            pos = pos + 1
+            if !started {
+                started = true
+                continue
+            }
+            if depth >= PP_MAXDEPTH {
+                return PP_ERR
+            }
+            if closed {
+                if cjmp != PP_NONE {
+                    return PP_ERR
+                }
+                let jmp: usize = np
+                if !pp_emit(out, np, cap, OP_JMP, 0.0) {
+                    return PP_ERR
+                }
+                np = np + 2
+                pp_st(out, cjz + 1, np as f64)
+                ojz[depth] = cjz
+                ojmp[depth] = jmp
+                closed = false
+            } else {
+                ojz[depth] = np
+                ojmp[depth] = PP_NONE
+                if !pp_emit(out, np, cap, OP_JZ, 0.0) {
+                    return PP_ERR
+                }
+                np = np + 2
+            }
+            depth = depth + 1
+            continue
+        }
+        if !started || closed && c != 105 as u8 && c != 125 as u8 {
+            return PP_ERR
+        }
+        if c == 125 as u8 {
+            if depth == 0 {
+                if closed {
+                    return PP_ERR
+                }
+                return np
+            }
+            if closed {
+                return PP_ERR
+            }
+            depth = depth - 1
+            cjz = ojz[depth]
+            cjmp = ojmp[depth]
+            closed = true
+            pos = pos + 1
+            continue
+        }
+        let st: usize = pos
+        while pos < n && !pp_is_space(pp_byte(src, pos)) && pp_byte(src, pos) != 123 as u8 &&
+            pp_byte(src, pos) != 125 as u8 && pp_byte(src, pos) != 37 as u8 {
+            pos = pos + 1
+        }
+        let wp: u64 = src + st as u64
+        let wl: usize = pos - st
+        if wl == 2 && pp_byte(wp, 0) == 105 as u8 && pp_byte(wp, 1) == 102 as u8 {
+            if !closed || cjmp != PP_NONE {
+                return PP_ERR
+            }
+            pp_st(out, cjz + 1, np as f64)
+            closed = false
+            continue
+        }
+        if wl == 6 && pp_byte(wp, 0) == 105 as u8 && pp_byte(wp, 1) == 102 as u8 &&
+            pp_byte(wp, 2) == 101 as u8 {
+            if !closed || cjmp == PP_NONE {
+                return PP_ERR
+            }
+            pp_st(out, cjmp + 1, np as f64)
+            closed = false
+            continue
+        }
+        if closed {
+            return PP_ERR
+        }
+        var v: f64 = 0.0
+        if pp_number(wp, wl, &v) {
+            if !pp_emit(out, np, cap, OP_NUM, v) {
+                return PP_ERR
+            }
+            np = np + 2
+            continue
+        }
+        let op: usize = pp_op_of(wp, wl)
+        if op == PP_ERR {
+            return PP_ERR
+        }
+        if !pp_emit(out, np, cap, op, 0.0) {
+            return PP_ERR
+        }
+        np = np + 2
+    }
+    return PP_ERR
+}
+
+fn pp_int(x: f64) -> i64 {
+    var v: f64 = x
+    if v > 1000000000000000.0 {
+        v = 1000000000000000.0
+    }
+    if v < -1000000000000000.0 {
+        v = -1000000000000000.0
+    }
+    return v as i64
+}
+
+fn pp_run(prog: *mut f64, len: usize, inp: *mut f64, nin: usize, out: *mut f64,
+    nout: usize) -> bool {
+    var s: [f64; 100] = [0.0; 100]
+    var b: [u8; 100] = [0 as u8; 100]
+    var sp: usize = 0
+    var i: usize = 0
+    while i < nin {
+        if sp >= PP_STACK {
+            return false
+        }
+        s[sp] = pp_ld(inp, i)
+        b[sp] = 0 as u8
+        sp = sp + 1
+        i = i + 1
+    }
+    var pc: usize = 0
+    var steps: usize = 0
+    while pc < len {
+        steps = steps + 1
+        if steps > 20000 {
+            return false
+        }
+        let op: usize = pp_ld(prog, pc) as usize
+        let arg: f64 = pp_ld(prog, pc + 1)
+        pc = pc + 2
+        if op == OP_NUM || op == 38 || op == 39 {
+            if sp >= PP_STACK {
+                return false
+            }
+            if op == OP_NUM {
+                s[sp] = arg
+                b[sp] = 0 as u8
+            } else {
+                b[sp] = 1 as u8
+                s[sp] = 0.0
+                if op == 38 {
+                    s[sp] = 1.0
+                }
+            }
+            sp = sp + 1
+            continue
+        }
+        if op == OP_JMP {
+            pc = arg as usize
+            continue
+        }
+        if op == OP_JZ {
+            if sp < 1 {
+                return false
+            }
+            sp = sp - 1
+            if s[sp] == 0.0 {
+                pc = arg as usize
+            }
+            continue
+        }
+        if op == 0 || op == 3 || op == 4 || op == 5 || op == 6 || op == 9 || op == 11 ||
+            op == 12 || op == 15 || op == 16 || op == 17 || op == 18 || op == 20 {
+            if sp < 1 {
+                return false
+            }
+            let x: f64 = s[sp - 1]
+            var r: f64 = x
+            if op == 0 {
+                r = math.fabs(x)
+            }
+            if op == 3 {
+                r = math.ceil(x)
+            }
+            if op == 4 {
+                r = math.cos(x * math.PI() / 180.0)
+            }
+            if op == 5 || op == 20 {
+                r = math.trunc(x)
+            }
+            if op == 9 {
+                r = math.floor(x)
+            }
+            if op == 11 {
+                if x <= 0.0 {
+                    return false
+                }
+                r = math.ln(x)
+            }
+            if op == 12 {
+                if x <= 0.0 {
+                    return false
+                }
+                r = math.log10(x)
+            }
+            if op == 15 {
+                r = 0.0 - x
+            }
+            if op == 16 {
+                r = math.floor(x + 0.5)
+            }
+            if op == 17 {
+                r = math.sin(x * math.PI() / 180.0)
+            }
+            if op == 18 {
+                if x < 0.0 {
+                    return false
+                }
+                r = math.sqrt(x)
+            }
+            s[sp - 1] = r
+            b[sp - 1] = 0 as u8
+            continue
+        }
+        if op == 1 || op == 2 || op == 7 || op == 8 || op == 10 || op == 13 || op == 14 ||
+            op == 19 || op == 22 {
+            if sp < 2 {
+                return false
+            }
+            let x: f64 = s[sp - 2]
+            let y: f64 = s[sp - 1]
+            var r: f64 = 0.0
+            if op == 1 {
+                r = x + y
+            }
+            if op == 2 {
+                r = math.atan2(x, y) * 180.0 / math.PI()
+                if r < 0.0 {
+                    r = r + 360.0
+                }
+            }
+            if op == 7 {
+                if y == 0.0 {
+                    return false
+                }
+                r = x / y
+            }
+            if op == 8 {
+                r = math.powf(x, y)
+            }
+            if op == 10 {
+                let yi: i64 = pp_int(y)
+                if yi == 0 {
+                    return false
+                }
+                r = (pp_int(x) / yi) as f64
+            }
+            if op == 13 {
+                let yi: i64 = pp_int(y)
+                if yi == 0 {
+                    return false
+                }
+                r = (pp_int(x) % yi) as f64
+            }
+            if op == 14 {
+                r = x * y
+            }
+            if op == 19 {
+                r = x - y
+            }
+            if op == 22 {
+                let sh: i64 = pp_int(y)
+                if sh >= 0 {
+                    r = math.trunc(x) * math.powf(2.0, sh as f64)
+                } else {
+                    r = math.floor(math.trunc(x) / math.powf(2.0, (0 - sh) as f64))
+                }
+            }
+            sp = sp - 1
+            s[sp - 1] = r
+            b[sp - 1] = 0 as u8
+            continue
+        }
+        if op == 23 || op == 24 || op == 25 || op == 26 || op == 27 || op == 28 {
+            if sp < 2 {
+                return false
+            }
+            let x: f64 = s[sp - 2]
+            let y: f64 = s[sp - 1]
+            var t: bool = false
+            if op == 23 {
+                t = x == y
+            }
+            if op == 24 {
+                t = x >= y
+            }
+            if op == 25 {
+                t = x > y
+            }
+            if op == 26 {
+                t = x <= y
+            }
+            if op == 27 {
+                t = x < y
+            }
+            if op == 28 {
+                t = x != y
+            }
+            sp = sp - 1
+            s[sp - 1] = 0.0
+            if t {
+                s[sp - 1] = 1.0
+            }
+            b[sp - 1] = 1 as u8
+            continue
+        }
+        if op == 21 || op == 30 || op == 31 {
+            if sp < 2 {
+                return false
+            }
+            let isb: bool = b[sp - 1] != 0 as u8 && b[sp - 2] != 0 as u8
+            let xi: i64 = pp_int(s[sp - 2])
+            let yi: i64 = pp_int(s[sp - 1])
+            var r: i64 = 0
+            if op == 21 {
+                r = xi & yi
+            }
+            if op == 30 {
+                r = xi | yi
+            }
+            if op == 31 {
+                r = xi ^ yi
+            }
+            sp = sp - 1
+            s[sp - 1] = r as f64
+            if isb {
+                b[sp - 1] = 1 as u8
+            } else {
+                b[sp - 1] = 0 as u8
+            }
+            continue
+        }
+        if op == 29 {
+            if sp < 1 {
+                return false
+            }
+            if b[sp - 1] != 0 as u8 {
+                if s[sp - 1] == 0.0 {
+                    s[sp - 1] = 1.0
+                } else {
+                    s[sp - 1] = 0.0
+                }
+            } else {
+                s[sp - 1] = (0 - 1 - pp_int(s[sp - 1])) as f64
+            }
+            continue
+        }
+        if op == 36 {
+            if sp < 1 {
+                return false
+            }
+            sp = sp - 1
+            continue
+        }
+        if op == 33 {
+            if sp < 1 || sp >= PP_STACK {
+                return false
+            }
+            s[sp] = s[sp - 1]
+            b[sp] = b[sp - 1]
+            sp = sp + 1
+            continue
+        }
+        if op == 34 {
+            if sp < 2 {
+                return false
+            }
+            let tv: f64 = s[sp - 1]
+            let tb: u8 = b[sp - 1]
+            s[sp - 1] = s[sp - 2]
+            b[sp - 1] = b[sp - 2]
+            s[sp - 2] = tv
+            b[sp - 2] = tb
+            continue
+        }
+        if op == 32 || op == 35 {
+            if sp < 1 {
+                return false
+            }
+            let k: i64 = pp_int(s[sp - 1])
+            sp = sp - 1
+            if k < 0 {
+                return false
+            }
+            let ku: usize = k as usize
+            if op == 35 {
+                if ku >= sp || sp >= PP_STACK {
+                    return false
+                }
+                s[sp] = s[sp - 1 - ku]
+                b[sp] = b[sp - 1 - ku]
+                sp = sp + 1
+                continue
+            }
+            if ku > sp || sp + ku > PP_STACK {
+                return false
+            }
+            var q: usize = 0
+            while q < ku {
+                s[sp + q] = s[sp - ku + q]
+                b[sp + q] = b[sp - ku + q]
+                q = q + 1
+            }
+            sp = sp + ku
+            continue
+        }
+        if op == 37 {
+            if sp < 2 {
+                return false
+            }
+            let jj: i64 = pp_int(s[sp - 1])
+            let nn: i64 = pp_int(s[sp - 2])
+            sp = sp - 2
+            if nn < 0 || (nn as usize) > sp {
+                return false
+            }
+            let nu: usize = nn as usize
+            if nu > 0 {
+                var sh: i64 = jj % nn
+                if sh < 0 {
+                    sh = sh + nn
+                }
+                var ts: [f64; 100] = [0.0; 100]
+                var tb: [u8; 100] = [0 as u8; 100]
+                var q: usize = 0
+                while q < nu {
+                    ts[q] = s[sp - nu + q]
+                    tb[q] = b[sp - nu + q]
+                    q = q + 1
+                }
+                q = 0
+                while q < nu {
+                    let dst: usize = (q + sh as usize) % nu
+                    s[sp - nu + dst] = ts[q]
+                    b[sp - nu + dst] = tb[q]
+                    q = q + 1
+                }
+            }
+            continue
+        }
+        return false
+    }
+    if sp < nout {
+        return false
+    }
+    i = 0
+    while i < nout {
+        pp_st(out, i, s[sp - nout + i])
+        i = i + 1
+    }
+    return true
+}
