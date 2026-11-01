@@ -25,7 +25,7 @@ compare() {
   local bps ssx ssy
   bps=$(bytes_per_sample $pix)
   read ssx ssy <<< "$(geometry $pix)"
-  ffmpeg -nostdin -v error -y -c:v libdav1d -i "$D/$name.ivf" -fps_mode passthrough -autoscale 0 -f rawvideo -pix_fmt $pix "$D/$name.ref" >/dev/null 2>&1
+  ffmpeg -nostdin -v error -y -c:v ${REFDEC:-libdav1d} -i "$D/$name.ivf" -fps_mode passthrough -autoscale 0 -f rawvideo -pix_fmt $pix "$D/$name.ref" >/dev/null 2>&1
   "$D/av1dec" "$D/$name.ivf" "$D/$name.yuv" "$D/$name.info" || true
   [ "$var" = 1 ] && w=0
   if python3 -I "$ROOT/tools/media_video/av1yuv_cmp.py" "$D/$name.yuv" "$D/$name.ref" $w $h $bps $ssx $ssy; then
@@ -90,7 +90,7 @@ svt_clip hd_rs_random2 mandelbrot 200x130 yuv420p 12 "resize-mode=2"
 svt_clip hd_rs_dynamic testsrc2 176x144 yuv420p 12 "resize-mode=3"
 svt_clip hd_sres_inter testsrc2 176x144 yuv420p 10 "superres-mode=1:superres-denom=12:superres-kf-denom=12"
 svt_clip hd_sres_rand testsrc2 176x144 yuv420p 10 "superres-mode=2"
-svt_clip hd_sres_both testsrc2 176x144 yuv420p 12 "superres-mode=1:superres-denom=10:superres-kf-denom=10:resize-mode=2"
+REFDEC=libaom-av1 svt_clip hd_sres_both testsrc2 176x144 yuv420p 12 "superres-mode=1:superres-denom=10:superres-kf-denom=10:resize-mode=2"
 svt_clip hd_sres_10 testsrc2 176x144 yuv420p10le 10 "superres-mode=1:superres-denom=14:superres-kf-denom=14"
 echo "pass=$PASS fail=$FAIL"
 [ $FAIL -eq 0 ]

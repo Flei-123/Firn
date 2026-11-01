@@ -1,6 +1,6 @@
 import os,random,subprocess,sys,tempfile
 root,vdec,runs=sys.argv[1],sys.argv[2],int(sys.argv[3])
-files=[os.path.join(root,f) for f in sorted(os.listdir(root)) if f.endswith('.obu')]
+files=[os.path.join(root,f) for f in sorted(os.listdir(root)) if f.endswith(('.obu','.ivf'))]
 rnd=random.Random(int(os.environ.get("FUZZ_SEED","7")))
 bad=0
 stats={'ok':0,'err':0}
