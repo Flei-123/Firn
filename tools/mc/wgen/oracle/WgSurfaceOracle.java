@@ -262,6 +262,8 @@ public class WgSurfaceOracle {
                         n += "[distance=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE) + (waterlogged ? ",waterlogged=true" : "") + "]";
                     } else if (st.getBlock() instanceof net.minecraft.world.level.block.HugeMushroomBlock) {
                         n += "[" + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOWN) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.EAST) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.NORTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.SOUTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.UP) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WEST) ? "1" : "0") + "]";
+                    } else if (st.getBlock() instanceof net.minecraft.world.level.block.BambooStalkBlock) {
+                        n += "[leaves=" + st.getValue(net.minecraft.world.level.block.BambooStalkBlock.LEAVES).getSerializedName() + ",stage=" + st.getValue(net.minecraft.world.level.block.BambooStalkBlock.STAGE) + "]";
                     } else if (st.is(net.minecraft.tags.BlockTags.LOGS) && st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS)) {
                         n += "[axis=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.AXIS).getSerializedName() + "]";
                     } else if (waterlogged) {
