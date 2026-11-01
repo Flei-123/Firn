@@ -1,5 +1,5 @@
 use super::index::{Bits, Index};
-use super::registry;
+use super::sites::{self, Site};
 use super::slots::Slots;
 use crate::fir::{Func, Inst, Op, Term, Val};
 use crate::fx::HashMap;
@@ -12,13 +12,11 @@ pub(crate) struct CellVal {
     pub derived: bool,
 }
 
-pub(crate) struct Site {
-    pub cell_p: usize,
-    pub cell_n: usize,
-}
-
 pub(crate) trait Borrows {
     fn borrows(&self, name: &str, arg: usize) -> bool;
+    fn fresh(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Flow {
@@ -30,6 +28,8 @@ pub(crate) struct Flow {
     pub derived: Vec<bool>,
     pub cin: Vec<Option<Vec<CellVal>>>,
     pub escaped: Bits,
+    pub ret_may: Bits,
+    pub ret_derived: bool,
     other_bits: Bits,
     scratch: Bits,
     uses: Vec<Val>,
@@ -54,20 +54,12 @@ impl Flow {
 
     pub fn build(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows, with_sites: bool) -> Flow {
         let nparams = f.params.len();
-        let mut sites = Vec::new();
-        let mut site_at = HashMap::default();
-        for &bi in ix.rpo.iter().filter(|_| with_sites) {
-            for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
-                if let Op::Call { name, args } = &inst.op {
-                    if registry::producer(name).map_or(false, |p| p.shape == registry::Shape::SretPair) && !args.is_empty() {
-                        if let Some((cp, cn)) = sl.producer_cells(args[0]) {
-                            site_at.insert((bi, ii), sites.len());
-                            sites.push(Site { cell_p: cp, cell_n: cn });
-                        }
-                    }
-                }
-            }
-        }
+        let (sites, site_at) = if with_sites {
+            let found = sites::find(f, ix, sl, br);
+            (found.sites, found.site_at)
+        } else {
+            (Vec::new(), HashMap::default())
+        };
         let nseeds = 1 + nparams + sites.len();
         let mut fl = Flow {
             nseeds,
@@ -78,6 +70,8 @@ impl Flow {
             derived: vec![false; ix.nvals],
             cin: vec![None; f.blocks.len()],
             escaped: Bits::new(nseeds),
+            ret_may: Bits::new(nseeds),
+            ret_derived: false,
             other_bits: Bits::single(nseeds, OTHER),
             scratch: Bits::new(nseeds),
             uses: Vec::new(),
@@ -118,7 +112,8 @@ impl Flow {
                 }
                 if let Term::Ret(Some(v)) = &f.blocks[bi].term {
                     let m = fl.may[*v as usize].clone();
-                    fl.escaped.union(&m);
+                    fl.ret_may.union(&m);
+                    fl.ret_derived |= fl.derived[*v as usize];
                 }
                 if cout[bi].as_ref() != Some(&cells) {
                     cout[bi] = Some(cells);
@@ -129,6 +124,7 @@ impl Flow {
                 if changed {
                     for k in 1..nseeds {
                         fl.escaped.set(k);
+                        fl.ret_may.set(k);
                     }
                 }
                 break;
@@ -195,6 +191,7 @@ impl Flow {
                 }
                 der = true;
             }
+            Op::Const(0) => {}
             Op::Cmp { .. }
             | Op::Const(_)
             | Op::Alloca { .. }
@@ -224,15 +221,17 @@ impl Flow {
                 None => self.sink(*val),
             },
             Op::Call { name, args } => {
-                let site = self.site_at.get(&at).copied();
-                if let Some(k) = site {
-                    let s = self.seed_of_site(k);
-                    let (cp, cn) = (self.sites[k].cell_p, self.sites[k].cell_n);
-                    cells[cp] = CellVal { may: Bits::single(self.nseeds, s), derived: false };
-                    cells[cn] = CellVal { may: self.other_bits.clone(), derived: false };
+                let mut pair = false;
+                if let Some(&k) = self.site_at.get(&at) {
+                    if let Site::Pair { cell_p, cell_n } = self.sites[k] {
+                        let s = self.seed_of_site(k);
+                        cells[cell_p] = CellVal { may: Bits::single(self.nseeds, s), derived: false };
+                        cells[cell_n] = CellVal { may: self.other_bits.clone(), derived: false };
+                        pair = true;
+                    }
                 }
                 for (k, v) in args.iter().enumerate() {
-                    if (site.is_some() && k == 0) || br.borrows(name, k) {
+                    if (pair && k == 0) || br.borrows(name, k) {
                         continue;
                     }
                     self.sink(*v);
@@ -245,6 +244,13 @@ impl Flow {
                     self.sink(*v);
                 }
                 acc.assign(&self.other_bits);
+            }
+        }
+        if let Some(&k) = self.site_at.get(&at) {
+            if self.sites[k] == Site::Value {
+                acc.reset();
+                acc.set(self.seed_of_site(k));
+                der = false;
             }
         }
         let ch = match (vals, inst.dst) {

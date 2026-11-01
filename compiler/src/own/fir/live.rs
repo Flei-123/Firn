@@ -1,5 +1,6 @@
 use super::flow::{Borrows, CellVal, Flow};
 use super::index::{term_uses, Bits, Index};
+use super::sites::Site;
 use super::slots::Slots;
 use crate::fir::{Func, Inst, Op, Val};
 use crate::fx::HashMap;
@@ -39,7 +40,7 @@ pub(crate) fn deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn B
     let mut freed = vec![false; fl.sites.len()];
     for k in 0..fl.sites.len() {
         let seed = fl.seed_of_site(k);
-        if fl.escaped.get(seed) {
+        if fl.escaped.get(seed) || fl.ret_may.get(seed) {
             continue;
         }
         if let Some(v) = site_deaths(f, ix, sl, fl, br, k) {
@@ -61,8 +62,10 @@ fn items_for(f: &Func, sl: &Slots, fl: &Flow, seed: usize, site: usize) -> Items
     }
     let nv = n;
     let mut cell = HashMap::default();
-    cell.insert(fl.sites[site].cell_p, n);
-    n += 1;
+    if let Site::Pair { cell_p, .. } = fl.sites[site] {
+        cell.insert(cell_p, n);
+        n += 1;
+    }
     for b in f.blocks.iter() {
         for inst in b.insts.iter() {
             if let Op::Store { addr, val: sv } = &inst.op {
@@ -127,9 +130,11 @@ impl<'a> Ctx<'a> {
             }
             Op::Call { .. } => {
                 if let Some(&k) = fl.site_at.get(&at) {
-                    for c in [fl.sites[k].cell_p, fl.sites[k].cell_n] {
-                        if let Some(&i) = self.items.cell.get(&c) {
-                            live.clear(i);
+                    if let Site::Pair { cell_p, cell_n } = fl.sites[k] {
+                        for c in [cell_p, cell_n] {
+                            if let Some(&i) = self.items.cell.get(&c) {
+                                live.clear(i);
+                            }
                         }
                     }
                 }
@@ -310,16 +315,30 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
 
 fn handle(cx: &Ctx, fl: &Flow, inst: &Inst, is_site: bool, after: &[CellVal]) -> Option<Handle> {
     if is_site {
-        let c = fl.sites[cx.site].cell_p;
-        if cx.must_cell(after, c) {
-            return Some(Handle::Cell(c));
+        if let Site::Pair { cell_p, .. } = fl.sites[cx.site] {
+            return cx.must_cell(after, cell_p).then_some(Handle::Cell(cell_p));
         }
-        return None;
     }
     let mut u = Vec::new();
     inst.op.uses(&mut u);
     if let Some(d) = inst.dst {
         u.push(d);
     }
-    u.into_iter().find(|v| fl.must(*v) == Some(cx.seed)).map(Handle::Val)
+    if let Some(v) = u.iter().copied().find(|v| fl.must(*v) == Some(cx.seed)) {
+        return Some(Handle::Val(v));
+    }
+    u.into_iter().find_map(|v| base_of(cx, fl, v)).map(Handle::Val)
+}
+
+fn base_of(cx: &Ctx, fl: &Flow, mut v: Val) -> Option<Val> {
+    for _ in 0..8 {
+        match cx.ix.op(cx.f, v)? {
+            Op::PtrAdd { base, .. } => v = *base,
+            _ => return None,
+        }
+        if fl.must(v) == Some(cx.seed) {
+            return Some(v);
+        }
+    }
+    None
 }

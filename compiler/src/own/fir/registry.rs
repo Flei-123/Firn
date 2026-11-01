@@ -34,6 +34,19 @@ pub(crate) const CONSUMES: &[&str] = &[
     "__str_concat4_tail_check",
 ];
 
+pub(crate) const GC_ALLOC: &str = crate::gc::FN_ALLOC;
+
+pub(crate) const ESCAPES: &[&str] = &[
+    crate::gc::FN_WEAK,
+    crate::gc::FN_AS,
+    "gc_finalizer_set",
+    "gc_finalizer_kind",
+    "gc_finalizer_delete",
+    "gc_root_register",
+    "gc_root_register_r",
+    "gc_root_unregister",
+];
+
 pub(crate) const BORROW_ALL: &[&str] = &["__own_blit"];
 
 pub(crate) fn producer(name: &str) -> Option<&'static Producer> {
@@ -41,7 +54,11 @@ pub(crate) fn producer(name: &str) -> Option<&'static Producer> {
 }
 
 pub(crate) fn consumes(name: &str) -> bool {
-    CONSUMES.contains(&name)
+    CONSUMES.contains(&name) || ESCAPES.contains(&name)
+}
+
+pub(crate) fn is_gc_alloc(name: &str) -> bool {
+    name == GC_ALLOC
 }
 
 pub(crate) fn borrows_all(name: &str) -> bool {
