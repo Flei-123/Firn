@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MPL-2.0
+import media.video.av1.av1blkst
+import media.video.av1.av1blkdat
+import media.video.av1.av1cdfidx
+import media.video.av1.av1sym
+import media.video.av1.av1modeinfo
+import media.video.av1.av1resid
+import media.video.vp9.vp9mem
+
+export { decode_partition, decode_block }
+
+const PART_NONE: i64 = 0
+const PART_HORZ: i64 = 1
+const PART_VERT: i64 = 2
+const PART_SPLIT: i64 = 3
+const PART_HORZ_A: i64 = 4
+const PART_HORZ_B: i64 = 5
+const PART_VERT_A: i64 = 6
+const PART_VERT_B: i64 = 7
+const PART_HORZ_4: i64 = 8
+const PART_VERT_4: i64 = 9
+
+fn is_inside(td: *mut av1blkst.TileDec, r: i64, c: i64) -> i64 {
+    if c >= (*td).mi_col_start && c < (*td).mi_col_end && r >= (*td).mi_row_start && r < (*td).mi_row_end {
+        return 1
+    }
+    return 0
+}
+
+fn cdf_diff(cdf: u64, i: i64) -> i64 {
+    var prev: i64 = 0
+    if i > 0 {
+        prev = vp9mem.ld16(cdf, (i - 1) as usize)
+    }
+    return vp9mem.ld16(cdf, i as usize) - prev
+}
+
+fn gather(cdf: u64, n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    var sum: i64 = 0
+    if a < n { sum = sum + cdf_diff(cdf, a) }
+    if b < n { sum = sum + cdf_diff(cdf, b) }
+    if c < n { sum = sum + cdf_diff(cdf, c) }
+    if d < n { sum = sum + cdf_diff(cdf, d) }
+    if e < n { sum = sum + cdf_diff(cdf, e) }
+    if f < n { sum = sum + cdf_diff(cdf, f) }
+    return sum
+}
+
+fn read_split_or(td: *mut av1blkst.TileDec, cdf: u64, n: i64, horz: bool) -> i64 {
+    var psum: i64 = 0
+    if horz {
+        psum = gather(cdf, n, PART_VERT, PART_SPLIT, PART_HORZ_A, PART_VERT_A, PART_VERT_B, PART_VERT_4)
+    } else {
+        psum = gather(cdf, n, PART_HORZ, PART_SPLIT, PART_HORZ_A, PART_HORZ_B, PART_VERT_A, PART_HORZ_4)
+    }
+    var tmp: [u16; 3] = [(32768 - psum) as u16, 32768, 0]
+    let cp: *mut [u16; 3] = &tmp
+    let saved: bool = (*td).sym.update
+    (*td).sym.update = false
+    let v: i64 = av1sym.sym_read(&(*td).sym, cp as u64, 2)
+    (*td).sym.update = saved
+    return v
+}
+
+fn partition_ctx(td: *mut av1blkst.TileDec, r: i64, c: i64, bsl: i64, avail_u: i64, avail_l: i64) -> i64 {
+    var above: i64 = 0
+    var left: i64 = 0
+    if avail_u != 0 && av1blkdat.bw_log2(av1blkst.mi_get(td, (*td).mi_size_a, r - 1, c)) < bsl {
+        above = 1
+    }
+    if avail_l != 0 && av1blkdat.bh_log2(av1blkst.mi_get(td, (*td).mi_size_a, r, c - 1)) < bsl {
+        left = 1
+    }
+    return left * 2 + above
+}
+
+fn store_block(td: *mut av1blkst.TileDec) {
+    var y: i64 = 0
+    while y < (*td).bh4 {
+        var x: i64 = 0
+        while x < (*td).bw4 {
+            let r: i64 = (*td).mi_row + y
+            let c: i64 = (*td).mi_col + x
+            if r < (*td).mi_rows && c < (*td).mi_cols {
+                av1blkst.mi_set(td, (*td).mi_size_a, r, c, (*td).mi_size)
+                av1blkst.mi_set(td, (*td).skip_a, r, c, (*td).skip)
+                av1blkst.mi_set(td, (*td).seg_a, r, c, (*td).segment_id)
+                av1blkst.mi_set(td, (*td).ymode_a, r, c, (*td).y_mode)
+                av1blkst.mi_set(td, (*td).inter_a, r, c, (*td).is_inter)
+                av1blkst.mi_set(td, (*td).txs_a, r, c, (*td).tx_size)
+                av1blkst.mi_set(td, (*td).paly_a, r, c, (*td).pal_size_y)
+                av1blkst.mi_set(td, (*td).paluv_a, r, c, (*td).pal_size_uv)
+                var k: i64 = 0
+                while k < 4 {
+                    av1blkst.st((*td).dlf_a, (r * (*td).mi_cols + c) * 4 + k, (*td).delta_lf[k as usize])
+                    k = k + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn decode_block(td: *mut av1blkst.TileDec, r: i64, c: i64, sub_size: i64) -> i64 {
+    (*td).mi_row = r
+    (*td).mi_col = c
+    (*td).mi_size = sub_size
+    (*td).bw4 = av1blkdat.bw4(sub_size)
+    (*td).bh4 = av1blkdat.bh4(sub_size)
+    var has_chroma: i64 = (*td).num_planes
+    if has_chroma > 1 {
+        has_chroma = 1
+    } else {
+        has_chroma = 0
+    }
+    if (*td).bh4 == 1 && (*td).ss_y != 0 && (r & 1) == 0 {
+        has_chroma = 0
+    } else if (*td).bw4 == 1 && (*td).ss_x != 0 && (c & 1) == 0 {
+        has_chroma = 0
+    }
+    (*td).has_chroma = has_chroma
+    (*td).avail_u = is_inside(td, r - 1, c)
+    (*td).avail_l = is_inside(td, r, c - 1)
+    (*td).avail_uc = (*td).avail_u
+    (*td).avail_lc = (*td).avail_l
+    if has_chroma != 0 {
+        if (*td).ss_y != 0 && (*td).bh4 == 1 {
+            (*td).avail_uc = is_inside(td, r - 2, c)
+        }
+        if (*td).ss_x != 0 && (*td).bw4 == 1 {
+            (*td).avail_lc = is_inside(td, r, c - 2)
+        }
+    } else {
+        (*td).avail_uc = 0
+        (*td).avail_lc = 0
+    }
+    let rc: i64 = av1modeinfo.intra_frame_mode_info(td)
+    if rc != av1blkst.TD_OK {
+        return rc
+    }
+    av1modeinfo.read_block_tx_size(td)
+    if (*td).skip != 0 {
+        av1resid.reset_block_context(td)
+        (*td).n_skip = (*td).n_skip + 1
+    }
+    store_block(td)
+    (*td).n_blocks = (*td).n_blocks + 1
+    return av1resid.residual(td)
+}
+
+fn decode_partition(td: *mut av1blkst.TileDec, r: i64, c: i64, bsize: i64) -> i64 {
+    if r >= (*td).mi_rows || c >= (*td).mi_cols {
+        return av1blkst.TD_OK
+    }
+    let avail_u: i64 = is_inside(td, r - 1, c)
+    let avail_l: i64 = is_inside(td, r, c - 1)
+    let num4: i64 = av1blkdat.bw4(bsize)
+    let half: i64 = num4 >> 1
+    let quarter: i64 = half >> 1
+    var has_rows: bool = (r + half) < (*td).mi_rows
+    var has_cols: bool = (c + half) < (*td).mi_cols
+    var partition: i64 = PART_SPLIT
+    let bsl: i64 = av1blkdat.bw_log2(bsize)
+    if bsize < av1blkdat.BLOCK_8X8 {
+        partition = PART_NONE
+    } else {
+        let n: i64 = av1blkdat.part_symbols(bsl)
+        let ctx: i64 = partition_ctx(td, r, c, bsl, avail_u, avail_l)
+        let off: usize = av1cdfidx.CDF_PARTITION + (((bsl - 1) * 4 + ctx) * 11) as usize
+        if has_rows && has_cols {
+            partition = av1blkst.rd_sym(td, off, n)
+        } else if has_cols {
+            let cdf: u64 = (*td).cdf + (off * 2) as u64
+            if read_split_or(td, cdf, n, true) == 1 {
+                partition = PART_SPLIT
+            } else {
+                partition = PART_HORZ
+            }
+        } else if has_rows {
+            let cdf: u64 = (*td).cdf + (off * 2) as u64
+            if read_split_or(td, cdf, n, false) == 1 {
+                partition = PART_SPLIT
+            } else {
+                partition = PART_VERT
+            }
+        }
+    }
+    let sub_size: i64 = av1blkdat.part_subsize(partition, bsize)
+    let split_size: i64 = av1blkdat.part_subsize(PART_SPLIT, bsize)
+    if sub_size == av1blkdat.BLOCK_INVALID {
+        return av1blkst.TD_ERR
+    }
+    var rc: i64 = av1blkst.TD_OK
+    if partition == PART_NONE {
+        rc = decode_block(td, r, c, sub_size)
+    } else if partition == PART_HORZ {
+        rc = decode_block(td, r, c, sub_size)
+        if rc == av1blkst.TD_OK && has_rows {
+            rc = decode_block(td, r + half, c, sub_size)
+        }
+    } else if partition == PART_VERT {
+        rc = decode_block(td, r, c, sub_size)
+        if rc == av1blkst.TD_OK && has_cols {
+            rc = decode_block(td, r, c + half, sub_size)
+        }
+    } else if partition == PART_SPLIT {
+        rc = decode_partition(td, r, c, sub_size)
+        if rc == av1blkst.TD_OK {
+            rc = decode_partition(td, r, c + half, sub_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_partition(td, r + half, c, sub_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_partition(td, r + half, c + half, sub_size)
+        }
+    } else if partition == PART_HORZ_A {
+        rc = decode_block(td, r, c, split_size)
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r, c + half, split_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r + half, c, sub_size)
+        }
+    } else if partition == PART_HORZ_B {
+        rc = decode_block(td, r, c, sub_size)
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r + half, c, split_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r + half, c + half, split_size)
+        }
+    } else if partition == PART_VERT_A {
+        rc = decode_block(td, r, c, split_size)
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r + half, c, split_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r, c + half, sub_size)
+        }
+    } else if partition == PART_VERT_B {
+        rc = decode_block(td, r, c, sub_size)
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r, c + half, split_size)
+        }
+        if rc == av1blkst.TD_OK {
+            rc = decode_block(td, r + half, c + half, split_size)
+        }
+    } else if partition == PART_HORZ_4 {
+        var i: i64 = 0
+        while i < 4 && rc == av1blkst.TD_OK {
+            if i < 3 || (r + quarter * 3) < (*td).mi_rows {
+                rc = decode_block(td, r + quarter * i, c, sub_size)
+            }
+            i = i + 1
+        }
+    } else {
+        var i: i64 = 0
+        while i < 4 && rc == av1blkst.TD_OK {
+            if i < 3 || (c + quarter * 3) < (*td).mi_cols {
+                rc = decode_block(td, r, c + quarter * i, sub_size)
+            }
+            i = i + 1
+        }
+    }
+    return rc
+}
