@@ -31,7 +31,7 @@ All libs: no native-only calls in model layers, must build for `wasm32-browser`,
 | FLAC, AAC, Opus (SILK+CELT), WAV | Certus `media/flac.fi`, `aac.fi`, `opus*.fi`/`celt*`/`silk*`, `player.fi` (WAV) | not in Firn; Firn `audio.engine` has `engine_load_wav` only |
 | MP4 / WebM / EBML demux | Certus `media/mp4.fi`, `webm.fi`, `ebml.fi`, `webm_ogg.fi` | not in Firn |
 | H.264 | Certus `media/h264.fi` (9.2k lines, CAVLC+CABAC, I/P/B, no interlace); Firn `cast/h264dec.fi` (244 lines) | Certus one is the real decoder |
-| VP8/VP9 | none (demux detects the codec only) | GAP |
+| VP8/VP9 | Firn `media.video.vp8.*`, `vp9.*`, sources `vidvp8`/`vidvp9` (registered in `vidmulti`) | done; VP9: WASM 221/920 KB (fast/safe), 720p inter 226 M instr/frame |
 | AV1 video | Firn `av1` = still image (AVIF) only | GAP (inter frames exist in tables: av1interm; check) |
 | A/V sync + audio out | Certus `media/player.fi` (audio engine), `audio_*.fi` backends; Firn `audio.sink`, `audio.player` | unify on `audio.sink` |
 | WASM audio/video output | Firn `plat/web` | needs WebAudio sink + canvas blit check |

@@ -169,8 +169,9 @@ corruption after round 9 -- the test can see a missing root.
   font from the loader, not from a file.
 * **Inline assembler, `#[interrupt]`, the kernel profile** -- x86 text and
   bare metal by nature.
-* **No debug information** in the module (a name section, so a trap names
-  the Firn function; no DWARF).
+* **No debug information** in the module (a name section at `dev` and
+  `dev-fast`, so a trap names the Firn function; `release-safe` and
+  `release-fast` leave it out; no DWARF).
 * **The stack**: the shadow stack has 8 MiB like a Linux process, but the
   engine's OWN call stack is its business; `tools/wasm/run.mjs` is started
   with `--stack-size=7800`, a browser has what it has. No test of the series
