@@ -166,8 +166,23 @@ pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>]
         plans.push(Plan { free: i, path, alloc: k });
     }
     let heads: HashSet<usize> = plans.iter().map(|p| allocs[p.alloc].head).collect();
-    plans.retain(|p| p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)) && simple_preds(ix, &p.path) && exits_ok(ix, &p.path, &allocs[p.alloc]));
+    let order = rpo_pos(ix);
+    plans.retain(|p| {
+        p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)) && simple_preds(ix, &p.path) && exits_ok(ix, &p.path, &allocs[p.alloc]) && !empty_on_back_edge(ix, &order, &p.path)
+    });
     plans
+}
+
+fn rpo_pos(ix: &Index) -> Vec<usize> {
+    let mut pos = vec![usize::MAX; ix.preds.len()];
+    for (k, &b) in ix.rpo.iter().enumerate() {
+        pos[b] = k;
+    }
+    pos
+}
+
+fn empty_on_back_edge(ix: &Index, order: &[usize], path: &[usize]) -> bool {
+    path.windows(2).any(|w| ix.preds[w[1]].iter().any(|&q| q != w[0] && order[q] != usize::MAX && order[q] >= order[w[1]]))
 }
 
 pub(crate) fn side_exits(ix: &Index, path: &[usize]) -> Vec<(usize, usize)> {
