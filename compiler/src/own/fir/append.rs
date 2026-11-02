@@ -1,4 +1,4 @@
-use crate::fir::{FTy, Func, Inst, Module, Op, Val};
+use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
 use crate::fx::HashMap;
 
 pub(crate) const APPEND: &str = "__own_str_append";
@@ -91,9 +91,40 @@ fn drop_after(f: &Func, bi: usize, ii: usize, old: Val, free_fn: &str, poison_fn
     None
 }
 
+fn succ_ids(t: &Term) -> Vec<u32> {
+    match t {
+        Term::Br(b) => vec![*b],
+        Term::BrCond { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Term::Switch { cases, default, .. } => {
+            let mut v: Vec<u32> = cases.iter().map(|c| c.1).collect();
+            v.push(*default);
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn on_cycle(f: &Func, start: usize) -> bool {
+    let pos: HashMap<u32, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let mut seen = vec![false; f.blocks.len()];
+    let mut stack: Vec<usize> = succ_ids(&f.blocks[start].term).iter().filter_map(|id| pos.get(id).copied()).collect();
+    while let Some(b) = stack.pop() {
+        if b == start {
+            return true;
+        }
+        if seen[b] {
+            continue;
+        }
+        seen[b] = true;
+        stack.extend(succ_ids(&f.blocks[b].term).iter().filter_map(|id| pos.get(id).copied()));
+    }
+    false
+}
+
 fn rewrite(f: &mut Func, free_fn: &str, poison_fn: &str) -> (usize, usize) {
     let defs = defs(f);
     let (mut sites, mut fused) = (0usize, 0usize);
+    let mut looped: Vec<Option<bool>> = vec![None; f.blocks.len()];
     for bi in 0..f.blocks.len() {
         let mut ii = 0;
         while ii < f.blocks[bi].insts.len() {
@@ -105,6 +136,10 @@ fn rewrite(f: &mut Func, free_fn: &str, poison_fn: &str) -> (usize, usize) {
                 ii += 1;
                 continue;
             };
+            if !*looped[bi].get_or_insert_with(|| on_cycle(f, bi)) {
+                ii += 1;
+                continue;
+            }
             let mut kind = Drop::Keep;
             if let Some((j, k)) = drop_after(f, bi, ii, old, free_fn, poison_fn) {
                 f.blocks[bi].insts.remove(j);

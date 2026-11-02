@@ -363,7 +363,7 @@ fn cell_p_of(fl: &Flow, site: usize) -> Option<usize> {
 }
 
 fn self_append_old(cx: &Ctx, fl: &Flow, inst: &Inst) -> Option<Val> {
-    if std::env::var_os("FIRN_OWN_NO_APPEND").is_some() {
+    if std::env::var_os("FIRN_OWN_NO_APPEND").is_some() || std::env::var_os("FIRN_OWN_NO_APPEND_FREE").is_some() {
         return None;
     }
     let Op::Call { name, args } = &inst.op else { return None };
