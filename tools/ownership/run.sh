@@ -67,6 +67,9 @@ same_out fir_map_loop
 expect_rc fir_vec_freed on 0
 expect_rc fir_vec_freed strict 0
 expect_rc fir_vec_freed check 0
+expect_rc fir_child_vecret on 0
+expect_rc fir_child_vecret strict 0
+expect_rc fir_child_vecret check 0
 expect_rc fir_map_freed on 0
 expect_rc fir_map_freed strict 0
 expect_rc fir_map_freed check 0

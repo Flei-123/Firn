@@ -4,7 +4,7 @@ use super::prep::{Cache, Prep};
 use super::registry;
 use super::sites::Site;
 use crate::fir::{Func, Module};
-use crate::fx::{HashMap, HashSet};
+use crate::fx::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const MAX_INSTS: usize = 40000;
@@ -13,14 +13,14 @@ pub(crate) const MAX_SITE_WORK: usize = 200_000;
 pub(crate) struct Summaries {
     idx: HashMap<String, usize>,
     params: Vec<Vec<AtomicBool>>,
-    fresh: HashSet<String>,
+    fresh: HashMap<String, registry::Drop>,
 }
 
 impl Summaries {
     fn new(m: &Module) -> Summaries {
         let idx = m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
         let params = m.funcs.iter().map(|f| (0..f.params.len()).map(|_| AtomicBool::new(analyzable(f))).collect()).collect();
-        Summaries { idx, params, fresh: HashSet::default() }
+        Summaries { idx, params, fresh: HashMap::default() }
     }
 
     pub(super) fn store(&self, i: usize, new: &[bool]) -> bool {
@@ -53,7 +53,11 @@ impl Borrows for Summaries {
     }
 
     fn fresh(&self, name: &str) -> bool {
-        self.fresh.contains(name)
+        self.fresh.contains_key(name)
+    }
+
+    fn fresh_drop(&self, name: &str) -> registry::Drop {
+        self.fresh.get(name).copied().unwrap_or(registry::Drop::Block)
     }
 }
 
@@ -70,13 +74,32 @@ pub(super) fn param_borrows(f: &Func, p: &Prep, s: &Summaries) -> Vec<bool> {
     (0..f.params.len()).map(|i| !fl.escaped.get(1 + i) && !fl.ret_may.get(1 + i)).collect()
 }
 
-fn returns_fresh(f: &Func, p: &Prep, s: &Summaries) -> bool {
+fn returns_fresh(f: &Func, p: &Prep, s: &Summaries) -> Option<registry::Drop> {
     let fl = Flow::build(f, p, s, true);
     if fl.ret_derived || fl.ret_may.count() == 0 {
-        return false;
+        return None;
     }
-    let ok = fl.ret_may.iter().all(|b| b > fl.nparams && fl.sites[b - 1 - fl.nparams] == Site::Value && !fl.escaped.get(b));
-    ok
+    let (mut all_value, mut all_owner) = (true, true);
+    for b in fl.ret_may.iter() {
+        if b <= fl.nparams || fl.escaped.get(b) {
+            return None;
+        }
+        let k = b - 1 - fl.nparams;
+        let owner = fl.drops[k] == registry::Drop::SlotsOwner;
+        let value = fl.sites[k] == Site::Value;
+        if !value && !owner {
+            return None;
+        }
+        all_value &= value;
+        all_owner &= owner;
+    }
+    if all_owner {
+        Some(registry::Drop::SlotsOwner)
+    } else if all_value {
+        Some(registry::Drop::Block)
+    } else {
+        None
+    }
 }
 
 fn fresh_candidate(f: &Func) -> bool {
@@ -113,22 +136,32 @@ pub(crate) fn compute(m: &Module, base: &[usize], cache: &Cache) -> (Summaries, 
         }
         budget -= batch.len();
         batch.iter().for_each(|&i| queued[i] = false);
-        let cand: Vec<usize> = batch.into_iter().filter(|&i| !s.fresh.contains(&m.funcs[i].name)).collect();
+        let cand: Vec<usize> = batch.into_iter().filter(|&i| !s.fresh.contains_key(&m.funcs[i].name)).collect();
         fresh_evals += cand.len();
         let res = {
             let sr: &Summaries = &s;
             crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| {
                 let f = &m.funcs[i];
-                fresh_candidate(f) && returns_fresh(f, cache.get(m, i), sr)
+                if fresh_candidate(f) {
+                    returns_fresh(f, cache.get(m, i), sr)
+                } else {
+                    None
+                }
             })
         };
-        let newly: Vec<usize> = cand.iter().zip(res).filter(|(_, ok)| *ok).map(|(&i, _)| i).collect();
+        let newly: Vec<(usize, registry::Drop)> = cand.iter().zip(res).filter_map(|(&i, d)| d.map(|d| (i, d))).collect();
         if newly.is_empty() {
             continue;
         }
         let mut new: Vec<usize> = Vec::new();
+        let newly: Vec<usize> = newly
+            .into_iter()
+            .map(|(i, d)| {
+                s.fresh.insert(m.funcs[i].name.clone(), d);
+                i
+            })
+            .collect();
         for &i in newly.iter() {
-            s.fresh.insert(m.funcs[i].name.clone());
             for &c in g.callers[i].iter() {
                 if !is_root[c] {
                     is_root[c] = true;

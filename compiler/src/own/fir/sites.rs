@@ -50,7 +50,8 @@ pub(crate) fn find(f: &Func, ix: &Index, sl: &Slots, br: &dyn Borrows) -> Found 
                     _ => {
                         if let Some(d) = inst.dst {
                             if inst.ty.bytes() == 8 && (registry::is_gc_alloc(name) || br.fresh(name)) {
-                                defs.push(Def { val: d, at: (bi, ii), slow: true, drop: Drop::Block });
+                                let drop = if registry::is_gc_alloc(name) { Drop::Block } else { br.fresh_drop(name) };
+                                defs.push(Def { val: d, at: (bi, ii), slow: true, drop });
                             }
                         }
                     }

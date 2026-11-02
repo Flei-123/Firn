@@ -19,6 +19,9 @@ pub(crate) trait Borrows {
     fn fresh(&self, _name: &str) -> bool {
         false
     }
+    fn fresh_drop(&self, _name: &str) -> Drop {
+        Drop::Block
+    }
 }
 
 pub(crate) struct Flow {
