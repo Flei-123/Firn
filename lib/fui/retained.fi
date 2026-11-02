@@ -1,0 +1,239 @@
+import std.rt
+import paint.canvas
+import fui.gpu
+
+export { begin, end, abort, clear, hits, misses, held_bytes }
+
+const SLOTS: usize = 24
+const NONE: usize = 24
+const BUDGET: usize = 100663296
+const MAX_BYTES: usize = 16777216
+
+static mut S_KEY: [u64; 24] = [0; 24]
+static mut S_W: [usize; 24] = [0; 24]
+static mut S_H: [usize; 24] = [0; 24]
+static mut S_FULL: [bool; 24] = [false; 24]
+static mut S_USED: [u64; 24] = [0; 24]
+static mut S_MEM: [u64; 24] = [0; 24]
+static mut S_CAP: [usize; 24] = [0; 24]
+static mut S_TGT: [u64; 24] = [0; 24]
+static mut TICK: u64 = 0
+static mut HELD: usize = 0
+static mut PENDING: usize = 24
+static mut P_X: usize = 0
+static mut P_Y: usize = 0
+static mut HITS: u64 = 0
+static mut MISSES: u64 = 0
+
+fn hits() -> u64 { return HITS }
+fn misses() -> u64 { return MISSES }
+fn held_bytes() -> usize { return HELD }
+
+fn round_i(v: f64) -> i64 {
+    if v >= 0.0 { return (v + 0.5) as i64 }
+    return 0 - ((0.0 - v + 0.5) as i64)
+}
+
+fn release_mem(i: usize) {
+    if S_MEM[i] != 0 {
+        rt.heap_free(S_MEM[i], S_CAP[i])
+        HELD = HELD - S_CAP[i]
+    }
+    S_MEM[i] = 0
+    S_CAP[i] = 0
+}
+
+fn release(i: usize, g: *mut gpu.Gpu) {
+    release_mem(i)
+    if S_TGT[i] != 0 {
+        if g as u64 != 0 {
+            gpu.gpu_target_free(g, S_TGT[i] as *mut gpu.Target)
+        }
+        rt.heap_free(S_TGT[i], 64)
+        S_TGT[i] = 0
+    }
+    S_FULL[i] = false
+}
+
+fn clear(cv: *mut canvas.Canvas) {
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    var i: usize = 0
+    while i < SLOTS {
+        release(i, g)
+        i = i + 1
+    }
+    PENDING = NONE
+}
+
+fn find(key: u64, w: usize, h: usize) -> usize {
+    var i: usize = 0
+    while i < SLOTS {
+        if S_FULL[i] && S_KEY[i] == key && S_W[i] == w && S_H[i] == h {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn victim() -> usize {
+    var pick: usize = 0
+    var best: u64 = 18446744073709551615
+    var i: usize = 0
+    while i < SLOTS {
+        if !S_FULL[i] && S_MEM[i] == 0 && S_TGT[i] == 0 { return i }
+        if S_USED[i] < best {
+            best = S_USED[i]
+            pick = i
+        }
+        i = i + 1
+    }
+    return pick
+}
+
+fn evict_software(keep: usize, need: usize) {
+    while HELD + need > BUDGET {
+        var pick: usize = NONE
+        var best: u64 = 18446744073709551615
+        var j: usize = 0
+        while j < SLOTS {
+            if j != keep && S_MEM[j] != 0 && S_USED[j] < best {
+                best = S_USED[j]
+                pick = j
+            }
+            j = j + 1
+        }
+        if pick == NONE { return }
+        release_mem(pick)
+        S_FULL[pick] = false
+    }
+}
+
+fn copy_rows(cv: *mut canvas.Canvas, mem: u64, mw: usize, cx: usize, cy: usize, sx: usize, sy: usize, w: usize, h: usize, to_canvas: bool) {
+    let stride: usize = canvas.canvas_width(cv) * 4
+    let mstride: usize = mw * 4
+    let rb: usize = w * 4
+    var r: usize = 0
+    while r < h {
+        let p: u64 = (canvas.canvas_pixels(cv) as u64) + ((cy + r) * stride + cx * 4) as u64
+        let q: u64 = mem + ((sy + r) * mstride + sx * 4) as u64
+        if to_canvas { rt.mem_copy(p, q, rb) } else { rt.mem_copy(q, p, rb) }
+        r = r + 1
+    }
+}
+
+fn clip_band(cv: *mut canvas.Canvas, x: i64, y: i64, w: i64, h: i64, out: *mut i64) -> bool {
+    var x0: i64 = x
+    var y0: i64 = y
+    var x1: i64 = x + w
+    var y1: i64 = y + h
+    let kx0: i64 = round_i(canvas.clip_x0(cv) + 0.4999)
+    let ky0: i64 = round_i(canvas.clip_y0(cv) + 0.4999)
+    let kx1: i64 = round_i(canvas.clip_x1(cv) - 0.4999)
+    let ky1: i64 = round_i(canvas.clip_y1(cv) - 0.4999)
+    if x0 < kx0 { x0 = kx0 }
+    if y0 < ky0 { y0 = ky0 }
+    if x1 > kx1 { x1 = kx1 }
+    if y1 > ky1 { y1 = ky1 }
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > canvas.canvas_width(cv) as i64 { x1 = canvas.canvas_width(cv) as i64 }
+    if y1 > canvas.canvas_height(cv) as i64 { y1 = canvas.canvas_height(cv) as i64 }
+    *out = x0
+    *((out as u64 + 8) as *mut i64) = y0
+    *((out as u64 + 16) as *mut i64) = x1
+    *((out as u64 + 24) as *mut i64) = y1
+    return x1 > x0 && y1 > y0
+}
+
+fn blit(cv: *mut canvas.Canvas, i: usize, x: i64, y: i64) -> bool {
+    var b: [i64; 4] = [0; 4]
+    let w: i64 = S_W[i] as i64
+    let h: i64 = S_H[i] as i64
+    if !clip_band(cv, x, y, w, h, &b[0]) {
+        return true
+    }
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 {
+        if S_TGT[i] == 0 || !gpu.gpu_target_ok(g, S_TGT[i] as *mut gpu.Target) {
+            return false
+        }
+        gpu.gpu_copy(g, S_TGT[i] as *mut gpu.Target, (b[0] - x) as i32, (b[1] - y) as i32, (b[2] - b[0]) as i32, (b[3] - b[1]) as i32,
+            gpu.gpu_main(g), b[0] as i32, b[1] as i32)
+        return true
+    }
+    if S_MEM[i] == 0 || canvas.canvas_pixels(cv) as u64 == 0 {
+        return false
+    }
+    copy_rows(cv, S_MEM[i], S_W[i], b[0] as usize, b[1] as usize, (b[0] - x) as usize, (b[1] - y) as usize, (b[2] - b[0]) as usize, (b[3] - b[1]) as usize, true)
+    return true
+}
+
+fn begin(cv: *mut canvas.Canvas, key: u64, x: f64, y: f64, w: f64, h: f64) -> bool {
+    PENDING = NONE
+    let xi: i64 = round_i(x)
+    let yi: i64 = round_i(y)
+    let wi: i64 = round_i(w)
+    let hi: i64 = round_i(h)
+    if wi <= 0 || hi <= 0 || (wi * hi * 4) as usize > MAX_BYTES { return false }
+    let hit: usize = find(key, wi as usize, hi as usize)
+    TICK = TICK + 1
+    if hit != NONE {
+        S_USED[hit] = TICK
+        if blit(cv, hit, xi, yi) {
+            HITS = HITS + 1
+            return true
+        }
+        S_FULL[hit] = false
+    }
+    MISSES = MISSES + 1
+    var b: [i64; 4] = [0; 4]
+    let visible: bool = clip_band(cv, xi, yi, wi, hi, &b[0])
+    if !visible || b[0] != xi || b[1] != yi || b[2] != xi + wi || b[3] != yi + hi { return false }
+    if gpu.gpu_of(cv) as u64 == 0 && canvas.canvas_pixels(cv) as u64 == 0 { return false }
+    let i: usize = victim()
+    S_USED[i] = TICK
+    S_FULL[i] = false
+    S_KEY[i] = key
+    S_W[i] = wi as usize
+    S_H[i] = hi as usize
+    P_X = xi as usize
+    P_Y = yi as usize
+    PENDING = i
+    return false
+}
+
+fn abort() {
+    PENDING = NONE
+}
+
+fn end(cv: *mut canvas.Canvas) {
+    let i: usize = PENDING
+    if i >= SLOTS { return }
+    PENDING = NONE
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 {
+        release_mem(i)
+        if S_TGT[i] == 0 {
+            S_TGT[i] = rt.heap_alloc(64)
+            if S_TGT[i] == 0 { return }
+            *(S_TGT[i] as *mut gpu.Target) = gpu.target_new()
+        }
+        let t: *mut gpu.Target = S_TGT[i] as *mut gpu.Target
+        if !gpu.gpu_target_make(g, t, S_W[i] as i32, S_H[i] as i32) { return }
+        gpu.gpu_copy(g, gpu.gpu_main(g), P_X as i32, P_Y as i32, S_W[i] as i32, S_H[i] as i32, t, 0, 0)
+        S_FULL[i] = true
+        return
+    }
+    let need: usize = S_W[i] * S_H[i] * 4
+    if S_MEM[i] == 0 || S_CAP[i] != need {
+        release_mem(i)
+        evict_software(i, need)
+        S_MEM[i] = rt.heap_alloc(need)
+        if S_MEM[i] == 0 { return }
+        S_CAP[i] = need
+        HELD = HELD + need
+    }
+    copy_rows(cv, S_MEM[i], S_W[i], P_X, P_Y, 0, 0, S_W[i], S_H[i], false)
+    S_FULL[i] = true
+}
