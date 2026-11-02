@@ -216,6 +216,7 @@ const firnTag = document.currentScript;
         // THE FIELD THE KEYBOARD REALLY EDITS (lib/plat/web.fi web_edit_mode):
         // the text field holds the page's whole line and lies over its field
         firn_web_edit_mode(on, font, line, left, top, right) { editMode(on, font, line, left, top, right); },
+        firn_web_edit_wrap(on) { if (mirror) Object.assign(ta.style, on ? { whiteSpace: 'pre-wrap', overflowWrap: 'break-word' } : { whiteSpace: 'pre', overflowWrap: 'normal' }); },
         firn_web_edit_set(p, n, cur, anc, scroll) { editSet(str(p, n), cur, anc, scroll); },
         // THE SYSTEM CLIPBOARD (lib/plat/webclip.fi). Text through
         // writeText/readText, image/png and a page's own types through

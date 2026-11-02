@@ -1,0 +1,511 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.gcobj
+import fui.editor
+import fui.textbuf
+import fui.textarea
+import fui.widget
+import fui.style
+import fui.render
+import fui.painter
+import fui.screenanim
+import fui.theme
+
+const CAP: usize = 8192
+const UNDO_CAP: usize = 4096
+const PAD_X: usize = 12
+const PAD_Y_ONE: usize = 8
+const PAD_Y_AREA: usize = 10
+const RADIUS: usize = 8
+
+static mut G_READY: bool = false
+static mut S_ACT: u64 = 0
+static mut S_VIEW: u64 = 0
+static mut S_ACT_LINES: u64 = 0
+static mut S_VIEW_LINES: u64 = 0
+static mut G_OWNER: i64 = 0 - 1
+static mut G_MULTI: bool = false
+static mut G_BOX: [f64; 4] = [0.0; 4]
+static mut G_CLIP: [u8; 8192] = [0; 8192]
+static mut G_CLIP_N: usize = 0
+static mut G_CLIP_FRESH: bool = false
+
+fn scale(c: *mut render.Ctx) -> f64 {
+    return (theme.theme_scale(render.ctx_theme(c)) as f64) / 1000.0
+}
+
+fn act() -> *mut editor.Editor {
+    return S_ACT as *mut editor.Editor
+}
+
+fn view_ed() -> *mut editor.Editor {
+    return S_VIEW as *mut editor.Editor
+}
+
+fn act_lines() -> *mut textarea.Lines {
+    return S_ACT_LINES as *mut textarea.Lines
+}
+
+fn view_lines() -> *mut textarea.Lines {
+    return S_VIEW_LINES as *mut textarea.Lines
+}
+
+fn new_editor() -> *mut editor.Editor {
+    var probe: [editor.Editor; 2] = [editor.editor_new(), editor.editor_new()]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let e: *mut editor.Editor = gcobj.alloc[editor.Editor](sz) as *mut editor.Editor
+    *e = editor.editor_new()
+    let buf: u64 = rt.heap_alloc(CAP)
+    editor.editor_init_cap(e, buf, CAP, UNDO_CAP)
+    return e
+}
+
+fn new_lines() -> *mut textarea.Lines {
+    var probe: [textarea.Lines; 2] = [textarea.ta_new(), textarea.ta_new()]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let l: *mut textarea.Lines = gcobj.alloc[textarea.Lines](sz) as *mut textarea.Lines
+    *l = textarea.ta_new()
+    textarea.ta_init(l, 0)
+    return l
+}
+
+fn clip_read(p: u64, cap: usize) -> usize {
+    var n: usize = G_CLIP_N
+    if n > cap {
+        n = cap
+    }
+    rt.mem_copy(p, (&G_CLIP[0]) as u64, n)
+    return n
+}
+
+fn clip_write(p: u64, n: usize) -> bool {
+    var k: usize = n
+    if k > CAP {
+        k = CAP
+    }
+    rt.mem_copy((&G_CLIP[0]) as u64, p, k)
+    G_CLIP_N = k
+    G_CLIP_FRESH = true
+    return true
+}
+
+fn ensure() {
+    if G_READY {
+        return
+    }
+    S_ACT = new_editor() as u64
+    S_VIEW = new_editor() as u64
+    editor.editor_set_clipboard(act(), clip_read, clip_write)
+    S_ACT_LINES = new_lines() as u64
+    S_VIEW_LINES = new_lines() as u64
+    G_READY = true
+}
+
+fn make_widget(x: f64, y: f64, w: f64, h: f64, multi: bool, secret: bool,
+    focus: bool, k: f64) -> widget.Widget {
+    var e: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&e, x * k, y * k, w * k, h * k)
+    var st: style.Style = style.style_new()
+    var py: usize = PAD_Y_ONE
+    if multi {
+        py = PAD_Y_AREA
+    }
+    st = style.style_set_pad(st, PAD_X, py)
+    st = style.style_set_radius(st, RADIUS)
+    widget.w_set_style(&e, st)
+    widget.w_set_focus(&e, focus)
+    if secret {
+        widget.w_set_secret(&e, true)
+    }
+    return e
+}
+
+fn same_text(t: *mut textbuf.TextBuf, p: u64, n: usize) -> bool {
+    if textbuf.tb_len(t) != n {
+        return false
+    }
+    return rt.mem_eq(textbuf.tb_ptr(t), p, n)
+}
+
+fn bind(owner: i64, p: u64, n: usize, cur: usize, anc: usize, multi: bool,
+    secret: bool) {
+    ensure()
+    let t: *mut textbuf.TextBuf = editor.editor_buf(act())
+    let same: bool = owner == G_OWNER && same_text(t, p, n)
+    if !same {
+        textbuf.tb_set_text(t, p, n)
+        textbuf.tb_set_range(t, cur, anc)
+        G_OWNER = owner
+    }
+    G_MULTI = multi
+    editor.editor_set_multiline(act(), multi)
+    textbuf.tb_set_secret(t, secret)
+}
+
+fn release() {
+    G_OWNER = 0 - 1
+}
+
+fn out(dst: u64, cap: usize, cur: *mut usize, anc: *mut usize) -> usize {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(act())
+    var n: usize = textbuf.tb_len(t)
+    if n > cap {
+        n = cap
+    }
+    rt.mem_copy(dst, textbuf.tb_ptr(t), n)
+    *cur = textbuf.tb_caret(t)
+    *anc = textbuf.tb_anchor(t)
+    return n
+}
+
+fn overflow(cap: usize) -> bool {
+    return textbuf.tb_len(editor.editor_buf(act())) > cap
+}
+
+fn undo_overflow(cap: usize) {
+    if overflow(cap) {
+        editor.editor_undo(act())
+    }
+}
+
+fn key_code(p: u64, n: usize) -> u32 {
+    if eq(p, n, "ArrowLeft") {
+        return editor.KEY_LEFT
+    }
+    if eq(p, n, "ArrowRight") {
+        return editor.KEY_RIGHT
+    }
+    if eq(p, n, "ArrowUp") {
+        return editor.KEY_UP
+    }
+    if eq(p, n, "ArrowDown") {
+        return editor.KEY_DOWN
+    }
+    if eq(p, n, "Home") {
+        return editor.KEY_HOME
+    }
+    if eq(p, n, "End") {
+        return editor.KEY_END
+    }
+    if eq(p, n, "Backspace") {
+        return editor.KEY_BACKSPACE
+    }
+    if eq(p, n, "Delete") {
+        return editor.KEY_DELETE
+    }
+    if eq(p, n, "PageUp") {
+        return editor.KEY_PGUP
+    }
+    if eq(p, n, "PageDown") {
+        return editor.KEY_PGDN
+    }
+    return 0 as u32
+}
+
+fn eq(p: u64, n: usize, s: str) -> bool {
+    if n != s.n {
+        return false
+    }
+    return rt.mem_eq(p, s.p as u64, n)
+}
+
+fn mods_of(ctrl: bool, shift: bool, alt: bool) -> u32 {
+    var m: u32 = 0 as u32
+    if ctrl {
+        m = m | editor.MOD_CTRL
+    }
+    if shift {
+        m = m | editor.MOD_SHIFT
+    }
+    if alt {
+        m = m | editor.MOD_ALT
+    }
+    return m
+}
+
+fn key(p: u64, n: usize, ctrl: bool, shift: bool, alt: bool, cap: usize) -> u32 {
+    ensure()
+    let m: u32 = mods_of(ctrl, shift, alt)
+    var r: u32 = editor.RES_PASS
+    let code: u32 = key_code(p, n)
+    if code != 0 as u32 {
+        if G_MULTI {
+            r = textarea.ta_key(act_lines(), act(), code, m)
+        } else {
+            r = editor.editor_key(act(), code, m)
+        }
+    } else if ctrl && n == 1 {
+        var cp: u32 = rt.ld8(p, 0) as u32
+        if cp >= 65 as u32 && cp <= 90 as u32 {
+            cp = cp + 32 as u32
+        }
+        if G_MULTI {
+            r = textarea.ta_char(act_lines(), act(), cp, m)
+        } else {
+            r = editor.editor_char(act(), cp, m)
+        }
+    }
+    undo_overflow(cap)
+    return r
+}
+
+fn insert(p: u64, n: usize, cap: usize) -> bool {
+    ensure()
+    var tmp: [u8; 8192] = [0; 8192]
+    var k: usize = 0
+    var i: usize = 0
+    while i < n && k < CAP {
+        var cl: usize = 1
+        let c0: u8 = rt.ld8(p, i)
+        if c0 >= 240 as u8 {
+            cl = 4
+        } else if c0 >= 224 as u8 {
+            cl = 3
+        } else if c0 >= 192 as u8 {
+            cl = 2
+        }
+        if i + cl > n || k + cl > CAP {
+            break
+        }
+        var keep: bool = c0 >= 32 as u8
+        if c0 == 10 as u8 && G_MULTI {
+            keep = true
+        }
+        if c0 == 127 as u8 {
+            keep = false
+        }
+        if keep {
+            var j: usize = 0
+            while j < cl {
+                tmp[k + j] = rt.ld8(p, i + j)
+                j = j + 1
+            }
+            k = k + cl
+        }
+        i = i + cl
+    }
+    if k == 0 {
+        return false
+    }
+    let t: *mut textbuf.TextBuf = editor.editor_buf(act())
+    var room: usize = cap
+    let used: usize = textbuf.tb_len(t)
+    var sel: usize = 0
+    if textbuf.tb_has_sel(t) {
+        sel = textbuf.tb_sel_b(t) - textbuf.tb_sel_a(t)
+    }
+    if used - sel >= room {
+        return false
+    }
+    room = room - (used - sel)
+    var take: usize = k
+    if take > room {
+        take = room
+        while take > 0 && (tmp[take] & 192 as u8) == 128 as u8 {
+            take = take - 1
+        }
+    }
+    if take == 0 {
+        return false
+    }
+    editor.editor_push_undo(act(), take <= 4)
+    return textbuf.tb_insert(t, (&tmp[0]) as u64, take)
+}
+
+fn box_set(x: f64, y: f64, w: f64, h: f64) {
+    G_BOX[0] = x
+    G_BOX[1] = y
+    G_BOX[2] = w
+    G_BOX[3] = h
+}
+
+fn press(c: *mut render.Ctx, x: f64, y: f64, shift: bool, now_us: u64,
+    secret: bool) -> u32 {
+    ensure()
+    let k: f64 = scale(c)
+    var e: widget.Widget = make_widget(G_BOX[0], G_BOX[1], G_BOX[2], G_BOX[3],
+        G_MULTI, secret, true, k)
+    let px: f64 = x * k
+    let py: f64 = y * k
+    if G_MULTI {
+        let ox: f64 = render.field_text_x0(c, &e)
+        let oy: f64 = widget.w_y(&e) + render.pady_of(c, &e)
+        return textarea.ta_mouse_down(act_lines(), act(), px - ox, py - oy,
+            now_us, shift)
+    }
+    var fm: render.FieldMeas = render.field_meas_new(c, &e)
+    return editor.editor_mouse_down(act(), px - render.field_text_x0(c, &e),
+        now_us, render.field_meas, (&fm) as u64, shift)
+}
+
+fn drag(c: *mut render.Ctx, x: f64, y: f64, secret: bool) -> u32 {
+    ensure()
+    let k: f64 = scale(c)
+    var e: widget.Widget = make_widget(G_BOX[0], G_BOX[1], G_BOX[2], G_BOX[3],
+        G_MULTI, secret, true, k)
+    let px: f64 = x * k
+    let py: f64 = y * k
+    if G_MULTI {
+        let ox: f64 = render.field_text_x0(c, &e)
+        let oy: f64 = widget.w_y(&e) + render.pady_of(c, &e)
+        return textarea.ta_mouse_drag(act_lines(), act(), px - ox, py - oy)
+    }
+    var fm: render.FieldMeas = render.field_meas_new(c, &e)
+    return editor.editor_mouse_drag(act(), px - render.field_text_x0(c, &e),
+        render.field_meas, (&fm) as u64)
+}
+
+fn release_mouse() {
+    ensure()
+    editor.editor_mouse_up(act())
+}
+
+fn dragging() -> bool {
+    ensure()
+    return textbuf.tb_drag(editor.editor_buf(act())) != 0 as u32
+}
+
+fn paint_active(c: *mut render.Ctx, ox: f64, x: f64, y: f64, w: f64, h: f64,
+    multi: bool, secret: bool) {
+    ensure()
+    box_set(x, y, w, h)
+    let k: f64 = scale(c)
+    var e: widget.Widget = make_widget(x + ox, y, w, h, multi, secret, true, k)
+    if multi {
+        let on: bool = screenanim.caret_on(c, act(), true)
+        textarea.ta_draw(c, &e, act(), act_lines(), on)
+        return
+    }
+    render.draw_textfield(c, &e, act(), screenanim.caret_on(c, act(), true))
+}
+
+fn paint_idle(c: *mut render.Ctx, ox: f64, x: f64, y: f64, w: f64, h: f64, p: u64,
+    n: usize, multi: bool, secret: bool) {
+    ensure()
+    let t: *mut textbuf.TextBuf = editor.editor_buf(view_ed())
+    textbuf.tb_set_text(t, p, n)
+    textbuf.tb_set_range(t, 0, 0)
+    textbuf.tb_set_secret(t, secret)
+    editor.editor_set_multiline(view_ed(), multi)
+    let k: f64 = scale(c)
+    var e: widget.Widget = make_widget(x + ox, y, w, h, multi, secret, false, k)
+    if multi {
+        textarea.ta_draw(c, &e, view_ed(), view_lines(), false)
+        return
+    }
+    render.draw_textfield(c, &e, view_ed(), false)
+}
+
+fn caret_due_ms() -> f64 {
+    if !G_READY || G_OWNER < 0 {
+        return 0.0
+    }
+    return (editor.editor_caret_due_us(act()) as f64) / 1000.0
+}
+
+fn wake() {
+    ensure()
+    editor.editor_caret_wake(act())
+}
+
+fn clip_ptr() -> u64 {
+    return (&G_CLIP[0]) as u64
+}
+
+fn clip_len() -> usize {
+    return G_CLIP_N
+}
+
+fn clip_fresh() -> bool {
+    return G_CLIP_FRESH
+}
+
+fn clip_sent(by_system: bool) {
+    G_CLIP_FRESH = false
+    if by_system {
+        G_CLIP_N = 0
+    }
+}
+
+fn text_ptr() -> u64 {
+    ensure()
+    return textbuf.tb_ptr(editor.editor_buf(act()))
+}
+
+fn text_len() -> usize {
+    ensure()
+    return textbuf.tb_len(editor.editor_buf(act()))
+}
+
+fn caret() -> usize {
+    ensure()
+    return textbuf.tb_caret(editor.editor_buf(act()))
+}
+
+fn anchor() -> usize {
+    ensure()
+    return textbuf.tb_anchor(editor.editor_buf(act()))
+}
+
+fn replace(p: u64, n: usize, cur: usize, anc: usize, cap: usize) -> usize {
+    ensure()
+    var k: usize = n
+    if k > cap {
+        k = cap
+    }
+    if k > CAP {
+        k = CAP
+    }
+    if !G_MULTI {
+        var i: usize = 0
+        while i < k {
+            if rt.ld8(p, i) == 10 as u8 {
+                k = i
+            }
+            i = i + 1
+        }
+    }
+    while k > 0 && k < n && (rt.ld8(p, k) & 192 as u8) == 128 as u8 {
+        k = k - 1
+    }
+    let t: *mut textbuf.TextBuf = editor.editor_buf(act())
+    var c0: usize = cur
+    var a0: usize = anc
+    if c0 > k {
+        c0 = k
+    }
+    if a0 > k {
+        a0 = k
+    }
+    if same_text(t, p, k) {
+        textbuf.tb_set_range(t, c0, a0)
+        return k
+    }
+    editor.editor_push_undo(act(), false)
+    textbuf.tb_set_text(t, p, k)
+    textbuf.tb_set_range(t, c0, a0)
+    return k
+}
+
+fn mirror_geom(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, multi: bool,
+    secret: bool, out: *mut f64) {
+    let k: f64 = scale(c)
+    var e: widget.Widget = make_widget(0.0, 0.0, w, h, multi, secret, true, k)
+    let px: f64 = render.field_px(c, &e)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let lh: f64 = painter.font_ascent(z, px) + painter.font_descent(z, px)
+    var top: f64 = (h - lh / k) / 2.0
+    if multi {
+        top = render.pady_of(c, &e) / k
+    }
+    *out = x
+    *((out as u64 + 8) as *mut f64) = y
+    *((out as u64 + 16) as *mut f64) = w
+    *((out as u64 + 24) as *mut f64) = h
+    *((out as u64 + 32) as *mut f64) = render.field_text_x0(c, &e) / k
+    *((out as u64 + 40) as *mut f64) = top
+    *((out as u64 + 48) as *mut f64) = render.field_text_x0(c, &e) / k
+    *((out as u64 + 56) as *mut f64) = 0.0
+    *((out as u64 + 64) as *mut f64) = px / k
+    *((out as u64 + 72) as *mut f64) = lh / k
+}
