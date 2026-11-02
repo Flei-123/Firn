@@ -103,6 +103,7 @@ pub(crate) fn root_names() -> Vec<String> {
     let mut v: Vec<String> = PRODUCERS.iter().map(|p| p.name.to_string()).collect();
     v.extend(RENAMES.iter().map(|(from, _)| from.to_string()));
     v.push(REUSE_ALLOC.to_string());
+    v.push(super::append::APPEND.to_string());
     for (_, free, poison) in DROP_FNS.iter() {
         v.push(free.to_string());
         v.push(poison.to_string());

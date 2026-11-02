@@ -49,6 +49,13 @@ same_out fir_str_param
 same_out fir_str_ret
 same_out fir_str_escape
 same_out fir_str_escape_novec
+same_out fir_str_append_loop
+same_out fir_str_append_alias
+same_out fir_str_append_cap
+expect_rc fir_str_append_count on 0
+expect_rc fir_str_append_count strict 0
+expect_rc fir_str_append_count check 0
+FIRN_OWN_NO_APPEND=1 same_out fir_str_append_alias
 expect_rc fir_str_freed on 0
 expect_rc fir_str_freed strict 0
 expect_rc fir_str_freed check 0

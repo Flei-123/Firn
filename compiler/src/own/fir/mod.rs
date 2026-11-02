@@ -1,3 +1,4 @@
+pub(crate) mod append;
 pub(crate) mod bits;
 pub(crate) mod borrow;
 pub(crate) mod flow;
@@ -61,6 +62,11 @@ pub(crate) fn run(m: &mut Module) {
     if !m.funcs.iter().any(|f| f.name == free_fn) {
         return;
     }
+    run_frees(m, mode, free_fn);
+    append::run(m, registry::drop_fn(registry::Drop::Block, super::Mode::On), registry::drop_fn(registry::Drop::Block, super::Mode::Check));
+}
+
+fn run_frees(m: &mut Module, mode: super::Mode, free_fn: &'static str) {
     let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
     let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
     let tree_fn = registry::drop_fn(registry::Drop::Tree, mode);
