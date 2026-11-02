@@ -71,7 +71,7 @@ if [ ! -x "$FIRNC" ]; then
     echo "firnc0 is missing: $FIRNC"
     exit 1
 fi
-"$FIRNC" -o "$W/soak0" "$SRC" 2>"$W/e0" || { cat "$W/e0"; echo "firnc0 could not translate the endurance run"; exit 1; }
+"$FIRNC" --ownership=off -o "$W/soak0" "$SRC" 2>"$W/e0" || { cat "$W/e0"; echo "firnc0 could not translate the endurance run"; exit 1; }
 run_pair "firnc0" "$W/soak0"
 
 # The same program through the self-hosting compiler.
