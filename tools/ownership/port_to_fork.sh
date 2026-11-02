@@ -12,6 +12,9 @@ python3 -I "$SRC/tools/ownership/fork_downgrade.py" "$DST/compiler/src/own"
 if ! grep -q "inline_requested_tracked" "$DST/compiler/src/inline.rs"; then
   (cd "$DST" && patch -p1 < "$SRC/tools/ownership/fork_hooks.patch")
 fi
+if ! grep -q 'name: "no_inline"' "$DST/compiler/src/attrs.rs"; then
+  (cd "$DST" && patch -p1 < "$SRC/tools/ownership/fork_inline_attr.patch")
+fi
 if [ ! -e "$DST/compiler/src/parfn.rs" ]; then
   cp "$SRC/tools/ownership/fork_parfn.rs" "$DST/compiler/src/parfn.rs"
   sed -i '0,/^mod fx;/s//mod fx;\nmod parfn;/' "$DST/compiler/src/main.rs"

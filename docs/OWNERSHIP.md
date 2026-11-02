@@ -189,3 +189,9 @@ Expected gain (estimates, to be checked by B4): OpenPlan derive -5 to -10 % inst
 8. Swift ARC optimization notes — https://fuchsia.googlesource.com/third_party/swift/+/refs/tags/swift-2.2.1-RELEASE/docs/ARCOptimization.rst
 9. Swift SIL Ownership (OSSA) — https://sources.debian.org/src/swiftlang/6.2.3-1/swift/docs/SIL/Ownership.md
 10. Mojo manual, death of a value — https://docs.modular.com/mojo/manual/lifecycle/death
+
+## Certus fork port (patch 0041)
+
+- `tools/ownership/port_to_fork.sh <fork worktree>` copies `compiler/src/own/` (incl. `fir/tree.rs`, `returns_fresh` slots owner, deep-borrow 8-byte loads) and applies `fork_hooks.patch`, `fork_inline_attr.patch` (`#[inline]` / `#[no_inline]` attributes) and the parfn / use-mut helpers.
+- The fork has no `gc_track` and its parser rejects `mod.fn[T](..)` calls: run `run.sh` with `OWN_FORK=1 OWN_NO_CACHE= OWN_SKIP="fir_str_param fir_str_escape fir_tree_rawcopy fir_tree_structcopy"` and the fuzzer with `OWN_NO_RAW=1 OWN_NO_CACHE=`.
+- `--ownership=check` poisons freed blocks and aborts when a conservative stack word of another thread still points at one: `fir_tree_threads` therefore compares only `on` and `strict` against `off`.

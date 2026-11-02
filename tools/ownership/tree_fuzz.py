@@ -8,6 +8,9 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
+NO_CACHE = os.environ.get("OWN_NO_CACHE", "--no-cache").split()
+NO_RAW = bool(os.environ.get("OWN_NO_RAW"))
+
 PRELUDE = """import std.io
 import std.gcobj
 
@@ -127,7 +130,8 @@ class Gen:
         if c == 11:
             return [f"total = total + sum_lim(build({r.randrange(4)}, i + {r.randrange(9)}), 7)"]
         if c == 12:
-            return [f"total = total + sum_lim((*rr).a, 7) + gcvec_length(vs)"]
+            raw_part = "0" if NO_RAW else "sum_lim((*rr).a, 7)"
+            return [f"total = total + {raw_part} + gcvec_length(vs)"]
         if depth < 2:
             body = []
             for _ in range(r.randrange(1, 4)):
@@ -154,8 +158,8 @@ class Gen:
 
     def program(self):
         r = self.r
-        picks = r.sample(sorted(HELPERS), r.randrange(2, 7))
-        src = [PRELUDE]
+        picks = r.sample(sorted(k for k in HELPERS if not (NO_RAW and k == "raw")), r.randrange(2, 7))
+        src = [PRELUDE.replace("import std.gcobj\n", "") if NO_RAW else PRELUDE]
         for k in picks:
             text, kind = HELPERS[k]
             name = f"h_{k}"
@@ -171,19 +175,23 @@ class Gen:
             main.append(f"    let h{k}: Gc[Holder] = holder()")
         main += [
             "    let vs: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()",
-            "    let rp: *mut u64 = gcobj.alloc[Raw](size_of[Raw]()) as *mut u64",
-            "    let rr: *mut Raw = rp as *mut Raw",
-            "    if rp as u64 == 0 {",
-            "        return 4",
-            "    }",
         ]
+        if not NO_RAW:
+            main += [
+                "    let rp: *mut u64 = gcobj.alloc[Raw](size_of[Raw]()) as *mut u64",
+                "    let rr: *mut Raw = rp as *mut Raw",
+                "    if rp as u64 == 0 {",
+                "        return 4",
+                "    }",
+            ]
         for k in range(TREES):
             main.append(f"    var t{k}: Gc[Node] = build({r.randrange(4)}, {k})")
         main += ["    var total: u64 = 0", "    var i: u64 = 0", f"    while i < {iters} {{"]
         main += ["        " + s for s in body]
         main += ["        i = i + 1", "    }", "    gc_collect()"]
         tail = " + ".join([f"sum_lim(t{k}, 7)" for k in range(TREES)] + [f"sum_lim(h{k}.keep, 7)" for k in range(HOLDERS)])
-        main.append(f"    total = total + {tail} + sum_lim((*rr).a, 7)")
+        raw_tail = "0" if NO_RAW else "sum_lim((*rr).a, 7)"
+        main.append(f"    total = total + {tail} + {raw_tail}")
         main.append("    var k: u64 = 0")
         main.append("    while k < gcvec_length(vs) {")
         main.append("        total = total + sum_lim(gcvec_read[Node](vs, k), 7)")
@@ -210,7 +218,7 @@ def run_one(args, seed):
         for mode, extra in VARIANTS:
             env = dict(os.environ, FIRNLIB=args.lib, FIRN_OWN_TRACE="1", **extra)
             exe = os.path.join(d, f"b_{mode}_{len(results)}")
-            c = subprocess.run([args.firnc, "--no-cache", f"--ownership={mode}", p, "-o", exe], env=env, capture_output=True, text=True, timeout=300)
+            c = subprocess.run([args.firnc, *NO_CACHE, f"--ownership={mode}", p, "-o", exe], env=env, capture_output=True, text=True, timeout=300)
             if c.returncode != 0:
                 return seed, "build", f"{mode} {extra}: {c.stderr[:400]}", src, 0
             trees += sum(1 for l in c.stderr.splitlines() if " tree drops " in l and not l.startswith("ownership fir: build "))

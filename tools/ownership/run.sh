@@ -24,11 +24,12 @@ expect_rc() {
 same_out() {
   case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
   local ref=""
-  for m in off on check strict; do
+  local modes="${SAME_MODES:-on check strict}"
+  for m in off $modes; do
     build "$1" "$m" || return
     run "$1" "$m" > /dev/null
   done
-  for m in on check strict; do
+  for m in $modes; do
     if cmp -s "$D/$1_off.out" "$D/$1_$m.out"; then pass=$((pass + 1)); else echo "FAIL $1: output $m differs from off"; fail=$((fail + 1)); fi
   done
 }
@@ -109,8 +110,8 @@ same_out fir_tree_calls
 FIRN_OWN_NO_AST=1 same_out fir_tree_calls
 same_out fir_tree_swap
 FIRN_OWN_NO_AST=1 same_out fir_tree_swap
-same_out fir_tree_threads
-FIRN_OWN_NO_AST=1 same_out fir_tree_threads
+SAME_MODES="on strict" same_out fir_tree_threads
+SAME_MODES="on strict" FIRN_OWN_NO_AST=1 same_out fir_tree_threads
 same_out fir_mt_loop
 same_out fir_vec_cycle
 expect_rc strict_trip on 0
