@@ -129,6 +129,12 @@ Like `escape.rs`: decidable cases are decided, everything else is `unknown` = GC
 - Short results (`n < OWN_APPEND_MIN` = 128 bytes) take a plain exact-size copy and never create a buffer: in OpenPlan derive 75000 of 169000 appends start from an empty string and are not appended again, so buffers there cost more than they save. Sites that were an unrenamed `__str_concat` carry flag bit 4: with an empty first part and one non-empty part the call returns that part unchanged, like `__str_concat` itself (no allocation).
 - Measured 02.11. (r1360): OpenPlan derive 300 Ir 5621.3 M vs 5608.6 M with `FIRN_OWN_NO_APPEND` (+0.23 %), md5 identical; strbench 173 M (NO_APPEND 3471 M, off 6810 M). The earlier +1.1 % was the buffer-allocation path for short strings (not GC budget).
 
+### Loop-carried frees (r1358, analysis 02.11., not implemented)
+- Case `tools/ownership/cases/fir_loop_carried.fi` (`p = q` and `p = step(p)` in loops): 12 frees at 14 sites, but `gc_own_freed()` stays far below the iteration count: the old `p` is never freed in the loop.
+- Cause: liveness and `must` are per seed (allocation site). The header phi `O = phi(entry, back)` and the fresh result `q` of the same site share one seed, so after the last use of `O` the seed is still carried by `q` (`carried` stays true). In addition `O` mixes the entry seed S0 and the loop seed S1 (`must(O)` is `None`), so no handle qualifies.
+- Needed (sound) design: split every Value site into a new generation and an old generation. Phi operands and cell states that cross a retreating edge turn `S` into `S_old`. Seeds that meet in one value or cell (S0 and `S_old`) are merged into a class and analysed together: items are all values/cells whose `may` intersects the class, a handle needs `may` inside the class, escape and return are OR-ed over the class. Free sites then carry one representative site, and reuse needs the same compile-time size class for every member.
+- Touch points: `flow.rs` (extra seeds, aging in phi and cell join), `live.rs` (class mask instead of one seed), `summary.rs`/`tree.rs` (`b - 1 - np` seed to site mapping must fold old seeds back), `reuse.rs` (class size for merged members). Not started because the seed-index mapping is used in many places and the strict gates need more than the time box.
+
 ### 4.3 Transformations
 
 - **A — ASAP free of temporaries**: `owned` value dead after its last use -> `__gc_free_block(p)`. First target: `str` temporaries of concat chains and of formatting, GcVec temporaries.

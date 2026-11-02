@@ -114,6 +114,7 @@ for c in fir_reuse_obj_loop fir_reuse_closure fir_reuse_mixed fir_reuse_quiet_ca
   has_reuse "$c"
 done
 same_out fir_reuse_pairs
+same_out fir_loop_carried
 quiet_gain fir_reuse_quiet_call
 same_out fir_tree_shared
 FIRN_OWN_NO_AST=1 same_out fir_tree_shared
