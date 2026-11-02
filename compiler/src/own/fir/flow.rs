@@ -34,6 +34,21 @@ pub(crate) trait Borrows {
 pub(crate) enum Mode {
     Plain,
     Deep,
+    DeepPtr,
+}
+
+impl Mode {
+    fn deep(self) -> bool {
+        self != Mode::Plain
+    }
+
+    fn deep_load(self, ty: crate::fir::FTy) -> bool {
+        match self {
+            Mode::Plain => false,
+            Mode::Deep => ty.bytes() == 8,
+            Mode::DeepPtr => ty == crate::fir::FTy::Ptr,
+        }
+    }
 }
 
 pub(crate) struct Flow {
@@ -127,7 +142,7 @@ impl Flow {
             fl.may[i].set(1 + i);
         }
         let entry = ix.rpo.first().copied().unwrap_or(0);
-        let deps = pr.users(f, owners || mode == Mode::Deep);
+        let deps = pr.users(f, owners || mode.deep());
         let mut dirty = vec![true; f.blocks.len()];
         let mut cout: Vec<Option<Vec<CellVal>>> = vec![None; f.blocks.len()];
         let mut rounds = 0;
@@ -322,7 +337,7 @@ impl Flow {
                 None => {
                     acc.assign(&self.other_bits);
                     der |= self.owner_field_load(*addr, inst.ty.bytes(), &mut acc);
-                    if self.mode == Mode::Deep && inst.ty == crate::fir::FTy::Ptr {
+                    if self.mode.deep_load(inst.ty) {
                         der |= self.param_bits_into(*addr, &mut acc);
                     }
                 }
@@ -346,7 +361,7 @@ impl Flow {
                     } else {
                         self.sink(*val);
                     }
-                    if self.mode == Mode::Deep {
+                    if self.mode.deep() {
                         let mut a = self.scratch_params();
                         self.param_bits_into(*addr, &mut a);
                         self.escaped.union(&a);
@@ -364,7 +379,7 @@ impl Flow {
                     }
                 }
                 for (k, v) in args.iter().enumerate() {
-                    if (pair && k == 0) || (self.mode == Mode::Plain && br.borrows(name, k)) || (self.mode == Mode::Deep && br.deep_borrows(name, k)) {
+                    if (pair && k == 0) || (self.mode == Mode::Plain && br.borrows(name, k)) || (self.mode.deep() && br.deep_borrows(name, k)) {
                         continue;
                     }
                     self.sink(*v);

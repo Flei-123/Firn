@@ -95,6 +95,22 @@ for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; d
   same_out "$c"
   has_reuse "$c"
 done
+same_out fir_tree_shared
+FIRN_OWN_NO_AST=1 same_out fir_tree_shared
+same_out fir_tree_after
+FIRN_OWN_NO_AST=1 same_out fir_tree_after
+same_out fir_tree_structcopy
+FIRN_OWN_NO_AST=1 same_out fir_tree_structcopy
+same_out fir_tree_rawcopy
+FIRN_OWN_NO_AST=1 same_out fir_tree_rawcopy
+same_out fir_tree_cycle
+FIRN_OWN_NO_AST=1 same_out fir_tree_cycle
+same_out fir_tree_calls
+FIRN_OWN_NO_AST=1 same_out fir_tree_calls
+same_out fir_tree_swap
+FIRN_OWN_NO_AST=1 same_out fir_tree_swap
+same_out fir_tree_threads
+FIRN_OWN_NO_AST=1 same_out fir_tree_threads
 same_out fir_mt_loop
 same_out fir_vec_cycle
 expect_rc strict_trip on 0

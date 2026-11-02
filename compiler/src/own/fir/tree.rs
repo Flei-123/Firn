@@ -105,8 +105,13 @@ fn deep(m: &Module, cache: &Cache, s: &mut Summaries) {
 
 fn deep_params(f: &Func, p: &Prep, s: &Summaries) -> Vec<bool> {
     let cur = s.deep.get(&f.name).cloned().unwrap_or_default();
+    if !cur.iter().any(|b| *b) {
+        return cur;
+    }
     let fl = Flow::build_with(f, p, s, false, Mode::Deep, &[]);
-    (0..f.params.len()).map(|i| cur.get(i).copied().unwrap_or(false) && !fl.escaped.get(1 + i) && !fl.ret_may.get(1 + i)).collect()
+    let narrow = (f.ret != FTy::Ptr).then(|| Flow::build_with(f, p, s, false, Mode::DeepPtr, &[]));
+    let ret = narrow.as_ref().map_or(&fl.ret_may, |n| &n.ret_may);
+    (0..f.params.len()).map(|i| cur.get(i).copied().unwrap_or(false) && !fl.escaped.get(1 + i) && !ret.get(1 + i)).collect()
 }
 
 fn site_defs_ok(f: &Func, fl: &Flow, k: usize, ok: &dyn Fn(&Op) -> bool) -> bool {
@@ -259,6 +264,9 @@ pub(crate) fn mark(f: &Func, p: &Prep, fl: &mut Flow, s: &dyn Borrows) -> usize 
             fl.drops[k] = Drop::Tree;
             n += 1;
         }
+    }
+    if n > 0 && std::env::var_os("FIRN_OWN_TRACE").is_some() {
+        eprintln!("ownership fir: {} tree drops {}", f.name, n);
     }
     n
 }
