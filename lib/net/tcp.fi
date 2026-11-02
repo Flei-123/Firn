@@ -33,8 +33,6 @@ profile kernel
 // and an orderly teardown in both directions.
 //
 // WHAT IS NOT IN HERE is listed in docs/OSUM-K3.md and not glossed over
-// here: no window scaling, no timestamps, no SACK, no PAWS, no urgent
-// data, no reassembly of IP fragments, no path MTU discovery.
 
 import net.wire
 
@@ -49,11 +47,14 @@ export {
     tcp_send, tcp_recv, tcp_readable, tcp_writable, tcp_state, tcp_error,
     tcp_input, tcp_pull, tcp_timers, tcp_free_slot,
     tcp_set_nodelay, tcp_set_time_wait, tcp_set_rto_min, tcp_set_no_rexmit,
+    tcp_set_wscale, tcp_set_ts, tcp_set_sack, tcp_icmp_toobig,
     tcp_seen, tcp_force_iss,
     tcp_peer_ip, tcp_peer_port, tcp_local_port,
     tcp_stat, tcp_dbg,
     ST_RX, ST_TX, ST_REXMIT, ST_CSUM, ST_UNACCEPTABLE, ST_OOO, ST_RST_TX,
     ST_BAD_ACK, ST_FAST_REXMIT, ST_PROBE, ST_DELACK, ST_DUPACK,
+    ST_PAWS, ST_SACK_RX, ST_SACK_TX, ST_REXMIT_SACK, ST_MTU_DOWN, ST_TW_REUSE,
+    ST_KEEPALIVE, ST_KA_DEAD, tcp_set_keepalive, tcp_keepalive_get,
 }
 
 // ===================================================================
@@ -72,9 +73,9 @@ export {
 // other and named in one place.
 const MAXCONN: usize = 8
 const SND_CAP: usize = 65536
-const RCV_CAP: usize = 65536
+const RCV_CAP: usize = 262144
 const SND_MASK: u32 = 65535
-const RCV_MASK: u32 = 65535
+const RCV_MASK: u32 = 262143
 const OOO_MAX: usize = 8
 const RST_SLOTS: usize = 4
 const MSS_DEFAULT: u32 = 1460
@@ -89,6 +90,15 @@ const FIN_WAIT_2_US: u64 = 60000000
 const PERSIST_MIN: u64 = 200000
 const PERSIST_MAX: u64 = 5000000
 const MAX_SHIFT: u32 = 12
+
+const WS_SELF: u8 = 2
+const WS_NONE: u8 = 255
+
+const PAWS_WINDOW: u32 = 2147483648
+
+const SACK_MAX: usize = 4
+
+const MTU_FLOOR: u32 = 576
 
 const S_CLOSED: u32 = 0
 const S_LISTEN: u32 = 1
@@ -121,7 +131,15 @@ const ST_FAST_REXMIT: u32 = 8
 const ST_PROBE: u32 = 9
 const ST_DELACK: u32 = 10
 const ST_DUPACK: u32 = 11
-const ST_COUNT: usize = 12
+const ST_PAWS: u32 = 12
+const ST_SACK_RX: u32 = 13
+const ST_SACK_TX: u32 = 14
+const ST_REXMIT_SACK: u32 = 15
+const ST_MTU_DOWN: u32 = 16
+const ST_TW_REUSE: u32 = 17
+const ST_KEEPALIVE: u32 = 18
+const ST_KA_DEAD: u32 = 19
+const ST_COUNT: usize = 20
 
 // ===================================================================
 // 2. the state of one connection
@@ -170,6 +188,31 @@ struct Tcb {
     ooo_hi: [u32; 8],
     ooo_n: usize,
 
+    ws_ok: u32,
+    snd_ws: u32,
+    rcv_ws: u32,
+
+    ts_ok: u32,
+    ts_recent: u32,
+    ts_recent_at: u64,
+    ts_lastack: u32,
+
+    sack_ok: u32,
+    sack_lo: [u32; 4],
+    sack_hi: [u32; 4],
+    sack_n: usize,
+    rexmit_ptr: u32,
+    in_recovery: u32,
+    recover: u32,
+
+    ka_on: u32,
+    ka_cnt: u32,
+    ka_sent: u32,
+    ka_idle: u64,
+    ka_intvl: u64,
+    ka_last: u64,
+    ka_at: u64,
+
     // congestion control and the round trip time
     mss: u32,
     cwnd: u32,
@@ -204,7 +247,7 @@ struct Tcb {
     err: i32,
 
     snd_buf: [u8; 65536],
-    rcv_buf: [u8; 65536],
+    rcv_buf: [u8; 262144],
 }
 
 struct Tcp {
@@ -223,7 +266,7 @@ struct Tcp {
     rst_ack: [u32; 4],
     rst_flags: [u8; 4],
 
-    stat: [u64; 12],
+    stat: [u64; 20],
 
     // Every state any connection of this stack has ever ENTERED, one
     // bit per state. A claim that a state machine has eleven states is
@@ -233,6 +276,11 @@ struct Tcp {
     time_wait_us: u64,
     rto_min: u64,
     no_rexmit: u32,
+
+    use_ws: u32,
+    use_ts: u32,
+    use_sack: u32,
+    ts_base: u64,
 }
 
 fn tcb(t: *mut Tcp, i: usize) -> *mut Tcb {
@@ -287,6 +335,18 @@ fn tcp_init(t: *mut Tcp, seed: u64) {
     (*t).time_wait_us = TIME_WAIT_US
     (*t).rto_min = RTO_MIN
     (*t).no_rexmit = 0
+    (*t).use_ws = 1
+    (*t).use_ts = 1
+    (*t).use_sack = 1
+    (*t).ts_base = seed
+}
+
+fn tcp_set_wscale(t: *mut Tcp, on: u32) { (*t).use_ws = on }
+fn tcp_set_ts(t: *mut Tcp, on: u32) { (*t).use_ts = on }
+fn tcp_set_sack(t: *mut Tcp, on: u32) { (*t).use_sack = on }
+
+fn ts_now(t: *mut Tcp, now: u64) -> u32 {
+    return (((now +% (*t).ts_base) >> 10) & 0xFFFFFFFF) as u32
 }
 
 fn clear(c: *mut Tcb) {
@@ -339,6 +399,31 @@ fn clear(c: *mut Tcb) {
     (*c).persist_on = 0
     (*c).reset_req = 0
     (*c).err = E_NONE
+    (*c).ws_ok = 0
+    (*c).snd_ws = 0
+    (*c).rcv_ws = 0
+    (*c).ts_ok = 0
+    (*c).ts_recent = 0
+    (*c).ts_recent_at = 0
+    (*c).ts_lastack = 0
+    (*c).sack_ok = 0
+    (*c).sack_n = 0
+    var q: usize = 0
+    while q < SACK_MAX {
+        (*c).sack_lo[q] = 0
+        (*c).sack_hi[q] = 0
+        q = q + 1
+    }
+    (*c).rexmit_ptr = 0
+    (*c).in_recovery = 0
+    (*c).recover = 0
+    (*c).ka_on = 0
+    (*c).ka_cnt = 9
+    (*c).ka_sent = 0
+    (*c).ka_idle = 7200000000
+    (*c).ka_intvl = 75000000
+    (*c).ka_last = 0
+    (*c).ka_at = 0
 }
 
 fn tcp_free_slot(t: *mut Tcp) -> i32 {
@@ -349,7 +434,24 @@ fn tcp_free_slot(t: *mut Tcp) -> i32 {
         }
         i = i + 1
     }
-    return 0 - 1
+    var best: i32 = 0 - 1
+    var best_at: u64 = 0
+    i = 0
+    while i < MAXCONN {
+        let c: *mut Tcb = tcb(t, i)
+        if (*c).state == S_TIME_WAIT {
+            if best < 0 || (*c).tw_at < best_at {
+                best = i as i32
+                best_at = (*c).tw_at
+            }
+        }
+        i = i + 1
+    }
+    if best >= 0 {
+        clear(tcb(t, best as usize))
+        bump(t, ST_TW_REUSE)
+    }
+    return best
 }
 
 fn new_iss(t: *mut Tcp) -> u32 {
@@ -447,6 +549,34 @@ fn tcp_set_nodelay(t: *mut Tcp, h: i32, on: bool) {
     if on { (*t).c[h as usize].nodelay = 1 } else { (*t).c[h as usize].nodelay = 0 }
 }
 
+fn tcp_set_keepalive(t: *mut Tcp, h: i32, on: bool, idle_us: u64, intvl_us: u64,
+    cnt: u32, now: u64) {
+    if h < 0 { return }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return }
+    (*c).ka_idle = idle_us
+    (*c).ka_intvl = intvl_us
+    (*c).ka_cnt = cnt
+    if on {
+        if (*c).ka_on == 0 { (*c).ka_sent = 0 }
+        (*c).ka_on = 1
+        if (*c).ka_last == 0 { (*c).ka_last = now }
+    } else {
+        (*c).ka_on = 0
+        (*c).ka_sent = 0
+    }
+}
+
+fn tcp_keepalive_get(t: *mut Tcp, h: i32, which: u32) -> u64 {
+    if h < 0 { return 0 }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if which == 0 { return (*c).ka_on as u64 }
+    if which == 1 { return (*c).ka_idle }
+    if which == 2 { return (*c).ka_intvl }
+    if which == 3 { return (*c).ka_cnt as u64 }
+    return (*c).ka_sent as u64
+}
+
 fn tcp_set_time_wait(t: *mut Tcp, us: u64) { (*t).time_wait_us = us }
 fn tcp_set_rto_min(t: *mut Tcp, us: u64) { (*t).rto_min = us }
 fn tcp_set_no_rexmit(t: *mut Tcp, on: bool) {
@@ -504,7 +634,42 @@ fn tcp_dbg(t: *mut Tcp, h: i32, which: u32) -> u64 {
     if which == 14 { return (*c).used as u64 }
     if which == 15 { return (*c).rttvar }
     if which == 16 { return (*c).snd_max as u64 }
+    if which == 17 { return (*c).ws_ok as u64 }
+    if which == 18 { return (*c).snd_ws as u64 }
+    if which == 19 { return (*c).rcv_ws as u64 }
+    if which == 20 { return (*c).ts_ok as u64 }
+    if which == 21 { return (*c).sack_ok as u64 }
+    if which == 22 { return (*c).ts_recent as u64 }
+    if which == 23 { return (*c).sack_n as u64 }
+    if which == 24 { return rcv_window(c) as u64 }
+    if which == 25 { return rcv_window_field(c) as u64 }
+    if which == 26 { return (*c).mss as u64 }
+    if which == 27 { return RCV_CAP as u64 }
     return 0
+}
+
+fn tcp_icmp_toobig(t: *mut Tcp, lip: u32, lport: u16, rip: u32, rport: u16,
+    next_mtu: u32) -> bool {
+    let h: i32 = find_conn(t, lip, lport, rip, rport)
+    if h < 0 { return false }
+    let c: *mut Tcb = tcb(t, h as usize)
+    if (*c).used == 0 { return false }
+    var mtu: u32 = next_mtu
+    if mtu == 0 {
+        let current_len: u32 = (*c).mss + 40
+        if current_len > 1492 { mtu = 1492 }
+        else if current_len > 1006 { mtu = 1006 }
+        else { mtu = MTU_FLOOR }
+    }
+    if mtu < MTU_FLOOR { mtu = MTU_FLOOR }
+    let new_mss: u32 = mtu - 40
+    if new_mss >= (*c).mss { return false }
+    (*c).mss = new_mss
+    if (*c).cwnd < new_mss { (*c).cwnd = new_mss }
+    (*c).snd_nxt = (*c).snd_una
+    (*c).fin_sent = 0
+    bump(t, ST_MTU_DOWN)
+    return true
 }
 
 // ===================================================================
@@ -555,11 +720,86 @@ fn rcv_free(c: *mut Tcb) -> u32 {
     return (RCV_CAP as u32) -% used
 }
 
+fn opt_peer(t: *mut Tcp, c: *mut Tcb, seg: *mut u8, now: u64) {
+    let seglen: usize = wire.tcp_off(seg)
+    if (*t).use_ws == 1 {
+        let ws: u8 = wire.tcp_wscale_option(seg, seglen)
+        if ws != WS_NONE {
+            (*c).ws_ok = 1
+            (*c).snd_ws = ws as u32
+        }
+    }
+    if (*t).use_ts == 1 {
+        var tsval: u32 = 0
+        var tsecr: u32 = 0
+        if wire.tcp_ts_option(seg, seglen, &tsval, &tsecr) {
+            (*c).ts_ok = 1
+            (*c).ts_recent = tsval
+            (*c).ts_recent_at = now
+        }
+    }
+    if (*t).use_sack == 1 {
+        if wire.tcp_sackok_option(seg, seglen) { (*c).sack_ok = 1 }
+    }
+}
+
+fn opt_arm(c: *mut Tcb) {
+    if (*c).ws_ok == 1 {
+        (*c).rcv_ws = WS_SELF as u32
+    } else {
+        (*c).snd_ws = 0
+        (*c).rcv_ws = 0
+    }
+}
+
+fn sack_covered(c: *mut Tcb, seq: u32) -> bool {
+    var i: usize = 0
+    while i < (*c).sack_n {
+        if wire.seq_ge(seq, (*c).sack_lo[i]) && wire.seq_lt(seq, (*c).sack_hi[i]) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn sack_skip(c: *mut Tcb, seq: u32) -> u32 {
+    var i: usize = 0
+    while i < (*c).sack_n {
+        if wire.seq_ge(seq, (*c).sack_lo[i]) && wire.seq_lt(seq, (*c).sack_hi[i]) {
+            return (*c).sack_hi[i]
+        }
+        i = i + 1
+    }
+    return seq
+}
+
+fn sack_prune(c: *mut Tcb) {
+    var w: usize = 0
+    var i: usize = 0
+    while i < (*c).sack_n {
+        if wire.seq_gt((*c).sack_hi[i], (*c).snd_una) {
+            (*c).sack_lo[w] = (*c).sack_lo[i]
+            (*c).sack_hi[w] = (*c).sack_hi[i]
+            w = w + 1
+        }
+        i = i + 1
+    }
+    (*c).sack_n = w
+}
+
 fn rcv_window(c: *mut Tcb) -> u32 {
     var w: u32 = rcv_free(c)
     if w < (*c).mss && w < (RCV_CAP as u32) / 2 { return 0 }
-    if w > 65535 { w = 65535 }
+    let sh: u32 = (*c).rcv_ws
+    var maxi: u32 = 65535
+    if sh < 32 { maxi = 65535 << sh }
+    if w > maxi { w = maxi }
     return w
+}
+
+fn rcv_window_field(c: *mut Tcb) -> u32 {
+    return (rcv_window(c) >> (*c).rcv_ws) & 0xFFFF
 }
 
 // The FIN occupies a sequence number, but it is NOT an octet of data.
@@ -915,6 +1155,7 @@ fn listen_step(t: *mut Tcp, l: i32, iph: *mut u8, seg: *mut u8, now: u64) {
     let m: u16 = wire.tcp_mss_option(seg, wire.tcp_off(seg))
     if m >= 536 as u16 && m <= 1460 as u16 { (*c).mss = m as u32 }
     (*c).cwnd = (*c).mss * 10
+    opt_peer(t, c, seg, now)
     arm_rt(t, c, now)
 }
 
@@ -951,11 +1192,14 @@ fn syn_sent_step(t: *mut Tcp, c: *mut Tcb, seg: *mut u8, now: u64) {
     (*c).snd_wl1 = wire.tcp_seq(seg)
     let m: u16 = wire.tcp_mss_option(seg, wire.tcp_off(seg))
     if m >= 536 as u16 && m <= 1460 as u16 { (*c).mss = m as u32 }
+    opt_peer(t, c, seg, now)
     if ack_ok {
         (*c).snd_una = ack
         (*c).snd_wl2 = ack
         if wire.seq_gt((*c).snd_una, (*c).iss) {
             setst(t, c, S_ESTABLISHED)
+            opt_arm(c)
+            (*c).snd_wnd = wire.tcp_wnd(seg) << (*c).snd_ws
             (*c).cwnd = (*c).mss * 10
             (*c).rt_on = 0
             if (*c).rtt_on == 1 && wire.seq_ge(ack, (*c).rtt_seq) {
@@ -1073,6 +1317,8 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     let st0: u32 = (*c).state
 
     if st0 == S_CLOSED { return }
+    (*c).ka_last = now
+    (*c).ka_sent = 0
     if st0 == S_SYN_SENT {
         syn_sent_step(t, c, seg, now)
         return
@@ -1092,11 +1338,31 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     if (fl & wire.F_SYN) != 0 { seglen = seglen + 1 }
     if (fl & wire.F_FIN) != 0 { seglen = seglen + 1 }
 
+    var pts: u32 = 0
+    var pecr: u32 = 0
+    let has_ts: bool = wire.tcp_ts_option(seg, wire.tcp_off(seg), &pts, &pecr)
+    if (*c).ts_ok == 1 && has_ts && (fl & wire.F_RST) == 0 {
+        if wire.seq_lt(pts, (*c).ts_recent)
+        && ((*c).ts_recent -% pts) < PAWS_WINDOW
+        && (now -% (*c).ts_recent_at) < 86400000000 {
+            bump(t, ST_PAWS)
+            (*c).ack_now = 1
+            return
+        }
+    }
+
     // ---- 1. is the segment inside the window at all?
     if !acceptable(c, seq, seglen) {
         bump(t, ST_UNACCEPTABLE)
         if (fl & wire.F_RST) == 0 { (*c).ack_now = 1 }
         return
+    }
+
+    if (*c).ts_ok == 1 && has_ts && wire.seq_le(seq, (*c).rcv_nxt) {
+        if wire.seq_ge(pts, (*c).ts_recent) {
+            (*c).ts_recent = pts
+            (*c).ts_recent_at = now
+        }
     }
 
     // ---- 2. a reset
@@ -1115,10 +1381,20 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     // ---- 4. the acknowledgement
     if (fl & wire.F_ACK) == 0 { return }
 
+    if (*c).sack_ok == 1 {
+        let sn: usize = wire.tcp_sack_blocks(seg, wire.tcp_off(seg),
+            &(*c).sack_lo[0], &(*c).sack_hi[0], SACK_MAX)
+        if sn > 0 {
+            (*c).sack_n = sn
+            bump(t, ST_SACK_RX)
+        }
+    }
+
     if (*c).state == S_SYN_RECEIVED {
         if wire.seq_gt(ack, (*c).snd_una) && wire.seq_le(ack, (*c).snd_max) {
             setst(t, c, S_ESTABLISHED)
-            (*c).snd_wnd = wire.tcp_wnd(seg)
+            opt_arm(c)
+            (*c).snd_wnd = wire.tcp_wnd(seg) << (*c).snd_ws
             (*c).snd_wl1 = seq
             (*c).snd_wl2 = ack
             (*c).cwnd = (*c).mss * 10
@@ -1143,6 +1419,8 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
         let acked: u32 = ack -% (*c).snd_una
         (*c).snd_una = ack
         (*c).dupacks = 0
+        sack_prune(c)
+        if wire.seq_ge(ack, (*c).recover) { (*c).in_recovery = 0 }
         if wire.seq_lt((*c).snd_nxt, (*c).snd_una) { (*c).snd_nxt = (*c).snd_una }
         if (*c).rtt_on == 1 && wire.seq_ge(ack, (*c).rtt_seq) {
             (*c).rtt_on = 0
@@ -1167,7 +1445,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
         }
     } else if ack == (*c).snd_una && dlen == 0
     && (fl & (wire.F_SYN | wire.F_FIN)) == 0
-    && wire.tcp_wnd(seg) <= (*c).snd_wnd
+    && (wire.tcp_wnd(seg) << (*c).snd_ws) <= (*c).snd_wnd
     && wire.seq_lt((*c).snd_una, (*c).snd_max) {
         // Three duplicates say that segments AFTER the hole are arriving
         // -- so the hole is a loss and not a reordering, and waiting for
@@ -1179,6 +1457,9 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
             (*c).ssthresh = u32max(flight / 2, 2 * (*c).mss)
             (*c).snd_nxt = (*c).snd_una
             (*c).fin_sent = 0
+            (*c).in_recovery = 1
+            (*c).recover = (*c).snd_max
+            (*c).rexmit_ptr = (*c).snd_una
             (*c).cwnd = (*c).ssthresh +% 3 * (*c).mss
             (*c).rtt_on = 0
             bump(t, ST_FAST_REXMIT)
@@ -1190,7 +1471,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     // is newer than the one the current window came from.
     if wire.seq_lt((*c).snd_wl1, seq)
     || ((*c).snd_wl1 == seq && wire.seq_le((*c).snd_wl2, ack)) {
-        (*c).snd_wnd = wire.tcp_wnd(seg)
+        (*c).snd_wnd = wire.tcp_wnd(seg) << (*c).snd_ws
         (*c).snd_wl1 = seq
         (*c).snd_wl2 = ack
         if (*c).snd_wnd > 0 { (*c).persist_on = 0 }
@@ -1264,9 +1545,37 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
 // ===================================================================
 
 fn seg_build(t: *mut Tcp, c: *mut Tcb, buf: *mut u8, cap: usize,
-    flags: u8, seq: u32, dlen: usize, mss_opt: bool) -> usize {
+    flags: u8, seq: u32, dlen: usize, mss_opt: bool, now: u64) -> usize {
+    let is_syn: bool = (flags & wire.F_SYN) != 0
+    let want_ts: bool = (*c).ts_ok == 1 || (is_syn && (*t).use_ts == 1)
     var optlen: usize = 0
     if mss_opt { optlen = 4 }
+    if is_syn {
+        if (*t).use_ws == 1 && ((*c).state != S_SYN_RECEIVED || (*c).ws_ok == 1) {
+            optlen = optlen + 4
+        }
+        if (*t).use_sack == 1 && ((*c).state != S_SYN_RECEIVED || (*c).sack_ok == 1) {
+            optlen = optlen + 2
+        }
+        if want_ts && ((*c).state != S_SYN_RECEIVED || (*c).ts_ok == 1) {
+            optlen = optlen + 10
+        }
+        if optlen % 4 != 0 { optlen = optlen + (4 - optlen % 4) }
+    } else {
+        if (*c).ts_ok == 1 { optlen = optlen + 12 }
+    }
+    var sack_n: usize = 0
+    if !is_syn && (*c).sack_ok == 1 && (*c).ooo_n > 0 && dlen == 0 {
+        let free_bytes: usize = 40 - optlen
+        if free_bytes >= 10 {
+            sack_n = (free_bytes - 2) / 8
+            if sack_n > (*c).ooo_n { sack_n = (*c).ooo_n }
+            if sack_n > SACK_MAX { sack_n = SACK_MAX }
+            if sack_n > 0 { optlen = optlen + 2 + sack_n * 8 }
+        }
+    }
+    if optlen % 4 != 0 { optlen = optlen + (4 - optlen % 4) }
+    if optlen > 40 { optlen = 40 }
     let total: usize = wire.IP_HDR + wire.TCP_HDR + optlen + dlen
     if total > cap { return 0 }
     (*t).ip_id = ((*t).ip_id +% 1) & 0xFFFF
@@ -1284,13 +1593,66 @@ fn seg_build(t: *mut Tcp, c: *mut Tcb, buf: *mut u8, cap: usize,
     let dataoff: usize = (wire.TCP_HDR + optlen) / 4
     wire.st8(seg, 12, ((dataoff * 16) & 0xF0) as u8)
     wire.st8(seg, 13, flags)
-    wire.put16(seg, 14, (rcv_window(c) & 0xFFFF) as u16)
+    wire.put16(seg, 14, (rcv_window_field(c) & 0xFFFF) as u16)
     wire.put16(seg, 16, 0 as u16)
     wire.put16(seg, 18, 0 as u16)
-    if mss_opt {
-        wire.st8(seg, 20, 2 as u8)
-        wire.st8(seg, 21, 4 as u8)
-        wire.put16(seg, 22, ((*c).mss & 0xFFFF) as u16)
+    var o: usize = wire.TCP_HDR
+    let oend: usize = wire.TCP_HDR + optlen
+    if mss_opt && o + 4 <= oend {
+        wire.st8(seg, o, wire.TOPT_MSS)
+        wire.st8(seg, o + 1, 4 as u8)
+        wire.put16(seg, o + 2, ((*c).mss & 0xFFFF) as u16)
+        o = o + 4
+    }
+    if is_syn {
+        if (*t).use_ws == 1 && ((*c).state != S_SYN_RECEIVED || (*c).ws_ok == 1)
+        && o + 4 <= oend {
+            wire.st8(seg, o, wire.TOPT_NOP)
+            wire.st8(seg, o + 1, wire.TOPT_WS)
+            wire.st8(seg, o + 2, 3 as u8)
+            wire.st8(seg, o + 3, WS_SELF)
+            o = o + 4
+        }
+        if (*t).use_sack == 1 && ((*c).state != S_SYN_RECEIVED || (*c).sack_ok == 1)
+        && o + 2 <= oend {
+            wire.st8(seg, o, wire.TOPT_SACKOK)
+            wire.st8(seg, o + 1, 2 as u8)
+            o = o + 2
+        }
+    }
+    let ts_here: bool = (is_syn && want_ts && ((*c).state != S_SYN_RECEIVED || (*c).ts_ok == 1))
+                     || (!is_syn && (*c).ts_ok == 1)
+    if ts_here && o + 10 <= oend {
+        if !is_syn && o + 12 <= oend {
+            wire.st8(seg, o, wire.TOPT_NOP)
+            wire.st8(seg, o + 1, wire.TOPT_NOP)
+            o = o + 2
+        }
+        wire.st8(seg, o, wire.TOPT_TS)
+        wire.st8(seg, o + 1, 10 as u8)
+        wire.put32(seg, o + 2, ts_now(t, now))
+        var ecr: u32 = 0
+        if (*c).ts_ok == 1 { ecr = (*c).ts_recent }
+        wire.put32(seg, o + 6, ecr)
+        o = o + 10
+    }
+    if sack_n > 0 && o + 2 + sack_n * 8 <= oend {
+        wire.st8(seg, o, wire.TOPT_SACK)
+        wire.st8(seg, o + 1, (2 + sack_n * 8) as u8)
+        o = o + 2
+        var b: usize = 0
+        while b < sack_n {
+            let idx: usize = (*c).ooo_n - 1 - b
+            wire.put32(seg, o, (*c).ooo_lo[idx])
+            wire.put32(seg, o + 4, (*c).ooo_hi[idx])
+            o = o + 8
+            b = b + 1
+        }
+        bump(t, ST_SACK_TX)
+    }
+    while o < oend {
+        wire.st8(seg, o, wire.TOPT_END)
+        o = o + 1
     }
     if dlen > 0 {
         snd_get(c, seq, ((seg as u64) + (wire.TCP_HDR + optlen) as u64) as *mut u8, dlen)
@@ -1336,7 +1698,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
 
     if (*c).reset_req == 1 {
         (*c).reset_req = 0
-        let n: usize = seg_build(t, c, buf, cap, wire.F_RST, (*c).snd_nxt, 0, false)
+        let n: usize = seg_build(t, c, buf, cap, wire.F_RST, (*c).snd_nxt, 0, false, now)
         bump(t, ST_RST_TX)
         clear(c)
         return n
@@ -1373,7 +1735,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
 
     if st == S_SYN_SENT {
         if (*c).snd_nxt == (*c).iss {
-            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN, (*c).iss, 0, true)
+            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN, (*c).iss, 0, true, now)
             if n == 0 { return 0 }
             advance_nxt(c, (*c).iss +% 1)
             start_rtt(c, (*c).iss, now)
@@ -1385,7 +1747,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
 
     if st == S_SYN_RECEIVED {
         if (*c).snd_nxt == (*c).iss {
-            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN | wire.F_ACK, (*c).iss, 0, true)
+            let n: usize = seg_build(t, c, buf, cap, wire.F_SYN | wire.F_ACK, (*c).iss, 0, true, now)
             if n == 0 { return 0 }
             advance_nxt(c, (*c).iss +% 1)
             (*c).ack_now = 0
@@ -1400,7 +1762,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
     if st == S_TIME_WAIT {
         if (*c).ack_now == 1 {
             (*c).ack_now = 0
-            return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false)
+            return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false, now)
         }
         return 0
     }
@@ -1435,7 +1797,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
             // refused as a forgery, the window update inside it is never
             // read, and both sides wait for each other for ever. That
             // deadlock is what this line is.
-            let pn: usize = seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 1, false)
+            let pn: usize = seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 1, false, now)
             if wire.seq_gt((*c).snd_nxt +% 1, (*c).snd_max) {
                 (*c).snd_max = (*c).snd_nxt +% 1
             }
@@ -1443,15 +1805,49 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         }
     }
 
+    if (*c).sack_ok == 1 && (*c).sack_n > 0 && (*c).in_recovery == 1
+    && wire.seq_lt((*c).snd_nxt, (*c).snd_max) {
+        var hops: usize = 0
+        while hops <= SACK_MAX && sack_covered(c, (*c).snd_nxt)
+        && wire.seq_lt((*c).snd_nxt, (*c).snd_max) {
+            var skip_to: u32 = sack_skip(c, (*c).snd_nxt)
+            if !wire.seq_gt(skip_to, (*c).snd_nxt) { break }
+            if wire.seq_gt(skip_to, (*c).snd_max) { skip_to = (*c).snd_max }
+            (*c).snd_nxt = skip_to
+            bump(t, ST_REXMIT_SACK)
+            hops = hops + 1
+        }
+        if wire.seq_lt((*c).snd_nxt, (*c).snd_end) {
+            pending = (*c).snd_end -% (*c).snd_nxt
+        } else {
+            pending = 0
+        }
+    }
+
+    var payload_mss: u32 = (*c).mss
+    if (*c).ts_ok == 1 {
+        if payload_mss > 12 { payload_mss = payload_mss - 12 } else { payload_mss = 1 }
+    }
+
     var can: u32 = 0
     if wire.seq_lt((*c).snd_nxt, edge) && pending > 0 {
         let allowed: u32 = edge -% (*c).snd_nxt
         can = u32min(pending, allowed)
-        can = u32min(can, (*c).mss)
+        can = u32min(can, payload_mss)
+        if (*c).sack_ok == 1 && (*c).sack_n > 0 {
+            var j: usize = 0
+            while j < (*c).sack_n {
+                let lo: u32 = (*c).sack_lo[j]
+                if wire.seq_gt(lo, (*c).snd_nxt) && wire.seq_lt(lo, (*c).snd_nxt +% can) {
+                    can = lo -% (*c).snd_nxt
+                }
+                j = j + 1
+            }
+        }
     }
 
     var send_now: bool = can > 0
-    if can > 0 && can < (*c).mss && (*c).nodelay == 0 {
+    if can > 0 && can < payload_mss && (*c).nodelay == 0 {
         // NAGLE. A small segment waits while something is still
         // unacknowledged -- unless it is the last one and the connection
         // is being closed, because then nothing will ever come after it
@@ -1474,7 +1870,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
             flags = flags | wire.F_FIN
             fin = true
         }
-        let n: usize = seg_build(t, c, buf, cap, flags, seq0, can as usize, false)
+        let n: usize = seg_build(t, c, buf, cap, flags, seq0, can as usize, false, now)
         if n == 0 { return 0 }
         advance_nxt(c, seq0 +% can)
         if fin {
@@ -1507,7 +1903,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
     // was asked for, everything queued has left, and no FIN is on the
     // wire, a FIN goes out.
     if (*c).close_req == 1 && (*c).fin_sent == 0 && (*c).snd_nxt == (*c).snd_end {
-        let n: usize = seg_build(t, c, buf, cap, wire.F_FIN | wire.F_ACK, (*c).snd_nxt, 0, false)
+        let n: usize = seg_build(t, c, buf, cap, wire.F_FIN | wire.F_ACK, (*c).snd_nxt, 0, false, now)
         if n == 0 { return 0 }
         (*c).fin_sent = 1
         advance_nxt(c, (*c).snd_nxt +% 1)
@@ -1527,7 +1923,28 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         if (*c).dup_due > 0 { (*c).dup_due = (*c).dup_due -% 1 }
         (*c).ack_on = 0
         (*c).seg_since_ack = 0
-        return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false)
+        return seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt, 0, false, now)
+    }
+
+    if (*c).ka_on == 1 && (st == S_ESTABLISHED || st == S_CLOSE_WAIT)
+    && (*c).rt_on == 0 && (*c).persist_on == 0 {
+        var due: u64 = (*c).ka_last + (*c).ka_idle
+        if (*c).ka_sent > 0 { due = (*c).ka_at }
+        if now >= due {
+            if (*c).ka_sent >= (*c).ka_cnt {
+                let rn: usize = seg_build(t, c, buf, cap, wire.F_RST, (*c).snd_nxt, 0, false, now)
+                bump(t, ST_KA_DEAD)
+                if rn > 0 { bump(t, ST_RST_TX) }
+                dead(t, c, E_TIMEOUT)
+                return rn
+            }
+            let kn: usize = seg_build(t, c, buf, cap, wire.F_ACK, (*c).snd_nxt -% 1, 0, false, now)
+            if kn == 0 { return 0 }
+            (*c).ka_sent = (*c).ka_sent + 1
+            (*c).ka_at = now + (*c).ka_intvl
+            bump(t, ST_KEEPALIVE)
+            return kn
+        }
     }
     return 0
 }

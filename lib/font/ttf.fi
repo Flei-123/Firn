@@ -45,14 +45,13 @@
 // readers below do the shifts by hand instead of casting a pointer; a
 // `*(p as *mut u16)` would read the machine's order and would be right on
 // nothing.
-import std.rt
 import font.raster
 
 export {
     Font,
     font_new, font_init, font_ok,
     font_upem, font_ascent, font_descent, font_line_gap, font_num_glyphs,
-    font_glyph_for, font_advance, font_lsb, font_kern, font_has_kern, font_kern_release, font_kern_raw,
+    font_glyph_for, font_set_faces, font_set_vhint, font_vhint, font_advance, font_lsb, font_kern, font_has_kern, font_kern_release, font_kern_raw, font_kerning_cache_attach, font_kerning_cache_size,
     font_glyph_bbox, font_outline, font_outline_m,
     font_scratch_needed,
     font_cmap_format,
@@ -107,6 +106,13 @@ struct Font {
     lat: [u32; 256],
     lat_ok: usize,
     kc: u64,
+    fb_base: usize,
+    fb_stride: usize,
+    fb_n: usize,
+    miss: fn(u32, u32) -> u32,
+    miss_on: usize,
+    vhint: fn(*mut Font, u32, i32) -> u32,
+    vhint_on: usize,
 }
 
 // ------------------------------------------------------- Big endian reads
@@ -227,7 +233,61 @@ fn font_new() -> Font {
         lat: [0 as u32; 256],
         lat_ok: 0,
         kc: 0 as u64,
+        fb_base: 0,
+        fb_stride: 0,
+        fb_n: 0,
+        miss: miss_none,
+        miss_on: 0,
+        vhint: vhint_none,
+        vhint_on: 0,
     }
+}
+
+#[no_gc]
+fn miss_none(cp: u32, upem: u32) -> u32 {
+    return 0 as u32
+}
+
+#[no_gc]
+fn vhint_none(f: *mut Font, px: u32, top: i32) -> u32 {
+    return 65536 as u32
+}
+
+#[no_gc]
+fn font_set_vhint(f: *mut Font, h: fn(*mut Font, u32, i32) -> u32) {
+    (*f).vhint = h
+    (*f).vhint_on = 1
+}
+
+#[no_gc]
+#[allow_fp]
+fn font_vhint(f: *mut Font, px: u32, top: i32) -> f64 {
+    if (*f).vhint_on == 0 {
+        return 1.0
+    }
+    let h: fn(*mut Font, u32, i32) -> u32 = (*f).vhint
+    return (h(f, px, top) as f64) / 65536.0
+}
+
+#[no_gc]
+fn font_set_faces(f: *mut Font, base: *mut Font, stride: usize, n: usize, miss: fn(u32, u32) -> u32) {
+    (*f).fb_base = base as u64 as usize
+    (*f).fb_stride = stride
+    (*f).fb_n = n
+    if n > 255 {
+        (*f).fb_n = 255
+    }
+    (*f).miss = miss
+    (*f).miss_on = 1
+}
+
+#[no_gc]
+fn fb_owner(f: *mut Font, gid: u32) -> *mut Font {
+    let k: usize = (gid >> 24) as usize
+    if k == 0 || k > (*f).fb_n {
+        return 0 as u64 as *mut Font
+    }
+    return ((*f).fb_base + (k - 1) * (*f).fb_stride) as u64 as *mut Font
 }
 
 #[no_gc]
@@ -428,6 +488,16 @@ fn font_has_kern(f: *mut Font) -> bool {
 
 #[no_gc]
 fn font_glyph_for(f: *mut Font, cp: u32) -> u32 {
+    let g: u32 = glyph_own(f, cp)
+    if g != 0 as u32 || (*f).miss_on == 0 || cp < 160 as u32 {
+        return g
+    }
+    let m: fn(u32, u32) -> u32 = (*f).miss
+    return m(cp, (*f).upem)
+}
+
+#[no_gc]
+fn glyph_own(f: *mut Font, cp: u32) -> u32 {
     if (*f).ok == 0 || (*f).cmap_off == 0 {
         return 0 as u32
     }
@@ -542,6 +612,13 @@ fn cmap12(f: *mut Font, sub: usize, cp: u32) -> u32 {
 // after the first few a width of zero.
 #[no_gc]
 fn font_advance(f: *mut Font, gid: u32) -> i32 {
+    if gid >= 16777216 as u32 {
+        let o: *mut Font = fb_owner(f, gid)
+        if o as u64 == 0 {
+            return 0
+        }
+        return font_advance(o, gid & 16777215 as u32)
+    }
     if (*f).ok == 0 || (*f).num_hmetrics == 0 as u32 {
         return 0
     }
@@ -554,6 +631,13 @@ fn font_advance(f: *mut Font, gid: u32) -> i32 {
 
 #[no_gc]
 fn font_lsb(f: *mut Font, gid: u32) -> i32 {
+    if gid >= 16777216 as u32 {
+        let o: *mut Font = fb_owner(f, gid)
+        if o as u64 == 0 {
+            return 0
+        }
+        return font_lsb(o, gid & 16777215 as u32)
+    }
     if (*f).ok == 0 {
         return 0
     }
@@ -849,6 +933,9 @@ fn gpos_kern(f: *mut Font, a: u32, b: u32) -> i32 {
 // Zero when there is neither or no pair.
 #[no_gc]
 fn font_kern_raw(f: *mut Font, left: u32, right: u32) -> i32 {
+    if left >= 16777216 as u32 || right >= 16777216 as u32 {
+        return 0
+    }
     let k: i32 = kern_table(f, left, right)
     if k != 0 {
         return k
@@ -882,10 +969,17 @@ fn kc_set32(p: u64, i: usize, v: i32) {
 
 #[no_gc]
 fn kern_cache_release(f: *mut Font) {
-    if (*f).kc != 0 as u64 {
-        rt.heap_free((*f).kc, KC_BYTES)
-        (*f).kc = 0 as u64
-    }
+    (*f).kc = 0 as u64
+}
+
+#[no_gc]
+fn font_kerning_cache_attach(f: *mut Font, mem: u64) {
+    (*f).kc = mem
+}
+
+#[no_gc]
+fn font_kerning_cache_size() -> usize {
+    return KC_BYTES
 }
 
 #[no_gc]
@@ -905,14 +999,10 @@ fn font_kern(f: *mut Font, left: u32, right: u32) -> i32 {
     if (*f).kern_len == 0 && (*f).gk_n == 0 {
         return 0
     }
-    if (*f).kc == 0 as u64 {
-        let p: u64 = rt.heap_alloc(KC_BYTES)
-        if p == 0 as u64 {
-            return font_kern_raw(f, left, right)
-        }
-        (*f).kc = p
-    }
     let kc: u64 = (*f).kc
+    if kc == 0 as u64 {
+        return font_kern_raw(f, left, right)
+    }
     let slot: usize = kern_cache_slot(left, right)
     let key: u64 = (((left as u64) << 32) | (right as u64)) + 1 as u64
     if kc_get64(kc, slot) == key {
@@ -953,6 +1043,13 @@ fn glyph_range(f: *mut Font, gid: u32, off: *mut usize,
 #[no_gc]
 fn font_glyph_bbox(f: *mut Font, gid: u32, x0: *mut i32, y0: *mut i32,
     x1: *mut i32, y1: *mut i32) -> bool {
+    if gid >= 16777216 as u32 {
+        let fo: *mut Font = fb_owner(f, gid)
+        if fo as u64 == 0 {
+            return false
+        }
+        return font_glyph_bbox(fo, gid & 16777215 as u32, x0, y0, x1, y1)
+    }
     var o: usize = 0
     var l: usize = 0
     if !glyph_range(f, gid, &o, &l) {
@@ -1025,6 +1122,14 @@ fn outline_at(f: *mut Font, gid: u32, r: *mut raster.Raster,
     sc: *mut u8, cap: usize, depth: i32) -> bool {
     if depth > MAX_DEPTH {
         return false
+    }
+    if gid >= 16777216 as u32 {
+        let fo: *mut Font = fb_owner(f, gid)
+        if fo as u64 == 0 {
+            return true
+        }
+        return outline_at(fo, gid & 16777215 as u32, r, ox, oy, scale,
+            m00, m01, m10, m11, tdx, tdy, sc, cap, depth)
     }
     var o: usize = 0
     var l: usize = 0
