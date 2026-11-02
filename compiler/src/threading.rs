@@ -107,6 +107,33 @@ fn disturbs_memory(op: &Op) -> bool {
     )
 }
 
+pub(crate) fn foreign_uses(f: &Func) -> crate::fx::HashSet<Val> {
+    let mut foreign: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
+    let mut buf: Vec<Val> = Vec::new();
+    for b in f.blocks.iter() {
+        for i in &b.insts {
+            buf.clear();
+            i.op.uses(&mut buf);
+            for v in buf.iter() {
+                foreign.insert(*v);
+            }
+        }
+        let t = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Ret(Some(v)) => Some(*v),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Br(_) | Term::Ret(None) | Term::Unset => None,
+        };
+        if let Some(v) = t {
+            let own = b.insts.len() == 1 && b.insts[0].dst == Some(v);
+            if !own {
+                foreign.insert(v);
+            }
+        }
+    }
+    foreign
+}
+
 /// One switch block: just `load.bool` from a cell, then `brcond`.
 struct Fork {
     cell: Val,
@@ -129,8 +156,9 @@ pub(crate) fn fork_cells(f: &Func) -> crate::fx::HashSet<Val> {
     if f.constant_time || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return out;
     }
+    let foreign = foreign_uses(f);
     for bi in 0..f.blocks.len() {
-        if let Some((cell, _, _)) = fork_at(f, bi) {
+        if let Some((cell, _, _)) = fork_at(f, bi, &foreign) {
             out.insert(cell);
         }
     }
@@ -152,7 +180,11 @@ pub(crate) fn fork_cells(f: &Func) -> crate::fx::HashSet<Val> {
 /// cell falls between the two.
 ///
 /// Yields `(cell, then, else)`.
-pub(crate) fn fork_at(f: &Func, bi: usize) -> Option<(Val, BlockId, BlockId)> {
+pub(crate) fn fork_at(
+    f: &Func,
+    bi: usize,
+    foreign: &crate::fx::HashSet<Val>,
+) -> Option<(Val, BlockId, BlockId)> {
     let b = f.blocks.get(bi)?;
     if b.id == 0 || b.insts.len() != 1 {
         return None; // bb0 carries the allocas; a phi would make it two
@@ -162,7 +194,7 @@ pub(crate) fn fork_at(f: &Func, bi: usize) -> Option<(Val, BlockId, BlockId)> {
         (Some(d), Op::Load { addr }) => (d, *addr),
         _ => return None,
     };
-    if i.ty != FTy::Bool || f.is_secret(d) {
+    if i.ty != FTy::Bool || f.is_secret(d) || foreign.contains(&d) {
         return None;
     }
     let (cond, then, els) = match &b.term {
@@ -302,33 +334,7 @@ pub(crate) fn thread_bool_phis(f: &mut Func) -> usize {
     // phi is read by NOTHING but the `brcond` of its own block. That leaves
     // the case the pass was written for -- the short circuit of `&&` / `||`,
     // whose phi is read exactly once -- untouched.
-    let mut foreign: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
-    {
-        let mut buf: Vec<Val> = Vec::new();
-        for b in f.blocks.iter() {
-            for i in &b.insts {
-                buf.clear();
-                i.op.uses(&mut buf);
-                for v in buf.iter() {
-                    foreign.insert(*v);
-                }
-            }
-            let t = match &b.term {
-                Term::BrCond { cond, .. } => Some(*cond),
-                Term::Ret(Some(v)) => Some(*v),
-                Term::Switch { val, .. } => Some(*val),
-                Term::Br(_) | Term::Ret(None) | Term::Unset => None,
-            };
-            if let Some(v) = t {
-                // The one use that is allowed: the terminator of the very
-                // block that defines the value -- that is the join itself.
-                let own = b.insts.len() == 1 && b.insts[0].dst == Some(v);
-                if !own {
-                    foreign.insert(v);
-                }
-            }
-        }
-    }
+    let foreign = foreign_uses(f);
     // 1. The joins: exactly one instruction, and it is a bool phi the
     //    terminator branches on.
     let mut joins: Vec<(usize, BlockId, BlockId, Vec<(BlockId, Val)>)> = Vec::new();
@@ -498,13 +504,14 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
         return 0;
     }
 
+    let foreign = foreign_uses(f);
     // 1. Collect the switch blocks.
     let mut forks: HashMap<BlockId, Fork> = HashMap::default();
     for b in &f.blocks {
         if b.id == 0 || b.insts.len() != 1 {
             continue; // bb0 carries the allocas
         }
-        let (addr, then, els) = match fork_at(f, b.id as usize) {
+        let (addr, then, els) = match fork_at(f, b.id as usize, &foreign) {
             Some(x) => x,
             None => continue,
         };
@@ -747,6 +754,20 @@ mod tests {
             Term::BrCond { then_bb, else_bb, .. } => {
                 assert_eq!((*then_bb, *else_bb), (1, 2), "bb0 unchanged");
             }
+            t => panic!("bb0: {:?}", t),
+        }
+    }
+
+    #[test]
+    fn fork_value_read_elsewhere_stays_untouched() {
+        let mut f = and_func();
+        let l = f.blocks[2].insts[0].dst.unwrap();
+        f.push(4, FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::Bool, a: l, b: l });
+        assert!(fork_cells(&f).is_empty());
+        assert_eq!(thread_bool_cells(&mut f), 0);
+        assert!(matches!(f.blocks[1].term, Term::Br(2)));
+        match &f.blocks[0].term {
+            Term::BrCond { then_bb, else_bb, .. } => assert_eq!((*then_bb, *else_bb), (1, 2)),
             t => panic!("bb0: {:?}", t),
         }
     }
