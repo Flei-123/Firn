@@ -271,7 +271,17 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             let before = cx.carried(&before_live, &states[ii]);
             let is_site = fl.site_at.get(&(bi, ii)) == Some(&site);
             if is_site && before {
-                return None;
+                let old = self_append_old(&cx, fl, inst)?;
+                let mut rest = live.clone();
+                if let Some(&c) = cx.items.cell.get(&cell_p_of(fl, site)?) {
+                    rest.clear(c);
+                }
+                if cx.carried(&rest, &states[ii + 1]) {
+                    return None;
+                }
+                frees.push(Free { block: bi, pos: ii + 1, handle: Handle::Val(old), site: cx.site });
+                live = before_live;
+                continue;
             }
             let defines = is_site || inst.dst.map_or(false, |d| cx.items.val.contains_key(&d));
             if (before || defines) && !after {
@@ -343,6 +353,32 @@ fn base_of(cx: &Ctx, fl: &Flow, mut v: Val) -> Option<Val> {
         }
     }
     None
+}
+
+fn cell_p_of(fl: &Flow, site: usize) -> Option<usize> {
+    match fl.sites[site] {
+        Site::Pair { cell_p, .. } => Some(cell_p),
+        Site::Value => None,
+    }
+}
+
+fn self_append_old(cx: &Ctx, fl: &Flow, inst: &Inst) -> Option<Val> {
+    if std::env::var_os("FIRN_OWN_NO_APPEND").is_some() {
+        return None;
+    }
+    let Op::Call { name, args } = &inst.op else { return None };
+    if !super::append::source(name) || args.len() < 5 {
+        return None;
+    }
+    let Site::Pair { cell_p, cell_n } = fl.sites[cx.site] else { return None };
+    let cell = |v: Val| match cx.ix.op(cx.f, v) {
+        Some(Op::Load { addr }) => cx.sl.access(*addr, cx.f.val_ty(v)).map(|a| a.cell),
+        _ => None,
+    };
+    if cell(args[1]) != Some(cell_p) || cell(args[2]) != Some(cell_n) || fl.must(args[1]) != Some(cx.seed) {
+        return None;
+    }
+    Some(args[1])
 }
 
 fn cell_handles(fl: &Flow, site: usize) -> bool {

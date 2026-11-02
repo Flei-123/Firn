@@ -34,6 +34,10 @@ pub(crate) fn run(m: &mut Module, free_fn: &str, poison_fn: &str) {
     }
 }
 
+pub(crate) fn source(name: &str) -> bool {
+    SOURCES.contains(&name)
+}
+
 fn defs(f: &Func) -> HashMap<Val, Op> {
     let mut out = HashMap::default();
     for b in f.blocks.iter() {
