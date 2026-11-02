@@ -10,6 +10,7 @@ pub(crate) enum Shape {
 pub(crate) enum Drop {
     Block,
     SlotsOwner,
+    Tree,
 }
 
 pub(crate) struct Producer {
@@ -29,6 +30,7 @@ pub(crate) const PRODUCERS: &[Producer] = &[
 const DROP_FNS: &[(Drop, &str, &str)] = &[
     (Drop::Block, "__gc_free_block", "__gc_poison_block"),
     (Drop::SlotsOwner, "__own_drop_slots_owner", "__own_drop_slots_owner_check"),
+    (Drop::Tree, "__own_drop_tree", "__own_drop_tree_check"),
 ];
 
 pub(crate) const REUSE_ALLOC: &str = "__own_reuse_alloc";

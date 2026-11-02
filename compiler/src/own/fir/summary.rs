@@ -14,13 +14,15 @@ pub(crate) struct Summaries {
     idx: HashMap<String, usize>,
     params: Vec<Vec<AtomicBool>>,
     fresh: HashMap<String, registry::Drop>,
+    pub(super) tree: crate::fx::HashSet<String>,
+    pub(super) deep: HashMap<String, Vec<bool>>,
 }
 
 impl Summaries {
     fn new(m: &Module) -> Summaries {
         let idx = m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
         let params = m.funcs.iter().map(|f| (0..f.params.len()).map(|_| AtomicBool::new(analyzable(f))).collect()).collect();
-        Summaries { idx, params, fresh: HashMap::default() }
+        Summaries { idx, params, fresh: HashMap::default(), tree: Default::default(), deep: HashMap::default() }
     }
 
     pub(super) fn store(&self, i: usize, new: &[bool]) -> bool {
@@ -31,6 +33,14 @@ impl Summaries {
             }
         }
         changed
+    }
+
+    pub(super) fn fresh_kind(&self, name: &str) -> Option<registry::Drop> {
+        self.fresh.get(name).copied()
+    }
+
+    pub(super) fn shallow(&self, i: usize) -> Vec<bool> {
+        self.params[i].iter().map(|b| b.load(Ordering::Relaxed)).collect()
     }
 
     pub(super) fn reset(&mut self) {
@@ -58,6 +68,14 @@ impl Borrows for Summaries {
 
     fn fresh_drop(&self, name: &str) -> registry::Drop {
         self.fresh.get(name).copied().unwrap_or(registry::Drop::Block)
+    }
+
+    fn deep_borrows(&self, name: &str, arg: usize) -> bool {
+        self.deep.get(name).and_then(|d| d.get(arg)).copied().unwrap_or(false)
+    }
+
+    fn tree(&self, name: &str) -> bool {
+        self.tree.contains(name)
     }
 }
 

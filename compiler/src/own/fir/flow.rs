@@ -22,6 +22,18 @@ pub(crate) trait Borrows {
     fn fresh_drop(&self, _name: &str) -> Drop {
         Drop::Block
     }
+    fn deep_borrows(&self, _name: &str, _arg: usize) -> bool {
+        false
+    }
+    fn tree(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mode {
+    Plain,
+    Deep,
 }
 
 pub(crate) struct Flow {
@@ -42,6 +54,9 @@ pub(crate) struct Flow {
     code_of: HashMap<Val, Val>,
     scratch: Bits,
     uses: Vec<Val>,
+    mode: Mode,
+    pub absorb: Bits,
+    pub absorbed: Vec<(usize, usize)>,
 }
 
 impl Flow {
@@ -62,6 +77,10 @@ impl Flow {
     }
 
     pub fn build(f: &Func, pr: &Prep, br: &dyn Borrows, with_sites: bool) -> Flow {
+        Flow::build_with(f, pr, br, with_sites, Mode::Plain, &[])
+    }
+
+    pub fn build_with(f: &Func, pr: &Prep, br: &dyn Borrows, with_sites: bool, mode: Mode, absorb: &[usize]) -> Flow {
         let (ix, sl) = (&pr.ix, &pr.sl);
         let nparams = f.params.len();
         let (sites, site_at, drops) = if with_sites {
@@ -78,6 +97,8 @@ impl Flow {
             }
         }
         let owners = owner_bits.count() > 0;
+        let mut absorb_bits = Bits::new(nseeds);
+        absorb.iter().filter(|&&b| b < nseeds).for_each(|&b| absorb_bits.set(b));
         let zero_add = if owners { pr.zero_add.clone() } else { HashMap::default() };
         let code_of = pr.code_of.clone();
         let mut fl = Flow {
@@ -98,12 +119,15 @@ impl Flow {
             code_of,
             scratch: Bits::new(nseeds),
             uses: Vec::new(),
+            mode,
+            absorb: absorb_bits,
+            absorbed: Vec::new(),
         };
         for i in 0..nparams.min(ix.nvals) {
             fl.may[i].set(1 + i);
         }
         let entry = ix.rpo.first().copied().unwrap_or(0);
-        let deps = pr.users(f, owners);
+        let deps = pr.users(f, owners || mode == Mode::Deep);
         let mut dirty = vec![true; f.blocks.len()];
         let mut cout: Vec<Option<Vec<CellVal>>> = vec![None; f.blocks.len()];
         let mut rounds = 0;
@@ -192,6 +216,38 @@ impl Flow {
         hit
     }
 
+    fn scratch_params(&self) -> Bits {
+        Bits::new(self.nseeds)
+    }
+
+    fn param_bits_into(&self, addr: Val, acc: &mut Bits) -> bool {
+        let mut hit = false;
+        for b in self.may[addr as usize].iter() {
+            if b >= 1 && b <= self.nparams {
+                acc.set(b);
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    fn absorbs(&self, addr: Val) -> bool {
+        if self.absorb.count() == 0 {
+            return false;
+        }
+        let mut any = false;
+        for b in self.may[addr as usize].iter() {
+            if b == OTHER {
+                continue;
+            }
+            if !self.absorb.get(b) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
     fn put(&mut self, v: Val, m: &Bits, d: bool) -> bool {
         let i = v as usize;
         let mut ch = self.may[i].union(m);
@@ -266,6 +322,9 @@ impl Flow {
                 None => {
                     acc.assign(&self.other_bits);
                     der |= self.owner_field_load(*addr, inst.ty.bytes(), &mut acc);
+                    if self.mode == Mode::Deep && inst.ty == crate::fir::FTy::Ptr {
+                        der |= self.param_bits_into(*addr, &mut acc);
+                    }
                 }
             },
             Op::Store { addr, val } => match sl.access(*addr, inst.ty) {
@@ -279,7 +338,20 @@ impl Flow {
                         c.derived = true;
                     }
                 }
-                None => self.sink(*val),
+                None => {
+                    if self.absorbs(*addr) {
+                        if !self.absorbed.contains(&at) {
+                            self.absorbed.push(at);
+                        }
+                    } else {
+                        self.sink(*val);
+                    }
+                    if self.mode == Mode::Deep {
+                        let mut a = self.scratch_params();
+                        self.param_bits_into(*addr, &mut a);
+                        self.escaped.union(&a);
+                    }
+                }
             },
             Op::Call { name, args } => {
                 let mut pair = false;
@@ -292,7 +364,7 @@ impl Flow {
                     }
                 }
                 for (k, v) in args.iter().enumerate() {
-                    if (pair && k == 0) || br.borrows(name, k) {
+                    if (pair && k == 0) || (self.mode == Mode::Plain && br.borrows(name, k)) || (self.mode == Mode::Deep && br.deep_borrows(name, k)) {
                         continue;
                     }
                     self.sink(*v);

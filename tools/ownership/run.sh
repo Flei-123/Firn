@@ -70,6 +70,12 @@ expect_rc fir_vec_freed check 0
 expect_rc fir_child_vecret on 0
 expect_rc fir_child_vecret strict 0
 expect_rc fir_child_vecret check 0
+same_out fir_child_alias
+FIRN_OWN_NO_AST=1 same_out fir_child_alias
+FIRN_OWN_NO_AST=1 expect_rc fir_child_tree on 0
+FIRN_OWN_NO_AST=1 expect_rc fir_child_tree strict 0
+FIRN_OWN_NO_AST=1 expect_rc fir_child_tree check 0
+expect_rc fir_child_tree on 0
 expect_rc fir_map_freed on 0
 expect_rc fir_map_freed strict 0
 expect_rc fir_map_freed check 0

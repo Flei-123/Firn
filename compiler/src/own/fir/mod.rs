@@ -11,6 +11,7 @@ pub(crate) mod reuse_apply;
 pub(crate) mod sites;
 pub(crate) mod slots;
 pub(crate) mod summary;
+pub(crate) mod tree;
 
 use crate::fir::{Module, Op};
 use crate::opt::Level;
@@ -61,6 +62,8 @@ pub(crate) fn run(m: &mut Module) {
     }
     let owner_fn = registry::drop_fn(registry::Drop::SlotsOwner, mode);
     let owner_fn = if m.funcs.iter().any(|f| f.name == owner_fn) { owner_fn } else { free_fn };
+    let tree_fn = registry::drop_fn(registry::Drop::Tree, mode);
+    let tree_on = m.funcs.iter().any(|f| f.name == tree_fn);
     let reuse_on = matches!(mode, super::Mode::On | super::Mode::Strict) && std::env::var_os("FIRN_OWN_NO_REUSE").is_none();
     let reuse_calls = m.funcs.iter().any(|f| f.name == registry::REUSE_ALLOC);
     let t0 = std::time::Instant::now();
@@ -72,7 +75,10 @@ pub(crate) fn run(m: &mut Module) {
     }
     let ts = std::time::Instant::now();
     let cache = prep::Cache::new(m.funcs.len());
-    let (sums, roots, st) = summary::compute(m, &base, &cache);
+    let (mut sums, roots, st) = summary::compute(m, &base, &cache);
+    if tree_on {
+        tree::compute(m, &cache, &mut sums);
+    }
     let sum_ms = ts.elapsed().as_millis();
     let ta = std::time::Instant::now();
     let plans = {
@@ -99,7 +105,14 @@ pub(crate) fn run(m: &mut Module) {
         }
         if let Some((d, drops, plans, allocs, exits)) = plan.pending {
             let Some(sl) = cache.built(fi).map(|p| &p.sl) else { continue };
-            let fns: Vec<&str> = drops.iter().map(|d| if *d == registry::Drop::SlotsOwner { owner_fn } else { free_fn }).collect();
+            let fns: Vec<&str> = drops
+                .iter()
+                .map(|d| match d {
+                    registry::Drop::SlotsOwner => owner_fn,
+                    registry::Drop::Tree => tree_fn,
+                    registry::Drop::Block => free_fn,
+                })
+                .collect();
             let marked: crate::fx::HashSet<usize> = plans.iter().map(|p| p.free).collect();
             let (n, handles) = insert::apply(f, sl, d, &fns, &marked);
             frees += n;
@@ -150,6 +163,9 @@ fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries
         return plan;
     }
     plan.sites = fl.sites.len();
+    if !sums.tree.is_empty() {
+        tree::mark(f, p, &mut fl, sums);
+    }
     let (d, freed) = live::deaths(f, ix, sl, &mut fl, sums);
     for (&at, &k) in fl.site_at.iter() {
         if freed[k] {
