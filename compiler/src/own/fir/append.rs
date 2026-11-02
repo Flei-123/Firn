@@ -5,6 +5,10 @@ pub(crate) const APPEND: &str = "__own_str_append";
 
 const SOURCES: &[&str] = &["__str_concat", "__own_str_concat2", "__str_concat3", "__own_str_concat3", "__str_concat4", "__own_str_concat4"];
 
+const ALIASING_SOURCE: &str = "__str_concat";
+
+const ALIAS_BIT: i128 = 4;
+
 const RUNTIME_PREFIXES: &[&str] = &["__own_", "__str_", "__gc"];
 
 const MAX_PARTS: usize = 4;
@@ -148,7 +152,9 @@ fn rewrite(f: &mut Func, free_fn: &str, poison_fn: &str) -> (usize, usize) {
             }
             let zero = f.new_val_pub(FTy::I64);
             let flag = f.new_val_pub(FTy::U64);
-            let mut pre = vec![Inst::new(Some(zero), FTy::I64, Op::Const(0)), Inst::new(Some(flag), FTy::U64, Op::Const(kind as i128))];
+            let aliasing = matches!(&f.blocks[bi].insts[ii].op, Op::Call { name, .. } if name == ALIASING_SOURCE);
+            let bits = kind as i128 | if aliasing { ALIAS_BIT } else { 0 };
+            let mut pre = vec![Inst::new(Some(zero), FTy::I64, Op::Const(0)), Inst::new(Some(flag), FTy::U64, Op::Const(bits))];
             if let Op::Call { name, args } = &mut f.blocks[bi].insts[ii].op {
                 *name = APPEND.to_string();
                 while args.len() < 1 + 2 * MAX_PARTS {
