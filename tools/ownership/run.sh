@@ -92,10 +92,21 @@ has_reuse() {
   n=$(FIRN_OWN_STATS=1 "$FIRNC" ${OWN_NO_CACHE---no-cache} --ownership=on "$C/$1.fi" -o "$D/$1_stats" 2>&1 | sed -n 's/.* \([0-9]*\) reuses.*/\1/p' | tail -1)
   if [ "${n:-0}" -gt 0 ]; then pass=$((pass + 1)); else echo "FAIL $1: no reuse"; fail=$((fail + 1)); fi
 }
-for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed; do
+reuse_count() {
+  "$@" 2>&1 | sed -n 's/.* \([0-9]*\) reuses.*/\1/p' | tail -1
+}
+quiet_gain() {
+  case " ${OWN_SKIP:-} " in *" $1 "*) return ;; esac
+  local a b
+  a=$(reuse_count env FIRN_OWN_NO_QUIET=1 FIRN_OWN_STATS=1 "$FIRNC" ${OWN_NO_CACHE---no-cache} --ownership=on "$C/$1.fi" -o "$D/$1_nq")
+  b=$(reuse_count env FIRN_OWN_STATS=1 "$FIRNC" ${OWN_NO_CACHE---no-cache} --ownership=on "$C/$1.fi" -o "$D/$1_q")
+  if [ "${b:-0}" -gt "${a:-0}" ]; then pass=$((pass + 1)); else echo "FAIL $1: no reuse across quiet calls ($a vs $b)"; fail=$((fail + 1)); fi
+}
+for c in fir_reuse_obj_loop fir_reuse_pairs fir_reuse_closure fir_reuse_mixed fir_reuse_quiet_call; do
   same_out "$c"
   has_reuse "$c"
 done
+quiet_gain fir_reuse_quiet_call
 same_out fir_tree_shared
 FIRN_OWN_NO_AST=1 same_out fir_tree_shared
 same_out fir_tree_after

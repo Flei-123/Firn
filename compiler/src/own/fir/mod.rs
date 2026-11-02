@@ -5,6 +5,7 @@ pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod live;
 pub(crate) mod prep;
+pub(crate) mod quiet;
 pub(crate) mod registry;
 pub(crate) mod reuse;
 pub(crate) mod reuse_apply;
@@ -80,10 +81,11 @@ pub(crate) fn run(m: &mut Module) {
         tree::compute(m, &cache, &mut sums);
     }
     let sum_ms = ts.elapsed().as_millis();
+    let quiet = if reuse_on && std::env::var_os("FIRN_OWN_NO_QUIET").is_none() { quiet::Quiet::compute(m) } else { quiet::Quiet::none() };
     let ta = std::time::Instant::now();
     let plans = {
         let m: &Module = m;
-        crate::parfn::map_weighted(&roots, |&fi| crate::parfn::weight(&m.funcs[fi]), |&fi| analyze(m, fi, &cache, &sums, reuse_on, reuse_calls))
+        crate::parfn::map_weighted(&roots, |&fi| crate::parfn::weight(&m.funcs[fi]), |&fi| analyze(m, fi, &cache, &sums, reuse_on, reuse_calls, &quiet))
     };
     let ana_ms = ta.elapsed().as_millis();
     let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
@@ -121,11 +123,12 @@ pub(crate) fn run(m: &mut Module) {
     }
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!(
-            "ownership fir: summaries {} ms ({} borrow evals in {} rounds, {} fresh evals), {} roots analyzed in {} ms",
+            "ownership fir: summaries {} ms ({} borrow evals in {} rounds, {} fresh evals, {} quiet functions), {} roots analyzed in {} ms",
             sum_ms,
             st.borrow_evals,
             st.rounds,
             st.fresh_evals,
+            quiet.len(),
             roots.len(),
             ana_ms
         );
@@ -150,7 +153,7 @@ struct Plan {
     sites: usize,
 }
 
-fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool) -> Plan {
+fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool, quiet: &quiet::Quiet) -> Plan {
     let f = &m.funcs[fi];
     let mut plan = Plan { kept: Default::default(), pending: None, sites: 0 };
     if summary::skipped(f) {
@@ -175,7 +178,7 @@ fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries
     let (plans, allocs) = if reuse_on {
         let classes = reuse::site_classes(f, ix, &fl.sites, &fl.drops, &fl.site_at);
         let allocs = reuse::allocs(f, ix, reuse_calls);
-        (reuse::plan(f, ix, &d, &classes, &allocs), allocs)
+        (reuse::plan(f, ix, &d, &classes, &allocs, quiet), allocs)
     } else {
         (Vec::new(), Vec::new())
     };

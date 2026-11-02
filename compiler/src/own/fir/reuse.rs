@@ -1,5 +1,6 @@
 use super::index::Index;
 use super::live::Free;
+use super::quiet::Quiet;
 use super::registry::{self, Drop};
 use super::sites::{fast_def, Site};
 use crate::fir::{Func, Op, Term, Val};
@@ -141,7 +142,7 @@ fn is_since_addr(f: &Func, ix: &Index, a: Val) -> bool {
     matches!(ix.op(f, *base), Some(Op::GcAddr { .. })) && ix.const_of(f, *off) == Some(crate::gc::ST_SINCE as i128)
 }
 
-pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>], allocs: &[Alloc]) -> Vec<Plan> {
+pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>], allocs: &[Alloc], q: &Quiet) -> Vec<Plan> {
     let mut used: HashSet<Val> = HashSet::default();
     let mut plans = Vec::new();
     for (i, fr) in frees.iter().enumerate() {
@@ -151,14 +152,14 @@ pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>]
         let here = allocs.iter().position(|a| a.head == b && a.class == c && !used.contains(&a.b0) && def_pos(ix, a.b0) >= fr.pos);
         let found = if let Some(k) = here {
             let upto = &f.blocks[b].insts[fr.pos.min(f.blocks[b].insts.len())..def_pos(ix, allocs[k].b0)];
-            (!has_call(upto)).then(|| (vec![b], k))
-        } else if has_call(rest) {
+            (!q.may_gc(upto)).then(|| (vec![b], k))
+        } else if q.may_gc(rest) {
             None
         } else {
             let mut path = vec![b];
             let mut seen: HashSet<usize> = HashSet::default();
             seen.insert(b);
-            search(f, ix, allocs, &used, c, &mut path, &mut seen)
+            search(f, ix, allocs, &used, c, &mut path, &mut seen, q)
         };
         let Some((path, k)) = found else { continue };
         used.insert(allocs[k].b0);
@@ -193,7 +194,7 @@ fn simple_preds(ix: &Index, path: &[usize]) -> bool {
     path.windows(2).all(|w| ix.preds[w[1]].iter().filter(|&&p| p == w[0]).count() == 1)
 }
 
-fn search(f: &Func, ix: &Index, allocs: &[Alloc], used: &HashSet<Val>, c: usize, path: &mut Vec<usize>, seen: &mut HashSet<usize>) -> Option<(Vec<usize>, usize)> {
+fn search(f: &Func, ix: &Index, allocs: &[Alloc], used: &HashSet<Val>, c: usize, path: &mut Vec<usize>, seen: &mut HashSet<usize>, q: &Quiet) -> Option<(Vec<usize>, usize)> {
     if path.len() > MAX_PATH {
         return None;
     }
@@ -203,17 +204,17 @@ fn search(f: &Func, ix: &Index, allocs: &[Alloc], used: &HashSet<Val>, c: usize,
             continue;
         }
         if let Some(k) = allocs.iter().position(|a| a.head == x && a.class == c && !used.contains(&a.b0)) {
-            if !has_call(&f.blocks[x].insts[..def_pos(ix, allocs[k].b0)]) {
+            if !q.may_gc(&f.blocks[x].insts[..def_pos(ix, allocs[k].b0)]) {
                 let mut p = path.clone();
                 p.push(x);
                 return Some((p, k));
             }
         }
-        if has_call(&f.blocks[x].insts) {
+        if q.may_gc(&f.blocks[x].insts) {
             continue;
         }
         path.push(x);
-        if let Some(r) = search(f, ix, allocs, used, c, path, seen) {
+        if let Some(r) = search(f, ix, allocs, used, c, path, seen, q) {
             return Some(r);
         }
         path.pop();
