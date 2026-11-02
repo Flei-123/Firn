@@ -18,6 +18,67 @@ pub(crate) struct Free {
     pub pos: usize,
     pub handle: Handle,
     pub site: usize,
+    pub mixed: bool,
+}
+
+pub(crate) struct Sel {
+    seed: Option<usize>,
+    lab: Bits,
+    twins: Bits,
+    seeds: Bits,
+}
+
+impl Sel {
+    fn seed(seed: usize) -> Sel {
+        Sel { seed: Some(seed), lab: Bits::new(0), twins: Bits::new(0), seeds: Bits::new(0) }
+    }
+
+    fn val(&self, fl: &Flow, v: Val) -> bool {
+        match self.seed {
+            Some(s) => fl.may[v as usize].get(s),
+            None => fl.gen[v as usize].intersects(&self.lab),
+        }
+    }
+
+    fn stored(&self, fl: &Flow, v: Val) -> bool {
+        match self.seed {
+            Some(s) => fl.may[v as usize].get(s),
+            None => fl.gen[v as usize].intersects(&self.twins),
+        }
+    }
+
+    fn cell(&self, c: &CellVal) -> bool {
+        match self.seed {
+            Some(s) => c.may.get(s),
+            None => c.gen.intersects(&self.lab),
+        }
+    }
+
+    fn owned(&self, may: &Bits, gen: &Bits, derived: bool) -> bool {
+        match self.seed {
+            Some(s) => !derived && may.count() == 1 && may.get(s),
+            None => !derived && gen.count() > 0 && gen.subset_of(&self.lab) && may.count() > 0 && may.subset_of(&self.seeds),
+        }
+    }
+
+    fn must_val(&self, fl: &Flow, v: Val) -> bool {
+        match self.seed {
+            Some(s) => fl.must(v) == Some(s),
+            None => self.owned(&fl.may[v as usize], &fl.gen[v as usize], fl.derived[v as usize]),
+        }
+    }
+
+    fn owner(&self, fl: &Flow) -> bool {
+        self.seed.map_or(false, |s| fl.owner_bits.get(s))
+    }
+
+    fn site_here(&self, fl: &Flow, at: (usize, usize), site: usize) -> Option<usize> {
+        let k = *fl.site_at.get(&at)?;
+        match self.seed {
+            Some(_) => (k == site).then_some(k),
+            None => fl.labels.as_ref()?.cur(at).filter(|&d| self.lab.get(d)).map(|_| k),
+        }
+    }
 }
 
 struct Items {
@@ -32,7 +93,7 @@ struct Ctx<'a> {
     f: &'a Func,
     ix: &'a Index,
     sl: &'a Slots,
-    seed: usize,
+    sel: Sel,
     site: usize,
     items: Items,
 }
@@ -45,7 +106,7 @@ pub(crate) fn deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn B
         if fl.escaped.get(seed) || fl.ret_may.get(seed) {
             continue;
         }
-        if let Some(v) = site_deaths(f, ix, sl, fl, br, k) {
+        if let Some(v) = site_deaths(f, ix, sl, fl, br, k, Sel::seed(seed), &[k]) {
             freed[k] = !v.is_empty();
             out.extend(v);
         }
@@ -53,26 +114,30 @@ pub(crate) fn deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn B
     (out, freed)
 }
 
-fn items_for(f: &Func, sl: &Slots, fl: &Flow, seed: usize, site: usize) -> Items {
+fn items_for(f: &Func, sl: &Slots, fl: &Flow, sel: &Sel, members: &[usize]) -> Items {
     let mut val = HashMap::default();
     let mut n = 0;
-    for (v, m) in fl.may.iter().enumerate() {
-        if m.get(seed) {
+    for v in 0..fl.may.len() {
+        if sel.val(fl, v as Val) {
             val.insert(v as Val, n);
             n += 1;
         }
     }
     let nv = n;
     let mut cell = HashMap::default();
-    if let Site::Pair { cell_p, .. } = fl.sites[site] {
-        cell.insert(cell_p, n);
-        n += 1;
+    for &k in members.iter() {
+        if let Site::Pair { cell_p, .. } = fl.sites[k] {
+            if !cell.contains_key(&cell_p) {
+                cell.insert(cell_p, n);
+                n += 1;
+            }
+        }
     }
     for b in f.blocks.iter() {
         for inst in b.insts.iter() {
             if let Op::Store { addr, val: sv } = &inst.op {
                 if let Some(a) = sl.access(*addr, inst.ty) {
-                    if fl.may[*sv as usize].get(seed) && !cell.contains_key(&a.cell) {
+                    if sel.stored(fl, *sv) && !cell.contains_key(&a.cell) {
                         cell.insert(a.cell, n);
                         n += 1;
                     }
@@ -159,12 +224,12 @@ impl<'a> Ctx<'a> {
         if live.intersects(&self.items.valmask) {
             return true;
         }
-        self.items.cell.iter().any(|(&c, &i)| live.get(i) && cells[c].may.get(self.seed))
+        self.items.cell.iter().any(|(&c, &i)| live.get(i) && self.sel.cell(&cells[c]))
     }
 
     fn must_cell(&self, cells: &[CellVal], c: usize) -> bool {
         let x = &cells[c];
-        !x.derived && x.may.count() == 1 && x.may.get(self.seed)
+        self.sel.owned(&x.may, &x.gen, x.derived)
     }
 
     fn live_in(&self, fl: &Flow, bi: usize, out: &Bits) -> Bits {
@@ -210,10 +275,9 @@ impl<'a> Ctx<'a> {
     }
 }
 
-fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows, site: usize) -> Option<Vec<Free>> {
-    let seed = fl.seed_of_site(site);
-    let items = items_for(f, sl, fl, seed, site);
-    let cx = Ctx { f, ix, sl, seed, site, items };
+fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows, site: usize, sel: Sel, members: &[usize]) -> Option<Vec<Free>> {
+    let items = items_for(f, sl, fl, &sel, members);
+    let cx = Ctx { f, ix, sl, sel, site, items };
     let nb = f.blocks.len();
     let mut ins = vec![Bits::new(cx.items.n); nb];
     let mut outs = vec![Bits::new(cx.items.n); nb];
@@ -269,8 +333,10 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             let mut before_live = live.clone();
             cx.back(fl, inst, (bi, ii), &mut before_live, &mut buf);
             let before = cx.carried(&before_live, &states[ii]);
-            let is_site = fl.site_at.get(&(bi, ii)) == Some(&site);
+            let here = cx.sel.site_here(fl, (bi, ii), site);
+            let is_site = here.is_some();
             if is_site && before {
+                cx.sel.seed?;
                 let old = self_append_old(&cx, fl, inst)?;
                 let mut rest = live.clone();
                 if let Some(&c) = cx.items.cell.get(&cell_p_of(fl, site)?) {
@@ -279,14 +345,14 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
                 if cx.carried(&rest, &states[ii + 1]) {
                     return None;
                 }
-                frees.push(Free { block: bi, pos: ii + 1, handle: Handle::Val(old), site: cx.site });
+                frees.push(Free { block: bi, pos: ii + 1, handle: Handle::Val(old), site: cx.site, mixed: false });
                 live = before_live;
                 continue;
             }
             let defines = is_site || inst.dst.map_or(false, |d| cx.items.val.contains_key(&d));
             if (before || defines) && !after {
-                if let Some(h) = handle(&cx, fl, inst, is_site, &states[ii + 1]) {
-                    frees.push(Free { block: bi, pos: ii + 1, handle: h, site: cx.site });
+                if let Some(h) = handle(&cx, fl, inst, here, &states[ii + 1]) {
+                    frees.push(Free { block: bi, pos: ii + 1, handle: h, site: cx.site, mixed: false });
                 }
             }
             live = before_live;
@@ -304,12 +370,12 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
         }
         let mut h = None;
         for (&v, &i) in cx.items.val.iter() {
-            if outs[p].get(i) && fl.must(v) == Some(seed) {
+            if outs[p].get(i) && cx.sel.must_val(fl, v) {
                 h = Some(Handle::Val(v));
                 break;
             }
         }
-        if h.is_none() && cell_handles(fl, cx.site) {
+        if h.is_none() && (cx.sel.seed.is_none() || cell_handles(fl, cx.site)) {
             for (&c, &i) in cx.items.cell.iter() {
                 if outs[p].get(i) && cx.must_cell(pend, c) {
                     h = Some(Handle::Cell(c));
@@ -318,16 +384,16 @@ fn site_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows
             }
         }
         if let Some(h) = h {
-            frees.push(Free { block: bi, pos: 0, handle: h, site: cx.site });
+            frees.push(Free { block: bi, pos: 0, handle: h, site: cx.site, mixed: false });
         }
     }
     Some(frees)
 }
 
-fn handle(cx: &Ctx, fl: &Flow, inst: &Inst, is_site: bool, after: &[CellVal]) -> Option<Handle> {
-    if is_site {
-        if let Site::Pair { cell_p, .. } = fl.sites[cx.site] {
-            return (cell_handles(fl, cx.site) && cx.must_cell(after, cell_p)).then_some(Handle::Cell(cell_p));
+fn handle(cx: &Ctx, fl: &Flow, inst: &Inst, here: Option<usize>, after: &[CellVal]) -> Option<Handle> {
+    if let Some(k) = here {
+        if let Site::Pair { cell_p, .. } = fl.sites[k] {
+            return (cell_handles(fl, k) && cx.must_cell(after, cell_p)).then_some(Handle::Cell(cell_p));
         }
     }
     let mut u = Vec::new();
@@ -335,7 +401,7 @@ fn handle(cx: &Ctx, fl: &Flow, inst: &Inst, is_site: bool, after: &[CellVal]) ->
     if let Some(d) = inst.dst {
         u.push(d);
     }
-    if let Some(v) = u.iter().copied().find(|v| fl.must(*v) == Some(cx.seed)) {
+    if let Some(v) = u.iter().copied().find(|v| cx.sel.must_val(fl, *v)) {
         return Some(Handle::Val(v));
     }
     u.into_iter().find_map(|v| base_of(cx, fl, v)).map(Handle::Val)
@@ -345,10 +411,10 @@ fn base_of(cx: &Ctx, fl: &Flow, mut v: Val) -> Option<Val> {
     for _ in 0..8 {
         match cx.ix.op(cx.f, v)? {
             Op::PtrAdd { base, .. } => v = *base,
-            Op::Load { addr } if fl.owner_bits.get(cx.seed) => v = fl.zero_add.get(addr).copied().unwrap_or(*addr),
+            Op::Load { addr } if cx.sel.owner(fl) => v = fl.zero_add.get(addr).copied().unwrap_or(*addr),
             _ => return None,
         }
-        if fl.must(v) == Some(cx.seed) {
+        if cx.sel.must_val(fl, v) {
             return Some(v);
         }
     }
@@ -375,7 +441,7 @@ fn self_append_old(cx: &Ctx, fl: &Flow, inst: &Inst) -> Option<Val> {
         Some(Op::Load { addr }) => cx.sl.access(*addr, cx.f.val_ty(v)).map(|a| a.cell),
         _ => None,
     };
-    if cell(args[1]) != Some(cell_p) || cell(args[2]) != Some(cell_n) || fl.must(args[1]) != Some(cx.seed) {
+    if cell(args[1]) != Some(cell_p) || cell(args[2]) != Some(cell_n) || !cx.sel.must_val(fl, args[1]) {
         return None;
     }
     Some(args[1])
@@ -383,4 +449,59 @@ fn self_append_old(cx: &Ctx, fl: &Flow, inst: &Inst) -> Option<Val> {
 
 fn cell_handles(fl: &Flow, site: usize) -> bool {
     fl.drops[site] != Drop::SlotsOwner
+}
+
+pub(crate) fn carried_deaths(f: &Func, ix: &Index, sl: &Slots, fl: &mut Flow, br: &dyn Borrows, group: &[Free], freed: &mut [bool], size: Option<&[Option<usize>]>) -> Vec<Free> {
+    let Some(lb) = fl.labels.as_ref() else { return Vec::new() };
+    let gens = fl.gen.iter().cloned().chain(fl.cin.iter().flatten().flat_map(|c| c.iter().map(|x| x.gen.clone())));
+    let classes = super::carried::classes(lb, gens);
+    let twins: Vec<Bits> = classes.iter().map(|c| lb.twins(&c.lab)).collect();
+    let mut out: Vec<Free> = Vec::new();
+    for (c, tw) in classes.into_iter().zip(twins) {
+        let mut members: Vec<usize> = c.defs.iter().filter_map(|at| fl.site_at.get(at).copied()).collect();
+        members.sort_unstable();
+        members.dedup();
+        let mut seeds = Bits::new(fl.nseeds);
+        members.iter().for_each(|&k| seeds.set(fl.seed_of_site(k)));
+        let ok = members.iter().all(|&k| {
+            let s = fl.seed_of_site(k);
+            fl.drops[k] == Drop::Block && !fl.escaped.get(s) && !fl.ret_may.get(s)
+        });
+        if !ok || members.is_empty() {
+            continue;
+        }
+        let sel = Sel { seed: None, lab: c.lab, twins: tw, seeds: seeds.clone() };
+        let Some(v) = site_deaths(f, ix, sl, fl, br, members[0], sel, &members) else { continue };
+        let mut any = false;
+        for mut fr in v {
+            let dup = group.iter().chain(out.iter()).any(|g| g.block == fr.block && g.pos == fr.pos && seeds.get(fl.seed_of_site(g.site)));
+            if dup {
+                continue;
+            }
+            match uniform_site(fl, &fr, &members, size) {
+                Some(k) => fr.site = k,
+                None => fr.mixed = true,
+            }
+            out.push(fr);
+            any = true;
+        }
+        if any {
+            members.iter().for_each(|&k| freed[k] = true);
+        }
+    }
+    out
+}
+
+fn uniform_site(fl: &Flow, fr: &Free, members: &[usize], size: Option<&[Option<usize>]>) -> Option<usize> {
+    let sz = size?;
+    let sites: Vec<usize> = match (fr.handle, fl.labels.as_ref()) {
+        (Handle::Val(v), Some(lb)) => {
+            let g = &fl.gen[v as usize];
+            lb.def_at.iter().filter(|(_, &d)| g.get(d) || g.get(lb.nd + d)).filter_map(|(at, _)| fl.site_at.get(at).copied()).collect()
+        }
+        _ => members.to_vec(),
+    };
+    let k0 = *sites.first()?;
+    let first = sz.get(k0).copied().flatten()?;
+    sites.iter().all(|&k| sz.get(k).copied().flatten() == Some(first)).then_some(k0)
 }

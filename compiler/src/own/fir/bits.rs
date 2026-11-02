@@ -44,6 +44,9 @@ impl Bits {
     pub fn intersects(&self, o: &Bits) -> bool {
         self.lo & o.lo != 0 || self.hi.iter().zip(o.hi.iter()).any(|(a, b)| a & b != 0)
     }
+    pub fn subset_of(&self, o: &Bits) -> bool {
+        self.lo & !o.lo == 0 && self.hi.iter().enumerate().all(|(k, a)| a & !o.hi.get(k).copied().unwrap_or(0) == 0)
+    }
     pub fn assign(&mut self, o: &Bits) {
         self.lo = o.lo;
         self.hi.clear();

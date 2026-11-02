@@ -1,6 +1,7 @@
 pub(crate) mod append;
 pub(crate) mod bits;
 pub(crate) mod borrow;
+pub(crate) mod carried;
 pub(crate) mod flow;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -167,7 +168,7 @@ fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries
     }
     let p = cache.get(m, fi);
     let (ix, sl) = (&p.ix, &p.sl);
-    let mut fl = flow::Flow::build(f, p, sums, true);
+    let mut fl = flow::Flow::build_carried(f, p, sums);
     if fl.sites.is_empty() || fl.sites.len().saturating_mul(f.inst_count()) > summary::MAX_SITE_WORK {
         return plan;
     }
@@ -175,14 +176,17 @@ fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries
     if !sums.tree.is_empty() {
         tree::mark(f, p, &mut fl, sums);
     }
-    let (d, freed) = live::deaths(f, ix, sl, &mut fl, sums);
+    let (mut d, mut freed) = live::deaths(f, ix, sl, &mut fl, sums);
+    let classes = if reuse_on { Some(reuse::site_classes(f, ix, &fl.sites, &fl.drops, &fl.site_at)) } else { None };
+    let extra = live::carried_deaths(f, ix, sl, &mut fl, sums, &d, &mut freed, classes.as_deref());
+    d.extend(extra);
     for (&at, &k) in fl.site_at.iter() {
         if freed[k] {
             plan.kept.insert(at);
         }
     }
     let (plans, allocs) = if reuse_on {
-        let classes = reuse::site_classes(f, ix, &fl.sites, &fl.drops, &fl.site_at);
+        let classes = classes.unwrap_or_default();
         let allocs = reuse::allocs(f, ix, reuse_calls);
         (reuse::plan(f, ix, &d, &classes, &allocs, quiet), allocs)
     } else {

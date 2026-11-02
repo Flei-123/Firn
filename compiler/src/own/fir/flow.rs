@@ -1,3 +1,4 @@
+use super::carried::Labels;
 use super::index::Bits;
 use super::prep::Prep;
 use super::registry::Drop;
@@ -12,6 +13,7 @@ pub(crate) const OTHER: usize = 0;
 pub(crate) struct CellVal {
     pub may: Bits,
     pub derived: bool,
+    pub gen: Bits,
 }
 
 pub(crate) trait Borrows {
@@ -72,6 +74,9 @@ pub(crate) struct Flow {
     mode: Mode,
     pub absorb: Bits,
     pub absorbed: Vec<(usize, usize)>,
+    pub gen: Vec<Bits>,
+    pub labels: Option<Labels>,
+    gscratch: Bits,
 }
 
 impl Flow {
@@ -80,7 +85,15 @@ impl Flow {
     }
 
     pub fn other(&self) -> CellVal {
-        CellVal { may: self.other_bits.clone(), derived: false }
+        CellVal { may: self.other_bits.clone(), derived: false, gen: self.no_gen() }
+    }
+
+    pub fn no_gen(&self) -> Bits {
+        Bits::new(self.labels.as_ref().map_or(0, |l| l.width()))
+    }
+
+    pub fn build_carried(f: &Func, pr: &Prep, br: &dyn Borrows) -> Flow {
+        Flow::build_inner(f, pr, br, true, Mode::Plain, &[], true)
     }
 
     pub fn must(&self, v: Val) -> Option<usize> {
@@ -96,6 +109,10 @@ impl Flow {
     }
 
     pub fn build_with(f: &Func, pr: &Prep, br: &dyn Borrows, with_sites: bool, mode: Mode, absorb: &[usize]) -> Flow {
+        Flow::build_inner(f, pr, br, with_sites, mode, absorb, false)
+    }
+
+    fn build_inner(f: &Func, pr: &Prep, br: &dyn Borrows, with_sites: bool, mode: Mode, absorb: &[usize], carried: bool) -> Flow {
         let (ix, sl) = (&pr.ix, &pr.sl);
         let nparams = f.params.len();
         let (sites, site_at, drops) = if with_sites {
@@ -116,6 +133,8 @@ impl Flow {
         absorb.iter().filter(|&&b| b < nseeds).for_each(|&b| absorb_bits.set(b));
         let zero_add = if owners { pr.zero_add.clone() } else { HashMap::default() };
         let code_of = pr.code_of.clone();
+        let labels = if carried { Labels::build(f, ix, &site_at) } else { None };
+        let nlab = labels.as_ref().map_or(0, |l| l.width());
         let mut fl = Flow {
             nseeds,
             nparams,
@@ -137,6 +156,9 @@ impl Flow {
             mode,
             absorb: absorb_bits,
             absorbed: Vec::new(),
+            gen: vec![Bits::new(nlab); ix.nvals],
+            labels,
+            gscratch: Bits::new(nlab),
         };
         for i in 0..nparams.min(ix.nvals) {
             fl.may[i].set(1 + i);
@@ -159,6 +181,16 @@ impl Flow {
                     let mut acc: Option<Vec<CellVal>> = None;
                     for &p in ix.preds[bi].iter() {
                         if let Some(c) = &cout[p] {
+                            let aged;
+                            let c = match &fl.labels {
+                                Some(lb) if lb.ages(p, bi) => {
+                                    let mut x = c.clone();
+                                    x.iter_mut().for_each(|cv| lb.age(p, bi, &mut cv.gen));
+                                    aged = x;
+                                    &aged
+                                }
+                                _ => c,
+                            };
                             match &mut acc {
                                 None => acc = Some(c.clone()),
                                 Some(a) => join(a, c),
@@ -263,9 +295,10 @@ impl Flow {
         any
     }
 
-    fn put(&mut self, v: Val, m: &Bits, d: bool) -> bool {
+    fn put(&mut self, v: Val, m: &Bits, g: &Bits, d: bool) -> bool {
         let i = v as usize;
         let mut ch = self.may[i].union(m);
+        ch |= self.gen[i].union(g);
         if d && !self.derived[i] {
             self.derived[i] = true;
             ch = true;
@@ -281,27 +314,34 @@ impl Flow {
     pub fn transfer(&mut self, f: &Func, sl: &Slots, br: &dyn Borrows, cells: &mut [CellVal], inst: &Inst, at: (usize, usize), vals: bool) -> bool {
         let mut acc = std::mem::take(&mut self.scratch);
         acc.reset();
+        let mut gacc = std::mem::take(&mut self.gscratch);
+        gacc.reset();
         let mut der = false;
         let mut uses = std::mem::take(&mut self.uses);
         uses.clear();
         match &inst.op {
             Op::Phi { incoming } => {
-                for (_, v) in incoming.iter() {
+                for (p, v) in incoming.iter() {
                     acc.union(&self.may[*v as usize]);
                     der |= self.derived[*v as usize];
+                    self.gen_from(&mut gacc, *v, Some((*p, at.0)));
                 }
             }
             Op::Copy { src } => {
                 acc.union(&self.may[*src as usize]);
+                gacc.union(&self.gen[*src as usize]);
                 der = self.derived[*src as usize];
             }
             Op::Cast { src, .. } => {
                 acc.union(&self.may[*src as usize]);
+                gacc.union(&self.gen[*src as usize]);
                 der = self.derived[*src as usize] || f.val_ty(*src).bytes() != inst.ty.bytes();
             }
             Op::Select { a, b, .. } => {
                 acc.union(&self.may[*a as usize]);
                 acc.union(&self.may[*b as usize]);
+                gacc.union(&self.gen[*a as usize]);
+                gacc.union(&self.gen[*b as usize]);
                 der = self.derived[*a as usize] || self.derived[*b as usize];
             }
             Op::PtrAdd { .. } if inst.dst.map_or(false, |d| sl.is_addr(d)) => acc.assign(&self.other_bits),
@@ -318,6 +358,7 @@ impl Flow {
                 acc.set(OTHER);
                 for v in uses.iter() {
                     acc.union(&self.may[*v as usize]);
+                    gacc.union(&self.gen[*v as usize]);
                 }
                 der = true;
             }
@@ -332,6 +373,7 @@ impl Flow {
             Op::Load { addr } => match sl.access(*addr, inst.ty) {
                 Some(a) => {
                     acc.assign(&cells[a.cell].may);
+                    gacc.assign(&cells[a.cell].gen);
                     der = cells[a.cell].derived || inst.ty.bytes() < 8;
                 }
                 None => {
@@ -345,10 +387,11 @@ impl Flow {
             Op::Store { addr, val } => match sl.access(*addr, inst.ty) {
                 Some(a) => {
                     if a.strong {
-                        cells[a.cell] = CellVal { may: self.may[*val as usize].clone(), derived: self.derived[*val as usize] };
+                        cells[a.cell] = CellVal { may: self.may[*val as usize].clone(), derived: self.derived[*val as usize], gen: self.gen[*val as usize].clone() };
                     } else {
                         let c = &mut cells[a.cell];
                         c.may.union(&self.may[*val as usize]);
+                        c.gen.union(&self.gen[*val as usize]);
                         c.may.set(OTHER);
                         c.derived = true;
                     }
@@ -373,8 +416,12 @@ impl Flow {
                 if let Some(&k) = self.site_at.get(&at) {
                     if let Site::Pair { cell_p, cell_n } = self.sites[k] {
                         let s = self.seed_of_site(k);
-                        cells[cell_p] = CellVal { may: Bits::single(self.nseeds, s), derived: false };
-                        cells[cell_n] = CellVal { may: self.other_bits.clone(), derived: false };
+                        let mut g = self.no_gen();
+                        if let Some(d) = self.labels.as_ref().and_then(|l| l.cur(at)) {
+                            g.set(d);
+                        }
+                        cells[cell_p] = CellVal { may: Bits::single(self.nseeds, s), derived: false, gen: g };
+                        cells[cell_n] = self.other();
                         pair = true;
                     }
                 }
@@ -409,21 +456,47 @@ impl Flow {
                 acc.reset();
                 acc.set(self.seed_of_site(k));
                 der = false;
+                gacc.reset();
+                if let Some(d) = self.labels.as_ref().and_then(|l| l.cur(at)) {
+                    gacc.set(d);
+                }
             }
         }
         let ch = match (vals, inst.dst) {
-            (true, Some(d)) => self.put(d, &acc, der),
+            (true, Some(d)) => self.put(d, &acc, &gacc, der),
             _ => false,
         };
         self.scratch = acc;
+        self.gscratch = gacc;
         self.uses = uses;
         ch
+    }
+}
+
+impl Flow {
+    fn gen_from(&self, acc: &mut Bits, v: Val, edge: Option<(crate::fir::BlockId, usize)>) {
+        let g = &self.gen[v as usize];
+        let aging = match (&self.labels, edge) {
+            (Some(lb), Some((pid, to))) => lb.block_of(pid).filter(|&from| lb.ages(from, to)).map(|from| (lb, from, to)),
+            _ => None,
+        };
+        match aging {
+            Some((lb, from, to)) => {
+                let mut x = g.clone();
+                lb.age(from, to, &mut x);
+                acc.union(&x);
+            }
+            None => {
+                acc.union(g);
+            }
+        }
     }
 }
 
 fn join(a: &mut [CellVal], b: &[CellVal]) {
     for (x, y) in a.iter_mut().zip(b.iter()) {
         x.may.union(&y.may);
+        x.gen.union(&y.gen);
         x.derived |= y.derived;
     }
 }

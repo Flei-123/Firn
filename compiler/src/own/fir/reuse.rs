@@ -6,7 +6,7 @@ use super::sites::{fast_def, Site};
 use crate::fir::{Func, Op, Term, Val};
 use crate::fx::{HashMap, HashSet};
 
-const MAX_PATH: usize = 8;
+const MAX_PATH: usize = 12;
 
 pub(crate) struct Alloc {
     pub call: bool,
@@ -145,8 +145,9 @@ fn is_since_addr(f: &Func, ix: &Index, a: Val) -> bool {
 pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>], allocs: &[Alloc], q: &Quiet) -> Vec<Plan> {
     let mut used: HashSet<Val> = HashSet::default();
     let mut plans = Vec::new();
+    let order = rpo_pos(ix);
     for (i, fr) in frees.iter().enumerate() {
-        let Some(c) = class.get(fr.site).copied().flatten() else { continue };
+        let Some(c) = class.get(fr.site).copied().flatten().filter(|_| !fr.mixed) else { continue };
         let b = fr.block;
         let rest = &f.blocks[b].insts[fr.pos.min(f.blocks[b].insts.len())..];
         let here = allocs.iter().position(|a| a.head == b && a.class == c && !used.contains(&a.b0) && def_pos(ix, a.b0) >= fr.pos);
@@ -161,15 +162,12 @@ pub(crate) fn plan(f: &Func, ix: &Index, frees: &[Free], class: &[Option<usize>]
             seen.insert(b);
             search(f, ix, allocs, &used, c, &mut path, &mut seen, q)
         };
-        let Some((path, k)) = found else { continue };
+        let Some((path, k)) = found.filter(|(path, k)| simple_preds(ix, path) && exits_ok(ix, path, &allocs[*k]) && !empty_on_back_edge(ix, &order, path)) else { continue };
         used.insert(allocs[k].b0);
         plans.push(Plan { free: i, path, alloc: k });
     }
     let heads: HashSet<usize> = plans.iter().map(|p| allocs[p.alloc].head).collect();
-    let order = rpo_pos(ix);
-    plans.retain(|p| {
-        p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)) && simple_preds(ix, &p.path) && exits_ok(ix, &p.path, &allocs[p.alloc]) && !empty_on_back_edge(ix, &order, &p.path)
-    });
+    plans.retain(|p| p.path[..p.path.len() - 1].iter().all(|x| !heads.contains(x)));
     plans
 }
 
