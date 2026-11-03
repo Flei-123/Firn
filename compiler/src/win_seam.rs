@@ -1433,7 +1433,20 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         let op: i64 = a2 & 127
         if op == 0 {
             var cmp: [i64; 1] = [a3]
-            WaitOnAddress(a1 as u64, (&cmp[0]) as u64, 4, 4294967295)
+            var wait_ms: i64 = 4294967295
+            if a4 != 0 {
+                let tsec: i64 = __win_ld64(a4 as u64, 0)
+                let tns: i64 = __win_ld64(a4 as u64, 1)
+                wait_ms = tsec * 1000 + (tns + 999999) / 1000000
+                if wait_ms > 4294967294 {
+                    wait_ms = 4294967294
+                }
+            }
+            if WaitOnAddress(a1 as u64, (&cmp[0]) as u64, 4, wait_ms) == 0 {
+                if (GetLastError() as i64) == 1460 {
+                    return 0 - 110
+                }
+            }
             return 0
         }
         if op == 1 {
