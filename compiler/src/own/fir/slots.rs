@@ -3,6 +3,7 @@ use super::registry;
 use crate::fir::{FTy, Func, Op, Val};
 use crate::fx::HashMap;
 
+#[derive(Clone)]
 pub(crate) struct Slots {
     pub addr: HashMap<Val, (usize, i64)>,
     pub cells: Vec<(usize, i64)>,

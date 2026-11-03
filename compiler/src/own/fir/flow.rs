@@ -211,7 +211,7 @@ impl Flow {
                     if fl.transfer(f, sl, br, &mut cells, inst, (bi, ii), true) {
                         changed = true;
                         if let Some(d) = inst.dst {
-                            for &u in deps[d as usize].iter() {
+                            for &u in deps.of(d as usize).iter() {
                                 dirty[u as usize] = true;
                             }
                         }

@@ -3,12 +3,14 @@ use crate::fx::HashMap;
 
 pub(crate) use super::bits::Bits;
 
+const NO_DEF: u32 = u32::MAX;
+
 pub(crate) struct Index {
     pub nvals: usize,
     pub preds: Vec<Vec<usize>>,
     pub succs: Vec<Vec<usize>>,
     pub rpo: Vec<usize>,
-    pub def: Vec<Option<(usize, usize)>>,
+    pub def: Vec<(u32, u32)>,
     pub uses: Vec<u32>,
 }
 
@@ -32,14 +34,14 @@ impl Index {
             });
         }
         let nvals = f.val_types.len();
-        let mut def = vec![None; nvals];
+        let mut def = vec![(NO_DEF, NO_DEF); nvals];
         let mut uses = vec![0u32; nvals];
         let mut buf = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, inst) in b.insts.iter().enumerate() {
                 if let Some(d) = inst.dst {
                     if (d as usize) < nvals {
-                        def[d as usize] = Some((bi, ii));
+                        def[d as usize] = (bi as u32, ii as u32);
                     }
                 }
                 buf.clear();
@@ -62,8 +64,17 @@ impl Index {
         Index { nvals, preds, succs, rpo, def, uses }
     }
 
+    pub fn def_of(&self, v: usize) -> Option<(usize, usize)> {
+        let &(b, i) = self.def.get(v)?;
+        if b == NO_DEF {
+            None
+        } else {
+            Some((b as usize, i as usize))
+        }
+    }
+
     pub fn op<'a>(&self, f: &'a Func, v: Val) -> Option<&'a Op> {
-        let (b, i) = (*self.def.get(v as usize)?)?;
+        let (b, i) = self.def_of(v as usize)?;
         Some(&f.blocks[b].insts[i].op)
     }
 

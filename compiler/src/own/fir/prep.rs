@@ -2,15 +2,15 @@ use super::index::{term_uses, Index};
 use super::slots::Slots;
 use crate::fir::{Func, Module, Op, Val};
 use crate::fx::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) struct Prep {
     pub ix: Index,
     pub sl: Slots,
     pub code_of: HashMap<Val, Val>,
     pub zero_add: HashMap<Val, Val>,
-    users: Vec<Vec<u32>>,
-    owner_users: OnceLock<Vec<Vec<u32>>>,
+    users: Users,
+    owner_users: OnceLock<Users>,
 }
 
 impl Prep {
@@ -22,7 +22,7 @@ impl Prep {
         Prep { code_of: code_loads(f), zero_add, users, owner_users: OnceLock::new(), ix, sl }
     }
 
-    pub fn users(&self, f: &Func, owners: bool) -> &[Vec<u32>] {
+    pub fn users(&self, f: &Func, owners: bool) -> &Users {
         if !owners || self.zero_add.is_empty() {
             return &self.users;
         }
@@ -31,20 +31,32 @@ impl Prep {
 }
 
 pub(crate) struct Cache {
-    slots: Vec<OnceLock<Prep>>,
+    slots: Vec<Mutex<Option<Arc<Prep>>>>,
 }
 
 impl Cache {
     pub fn new(n: usize) -> Cache {
-        Cache { slots: (0..n).map(|_| OnceLock::new()).collect() }
+        Cache { slots: (0..n).map(|_| Mutex::new(None)).collect() }
     }
 
-    pub fn get(&self, m: &Module, i: usize) -> &Prep {
-        self.slots[i].get_or_init(|| Prep::build(&m.funcs[i]))
+    pub fn get(&self, m: &Module, i: usize) -> Arc<Prep> {
+        let mut slot = self.slots[i].lock().unwrap();
+        if let Some(p) = slot.as_ref() {
+            return p.clone();
+        }
+        let p = Arc::new(Prep::build(&m.funcs[i]));
+        *slot = Some(p.clone());
+        p
     }
 
-    pub fn built(&self, i: usize) -> Option<&Prep> {
-        self.slots[i].get()
+    pub fn evict(&self, i: usize) {
+        *self.slots[i].lock().unwrap() = None;
+    }
+
+    pub fn clear(&mut self) {
+        for s in self.slots.iter_mut() {
+            *s.get_mut().unwrap() = None;
+        }
     }
 }
 
@@ -62,16 +74,22 @@ fn zero_adds(f: &Func, ix: &Index) -> HashMap<Val, Val> {
     out
 }
 
-fn value_users(f: &Func, ix: &Index, zero_add: &HashMap<Val, Val>) -> Vec<Vec<u32>> {
-    let mut users: Vec<Vec<u32>> = vec![Vec::new(); ix.nvals];
-    let mut buf = Vec::new();
-    let add = |users: &mut Vec<Vec<u32>>, v: Val, bi: usize| {
-        if let Some(u) = users.get_mut(v as usize) {
-            if u.last() != Some(&(bi as u32)) {
-                u.push(bi as u32);
-            }
+pub(crate) struct Users {
+    start: Vec<u32>,
+    data: Vec<u32>,
+}
+
+impl Users {
+    pub fn of(&self, v: usize) -> &[u32] {
+        match (self.start.get(v), self.start.get(v + 1)) {
+            (Some(&a), Some(&b)) => &self.data[a as usize..b as usize],
+            _ => &[],
         }
-    };
+    }
+}
+
+fn for_each_use(f: &Func, zero_add: &HashMap<Val, Val>, mut visit: impl FnMut(Val, u32)) {
+    let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for inst in b.insts.iter() {
             buf.clear();
@@ -82,16 +100,41 @@ fn value_users(f: &Func, ix: &Index, zero_add: &HashMap<Val, Val>) -> Vec<Vec<u3
                 }
             }
             for &v in buf.iter() {
-                add(&mut users, v, bi);
+                visit(v, bi as u32);
             }
         }
         buf.clear();
         term_uses(&b.term, &mut buf);
         for &v in buf.iter() {
-            add(&mut users, v, bi);
+            visit(v, bi as u32);
         }
     }
-    users
+}
+
+fn value_users(f: &Func, ix: &Index, zero_add: &HashMap<Val, Val>) -> Users {
+    let nvals = ix.nvals;
+    let mut start = vec![0u32; nvals + 1];
+    let mut last = vec![u32::MAX; nvals];
+    for_each_use(f, zero_add, |v, bi| {
+        if (v as usize) < nvals && last[v as usize] != bi {
+            last[v as usize] = bi;
+            start[v as usize + 1] += 1;
+        }
+    });
+    for i in 0..nvals {
+        start[i + 1] += start[i];
+    }
+    let mut data = vec![0u32; start[nvals] as usize];
+    let mut fill: Vec<u32> = start[..nvals].to_vec();
+    last.iter_mut().for_each(|l| *l = u32::MAX);
+    for_each_use(f, zero_add, |v, bi| {
+        if (v as usize) < nvals && last[v as usize] != bi {
+            last[v as usize] = bi;
+            data[fill[v as usize] as usize] = bi;
+            fill[v as usize] += 1;
+        }
+    });
+    Users { start, data }
 }
 
 fn code_loads(f: &Func) -> HashMap<Val, Val> {

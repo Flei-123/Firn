@@ -30,7 +30,7 @@ pub(crate) fn compute(m: &Module, cache: &Cache, s: &mut Summaries) {
     for _ in 0..MAX_ROUNDS {
         let keep = {
             let sr: &Summaries = s;
-            crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| constructs_tree(&m.funcs[i], cache.get(m, i), sr))
+            crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| constructs_tree(&m.funcs[i], &cache.get(m, i), sr))
         };
         let next: Vec<usize> = cand.iter().zip(keep).filter(|(_, k)| *k).map(|(&i, _)| i).collect();
         stable = next.len() == cand.len();
@@ -81,7 +81,7 @@ fn deep(m: &Module, cache: &Cache, s: &mut Summaries) {
     for _ in 0..MAX_ROUNDS {
         let res = {
             let sr: &Summaries = s;
-            crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| deep_params(&m.funcs[i], cache.get(m, i), sr))
+            crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| deep_params(&m.funcs[i], &cache.get(m, i), sr))
         };
         let mut changed = false;
         for (&i, new) in cand.iter().zip(res) {
