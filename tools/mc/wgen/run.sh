@@ -73,6 +73,7 @@ if [ -z "${WG_NO_GEN:-}" ]; then
     bash tools/mc/wgen/feature_gate.sh || ERR=1
     bash tools/mc/wgen/scan_gate.sh || ERR=1
     bash tools/mc/wgen/persist_gate.sh || ERR=1
+    PERSIST_PROTO=777 bash tools/mc/wgen/persist_gate.sh || ERR=1
 fi
 
 [ $ERR = 0 ] && echo "mc/wgen: all ok" || echo "mc/wgen: FAILED"

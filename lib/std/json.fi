@@ -149,6 +149,7 @@ const JSON_OBJECT: u8 = 6
 
 const JSON_NONE: u32 = 4294967295
 const JSON_MAX_DEPTH: usize = 200
+const ALL_ONES: u64 = 18446744073709551615
 
 // The error numbers `json_err_code` reports. They exist so that a caller
 // can react differently to "the document is truncated" than to "there is a
@@ -375,15 +376,46 @@ fn fail(d: *mut Json, code: usize) {
 }
 
 // RFC 8259 2: exactly these four are whitespace.
+#[inline]
 fn skip_ws(d: *mut Json) {
-    while true {
-        let c: i32 = peek(d)
-        if c == 32 || c == 9 || c == 10 || c == 13 {
-            advance(d)
-        } else {
-            return
+    let at: usize = (*d).at
+    if at < (*d).n {
+        if *(((*d).src +% at as u64) as *mut u8) <= 32 as u8 {
+            skip_ws_run(d)
         }
     }
+}
+
+#[no_inline]
+fn skip_ws_run(d: *mut Json) {
+    let src: u64 = (*d).src
+    let n: usize = (*d).n
+    var at: usize = (*d).at
+    var line: usize = (*d).line
+    var col: usize = (*d).col
+    while at < n {
+        let c: u8 = *((src +% at as u64) as *mut u8)
+        if c == 32 as u8 {
+            at = at +% 1
+            col = col +% 1
+        } else if c == 10 as u8 {
+            at = at +% 1
+            line = line +% 1
+            col = 1
+            while at +% 8 <= n && *((src +% at as u64) as *mut u64) == 0x2020202020202020 as u64 {
+                at = at +% 8
+                col = col +% 8
+            }
+        } else if c == 9 as u8 || c == 13 as u8 {
+            at = at +% 1
+            col = col +% 1
+        } else {
+            break
+        }
+    }
+    (*d).at = at
+    (*d).line = line
+    (*d).col = col
 }
 
 fn hex4(d: *mut Json, out: *mut u32) -> bool {
@@ -450,6 +482,47 @@ fn blob_push_cp(d: *mut Json, cp0: u32) -> bool {
     return blob_push(d, (128 as u32 | (cp & 63 as u32)) as u8)
 }
 
+#[inline]
+fn first_set_byte(m: u64) -> usize {
+    var k: usize = 0
+    var v: u64 = m
+    if (v & 0xFFFFFFFF as u64) == 0 as u64 {
+        k = 4
+        v = v >> 32
+    }
+    if (v & 0xFFFF as u64) == 0 as u64 {
+        k = k + 2
+        v = v >> 16
+    }
+    if (v & 0xFF as u64) == 0 as u64 {
+        k = k + 1
+    }
+    return k
+}
+
+#[inline]
+fn blob_copy(dst: u64, src: u64, n: usize) {
+    if n >= 8 {
+        if n <= 16 {
+            *(dst as *mut u64) = *(src as *mut u64)
+            *((dst +% (n - 8) as u64) as *mut u64) = *((src +% (n - 8) as u64) as *mut u64)
+        } else {
+            rt.mem_copy(dst, src, n)
+        }
+    } else if n >= 4 {
+        *(dst as *mut u32) = *(src as *mut u32)
+        *((dst +% (n - 4) as u64) as *mut u32) = *((src +% (n - 4) as u64) as *mut u32)
+    } else {
+        *(dst as *mut u8) = *(src as *mut u8)
+        if n > 1 {
+            *((dst +% (n - 1) as u64) as *mut u8) = *((src +% (n - 1) as u64) as *mut u8)
+            if n > 2 {
+                *((dst +% 1) as *mut u8) = *((src +% 1) as *mut u8)
+            }
+        }
+    }
+}
+
 // Reads a string, decodes it into the blob and reports where it landed.
 // The opening quote has already been consumed.
 fn parse_string_raw(d: *mut Json, off: *mut u64, len: *mut u32) -> bool {
@@ -463,19 +536,39 @@ fn parse_string_raw(d: *mut Json, off: *mut u64, len: *mut u32) -> bool {
         let lim: usize = (*d).n - at0
         let src0: u64 = (*d).src +% at0 as u64
         var run: usize = 0
-        while run < lim {
-            let b: u8 = *((src0 +% run as u64) as *mut u8)
-            if b < 32 as u8 || b == 34 as u8 || b == 92 as u8 {
+        var found: bool = false
+        while run + 8 <= lim {
+            let w: u64 = *((src0 +% run as u64) as *mut u64)
+            let q: u64 = w ^ 0x2222222222222222 as u64
+            let r: u64 = w ^ 0x5C5C5C5C5C5C5C5C as u64
+            let lo: u64 = (w -% 0x2020202020202020 as u64) & (w ^ ALL_ONES)
+            let qz: u64 = (q -% 0x0101010101010101 as u64) & (q ^ ALL_ONES)
+            let rz: u64 = (r -% 0x0101010101010101 as u64) & (r ^ ALL_ONES)
+            let hit: u64 = (lo | qz | rz) & 0x8080808080808080 as u64
+            if hit != 0 as u64 {
+                run = run + first_set_byte(hit)
+                found = true
                 break
             }
-            run = run + 1
+            run = run + 8
+        }
+        if !found {
+            while run < lim {
+                let b: u8 = *((src0 +% run as u64) as *mut u8)
+                if b < 32 as u8 || b == 34 as u8 || b == 92 as u8 {
+                    break
+                }
+                run = run + 1
+            }
         }
         if run > 0 {
-            if !blob_reserve(d, run) {
-                fail(d, E_MEMORY)
-                return false
+            if (*d).blob_len + run > (*d).blob_cap {
+                if !blob_reserve(d, run) {
+                    fail(d, E_MEMORY)
+                    return false
+                }
             }
-            rt.mem_copy((*d).blob +% (*d).blob_len as u64, src0, run)
+            blob_copy((*d).blob +% (*d).blob_len as u64, src0, run)
             (*d).blob_len = (*d).blob_len + run
             (*d).at = at0 + run
             (*d).col = (*d).col + run
@@ -571,6 +664,54 @@ fn parse_string_raw(d: *mut Json, off: *mut u64, len: *mut u32) -> bool {
 // The number grammar, walked by hand. `num.parse_f64` would accept `+1`,
 // `.5`, `nan` and hexadecimal -- correct for a programming language, wrong
 // for JSON. So the SHAPE is checked here and only the value is handed over.
+fn parse_int_fast(d: *mut Json, into: u32) -> bool {
+    let src: u64 = (*d).src
+    let n: usize = (*d).n
+    let start: usize = (*d).at
+    var at: usize = start
+    var neg: bool = false
+    if at < n && *((src +% at as u64) as *mut u8) == 45 as u8 {
+        neg = true
+        at = at + 1
+    }
+    if at >= n {
+        return false
+    }
+    let first: u8 = *((src +% at as u64) as *mut u8)
+    if first < 49 as u8 || first > 57 as u8 {
+        return false
+    }
+    let digits_at: usize = at
+    var v: i64 = 0
+    while at < n {
+        let c: u8 = *((src +% at as u64) as *mut u8)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        if at - digits_at == 18 {
+            return false
+        }
+        v = v * 10 + (c as i64 - 48)
+        at = at + 1
+    }
+    if at < n {
+        let t: u8 = *((src +% at as u64) as *mut u8)
+        if t == 46 as u8 || t == 101 as u8 || t == 69 as u8 {
+            return false
+        }
+    }
+    if neg {
+        v = 0 - v
+    }
+    let nd: *mut Node = node_at(d, into)
+    (*nd).is_int = true
+    (*nd).inum = v
+    (*nd).num = v as f64
+    (*d).col = (*d).col + (at - start)
+    (*d).at = at
+    return true
+}
+
 fn parse_number(d: *mut Json, into: u32) -> bool {
     let start: usize = (*d).at
     var is_int: bool = true
@@ -824,7 +965,7 @@ fn parse_value(d: *mut Json) -> u32 {
     } else if c == 45 || (c >= 48 && c <= 57) {
         out = node_new(d, JSON_NUMBER)
         if out != JSON_NONE {
-            if !parse_number(d, out) {
+            if !parse_int_fast(d, out) && !parse_number(d, out) {
                 out = JSON_NONE
             }
         }

@@ -225,6 +225,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "shl(x, k) | shr(x, W - k) becomes one rotate left, constant or variable count, u32/u64 (x86-64 only, once, after rotate; env FIRN_NO_ROTL)",
     },
     PassInfo {
+        name: "truncmask",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "a truncating cast of (x & M) where M keeps every bit of the narrow type reads x directly (x86-64 only, once, after rotl; env FIRN_NO_TRUNCMASK)",
+    },
+    PassInfo {
         name: "ifconv",
         scope: Scope::Func,
         debug_preserving: false,
@@ -818,6 +824,22 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
             n += k;
         }
         clk.add2("rotl", t, n > 0);
+    }
+    if cfg.runs("truncmask") && crate::truncmask::enabled() && crate::target::active() == crate::target::Target::X86_64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::truncmask::run(f);
+            if k > 0 {
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "truncmask");
+            }
+            n += k;
+        }
+        clk.add2("truncmask", t, n > 0);
     }
     if cfg.runs("ifconv") && crate::ifconv::enabled() && crate::target::active() == crate::target::Target::X86_64 {
         let t = std::time::Instant::now();
