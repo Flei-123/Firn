@@ -44,6 +44,7 @@ fn parse(text: &str) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
 }
 
 fn emit(out: &mut String, name: &str, value: &str) {
+    out.push_str("#[allow(dead_code)]\n");
     out.push_str(&format!("pub const {}: &str = \"{}\";\n", name, value));
 }
 

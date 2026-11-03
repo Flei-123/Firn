@@ -14,8 +14,6 @@ ok() { PASS=$((PASS + 1)); echo "ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL $1"; }
 git worktree add -q -b "rename-check-$$" "$D/wt" HEAD || exit 1
 cd "$D/wt"
-git config user.email check@example.invalid
-git config user.name check
 R="python3 -I tools/rename/rename.py"
 $R --from "$OLD" --to "$NEW" > "$D/dry.txt" && grep -q '^DRY RUN' "$D/dry.txt" && ok "dry run reports" || bad "dry run reports"
 [ -z "$(git status --porcelain)" ] && ok "dry run changes nothing" || bad "dry run changes nothing"
