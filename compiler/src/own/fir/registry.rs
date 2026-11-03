@@ -69,7 +69,7 @@ pub(crate) const ESCAPES: &[&str] = &[
     "gc_root_unregister",
 ];
 
-pub(crate) const BORROW_ALL: &[&str] = &["__gc_blit"];
+pub(crate) const BORROW_ALL: &[&str] = &["__own_blit"];
 
 pub(crate) fn producer(name: &str) -> Option<&'static Producer> {
     PRODUCERS.iter().find(|p| p.name == name)
