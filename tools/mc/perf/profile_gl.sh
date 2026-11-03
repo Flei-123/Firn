@@ -39,6 +39,16 @@ for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break;
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
 for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
+if [ -n "${PROF_BIOME:-}" ]; then
+    echo "locate biome minecraft:$PROF_BIOME" >&3
+    for i in $(seq 1 120); do grep -q 'is at \[' "$W/server.log" && break; sleep 1; done
+    BXZ=$(grep -o 'is at \[[-0-9]*, [-0-9~]*, [-0-9]*\]' "$W/server.log" | head -1 | tr -d '[]~,' | awk '{print $3, $NF}')
+    set -- $BXZ
+    [ $# -ge 2 ] || { tail -5 "$W/server.log" | cut -c1-200; fail "biome $PROF_BIOME not found"; }
+    echo "setworldspawn $1 100 $2" >&3
+    sleep 2
+    echo "  biome $PROF_BIOME at $1 $2"
+fi
 DN=$(bash tools/mc/pick_display.sh 90 100)
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
@@ -48,7 +58,7 @@ ERR=0
 for i in $(seq 1 "$N"); do
     MCPLAY_GL=1 MCPLAY_WORKERS=3 MCPLAY_VSYNC=0 MCPLAY_FPS=0 FIRN_AUDIO=null MCPLAY_RUN_S=${PROF_RUN_S:-25} MCPLAY_VIEW=$VIEW MCPLAY_W=640 MCPLAY_H=360 \
         MCPLAY_PROFILE=1 MCPLAY_PROFILE_FROM=${PROF_FROM:-14} MCPLAY_SPIN=3 \
-        timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" "Pr$i" > "$W/p$i.out" 2>&1
+        timeout "${PROF_TIMEOUT:-150}" ${PROF_WRAP:-} "$W/mcplay" 127.0.0.1 "$PORT" "Pr$i" > "$W/p$i.out" 2>&1
     rc=$?
     [ -n "${PROF_OUT:-}" ] && cp "$W/p$i.out" "$PROF_OUT/p$i.out" 2>/dev/null
     [ $rc -eq 0 ] || { echo "  FAIL  run $i exit code $rc"; ERR=1; continue; }
