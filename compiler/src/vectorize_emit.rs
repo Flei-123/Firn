@@ -290,10 +290,16 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         }
         let mut anext: Vec<Vec<Val>> = vec![Vec::new(); plan.accs.len()];
         let mut vmap: HashMap<(Val, u32), Val> = HashMap::default();
+        let forward = std::env::var_os("FIRN_NO_VEC_FORWARD").is_none();
+        let mut known: HashMap<(usize, u32), Val> = HashMap::default();
         for j in 0..UNROLL {
             for st in &plan.steps {
                 match st {
                     Step::Load { dst, key } => {
+                        if let Some(&v) = known.get(&(*key, j)) {
+                            vmap.insert((*dst, j), v);
+                            continue;
+                        }
                         let ptr = if j == 0 {
                             pphi[*key]
                         } else {
@@ -302,6 +308,9 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                         };
                         let v = em.simd(SimdKind::Load, vec![ptr], 0, FTy::V128);
                         vmap.insert((*dst, j), v);
+                        if forward {
+                            known.insert((*key, j), v);
+                        }
                     }
                     Step::Bin { dst, op, a, b } => {
                         let ty = em.f.val_types[*dst as usize];
@@ -320,6 +329,11 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                             em.op(FTy::Ptr, Op::PtrAdd { base: pphi[*key], off: o })
                         };
                         let v = operand(&vmap, &splats, plan, *val, j)?;
+                        if forward {
+                            let e = plan.keys[*key].e;
+                            known.retain(|&(k, kj), _| kj != j || k == *key || plan.keys[k].e != e);
+                            known.insert((*key, j), v);
+                        }
                         let loc = em.f.loc_stamp;
                         em.f.blocks[vl as usize].insts.push(Inst {
                             dst: None,
