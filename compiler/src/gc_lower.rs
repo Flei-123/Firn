@@ -65,9 +65,9 @@ pub(crate) fn hook_call(
     // field is still evaluated (order of side effects), not used.
     if name == gc::FN_BARRIER && args.len() == 2 {
         return Some((|| {
-            lo.lower_expr(&args[0])?;
+            let f = lo.lower_expr(&args[0])?;
             let v = lo.lower_expr(&args[1])?;
-            emit_barrier(lo, v);
+            emit_barrier(lo, f, v);
             Some(None)
         })());
     }
@@ -288,17 +288,21 @@ fn alloc_and_init(
     lo.store(FTy::U32, dest, zero);
     let va = lo.field_addr_at(dest, union.val_off);
     lo.store(FTy::Ptr, va, p);
-    let decl: Vec<(String, u64)> = match lo.info.tcx.structs.get(sidx) {
-        Some(d) => d.fields.iter().map(|f| (f.name.clone(), f.offset)).collect(),
+    let decl: Vec<(String, u64, bool)> = match lo.info.tcx.structs.get(sidx) {
+        Some(d) => d.fields.iter().map(|f| (f.name.clone(), f.offset, gc::is_gc_ptr(&f.ty))).collect(),
         None => Vec::new(),
     };
     for (fname, fexpr, fspan) in fields {
-        let off = match decl.iter().find(|(n, _)| n == fname) {
-            Some((_, o)) => *o,
+        let (off, is_gc) = match decl.iter().find(|(n, _, _)| n == fname) {
+            Some((_, o, g)) => (*o, *g),
             None => return lo.ice(*fspan, "unknown field in the gc allocation"),
         };
         let fa = lo.ptradd_const(p, off);
         lo.write_into(fa, fexpr)?;
+        if is_gc && crate::gc_ext::cards() && !simple_init(fexpr) {
+            let val = lo.load(FTy::Ptr, fa);
+            emit_barrier(lo, fa, val);
+        }
     }
     if !lo.terminated() {
         lo.set_term(crate::fir::Term::Br(join));
@@ -332,7 +336,7 @@ pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr, addr: Val) -> Option<()
     // the target -- `pick().next = x` used to call `pick()` twice
     // (tests/1664_gc_barrier_inline.fi counts the calls).
     let val = lo.load(FTy::Ptr, addr);
-    emit_barrier(lo, val);
+    emit_barrier(lo, addr, val);
     Some(())
 }
 
@@ -357,7 +361,7 @@ pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr, addr: Val) -> Option<()
 ///
 /// The old runtime test `field == 0 && value == 0` is gone on purpose: the
 /// field address of a store that just happened is never 0.
-pub(crate) fn emit_barrier(lo: &mut Lower, value: Val) {
+pub(crate) fn emit_barrier(lo: &mut Lower, field: Val, value: Val) {
     let st = lo.push(FTy::Ptr, Op::GcAddr { regs: false });
     let ca = lo.ptradd_const(st, gc::BARRIER_COUNT_OFF);
     let c = lo.load(FTy::U64, ca);
@@ -367,17 +371,37 @@ pub(crate) fn emit_barrier(lo: &mut Lower, value: Val) {
     let pa = lo.ptradd_const(st, gc::PHASE_OFF);
     let ph = lo.load(FTy::U64, pa);
     let zero = lo.constant(FTy::U64, 0);
-    let busy = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::U64, a: ph, b: zero });
+    let mode = if crate::gc_ext::cards() {
+        let cka = lo.ptradd_const(st, crate::gc_ext::CARDON_OFF);
+        let ck = lo.load(FTy::U64, cka);
+        lo.push(FTy::U64, Op::Bin(BinOp::Or, ph, ck))
+    } else {
+        ph
+    };
+    let busy = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::U64, a: mode, b: zero });
     let slow = lo.new_block();
     let join = lo.new_block();
     lo.set_term(crate::fir::Term::BrCond { cond: busy, then_bb: slow, else_bb: join });
     lo.cur = slow;
     lo.push_void(
         FTy::Void,
-        Op::Call { name: gc::FN_BARRIER_SLOW.to_string(), args: vec![value] },
+        Op::Call {
+            name: gc::FN_BARRIER_SLOW.to_string(),
+            args: if crate::gc_ext::active() { vec![field, value] } else { vec![value] },
+        },
     );
     lo.set_term(crate::fir::Term::Br(join));
     lo.cur = join;
+}
+
+fn simple_init(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(_) | ExprKind::Int(_) | ExprKind::Bool(_) => true,
+        ExprKind::Field(b, _, _) => simple_init(b),
+        ExprKind::Cast(b, _) => simple_init(b),
+        ExprKind::Call(n, a, _) => n == "gc_null" && a.is_empty(),
+        _ => false,
+    }
 }
 
 fn is_ptr(t: &Type) -> bool {

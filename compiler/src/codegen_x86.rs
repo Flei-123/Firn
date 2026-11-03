@@ -421,7 +421,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // threads of its own that a foreign library started (Mesa's llvmpipe):
     // `exit` would end only this one and leave the process alive and hung.
     // `exit_group` ends all. A static image keeps `exit` bit for bit.
-    if crate::extfn::link_libs().is_empty() {
+    if crate::extfn::link_libs().is_empty() && !(crate::gc_ext::active() && crate::gc::runtime_active()) {
         e.line("mov eax, 60");
     } else {
         e.line("mov eax, 231");
