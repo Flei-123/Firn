@@ -5,6 +5,7 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
+export TOOL_FIRNC=$FIRNC
 D=$(mktemp -d)
 SERVER_PID=
 cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; rm -rf "$D"; }
@@ -85,11 +86,11 @@ expect_fail "replayed old manifest below floor refused" "$F" install; has "floor
 PORT=$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 -I -m http.server "$PORT" --bind 127.0.0.1 --directory "$PUB" >/dev/null 2>&1 &
 SERVER_PID=$!
-cp "$D/good.json" "$PUB/stable/manifest.json"
+cp "$PUB/stable/manifest-0.1.6.json" "$PUB/stable/manifest.json"
 sleep 1
 export FIRN_HOME=$D/home2
 expect "bootstrap over http://127.0.0.1" sh tools/release/install.sh "http://127.0.0.1:$PORT" stable
-expect "http install runs" "$FIRN_HOME/bin/firn" version; has "http version" "firn 0.1.5"
+expect "http install runs" "$FIRN_HOME/bin/firn" version; has "http version" "firn 0.1.6"
 
 echo "toolchain e2e: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

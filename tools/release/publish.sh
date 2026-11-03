@@ -55,7 +55,7 @@ else
     git archive "$COMMIT" lib | tar -x -C "$W"
 fi
 FIRN_TOOL=$W/firn-tool
-FIRNLIB=$ROOT/lib "$FIRNC" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
+FIRNLIB=$ROOT/lib "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
 ENTRIES=()
 pack() {
     local plat=$1 bin=$2 ext=$3 tool=$4
