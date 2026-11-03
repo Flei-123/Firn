@@ -2,6 +2,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 ROOT=$(pwd)
+PROTO=${DIM_PROTO:-763}
 FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNLIB="$ROOT/lib"
@@ -22,10 +23,11 @@ json.dump([{"uuid": offline("DimBot"), "name": "DimBot", "level": 4, "bypassesPl
 PY
 mkfifo "$W/run/in.fifo"
 (sleep 200 > "$W/run/in.fifo" &)
-(cd "$W/run" && setsid nohup "$W/firnmc-server" nogui --protocol 763 < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
+(cd "$W/run" && setsid nohup "$W/firnmc-server" nogui --protocol "$PROTO" < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
 for _ in $(seq 1 100); do grep -q 'Done (' "$W/run/out.log" 2>/dev/null && break; sleep 0.1; done
 grep -q 'Done (' "$W/run/out.log" || { echo "  FAIL  server start"; tail -n 5 "$W/run/out.log"; exit 1; }
-node tools/mc/wgen/dim_bot.cjs 127.0.0.1 "$PORT" > "$W/bot.json" 2>"$W/bot.err"
+BOT=tools/mc/wgen/dim_bot.cjs; [ "$PROTO" = 777 ] && BOT=tools/mc/wgen/dim_bot777.cjs
+node "$BOT" 127.0.0.1 "$PORT" > "$W/bot.json" 2>"$W/bot.err"
 node -e '
 const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
 const want = ["login minecraft:overworld", "respawn minecraft:the_nether", "respawn minecraft:overworld", "respawn minecraft:the_end", "respawn minecraft:the_nether"]
