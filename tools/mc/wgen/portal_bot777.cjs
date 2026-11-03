@@ -123,12 +123,14 @@ function packPos(x, y, z) {
 }
 function i16(n) { const b = Buffer.alloc(2); b.writeInt16BE(n); return b }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+async function until(cond, ms) { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await sleep(100) }
+const respawns = () => out.events.filter((e) => /^respawn/.test(e)).length
 const place = (x, y, z) => send(C2S.blockPlace, Buffer.concat([varint(0), packPos(x, y - 1, z), varint(1), f32(0.5), f32(1), f32(0.5), Buffer.from([0, 0]), varint(++seq)]))
 const give = (slot, id, n) => send(C2S.creativeSlot, Buffer.concat([i16(slot), varint(n), varint(id), varint(0), varint(0)]))
-const move = (x, y, z) => send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(0), f32(0), Buffer.from([1])]))
+const move = (x, y, z) => send(C2S.chatCommand, str(`tp ${x} ${y} ${z}`))
 
 async function run() {
-  setTimeout(finish, 60000)
+  setTimeout(finish, 110000)
   await sleep(1500)
   send(C2S.chatCommand, str('tp 10.5 150 3.5'))
   await sleep(1500)
@@ -148,13 +150,15 @@ async function run() {
   await sleep(1000)
   out.afterIgnite = out.portalBlocks
   move(10.5, 150, 0.5)
-  await sleep(2500)
+  await until(() => respawns() >= 1, 30000)
+  await sleep(1000)
   out.nether = pos
   const there = pos
   move(there.x, there.y, there.z + 3)
   await sleep(1500)
   move(there.x, there.y, there.z)
-  await sleep(2500)
+  await until(() => respawns() >= 2, 30000)
+  await sleep(1000)
   out.back = pos
   finish()
 }
@@ -232,4 +236,4 @@ sock.on('data', (d) => {
 })
 sock.on('error', (e) => { out.errors.push('socket ' + e.message); finish() })
 sock.on('close', finish)
-setTimeout(finish, 70000)
+setTimeout(finish, 120000)
