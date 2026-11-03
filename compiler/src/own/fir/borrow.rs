@@ -243,7 +243,7 @@ fn run_worker(sh: &Shared, lock: &Mutex<Queue>, cv: &Condvar, m: &Module, cache:
         q.nrunning += 1;
         drop(q);
         let f = &m.funcs[i];
-        let new = if f.params.is_empty() { Vec::new() } else { param_borrows(f, cache.get(m, i), s) };
+        let new = if f.params.is_empty() { Vec::new() } else { param_borrows(f, &cache.get(m, i), s) };
         q = lock.lock().unwrap();
         if s.store(i, &new) {
             for &c in sh.callers[i].iter() {

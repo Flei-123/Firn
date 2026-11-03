@@ -82,11 +82,12 @@ fn run_frees(m: &mut Module, mode: super::Mode, free_fn: &'static str) {
         return;
     }
     let ts = std::time::Instant::now();
-    let cache = prep::Cache::new(m.funcs.len());
+    let mut cache = prep::Cache::new(m.funcs.len());
     let (mut sums, roots, st) = summary::compute(m, &base, &cache);
     if tree_on {
         tree::compute(m, &cache, &mut sums);
     }
+    cache.clear();
     let sum_ms = ts.elapsed().as_millis();
     let quiet = if reuse_on && std::env::var_os("FIRN_OWN_NO_QUIET").is_none() { quiet::Quiet::compute(m) } else { quiet::Quiet::none() };
     let ta = std::time::Instant::now();
@@ -113,7 +114,7 @@ fn run_frees(m: &mut Module, mode: super::Mode, free_fn: &'static str) {
             reverted += 1;
         }
         if let Some((d, drops, plans, allocs, exits)) = plan.pending {
-            let Some(sl) = cache.built(fi).map(|p| &p.sl) else { continue };
+            let Some(sl) = plan.sl.as_ref() else { continue };
             let fns: Vec<&str> = drops
                 .iter()
                 .map(|d| match d {
@@ -157,16 +158,24 @@ fn root_window() -> (usize, usize) {
 struct Plan {
     kept: crate::fx::HashSet<(usize, usize)>,
     pending: Option<(Vec<live::Free>, Vec<registry::Drop>, Vec<reuse::Plan>, Vec<reuse::Alloc>, Vec<Vec<(usize, usize)>>)>,
+    sl: Option<slots::Slots>,
     sites: usize,
 }
 
 fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool, quiet: &quiet::Quiet) -> Plan {
-    let f = &m.funcs[fi];
-    let mut plan = Plan { kept: Default::default(), pending: None, sites: 0 };
-    if summary::skipped(f) {
-        return plan;
+    if summary::skipped(&m.funcs[fi]) {
+        return Plan { kept: Default::default(), pending: None, sl: None, sites: 0 };
     }
     let p = cache.get(m, fi);
+    let plan = analyze_prepared(m, fi, &p, sums, reuse_on, reuse_calls, quiet);
+    drop(p);
+    cache.evict(fi);
+    plan
+}
+
+fn analyze_prepared(m: &Module, fi: usize, p: &prep::Prep, sums: &summary::Summaries, reuse_on: bool, reuse_calls: bool, quiet: &quiet::Quiet) -> Plan {
+    let f = &m.funcs[fi];
+    let mut plan = Plan { kept: Default::default(), pending: None, sl: None, sites: 0 };
     let (ix, sl) = (&p.ix, &p.sl);
     let mut fl = flow::Flow::build_carried(f, p, sums);
     if fl.sites.is_empty() || fl.sites.len().saturating_mul(f.inst_count()) > summary::MAX_SITE_WORK {
@@ -194,6 +203,7 @@ fn analyze(m: &Module, fi: usize, cache: &prep::Cache, sums: &summary::Summaries
     };
     let exits: Vec<Vec<(usize, usize)>> = plans.iter().map(|q| reuse::side_exits(ix, &q.path)).collect();
     plan.pending = Some((d, fl.drops.clone(), plans, allocs, exits));
+    plan.sl = Some(p.sl.clone());
     plan
 }
 

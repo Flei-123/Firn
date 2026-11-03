@@ -161,7 +161,7 @@ pub(crate) fn compute(m: &Module, base: &[usize], cache: &Cache) -> (Summaries, 
             crate::parfn::map_weighted(&cand, |&i| crate::parfn::weight(&m.funcs[i]), |&i| {
                 let f = &m.funcs[i];
                 if fresh_candidate(f) {
-                    returns_fresh(f, cache.get(m, i), sr)
+                    returns_fresh(f, &cache.get(m, i), sr)
                 } else {
                     None
                 }
