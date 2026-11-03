@@ -2,9 +2,10 @@
 const fs = require('fs')
 const [vf, ff] = process.argv.slice(2)
 const IGNORE = new Set((process.env.ORDER_IGNORE || 'update_time,time,entity_metadata,entity_velocity,entity_teleport,rel_entity_move,entity_move_look,entity_look,entity_head_rotation,entity_update_attributes,update_attributes,entity_equipment,player_info,player_remove,named_entity_spawn,spawn_entity,entity_destroy,declare_recipes,tags,declare_commands,advancements,unlock_recipes,sound_effect,named_sound_effect,block_change,multi_block_change,acknowledge_player_digging,block_break_animation,world_particles,statistics,update_light,tile_entity_data,map_chunk,chunk_biomes,unload_chunk,system_chat,chunk_batch_start,chunk_batch_finished,boss_bar,bundle_delimiter,experience,set_ticking_state,step_tick,post_effects,set_time,level_chunk_with_light,light_update,forget_level_chunk').split(','))
-function norm(packets) {
+function norm(packets, loose) {
   const res = []
-  for (const p of packets) {
+  for (let p of packets) {
+    if (loose) p = p.replace(/^(position|update_view_position) .*/, '$1')
     const name = p.split(' ')[0]
     if (IGNORE.has(name)) continue
     res.push(p.replace(/"entityId":\d+/, '"entityId":0').replace(/^spawn_position .*/, 'spawn_position'))
@@ -29,9 +30,10 @@ if (v.errors.length || f.errors.length) { console.log('errors', JSON.stringify(v
 const n = Math.max(v.marks.length, f.marks.length)
 for (let i = 0; i < n; i++) {
   const vm = v.marks[i], fm = f.marks[i]
-  if (vm && !/^execute in/.test(vm.cmd)) continue
+  if (vm && !/^(execute in|raw:enter|raw:leave)/.test(vm.cmd)) continue
   if (!vm || !fm) { console.log('mark count differs'); bad++; break }
-  const a = norm(vm.packets), b = norm(fm.packets)
+  const loose = vm.cmd.startsWith('raw:')
+  const a = norm(vm.packets, loose), b = norm(fm.packets, loose)
   const same = JSON.stringify(a) === JSON.stringify(b)
   console.log(`${same ? '  ok   ' : '  DIFF '} ${vm.cmd}  (vanilla ${a.length}, firn ${b.length}, chunks ${chunkRuns(vm.packets)}/${chunkRuns(fm.packets)})`)
   if (!same || process.env.ORDER_VERBOSE) {

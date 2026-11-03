@@ -44,5 +44,13 @@ grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server start
 grep -q 'Done (' "$W/firn/out.log" 2>/dev/null || sleep 3
 node "$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla.json" 2>"$W/vbot.err"
 node "$BOT" 127.0.0.1 "$FPORT" > "$W/firn.json" 2>"$W/fbot.err"
+PORTAL_RC=0
+if [ "$PROTO" = 763 ]; then
+    PCMDS='["tp @s 10.5 150 3.5","raw:frame","raw:ignite","raw:enter","raw:leave"]'
+    DIM_CMDS=$PCMDS node "$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla_p.json" 2>"$W/vbot_p.err"
+    DIM_CMDS=$PCMDS node "$BOT" 127.0.0.1 "$FPORT" > "$W/firn_p.json" 2>"$W/fbot_p.err"
+fi
 echo stop >&3
-node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla.json" "$W/firn.json" && echo "mc/wgen dim order $PROTO: ok" || { echo "  FAIL  dim order"; exit 1; }
+node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla.json" "$W/firn.json" || PORTAL_RC=1
+if [ "$PROTO" = 763 ]; then node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla_p.json" "$W/firn_p.json" || PORTAL_RC=1; fi
+[ "$PORTAL_RC" = 0 ] && echo "mc/wgen dim order $PROTO: ok" || { echo "  FAIL  dim order"; exit 1; }
