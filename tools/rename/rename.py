@@ -56,7 +56,7 @@ def map_path(forms, path):
 
 
 def scan(root, forms, excludes):
-    stats = {"files": 0, "lines": 0, "occurrences": 0, "binary": 0, "symlinks": 0,
+    stats = {"files": 0, "lines": 0, "occurrences": 0, "binary": 0, "symlinks": 0, "arrays": 0,
              "by_category": Counter(), "by_dir": Counter(), "env_names": set()}
     edges, odd = Counter(), Counter()
     changes, renames, symlinks = [], [], []
@@ -83,6 +83,7 @@ def scan(root, forms, excludes):
         if not n:
             continue
         stats["files"] += 1
+        stats["arrays"] += forms.count_arrays(text)
         stats["occurrences"] += n
         lines = sum(1 for line in text.splitlines() if forms.count(line))
         stats["lines"] += lines

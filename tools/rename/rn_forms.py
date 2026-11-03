@@ -15,6 +15,7 @@ class Forms:
         self.mixed = re.compile(re.escape(old), re.IGNORECASE)
         self.token = re.compile(r"[A-Za-z0-9_]*(?:%s)[A-Za-z0-9_]*" % alts)
         self.table = dict(self.pairs)
+        self.fixed_arrays = re.compile(r'(?P<head>\[u8;\s*)(?P<n>\d+)(?P<tail>\]\s*=\s*b?"(?P<lit>(?:[^"\\\n]|\\.)*)")')
         o, u, c = re.escape(old), re.escape(old.upper()), re.escape(old.capitalize())
         self.categories = (
             ("env_variable", re.compile(r"^[A-Z0-9_]*%s[A-Z0-9_]*$" % u)),
@@ -26,7 +27,17 @@ class Forms:
         )
 
     def replace(self, text):
+        text = self.fixed_arrays.sub(self.fix_array, text)
         return self.pattern.sub(lambda m: self.table[m.group(0)], text)
+
+    def fix_array(self, m):
+        delta = (len(self.new) - len(self.old)) * self.count(m.group("lit"))
+        if not delta:
+            return m.group(0)
+        return "%s%d%s" % (m.group("head"), int(m.group("n")) + delta, m.group("tail"))
+
+    def count_arrays(self, text):
+        return sum(1 for m in self.fixed_arrays.finditer(text) if self.count(m.group("lit")) and len(self.new) != len(self.old))
 
     def count(self, text):
         return len(self.pattern.findall(text))

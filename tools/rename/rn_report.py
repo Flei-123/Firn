@@ -17,6 +17,7 @@ def render(stats, rename_plan, edges, odd, conflicts, warnings):
     out.append("occurrences:                %d" % stats["occurrences"])
     out.append("files skipped (binary):     %d" % stats["binary"])
     out.append("symlinks with matching target: %d" % stats["symlinks"])
+    out.append("[u8; N] literal lengths adjusted: %d" % stats["arrays"])
     out.append("paths to rename:            %d" % len(rename_plan))
     out.append("")
     out.extend(table("occurrences by category:", stats["by_category"]))
