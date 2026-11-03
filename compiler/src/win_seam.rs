@@ -62,6 +62,7 @@ pub const BASELINE: &[&str] = &[
     "QueryPerformanceCounter",
     "QueryPerformanceFrequency",
     "GetSystemTimeAsFileTime",
+    "GetThreadTimes",
     "Sleep",
     "SwitchToThread",
     "GetCommandLineW",
@@ -136,6 +137,7 @@ extern fn GetLastError() -> i32;
 extern fn QueryPerformanceCounter(p: u64) -> i32;
 extern fn QueryPerformanceFrequency(p: u64) -> i32;
 extern fn GetSystemTimeAsFileTime(p: u64);
+extern fn GetThreadTimes(h: i64, creation: u64, exit: u64, kernel: u64, user: u64) -> i32;
 extern fn Sleep(ms: i64);
 extern fn SwitchToThread() -> i32;
 extern fn GetCommandLineW() -> u64;
@@ -819,6 +821,7 @@ fn __win_close(fd: i64) -> i64 {
     }
     if fd >= 3 {
         __win_kind[fd as usize] = 0
+        __win_nb[fd as usize] = 0
     }
     if k == 3 {
         return 0
@@ -861,6 +864,17 @@ fn __win_clock(id: i64, ts: u64) -> i64 {
         let u: i64 = ft - 116444736000000000
         __win_st64(ts, 0, u / 10000000)
         __win_st64(ts, 1, (u % 10000000) * 100)
+        return 0
+    }
+    if id == 3 {
+        var tt: [i64; 4] = [0; 4]
+        let tp: u64 = (&tt[0]) as u64
+        if GetThreadTimes(0 - 2, tp, tp + 8, tp + 16, tp + 24) == 0 {
+            return __win_errno()
+        }
+        let t: i64 = tt[2] + tt[3]
+        __win_st64(ts, 0, t / 10000000)
+        __win_st64(ts, 1, (t % 10000000) * 100)
         return 0
     }
     var qpc: [i64; 1] = [0; 1]
@@ -985,7 +999,7 @@ fn __win_fdset_clear(p: u64) {
 
 fn __win_fdset_add(p: u64, s: i64) {
     let c: i64 = __win_ld64(p, 0)
-    if c >= 64 { return }
+    if c >= 256 { return }
     __win_st64(p, 1 + c, s)
     __win_st64(p, 0, c + 1)
 }
@@ -1005,11 +1019,11 @@ fn __win_poll(fds: u64, nfds: i64, ms: i64) -> i64 {
         if ms > 0 { Sleep(ms) }
         return 0
     }
-    // fd_set = {u32 count, pad, SOCKET[64]} = 520 octets; locals, so that
+    // fd_set = {u32 count, pad, SOCKET[256]} = 2056 octets; locals, so that
     // two threads can wait at the same time without the seam lock.
-    var rdb: [i64; 66] = [0; 66]
-    var wrb: [i64; 66] = [0; 66]
-    var exb: [i64; 66] = [0; 66]
+    var rdb: [i64; 258] = [0; 258]
+    var wrb: [i64; 258] = [0; 258]
+    var exb: [i64; 258] = [0; 258]
     var tvb: [i64; 2] = [0; 2]
     let rd: u64 = (&rdb[0]) as u64
     let wr: u64 = (&wrb[0]) as u64

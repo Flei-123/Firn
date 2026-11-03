@@ -132,6 +132,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("QueryPerformanceCounter", "KERNEL32.dll", 1),
     ("QueryPerformanceFrequency", "KERNEL32.dll", 1),
     ("GetSystemTimeAsFileTime", "KERNEL32.dll", 1),
+    ("GetThreadTimes", "KERNEL32.dll", 5),
     ("FileTimeToSystemTime", "KERNEL32.dll", 2),
     ("SystemTimeToTzSpecificLocalTime", "KERNEL32.dll", 3),
     ("SystemTimeToFileTime", "KERNEL32.dll", 2),
