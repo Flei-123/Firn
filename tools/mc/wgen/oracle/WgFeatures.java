@@ -127,7 +127,8 @@ public class WgFeatures {
                 case "levelEvent": return null;
                 case "gameEvent": return null;
                 case "setCurrentlyGenerating": return null;
-                case "getLevel": return null;
+                case "getLevel": return fakeLevel();
+                case "addFreshEntity": return true;
                 case "getRandom": return r.rnd;
                 case "getBrightness": return 0;
                 case "getRawBrightness": return 0;
@@ -149,12 +150,38 @@ public class WgFeatures {
         return (WorldGenLevel) Proxy.newProxyInstance(WgFeatures.class.getClassLoader(), new Class<?>[]{WorldGenLevel.class}, h);
     }
 
+    private static net.minecraft.server.level.ServerLevel fakeLevelInstance;
+
+    static synchronized net.minecraft.server.level.ServerLevel fakeLevel() {
+        if (fakeLevelInstance != null) return fakeLevelInstance;
+        try {
+            Class<?> uc = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field uf = uc.getDeclaredField("theUnsafe");
+            uf.setAccessible(true);
+            Object u = uf.get(null);
+            Method alloc = uc.getMethod("allocateInstance", Class.class);
+            net.minecraft.server.MinecraftServer server = (net.minecraft.server.MinecraftServer) alloc.invoke(u, net.minecraft.server.dedicated.DedicatedServer.class);
+            net.minecraft.world.level.storage.WorldData wd = (net.minecraft.world.level.storage.WorldData) Proxy.newProxyInstance(WgFeatures.class.getClassLoader(), new Class<?>[]{net.minecraft.world.level.storage.WorldData.class}, (px, mm, aa) -> mm.getName().equals("enabledFeatures") ? net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS : null);
+            java.lang.reflect.Field wf = net.minecraft.server.MinecraftServer.class.getDeclaredField("worldData");
+            wf.setAccessible(true);
+            wf.set(server, wd);
+            net.minecraft.server.level.ServerLevel lv = (net.minecraft.server.level.ServerLevel) alloc.invoke(u, net.minecraft.server.level.ServerLevel.class);
+            java.lang.reflect.Field sf = net.minecraft.server.level.ServerLevel.class.getDeclaredField("server");
+            sf.setAccessible(true);
+            sf.set(lv, server);
+            fakeLevelInstance = lv;
+            return lv;
+        } catch (ReflectiveOperationException ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public static void run(WgSurfaceOracle.Env e, PrintStream out, String dim, String filter, int cx, int cz) throws Exception {
         WgCarve.bindTags();
         Function<ResourceKey<Biome>, Holder<Biome>> toHolder = e::biomeOf;
         Climate.ParameterList<Holder<Biome>> hl = (Climate.ParameterList<Holder<Biome>>) e.ap.invoke(e.provider, toHolder);
-        MultiNoiseBiomeSource src = MultiNoiseBiomeSource.createFromList(hl);
+        net.minecraft.world.level.biome.BiomeSource src = e.endSrc != null ? e.endSrc : MultiNoiseBiomeSource.createFromList(hl);
         NoiseBasedChunkGenerator gen = new NoiseBasedChunkGenerator(src, e.ngsHolder);
         java.lang.reflect.Field ff = net.minecraft.world.level.chunk.ChunkGenerator.class.getDeclaredField("featuresPerStep");
         ff.setAccessible(true);
