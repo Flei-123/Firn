@@ -77,7 +77,7 @@ def convert_blocks(reports, registries, dump, base, item_stack):
         measured = dump_by_name.get(name)
         if old is not None:
             for key in ("hardness", "resistance", "stackSize", "diggable", "transparent",
-                        "emitLight", "filterLight", "boundingBox", "material", "displayName"):
+                        "emitLight", "filterLight", "boundingBox", "material", "displayName", "harvestTools"):
                 if key in old:
                     rec[key] = old[key]
             rec["source"] = "base"
@@ -158,6 +158,7 @@ def main():
     ap.add_argument("--delta")
     ap.add_argument("--out", required=True)
     ap.add_argument("--remeasure", action="store_true")
+    ap.add_argument("--jar-data")
     args = ap.parse_args()
     import jar_protocol
     reports = {"blocks": load_json(os.path.join(args.reports, "blocks.json"))}
@@ -177,6 +178,12 @@ def main():
     stacks = {i["name"]: i["stackSize"] for i in items}
     write_json(os.path.join(version_dir, "blocks.json"), convert_blocks(reports, registries, dump, base_blocks, stacks))
     write_json(os.path.join(version_dir, "items.json"), items)
+    if args.jar_data:
+        import jar_recipes
+        item_ids = {"minecraft:" + i["name"]: i["id"] for i in items}
+        recipes, rstats = jar_recipes.convert(args.jar_data, item_ids, {})
+        write_json(os.path.join(version_dir, "recipes.json"), recipes)
+        print("recipes", rstats, file=sys.stderr)
     write_json(os.path.join(version_dir, "entities.json"), convert_entities(registries, dump, base_entities))
     write_json(os.path.join(version_dir, "sounds.json"), convert_sounds(registries))
     proto, report = jar_protocol.apply_delta(base_proto, base_packets, new_packets, delta)
@@ -187,6 +194,8 @@ def main():
     entry = dict(paths)
     for what in ("blocks", "items", "entities", "sounds", "protocol", "version"):
         entry[what] = "pc/" + args.version
+    if args.jar_data:
+        entry["recipes"] = "pc/" + args.version
     write_json(os.path.join(args.out, "dataPaths.json"), {"pc": {args.version: entry}}, 2)
     for key in ("added", "removed", "unnamed"):
         print(key, report[key], file=sys.stderr)
