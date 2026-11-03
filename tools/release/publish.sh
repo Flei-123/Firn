@@ -55,6 +55,7 @@ if [ -n "$LIB_DIRS" ]; then
 else
     git archive "$COMMIT" lib | tar -x -C "$W"
 fi
+bash "$ROOT/tools/release/portable_lib.sh" "$W" "$ROOT"
 FIRN_TOOL=$W/$BRAND_CLI-tool
 env "$BRAND_SYSROOT_ENV=$ROOT/lib" "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
 ENTRIES=()
@@ -66,6 +67,8 @@ pack() {
     cp -a "$W/lib" "$top/lib"
     cp "$bin" "$top/bin/$BRAND_COMPILER$ext"
     [ -n "$tool" ] && cp "$tool" "$top/bin/$BRAND_CLI$ext"
+    mkdir -p "$top/src"
+    git show "$COMMIT:bin/firnc1.fi" > "$top/src/firnc1.fi"
     echo "$VERSION" > "$top/VERSION"
     echo "$plat" > "$top/PLATFORM"
     echo "$COMMIT" > "$top/COMMIT"

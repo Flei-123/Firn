@@ -16,6 +16,7 @@ import std.rt
 import std.fs
 import std.math
 import photo.par
+import photo.fastmath
 
 export {
     Image, Rng,
@@ -177,10 +178,7 @@ fn img_mean(im: *mut Image, c: i32) -> f32 {
 // ---------------------------------------------------------------- sRGB transfer
 
 fn srgb_encode(x: f32) -> f32 {
-    if x <= 0.0f { return 0.0f }
-    if x >= 1.0f { return 1.0f }
-    if x <= 0.0031308f { return 12.92f * x }
-    return (1.055 * math.powf(x as f64, 0.4166666666666667) - 0.055) as f32
+    return fastmath.srgb_encode(x)
 }
 
 fn srgb_decode(y: f32) -> f32 {
@@ -576,22 +574,53 @@ fn noise_sigma(im: *mut Image, c: i32) -> f32 {
 }
 
 // Sharpness measure: variance of the 4-neighbour Laplacian of channel 0 (or luma) -- higher = sharper.
-fn sharpness(im: *mut Image, c: i32) -> f32 {
-    var s: f64 = 0.0
-    var s2: f64 = 0.0
-    var n: f64 = 0.0
-    var y: i32 = 1
-    while y < (*im).h - 1 {
+struct SharpCtx {
+    im: *mut Image,
+    c: i32,
+    acc: u64,
+}
+
+fn sharp_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut SharpCtx = ctx as *mut SharpCtx
+    let w: i32 = (*(*k).im).w
+    let p: u64 = img_plane((*k).im, (*k).c)
+    var r: i32 = lo as i32
+    while r < (hi as i32) {
+        let y: i32 = r + 1
+        var s: f64 = 0.0
+        var s2: f64 = 0.0
         var x: i32 = 1
-        while x < (*im).w - 1 {
-            let l: f64 = (img_get(im, c, x - 1, y) + img_get(im, c, x + 1, y) + img_get(im, c, x, y - 1) + img_get(im, c, x, y + 1) - 4.0f * img_get(im, c, x, y)) as f64
+        while x < w - 1 {
+            let o: u64 = p + ((y * w + x) as u64) * (4 as u64)
+            let l: f64 = (*((o - (4 as u64)) as *mut f32) + *((o + (4 as u64)) as *mut f32) + *((o - ((w * 4) as u64)) as *mut f32) + *((o + ((w * 4) as u64)) as *mut f32) - 4.0f * *(o as *mut f32)) as f64
             s = s + l
             s2 = s2 + l * l
-            n = n + 1.0
             x = x + 1
         }
-        y = y + 1
+        *(((*k).acc + ((r * 2) as u64) * (8 as u64)) as *mut f64) = s
+        *(((*k).acc + ((r * 2 + 1) as u64) * (8 as u64)) as *mut f64) = s2
+        r = r + 1
     }
+}
+
+// Sharpness measure: variance of the 4-neighbour Laplacian of channel c -- higher = sharper. Row sums are added in
+// row order, so the value does not depend on the thread count.
+fn sharpness(im: *mut Image, c: i32) -> f32 {
+    let rows: i32 = (*im).h - 2
+    if rows < 1 || (*im).w < 3 { return 0.0f }
+    let acc: u64 = rt.heap_alloc((rows as usize) * 16)
+    var k: SharpCtx = SharpCtx { im: im, c: c, acc: acc }
+    par.rows(rows, 16, sharp_rows, (&k) as u64)
+    var s: f64 = 0.0
+    var s2: f64 = 0.0
+    var r: i32 = 0
+    while r < rows {
+        s = s + *((acc + ((r * 2) as u64) * (8 as u64)) as *mut f64)
+        s2 = s2 + *((acc + ((r * 2 + 1) as u64) * (8 as u64)) as *mut f64)
+        r = r + 1
+    }
+    rt.heap_free(acc, (rows as usize) * 16)
+    let n: f64 = (rows as f64) * (((*im).w - 2) as f64)
     let m: f64 = s / n
     return (s2 / n - m * m) as f32
 }

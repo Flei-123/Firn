@@ -29,5 +29,7 @@ run_dim() {
 run_dim overworld 11:0:0 11:-3:5 42:20:-17 5:-40:31 1234:7:-60
 run_dim amplified 3:2:2 77:-9:14
 run_dim large_biomes 3:2:2
+run_dim end 11:0:0 5:-400:-376 5:-110:60 5:70:100 5:90:-20 42:-90:100 42:70:-20 42:70:60
+run_dim nether 11:0:0 42:-30:70 42:200:-90
 [ $ERR = 0 ] && echo "mc/wgen gen: all ok" || echo "mc/wgen gen: FAILED"
 exit $ERR
