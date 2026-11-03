@@ -1353,7 +1353,7 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                                 None
                             }
                         }
-                        BinOp::Rem | BinOp::Rotr32 => None,
+                        BinOp::Rem | BinOp::Rotr32 | BinOp::Rotl => None,
                     }
                 }
                 _ => None,

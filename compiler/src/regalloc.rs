@@ -1137,7 +1137,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 Op::Bin(BinOp::Div, a, _) | Op::Bin(BinOp::Rem, a, _) => {
                     kill(*a, &mut bad);
                 }
-                Op::Bin(BinOp::Shl, a, _) | Op::Bin(BinOp::Shr, a, _) | Op::Bin(BinOp::Rotr32, a, _) => kill(*a, &mut bad),
+                Op::Bin(BinOp::Shl, a, _) | Op::Bin(BinOp::Shr, a, _) | Op::Bin(BinOp::Rotr32, a, _) | Op::Bin(BinOp::Rotl, a, _) => kill(*a, &mut bad),
                 Op::Cast { src, .. } => kill(*src, &mut bad),
                 // untouchable (SPEC §9.2): unchanged as at the base path
                 Op::Select { cond, a, b: b2 } => {
@@ -1997,7 +1997,7 @@ pub fn allocate(f: &Func) -> Alloc {
                             && match op {
                                 BinOp::And | BinOp::Or | BinOp::Xor => true,
                                 BinOp::Sub | BinOp::Mul => !alloc.imms.contains_key(b),
-                                BinOp::Shl | BinOp::Shr | BinOp::Rotr32 => alloc.imms.contains_key(b),
+                                BinOp::Shl | BinOp::Shr | BinOp::Rotr32 | BinOp::Rotl => alloc.imms.contains_key(b),
                                 _ => false,
                             } =>
                     {
@@ -4073,7 +4073,17 @@ fn foldable_addresses(
                 if f.is_secret(off) || a.alias.contains_key(&off) || a.cell(off).is_some() {
                     continue;
                 }
-                let p = &b.insts[idx - 1];
+                let gsc: Option<Val> = if abs_ok
+                    && std::env::var_os("FIRN_NO_GSCALE").is_none()
+                    && gname.contains_key(&base)
+                    && !away.contains(&base)
+                {
+                    Some(base)
+                } else {
+                    None
+                };
+                let pidx = if gsc.is_some() && b.insts[idx - 1].dst == Some(base) && idx > 1 { idx - 2 } else { idx - 1 };
+                let p = &b.insts[pidx];
                 if p.dst != Some(off) || p.ty.bits() != 64 {
                     continue;
                 }
@@ -4092,12 +4102,19 @@ fn foldable_addresses(
                     Some(v) => v,
                     None => continue,
                 };
-                let (br, ir) = match (pure_reg(base), pure_reg(xi)) {
+                let br = match gsc {
+                    Some(g) => gname.get(&g).copied(),
+                    None => pure_reg(base),
+                };
+                let (br, ir) = match (br, pure_reg(xi)) {
                     (Some(br), Some(ir)) => (br, ir),
                     _ => continue,
                 };
                 scale.insert(d, (br, ir, fact));
                 away.insert(off);
+                if let Some(g) = gsc {
+                    away.insert(g);
+                }
             }
         }
     }
@@ -8102,21 +8119,23 @@ fn emit_inst(
         }
         Op::VtabAddr { table } => {
             let d = i.dst.ok_or("internal error: vtab without target")?;
-            e.line(&format!(
-                "lea rax, [rip + {}]",
-                crate::iface::table_label(table)
-            ));
-            ra.store_dst(e, d, "rax");
+            let dr = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => "rax",
+            };
+            e.line(&format!("lea {}, [rip + {}]", dr, crate::iface::table_label(table)));
+            ra.store_dst(e, d, dr);
         }
         // Round 58 (fnval.rs), like `VtabAddr`: `rax` is never the home of a
         // value, so the address may be built there.
         Op::FnRef { name } => {
             let d = i.dst.ok_or("internal error: fnref without target")?;
-            e.line(&format!(
-                "lea rax, [rip + {}]",
-                crate::fnval::record_label(name)
-            ));
-            ra.store_dst(e, d, "rax");
+            let dr = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => "rax",
+            };
+            e.line(&format!("lea {}, [rip + {}]", dr, crate::fnval::record_label(name)));
+            ra.store_dst(e, d, dr);
         }
         // Round 89 (statics.rs), like `FnRef`: a link time constant address.
         Op::GlobalAddr { name } => {
@@ -8124,11 +8143,12 @@ fn emit_inst(
             if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
                 return Ok(()); // the symbol stands in the access
             }
-            e.line(&format!(
-                "lea rax, [rip + {}]",
-                crate::statics::label_of(name)
-            ));
-            ra.store_dst(e, d, "rax");
+            let dr = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => "rax",
+            };
+            e.line(&format!("lea {}, [rip + {}]", dr, crate::statics::label_of(name)));
+            ra.store_dst(e, d, dr);
         }
         Op::Syscall { args } => {
             const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
@@ -8722,6 +8742,27 @@ fn emit_bin_mem(
                     e.line(&format!("ror eax, {}", k));
                     ra.store_dst(e, d, "rax");
                 }
+            }
+        }
+        BinOp::Rotl => {
+            if let Some(k) = ra.a.imm(b) {
+                let k = k & if bits == 64 { 63 } else { 31 };
+                match ra.a.loc(d) {
+                    Loc::Reg(dr) => {
+                        ra.load_full(e, dr, a);
+                        e.line(&format!("rol {}, {}", rn(dr, bits), k));
+                    }
+                    Loc::Slot(_) => {
+                        ra.load_full(e, "rax", a);
+                        e.line(&format!("rol {}, {}", rn("rax", bits), k));
+                        ra.store_dst(e, d, "rax");
+                    }
+                }
+            } else {
+                ra.load_full(e, "rax", a);
+                ra.load_full(e, "rcx", b);
+                e.line(&format!("rol {}, cl", rn("rax", bits)));
+                ra.store_dst(e, d, "rax");
             }
         }
         BinOp::Shl | BinOp::Shr => {
