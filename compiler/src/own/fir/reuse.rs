@@ -90,7 +90,7 @@ pub(crate) fn allocs(f: &Func, ix: &Index, with_calls: bool) -> Vec<Alloc> {
 
 fn alloc_at(f: &Func, ix: &Index, pos: &HashMap<u32, usize>, t: usize, obj: Val, b0: Val) -> Option<Alloc> {
     let class = head_class(f, ix, b0)?;
-    let (head, b0_at) = ix.def.get(b0 as usize).copied().flatten()?;
+    let (head, b0_at) = ix.def_of(b0 as usize)?;
     if head == t || ix.preds[t] != [head] || has_call(&f.blocks[t].insts) {
         return None;
     }
@@ -200,7 +200,7 @@ fn exits_ok(ix: &Index, path: &[usize], a: &Alloc) -> bool {
 }
 
 fn def_pos(ix: &Index, v: Val) -> usize {
-    ix.def[v as usize].map(|d| d.1).unwrap_or(0)
+    ix.def_of(v as usize).map(|d| d.1).unwrap_or(0)
 }
 
 fn simple_preds(ix: &Index, path: &[usize]) -> bool {

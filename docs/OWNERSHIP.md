@@ -177,7 +177,7 @@ Debug mode `--ownership=strict`: frees exactly like `on` (same passes, reuse inc
 
 ### 4.6 Flag and compiler parity
 
-- `--ownership=off|on|check|strict` (default `off`). Env override `FIRNC_OWNERSHIP` for measurement only.
+- `--ownership=off|on|check|strict` (default `on`). Env override `FIRNC_OWNERSHIP` for measurement only.
 - Implemented in firnc0 only (FIR pass in the `opt` pipeline, registered in `opt.rs` like the other passes). firnc1 accepts the flag and ignores it; `fir_compare` compares pre-optimization FIR, so parity is unaffected; fixpoint builds with the default `off`.
 - When the prototype is accepted, the FIR pass moves to firnc1 as a twin like `escape.fi`, with a compare tool (`tools/ownership/compare.sh`: same free sites per function in both compilers).
 
