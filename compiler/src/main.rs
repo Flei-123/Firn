@@ -32,6 +32,7 @@ mod codegen_x86;
 mod x86enc;
 mod asm_intern;
 mod asm_x86;
+mod a64addr;
 mod a64enc;
 mod asm_a64;
 mod asm_dwarf;

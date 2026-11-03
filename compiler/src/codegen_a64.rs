@@ -199,6 +199,7 @@ pub(crate) struct Frame {
     /// rescues the callee-saved registers it hands out. It sits directly
     /// above the outgoing argument area and below the value slots.
     saved_at: u64,
+    pub(crate) fold: crate::a64addr::AddrFold,
 }
 
 /// Marker in `Frame::slot`: this value has NO slot, it lives in a register
@@ -344,6 +345,7 @@ fn layout(f: &Func) -> Frame {
     // (`size - slot`), and the arguments from the bottom. The gap in between
     // was padding until this round.
     let saved_bytes = align_up(8 * (ra.saved.len() + ra.fsaved.len()) as u64, 16);
+    let fold = crate::a64addr::analyse(f, &consts);
     Frame {
         slot,
         alloca_off,
@@ -352,6 +354,7 @@ fn layout(f: &Func) -> Frame {
         consts,
         ra,
         saved_at: outgoing,
+        fold,
     }
 }
 
@@ -589,6 +592,27 @@ fn ext_reg(e: &mut Emitter, dst: &str, src: &str, ty: FTy, to_bits: u32) {
 /// the one into the other, and they are used only where the whole operation
 /// is a SINGLE instruction that reads all its sources before it writes its
 /// target -- then `d == a` is harmless and needs no ordering rule.
+fn mem_operand(e: &mut Emitter, fr: &Frame, addr: Val) -> String {
+    use crate::a64addr::Shape;
+    if let Some(fd) = fr.fold.access.get(&addr) {
+        let rb = src(e, fr, fd.base, B);
+        return match &fd.shape {
+            Shape::Imm(0) => format!("[{}]", rb),
+            Shape::Imm(c) => format!("[{}, #{}]", rb, c),
+            Shape::Index { idx, shift } => {
+                let ri = src(e, fr, *idx, C);
+                if *shift == 0 {
+                    format!("[{}, {}]", rb, ri)
+                } else {
+                    format!("[{}, {}, lsl #{}]", rb, ri, shift)
+                }
+            }
+        };
+    }
+    let rb = src(e, fr, addr, B);
+    format!("[{}]", rb)
+}
+
 fn src(e: &mut Emitter, fr: &Frame, v: Val, scratch: &'static str) -> &'static str {
     if let Some(r) = fr.ra.reg(v) {
         return r;
@@ -1294,7 +1318,12 @@ fn emit_block(
     let bi = b.id as usize;
     let mut fused_cc: Option<&'static str> = None;
     let fused_at = if fused { fusable_cmp_index(b) } else { None };
+    let mut deferred: Vec<&'static str> = Vec::new();
     for (ii, i) in b.insts.iter().enumerate() {
+        if fr.fold.skips(i.dst) {
+            deferred.extend(fr.ra.clear_after(bi, ii).iter().copied());
+            continue;
+        }
         if fused && Some(ii) == fused_at {
             // the compare feeds the branch of this block: flags only, no boolean
             if let Op::Cmp { op, ty: oty, a, b: rb } = &i.op {
@@ -1308,6 +1337,12 @@ fn emit_block(
         // whole tree alive -- and the prologue of every called function also
         // carries it into that function's frame. A `mov rN, xzr` at the place
         // of death costs one instruction, and only where one really dies.
+        let kept = i.dst.and_then(|d| fr.ra.reg(d));
+        for r in deferred.drain(..) {
+            if Some(r) != kept {
+                e.line(&format!("mov {}, xzr", r));
+            }
+        }
         for r in fr.ra.clear_after(bi, ii) {
             e.line(&format!("mov {}, xzr", r));
         }
@@ -1643,6 +1678,10 @@ fn emit_inst(
                 e.line(&format!("cmp {}, #0", rw(A, to)));
                 e.line(&format!("cset {}, ne", w(A)));
             } else {
+                if let Some(rd) = fr.ra.reg(d) {
+                    load_ext(e, fr, rd, *src, *from, 64);
+                    return Ok(());
+                }
                 load_ext(e, fr, A, *src, *from, 64);
             }
             store_dst(e, fr, d, A);
@@ -1694,18 +1733,18 @@ fn emit_inst(
             // ROUND FREG: a float with a `d` register is loaded straight into it.
             if ty.is_float() {
                 if let Some((dn, _)) = fr.ra.freg(d) {
-                    let rb = src(e, fr, *addr, B);
-                    e.line(&format!("ldr {}, [{}]", fname(dn, ty == FTy::F32), rb));
+                    let mem = mem_operand(e, fr, *addr);
+                    e.line(&format!("ldr {}, {}", fname(dn, ty == FTy::F32), mem));
                     return Ok(());
                 }
             }
-            let rb = src(e, fr, *addr, B);
+            let mem = mem_operand(e, fr, *addr);
             let rd = dreg(fr, d, A);
             match bits {
-                8 => e.line(&format!("ldrb {}, [{}]", w(rd), rb)),
-                16 => e.line(&format!("ldrh {}, [{}]", w(rd), rb)),
-                32 => e.line(&format!("ldr {}, [{}]", w(rd), rb)),
-                _ => e.line(&format!("ldr {}, [{}]", rd, rb)),
+                8 => e.line(&format!("ldrb {}, {}", w(rd), mem)),
+                16 => e.line(&format!("ldrh {}, {}", w(rd), mem)),
+                32 => e.line(&format!("ldr {}, {}", w(rd), mem)),
+                _ => e.line(&format!("ldr {}, {}", rd, mem)),
             }
             commit(e, fr, d, rd);
         }
@@ -1723,19 +1762,19 @@ fn emit_inst(
             }
             if ty.is_float() {
                 if let Some((vn, _)) = fr.ra.freg(*val) {
-                    let rb = src(e, fr, *addr, B);
-                    e.line(&format!("str {}, [{}]", fname(vn, ty == FTy::F32), rb));
+                    let mem = mem_operand(e, fr, *addr);
+                    e.line(&format!("str {}, {}", fname(vn, ty == FTy::F32), mem));
                     return Ok(());
                 }
             }
-            let rb = src(e, fr, *addr, B);
+            let mem = mem_operand(e, fr, *addr);
             let rv = src(e, fr, *val, A);
             let bits = ty.bits().max(8);
             match bits {
-                8 => e.line(&format!("strb {}, [{}]", w(rv), rb)),
-                16 => e.line(&format!("strh {}, [{}]", w(rv), rb)),
-                32 => e.line(&format!("str {}, [{}]", w(rv), rb)),
-                _ => e.line(&format!("str {}, [{}]", rv, rb)),
+                8 => e.line(&format!("strb {}, {}", w(rv), mem)),
+                16 => e.line(&format!("strh {}, {}", w(rv), mem)),
+                32 => e.line(&format!("str {}, {}", w(rv), mem)),
+                _ => e.line(&format!("str {}, {}", rv, mem)),
             }
         }
         Op::PtrAdd { base, off } => {
