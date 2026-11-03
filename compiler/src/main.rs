@@ -1437,6 +1437,11 @@ fn output_path(opts: &Options, path: &Path, target_out_manifest: Option<PathBuf>
         })
 }
 
+fn scratch_path(out: &Path, ext: &str) -> PathBuf {
+    let stem = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    out.with_file_name(format!(".{}.{}.{}", stem, std::process::id(), ext))
+}
+
 fn make_object(
     asm: Option<&str>,
     cached: &mut Option<Vec<u8>>,
@@ -1560,21 +1565,32 @@ fn finish(
         tm.print();
         return 0;
     }
-    let obj_path = out.with_extension("o");
+    let obj_path = scratch_path(&out, "o");
+    let asm_path = if opts.keep_asm { asm_path } else { scratch_path(&out, "s") };
+    let staged_out = scratch_path(&out, "tmp");
     if let Err(code) = check_link(link) {
         return code;
     }
     if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, opts.keep_asm, tm) {
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(&asm_path);
         return code;
     }
-    if let Err(code) = link_executable(&obj_path, &out, link) {
-        return code;
-    }
-    tm.mark("as + ld");
+    let linked = link_executable(&obj_path, &staged_out, link);
     let _ = std::fs::remove_file(&obj_path);
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
     }
+    if let Err(code) = linked {
+        let _ = std::fs::remove_file(&staged_out);
+        return code;
+    }
+    if let Err(e) = std::fs::rename(&staged_out, &out) {
+        let _ = std::fs::remove_file(&staged_out);
+        eprintln!("error: cannot write '{}': {}", out.display(), e);
+        return 2;
+    }
+    tm.mark("as + ld");
     tm.print();
     // ROUND 94: `firnc --test x.fi` builds AND runs, like every other test
     // runner. The exit code is the runner's own (0 = everything passed), so
