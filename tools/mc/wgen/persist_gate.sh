@@ -8,7 +8,8 @@ export FIRNLIB="$ROOT/lib"
 W=$(mktemp -d)
 trap 'pkill -9 -f "$W/firnmc-server" 2>/dev/null; rm -rf "$W"' EXIT
 SEED=11
-BOT=tools/mc/wgen/persist_bot.cjs
+PROTO=${PERSIST_PROTO:-763}
+if [ "$PROTO" = 777 ]; then BOT=tools/mc/wgen/persist_bot777.cjs; STONE=1; else BOT=tools/mc/wgen/persist_bot.cjs; STONE=minecraft:stone; fi
 PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 "$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
 mkdir -p "$W/run"
@@ -18,13 +19,14 @@ start_server() {
     rm -f "$W/run/in.fifo" "$W/run/out.log"
     mkfifo "$W/run/in.fifo"
     (sleep 120 > "$W/run/in.fifo" &)
-    (cd "$W/run" && setsid nohup "$W/firnmc-server" nogui < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
+    (cd "$W/run" && setsid nohup "$W/firnmc-server" nogui --protocol "$PROTO" < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
     for _ in $(seq 1 100); do grep -q 'Done (' "$W/run/out.log" 2>/dev/null && break; sleep 0.1; done
     grep -q 'Done (' "$W/run/out.log" || { echo "  FAIL  server start"; tail -5 "$W/run/out.log"; exit 1; }
 }
 
 chunk_row() {
-    node tools/mc/wgen/gen_bot.cjs 127.0.0.1 "$PORT" "$SEED" 25 2>/dev/null | awk -v y="$1" '$4 == y { print substr($5, 137, 1) }'
+    if [ "$PROTO" = 777 ]; then node -e 'const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(j.row || "")' "$1"; return; fi
+    node tools/mc/wgen/gen_bot.cjs 127.0.0.1 "$PORT" "$SEED" 25 2>/dev/null | awk -v y="$2" '$4 == y { print substr($5, 137, 1) }'
 }
 
 props() {
@@ -43,7 +45,6 @@ ok() { echo "  ok    $1"; }
 props "$SEED" creative
 
 start_server
-BEFORE=$(chunk_row 20)
 echo "time set 6000" > "$W/run/in.fifo"
 sleep 1
 node "$BOT" 127.0.0.1 "$PORT" edit "$W/state.json" > "$W/edit.json" 2>"$W/edit.err"
@@ -53,6 +54,7 @@ const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
 const bad = s.expect.filter((e, i) => s.after[i] !== e.block)
 if (bad.length || s.errors.length) { console.log("bad " + JSON.stringify({ after: s.after, errors: s.errors })); process.exit(1) }
 ' "$W/state.json" > "$W/edit.chk" 2>&1 && ok "edit: dig + place applied live" || fail "edit: live state wrong: $(cat "$W/edit.chk")"
+BEFORE=$(chunk_row "$W/edit.json" 20)
 stop_server
 [ -s "$W/run/gw/firn_world.txt" ] || fail "no world meta file"
 [ -s "$W/run/gw/firn_edits.bin" ] && ok "firn_edits.bin written ($(stat -c %s "$W/run/gw/firn_edits.bin") bytes)" || fail "firn_edits.bin empty"
@@ -62,7 +64,7 @@ ls "$W/run/gw"/firn_player_*.bin >/dev/null 2>&1 && ok "player file written" || 
 props 999 survival
 start_server
 node "$BOT" 127.0.0.1 "$PORT" check "$W/state.json" > "$W/check.json" 2>"$W/check.err"
-AFTER=$(chunk_row 20)
+AFTER=$(chunk_row "$W/check.json" 20)
 node -e '
 const fs = require("fs")
 const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
@@ -73,10 +75,10 @@ const near = (a, b) => Math.abs(a - b) < 1e-6
 if (!near(c.pos.x, s.final_pos.x) || !near(c.pos.y, s.final_pos.y) || !near(c.pos.z, s.final_pos.z)) errs.push("pos " + JSON.stringify(c.pos) + " vs " + JSON.stringify(s.final_pos))
 if (c.gameMode !== 1) errs.push("gamemode " + c.gameMode)
 if (c.window[36] !== s.stone) errs.push("hotbar " + JSON.stringify(c.window))
-if (c.placed !== "minecraft:stone") errs.push("place after restart " + c.placed)
+if (String(c.placed) !== process.argv[2]) errs.push("place after restart " + c.placed)
 if (!(c.time >= 6000 && c.time < 9000)) errs.push("time " + c.time)
 if (errs.length) { console.log(errs.join("; ")); process.exit(1) }
-' "$W/check.json" > "$W/check.chk" 2>&1 && ok "restart: blocks, position, gamemode, hotbar, time identical" || fail "restart: $(cat "$W/check.chk")"
+' "$W/check.json" "$STONE" > "$W/check.chk" 2>&1 && ok "restart: blocks, position, gamemode, hotbar, time identical" || fail "restart: $(cat "$W/check.chk")"
 if [ -n "$BEFORE" ] && [ "$BEFORE" = "$AFTER" ]; then ok "restart keeps saved seed (chunk row $BEFORE == $AFTER)"; else fail "seed: before=$(echo "$BEFORE" | wc -l) lines after=$(echo "$AFTER" | wc -l) lines; $(echo "$BEFORE" | head -c 40) / $(echo "$AFTER" | head -c 40)"; fi
 stop_server
 [ "$FAILS" = 0 ] && { echo "mc/wgen persist: all ok"; exit 0; }

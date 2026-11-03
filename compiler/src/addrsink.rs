@@ -170,8 +170,16 @@ fn sink_consts(f: &Func) -> Option<Func> {
         }
     }
     // candidates: d -> (the defining op to copy, its type)
+    let globals: crate::fx::HashSet<Val> = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i.op, Op::GlobalAddr { .. }))
+        .filter_map(|i| i.dst)
+        .collect();
     let mut cand: HashMap<Val, (Op, FTy)> = HashMap::default();
-    for b in &f.blocks {
+    let mut far_ok: HashMap<Val, usize> = HashMap::default();
+    for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
             let d = match i.dst {
                 Some(d) if defs.get(d as usize) == Some(&1) => d,
@@ -194,6 +202,9 @@ fn sink_consts(f: &Func) -> Option<Func> {
                 let k64 = (k as u64) as i64;
                 if (0..=i32::MAX as i64).contains(&k64) {
                     cand.insert(d, (i.op.clone(), i.ty));
+                    if matches!(&i.op, Op::PtrAdd { base, .. } if globals.contains(base)) {
+                        far_ok.insert(d, bi);
+                    }
                 }
             }
         }
@@ -203,9 +214,10 @@ fn sink_consts(f: &Func) -> Option<Func> {
     }
     // every reader must be a memory access through it; count them
     let mut readers: HashMap<Val, u32> = HashMap::default();
+    let mut near: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     let mut bad: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     let mut buf = Vec::new();
-    for b in &f.blocks {
+    for (bi, b) in f.blocks.iter().enumerate() {
         for i in b.insts.iter() {
             buf.clear();
             i.op.uses(&mut buf);
@@ -224,6 +236,10 @@ fn sink_consts(f: &Func) -> Option<Func> {
                 };
                 if ok {
                     *readers.entry(*u).or_insert(0) += 1;
+                    if far_ok.get(u) != Some(&bi) {
+                        continue;
+                    }
+                    near.insert(*u);
                 } else {
                     bad.insert(*u);
                 }
@@ -239,13 +255,19 @@ fn sink_consts(f: &Func) -> Option<Func> {
             bad.insert(v);
         }
     }
+    let far_single = |d: &Val| {
+        far_ok.contains_key(d) && !near.contains(d) && std::env::var_os("FIRN_NO_FARSINK").is_none()
+    };
     // Only addresses with two or more readers: a single reader either
     // stands right behind (folded already) or the sinking buys one `lea`
     // for a longer base -- not worth a second allocation.
     let sinkable: crate::fx::HashSet<Val> = cand
         .keys()
         .copied()
-        .filter(|d| !bad.contains(d) && readers.get(d).copied().unwrap_or(0) >= 2)
+        .filter(|d| {
+            let n = readers.get(d).copied().unwrap_or(0);
+            !bad.contains(d) && (n >= 2 || (n == 1 && far_single(d)))
+        })
         .collect();
     if sinkable.is_empty() {
         return None;
