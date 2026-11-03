@@ -91,6 +91,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn certus_chunk_header_holds_data_end() {
+        let mut s = include_str!("../../../lib/gc/gc.fi").to_string();
+        for m in CERTUS {
+            s = overlay::overlay(&s, m.text);
+        }
+        let items = overlay::items(&s);
+        let chunk_new = items.iter().find(|i| i.name == "__gc_chunk_new").expect("missing __gc_chunk_new");
+        let body = &s[chunk_new.start..chunk_new.end];
+        assert!(body.contains("*((p + 32) as *mut u64) = p + CHUNK_HEADER + block * count"), "chunk word 32 must be the data end");
+        assert!(s.contains("a < __gc_ld64(ci +% 32)"), "the parallel block lookup reads the data end");
+    }
+
+    #[test]
     fn certus_overlay_keeps_core_and_adds_api() {
         let core = include_str!("../../../lib/gc/gc.fi");
         let mut s = core.to_string();

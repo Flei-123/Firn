@@ -1401,10 +1401,13 @@ SOAK_SEC=${TEST_SOAK_SEC:-90} SOAK_LEAK_SEC=${TEST_SOAK_LEAK_SEC:-30} \
     bash tools/gc_soak/run.sh > "$WORK/gc_soak.log" 2>&1 || SOAKRC=$?
 grep -E '^   (PASSED|FAILED|Counter-check|Overhead)|^     (duration|rounds|heap/live 2nd|pause per window|PASSED|FAILED)|^     throughput' \
     "$WORK/gc_soak.log" | cut -c1-110 | sed 's/^/ /'
-if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ]; then
+GCCRC=0
+bash tools/gc_certus/run.sh > "$WORK/gc_certus.log" 2>&1 || GCCRC=$?
+grep -E '^   (gc_certus|FAIL|COMPILE-FAIL)' "$WORK/gc_certus.log" | cut -c1-110 | sed 's/^/ /'
+if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ] && [ "$GCCRC" -eq 0 ]; then
     ok
 else
-    bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
+    bad "round 95 failed (ucd $UCDRC, soak $SOAKRC, gc_certus $GCCRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log, .test-work/gc_certus.log)"
     grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /' || true
 fi
 echo "== 59. the official html5lib tests, the DOM and the style tree (tools/domb1/run.sh, ROUND B1) =="
