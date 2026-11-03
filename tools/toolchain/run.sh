@@ -20,7 +20,7 @@ bad() { FAIL=$((FAIL + 1)); echo "FAIL $1"; }
 expect() { local what=$1; shift; if "$@" >"$D/out" 2>&1; then ok "$what"; else bad "$what"; sed 's/^/     /' "$D/out" | head -5; fi; }
 expect_fail() { local what=$1; shift; if "$@" >"$D/out" 2>&1; then bad "$what (succeeded)"; else ok "$what"; fi; }
 has() { grep -q -- "$2" "$D/out" && ok "$1" || { bad "$1"; sed 's/^/     /' "$D/out" | head -5; }; }
-publish() { bash tools/release/publish.sh --out "$PUB" --channel stable --gate-stamp "$D/stamp" --firnc "${2:-$FIRNC}" --lib-dirs std --version "$1" ${3:-} >"$D/pub.log" 2>&1 || { cat "$D/pub.log"; return 1; }; }
+publish() { bash tools/release/publish.sh --out "$PUB" --channel stable --gate-stamp "$D/stamp" --firnc "${2:-$FIRNC}" --lib-dirs "std rt rc" --version "$1" ${3:-} >"$D/pub.log" 2>&1 || { cat "$D/pub.log"; return 1; }; }
 current() { readlink "$FIRN_HOME/current" | sed 's#.*/##'; }
 printf 'commit=%s\nresult=green\n' "$(git rev-parse HEAD)" > "$D/stamp"
 F=$FIRN_HOME/bin/firn
