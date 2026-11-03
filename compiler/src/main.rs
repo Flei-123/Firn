@@ -10,6 +10,7 @@ mod layout_attrs;
 mod fx;
 mod parcodegen;
 mod parfn;
+mod pgo;
 mod alias;
 mod archsel;
 mod ast;
@@ -425,6 +426,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 print!("{}", attrs::attrs_text());
                 std::process::exit(0);
             }
+            _ if a.starts_with("--profile-") && pgo::parse_arg(a).is_some() => {
+                if let Some(Err(e)) = pgo::parse_arg(a) {
+                    return Err(e);
+                }
+            }
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];
                 match own::parse(v) {
@@ -803,6 +809,10 @@ fn run(opts: &Options) -> i32 {
         }
     };
     let path = &input;
+    if let Err(e) = pgo::finish_config(opts.output.as_deref(), path).and_then(|_| pgo::check_target()) {
+        eprintln!("error: {}", e);
+        return 2;
+    }
     let cache_dir = cache_dir_for(opts);
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     let manifest_paths: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
@@ -1250,6 +1260,7 @@ fn run(opts: &Options) -> i32 {
         }
     }
     tm.mark("prune");
+    pgo::hash::record(&module);
 
     // --- Optimizer ---
     if opts.optimize {
@@ -1344,6 +1355,7 @@ fn run(opts: &Options) -> i32 {
         };
         return emit_wasm(opts, &module, path, target_out_manifest, &mut tm, store, manifest);
     }
+    pgo::instrument::plan(&module);
     let emitted = match target::active() {
         target::Target::X86_64 => {
             codegen_x86::set_object_only(opts.only_object);
@@ -1412,6 +1424,7 @@ fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
         && !opts.no_cache
         && !buildcache::disabled_by_env()
         && !opts.stats
+        && !pgo::active()
         && !opts.timings
         && !opts.env_log
         && opts.header.is_none()
