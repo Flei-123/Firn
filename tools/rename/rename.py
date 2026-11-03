@@ -140,6 +140,14 @@ def write_legacy(root, old_values):
     p.write_text(head)
 
 
+def sync_generated(root):
+    script = root / "tools" / "brand.sh"
+    target = root / "lib" / "toolchain" / "tcbrand.fi"
+    if script.is_file() and target.is_file():
+        out = subprocess.run(["bash", str(script), "--emit-fi"], capture_output=True, check=True, cwd=root)
+        target.write_bytes(out.stdout)
+
+
 def apply(root, forms, changes, renames, symlinks):
     for path in changes:
         full = root / path
@@ -212,6 +220,7 @@ def main():
         apply(root, forms, changes, renames, symlinks)
         if args.keep_aliases and (root / "brand.toml").is_file():
             write_legacy(root, old_brand)
+            sync_generated(root)
         left = residual(root, forms, args.exclude, args.keep_aliases)
         report += "\nAPPLIED. files still containing '%s': %d\n" % (args.old, len(left))
         for path, n in left.most_common(20):
