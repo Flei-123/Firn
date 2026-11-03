@@ -127,6 +127,7 @@ mod sema_match;
 mod peephole;
 mod rotate;
 mod rotl;
+mod truncmask;
 mod ifconv;
 mod bitsel;
 mod bswapload;
