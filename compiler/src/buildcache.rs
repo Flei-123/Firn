@@ -124,7 +124,7 @@ impl LinkInfo {
     pub fn capture() -> LinkInfo {
         LinkInfo {
             kernel: crate::prof::is_kernel(),
-            statics: crate::statics::any(),
+            statics: crate::statics::any() || crate::pgo::instrument::enabled(),
             libs: crate::extfn::link_libs(),
             exports: crate::extfn::export_names(),
         }
