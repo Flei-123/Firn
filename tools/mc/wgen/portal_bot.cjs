@@ -8,6 +8,7 @@ const out = { events: [], portalBlocks: 0, errors: [] }
 const portalMin = mcData.blocksByName.nether_portal.minStateId
 const obsidian = mcData.itemsByName.obsidian.id
 const flint = mcData.itemsByName.flint_and_steel.id
+const FX = parseInt(process.env.FRAME_X || '10', 10)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let current = 'login'
 let pos = null
@@ -31,7 +32,7 @@ const place = (x, y, z) => client.write('block_place', { hand: 0, location: { x,
 const move = (x, y, z) => client.write('position', { x, y, z, onGround: true })
 async function run() {
   await sleep(1500)
-  cmd('tp 10.5 150 3.5')
+  cmd(`tp ${FX + 0.5} 150 3.5`)
   await sleep(1500)
   client.write('set_creative_slot', { slot: 36, item: item(obsidian, 64) })
   client.write('set_creative_slot', { slot: 37, item: item(flint, 1) })
@@ -39,16 +40,16 @@ async function run() {
   client.write('held_item_slot', { slotId: 0 })
   await sleep(300)
   const frame = []
-  for (const x of [10, 11]) { frame.push([x, 149, 0], [x, 153, 0]) }
-  for (const x of [9, 12]) for (const y of [150, 151, 152]) frame.push([x, y, 0])
+  for (const x of [FX, FX + 1]) { frame.push([x, 149, 0], [x, 153, 0]) }
+  for (const x of [FX - 1, FX + 2]) for (const y of [150, 151, 152]) frame.push([x, y, 0])
   for (const [x, y, z] of frame) { place(x, y, z); await sleep(60) }
   await sleep(500)
   client.write('held_item_slot', { slotId: 1 })
   await sleep(300)
-  client.write('block_place', { hand: 0, location: { x: 10, y: 149, z: 0 }, direction: 1, cursorX: 0.5, cursorY: 1, cursorZ: 0.5, insideBlock: false, sequence: ++seq })
+  client.write('block_place', { hand: 0, location: { x: FX, y: 149, z: 0 }, direction: 1, cursorX: 0.5, cursorY: 1, cursorZ: 0.5, insideBlock: false, sequence: ++seq })
   await sleep(1000)
   out.afterIgnite = out.portalBlocks
-  move(10.5, 150, 0.5)
+  move(FX + 0.5, 150, 0.5)
   await sleep(2500)
   out.nether = pos
   const there = pos

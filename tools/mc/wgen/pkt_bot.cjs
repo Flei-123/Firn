@@ -12,8 +12,8 @@ client.on('error', (e) => out.errors.push(String(e.message)))
 client.on('kick_disconnect', (p) => out.errors.push('kick ' + JSON.stringify(p)))
 const SKIP = new Set(['keep_alive', 'chunk_biomes'])
 const FIELDS = {
-  login: ['entityId', 'isHardcore', 'gameMode', 'previousGameMode', 'worldName', 'maxPlayers', 'viewDistance', 'simulationDistance', 'reducedDebugInfo', 'enableRespawnScreen', 'isDebug', 'isFlat'],
-  respawn: ['dimension', 'worldName', 'gamemode', 'previousGamemode', 'isDebug', 'isFlat', 'copyMetadata'],
+  login: ['entityId', 'isHardcore', 'gameMode', 'previousGameMode', 'worldName', 'hashedSeed', 'maxPlayers', 'viewDistance', 'simulationDistance', 'reducedDebugInfo', 'enableRespawnScreen', 'isDebug', 'isFlat'],
+  respawn: ['dimension', 'worldName', 'hashedSeed', 'gamemode', 'previousGamemode', 'isDebug', 'isFlat', 'copyMetadata'],
   position: ['x', 'y', 'z', 'yaw', 'pitch', 'flags'],
   update_view_position: ['chunkX', 'chunkZ'],
   game_state_change: ['reason', 'gameMode'],

@@ -13,6 +13,7 @@ const OBSIDIAN = 394
 const FLINT = 1005
 const PORTAL_MIN = 8687
 let pos = null
+const FX = parseInt(process.env.FRAME_X || '10', 10)
 let seq = 0
 const DIM_NAMES = ['minecraft:overworld', 'minecraft:the_nether', 'minecraft:the_end']
 let current = 'login'
@@ -132,7 +133,7 @@ const move = (x, y, z) => send(C2S.positionLook, Buffer.concat([f64(x), f64(y), 
 async function run() {
   setTimeout(finish, 110000)
   await sleep(1500)
-  move(10.5, 150, 3.5)
+  move(FX + 0.5, 150, 3.5)
   await sleep(1500)
   give(36, OBSIDIAN, 64)
   give(37, FLINT, 1)
@@ -140,16 +141,16 @@ async function run() {
   send(C2S.heldItem, i16(0))
   await sleep(300)
   const frame = []
-  for (const x of [10, 11]) frame.push([x, 149, 0], [x, 153, 0])
-  for (const x of [9, 12]) for (const y of [150, 151, 152]) frame.push([x, y, 0])
+  for (const x of [FX, FX + 1]) frame.push([x, 149, 0], [x, 153, 0])
+  for (const x of [FX - 1, FX + 2]) for (const y of [150, 151, 152]) frame.push([x, y, 0])
   for (const [x, y, z] of frame) { place(x, y, z); await sleep(60) }
   await sleep(500)
   send(C2S.heldItem, i16(1))
   await sleep(300)
-  place(10, 150, 0)
+  place(FX, 150, 0)
   await sleep(1000)
   out.afterIgnite = out.portalBlocks
-  move(10.5, 150, 0.5)
+  move(FX + 0.5, 150, 0.5)
   await until(() => respawns() >= 1, 30000)
   await sleep(1000)
   out.nether = pos
