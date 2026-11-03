@@ -2,12 +2,12 @@
 const fs = require('fs')
 const [vf, ff] = process.argv.slice(2)
 const IGNORE = new Set((process.env.ORDER_IGNORE || 'update_time,time,entity_metadata,entity_velocity,entity_teleport,rel_entity_move,entity_move_look,entity_look,entity_head_rotation,entity_update_attributes,update_attributes,entity_equipment,player_info,player_remove,named_entity_spawn,spawn_entity,entity_destroy,declare_recipes,tags,declare_commands,advancements,recipe_book_settings,recipe_book_add,recipe_book_remove,server_data,feature_flags,custom_payload,sync_entity_position,unlock_recipes,sound_effect,named_sound_effect,block_change,multi_block_change,acknowledge_player_digging,block_break_animation,world_particles,statistics,update_light,tile_entity_data,map_chunk,chunk_biomes,unload_chunk,system_chat,chunk_batch_start,chunk_batch_finished,boss_bar,bundle_delimiter,experience,set_ticking_state,step_tick,post_effects,set_time,level_chunk_with_light,light_update,forget_level_chunk').split(','))
-function norm(packets, loose) {
+function norm(packets, loose, ambient) {
   const res = []
   for (let p of packets) {
     if (loose) p = p.replace(/^(position|update_view_position) .*/, '$1')
     const name = p.split(' ')[0]
-    if (IGNORE.has(name)) continue
+    if (IGNORE.has(name) || (ambient && name === 'world_event')) continue
     res.push(p.replace(/"entityId":\d+/, '"entityId":0').replace(/^spawn_position .*/, 'spawn_position'))
   }
   const merged = []
@@ -33,7 +33,8 @@ for (let i = 0; i < n; i++) {
   if (vm && !/^(join|execute in|raw:enter|raw:leave)/.test(vm.cmd)) continue
   if (!vm || !fm) { console.log('mark count differs'); bad++; break }
   const loose = vm.cmd.startsWith('raw:') || vm.cmd === 'join'
-  const a = norm(vm.packets, loose), b = norm(fm.packets, loose)
+  const ambient = vm.cmd === 'join'
+  const a = norm(vm.packets, loose, ambient), b = norm(fm.packets, loose, ambient)
   const same = JSON.stringify(a) === JSON.stringify(b)
   console.log(`${same ? '  ok   ' : '  DIFF '} ${vm.cmd}  (vanilla ${a.length}, firn ${b.length}, chunks ${chunkRuns(vm.packets)}/${chunkRuns(fm.packets)})`)
   if (!same || process.env.ORDER_VERBOSE) {

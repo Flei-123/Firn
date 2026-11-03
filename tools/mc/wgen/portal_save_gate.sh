@@ -2,66 +2,71 @@
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 ROOT=$(pwd)
-PROTO=${DIM_PROTO:-763}
 FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNLIB="$ROOT/lib"
+JARS=${MC_JARS:-/root/.w5/jars}
 W=$(mktemp -d)
-trap 'kill -9 "$(cat "$W/pid" 2>/dev/null)" 2>/dev/null; rm -rf "$W"' EXIT
-PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
-mkdir -p "$W/run"
-printf 'level-type=minecraft:flat\nlevel-name=sw\nview-distance=2\ngamemode=creative\nwhite-list=false\nserver-port=%s\n' "$PORT" > "$W/run/server.properties"
-python3 -I - "$W/run/ops.json" PortalBot:4 <<'PY'
-import hashlib, json, sys, uuid
-def offline(name):
-    b = bytearray(hashlib.md5(("OfflinePlayer:" + name).encode()).digest())
-    b[6] = (b[6] & 0x0f) | 0x30
-    b[8] = (b[8] & 0x3f) | 0x80
-    return str(uuid.UUID(bytes=bytes(b)))
-json.dump([{"uuid": offline("PortalBot"), "name": "PortalBot", "level": 4, "bypassesPlayerLimit": False}], open(sys.argv[1], "w"))
+VPID=""; FPID=""
+cleanup() { exec 3>&- 2>/dev/null; for p in $VPID $FPID; do kill "$p" 2>/dev/null; done; sleep 1; for p in $VPID $FPID; do kill -9 "$p" 2>/dev/null; done; rm -rf "$W"; }
+trap cleanup EXIT
+free_port() { python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+VPORT=$(free_port); FPORT=$(free_port)
+OPS=$(python3 -I - <<'PY'
+import hashlib, json, uuid
+b = bytearray(hashlib.md5(b"OfflinePlayer:PortalBot").digest())
+b[6] = (b[6] & 0x0f) | 0x30
+b[8] = (b[8] & 0x3f) | 0x80
+print(json.dumps([{"uuid": str(uuid.UUID(bytes=bytes(b))), "name": "PortalBot", "level": 4, "bypassesPlayerLimit": False}]))
 PY
-start_server() {
-    rm -f "$W/run/in.fifo" "$W/run/out.log"
-    mkfifo "$W/run/in.fifo"
-    (sleep 200 > "$W/run/in.fifo" &)
-    (cd "$W/run" && setsid nohup "$W/firnmc-server" nogui --protocol "$PROTO" < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
-    for _ in $(seq 1 100); do grep -q 'Done (' "$W/run/out.log" 2>/dev/null && break; sleep 0.1; done
-    grep -q 'Done (' "$W/run/out.log" || { echo "  FAIL  server start"; tail -n 5 "$W/run/out.log"; exit 1; }
-}
-stop_server() {
-    echo "save-all" > "$W/run/in.fifo"
-    sleep 2
-    echo "stop" > "$W/run/in.fifo"
-    sleep 2
-    kill -9 "$(cat "$W/pid")" 2>/dev/null
-}
-BOT=tools/mc/wgen/portal_bot.cjs; [ "$PROTO" = 777 ] && BOT=tools/mc/wgen/portal_bot777.cjs
-start_server
-FRAME_X=10 node "$BOT" 127.0.0.1 "$PORT" > "$W/bot1.json" 2>"$W/bot1.err"
-stop_server
-SAVED=$(ls "$W/run/sw/DIM-1/region" 2>/dev/null | wc -l)
-start_server
-FRAME_X=80 node "$BOT" 127.0.0.1 "$PORT" > "$W/bot2.json" 2>"$W/bot2.err"
-stop_server
+)
+mkdir -p "$W/vanilla" "$W/firn"
+printf 'online-mode=false\nserver-port=%s\nlevel-seed=11\nview-distance=3\nsimulation-distance=3\nspawn-protection=0\nspawn-monsters=false\nspawn-animals=false\nspawn-npcs=false\ngenerate-structures=false\ngamemode=creative\nforce-gamemode=true\nenforce-secure-profile=false\nwhite-list=false\n' "$VPORT" > "$W/vanilla/server.properties"
+echo "eula=true" > "$W/vanilla/eula.txt"
+echo "$OPS" > "$W/vanilla/ops.json"
+echo "$OPS" > "$W/firn/ops.json"
+"$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
+mkfifo "$W/vanilla/in"; exec 3<>"$W/vanilla/in"
+( cd "$W/vanilla" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vanilla/in" > server.out 2>&1 ) &
+VPID=$!
+for _ in $(seq 1 240); do grep -q 'Done (' "$W/vanilla/server.out" 2>/dev/null && break; sleep 1; done
+grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server start"; tail -n 5 "$W/vanilla/server.out"; exit 1; }
+FRAME_X=10 node tools/mc/wgen/portal_bot.cjs 127.0.0.1 "$VPORT" > "$W/bot1.json" 2>"$W/bot1.err"
+echo "save-all flush" >&3
+sleep 3
+echo stop >&3
+for _ in $(seq 1 60); do kill -0 "$VPID" 2>/dev/null || break; sleep 1; done
+VPID=""
+ls "$W/vanilla/world/DIM-1/region" > "$W/regions.txt" 2>&1
+cp -r "$W/vanilla/world" "$W/firn/world"
+rm -f "$W/firn/world/session.lock"
+printf 'level-name=world\nview-distance=3\ngamemode=creative\nwhite-list=false\nserver-port=%s\n' "$FPORT" > "$W/firn/server.properties"
+mkfifo "$W/firn/in.fifo"
+(sleep 120 > "$W/firn/in.fifo" &)
+(cd "$W/firn" && setsid nohup "$W/firnmc-server" nogui --protocol 763 < in.fifo > out.log 2>&1 & echo $! > "$W/fpid")
+FPID=$(cat "$W/fpid")
+for _ in $(seq 1 100); do grep -q 'Done (' "$W/firn/out.log" 2>/dev/null && break; sleep 0.2; done
+grep -q 'Done (' "$W/firn/out.log" || { echo "  FAIL  firn server start"; tail -n 5 "$W/firn/out.log"; exit 1; }
+grep -q 'non-persistent' "$W/firn/out.log" && { echo "  FAIL  saved world not loaded"; cat "$W/firn/out.log" | tail -n 5; exit 1; }
+FRAME_X=80 node tools/mc/wgen/portal_bot.cjs 127.0.0.1 "$FPORT" > "$W/bot2.json" 2>"$W/bot2.err"
 node -e '
 const fs = require("fs")
 const a = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
 const b = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))
-const saved = parseInt(process.argv[3], 10)
+const regions = fs.readFileSync(process.argv[3], "utf8").trim()
 const errs = []
 const want = ["login minecraft:overworld", "respawn minecraft:the_nether", "respawn minecraft:overworld"]
-for (const [n, o] of [["first", a], ["second", b]]) {
+for (const [n, o] of [["vanilla", a], ["firn", b]]) {
   const got = o.events.filter((e) => /^(login|respawn)/.test(e))
   if (JSON.stringify(got) !== JSON.stringify(want)) errs.push(n + " events " + JSON.stringify(got))
   if (o.errors.length) errs.push(n + " errors " + JSON.stringify(o.errors))
   if (!o.nether) errs.push(n + " no nether arrival")
 }
-if (!saved) errs.push("no nether region files saved")
+if (!/\.mca/.test(regions)) errs.push("vanilla saved no nether region: " + regions)
 if (a.nether && b.nether) {
   const d = Math.hypot(a.nether.x - b.nether.x, a.nether.z - b.nether.z, a.nether.y - b.nether.y)
-  if (d > 2) errs.push("second portal did not reuse the saved nether portal, distance " + d.toFixed(2) + " a=" + JSON.stringify(a.nether) + " b=" + JSON.stringify(b.nether))
+  if (d > 2) errs.push("firn did not reuse the saved vanilla nether portal, distance " + d.toFixed(2) + " vanilla=" + JSON.stringify(a.nether) + " firn=" + JSON.stringify(b.nether))
 }
 if (errs.length) { console.log(errs.join("; ")); process.exit(1) }
-' "$W/bot1.json" "$W/bot2.json" "$SAVED" && echo "  ok    saved nether portal found after restart" || { echo "  FAIL  portal save"; tail -n 5 "$W/run/out.log"; exit 1; }
+' "$W/bot1.json" "$W/bot2.json" "$W/regions.txt" && echo "  ok    firn finds the nether portal saved by vanilla after loading the saved world" || { echo "  FAIL  portal save"; tail -n 5 "$W/firn/out.log"; exit 1; }
 echo "mc/wgen portal save: all ok"
