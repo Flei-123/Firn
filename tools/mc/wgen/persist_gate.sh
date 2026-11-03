@@ -9,11 +9,14 @@ W=$(mktemp -d)
 trap 'pkill -9 -f "$W/firnmc-server" 2>/dev/null; rm -rf "$W"' EXIT
 SEED=11
 PROTO=${PERSIST_PROTO:-763}
+DIM=${PERSIST_DIM:-overworld}
+case "$DIM" in overworld) LEVEL=minecraft:normal ;; *) LEVEL=$DIM ;; esac
+export PERSIST_DIM=$DIM GEN_DIM=$DIM
 if [ "$PROTO" = 777 ]; then BOT=tools/mc/wgen/persist_bot777.cjs; STONE=1; else BOT=tools/mc/wgen/persist_bot.cjs; STONE=minecraft:stone; fi
 PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 "$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
 mkdir -p "$W/run"
-printf 'level-type=minecraft:normal\nlevel-seed=%s\nlevel-name=gw\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nview-distance=2\nwhite-list=false\nserver-port=%s\n' "$SEED" "$ROOT" "$PORT" > "$W/run/server.properties"
+printf 'level-type=%s\nlevel-seed=%s\nlevel-name=gw\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nview-distance=2\nwhite-list=false\nserver-port=%s\n' "$LEVEL" "$SEED" "$ROOT" "$PORT" > "$W/run/server.properties"
 
 start_server() {
     rm -f "$W/run/in.fifo" "$W/run/out.log"
@@ -30,7 +33,7 @@ chunk_row() {
 }
 
 props() {
-    printf 'level-type=minecraft:normal\nlevel-seed=%s\nlevel-name=gw\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nview-distance=3\nwhite-list=false\nserver-port=%s\ngamemode=%s\n' "$1" "$ROOT" "$PORT" "$2" > "$W/run/server.properties"
+    printf 'level-type=%s\nlevel-seed=%s\nlevel-name=gw\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nview-distance=3\nwhite-list=false\nserver-port=%s\ngamemode=%s\n' "$LEVEL" "$1" "$ROOT" "$PORT" "$2" > "$W/run/server.properties"
 }
 stop_server() {
     echo "save-all" > "$W/run/in.fifo"
