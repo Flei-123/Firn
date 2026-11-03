@@ -137,6 +137,7 @@ mod idxsink;
 mod usecount;
 mod promote;
 mod rangecheck;
+mod negidx;
 mod strings;
 mod strtype;
 mod fmtspec;
