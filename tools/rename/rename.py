@@ -56,7 +56,7 @@ def map_path(forms, path):
 
 
 def scan(root, forms, excludes):
-    stats = {"files": 0, "lines": 0, "occurrences": 0, "binary": 0, "symlinks": 0, "arrays": 0,
+    stats = {"files": 0, "lines": 0, "occurrences": 0, "binary": 0, "symlinks": 0, "arrays": 0, "bytes": [],
              "by_category": Counter(), "by_dir": Counter(), "env_names": set()}
     edges, odd = Counter(), Counter()
     changes, renames, symlinks = [], [], []
@@ -83,6 +83,8 @@ def scan(root, forms, excludes):
         if not n:
             continue
         stats["files"] += 1
+        if forms.byte_sequences(text):
+            stats["bytes"].append(path)
         stats["arrays"] += forms.count_arrays(text)
         stats["occurrences"] += n
         lines = sum(1 for line in text.splitlines() if forms.count(line))
@@ -197,6 +199,8 @@ def main():
         warnings.append("target name '%s' already occurs in %d files; a rename back is not exact" % (args.new, pre))
     if args.keep_aliases and not (root / "brand.toml").is_file():
         warnings.append("--keep-aliases needs brand.toml; no alias section will be written")
+    for path in stats["bytes"]:
+        warnings.append("name spelled as byte values (not renamed, fix by hand): %s" % path)
     report = render(stats, renames, edges, odd, conflicts, warnings)
     if args.apply and not args.dry_run:
         if conflicts:

@@ -15,6 +15,7 @@ class Forms:
         self.mixed = re.compile(re.escape(old), re.IGNORECASE)
         self.token = re.compile(r"[A-Za-z0-9_]*(?:%s)[A-Za-z0-9_]*" % alts)
         self.table = dict(self.pairs)
+        self.byte_rx = [re.compile(r"\b" + r"\s*,\s*".join(str(ord(c)) for c in a) + r"\b") for a, _ in self.pairs]
         self.fixed_arrays = re.compile(r'(?P<head>\[u8;\s*)(?P<n>\d+)(?P<tail>\]\s*=\s*b?"(?P<lit>(?:[^"\\\n]|\\.)*)")')
         o, u, c = re.escape(old), re.escape(old.upper()), re.escape(old.capitalize())
         self.categories = (
@@ -35,6 +36,9 @@ class Forms:
         if not delta:
             return m.group(0)
         return "%s%d%s" % (m.group("head"), int(m.group("n")) + delta, m.group("tail"))
+
+    def byte_sequences(self, text):
+        return sum(len(rx.findall(text)) for rx in self.byte_rx)
 
     def count_arrays(self, text):
         return sum(1 for m in self.fixed_arrays.finditer(text) if self.count(m.group("lit")) and len(self.new) != len(self.old))
