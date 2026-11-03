@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/firncam/shotq.fi -- background photo jobs of FirnCam: a fixed number of slots, one processing thread.
+import std.rt
+import photo.camjob
+import photo.campreset
+import photo.stagelog
+import android.ndk
+
+export {
+    Slot, Queue, SLOTS, S_FREE, S_CAPTURE, S_QUEUED, S_RUNNING, S_DONE, S_FAILED,
+    queue_new, state, set_state, reserve, release, slot_at, pending, running_progress, oldest_finished,
+    start_thread, take_preview, request_stop, idle, run_slot,
+}
+
+const SLOTS: i32 = 2
+const S_FREE: u64 = 0
+const S_CAPTURE: u64 = 1
+const S_QUEUED: u64 = 2
+const S_RUNNING: u64 = 3
+const S_DONE: u64 = 4
+const S_FAILED: u64 = 5
+const QSTACK: usize = 16 * 1024 * 1024
+
+extern fn pthread_create(tid: u64, attr: u64, start: u64, arg: u64) -> i32;
+extern fn pthread_attr_init(attr: u64) -> i32;
+extern fn pthread_attr_setstacksize(attr: u64, n: usize) -> i32;
+extern fn pthread_attr_setdetachstate(attr: u64, state: i32) -> i32;
+extern fn usleep(us: u32) -> i32;
+
+struct Slot {
+    state: u64,
+    pready: u64,
+    seq: u64,
+    preview: bool,
+    job: camjob.Job,
+    pjob: camjob.Job,
+    cbuf: u64,
+    ccap: usize,
+    fbuf: u64,
+    fcap: usize,
+    uri: u64,
+    psaved: i32,
+    pstages: stagelog.Snap,
+    stages: stagelog.Snap,
+}
+
+struct Queue {
+    slots: [Slot; 2],
+    next_seq: u64,
+    tid: u64,
+    tattr: [u64; 16],
+    stop: u64,
+    working: u64,
+}
+
+fn slot_new() -> Slot {
+    return Slot {
+        state: S_FREE, pready: 0, seq: 0, preview: false, job: camjob.job_new(), pjob: camjob.job_new(),
+        cbuf: 0, ccap: 0, fbuf: 0, fcap: 0, uri: 0, psaved: 0, pstages: stagelog.snap_empty(), stages: stagelog.snap_empty(),
+    }
+}
+
+fn queue_new() -> Queue {
+    return Queue { slots: [slot_new(), slot_new()], next_seq: 1, tid: 0, tattr: [0; 16], stop: 0, working: 0 }
+}
+
+fn slot_at(q: *mut Queue, i: i32) -> *mut Slot {
+    return &(*q).slots[i as usize]
+}
+
+fn load(p: *mut u64) -> u64 {
+    return __atomic_add(p, 0)
+}
+
+fn store(p: *mut u64, v: u64) {
+    let old: u64 = __atomic_add(p, 0)
+    let d: u64 = __atomic_add(p, v - old)
+}
+
+fn state(s: *mut Slot) -> u64 {
+    return load(&(*s).state)
+}
+
+fn set_state(s: *mut Slot, v: u64) {
+    store(&(*s).state, v)
+}
+
+fn reserve(q: *mut Queue) -> i32 {
+    var i: i32 = 0
+    while i < SLOTS {
+        let s: *mut Slot = slot_at(q, i)
+        if state(s) == S_FREE {
+            camjob.job_free(&(*s).job)
+            camjob.job_free(&(*s).pjob)
+            (*s).job = camjob.job_new()
+            (*s).pjob = camjob.job_new()
+            (*s).seq = (*q).next_seq
+            (*q).next_seq = (*q).next_seq + 1
+            (*s).pready = 0
+            (*s).preview = false
+            (*s).uri = 0
+            (*s).psaved = 0
+            (*s).pstages = stagelog.snap_empty()
+            (*s).stages = stagelog.snap_empty()
+            set_state(s, S_CAPTURE)
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn release(s: *mut Slot) {
+    camjob.job_free(&(*s).job)
+    camjob.job_free(&(*s).pjob)
+    (*s).job = camjob.job_new()
+    (*s).pjob = camjob.job_new()
+    (*s).cbuf = 0
+    (*s).fbuf = 0
+    set_state(s, S_FREE)
+}
+
+fn pending(q: *mut Queue) -> i32 {
+    var n: i32 = 0
+    var i: i32 = 0
+    while i < SLOTS {
+        let st: u64 = state(slot_at(q, i))
+        if st == S_QUEUED || st == S_RUNNING || st == S_DONE || st == S_FAILED { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn running_progress(q: *mut Queue) -> i32 {
+    var i: i32 = 0
+    while i < SLOTS {
+        let s: *mut Slot = slot_at(q, i)
+        if state(s) == S_RUNNING { return camjob.job_progress(&(*s).job) as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn oldest_with(q: *mut Queue, a: u64, b: u64) -> i32 {
+    var best: i32 = 0 - 1
+    var i: i32 = 0
+    while i < SLOTS {
+        let s: *mut Slot = slot_at(q, i)
+        let st: u64 = state(s)
+        if st == a || st == b {
+            if best < 0 || (*s).seq < (*slot_at(q, best)).seq { best = i }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn oldest_finished(q: *mut Queue) -> i32 {
+    return oldest_with(q, S_DONE, S_FAILED)
+}
+
+fn take_preview(s: *mut Slot) -> bool {
+    if load(&(*s).pready) != 1 { return false }
+    store(&(*s).pready, 2)
+    return true
+}
+
+fn run_preview(s: *mut Slot) {
+    camjob.job_free(&(*s).pjob)
+    (*s).pjob = (*s).job
+    (*s).pjob.out = 0
+    (*s).pjob.out_n = 0
+    (*s).pjob.out_cap = 0
+    (*s).pjob.pdf = rt.buf_new()
+    (*s).pjob.have_pdf = false
+    (*s).pjob.n = 1
+    campreset.apply_preview(&(*s).pjob)
+    let ok: bool = camjob.run_job(&(*s).pjob)
+    (*s).pstages = stagelog.snap()
+    if (*s).pjob.ok { store(&(*s).pready, 1) }
+}
+
+fn run_slot(s: *mut Slot) {
+    set_state(s, S_RUNNING)
+    if (*s).preview { run_preview(s) }
+    camjob.job_entry((&(*s).job) as u64)
+    (*s).stages = stagelog.snap()
+    if (*s).job.ok { set_state(s, S_DONE) } else { set_state(s, S_FAILED) }
+}
+
+fn proc_main(arg: u64) -> u64 {
+    let q: *mut Queue = arg as *mut Queue
+    if !thread_attach() { return 0 }
+    while load(&(*q).stop) == 0 {
+        let i: i32 = oldest_with(q, S_QUEUED, S_QUEUED)
+        if i >= 0 {
+            thread_blocking_out()
+            store(&(*q).working, 1)
+            run_slot(slot_at(q, i))
+            store(&(*q).working, 0)
+            thread_blocking_an()
+        } else {
+            usleep(10000 as u32)
+        }
+    }
+    return 0
+}
+
+fn start_thread(q: *mut Queue) -> bool {
+    if (*q).tid != 0 { return true }
+    pthread_attr_init((&(*q).tattr[0]) as u64)
+    pthread_attr_setstacksize((&(*q).tattr[0]) as u64, QSTACK)
+    pthread_attr_setdetachstate((&(*q).tattr[0]) as u64, 1)
+    let rc: i32 = pthread_create((&(*q).tid) as u64, (&(*q).tattr[0]) as u64, ndk.code_of_thread(proc_main), q as u64)
+    if rc != 0 { (*q).tid = 0 }
+    return (*q).tid != 0
+}
+
+fn request_stop(q: *mut Queue) {
+    store(&(*q).stop, 1)
+}
+
+fn idle(q: *mut Queue) -> bool {
+    return load(&(*q).working) == 0 && oldest_with(q, S_QUEUED, S_RUNNING) < 0
+}

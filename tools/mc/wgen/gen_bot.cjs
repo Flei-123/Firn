@@ -6,7 +6,10 @@ const mcData = require(path.join(root, 'minecraft-data'))('1.20.1')
 
 const [host, portArg, seedArg, expectArg] = process.argv.slice(2)
 const expect = parseInt(expectArg, 10)
-const CODES = { stone: 'S', air: 'A', water: 'W', lava: 'L', copper_ore: 'C', raw_copper_block: 'c', granite: 'G', deepslate_iron_ore: 'I', raw_iron_block: 'i', tuff: 'T' }
+const DIM = process.env.GEN_DIM || 'overworld'
+const DIMS = { overworld: { name: 'minecraft:overworld', minY: -64, sections: 24, rows: 384 }, nether: { name: 'minecraft:the_nether', minY: 0, sections: 16, rows: 128 }, end: { name: 'minecraft:the_end', minY: 0, sections: 16, rows: 128 } }
+const D = DIMS[DIM]
+const CODES = { stone: 'S', netherrack: 'S', end_stone: 'S', air: 'A', water: 'W', lava: 'L', copper_ore: 'C', raw_copper_block: 'c', granite: 'G', deepslate_iron_ore: 'I', raw_iron_block: 'i', tuff: 'T' }
 
 function varint(buf, o) {
   let r = 0, s = 0, b
@@ -41,7 +44,7 @@ function rows(data, cx, cz) {
   const buf = data.chunkData
   const o = { p: 0 }
   const out = []
-  for (let sec = 0; sec < 24; sec++) {
+  for (let sec = 0; sec < D.sections; sec++) {
     o.p += 2
     const blocks = container(buf, o, 8)
     container(buf, o, 3)
@@ -51,7 +54,9 @@ function rows(data, cx, cz) {
         const b = mcData.blocksByStateId[entry(blocks, ly * 256 + i)]
         row += (b && CODES[b.name]) || '?'
       }
-      out.push(`${seedArg} ${cx} ${cz} ${-64 + sec * 16 + ly} ${row}`)
+      const y = D.minY + sec * 16 + ly
+      if (y >= D.minY + D.rows) { if (/[^A]/.test(row)) { console.error(`padding row y=${y} not air`); process.exit(1) } continue }
+      out.push(`${seedArg} ${cx} ${cz} ${y} ${row}`)
     }
   }
   return out.reverse()
@@ -61,6 +66,10 @@ const client = mc.createClient({ host, port: parseInt(portArg, 10), username: 'G
 const t0 = Date.now()
 let count = 0
 let origin = null
+client.on('login', (p) => {
+  if (p.worldType !== D.name || p.worldName !== D.name) { console.error(`dimension mismatch ${p.worldType} ${p.worldName}`); process.exit(1) }
+})
+client.on('position', (p) => { console.error(`position ${p.x} ${p.y} ${p.z}`) })
 client.on('map_chunk', (p) => {
   count++
   if (p.x === 0 && p.z === 0) origin = rows(p, 0, 0)

@@ -230,7 +230,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT=$(pwd)
-FIRNC="$ROOT/compiler/target/release/firnc"
+. "$ROOT/tools/brand.sh"
+FIRNC="$ROOT/compiler/target/release/$BRAND_COMPILER"
 WORK="${TEST_WORK:-$ROOT/.test-work}"
 
 if [ "${1:-}" = "--stage" ]; then
@@ -248,7 +249,7 @@ fi
 
 # Module search path (round 39): `import std.*` resolves over $FIRNLIB to
 # <repo>/lib -- no matter which directory a test project calls from.
-export FIRNLIB="$ROOT/lib"
+export "$BRAND_SYSROOT_ENV=$ROOT/lib"
 
 PASS=0
 FAIL=0

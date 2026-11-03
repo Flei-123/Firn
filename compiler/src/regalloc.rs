@@ -5685,7 +5685,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
 
     // Round 51: the blocks are no longer printed in their FIR order but
     // along traces (see `emit_order`).
-    let order = emit_order(f);
+    let order = crate::pgo::layout::emit_order(f).unwrap_or_else(|| emit_order(f));
     // ROUND SPEED -- a loop head starts at a 16 byte boundary.
     //
     // Round 3 moved blocks around, and two benchmarks whose emitted
@@ -5706,6 +5706,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             e.raw("    .p2align 4, 0x90");
         }
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
+        if let Some(l) = crate::pgo::instrument::counter_line(&f.name, f.blocks.len(), bi) {
+            e.line(&l);
+        }
         // Fallthrough: if the jump target sits right behind it, the jump
         // disappears (saves one `jmp` per BrCond with else==next block).
         let next = order.get(k + 1).map(|&j| f.blocks[j].id);
@@ -6625,6 +6628,7 @@ fn emit_block(
                         && tb.id != b.id
                         && cmp_br_mergeable(ra, tb)
                         && std::env::var_os("FIRN_NO_ROTATE").is_none()
+                        && !crate::pgo::instrument::enabled()
                     {
                         for i in &tb.insts[..tb.insts.len() - 1] {
                             e.loc_at(i.loc);
@@ -8246,6 +8250,7 @@ fn emit_inst(
                 ra.load_full(e, SYS_REGS[k], arg);
             }
             ra.load_full(e, "rax", args[0]);
+            crate::pgo::instrument::emit_exit_hook_call(e);
             e.line("syscall");
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");

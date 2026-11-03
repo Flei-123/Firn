@@ -54,7 +54,7 @@ use crate::package;
 use crate::package_world::{self, World};
 
 /// Name of the lock file. Stands exclusively here.
-pub const LOCKFILE: &str = "firn.lock";
+pub const LOCKFILE: &str = crate::brand::LOCK_FILE;
 /// Format number of the first line. A reader that finds a different one
 /// stops instead of guessing.
 pub const FORMAT: u32 = 1;

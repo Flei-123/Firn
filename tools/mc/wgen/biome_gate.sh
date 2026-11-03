@@ -30,5 +30,6 @@ run_dim overworld 6:85:44 6:85:45 11:0:0 11:-3:5 42:20:-17 5:-40:31 1234:7:-60 9
 run_dim amplified 3:2:2 77:-9:14 77:600:-300
 run_dim large_biomes 3:2:2 5:400:400
 run_dim nether 11:0:0 42:-30:70 42:200:-90
+run_dim end 5:-400:-376 5:-400:-336 5:-400:-400 5:-400:-392 5:62:20 5:64:0 11:0:0 42:-90:130
 [ $ERR = 0 ] && echo "mc/wgen biome: all ok" || echo "mc/wgen biome: FAILED"
 exit $ERR
