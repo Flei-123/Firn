@@ -119,6 +119,7 @@ const cmds = [
   'execute in minecraft:the_end run tp 100 49 0',
   'execute in minecraft:the_nether run tp 8 70 8',
 ]
+if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
 
 function run() {
   cmds.forEach((cmd, i) => setTimeout(() => send(C2S.chatCommand, str(cmd)), 3000 + i * 6000))
@@ -155,6 +156,7 @@ function finish() {
   if (done) return
   done = true
   if (tickTimer) clearInterval(tickTimer)
+  out.final = current
   console.log(JSON.stringify(out))
   try { sock.destroy() } catch (e) {}
   setTimeout(() => process.exit(0), 200)

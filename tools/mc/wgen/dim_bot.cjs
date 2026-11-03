@@ -25,11 +25,13 @@ const cmds = [
   'execute in minecraft:the_end run tp 100 49 0',
   'execute in minecraft:the_nether run tp 8 70 8',
 ]
+if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
 function run() {
   cmds.forEach((c, i) => setTimeout(() => client.write('chat_command', { command: c, timestamp: BigInt(Date.now()), salt: 0n, argumentSignatures: [], messageCount: 0, acknowledged: Buffer.alloc(3) }), 3000 + i * 6000))
   setTimeout(finish, 3000 + cmds.length * 6000 + 4000)
 }
 function finish() {
+  out.final = current
   console.log(JSON.stringify(out))
   try { client.end('bye') } catch (e) {}
   setTimeout(() => process.exit(0), 300)
