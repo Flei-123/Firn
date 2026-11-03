@@ -54,6 +54,7 @@ if [ -n "$LIB_DIRS" ]; then
 else
     git archive "$COMMIT" lib | tar -x -C "$W"
 fi
+bash "$ROOT/tools/release/portable_lib.sh" "$W" "$ROOT"
 FIRN_TOOL=$W/firn-tool
 FIRNLIB=$ROOT/lib "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
 ENTRIES=()
