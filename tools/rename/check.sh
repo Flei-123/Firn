@@ -4,7 +4,7 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 . "$ROOT/tools/brand.sh"
 OLD=$BRAND_CLI
-NEW=${1:-fiero}
+NEW=${1:-zq$$}
 D=$(mktemp -d)
 cleanup() { git -C "$ROOT" worktree remove --force "$D/wt" >/dev/null 2>&1; git -C "$ROOT" branch -D "rename-check-$$" >/dev/null 2>&1; rm -rf "$D"; }
 trap cleanup EXIT
