@@ -128,6 +128,7 @@ public class WgFeatures {
                 case "gameEvent": return null;
                 case "setCurrentlyGenerating": return null;
                 case "getLevel": return null;
+                case "addFreshEntity": return true;
                 case "getRandom": return r.rnd;
                 case "getBrightness": return 0;
                 case "getRawBrightness": return 0;
@@ -154,7 +155,7 @@ public class WgFeatures {
         WgCarve.bindTags();
         Function<ResourceKey<Biome>, Holder<Biome>> toHolder = e::biomeOf;
         Climate.ParameterList<Holder<Biome>> hl = (Climate.ParameterList<Holder<Biome>>) e.ap.invoke(e.provider, toHolder);
-        MultiNoiseBiomeSource src = MultiNoiseBiomeSource.createFromList(hl);
+        net.minecraft.world.level.biome.BiomeSource src = e.endSrc != null ? e.endSrc : MultiNoiseBiomeSource.createFromList(hl);
         NoiseBasedChunkGenerator gen = new NoiseBasedChunkGenerator(src, e.ngsHolder);
         java.lang.reflect.Field ff = net.minecraft.world.level.chunk.ChunkGenerator.class.getDeclaredField("featuresPerStep");
         ff.setAccessible(true);
@@ -274,7 +275,7 @@ public class WgFeatures {
                                 java.nio.file.Files.write(java.nio.file.Paths.get(System.getProperty("wg.cntlog")), ("CNT " + cx + " " + cz + " " + nx + " " + nz + " " + j + " " + n + " " + rnd.getCount() + " " + pfNames.get(pf) + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
                             }
                         } catch (RuntimeException ex) {
-                            if (dirOnly) throw ex;
+                            if (dirOnly && !"end_spike".equals(pfNames.get(pf))) throw ex;
                             failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
                         }
                     }

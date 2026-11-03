@@ -67,6 +67,12 @@ public class WgSurfaceOracle {
         Climate.Sampler sampler;
         Climate.ParameterList<ResourceKey<Biome>> chunkList;
         boolean carve;
+        net.minecraft.world.level.biome.TheEndBiomeSource endSrc;
+
+        ResourceKey<Biome> keyAt(int qx, int qy, int qz) {
+            if (endSrc != null) return endSrc.getNoiseBiome(qx, qy, qz, sampler).unwrapKey().get();
+            return chunkList.findValue(sampler.sample(qx, qy, qz));
+        }
 
         @SuppressWarnings("unchecked")
         void reset(long s) throws Exception {
@@ -93,7 +99,7 @@ public class WgSurfaceOracle {
                     for (int fx = 0; fx < 4; fx++) {
                         int gx = cx * 4 + fx;
                         int gz = cz * 4 + fz;
-                        memo.put(gx + "," + fy + "," + gz, chunkList.findValue(sampler.sample(gx, fy, gz)));
+                        memo.put(gx + "," + fy + "," + gz, keyAt(gx, fy, gz));
                     }
             final int clampLo = fillMinY;
             final int clampHi = fillMaxY - 1;
@@ -102,7 +108,7 @@ public class WgSurfaceOracle {
                 ResourceKey<Biome> k = memo.get(qx + "," + qy + "," + qz);
                 if (k == null) {
                     resetLast(list);
-                    k = list.findValue(sampler.sample(qx, qy, qz));
+                    k = endSrc != null ? keyAt(qx, qy, qz) : list.findValue(sampler.sample(qx, qy, qz));
                 }
                 return biomeOf(k);
             };
@@ -134,6 +140,22 @@ public class WgSurfaceOracle {
     }
 
     public static void main(String[] a) throws Exception {
+        try {
+            run(a);
+        } catch (Throwable t) {
+            System.err.println("ORACLE ERROR " + t.getClass().getName() + " " + t.getMessage());
+            for (StackTraceElement el : t.getStackTrace()) System.err.println("  at " + el);
+            Throwable c = t.getCause();
+            while (c != null) {
+                System.err.println("CAUSE " + c.getClass().getName() + " " + c.getMessage());
+                for (StackTraceElement el : c.getStackTrace()) System.err.println("  at " + el);
+                c = c.getCause();
+            }
+            System.exit(1);
+        }
+    }
+
+    static void run(String[] a) throws Exception {
         PrintStream out = new PrintStream(new java.io.FileOutputStream(a[0]));
         String dim = a[1];
         SharedConstants.tryDetectVersion();
@@ -158,6 +180,7 @@ public class WgSurfaceOracle {
         e.plains = prov.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS);
         e.biomeReg = new MappedRegistry<>(Registries.BIOME, Lifecycle.stable());
         e.biomeReg.register(Biomes.PLAINS, e.plains.value(), Lifecycle.stable());
+        if (dim.equals("end")) e.endSrc = net.minecraft.world.level.biome.TheEndBiomeSource.create(prov.lookupOrThrow(Registries.BIOME));
         e.carve = System.getProperty("wg.carve") != null || System.getProperty("wg.features") != null;
         String features = System.getProperty("wg.features");
         for (int i = 2; i < a.length; i++) {
@@ -258,7 +281,14 @@ public class WgSurfaceOracle {
                     String n = BuiltInRegistries.BLOCK.getKey(st.getBlock()).getPath();
                     if (n.equals("bee_nest")) n = "air";
                     boolean waterlogged = st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED) && st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED);
-                    if (st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE)) {
+                    if (st.getBlock() instanceof net.minecraft.world.level.block.ChorusPlantBlock || st.getBlock() instanceof net.minecraft.world.level.block.ChorusFlowerBlock || st.getBlock() instanceof net.minecraft.world.level.block.IronBarsBlock) {
+                        java.util.TreeMap<String, String> props = new java.util.TreeMap<>();
+                        BlockState dflt = st.getBlock().defaultBlockState();
+                        for (java.util.Map.Entry<net.minecraft.world.level.block.state.properties.Property<?>, Comparable<?>> pe : st.getValues().entrySet()) if (!pe.getValue().equals(dflt.getValue(pe.getKey()))) props.put(pe.getKey().getName(), String.valueOf(pe.getValue()));
+                        StringBuilder ps = new StringBuilder("[");
+                        for (java.util.Map.Entry<String, String> pe : props.entrySet()) ps.append(ps.length() > 1 ? "," : "").append(pe.getKey()).append("=").append(pe.getValue());
+                        if (!props.isEmpty()) n += ps.append("]");
+                    } else if (st.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE)) {
                         n += "[distance=" + st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DISTANCE) + (waterlogged ? ",waterlogged=true" : "") + "]";
                     } else if (st.getBlock() instanceof net.minecraft.world.level.block.HugeMushroomBlock) {
                         n += "[" + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOWN) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.EAST) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.NORTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.SOUTH) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.UP) ? "1" : "0") + (st.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WEST) ? "1" : "0") + "]";
