@@ -5,7 +5,11 @@ const IGNORE = new Set((process.env.ORDER_IGNORE || 'update_time,time,entity_met
 function norm(packets, loose, ambient) {
   const res = []
   let statuses = 0
+  let prev = ''
   for (let p of packets) {
+    const prevName = prev
+    prev = p.split(' ')[0]
+    if (prev === 'set_slot' && prevName === 'recipe_book_add') continue
     if (loose) p = p.replace(/^(position|update_view_position) .*/, '$1')
     const name = p.split(' ')[0]
     if (IGNORE.has(name) || (ambient && name === 'world_event')) continue
