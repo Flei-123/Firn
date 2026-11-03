@@ -30,9 +30,9 @@ if (v.errors.length || f.errors.length) { console.log('errors', JSON.stringify(v
 const n = Math.max(v.marks.length, f.marks.length)
 for (let i = 0; i < n; i++) {
   const vm = v.marks[i], fm = f.marks[i]
-  if (vm && !/^(execute in|raw:enter|raw:leave)/.test(vm.cmd)) continue
+  if (vm && !/^(execute in|raw:enter|raw:leave|raw:end)/.test(vm.cmd)) continue
   if (!vm || !fm) { console.log('mark count differs'); bad++; break }
-  const loose = vm.cmd.startsWith('raw:')
+  const loose = vm.cmd.startsWith('raw:') && !vm.cmd.startsWith('raw:end')
   const a = norm(vm.packets, loose), b = norm(fm.packets, loose)
   const same = JSON.stringify(a) === JSON.stringify(b)
   console.log(`${same ? '  ok   ' : '  DIFF '} ${vm.cmd}  (vanilla ${a.length}, firn ${b.length}, chunks ${chunkRuns(vm.packets)}/${chunkRuns(fm.packets)})`)

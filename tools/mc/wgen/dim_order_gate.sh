@@ -45,6 +45,9 @@ grep -q 'Done (' "$W/firn/out.log" 2>/dev/null || sleep 3
 node "$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla.json" 2>"$W/vbot.err"
 node "$BOT" 127.0.0.1 "$FPORT" > "$W/firn.json" 2>"$W/fbot.err"
 PORTAL_RC=0
+END_CMDS='["tp @s 20.5 150 20.5","raw:endenter","raw:endwin","raw:endrespawn"]'
+DIM_CMDS=$END_CMDS node "$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla_e.json" 2>"$W/vbot_e.err"
+DIM_CMDS=$END_CMDS node "$BOT" 127.0.0.1 "$FPORT" > "$W/firn_e.json" 2>"$W/fbot_e.err"
 if [ "$PROTO" = 763 ]; then
     PCMDS='["tp @s 10.5 150 3.5","raw:frame","raw:ignite","raw:enter","raw:leave"]'
     DIM_CMDS=$PCMDS node "$BOT" 127.0.0.1 "$VPORT" > "$W/vanilla_p.json" 2>"$W/vbot_p.err"
@@ -53,4 +56,5 @@ fi
 echo stop >&3
 node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla.json" "$W/firn.json" || PORTAL_RC=1
 if [ "$PROTO" = 763 ]; then node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla_p.json" "$W/firn_p.json" || PORTAL_RC=1; fi
+node tools/mc/wgen/pkt_cmp.cjs "$W/vanilla_e.json" "$W/firn_e.json" || PORTAL_RC=1
 [ "$PORTAL_RC" = 0 ] && echo "mc/wgen dim order $PROTO: ok" || { echo "  FAIL  dim order"; exit 1; }

@@ -5,7 +5,7 @@ const zlib = require('zlib')
 const [host, portArg] = process.argv.slice(2)
 const port = parseInt(portArg, 10)
 const PROTOCOL = 777
-const C2S = { teleportConfirm: 0, chatCommand: 7, tickEnd: 13, keepAlive: 28, positionLook: 31 }
+const C2S = { teleportConfirm: 0, chatCommand: 7, clientCommand: 12, tickEnd: 13, keepAlive: 28, positionLook: 31 }
 const S2C = { mapChunk: 46, login: 50, position: 73, respawn: 84, keepAlive: 45, disconnect: 0x1d }
 
 const PROTO = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, '../../mcgen/data_extra/pc/26.3/protocol.json'), 'utf8'))
@@ -119,15 +119,40 @@ const cmds = [
   'tp @s 9 52 9',
   'execute in minecraft:the_nether run tp @s 8 70 8',
   'execute in minecraft:overworld run tp @s 0 120 0',
-  'execute in minecraft:the_end run tp @s 100 49 0',
+  'execute in minecraft:the_end run tp @s 100 50 0',
   'execute in minecraft:the_nether run tp @s 8 70 8',
 ]
 if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const chat = (cmd) => send(C2S.chatCommand, str(cmd))
+const move = (x, y, z) => send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(0), f32(0), Buffer.from([1])]))
+const ACTIONS = {
+  async endenter() {
+    chat('setblock 20 150 20 minecraft:end_portal')
+    await sleep(600)
+    move(20.5, 150, 20.5)
+    await sleep(3500)
+  },
+  async endwin() {
+    chat('setblock 100 50 0 minecraft:end_portal')
+    await sleep(600)
+    move(100.5, 50, 0.5)
+    await sleep(1500)
+    move(100.6, 50, 0.5)
+    await sleep(2500)
+  },
+  async endrespawn() {
+    send(C2S.clientCommand, varint(0))
+    await sleep(3500)
+  },
+}
 
 function run() {
   cmds.forEach((cmd, i) => setTimeout(() => {
     mark = { cmd, packets: [] }
     out.marks.push(mark)
+    if (cmd.startsWith('raw:')) { ACTIONS[cmd.slice(4)]().catch((e) => out.errors.push(String(e))); return }
     send(C2S.chatCommand, str(cmd))
   }, i * 7000))
   setTimeout(finish, cmds.length * 7000 + 3000)
@@ -137,6 +162,7 @@ function describe(id, body) {
   const name = NAMES[id] || ('id' + id)
   if (SKIP.has(name)) return null
   if (id === S2C.position) return 'position'
+  if (name === 'game_state_change') return 'game_state_change ' + body[0] + ' ' + body.readFloatBE(1)
   if (id === S2C.respawn) return 'respawn ' + body.toString('latin1').match(/minecraft:[a-z_]+/g).slice(0, 2).join(' ')
   return name
 }

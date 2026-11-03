@@ -58,7 +58,7 @@ const cmds = [
   'tp @s 9 52 9',
   'execute in minecraft:the_nether run tp @s 8 70 8',
   'execute in minecraft:overworld run tp @s 0 120 0',
-  'execute in minecraft:the_end run tp @s 100 49 0',
+  'execute in minecraft:the_end run tp @s 100 50 0',
   'execute in minecraft:the_nether run tp @s 8 70 8',
 ]
 if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
@@ -88,6 +88,24 @@ const ACTIONS = {
   },
   async enter() {
     move(10.5, 150, 0.5)
+    await sleep(3500)
+  },
+  async endenter() {
+    client.write('chat_command', { command: 'setblock 20 150 20 minecraft:end_portal', timestamp: BigInt(Date.now()), salt: 0n, argumentSignatures: [], messageCount: 0, acknowledged: Buffer.alloc(3) })
+    await sleep(600)
+    move(20.5, 150, 20.5)
+    await sleep(3500)
+  },
+  async endwin() {
+    client.write('chat_command', { command: 'setblock 100 50 0 minecraft:end_portal', timestamp: BigInt(Date.now()), salt: 0n, argumentSignatures: [], messageCount: 0, acknowledged: Buffer.alloc(3) })
+    await sleep(600)
+    move(100.5, 50, 0.5)
+    await sleep(1500)
+    move(100.6, 50, 0.5)
+    await sleep(2500)
+  },
+  async endrespawn() {
+    client.write('client_command', { actionId: 0 })
     await sleep(3500)
   },
   async leave() {

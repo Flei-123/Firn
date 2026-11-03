@@ -116,7 +116,7 @@ const cmds = [
   'tp 9 52 9',
   'execute in minecraft:the_nether run tp 8 70 8',
   'execute in minecraft:overworld run tp 0 120 0',
-  'execute in minecraft:the_end run tp 100 49 0',
+  'execute in minecraft:the_end run tp 100 50 0',
   'execute in minecraft:the_nether run tp 8 70 8',
 ]
 if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
