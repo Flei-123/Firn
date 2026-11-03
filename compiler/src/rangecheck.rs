@@ -93,6 +93,10 @@ thread_local! {
 }
 
 /// Copy of the table for worker threads (`parfn.rs`).
+fn range_div_enabled() -> bool {
+    std::env::var_os("FIRN_NO_RANGEDIV").is_none()
+}
+
 pub(crate) fn len_getters_get() -> HashMap<String, i128> {
     LEN_GETTERS.with(|g| g.borrow().clone())
 }
@@ -460,6 +464,23 @@ impl<'a> Ana<'a> {
                 } else {
                     None
                 }
+            }
+            Op::Bin(BinOp::Div, a, b) | Op::CheckedDiv { op: BinOp::Div, a, b, .. } if range_div_enabled() => {
+                let k = cst(*b)?;
+                if k == 0 || k == -1 {
+                    return None;
+                }
+                let ra = self.range_x(*a, at, depth, use_facts, ex)?;
+                let (x, y) = (ra.0 / k, ra.1 / k);
+                Some((x.min(y), x.max(y)))
+            }
+            Op::Bin(BinOp::Shr, a, b) if signed && range_div_enabled() => {
+                let k = cst(*b)?;
+                if k < 0 || k >= t.bits() as i128 {
+                    return None;
+                }
+                let ra = self.range_x(*a, at, depth, use_facts, ex)?;
+                Some((ra.0 >> k, ra.1 >> k))
             }
             // ROUND 89's checked index hands back an index below the length.
             Op::CheckedIdx { len, .. } => Some((0, (*len as i128) - 1)),
@@ -905,6 +926,18 @@ impl<'a> Ana<'a> {
         })
     }
 
+    fn mask_parts(&self, idx: Val) -> Option<(Val, Val)> {
+        let (s, m) = match self.op_of(idx)? {
+            Op::Bin(BinOp::Add, a, b) => (*a, *b),
+            _ => return None,
+        };
+        match self.op_of(m)? {
+            Op::Bin(BinOp::And, a, b) if matches!(self.op_of(*b), Some(Op::Bin(BinOp::Shr, x, _)) if *x == s) => Some((s, *a)),
+            Op::Bin(BinOp::And, a, b) if matches!(self.op_of(*a), Some(Op::Bin(BinOp::Shr, x, _)) if *x == s) => Some((s, *b)),
+            _ => None,
+        }
+    }
+
     /// `n` is `len` converted to the type of the guard (`cast u64 -> T`).
     fn is_len_cast(&self, n: Val, l: Val) -> bool {
         match self.op_of(n) {
@@ -1300,6 +1333,44 @@ pub(crate) fn nonneg_at(f: &Func, queries: &[(usize, Val)]) -> Vec<bool> {
         .iter()
         .map(|&(bi, v)| !f.is_secret(v) && ana.range(v, bi, DEPTH).map_or(false, |r| r.0 >= 0))
         .collect()
+}
+
+pub(crate) fn nonneg_signed_index_masks(f: &Func) -> Vec<(usize, usize, Val)> {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return Vec::new();
+    }
+    let ana = Ana::new(f);
+    let mut out = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let d = match (inst.dst, &inst.op) {
+                (Some(d), Op::Bin(BinOp::Add, _, m)) if inst.ty == FTy::U64 || inst.ty == FTy::I64 => {
+                    if !matches!(ana.op_of(*m), Some(Op::Bin(BinOp::And, ..))) {
+                        continue;
+                    }
+                    d
+                }
+                _ => continue,
+            };
+            let (s, len) = match ana.mask_parts(d) {
+                Some(x) => x,
+                None => continue,
+            };
+            if f.is_secret(s) {
+                continue;
+            }
+            let sv = match ana.signed_index_base(d, len) {
+                Some(v) => v,
+                None => continue,
+            };
+            let proven = ana.range(s, bi, DEPTH).map_or(false, |r| r.0 >= 0)
+                || ana.sless(sv, len, bi, None, DEPTH, &mut Vec::new());
+            if proven {
+                out.push((bi, ii, s));
+            }
+        }
+    }
+    out
 }
 
 /// Replaces every checked operation whose check provably cannot fire with

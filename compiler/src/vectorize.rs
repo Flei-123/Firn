@@ -23,6 +23,7 @@ pub(crate) struct Test {
     pub n: Val,
     pub e: i128,
     pub r: bool,
+    pub ty: FTy,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +72,7 @@ pub(crate) struct Plan {
     pub defs: HashMap<Val, (usize, usize)>,
     pub consts: HashMap<Val, i128>,
     pub cls: HashMap<Val, Cls>,
+    pub ity: FTy,
 }
 
 pub(crate) fn elem_bits(ty: FTy) -> Option<u32> {
@@ -78,6 +80,18 @@ pub(crate) fn elem_bits(ty: FTy) -> Option<u32> {
         FTy::I64 | FTy::U64 => Some(64),
         FTy::I32 | FTy::U32 => Some(32),
         _ => None,
+    }
+}
+
+fn iv_ty(ty: FTy) -> bool {
+    matches!(ty, FTy::U64 | FTy::I64 | FTy::I32)
+}
+
+fn ty_bounds(ty: FTy) -> (i128, i128) {
+    match ty {
+        FTy::I32 => (i32::MIN as i128, i32::MAX as i128),
+        FTy::I64 => (i64::MIN as i128, i64::MAX as i128),
+        _ => (0, u64::MAX as i128),
     }
 }
 
@@ -239,8 +253,9 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
         }
     }
     let mut s: Option<i128> = None;
+    let mut ity: Option<FTy> = None;
     for &(phi, ty, init, back) in &phis {
-        if ty != FTy::U64 {
+        if !iv_ty(ty) || ity.map_or(false, |t| t != ty) {
             continue;
         }
         let k = match consts.get(&init) {
@@ -259,16 +274,24 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
         if !is_inc {
             continue;
         }
+        ity = Some(ty);
         let base = *s.get_or_insert(k);
         cls.insert(phi, Cls::Iv(k - base));
         ivs.push(IvPhi { phi, init });
     }
     let s = s?;
+    let ity = ity?;
+    if ity != FTy::U64 && std::env::var_os("FIRN_NO_VEC_SIGNED").is_some() {
+        return None;
+    }
+    let (ty_min, ty_max) = ty_bounds(ity);
+    let mut c_lo: i128 = 0;
+    let mut c_hi: i128 = 0;
     let mut changed = true;
     while changed {
         changed = false;
         for &(phi, ty, init, back) in &phis {
-            if cls.contains_key(&phi) || ty != FTy::U64 {
+            if cls.contains_key(&phi) || ty != ity {
                 continue;
             }
             if let (Some(Cls::Iv(cb)), Some(&k)) = (cls.get(&back).copied(), consts.get(&init)) {
@@ -373,7 +396,7 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
                 Op::Const(_) => {
                     cls.insert(d, Cls::Inv);
                 }
-                Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a, b } if cond_set.contains_key(&d) => {
+                Op::Cmp { op: CmpOp::Lt, ty: cty, a, b } if *cty == ity && cond_set.contains_key(&d) => {
                     let e = match get(&cls, *a) {
                         Cls::Iv(e) => e,
                         _ => return None,
@@ -391,7 +414,7 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
                         }
                     }
                     let nn = canon(&rep, *b);
-                    tests.push(Test { pos, n: nn, e, r });
+                    tests.push(Test { pos, n: nn, e, r, ty: ity });
                 }
                 Op::Bin(op, a, bb) => {
                     let (ca, cb) = (get(&cls, *a), get(&cls, *bb));
@@ -399,13 +422,17 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
                         (_, Cls::Inv, Cls::Inv) if i.ty != FTy::V128 => {
                             cls.insert(d, Cls::Inv);
                         }
-                        (BinOp::Add, Cls::Iv(c), Cls::Inv) | (BinOp::Add, Cls::Inv, Cls::Iv(c)) if i.ty == FTy::U64 => {
+                        (BinOp::Add, Cls::Iv(c), Cls::Inv) | (BinOp::Add, Cls::Inv, Cls::Iv(c)) if i.ty == ity => {
                             let o = if matches!(ca, Cls::Iv(_)) { bb } else { a };
                             let k = *consts.get(o)?;
+                            c_lo = c_lo.min(c + k);
+                            c_hi = c_hi.max(c + k);
                             cls.insert(d, Cls::Iv(c + k));
                         }
-                        (BinOp::Sub, Cls::Iv(c), Cls::Inv) if i.ty == FTy::U64 => {
+                        (BinOp::Sub, Cls::Iv(c), Cls::Inv) if i.ty == ity => {
                             let k = *consts.get(bb)?;
+                            c_lo = c_lo.min(c - k);
+                            c_hi = c_hi.max(c - k);
                             cls.insert(d, Cls::Iv(c - k));
                         }
                         (BinOp::Mul, Cls::Iv(c), Cls::Inv) if i.ty == FTy::U64 => {
@@ -447,6 +474,18 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
                         _ => return None,
                     }
                 }
+                Op::Cast { src, from } => match get(&cls, *src) {
+                    Cls::Iv(c) if *from == ity && ity.signed() && matches!(i.ty, FTy::I64 | FTy::U64) => {
+                        cls.insert(d, Cls::Iv(c));
+                    }
+                    Cls::Iv(c) if *from == FTy::I64 && ity.signed() && i.ty == FTy::U64 => {
+                        cls.insert(d, Cls::Iv(c));
+                    }
+                    Cls::Inv => {
+                        cls.insert(d, Cls::Inv);
+                    }
+                    _ => return None,
+                },
                 Op::PtrAdd { base, off } => match (get(&cls, *base), get(&cls, *off)) {
                     (Cls::Inv, Cls::Idx(c, e)) => {
                         cls.insert(d, Cls::Addr(canon(&rep, *base), c, e));
@@ -534,6 +573,12 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
             return None;
         }
     }
+    if ity.signed() {
+        let e_max = tests.iter().map(|t| t.e).max()?;
+        if c_hi > e_max + 1 || s + c_lo < ty_min || s > ty_max {
+            return None;
+        }
+    }
     Some(Plan {
         h,
         p: ch.p,
@@ -551,6 +596,7 @@ fn analyze(f: &Func, preds: &[Vec<usize>], h: usize) -> Option<Plan> {
         defs,
         consts,
         cls,
+        ity,
     })
 }
 

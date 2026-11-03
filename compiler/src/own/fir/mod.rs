@@ -1,6 +1,7 @@
 pub(crate) mod append;
 pub(crate) mod bits;
 pub(crate) mod borrow;
+pub(crate) mod budget;
 pub(crate) mod carried;
 pub(crate) mod flow;
 pub(crate) mod index;
@@ -93,7 +94,11 @@ fn run_frees(m: &mut Module, mode: super::Mode, free_fn: &'static str) {
     let ta = std::time::Instant::now();
     let plans = {
         let m: &Module = m;
-        crate::parfn::map_weighted(&roots, |&fi| crate::parfn::weight(&m.funcs[fi]), |&fi| analyze(m, fi, &cache, &sums, reuse_on, reuse_calls, &quiet))
+        let budget = budget::Budget::new(analysis_budget());
+        crate::parfn::map_weighted(&roots, |&fi| crate::parfn::weight(&m.funcs[fi]), |&fi| {
+            let _lease = budget.acquire(state_cost(&m.funcs[fi]));
+            analyze(m, fi, &cache, &sums, reuse_on, reuse_calls, &quiet)
+        })
     };
     let ana_ms = ta.elapsed().as_millis();
     let defined: crate::fx::HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
@@ -145,6 +150,14 @@ fn run_frees(m: &mut Module, mode: super::Mode, free_fn: &'static str) {
     if std::env::var_os("FIRN_OWN_STATS").is_some() {
         eprintln!("ownership fir: reverted calls in {} functions", reverted);
     }
+}
+
+fn state_cost(f: &crate::fir::Func) -> usize {
+    f.blocks.len().saturating_mul(f.val_types.len())
+}
+
+fn analysis_budget() -> usize {
+    std::env::var("FIRN_OWN_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8_000_000)
 }
 
 fn root_window() -> (usize, usize) {

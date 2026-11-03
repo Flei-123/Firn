@@ -131,6 +131,7 @@ pub enum BinOp {
     /// and zero-extend the result to the full width. Produced only by
     /// `rotate.rs` (aarch64 builds, `ror w, w, #n`), never by the front end.
     Rotr32,
+    Rotl,
 }
 
 impl BinOp {
@@ -147,6 +148,7 @@ impl BinOp {
             BinOp::Shl => "shl",
             BinOp::Shr => "shr",
             BinOp::Rotr32 => "rotr32",
+            BinOp::Rotl => "rotl",
         }
     }
 }

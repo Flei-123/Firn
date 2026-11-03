@@ -219,6 +219,18 @@ pub const PASSES: &[PassInfo] = &[
         what: "r837: ((x & M32) >> n | x << (32 - n)) & M32 becomes one 32-bit rotate (aarch64 only, once, after the fixpoint)",
     },
     PassInfo {
+        name: "rotl",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "shl(x, k) | shr(x, W - k) becomes one rotate left, constant or variable count, u32/u64 (x86-64 only, once, after rotate; env FIRN_NO_ROTL)",
+    },
+    PassInfo {
+        name: "ifconv",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "branch diamonds/triangles whose arms are short and side effect free become selects (cmov); clamp/min/max (x86-64 only, once, after rotl; opt-in env FIRN_IFCONV=1 until select emission fuses the compare)",
+    },
+    PassInfo {
         name: "bitsel",
         scope: Scope::Func,
         debug_preserving: false,
@@ -791,6 +803,39 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         clk.add2("rotate", t, n > 0);
     }
+    if cfg.runs("rotl") && crate::rotl::enabled() && crate::target::active() == crate::target::Target::X86_64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::rotl::run(f);
+            if k > 0 {
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "rotl");
+            }
+            n += k;
+        }
+        clk.add2("rotl", t, n > 0);
+    }
+    if cfg.runs("ifconv") && crate::ifconv::enabled() && crate::target::active() == crate::target::Target::X86_64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::ifconv::run(f);
+            if k > 0 {
+                remove_unreachable_blocks(f, &mut st);
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "ifconv");
+            }
+            n += k;
+        }
+        clk.add2("ifconv", t, n > 0);
+    }
     // GAPS: bit-select / majority identities (SHA-2 `ch` and `maj`), x86-64 only.
     if cfg.runs("bitsel") && crate::target::active() == crate::target::Target::X86_64 {
         let t = std::time::Instant::now();
@@ -1107,7 +1152,8 @@ fn optimize_func_inner(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &m
             let r = remove_redundant_checks(f)
                 + remove_provable_index_checks(f)
                 + crate::rangecheck::remove_provable_arith_checks(f)
-                + crate::divnonneg::run(f);
+                + crate::divnonneg::run(f)
+                + crate::negidx::run(f);
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
@@ -1260,6 +1306,7 @@ fn bink(o: BinOp) -> u8 {
         BinOp::Shl => 9,
         BinOp::Shr => 10,
         BinOp::Rotr32 => 11,
+        BinOp::Rotl => 12,
     }
 }
 
@@ -1847,6 +1894,11 @@ pub(crate) fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
             let lo = (a as u64 & 0xFFFF_FFFF) as u32;
             lo.rotate_right(b as u32) as i128
         }
+        BinOp::Rotl => match ty {
+            FTy::U64 => (a as u64).rotate_left(b.rem_euclid(64) as u32) as i128,
+            FTy::U32 => (a as u32).rotate_left(b.rem_euclid(32) as u32) as i128,
+            _ => return None,
+        },
     };
     Some(ty.truncate(r))
 }

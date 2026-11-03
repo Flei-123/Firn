@@ -2528,6 +2528,9 @@ fn emit_bin(
                 commit(e, fr, d, rd);
             }
         }
+        BinOp::Rotl => {
+            return Err("internal error: 'rotl' is only generated for x86-64".to_string());
+        }
         BinOp::Rotr32 => {
             // r837: rotate the low 32 bits right; a write to a `w` register
             // zero-extends, which is exactly the contract of `Rotr32`.
