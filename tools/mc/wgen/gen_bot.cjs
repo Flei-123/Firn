@@ -69,6 +69,7 @@ let origin = null
 client.on('login', (p) => {
   if (p.worldType !== D.name || p.worldName !== D.name) { console.error(`dimension mismatch ${p.worldType} ${p.worldName}`); process.exit(1) }
 })
+client.on('position', (p) => { console.error(`position ${p.x} ${p.y} ${p.z}`) })
 client.on('map_chunk', (p) => {
   count++
   if (p.x === 0 && p.z === 0) origin = rows(p, 0, 0)

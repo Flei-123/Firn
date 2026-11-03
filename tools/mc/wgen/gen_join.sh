@@ -12,12 +12,14 @@ SEED=${GEN_SEED:-11}
 DIM=${GEN_DIM:-overworld}
 case "$DIM" in overworld) LEVEL=minecraft:normal ;; *) LEVEL=$DIM ;; esac
 export GEN_DIM=$DIM
+SURF=false
+[ -n "${GEN_FULL:-}" ] && SURF=true
 VIEW=${GEN_VIEW:-3}
 EXPECT=$(( (2 * VIEW + 1) * (2 * VIEW + 1) ))
 PORT=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 "$FIRNC" ${WG_OPT:+--opt-level=$WG_OPT} -o "$W/firnmc-server" demos/firnmc-server/main.fi 2>"$W/err" || { echo "  FAIL  compile firnmc-server"; head -8 "$W/err"; exit 1; }
 mkdir -p "$W/run"
-printf 'level-type=%s\nlevel-seed=%s\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nworldgen-surface=false\nview-distance=%s\nwhite-list=false\nserver-port=%s\n' "$LEVEL" "$SEED" "$ROOT" "$VIEW" "$PORT" > "$W/run/server.properties"
+printf 'level-type=%s\nlevel-seed=%s\nworldgen-data=%s/tools/mcgen/worldgen/1.20.1\nworldgen-surface=%s\nworldgen-carvers=%s\nworldgen-features=%s\nview-distance=%s\nwhite-list=false\nserver-port=%s\n' "$LEVEL" "$SEED" "$ROOT" "$SURF" "$SURF" "$SURF" "$VIEW" "$PORT" > "$W/run/server.properties"
 mkfifo "$W/run/in.fifo"
 (sleep 600 > "$W/run/in.fifo" &)
 (cd "$W/run" && setsid nohup "$W/firnmc-server" nogui < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
@@ -28,6 +30,7 @@ node tools/mc/wgen/gen_bot.cjs 127.0.0.1 "$PORT" "$SEED" "$EXPECT" > "$W/got.txt
 RC=$?
 cat "$W/bot.err"
 [ $RC = 0 ] || { echo "  FAIL  bot join/chunks (rc=$RC)"; tail -5 "$W/run/out.log"; exit 1; }
+[ -n "${GEN_FULL:-}" ] && { echo "  ok    join $DIM full generation: $EXPECT chunks"; exit 0; }
 bash tools/mc/wgen/fill_oracle.sh "$W/ref.txt" "$DIM" "$SEED:0:0" 2>&1 | grep -v WARNING
 if cmp -s "$W/ref.txt" "$W/got.txt"; then echo "  ok    join $DIM: $EXPECT chunks, chunk 0,0 identical to oracle ($(wc -l < "$W/ref.txt") rows)"; echo "mc/wgen join $DIM: all ok"; exit 0; fi
 echo "  FAIL  join $DIM chunk 0,0 differs: $(diff "$W/ref.txt" "$W/got.txt" | grep -c '^<') rows"; exit 1
