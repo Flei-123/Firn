@@ -4,10 +4,14 @@ mod rules;
 #[cfg(test)]
 mod rule_tests;
 #[cfg(test)]
+mod liveness_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+use liveness::Labels;
 
 pub(crate) use rules::{Rule, RULES};
 
@@ -30,14 +34,14 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FIRN_NO_SUPEROPT").map_or(true, |v| v.is_empty() || v == "0"))
 }
 
-fn applies(rule: &Rule, lines: &[&str], end: usize, regs: &[usize]) -> bool {
-    if rule.flags_dead && !liveness::flags_dead_after(lines, end) {
+fn applies(rule: &Rule, lines: &[&str], end: usize, regs: &[usize], labels: &Labels) -> bool {
+    if rule.flags_dead && !liveness::flags_dead_after(lines, end, labels) {
         return false;
     }
-    (0..regs.len()).all(|v| rule.dead >> v & 1 == 0 || liveness::reg_dead_after(lines, end, regs[v]))
+    (0..regs.len()).all(|v| rule.dead >> v & 1 == 0 || liveness::reg_dead_after(lines, end, regs[v], labels))
 }
 
-fn rewrite_at(lines: &[&str], i: usize, out: &mut Vec<String>) -> Option<usize> {
+fn rewrite_at(lines: &[&str], i: usize, labels: &Labels, out: &mut Vec<String>) -> Option<usize> {
     let tab = table();
     let windows = normalize::prefixes(&lines[i..], MAX_WINDOW);
     for (len, key, regs) in windows.into_iter().rev() {
@@ -46,7 +50,7 @@ fn rewrite_at(lines: &[&str], i: usize, out: &mut Vec<String>) -> Option<usize> 
         }
         let Some(cands) = tab.get(&key) else { continue };
         for rule in cands {
-            if !applies(rule, lines, i + len, &regs) {
+            if !applies(rule, lines, i + len, &regs, labels) {
                 continue;
             }
             let rendered: Option<Vec<String>> = rule.replacement.iter().map(|t| normalize::render(t, &regs)).collect();
@@ -60,12 +64,13 @@ fn rewrite_at(lines: &[&str], i: usize, out: &mut Vec<String>) -> Option<usize> 
 
 fn round(asm: &str) -> (String, usize) {
     let lines: Vec<&str> = asm.lines().collect();
+    let labels = liveness::label_map(&lines);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut hits = 0;
     let mut i = 0;
     while i < lines.len() {
         if normalize::eligible(lines[i]) {
-            if let Some(n) = rewrite_at(&lines, i, &mut out) {
+            if let Some(n) = rewrite_at(&lines, i, &labels, &mut out) {
                 hits += 1;
                 i += n;
                 continue;

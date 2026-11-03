@@ -7,6 +7,8 @@ pub(crate) struct Rule {
 }
 
 pub(crate) const RULES: &[Rule] = &[
+    Rule { pattern: &["mov %0, %1", "mov %1, %0"], replacement: &["mov %0, %1"], dead: 0, flags_dead: false, hits: 504 },
     Rule { pattern: &["mov %0, %0"], replacement: &[], dead: 0, flags_dead: false, hits: 129 },
-    Rule { pattern: &["mov %0, %1", "mov %2, %2"], replacement: &["mov %0, %1"], dead: 0, flags_dead: false, hits: 50 },
+    Rule { pattern: &["mov %0, %1", "sub %0, 1"], replacement: &["lea %0, [%1-1]"], dead: 0, flags_dead: true, hits: 220 },
+    Rule { pattern: &["mov %0, %1"], replacement: &[], dead: 1, flags_dead: false, hits: 159 },
 ];

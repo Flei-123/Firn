@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::normalize::{parse_reg, split_line};
 
 const PURE_WRITE: [&str; 5] = ["mov", "movzx", "movsx", "movsxd", "lea"];
@@ -17,12 +19,58 @@ const FLAG_NEUTRAL: [&str; 14] = [
     "movapd", "bswap",
 ];
 
-fn is_boundary(s: &str) -> bool {
-    s.ends_with(':') || (s.starts_with('.') && !s.starts_with(".loc"))
+const JCC: [&str; 30] = [
+    "jo", "jno", "jb", "jc", "jnae", "jae", "jnb", "jnc", "je", "jz", "jne", "jnz", "jbe", "jna", "ja", "jnbe",
+    "js", "jns", "jp", "jpe", "jnp", "jpo", "jl", "jnge", "jge", "jnl", "jle", "jng", "jg", "jnle",
+];
+
+const QUIET_DIRECTIVES: [&str; 4] = [".loc", ".p2align", ".align", ".cfi_"];
+
+const LIVE_AT_RET: [usize; 9] = [0, 2, 3, 4, 5, 12, 13, 14, 15];
+
+const STEP_BUDGET: i64 = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Dead,
+    Live,
+    Next,
+    Cut,
 }
 
-fn skip(s: &str) -> bool {
-    s.is_empty() || s.starts_with('#') || s.starts_with(".loc")
+enum Kind<'a> {
+    Skip,
+    Barrier,
+    Insn(&'a str, Vec<&'a str>),
+}
+
+pub(crate) type Labels<'a> = HashMap<&'a str, usize>;
+
+pub(crate) fn label_map<'a>(lines: &[&'a str]) -> Labels<'a> {
+    let mut out = HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let s = line.trim();
+        if s.ends_with(':') && !s.contains(' ') && !s.contains('\t') {
+            out.entry(&s[..s.len() - 1]).or_insert(i);
+        }
+    }
+    out
+}
+
+fn classify(s: &str) -> Kind<'_> {
+    if s.is_empty() || s.starts_with('#') || QUIET_DIRECTIVES.iter().any(|d| s.starts_with(d)) {
+        return Kind::Skip;
+    }
+    if s.ends_with(':') {
+        return Kind::Skip;
+    }
+    if s.starts_with('.') {
+        return Kind::Barrier;
+    }
+    match split_line(s) {
+        Some((mn, ops)) => Kind::Insn(mn, ops),
+        None => Kind::Skip,
+    }
 }
 
 fn regs_in(op: &str) -> Vec<usize> {
@@ -36,52 +84,104 @@ fn full_write_of(op: &str, reg: usize) -> bool {
     matches!(parse_reg(op), Some((r, w)) if r == reg && w <= 1)
 }
 
-pub(crate) fn reg_dead_after(lines: &[&str], start: usize, reg: usize) -> bool {
-    for line in &lines[start.min(lines.len())..] {
-        let s = line.trim();
-        if skip(s) {
-            continue;
-        }
-        if is_boundary(s) {
-            return false;
-        }
-        let Some((mn, ops)) = split_line(s) else { continue };
-        if !EXPLICIT.contains(&mn) || (mn == "imul" && ops.len() == 1) {
-            return false;
-        }
-        if ops.is_empty() {
-            continue;
-        }
-        let rest: Vec<usize> = ops[1..].iter().flat_map(|o| regs_in(o)).collect();
-        if mn == "xor" && ops.len() == 2 && ops[0] == ops[1] && full_write_of(ops[0], reg) {
-            return true;
-        }
-        if PURE_WRITE.contains(&mn) && full_write_of(ops[0], reg) && !rest.contains(&reg) {
-            return true;
-        }
-        if rest.contains(&reg) || regs_in(ops[0]).contains(&reg) {
-            return false;
-        }
+fn control(mn: &str, ops: &[&str], labels: &Labels, stack: &mut Vec<usize>) -> Option<Step> {
+    if mn == "ret" {
+        return Some(Step::Cut);
     }
-    false
+    let jcc = JCC.contains(&mn);
+    if mn != "jmp" && !jcc {
+        return None;
+    }
+    match (ops.len(), ops.first().and_then(|t| labels.get(t))) {
+        (1, Some(&target)) => {
+            stack.push(target);
+            Some(if jcc { Step::Next } else { Step::Cut })
+        }
+        _ => Some(Step::Live),
+    }
 }
 
-pub(crate) fn flags_dead_after(lines: &[&str], start: usize) -> bool {
-    for line in &lines[start.min(lines.len())..] {
-        let s = line.trim();
-        if skip(s) {
+fn reg_step(mn: &str, ops: &[&str], reg: usize) -> Step {
+    if mn == "ret" {
+        return if LIVE_AT_RET.contains(&reg) { Step::Live } else { Step::Dead };
+    }
+    if mn == "jmp" || JCC.contains(&mn) {
+        return Step::Next;
+    }
+    if !EXPLICIT.contains(&mn) || (mn == "imul" && ops.len() == 1) {
+        return Step::Live;
+    }
+    if ops.is_empty() {
+        return Step::Next;
+    }
+    let rest: Vec<usize> = ops[1..].iter().flat_map(|o| regs_in(o)).collect();
+    if mn == "xor" && ops.len() == 2 && ops[0] == ops[1] && full_write_of(ops[0], reg) {
+        return Step::Dead;
+    }
+    if PURE_WRITE.contains(&mn) && full_write_of(ops[0], reg) && !rest.contains(&reg) {
+        return Step::Dead;
+    }
+    if rest.contains(&reg) || regs_in(ops[0]).contains(&reg) {
+        return Step::Live;
+    }
+    Step::Next
+}
+
+fn flags_step(mn: &str, _ops: &[&str]) -> Step {
+    if mn == "ret" || FLAG_FULL.contains(&mn) {
+        return Step::Dead;
+    }
+    if JCC.contains(&mn) {
+        return Step::Live;
+    }
+    if FLAG_NEUTRAL.contains(&mn) || mn == "jmp" {
+        return Step::Next;
+    }
+    Step::Live
+}
+
+fn dead_after(lines: &[&str], start: usize, labels: &Labels, step: &dyn Fn(&str, &[&str]) -> Step) -> bool {
+    let mut stack = vec![start];
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut budget = STEP_BUDGET;
+    while let Some(mut i) = stack.pop() {
+        if !seen.insert(i) {
             continue;
         }
-        if is_boundary(s) {
-            return false;
-        }
-        let Some((mn, _)) = split_line(s) else { continue };
-        if FLAG_FULL.contains(&mn) {
-            return true;
-        }
-        if !FLAG_NEUTRAL.contains(&mn) {
-            return false;
+        loop {
+            if i >= lines.len() {
+                return false;
+            }
+            budget -= 1;
+            if budget < 0 {
+                return false;
+            }
+            let kind = classify(lines[i].trim());
+            i += 1;
+            let (mn, ops) = match kind {
+                Kind::Skip => continue,
+                Kind::Barrier => return false,
+                Kind::Insn(mn, ops) => (mn, ops),
+            };
+            match step(mn, &ops) {
+                Step::Live => return false,
+                Step::Dead => break,
+                _ => {}
+            }
+            match control(mn, &ops, labels, &mut stack) {
+                Some(Step::Live) => return false,
+                Some(Step::Cut) => break,
+                _ => {}
+            }
         }
     }
-    false
+    true
+}
+
+pub(crate) fn reg_dead_after(lines: &[&str], start: usize, reg: usize, labels: &Labels) -> bool {
+    dead_after(lines, start, labels, &|mn, ops| reg_step(mn, ops, reg))
+}
+
+pub(crate) fn flags_dead_after(lines: &[&str], start: usize, labels: &Labels) -> bool {
+    dead_after(lines, start, labels, &flags_step)
 }

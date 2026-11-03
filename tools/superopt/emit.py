@@ -1,6 +1,11 @@
 import json
 import sys
 
+from x86 import GPR, SUFFIX, VARTOK, normalize
+
+CONCRETE = [0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+WIDTH_INDEX = {"": 0, "d": 1, "w": 2, "b": 3}
+
 HEADER = ""
 
 
@@ -22,6 +27,28 @@ def order(rules):
         seen.add(k)
         out.append(r)
     return out
+
+
+def render(texts):
+    return ["    " + VARTOK.sub(lambda m: GPR[CONCRETE[int(m.group(1))]][WIDTH_INDEX[m.group(2)]], t) for t in texts]
+
+
+def covered_by(r, s):
+    if s is r or len(s["pattern"]) >= len(r["pattern"]) or s["dead"] or s["flags_dead"]:
+        return False
+    if len(s["pattern"]) - len(s["replacement"]) < r["gain"]:
+        return False
+    lines = render(r["pattern"])
+    n = len(s["pattern"])
+    for a in range(len(lines) - n + 1):
+        norm = normalize(lines[a:a + n])
+        if norm and norm[0] == s["pattern"]:
+            return True
+    return False
+
+
+def drop_decomposable(rules):
+    return [r for r in rules if not any(covered_by(r, s) for s in rules)]
 
 
 def emit_rules(rules):
@@ -52,7 +79,7 @@ def main():
     rules = []
     for p in src.split(","):
         rules += json.load(open(p))
-    rules = order(rules)
+    rules = drop_decomposable(order(rules))
     json.dump(rules, open(out_json, "w"), indent=1)
     open(rules_rs, "w").write(emit_rules(rules))
     open(tests_rs, "w").write(emit_tests(rules))
