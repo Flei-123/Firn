@@ -94,7 +94,7 @@ fn is_file(p: &str) -> bool {
 pub fn search_manifest(dirname: &str) -> Option<String> {
     let mut d = package::normalize(dirname);
     for _ in 0..package::SUCHTIEFE {
-        if is_file(&package::join(&d, package::MANIFEST)) {
+        if is_file(&package::manifest_path(&d)) {
             return Some(d);
         }
         let high = package::join(&d, "..");
@@ -107,7 +107,7 @@ pub fn search_manifest(dirname: &str) -> Option<String> {
 }
 
 fn load(root: &str) -> Result<(Manifest, String), String> {
-    let mpath = package::join(root, package::MANIFEST);
+    let mpath = package::manifest_path(root);
     let text = match std::fs::read_to_string(&mpath) {
         Ok(t) => t,
         Err(e) => {
@@ -140,7 +140,7 @@ impl World {
     pub fn ab_root(root: &str) -> Result<World, String> {
         let c = cwd();
         let w = absolute(root, &c);
-        if !is_file(&package::join(&w, package::MANIFEST)) {
+        if !is_file(&package::manifest_path(&w)) {
             return Err(error_with_note(
                 format!("no manifest in '{}'", root),
                 format!("the file '{}' is expected", package::join(root, package::MANIFEST)),
@@ -185,7 +185,7 @@ impl World {
                 let idx = match present {
                     Some(k) => k,
                     None => {
-                        if !is_file(&package::join(&dw, package::MANIFEST)) {
+                        if !is_file(&package::manifest_path(&dw)) {
                             return Err(error_with_note(
                                 format!(
                                     "{}:{}: dependency '{}' has no manifest",

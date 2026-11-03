@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Central configuration: the language name and the file suffix live EXCLUSIVELY here.
-//! Renaming the language = adjust these three constants, nothing else.
+//! Central configuration; names come from brand.toml via brand.rs.
 
-pub const LANG_NAME: &str = "Firn";
-pub const LANG_NAME_LOWER: &str = "firn";
-pub const FILE_EXT: &str = "fi";
+pub const LANG_NAME: &str = crate::brand::LANG_NAME;
+pub const FILE_EXT: &str = crate::brand::EXT;
 
 /// Name of the compiler binary, derived from the language name.
 pub fn compiler_name() -> String {
-    format!("{}c", LANG_NAME_LOWER)
+    crate::brand::COMPILER.to_string()
 }
 
 /// Version of the prototype (stage 0).
