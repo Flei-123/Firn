@@ -75,7 +75,7 @@ function layerHashes(mask, arrays) {
   const out = {}
   let k = 0
   for (let i = 0; i < 64; i++) {
-    if ((m >> BigInt(i)) & 1n) { out[i] = md5(arrays[k]); k++ }
+    if ((m >> BigInt(i)) & 1n) { out[i] = process.env.BOT_RAW ? Buffer.from(arrays[k]).toString('hex') : md5(arrays[k]); k++ }
   }
   return out
 }
@@ -142,6 +142,7 @@ if (scenario === 'status') {
       res.center.push([data.chunkX, data.chunkZ])
     } else if (meta.name === 'map_chunk') {
       res.chunks++
+      lastChunkAt = Date.now()
       const key = data.x + ',' + data.z
       if (!res.columns[key]) {
         res.columns[key] = true
@@ -158,6 +159,7 @@ if (scenario === 'status') {
       res.system_chat.push(meta.name + ':' + JSON.stringify(data).slice(0, 300))
     }
   })
+  let lastChunkAt = Date.now()
   const finish = (code) => { finished = true; if (!process.env.BOT_HISTS) delete res.hists; if (!process.env.BOT_FULL) delete res.extras; res.column_count = Object.keys(res.columns).length; delete res.columns; out(res); try { client.end('bye') } catch (e) {} ; setTimeout(() => process.exit(code), 100) }
   if (scenario === 'join') {
     const total = parseInt(process.env.BOT_SECONDS || '18', 10) * 1000
@@ -174,7 +176,14 @@ if (scenario === 'status') {
         else client.write('chat_message', { message: 'hello firn', timestamp: BigInt(Date.now()), salt: 0n, offset: 0, acknowledged: Buffer.alloc(3) })
       }
     }, 6000)
-    setTimeout(() => finish(0), total)
+    const settleMs = parseInt(process.env.BOT_SETTLE_MS || '0', 10)
+    const startedAt = Date.now()
+    const waitSettled = () => {
+      const quiet = Date.now() - lastChunkAt >= settleMs
+      if (settleMs === 0 || quiet || Date.now() - startedAt > total + 60000) finish(0)
+      else setTimeout(waitSettled, 500)
+    }
+    setTimeout(waitSettled, total)
   } else if (scenario === 'silent') {
     setTimeout(() => finish(0), parseInt(process.env.BOT_SECONDS || '55', 10) * 1000)
   } else if (scenario === 'login_only') {

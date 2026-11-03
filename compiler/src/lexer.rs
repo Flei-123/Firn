@@ -984,7 +984,7 @@ pub fn char_hint(c: char) -> Option<String> {
     match c {
         // apostrophe and single typographic quotation marks
         '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some(
-            "Firn has no character literals -- write a text literal with '\"'".to_string(),
+            format!("{} has no character literals -- write a text literal with '\"'", crate::brand::LANG_NAME),
         ),
         // double typographic quotation marks, guillemets, backtick
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{00AB}' | '\u{00BB}' | '`' => {
@@ -1000,7 +1000,7 @@ pub fn char_hint(c: char) -> Option<String> {
             c as u32
         )),
         '@' => Some(
-            "Firn has no annotations with '@' -- an attribute is written '#[name]'".to_string(),
+            format!("{} has no annotations with '@' -- an attribute is written '#[name]'", crate::brand::LANG_NAME),
         ),
         _ => None,
     }

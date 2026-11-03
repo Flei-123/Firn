@@ -6,15 +6,18 @@ import mc.gen.wgdf_graph
 import mc.gen.wgdf_gen
 import mc.gen.wgdf_fluid
 import mc.server.sv_world
+import mc.server.sv_dim
 
 export { gen_source_new, gen_dim_known, gen_dim_of_level_type }
 
 const PALETTE_ENTRIES: usize = 512
-const GEN_MIN_Y: i32 = 0 - 64
-const GEN_HEIGHT: i32 = 384
 
 struct GenCtx {
     gen: *mut wgdf_gen.WgGen,
+    kind: i32,
+    min_y: i32,
+    height: i32,
+    gen_height: i32,
     palette: u64,
     scratch: u64,
     scratch_len: usize,
@@ -86,24 +89,73 @@ fn biome_ids_build(c: *mut GenCtx, gen: *mut wgdf_gen.WgGen, r: *mut mc_registry
 }
 
 fn gen_dim_known(dim: str) -> bool {
-    return dim == "overworld" || dim == "amplified" || dim == "large_biomes"
+    return dim == "overworld" || dim == "amplified" || dim == "large_biomes" || dim == "nether" || dim == "end"
+}
+
+fn kind_of_gen_dim(dim: str) -> i32 {
+    if dim == "nether" { return sv_dim.DIM_NETHER }
+    if dim == "end" { return sv_dim.DIM_END }
+    return sv_dim.DIM_OVERWORLD
 }
 
 fn gen_dim_of_level_type(level_type: str) -> str {
     if level_type == "normal" || level_type == "minecraft:normal" || level_type == "default" { return "overworld" }
     if level_type == "amplified" || level_type == "minecraft:amplified" { return "amplified" }
     if level_type == "large_biomes" || level_type == "minecraft:large_biomes" || level_type == "largebiomes" { return "large_biomes" }
+    if sv_dim.dim_kind_of_level_type(level_type) != sv_dim.DIM_OVERWORLD { return sv_dim.dim_gen_name(sv_dim.dim_kind_of_level_type(level_type)) }
     return ""
 }
 
-fn spawn_height(ctx: u64) -> i32 {
+fn code_at(c: *mut GenCtx, yi: i32, x: i32, z: i32) -> u16 {
+    return rt.ld16((*c).scratch, (((yi as usize) * 16 + (z as usize)) * 16) + (x as usize))
+}
+
+fn is_open(code: u16) -> bool {
+    return code == (wgdf_fluid.STATE_AIR as u16)
+}
+
+fn is_floor(code: u16) -> bool {
+    return code != (wgdf_fluid.STATE_AIR as u16) && code != (wgdf_fluid.STATE_WATER as u16) && code != (wgdf_fluid.STATE_LAVA as u16)
+}
+
+fn nether_spawn_y(c: *mut GenCtx, x: i32, z: i32) -> i32 {
+    var yi: i32 = 110
+    while yi > 33 {
+        if is_open(code_at(c, yi, x, z)) && is_open(code_at(c, yi + 1, x, z)) && is_floor(code_at(c, yi - 1, x, z)) { return yi }
+        yi = yi - 1
+    }
+    return 0 - 1
+}
+
+fn surface_spawn_y(c: *mut GenCtx, x: i32, z: i32) -> i32 {
+    var yi: i32 = (*c).gen_height - 1
+    while yi > 0 {
+        let code: u16 = code_at(c, yi, x, z)
+        if code != (wgdf_fluid.STATE_AIR as u16) && code != (wgdf_fluid.STATE_WATER as u16) { return (*c).min_y + yi + 1 }
+        yi = yi - 1
+    }
+    return 100
+}
+
+fn spawn_search(ctx: u64, out_x: *mut i32, out_z: *mut i32) -> i32 {
     let c: *mut GenCtx = ctx as *mut GenCtx
     wgdf_gen.gen_chunk((*c).gen, 0, 0, (*c).scratch as *mut u16, (*c).bio_scratch as *mut u8)
-    var yi: i32 = GEN_HEIGHT - 1
-    while yi > 0 {
-        let code: u16 = rt.ld16((*c).scratch, ((yi as usize) * 16 + 8) * 16 + 8)
-        if code != (wgdf_fluid.STATE_AIR as u16) && code != (wgdf_fluid.STATE_WATER as u16) { return GEN_MIN_Y + yi + 1 }
-        yi = yi - 1
+    *out_x = 8
+    *out_z = 8
+    if (*c).kind != sv_dim.DIM_NETHER { return surface_spawn_y(c, 8, 8) }
+    var z: i32 = 0
+    while z < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            let y: i32 = nether_spawn_y(c, x, z)
+            if y >= 0 {
+                *out_x = x
+                *out_z = z
+                return y
+            }
+            x = x + 1
+        }
+        z = z + 1
     }
     return 100
 }
@@ -118,10 +170,21 @@ fn gen_fill(ctx: u64, cx: i32, cz: i32, col: *mut sv_world.Column) -> bool {
         rt.st16(blocks, i, rt.ld16((*c).palette, rt.ld16((*c).scratch, i) as usize))
         i = i + 1
     }
+    let air: u16 = rt.ld16((*c).palette, wgdf_fluid.STATE_AIR as usize)
+    let total: usize = ((*c).height as usize) * 256
+    while i < total {
+        rt.st16(blocks, i, air)
+        i = i + 1
+    }
     let biomes: u64 = (*col).biomes
     i = 0
     while i < (*c).bio_len {
         rt.st16(biomes, i, (*c).bio_ids[rt.ld8((*c).bio_scratch, i) as usize])
+        i = i + 1
+    }
+    let bio_total: usize = ((*c).height as usize) / 16 * 64
+    while i < bio_total {
+        rt.st16(biomes, i, rt.ld16(biomes, i - 64))
         i = i + 1
     }
     return true
@@ -137,7 +200,7 @@ fn gen_release(ctx: u64) {
 }
 
 fn source_none() -> sv_world.WorldSource {
-    return sv_world.WorldSource { ctx: 0 as u64, fill: gen_fill, release: gen_release, min_y: GEN_MIN_Y, height: GEN_HEIGHT,
+    return sv_world.WorldSource { ctx: 0 as u64, fill: gen_fill, release: gen_release, min_y: 0 - 64, height: 384,
         spawn_x: 8, spawn_y: 100, spawn_z: 8, biome: 0, uniform: false }
 }
 
@@ -145,20 +208,29 @@ fn gen_source_new(ver: *mut mc_version.Version, biome: i32, data_root: str, dim:
     if !gen_dim_known(dim) { return source_none() }
     let gen: *mut wgdf_gen.WgGen = wgdf_gen.gen_open(data_root, dim, seed, surface, carvers, features)
     if gen == (0 as *mut wgdf_gen.WgGen) { return source_none() }
-    if wgdf_gen.gen_min_y(gen) != GEN_MIN_Y || wgdf_gen.gen_height(gen) != GEN_HEIGHT {
+    let kind: i32 = kind_of_gen_dim(dim)
+    let col_height: i32 = sv_dim.dim_height(kind)
+    if wgdf_gen.gen_min_y(gen) != sv_dim.dim_min_y(kind) || wgdf_gen.gen_height(gen) > col_height {
         wgdf_gen.gen_close(gen)
         return source_none()
     }
     var reg: mc_registry.Registry = (*ver).registry_of()
     let c: *mut GenCtx = rt.heap_alloc(ctx_bytes()) as *mut GenCtx
     (*c).gen = gen
+    (*c).kind = kind
+    (*c).min_y = sv_dim.dim_min_y(kind)
+    (*c).height = col_height
+    (*c).gen_height = wgdf_gen.gen_height(gen)
     (*c).palette = rt.heap_alloc(PALETTE_ENTRIES * 2)
-    (*c).scratch_len = (GEN_HEIGHT as usize) * 256
+    (*c).scratch_len = ((*c).gen_height as usize) * 256
     (*c).scratch = rt.heap_alloc((*c).scratch_len * 2)
-    (*c).bio_len = (GEN_HEIGHT as usize) / 16 * 64
+    (*c).bio_len = ((*c).gen_height as usize) / 16 * 64
     (*c).bio_scratch = rt.heap_alloc((*c).bio_len + 8)
     biome_ids_build(c, gen, &reg, biome)
     palette_build((*c).palette, &reg, wgdf_gen.gen_default_block(gen), gen)
-    return sv_world.WorldSource { ctx: c as u64, fill: gen_fill, release: gen_release, min_y: GEN_MIN_Y, height: GEN_HEIGHT,
-        spawn_x: 8, spawn_y: spawn_height(c as u64), spawn_z: 8, biome: biome, uniform: false }
+    var sx: i32 = 8
+    var sz: i32 = 8
+    let sy: i32 = spawn_search(c as u64, &sx, &sz)
+    return sv_world.WorldSource { ctx: c as u64, fill: gen_fill, release: gen_release, min_y: (*c).min_y, height: (*c).height,
+        spawn_x: sx, spawn_y: sy, spawn_z: sz, biome: biome, uniform: false }
 }
