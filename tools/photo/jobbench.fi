@@ -1,0 +1,131 @@
+// tools/photo/jobbench.fi -- FirnCam shot job (photo.camjob) on a synthetic RAW16 burst, wall time per stage.
+// Usage: jobbench W H FRAMES THREADS PRESET META   (PRESET 0 = legacy job defaults, else camjob.PRESET_*; META 1 = noise
+// profile + white balance like a phone RAW, 0 = none)
+// Prints `FIRNCAM_T stage=<name> ms=<n>` per stage, `FIRNCAM_T total ms=<n> w=<out w> h=<out h> frames=<n>`, `jpeg_bytes`
+// and `jpeg_hash` (FNV-1a of the JPEG) so two builds can be compared bit for bit.
+import std.io
+import std.rt
+import jobs.jobs
+import photo.image
+import photo.par
+import photo.meta
+import photo.camjob
+import photo.stagelog
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn parse_dec(p: u64, fallback: u64) -> u64 {
+    if p == 0 { return fallback }
+    let n: usize = rt.c_length(p)
+    if n == 0 { return fallback }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 { return fallback }
+        v = v * 10 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn make_raw(scene: *mut image.Image, dx: f32, dy: f32, rng: *mut image.Rng) -> u64 {
+    let w: i32 = (*scene).w
+    let h: i32 = (*scene).h
+    var sh: image.Image = image.shift_image(scene, dx, dy)
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var c: i32 = 1
+            if (y & 1) == 0 && (x & 1) == 0 { c = 0 }
+            if (y & 1) == 1 && (x & 1) == 1 { c = 2 }
+            let s: f32 = image.img_get(&sh, c, x, y) * 0.8f
+            var v: f32 = s + image.sqrtf(2.0e-4f * s + 4.0e-6f) * image.rng_gauss(rng)
+            v = image.fclampf(v, 0.0f, 1.0f)
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (64.0f + v * 4031.0f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&sh)
+    return p
+}
+
+fn put(name: str, v: i64) {
+    io.print(name)
+    io.fmt_print_line(io.fmt_number(io.fmt_new(), v))
+}
+
+fn arg(start: u64, i: usize, fallback: u64) -> u64 {
+    if rt.arg_count(start) > i { return parse_dec(rt.arg_ptr(start, i), fallback) }
+    return fallback
+}
+
+fn main(start: u64) -> i32 {
+    let w: i32 = arg(start, 1, 4096) as i32
+    let h: i32 = arg(start, 2, 3072) as i32
+    let n: i32 = arg(start, 3, 4) as i32
+    let th: u64 = arg(start, 4, 8)
+    let preset: i32 = arg(start, 5, 0) as i32
+    let phone_meta: bool = arg(start, 6, 1) != 0
+    if th > 1 { par.init(th - 1) }
+    var scene: image.Image = image.scene_make(w, h)
+    var rng: image.Rng = image.rng_new(7 as u64)
+    var raws: [u64; 16] = [0 as u64; 16]
+    var i: i32 = 0
+    while i < n {
+        raws[i as usize] = make_raw(&scene, (i as f32) * 0.7f, (i as f32) * -0.4f, &rng)
+        i = i + 1
+    }
+    image.img_free(&scene)
+    var j: camjob.Job = camjob.job_new()
+    j.mode = camjob.MODE_PHOTO
+    j.meta.has_black = true
+    j.meta.black = [64.0f, 64.0f, 64.0f, 64.0f]
+    j.meta.white_level = 4095.0f
+    j.meta.has_wb = phone_meta
+    if phone_meta { j.meta.wb = [2.0f, 1.0f, 1.0f, 1.6f] }
+    var site: usize = 0
+    while phone_meta && site < 4 {
+        meta.meta_set_noise(&j.meta, site, 1.6e-4f, 3.0e-6f)
+        site = site + 1
+    }
+    j.aw = 16
+    j.ah = 9
+    j.max_px = 9500000
+    i = 0
+    while i < n {
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, w, h, raws[i as usize], ((w * h) as usize) * 2, 10000000, 100)
+        i = i + 1
+    }
+    camjob.job_entry((&j) as u64)
+    var k: i32 = 0
+    while k < stagelog.count() {
+        io.print("FIRNCAM_T stage=")
+        rt.write_everything(1, stagelog.name_p(k), stagelog.name_n(k))
+        put(" ms=", stagelog.ms_at(k))
+        k = k + 1
+    }
+    io.print("FIRNCAM_T total ms=")
+    io.fmt_print(io.fmt_number(io.fmt_new(), stagelog.total_ms()))
+    io.print(" w=")
+    io.fmt_print(io.fmt_number(io.fmt_new(), j.out_w as i64))
+    io.print(" h=")
+    io.fmt_print(io.fmt_number(io.fmt_new(), j.out_h as i64))
+    put(" frames=", n as i64)
+    put("jpeg_bytes ", j.out_n as i64)
+    var hsh: u64 = 14695981039346656037
+    var q: usize = 0
+    while q < j.out_n {
+        hsh = (hsh ^ (rt.ld8(j.out, q) as u64)) * 1099511628211
+        q = q + 1
+    }
+    put("jpeg_hash ", (hsh >> 1) as i64)
+    if j.ok { return 0 }
+    return 1
+}

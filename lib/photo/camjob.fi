@@ -36,6 +36,7 @@ import photo.demosaic
 import photo.antialias
 import photo.resample
 import photo.sr
+import photo.stagelog
 
 export {
     Shot, Job, job_new, job_add_shot, job_free, job_entry, run_job, job_progress, job_finished,
@@ -255,22 +256,26 @@ fn resample_img(im: image.Image, nw: i32, nh: i32) -> image.Image {
 // > 1) turns every blown light pink or green. Per pixel: how close the brightest channel is to the limit
 // (smoothstep 0.90 .. 0.99) blends the pixel to the neutral colour that the gains map to equal channels, at the
 // level of the brightest balanced channel. Colours below 0.90 are untouched. Needs the gains (has_wb).
-fn neutralise_clipped(im: *mut image.Image, m: *mut meta.SensorMeta) {
-    if !(*m).has_wb { return }
-    let gr: f32 = (*m).wb[0]
-    let gg: f32 = 0.5f * ((*m).wb[1] + (*m).wb[2])
-    let gb: f32 = (*m).wb[3]
-    if gr <= 0.0f || gg <= 0.0f || gb <= 0.0f { return }
-    let n: i32 = (*im).w * (*im).h
-    let pr: u64 = image.img_plane(im, 0)
-    let pg: u64 = image.img_plane(im, 1)
-    let pb: u64 = image.img_plane(im, 2)
-    var i: i32 = 0
-    while i < n {
-        let o: u64 = (i as u64) * (4 as u64)
-        let r: f32 = *((pr + o) as *mut f32)
-        let g: f32 = *((pg + o) as *mut f32)
-        let b: f32 = *((pb + o) as *mut f32)
+struct ClipCtx {
+    pr: u64,
+    pg: u64,
+    pb: u64,
+    gr: f32,
+    gg: f32,
+    gb: f32,
+}
+
+fn clip_range(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ClipCtx = ctx as *mut ClipCtx
+    let gr: f32 = (*k).gr
+    let gg: f32 = (*k).gg
+    let gb: f32 = (*k).gb
+    var i: u64 = lo
+    while i < hi {
+        let o: u64 = i * (4 as u64)
+        let r: f32 = *(((*k).pr + o) as *mut f32)
+        let g: f32 = *(((*k).pg + o) as *mut f32)
+        let b: f32 = *(((*k).pb + o) as *mut f32)
         var mx: f32 = r
         if g > mx { mx = g }
         if b > mx { mx = b }
@@ -281,12 +286,22 @@ fn neutralise_clipped(im: *mut image.Image, m: *mut meta.SensorMeta) {
             var lvl: f32 = r * gr
             if g * gg > lvl { lvl = g * gg }
             if b * gb > lvl { lvl = b * gb }
-            *((pr + o) as *mut f32) = r + w * (lvl / gr - r)
-            *((pg + o) as *mut f32) = g + w * (lvl / gg - g)
-            *((pb + o) as *mut f32) = b + w * (lvl / gb - b)
+            *(((*k).pr + o) as *mut f32) = r + w * (lvl / gr - r)
+            *(((*k).pg + o) as *mut f32) = g + w * (lvl / gg - g)
+            *(((*k).pb + o) as *mut f32) = b + w * (lvl / gb - b)
         }
         i = i + 1
     }
+}
+
+fn neutralise_clipped(im: *mut image.Image, m: *mut meta.SensorMeta) {
+    if !(*m).has_wb { return }
+    let gr: f32 = (*m).wb[0]
+    let gg: f32 = 0.5f * ((*m).wb[1] + (*m).wb[2])
+    let gb: f32 = (*m).wb[3]
+    if gr <= 0.0f || gg <= 0.0f || gb <= 0.0f { return }
+    var k: ClipCtx = ClipCtx { pr: image.img_plane(im, 0), pg: image.img_plane(im, 1), pb: image.img_plane(im, 2), gr: gr, gg: gg, gb: gb }
+    par.rows((*im).w * (*im).h, 65536, clip_range, (&k) as u64)
 }
 
 // ---------------------------------------------------------------- RAW16 -> linear RGB at half resolution
@@ -390,7 +405,9 @@ fn jpeg_linear(p: u64, n: usize, max_px: i32) -> image.Image {
     }
     jpeg.jpeg_image_free(&dj)
     image.img_from_srgb(&d)
-    return shrink_img(d, max_px)
+    let r: image.Image = shrink_img(d, max_px)
+    stagelog.tick("decode")
+    return r
 }
 
 // the centre window of a w x h frame for a digital zoom (even origin and size so the CFA phase is kept)
@@ -459,8 +476,12 @@ fn raw_window_aa(p: u64, w: i32, h: i32, m: *mut meta.SensorMeta, max_px: i32, z
     var th: i32 = 0
     if quad {
         var hf: image.Image = raw_half(p, w, h, m)
+        stagelog.tick("demosaic")
         neutralise_clipped(&hf, m)
-        return shrink_img(hf, max_px)
+        stagelog.tick("highlights")
+        let sq: image.Image = shrink_img(hf, max_px)
+        stagelog.tick("resample")
+        return sq
     }
     var x0: i32 = 0
     var y0: i32 = 0
@@ -485,11 +506,17 @@ fn raw_window_aa(p: u64, w: i32, h: i32, m: *mut meta.SensorMeta, max_px: i32, z
         while i < 4 { black[i] = (*m).black[i]; i = i + 1 }
     }
     var rgb: image.Image = demosaic.demosaic_u16(p, w, h, x0, y0, cw, ch, (*m).cfa, &black[0], white)
+    stagelog.tick("demosaic")
     neutralise_clipped(&rgb, m)
-    if aa_edge > 0.0f || aa_chroma > 0.0f { antialias.aa_apply_opts(&rgb, aa_edge, aa_chroma) }
+    stagelog.tick("highlights")
+    if aa_edge > 0.0f || aa_chroma > 0.0f {
+        antialias.aa_apply_opts(&rgb, aa_edge, aa_chroma)
+        stagelog.tick("antialias")
+    }
     if cw == tw && ch == th { return rgb }
     let d: image.Image = resample.resample(&rgb, 0.0f, 0.0f, cw as f32, ch as f32, tw, th)
     image.img_free(&rgb)
+    stagelog.tick("resample")
     return d
 }
 
@@ -589,12 +616,15 @@ fn sr_merge_job(j: *mut Job, lin: *mut image.Image, vp: *mut image.Image) -> boo
         i = i + 1
     }
     if !sr.sr_burst(&ptrs[0], (*j).n, w, h, &(*j).meta, x0, y0, cw, ch, tw, th, (*j).ref_idx, &(*j).sro, lin, vp) { return false }
+    stagelog.tick("sr")
     neutralise_clipped(lin, &(*j).meta)
+    stagelog.tick("highlights")
     return true
 }
 
 fn run_job(j: *mut Job) -> bool {
     (*j).ok = false
+    stagelog.start()
     set_progress(j, 1)
     if (*j).n < 1 { return false }
     let jpeg_in: bool = (*j).shots[0].kind != SHOT_RAW
@@ -663,6 +693,7 @@ fn run_job(j: *mut Job) -> bool {
         image.img_free(&dp)
         focus.focus_stack(&b, &fo, &st, &dp)
         image.img_free(&dp)
+        stagelog.tick("stack")
         set_progress(j, 70)
         pipeline.process_single_linear(&st, &m, &po, &out)
         image.img_free(&st)
@@ -678,6 +709,7 @@ fn run_job(j: *mut Job) -> bool {
         var res: image.Image = image.img_new(1, 1, 3)
         image.img_free(&res)
         portrait.portrait_auto(&out, &pr, &res)
+        stagelog.tick("portrait")
         image.img_free(&out)
         out = res
     } else if mode == MODE_DOC {
@@ -689,6 +721,7 @@ fn run_job(j: *mut Job) -> bool {
             out = res
         }
         (*j).have_pdf = document.pdf_write(&out, 200.0f, &(*j).pdf)
+        stagelog.tick("document")
     }
     set_progress(j, 90)
     var eo: jpegenc.EncOpts = jpegenc.enc_default()
@@ -697,7 +730,9 @@ fn run_job(j: *mut Job) -> bool {
     let cap: usize = jpegenc.jpeg_max_size(out.w, out.h)
     let buf: u64 = rt.heap_alloc(cap)
     if buf == 0 as u64 { image.img_free(&out); return false }
+    stagelog.tick("other")
     let n: usize = jpegenc.jpeg_encode_image(&out, &eo, buf, cap)
+    stagelog.tick("jpeg")
     (*j).out_w = out.w
     (*j).out_h = out.h
     image.img_free(&out)

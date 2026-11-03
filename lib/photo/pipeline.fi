@@ -25,6 +25,8 @@ import photo.tonemap
 import photo.sharpen
 import photo.photocolor
 import photo.look
+import photo.par
+import photo.stagelog
 
 export {
     PipeOpts, opts_default, raw_to_linear, process_burst, process_single_linear, process_rgba8, pick_reference, pick_reference_c, finish_chain,
@@ -75,28 +77,44 @@ fn raw_to_linear(p: u64, w: i32, h: i32, stride: i32, m: *mut meta.SensorMeta) -
 const REF_BLOCK: i32 = 16
 
 // Block means (green, exposure normalised) of frame i on a coarse grid; out must hold bw * bh floats.
-fn block_means(im: *mut image.Image, gain: f32, bw: i32, bh: i32, out: u64) {
-    var by: i32 = 0
-    while by < bh {
+struct BlockCtx {
+    im: *mut image.Image,
+    gain: f32,
+    bw: i32,
+    out: u64,
+}
+
+fn block_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut BlockCtx = ctx as *mut BlockCtx
+    let im: *mut image.Image = (*k).im
+    let p: u64 = image.img_plane(im, 1)
+    let w: i32 = (*im).w
+    var by: i32 = lo as i32
+    while by < (hi as i32) {
         var bx: i32 = 0
-        while bx < bw {
+        while bx < (*k).bw {
             var s: f32 = 0.0f
             var n: f32 = 0.0f
             var y: i32 = by * REF_BLOCK
             while y < (by + 1) * REF_BLOCK && y < (*im).h {
                 var x: i32 = bx * REF_BLOCK
-                while x < (bx + 1) * REF_BLOCK && x < (*im).w {
-                    s = s + image.img_get(im, 1, x, y)
+                while x < (bx + 1) * REF_BLOCK && x < w {
+                    s = s + *((p + ((y * w + x) as u64) * (4 as u64)) as *mut f32)
                     n = n + 1.0f
                     x = x + 1
                 }
                 y = y + 1
             }
-            *((out + ((by * bw + bx) as u64) * (4 as u64)) as *mut f32) = s / (n * gain + 1.0e-9f)
+            *(((*k).out + ((by * (*k).bw + bx) as u64) * (4 as u64)) as *mut f32) = s / (n * (*k).gain + 1.0e-9f)
             bx = bx + 1
         }
         by = by + 1
     }
+}
+
+fn block_means(im: *mut image.Image, gain: f32, bw: i32, bh: i32, out: u64) {
+    var k: BlockCtx = BlockCtx { im: im, gain: gain, bw: bw, out: out }
+    par.rows(bh, 1, block_rows, (&k) as u64)
 }
 
 // How far a frame strays from the burst consensus: per coarse block the relative distance of the frame's mean
@@ -213,19 +231,25 @@ fn finish_chain(lin: *mut image.Image, var_plane: *mut image.Image, m: *mut meta
     } else if (*o).wb > 0.0f {
         photocolor.gray_world(lin, (*o).wb)
     }
+    stagelog.tick("color")
     var den: image.Image = image.img_new(1, 1, 3)
     image.img_free(&den)
     denoise.denoise(lin, var_plane, (*o).denoise, (*o).keep, &den)
+    stagelog.tick("denoise")
     var to: tonemap.ToneOpts = tonemap.tone_default()
     to.strength = (*o).tone
     tonemap.tonemap(&den, &to)
+    stagelog.tick("tonemap")
     image.img_to_srgb(&den)
+    stagelog.tick("srgb")
     if (*o).look > 0.0f {
         var lk: look.LookOpts = look.look_scaled((*o).look)
         look.look_apply(&den, &lk)
+        stagelog.tick("look")
     }
     if (*o).sharpen > 0.0f {
         sharpen.sharpen(&den, (*o).sharpen, 1.2f, 0.004f)
+        stagelog.tick("sharpen")
     }
     *out = den
 }
@@ -234,6 +258,7 @@ fn finish_chain(lin: *mut image.Image, var_plane: *mut image.Image, m: *mut meta
 fn process_burst(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
     var r: i32 = (*o).ref_idx
     if r < 0 || r >= (*b).n { r = pick_reference_c(b, (*o).consensus) }
+    stagelog.tick("reference")
     var nm: noise.NoiseModel = noise.from_meta(m)
     if !(*m).has_noise {
         nm = noise.estimate_model(&(*b).frames[r as usize])
@@ -246,6 +271,7 @@ fn process_burst(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut PipeOpts,
             if !(*m).has_noise { nm = noise.estimate_model(&(*b).frames[r as usize]) }
         }
     }
+    stagelog.tick("noise")
     var lin: image.Image = image.img_new(1, 1, 3)
     var vp: image.Image = image.img_new(1, 1, 1)
     var ws: image.Image = image.img_new(1, 1, 1)
@@ -256,6 +282,7 @@ fn process_burst(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut PipeOpts,
     mo.flicker = (*o).flicker
     merge.merge_burst_opts(b, r, &nm, &mo, &lin, &vp, &ws)
     image.img_free(&ws)
+    stagelog.tick("merge")
     finish_chain(&lin, &vp, m, o, out)
     image.img_free(&lin)
     image.img_free(&vp)
@@ -278,6 +305,7 @@ fn process_single_linear(im: *mut image.Image, m: *mut meta.SensorMeta, o: *mut 
         }
         y = y + 1
     }
+    stagelog.tick("varplane")
     finish_chain(&lin, &vp, m, o, out)
     image.img_free(&lin)
     image.img_free(&vp)
