@@ -206,3 +206,12 @@ files came from.
   [ROADMAP.md](ROADMAP.md).
 * Stricter ownership checking (see Known limits).
 * WebAssembly threads, and a Windows and Android host for `fui.app`.
+
+## Install
+
+```
+sh tools/release/install.sh https://<channel-host>/firn stable   # once; adds ~/.firn/bin
+firn upgrade                                                     # newest tested compiler
+firn upgrade --pin 0.1.5123 | --unpin ; firn list ; firn doctor
+```
+A project can ask for a version with a `firn.toolchain` file (`firn >=0.1.5000`). Details: docs/TOOLCHAIN.md.
