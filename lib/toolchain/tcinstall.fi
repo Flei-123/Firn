@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.fs
+import std.pystr
+import std.hashfile
+import std.extract
+import std.safefs
+import std.tar
+import toolchain.tcver
+import toolchain.tcpaths
+import toolchain.tcplat
+import toolchain.tcconfig
+import toolchain.tcfetch
+import toolchain.tcmanifest
+import toolchain.tcselftest
+
+struct Outcome {
+    version: str,
+    err: str,
+    fresh: bool,
+}
+
+fn outcome(v: str, err: str, fresh: bool) -> Outcome {
+    return Outcome { version: v, err: err, fresh: fresh }
+}
+
+fn channel_url() -> str {
+    return tcconfig.config_get("url")
+}
+
+fn channel_name(over: str) -> str {
+    if over.length() > 0 {
+        return over
+    }
+    let c: str = tcconfig.config_get("channel")
+    if c.length() > 0 {
+        return c
+    }
+    return "stable"
+}
+
+fn manifest_url(channel: str, version: str) -> str {
+    let base: str = tcfetch.url_join(channel_url(), channel)
+    if version.length() == 0 {
+        return tcfetch.url_join(base, "manifest.json")
+    }
+    return tcfetch.url_join(base, "manifest-" + version + ".json")
+}
+
+fn fetch_release(channel: str, version: str) -> tcmanifest.Release {
+    var r: tcmanifest.Release = tcmanifest.release_empty()
+    if channel_url().length() == 0 {
+        r.err = "no channel address configured (firn channel <url>)"
+        return r
+    }
+    let mu: str = manifest_url(channel, version)
+    var body: rt.Buf = rt.buf_new()
+    let e: str = tcfetch.fetch_text(mu, &body)
+    if e.length() > 0 {
+        rt.buf_free(&body)
+        r.err = e
+        return r
+    }
+    r = tcmanifest.manifest_parse(rt.buf_str(&body), tcpaths.platform())
+    rt.buf_free(&body)
+    if r.err.length() == 0 && version.length() > 0 && r.version != version {
+        r.err = "manifest " + mu + " names version " + r.version
+    }
+    if r.err.length() == 0 {
+        r.file = tcfetch.url_join(tcfetch.url_dir(mu), r.file)
+    }
+    return r
+}
+
+fn floor_ok(r: *mut tcmanifest.Release, force: bool) -> str {
+    let floor: str = tcconfig.config_get("floor")
+    if !force && tcver.ver_valid(floor) && tcver.ver_cmp((*r).version, floor) < 0 {
+        return "refused: " + (*r).version + " is older than the trusted floor " + floor + " (--force to allow)"
+    }
+    return ""
+}
+
+fn raise_floor(r: *mut tcmanifest.Release) {
+    let m: str = (*r).min_version
+    let floor: str = tcconfig.config_get("floor")
+    if tcver.ver_valid(m) && (!tcver.ver_valid(floor) || tcver.ver_cmp(m, floor) > 0) {
+        tcconfig.config_set("floor", m)
+    }
+}
+
+fn failed(bad: *mut bool) -> safefs.ExtractStats {
+    *bad = true
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}
+
+fn unpack(r: *mut tcmanifest.Release, stage: str) -> str {
+    var blob: rt.Buf = rt.buf_new()
+    let e: str = tcfetch.fetch_text((*r).file, &blob)
+    if e.length() > 0 {
+        rt.buf_free(&blob)
+        return e
+    }
+    if rt.buf_len(&blob) as u64 != (*r).size {
+        rt.buf_free(&blob)
+        return "size mismatch for " + (*r).file
+    }
+    let got: str = hashfile.hash_bytes_hex(hashfile.HASH_SHA256, rt.buf_ptr(&blob), rt.buf_len(&blob))
+    if got != (*r).sha256 {
+        rt.buf_free(&blob)
+        return "SHA-256 mismatch for " + (*r).file + ": got " + got
+    }
+    if !tcpaths.make_dir(stage) {
+        rt.buf_free(&blob)
+        return "cannot create " + stage
+    }
+    var o: safefs.ExtractOptions = safefs.extract_options_default()
+    o.strip = 1
+    var bad: bool = false
+    let st: safefs.ExtractStats = extract.extract_memory(rt.buf_ptr(&blob), rt.buf_len(&blob), (*r).file, stage, o, tar.tar_limits_default()) catch failed(&bad)
+    rt.buf_free(&blob)
+    if bad {
+        return "cannot unpack " + (*r).file
+    }
+    return ""
+}
+
+fn install(channel: str, version: str, force: bool) -> Outcome {
+    var r: tcmanifest.Release = fetch_release(channel, version)
+    if r.err.length() > 0 {
+        return outcome("", r.err, false)
+    }
+    let fe: str = floor_ok(&r, force)
+    if fe.length() > 0 {
+        return outcome(r.version, fe, false)
+    }
+    if tcpaths.is_installed(r.version) {
+        raise_floor(&r)
+        return outcome(r.version, "", false)
+    }
+    if !tcpaths.make_dir(tcpaths.versions_dir()) {
+        return outcome(r.version, "cannot create " + tcpaths.versions_dir(), false)
+    }
+    let stage: str = tcpaths.join(tcpaths.versions_dir(), ".stage-" + r.version)
+    let target: str = tcpaths.version_dir(r.version)
+    if fs.exists(stage) { fs.remove_tree(stage) catch false }
+    var err: str = unpack(&r, stage)
+    if err.length() == 0 {
+        err = tcselftest.selftest(stage)
+    }
+    if err.length() == 0 {
+        if fs.exists(target) { fs.remove_tree(target) catch false }
+        let moved: bool = fs.rename(stage, target) catch false
+        if !moved {
+            err = "cannot move " + stage + " to " + target
+        }
+    }
+    if err.length() > 0 {
+        if fs.exists(stage) { fs.remove_tree(stage) catch false }
+        return outcome(r.version, err, false)
+    }
+    let mark: str = r.channel + " " + r.sha256 + "\n"
+    tcpaths.write_text_atomic(tcpaths.ready_marker(r.version), mark)
+    raise_floor(&r)
+    return outcome(r.version, "", true)
+}
+
+fn switch_to(v: str) -> str {
+    if !tcpaths.is_installed(v) {
+        return "version " + v + " is not installed"
+    }
+    let prev: str = tcpaths.current_version()
+    let link: str = tcpaths.current_link()
+    if tcplat.links_supported() {
+        let tmp: str = link + ".new"
+        fs.remove(tmp) catch false
+        let made: bool = fs.symlink(tcpaths.join("versions", v), tmp) catch false
+        if !made {
+            return "cannot create link " + tmp
+        }
+        let moved: bool = fs.rename(tmp, link) catch false
+        if !moved {
+            return "cannot switch " + link
+        }
+    } else if !tcpaths.write_text_atomic(link + ".txt", v + "\n") {
+        return "cannot switch " + link
+    }
+    let check: str = tcselftest.selftest(tcpaths.current_link())
+    if check.length() > 0 {
+        if prev.length() > 0 && prev != v {
+            switch_back(prev)
+        }
+        return "new compiler failed after switching, rolled back to " + prev + ": " + check
+    }
+    if prev.length() > 0 && prev != v {
+        tcconfig.config_set("previous", prev)
+    }
+    return ""
+}
+
+fn switch_back(prev: str) {
+    let link: str = tcpaths.current_link()
+    if tcplat.links_supported() {
+        let tmp: str = link + ".back"
+        fs.remove(tmp) catch false
+        let made: bool = fs.symlink(tcpaths.join("versions", prev), tmp) catch false
+        if made { fs.rename(tmp, link) catch false }
+    } else {
+        tcpaths.write_text_atomic(link + ".txt", prev + "\n")
+    }
+}
