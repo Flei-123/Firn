@@ -47,6 +47,15 @@ def covered_by(r, s):
     return False
 
 
+SLOW = ("imul",)
+
+
+def slower(r):
+    def count(texts):
+        return sum(1 for t in texts if t.split()[0] in SLOW)
+    return count(r["replacement"]) > count(r["pattern"])
+
+
 def drop_decomposable(rules):
     return [r for r in rules if not any(covered_by(r, s) for s in rules)]
 
@@ -79,7 +88,7 @@ def main():
     rules = []
     for p in src.split(","):
         rules += json.load(open(p))
-    rules = drop_decomposable(order(rules))
+    rules = drop_decomposable([r for r in order(rules) if not slower(r)])
     json.dump(rules, open(out_json, "w"), indent=1)
     open(rules_rs, "w").write(emit_rules(rules))
     open(tests_rs, "w").write(emit_tests(rules))

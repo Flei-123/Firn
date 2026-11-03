@@ -4,6 +4,7 @@ use super::{run, Rule, RULES};
 const TEST_REGS: [usize; 8] = [0, 1, 2, 6, 7, 8, 9, 10];
 const FLAG_KILL: &str = "    test r11, r11";
 const FENCE: &str = "    .loc 1 1 0";
+const BARRIER: &str = "    lfence";
 
 fn body(lines: &[&str]) -> Vec<String> {
     lines.iter().map(|t| format!("    {}", render(t, &TEST_REGS).unwrap())).collect()
@@ -19,6 +20,7 @@ fn tail(rule: &Rule, nvars: usize) -> Vec<String> {
     if rule.flags_dead {
         out.push(FLAG_KILL.to_string());
     }
+    out.push(BARRIER.to_string());
     out.push("    ret".to_string());
     out
 }
@@ -84,4 +86,16 @@ fn normalization_numbers_registers_by_first_use() {
     let (key, regs) = normalize(&["    mov r9d, edi", "    lea rdi, [r9+r9*4]"]).unwrap();
     assert_eq!(key, "mov %0d, %1d\nlea %1, [%0+%0*4]");
     assert_eq!(regs, vec![9, 7]);
+}
+
+#[test]
+fn dead_copy_is_removed_across_a_jump() {
+    let text = "    mov rcx, rax\n    jmp .La\n.La:\n    mov rcx, 1\n    lfence\n    ret";
+    assert_eq!(run(text), "    jmp .La\n.La:\n    mov rcx, 1\n    lfence\n    ret");
+}
+
+#[test]
+fn copy_read_on_one_branch_is_kept() {
+    let text = "    mov rcx, rax\n    jne .La\n    mov rcx, 1\n    ret\n.La:\n    add rdx, rcx\n    lfence\n    ret";
+    assert_eq!(run(text), text);
 }
