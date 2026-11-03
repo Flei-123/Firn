@@ -26,7 +26,7 @@ mkfifo "$W/run/in.fifo"
 (cd "$W/run" && setsid nohup "$W/firnmc-server" nogui --protocol "$PROTO" < in.fifo > out.log 2>&1 & echo $! > "$W/pid")
 for _ in $(seq 1 100); do grep -q 'Done (' "$W/run/out.log" 2>/dev/null && break; sleep 0.1; done
 grep -q 'Done (' "$W/run/out.log" || { echo "  FAIL  server start"; tail -n 5 "$W/run/out.log"; exit 1; }
-BOT=tools/mc/wgen/portal_bot.cjs
+BOT=tools/mc/wgen/portal_bot.cjs; [ "$PROTO" = 777 ] && BOT=tools/mc/wgen/portal_bot777.cjs
 node "$BOT" 127.0.0.1 "$PORT" > "$W/bot.json" 2>"$W/bot.err"
 node -e '
 const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
