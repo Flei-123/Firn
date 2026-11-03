@@ -6602,11 +6602,17 @@ fn emit_block(
                 // checked calculations) and changes nothing but its target
                 // (no writing, no call).
                 if let Some(tb) = f.blocks.iter().find(|x| x.id == *t) {
-                    let schlicht = tb.insts.len() <= 4
+                    let costly = tb
+                        .insts
+                        .iter()
+                        .filter(|i| !matches!(i.op, Op::GlobalAddr { .. } | Op::Const(_)))
+                        .count();
+                    let plain = costly <= 4
                         && tb.insts[..tb.insts.len().saturating_sub(1)].iter().all(|i| {
                             matches!(
                                 i.op,
-                                Op::Bin(..)
+                                Op::GlobalAddr { .. }
+                                    | Op::Bin(..)
                                     | Op::Un(..)
                                     | Op::Cast { .. }
                                     | Op::Copy { .. }
@@ -6615,7 +6621,7 @@ fn emit_block(
                                     | Op::Load { .. }
                             )
                         });
-                    if schlicht
+                    if plain
                         && tb.id != b.id
                         && cmp_br_mergeable(ra, tb)
                         && std::env::var_os("FIRN_NO_ROTATE").is_none()
