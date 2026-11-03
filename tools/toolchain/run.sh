@@ -59,7 +59,13 @@ expect "upgrade reports stale project pins" "$F" upgrade; has "stale project lis
 
 expect "publish 0.1.3" publish 0.1.3
 cp "$PUB/stable/manifest.json" "$D/good.json"
-python3 -I -c "import json; p='$PUB/stable/manifest.json'; t=open(p).read(); m=json.loads(t); h=m['platforms']['linux-x86_64']['sha256']; open(p,'w').write(t.replace(h, ('0' if h[0]!='0' else '1')+h[1:]))"
+python3 -I - "$PUB/stable/manifest.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+t = open(p).read()
+h = json.loads(t)["platforms"]["linux-x86_64"]["sha256"]
+open(p, "w").write(t.replace(h, ("0" if h[0] != "0" else "1") + h[1:]))
+PY
 expect_fail "upgrade with a wrong hash fails" "$F" upgrade; has "hash error named" "SHA-256 mismatch"
 [ "$(current)" = 0.1.2 ] && ok "current stays 0.1.2 after bad hash" || bad "current stays 0.1.2 after bad hash"
 [ ! -e "$FIRN_HOME/versions/0.1.3" ] && [ -z "$(ls -A "$FIRN_HOME/versions" | grep stage)" ] && ok "nothing left of the bad download" || bad "nothing left of the bad download"
