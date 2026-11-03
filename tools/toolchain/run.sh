@@ -26,6 +26,7 @@ printf 'commit=%s\nresult=green\n' "$(git rev-parse HEAD)" > "$D/stamp"
 F=$FIRN_HOME/bin/firn
 FC=$FIRN_HOME/bin/firnc
 
+expect "tcbrand.fi matches brand.toml" bash tools/brand.sh --check-fi
 expect "publish 0.1.1" publish 0.1.1
 expect_fail "stable without green stamp is refused" bash tools/release/publish.sh --out "$PUB" --channel stable --firnc "$FIRNC" --lib-dirs std --version 0.1.9
 expect_fail "publishing an older version is refused" publish 0.1.0

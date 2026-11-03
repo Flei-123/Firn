@@ -3,7 +3,11 @@
 set -eu
 URL=${1:?usage: install.sh CHANNEL-URL [stable|nightly]}
 CHANNEL=${2:-stable}
-FIRN_HOME=${FIRN_HOME:-$HOME/.firn}
+CLI=firn
+COMPILER=firnc
+HOME_ENV=FIRN_HOME
+HOME_DIR=.firn
+eval "BASE=\${$HOME_ENV:-\$HOME/$HOME_DIR}"
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) PLAT=linux-x86_64 ;;
     Linux-aarch64|Linux-arm64) PLAT=linux-aarch64 ;;
@@ -26,16 +30,16 @@ get "$URL/$CHANNEL/$FILE" "$T/$FILE"
 echo "$SHA  $T/$FILE" | sha256sum -c - >/dev/null || { echo "SHA-256 mismatch for $FILE" >&2; exit 1; }
 mkdir -p "$T/x"
 tar -xzf "$T/$FILE" -C "$T/x"
-TOOL=$(echo "$T"/x/*/bin/firn)
-mkdir -p "$FIRN_HOME/bin"
-echo "$PLAT" > "$FIRN_HOME/platform"
-export FIRN_HOME
+TOOL=$(echo "$T"/x/*/bin/$CLI)
+mkdir -p "$BASE/bin"
+echo "$PLAT" > "$BASE/platform"
+export "$HOME_ENV=$BASE"
 "$TOOL" channel "$URL" "$CHANNEL"
 "$TOOL" install --channel "$CHANNEL"
-ln -sfn ../current/bin/firn "$FIRN_HOME/bin/firn"
-ln -sfn ../current/bin/firn "$FIRN_HOME/bin/firnc"
+ln -sfn ../current/bin/$CLI "$BASE/bin/$CLI"
+ln -sfn ../current/bin/$CLI "$BASE/bin/$COMPILER"
 case ":$PATH:" in
-    *":$FIRN_HOME/bin:"*) ;;
-    *) echo "add to your shell profile: export PATH=\"$FIRN_HOME/bin:\$PATH\"" ;;
+    *":$BASE/bin:"*) ;;
+    *) echo "add to your shell profile: export PATH=\"$BASE/bin:\$PATH\"" ;;
 esac
-echo "firn installed in $FIRN_HOME"
+echo "$CLI installed in $BASE"

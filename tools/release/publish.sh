@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
+. "$ROOT/tools/brand.sh"
 OUT=/root/firn-publish/channels
 CHANNEL=nightly
 VERSION=
@@ -38,7 +39,7 @@ if [ "$CHANNEL" = stable ]; then
 fi
 if [ -z "$FIRNC" ]; then
     /root/jarvis/bin/heavy cargo build --release --manifest-path compiler/Cargo.toml >&2
-    FIRNC=$ROOT/compiler/target/release/firnc
+    FIRNC=$ROOT/compiler/target/release/$BRAND_COMPILER
 fi
 [ -x "$FIRNC" ] || { echo "no firnc at $FIRNC" >&2; exit 1; }
 DEST=$OUT/$CHANNEL
@@ -54,17 +55,17 @@ if [ -n "$LIB_DIRS" ]; then
 else
     git archive "$COMMIT" lib | tar -x -C "$W"
 fi
-FIRN_TOOL=$W/firn-tool
-FIRNLIB=$ROOT/lib "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
+FIRN_TOOL=$W/$BRAND_CLI-tool
+env "$BRAND_SYSROOT_ENV=$ROOT/lib" "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
 ENTRIES=()
 pack() {
     local plat=$1 bin=$2 ext=$3 tool=$4
-    local name=firn-$VERSION-$plat
+    local name=$BRAND_CLI-$VERSION-$plat
     local top=$W/stage-$plat/$name
     mkdir -p "$top/bin"
     cp -a "$W/lib" "$top/lib"
-    cp "$bin" "$top/bin/firnc$ext"
-    [ -n "$tool" ] && cp "$tool" "$top/bin/firn$ext"
+    cp "$bin" "$top/bin/$BRAND_COMPILER$ext"
+    [ -n "$tool" ] && cp "$tool" "$top/bin/$BRAND_CLI$ext"
     echo "$VERSION" > "$top/VERSION"
     echo "$plat" > "$top/PLATFORM"
     echo "$COMMIT" > "$top/COMMIT"
@@ -85,4 +86,4 @@ for plat in "${!EXTRA_FIRNC[@]}"; do
     pack "$plat" "${EXTRA_FIRNC[$plat]}" "$ext" ""
 done
 python3 -I "$ROOT/tools/release/manifest.py" write "$DEST" "$CHANNEL" "$VERSION" "$MIN_VERSION" "$COMMIT" "${ENTRIES[@]}"
-echo "published firn $VERSION to $DEST"
+echo "published $BRAND_CLI $VERSION to $DEST"

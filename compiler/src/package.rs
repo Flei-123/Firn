@@ -38,7 +38,15 @@
 //! open.
 
 /// File name of the manifest. Stands exclusively here.
-pub const MANIFEST: &str = "firn.package";
+pub const MANIFEST: &str = crate::brand::PACKAGE_FILE;
+
+pub fn manifest_name(dir: &str) -> String {
+    crate::brand_compat::existing_name(dir, MANIFEST, crate::brand::LEGACY_PACKAGE_FILE)
+}
+
+pub fn manifest_path(dir: &str) -> String {
+    join(dir, &manifest_name(dir))
+}
 
 /// How many directory levels the upward search covers at most.
 pub const SUCHTIEFE: usize = 64;

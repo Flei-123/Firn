@@ -458,7 +458,7 @@ fn c_scalar(n: &str) -> Option<&'static str> {
         "bool" => "bool",
         "f32" => "float",
         "f64" => "double",
-        "v128" => "firn_v128",
+        "v128" => crate::brand::C_V128_TYPE,
         _ => return None,
     })
 }
@@ -543,8 +543,10 @@ pub fn header_text(guard: &str) -> String {
         emit_struct(&n, &mut done, &mut structs);
     }
     format!(
-        "/* C header written by the Firn compiler with --header; regenerate it, never edit it. */\n#ifndef {g}\n#define {g}\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\ntypedef float firn_v128 __attribute__((vector_size(16)));\n\n{s}{p}\n#ifdef __cplusplus\n}}\n#endif\n\n#endif /* {g} */\n",
+        "/* C header written by the {lang} compiler with --header; regenerate it, never edit it. */\n#ifndef {g}\n#define {g}\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\ntypedef float {v128} __attribute__((vector_size(16)));\n\n{s}{p}\n#ifdef __cplusplus\n}}\n#endif\n\n#endif /* {g} */\n",
         g = guard,
+        lang = crate::brand::LANG_NAME,
+        v128 = crate::brand::C_V128_TYPE,
         s = structs,
         p = protos
     )
