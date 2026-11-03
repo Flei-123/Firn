@@ -3,7 +3,7 @@
 ## Layout
 ```
 ~/.firn  (Windows: %LOCALAPPDATA%\firn, FIRN_HOME overrides)
-  versions/<X.Y.Z>/{bin/firnc, bin/firn, lib/, src/firnc1.fi, VERSION, PLATFORM, COMMIT, .ready}
+  versions/<X.Y.Z>/{bin/firnc, bin/firn, lib/, src/ (bin/*.fi: firnc1.fi + links into lib/firnc1), VERSION, PLATFORM, COMMIT, .ready}
   current -> versions/<X.Y.Z>     (Windows: current.txt)
   bin/firn, bin/firnc             shims (symlinks to current/bin/firn; argv[0] "firnc" = proxy)
   config                          url=, channel=, pin=, floor=, previous=
