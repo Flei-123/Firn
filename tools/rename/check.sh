@@ -25,5 +25,9 @@ git add -A && git commit -q -m "rename" || bad "commit"
 $R --from "$NEW" --to "$OLD" --apply > "$D/back.txt" && ok "apply back" || bad "apply back"
 git add -A
 [ -z "$(git diff --cached --stat HEAD~1)" ] && ok "round trip is exact" || { bad "round trip is exact"; git diff --cached --stat HEAD~1 | tail -5; }
+git reset -q --hard HEAD~1
+$R --from "$OLD" --to "$NEW" --apply --keep-aliases > "$D/alias.txt" && ok "apply with aliases" || bad "apply with aliases"
+grep -q "^env_prefix = \"$BRAND_ENV_PREFIX\"" brand.toml && ok "legacy section written" || bad "legacy section written"
+bash tools/brand.sh --check-fi && ok "tcbrand.fi regenerated" || bad "tcbrand.fi regenerated"
 echo "passed $PASS failed $FAIL"
 [ "$FAIL" = 0 ]
