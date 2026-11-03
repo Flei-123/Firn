@@ -61,6 +61,7 @@ mod gc;
 mod gc_names;
 mod ifexpr;
 mod gc_lower;
+mod gc_ext;
 mod iface;
 mod impls;
 mod core;
@@ -129,6 +130,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod superopt;
 mod rotate;
 mod rotl;
 mod truncmask;
@@ -340,6 +342,8 @@ fn usage() -> String {
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
+         --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
+         --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
@@ -400,6 +404,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut env_allow: Vec<String> = Vec::new();
     let mut env_log = false;
     own::apply_env()?;
+    gc_ext::apply_env()?;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -434,6 +439,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--list-attrs" => {
                 print!("{}", attrs::attrs_text());
                 std::process::exit(0);
+            }
+            "--gc-cards" => gc_ext::set_cards(true),
+            _ if a.starts_with("--gc-runtime=") => {
+                let v = &a["--gc-runtime=".len()..];
+                match gc_ext::parse(v) {
+                    Some(p) => gc_ext::set_profile(p),
+                    None => return Err(format!("unknown gc runtime '{}' (allowed: {})", v, gc_ext::ALLOWED)),
+                }
             }
             _ if a.starts_with("--profile-") && pgo::parse_arg(a).is_some() => {
                 if let Some(Err(e)) = pgo::parse_arg(a) {
