@@ -66,6 +66,8 @@ pack() {
     cp -a "$W/lib" "$top/lib"
     cp "$bin" "$top/bin/firnc$ext"
     [ -n "$tool" ] && cp "$tool" "$top/bin/firn$ext"
+    mkdir -p "$top/src"
+    git show "$COMMIT:bin/firnc1.fi" > "$top/src/firnc1.fi"
     echo "$VERSION" > "$top/VERSION"
     echo "$plat" > "$top/PLATFORM"
     echo "$COMMIT" > "$top/COMMIT"

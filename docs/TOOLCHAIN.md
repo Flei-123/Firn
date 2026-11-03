@@ -3,7 +3,7 @@
 ## Layout
 ```
 ~/.firn  (Windows: %LOCALAPPDATA%\firn, FIRN_HOME overrides)
-  versions/<X.Y.Z>/{bin/firnc, bin/firn, lib/, VERSION, PLATFORM, COMMIT, .ready}
+  versions/<X.Y.Z>/{bin/firnc, bin/firn, lib/, src/firnc1.fi, VERSION, PLATFORM, COMMIT, .ready}
   current -> versions/<X.Y.Z>     (Windows: current.txt)
   bin/firn, bin/firnc             shims (symlinks to current/bin/firn; argv[0] "firnc" = proxy)
   config                          url=, channel=, pin=, floor=, previous=
@@ -50,7 +50,7 @@ Inventory 03.11.2026:
 
 Fork `/root/firnc-gc` vs main: no source file only in the fork; Windows target, integrated assembler, `regalloc_a64`, inliner, ownership are on main
 (docs/CERTUS-COMPILER-MERGE.md). Fork-only: GC runtime rounds after the freeze (card verifier `gccards.fi` + `--gc-cards`, perm realm
-`gc_perm_seal` (no Certus caller), `block_of` fast/slow split, 2 MiB chunk arena with `MADV_HUGEPAGE`, step hook, `gcpar.fi`), Windows seam
+`gc_perm_seal`/`gc_perm_diag` (Certus `lib/js/gcperm.fi`, opt-in mode), `block_of` fast/slow split, 2 MiB chunk arena with `MADV_HUGEPAGE`, step hook, `gcpar.fi`), Windows seam
 0024 (poll over 256 sockets, F_GETFL) and 0025 (thread CPU clock); German census names (`tools/certus/gc_api_rename.sh`).
 
 Steps:
