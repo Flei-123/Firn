@@ -27,11 +27,13 @@ public class WgBlockFlags {
         List<String> up = new ArrayList<>();
         List<String> down = new ArrayList<>();
         List<String> side = new ArrayList<>();
+        List<String> repl = new ArrayList<>();
         for (Block b : BuiltInRegistries.BLOCK) {
             String name = BuiltInRegistries.BLOCK.getKey(b).getPath();
             BlockState s = b.defaultBlockState();
             all.add(name);
             if (s.isSolid()) solid.add(name);
+            if (s.canBeReplaced()) repl.add(name);
             if (s.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.UP)) up.add(name);
             if (s.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, Direction.DOWN)) down.add(name);
             boolean sides = true;
@@ -43,13 +45,15 @@ public class WgBlockFlags {
         java.util.Collections.sort(up);
         java.util.Collections.sort(down);
         java.util.Collections.sort(side);
+        java.util.Collections.sort(repl);
         try (PrintWriter out = new PrintWriter(args[0])) {
             out.println("{");
             emit(out, "all", all, false);
             emit(out, "solid", solid, false);
             emit(out, "sturdy_up", up, false);
             emit(out, "sturdy_down", down, false);
-            emit(out, "sturdy_side", side, true);
+            emit(out, "sturdy_side", side, false);
+            emit(out, "replaceable", repl, true);
             out.println("}");
         }
     }
