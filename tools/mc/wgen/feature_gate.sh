@@ -46,6 +46,7 @@ LUSH_DEFAULT="3:-6:-32 3:-48:24 3:-28:46 3:-22:42 3:-10:-16 3:-90:12 3:-90:14 3:
 if [ -z "${FEAT_SKIP_LUSH:-}" ]; then
     run_dim overworld ${FEAT_LUSH:-$LUSH_DEFAULT}
 fi
-run_dim nether ${FEAT_NETHER:-7:0:0 7:3:-2 12:-5:4 7:10:10 7:-64:-64 7:-60:-64 12:-64:-40 12:-64:-60}
+NETHER_DEFAULT="7:0:0 7:3:-2 12:-5:4 7:10:10 7:-64:-64 7:-60:-64 12:-64:-40 12:-64:-60 7:-64:-16 7:-44:-4 7:-28:0 7:-56:-12 7:-52:-8 7:36:0 7:-44:4 7:28:0 7:4:-4 7:8:4 7:16:8 7:-56:-56 7:-4:-32 7:-4:36 7:60:-64 7:40:36 7:52:32 7:8:-56 7:-56:4 7:40:-64 7:64:-44 7:4:0 7:-8:52"
+run_dim nether ${FEAT_NETHER:-$NETHER_DEFAULT}
 [ $ERR = 0 ] && echo "mc/wgen features: all ok" || echo "mc/wgen features: FAILED"
 exit $ERR
