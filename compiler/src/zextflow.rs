@@ -157,10 +157,70 @@ fn classify(line: &str) -> Option<Item<'_>> {
     if t.ends_with(':') && !t.contains(' ') {
         return Some(Item::Label(&t[..t.len() - 1]));
     }
-    if t.contains(".L") && !t.starts_with('j') {
+    if t.contains(".L") && !t.starts_with('j') && !only_static_refs(t) {
         return None;
     }
     Some(Item::Instr(t))
+}
+
+fn only_static_refs(t: &str) -> bool {
+    t.match_indices(".L").all(|(i, _)| t[i + 2..].starts_with("static_"))
+}
+
+fn dest_mask(line: &str) -> u16 {
+    let t = line.trim();
+    let (m, rest) = match t.split_once(' ') {
+        Some(x) => x,
+        None => return 0,
+    };
+    if NO_EFFECT.contains(&m) {
+        return 0;
+    }
+    match parse_reg(split_ops(rest).first().copied().unwrap_or("")) {
+        Some((i, _)) => 1 << i,
+        None => 0,
+    }
+}
+
+fn byte_zext_dest(line: &str) -> u16 {
+    let rest = match line.trim().strip_prefix("movzx ") {
+        Some(r) => r,
+        None => return 0,
+    };
+    let (d, src) = match rest.split_once(", ") {
+        Some(x) => x,
+        None => return 0,
+    };
+    let byte_src = src.starts_with("byte ptr ") || matches!(parse_reg(src), Some((_, 3)));
+    match parse_reg(d) {
+        Some((i, w)) if byte_src && w <= 1 => 1 << i,
+        _ => 0,
+    }
+}
+
+fn step2(state: u32, line: &str) -> u32 {
+    let lo = step(state as u16, line);
+    let hi = ((state >> 16) as u16 & step(ALL, line) & !dest_mask(line)) | byte_zext_dest(line);
+    lo as u32 | (hi as u32) << 16
+}
+
+fn same_reg_zext8(line: &str) -> Option<usize> {
+    let rest = line.trim().strip_prefix("movzx ")?;
+    let (d, s) = rest.split_once(", ")?;
+    match (parse_reg(d), parse_reg(s)) {
+        (Some((i, 1)), Some((j, 3))) if i == j && !matches!(s, "ah" | "ch" | "dh" | "bh") => Some(i),
+        _ => None,
+    }
+}
+
+fn droppable(line: &str, state: u32) -> bool {
+    if let Some(r) = same_reg32(line) {
+        return state & (1 << r) != 0;
+    }
+    if let Some(r) = same_reg_zext8(line) {
+        return std::env::var_os("FIRN_NO_ZEXT8").is_none() && state & (1 << (16 + r)) != 0;
+    }
+    false
 }
 
 fn same_reg32(line: &str) -> Option<usize> {
@@ -186,7 +246,7 @@ pub fn run(asm: &str) -> String {
     for l in &lines {
         match classify(l) {
             Some(it) => {
-                if same_reg32(l).is_some() {
+                if same_reg32(l).is_some() || same_reg_zext8(l).is_some() {
                     any_candidate = true;
                 }
                 items.push(it);
@@ -197,23 +257,23 @@ pub fn run(asm: &str) -> String {
     if !any_candidate {
         return asm.to_string();
     }
-    let mut label_state: HashMap<&str, u16> = HashMap::new();
+    let mut label_state: HashMap<&str, u32> = HashMap::new();
     for it in &items {
         if let Item::Label(l) = it {
-            label_state.insert(*l, ALL);
+            label_state.insert(*l, u32::MAX);
         }
     }
     let mut converged = false;
     for _ in 0..64 {
-        let mut incoming: HashMap<&str, u16> = HashMap::new();
-        let mut state: u16 = 0;
+        let mut incoming: HashMap<&str, u32> = HashMap::new();
+        let mut state: u32 = 0;
         let mut reachable = true;
         for it in &items {
             match it {
                 Item::Skip => {}
                 Item::Label(l) => {
                     if reachable {
-                        let e = incoming.entry(*l).or_insert(ALL);
+                        let e = incoming.entry(*l).or_insert(u32::MAX);
                         *e &= state;
                     }
                     state = label_state.get(l).copied().unwrap_or(0);
@@ -228,7 +288,7 @@ pub fn run(asm: &str) -> String {
                         match target {
                             Some(name) => {
                                 if let Some((k, _)) = label_state.get_key_value(name.as_str()) {
-                                    let e = incoming.entry(*k).or_insert(ALL);
+                                    let e = incoming.entry(*k).or_insert(u32::MAX);
                                     *e &= state;
                                 }
                             }
@@ -243,11 +303,11 @@ pub fn run(asm: &str) -> String {
                         reachable = false;
                         continue;
                     }
-                    state = step(state, t);
+                    state = step2(state, t);
                 }
             }
         }
-        let mut next: HashMap<&str, u16> = HashMap::new();
+        let mut next: HashMap<&str, u32> = HashMap::new();
         for k in label_state.keys() {
             next.insert(*k, incoming.get(k).copied().unwrap_or(0));
         }
@@ -261,7 +321,7 @@ pub fn run(asm: &str) -> String {
         return asm.to_string();
     }
     let mut res = String::with_capacity(asm.len());
-    let mut state: u16 = 0;
+    let mut state: u32 = 0;
     let mut dropped = false;
     for (i, it) in items.iter().enumerate() {
         match it {
@@ -278,14 +338,11 @@ pub fn run(asm: &str) -> String {
                     if *t == "ret" || m == "jmp" {
                         state = 0;
                     }
-                } else if let Some(r) = same_reg32(lines[i]) {
-                    if state & (1 << r) != 0 {
-                        dropped = true;
-                        continue;
-                    }
-                    state = step(state, t);
+                } else if droppable(lines[i], state) {
+                    dropped = true;
+                    continue;
                 } else {
-                    state = step(state, t);
+                    state = step2(state, t);
                 }
             }
         }
