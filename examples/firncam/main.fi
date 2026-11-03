@@ -34,6 +34,7 @@ import android.ndk
 import android.activity
 import plat.android.focusplan
 import ui
+import shotq
 
 // Writes decimal `v` into dst (zero terminated), returns the length.
 fn put_int(dst: u64, v: i64) -> usize {
@@ -244,8 +245,8 @@ struct App {
     sptr: u64,
     sn: usize,
     preset: i32,
-    pjob: camjob.Job,
-    psaved: i32,
+    q: shotq.Queue,
+    qslot: i32,
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -601,15 +602,20 @@ fn start_job(a: *mut App) {
     while n > 1 && (n as usize) * fb > BUDGET { n = n - 1 }
     if (*a).mode == M_STACK && n < 2 { set_status(a, "NO FOCUS RANGE"); return }
     if n > 16 { n = 16 }
+    let qs: i32 = shotq.reserve(&(*a).q)
+    if qs < 0 { set_status(a, "SAVING - WAIT"); return }
     let cap: usize = fb * (n as usize)
     let buf: u64 = camera.camera_alloc(cap)
     let fra: u64 = camera.camera_alloc(camera.sizeof_frame() * 16)
     if buf == 0 || fra == 0 {
         if buf != 0 { camera.camera_free(buf, cap) }
         if fra != 0 { camera.camera_free(fra, camera.sizeof_frame() * 16) }
+        shotq.release(shotq.slot_at(&(*a).q, qs))
         set_status(a, "NO MEMORY")
         return
     }
+    let started: bool = shotq.start_thread(&(*a).q)
+    (*a).qslot = qs
     camjob.job_free(&(*a).job)
     (*a).job = camjob.job_new()
     if (*a).fl_last > 0 { let f0: i32 = camera.camera_set_flash(camera.FLASH_OFF); (*a).fl_last = camera.FLASH_OFF } // a series never fires the flash
@@ -666,57 +672,100 @@ fn work_shot(a: *mut App) {
     if worker_aborted(a) { (*a).wstat = WS_ABORTED; return }
     if (*a).cap_i < 1 { (*a).wstat = WS_CAPTURE_FAILED; return }
     fill_job(a)
-    (*a).stage = 2
-    (*a).psaved = 0
-    if (*a).mode == M_PHOTO && (*a).preset != campreset.FAST && (*a).cap_i > 1 { run_preview(a) }
-    camjob.job_entry((&(*a).job) as u64)
-    if !(*a).job.ok { (*a).wstat = WS_PROCESS_FAILED; return }
-    if worker_aborted(a) { (*a).wstat = WS_ABORTED; return }
+    hand_to_queue(a)
     (*a).wtxt = 0
     (*a).shots = (*a).shots + 1
 }
 
-fn run_preview(a: *mut App) {
-    camjob.job_free(&(*a).pjob)
-    (*a).pjob = (*a).job
-    (*a).pjob.out = 0
-    (*a).pjob.out_n = 0
-    (*a).pjob.out_cap = 0
-    (*a).pjob.pdf = rt.buf_new()
-    (*a).pjob.have_pdf = false
-    (*a).pjob.n = 1
-    campreset.apply_preview(&(*a).pjob)
-    camjob.run_job(&(*a).pjob)
-    log_stages("preview")
-    if (*a).pjob.ok { (*a).stage = 3 }
+fn hand_to_queue(a: *mut App) {
+    let s: *mut shotq.Slot = shotq.slot_at(&(*a).q, (*a).qslot)
+    camjob.job_free(&(*s).job)
+    (*s).job = (*a).job
+    (*a).job = camjob.job_new()
+    (*s).preview = (*a).mode == M_PHOTO && (*a).preset != campreset.FAST && (*a).cap_i > 1
+    (*s).cbuf = (*a).cbuf
+    (*s).ccap = (*a).ccap
+    (*s).fbuf = (*a).fbuf
+    (*s).fcap = camera.sizeof_frame() * 16
+    (*a).cbuf = 0
+    (*a).fbuf = 0
+    (*a).qslot = 0 - 1
+    shotq.set_state(s, shotq.S_QUEUED)
+    if (*a).q.tid == 0 { shotq.run_slot(s) }
 }
 
-fn save_preview(a: *mut App) {
+// UI side: the JNI part of a queued shot -- the quick preview first, later the final picture over it
+fn save_slot_preview(a: *mut App, s: *mut shotq.Slot) {
     var name: [u8; 48] = [0 as u8; 48]
     name_into((&name[0]) as u64, "IMG_", ".jpg")
     let mime: str = "image/jpeg\0"
-    (*a).psaved = camera.camera_save((*a).pjob.out, (*a).pjob.out_n, (&name[0]) as u64, mime.p as u64)
-    camjob.job_free(&(*a).pjob)
-    (*a).wseen = 3
+    (*s).psaved = camera.camera_save((*s).pjob.out, (*s).pjob.out_n, (&name[0]) as u64, mime.p as u64)
+    if (*s).psaved == 1 { (*s).uri = camera.camera_take_last_uri() }
+    if (*s).psaved == 1 || (*s).psaved == 2 { commit_thumb(a) }
+    camjob.job_free(&(*s).pjob)
+    (*s).pjob = camjob.job_new()
+    log_stages("preview", &(*s).pstages)
+    set_status(a, "PREVIEW SAVED - REFINING")
 }
 
-// UI side: the JNI part of a burst result
-fn save_job_result(a: *mut App) {
+fn save_slot_final(a: *mut App, s: *mut shotq.Slot) -> i32 {
     var name: [u8; 48] = [0 as u8; 48]
     name_into((&name[0]) as u64, "IMG_", ".jpg")
     let mime: str = "image/jpeg\0"
-    if (*a).psaved == 1 && camera.camera_replace_last((*a).job.out, (*a).job.out_n) {
-        (*a).wsave = 1
+    var r: i32 = 0
+    if (*s).uri != 0 && camera.camera_replace_uri((*s).uri, (*s).job.out, (*s).job.out_n) {
+        r = 1
     } else {
-        (*a).wsave = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
+        r = camera.camera_save((*s).job.out, (*s).job.out_n, (&name[0]) as u64, mime.p as u64)
     }
-    (*a).psaved = 0
-    if (*a).job.have_pdf {
+    if (*s).job.have_pdf {
         var pn: [u8; 48] = [0 as u8; 48]
         name_into((&pn[0]) as u64, "SCAN_", ".pdf")
         let pm: str = "application/pdf\0"
-        camera.camera_save_doc(rt.buf_ptr(&(*a).job.pdf), rt.buf_len(&(*a).job.pdf), (&pn[0]) as u64, pm.p as u64)
+        camera.camera_save_doc(rt.buf_ptr(&(*s).job.pdf), rt.buf_len(&(*s).job.pdf), (&pn[0]) as u64, pm.p as u64)
     }
+    return r
+}
+
+fn finish_slot(a: *mut App, s: *mut shotq.Slot) {
+    log_stages("final", &(*s).stages)
+    if shotq.state(s) == shotq.S_DONE {
+        report(a, save_slot_final(a, s), "SAVED", "SAVED PRIVATE")
+    } else if (*s).psaved == 1 || (*s).psaved == 2 {
+        set_status(a, "KEPT PREVIEW")
+    } else {
+        set_status(a, "PROCESSING FAILED")
+    }
+    camera.camera_drop_uri((*s).uri)
+    (*s).uri = 0
+    if (*s).cbuf != 0 { camera.camera_free((*s).cbuf, (*s).ccap) }
+    if (*s).fbuf != 0 { camera.camera_free((*s).fbuf, (*s).fcap) }
+    shotq.release(s)
+}
+
+// UI side, once per turn: save what the processing thread finished
+fn queue_tick(a: *mut App) {
+    var i: i32 = 0
+    while i < shotq.SLOTS {
+        let s: *mut shotq.Slot = shotq.slot_at(&(*a).q, i)
+        if shotq.take_preview(s) { save_slot_preview(a, s) }
+        i = i + 1
+    }
+    let k: i32 = shotq.oldest_finished(&(*a).q)
+    if k >= 0 { finish_slot(a, shotq.slot_at(&(*a).q, k)) }
+}
+
+// leaving the app: the running job may finish (bounded wait); otherwise its saved preview stays the picture
+fn queue_drain(a: *mut App, max_ms: i32) -> bool {
+    var waited: i32 = 0
+    while waited < max_ms {
+        queue_tick(a)
+        if shotq.idle(&(*a).q) && shotq.pending(&(*a).q) == 0 { break }
+        usleep(20000 as u32)
+        waited = waited + 20
+    }
+    shotq.request_stop(&(*a).q)
+    return shotq.idle(&(*a).q)
 }
 
 // the job description from the captured frames (worker thread)
@@ -817,17 +866,17 @@ fn worker_stop(a: *mut App) {
     }
 }
 
-fn log_stages(tag_text: str) {
+fn log_stages(tag_text: str, sn: *mut stagelog.Snap) {
     var i: i32 = 0
     let tag: str = "FIRNCAM_T\0"
-    while i < stagelog.count() {
+    while i < (*sn).n {
         var b: [u8; 96] = [0 as u8; 96]
         let p: u64 = (&b[0]) as u64
         var n: usize = put_str(p, tag_text)
         n = n + put_str(p + n as u64, " stage=")
-        n = n + copy_name(p + n as u64, stagelog.name_p(i), stagelog.name_n(i))
+        n = n + copy_name(p + n as u64, (*sn).p[i as usize], (*sn).len[i as usize])
         n = n + put_str(p + n as u64, " ms=")
-        n = n + put_int(p + n as u64, stagelog.ms_at(i))
+        n = n + put_int(p + n as u64, (((*sn).ns[i as usize] + 500000) / 1000000) as i64)
         let r: i32 = log_write(4, tag.p as u64, p)
         i = i + 1
     }
@@ -835,7 +884,7 @@ fn log_stages(tag_text: str) {
     let p2: u64 = (&b2[0]) as u64
     var n2: usize = put_str(p2, tag_text)
     n2 = n2 + put_str(p2 + n2 as u64, " total ms=")
-    n2 = n2 + put_int(p2 + n2 as u64, stagelog.total_ms())
+    n2 = n2 + put_int(p2 + n2 as u64, (((*sn).total_ns + 500000) / 1000000) as i64)
     let r2: i32 = log_write(4, tag.p as u64, p2)
 }
 
@@ -872,10 +921,10 @@ fn finish_shot(a: *mut App) {
             (*a).sdbuf = 0
             (*a).sbuf = 0
         }
-    } else if st == WS_OK {
-        save_job_result(a)
     }
-    if st == WS_OK {
+    if st == WS_OK && op == W_SHOT {
+        set_status(a, "PROCESSING")
+    } else if st == WS_OK {
         if (*a).wtxt == 2 {
             report(a, (*a).wsave, "SAVED DNG", "SAVED DNG PRIVATE")
         } else if (*a).wtxt == 1 {
@@ -895,9 +944,13 @@ fn finish_shot(a: *mut App) {
         set_status(a, "YUV NOT SAVED")
     }
     if op == W_SHOT {
-        camjob.job_free(&(*a).pjob)
         camjob.job_free(&(*a).job)
+        (*a).job = camjob.job_new()
         release_capture(a)
+        if (*a).qslot >= 0 {
+            shotq.release(shotq.slot_at(&(*a).q, (*a).qslot))
+            (*a).qslot = 0 - 1
+        }
     }
     (*a).stage = 0
     (*a).busy = false
@@ -906,18 +959,13 @@ fn finish_shot(a: *mut App) {
 
 // UI side, once per turn: follow the running operation and finish it when the worker is done
 fn worker_tick(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
+    queue_tick(a)
     if (*a).wop == W_NONE { return }
     if !worker_idle(a) {
-        if (*a).wop == W_SHOT && (*a).stage != (*a).wseen {
-            (*a).wseen = (*a).stage
-            if (*a).stage == 2 { set_status(a, "PROCESSING") }
-            if (*a).stage == 3 { save_preview(a); set_status(a, "PREVIEW SAVED - REFINING") }
-        }
         return
     }
     let op: i32 = (*a).wop
     log_work(op, (*a).wstat, now - (*a).wt0)
-    if op == W_SHOT { log_stages("final") }
     if op == W_OPEN {
         mark(a, P_OPEN)
         finish_open(a, u, cv, now)
@@ -1732,8 +1780,12 @@ fn sync_ui(a: *mut App, u: *mut ui.Ui) {
     (*u).can_flip = (*a).can_flip
     (*u).busy = (*a).busy
     (*u).recording = (*a).recording
+    (*u).bg_jobs = shotq.pending(&(*a).q)
     if (*a).busy && (*a).wop == W_SHOT {
         (*u).progress = camjob.job_progress(&(*a).job) as i32
+    } else if (*u).bg_jobs > 0 {
+        (*u).progress = shotq.running_progress(&(*a).q)
+        if (*u).progress < 0 { (*u).progress = 0 }
     } else {
         (*u).progress = 0
     }
@@ -2029,7 +2081,7 @@ fn main() -> i32 {
         sw_t0: 0, sw_c0: 0, sw_ci: 0, sw_same: 10, sw_diff: 0, sw_guard: 0, cache_hit: false, dbuf: 0, dn: 0, dstage: 0, didx: 0,
         wop: 0, wdone: 0, wabort: 0, warg: 0, wstat: 0, wsave: 0 - 1, wtxt: 0, wres: 0, wseen: 0, wt0: 0, o_keep: 0.0f, o_first: false,
         defer_lens: 0 - 1, lost_at: 0, vok: false, wname: [0 as u8; 48], pexp: 0, piso: 0, pfoc: 0.0f, phave_e: false, phave_f: false,
-        pflash: false, sbuf: 0, scap: 0, sdbuf: 0, sdcap: 0, sptr: 0, sn: 0, preset: campreset.ULTRA, pjob: camjob.job_new(), psaved: 0,
+        pflash: false, sbuf: 0, scap: 0, sdbuf: 0, sdcap: 0, sptr: 0, sn: 0, preset: campreset.ULTRA, q: shotq.queue_new(), qslot: 0 - 1,
         chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, learn_x10: 0, learn_lens: 0 - 1, swept: false, sw_n: 0, sw_z: [0; 16], sw_f: [0; 16], sw_cw: [0; 16], sw_ph: [[0 as u8; 16]; 16], ph1: [0 as u8; 16], can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
@@ -2219,9 +2271,10 @@ fn main() -> i32 {
         }
     }
     worker_stop(&a)
+    let drained: bool = queue_drain(&a, 20000)
     if a.recording { let okv: bool = camera.camera_video_stop() }
     camera.camera_close()
-    par.shutdown()
+    if drained { par.shutdown() }
     fuishell.shell_close(&s)
     return 0
 }
