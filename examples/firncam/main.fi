@@ -23,6 +23,8 @@ import plat.android.display
 import plat.android.dngwrite
 import photo.meta
 import photo.camjob
+import photo.campreset
+import photo.stagelog
 import photo.focus
 import photo.par
 import jobs.jobs
@@ -241,6 +243,9 @@ struct App {
     sdcap: usize,
     sptr: u64,
     sn: usize,
+    preset: i32,
+    pjob: camjob.Job,
+    psaved: i32,
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -576,7 +581,7 @@ fn set_shot_rotation(a: *mut App) {
 
 fn want_frames(a: *mut App, raw: bool, steps: *mut [f32; 16]) -> i32 {
     let m: i32 = (*a).mode
-    if m == M_PHOTO { return 4 } // RAW photos are merged at the full 16:9 window (9.4 MP float): 4 frames bound the memory
+    if m == M_PHOTO { return campreset.frames((*a).preset) }
     if m == M_NIGHT { return if raw { 10 } else { 6 } }
     if m == M_PORTRAIT { return 3 }
     if m == M_DOC { return 2 }
@@ -662,6 +667,8 @@ fn work_shot(a: *mut App) {
     if (*a).cap_i < 1 { (*a).wstat = WS_CAPTURE_FAILED; return }
     fill_job(a)
     (*a).stage = 2
+    (*a).psaved = 0
+    if (*a).mode == M_PHOTO && (*a).preset != campreset.FAST && (*a).cap_i > 1 { run_preview(a) }
     camjob.job_entry((&(*a).job) as u64)
     if !(*a).job.ok { (*a).wstat = WS_PROCESS_FAILED; return }
     if worker_aborted(a) { (*a).wstat = WS_ABORTED; return }
@@ -669,12 +676,41 @@ fn work_shot(a: *mut App) {
     (*a).shots = (*a).shots + 1
 }
 
+fn run_preview(a: *mut App) {
+    camjob.job_free(&(*a).pjob)
+    (*a).pjob = (*a).job
+    (*a).pjob.out = 0
+    (*a).pjob.out_n = 0
+    (*a).pjob.out_cap = 0
+    (*a).pjob.pdf = rt.buf_new()
+    (*a).pjob.have_pdf = false
+    (*a).pjob.n = 1
+    campreset.apply_preview(&(*a).pjob)
+    camjob.run_job(&(*a).pjob)
+    log_stages("preview")
+    if (*a).pjob.ok { (*a).stage = 3 }
+}
+
+fn save_preview(a: *mut App) {
+    var name: [u8; 48] = [0 as u8; 48]
+    name_into((&name[0]) as u64, "IMG_", ".jpg")
+    let mime: str = "image/jpeg\0"
+    (*a).psaved = camera.camera_save((*a).pjob.out, (*a).pjob.out_n, (&name[0]) as u64, mime.p as u64)
+    camjob.job_free(&(*a).pjob)
+    (*a).wseen = 3
+}
+
 // UI side: the JNI part of a burst result
 fn save_job_result(a: *mut App) {
     var name: [u8; 48] = [0 as u8; 48]
     name_into((&name[0]) as u64, "IMG_", ".jpg")
     let mime: str = "image/jpeg\0"
-    (*a).wsave = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
+    if (*a).psaved == 1 && camera.camera_replace_last((*a).job.out, (*a).job.out_n) {
+        (*a).wsave = 1
+    } else {
+        (*a).wsave = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
+    }
+    (*a).psaved = 0
     if (*a).job.have_pdf {
         var pn: [u8; 48] = [0 as u8; 48]
         name_into((&pn[0]) as u64, "SCAN_", ".pdf")
@@ -697,8 +733,9 @@ fn fill_job(a: *mut App) {
     if (*a).mode == M_PHOTO && (*a).kind == camera.KIND_RAW {
         (*a).job.aw = 16
         (*a).job.ah = 9
-        (*a).job.max_px = 9500000
+        (*a).job.max_px = campreset.max_px((*a).preset)
     }
+    if (*a).mode == M_PHOTO { campreset.apply(&(*a).job, (*a).preset) }
     if ZOOM_RAW_CROP && (*a).kind == camera.KIND_RAW && (*a).zr > 1.05f { (*a).job.zoom = (*a).zr }
     var mt: meta.SensorMeta = meta.meta_default()
     camera.camera_meta((*fptr).slot, &mt)
@@ -780,6 +817,37 @@ fn worker_stop(a: *mut App) {
     }
 }
 
+fn log_stages(tag_text: str) {
+    var i: i32 = 0
+    let tag: str = "FIRNCAM_T\0"
+    while i < stagelog.count() {
+        var b: [u8; 96] = [0 as u8; 96]
+        let p: u64 = (&b[0]) as u64
+        var n: usize = put_str(p, tag_text)
+        n = n + put_str(p + n as u64, " stage=")
+        n = n + copy_name(p + n as u64, stagelog.name_p(i), stagelog.name_n(i))
+        n = n + put_str(p + n as u64, " ms=")
+        n = n + put_int(p + n as u64, stagelog.ms_at(i))
+        let r: i32 = log_write(4, tag.p as u64, p)
+        i = i + 1
+    }
+    var b2: [u8; 64] = [0 as u8; 64]
+    let p2: u64 = (&b2[0]) as u64
+    var n2: usize = put_str(p2, tag_text)
+    n2 = n2 + put_str(p2 + n2 as u64, " total ms=")
+    n2 = n2 + put_int(p2 + n2 as u64, stagelog.total_ms())
+    let r2: i32 = log_write(4, tag.p as u64, p2)
+}
+
+fn copy_name(dst: u64, src: u64, n: usize) -> usize {
+    var k: usize = 0
+    while k < n && k < 24 {
+        *((dst + k as u64) as *mut u8) = *((src + k as u64) as *mut u8)
+        k = k + 1
+    }
+    return k
+}
+
 fn log_work(op: i32, stat: i32, ms: i64) {
     var b: [u8; 64] = [0 as u8; 64]
     let p: u64 = (&b[0]) as u64
@@ -827,6 +895,7 @@ fn finish_shot(a: *mut App) {
         set_status(a, "YUV NOT SAVED")
     }
     if op == W_SHOT {
+        camjob.job_free(&(*a).pjob)
         camjob.job_free(&(*a).job)
         release_capture(a)
     }
@@ -842,11 +911,13 @@ fn worker_tick(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
         if (*a).wop == W_SHOT && (*a).stage != (*a).wseen {
             (*a).wseen = (*a).stage
             if (*a).stage == 2 { set_status(a, "PROCESSING") }
+            if (*a).stage == 3 { save_preview(a); set_status(a, "PREVIEW SAVED - REFINING") }
         }
         return
     }
     let op: i32 = (*a).wop
     log_work(op, (*a).wstat, now - (*a).wt0)
+    if op == W_SHOT { log_stages("final") }
     if op == W_OPEN {
         mark(a, P_OPEN)
         finish_open(a, u, cv, now)
@@ -1108,6 +1179,10 @@ extern fn libc_close(fd: i32) -> i32;
 // app version and the camera (id, zoom range, focal length, RAW width, number of scan entries): another phone, another
 // camera app version or another zoom range = another key = the sweep runs again. 0 = swept, no tele switch found.
 fn cache_path(dst: u64) -> bool {
+    return app_file(dst, "/firncam-learned.txt")
+}
+
+fn app_file(dst: u64, file: str) -> bool {
     let d: u64 = activity.activity_data_path()
     if d == 0 as u64 { return false }
     var n: usize = 0
@@ -1115,9 +1190,33 @@ fn cache_path(dst: u64) -> bool {
         *((dst + n as u64) as *mut u8) = *((d + n as u64) as *mut u8)
         n = n + 1
     }
-    n = n + put_str(dst + n as u64, "/firncam-learned.txt")
+    n = n + put_str(dst + n as u64, file)
     *((dst + n as u64) as *mut u8) = 0 as u8
     return true
+}
+
+fn preset_load() -> i32 {
+    var path: [u8; 512] = [0 as u8; 512]
+    if !app_file((&path[0]) as u64, "/firncam-preset.txt") { return campreset.ULTRA }
+    let fd: i32 = libc_open((&path[0]) as u64, 0, 0 as u32)
+    if fd < 0 { return campreset.ULTRA }
+    var buf: [u8; 8] = [0 as u8; 8]
+    let rn: i64 = libc_read(fd, (&buf[0]) as u64, 4)
+    let cl: i32 = libc_close(fd)
+    if rn < 1 || buf[0] < 48 as u8 || buf[0] > 57 as u8 { return campreset.ULTRA }
+    return campreset.clamp((buf[0] as i32) - 48)
+}
+
+fn preset_store(p: i32) {
+    var path: [u8; 512] = [0 as u8; 512]
+    if !app_file((&path[0]) as u64, "/firncam-preset.txt") { return }
+    var buf: [u8; 4] = [0 as u8; 4]
+    buf[0] = (48 + p) as u8
+    buf[1] = 10 as u8
+    let fd: i32 = libc_open((&path[0]) as u64, 577, 420 as u32)
+    if fd < 0 { return }
+    let w: i64 = libc_write(fd, (&buf[0]) as u64, 2)
+    let cl: i32 = libc_close(fd)
 }
 
 fn cache_key(a: *mut App, dst: u64) -> usize {
@@ -1772,6 +1871,16 @@ fn run_cmd(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, c: *mut ui.Cmd,
             do_zoom(a, cv, sz)
             ui.ui_set_zoom(u, sz)
         }
+    } else if k == ui.C_PRESET {
+        (*a).preset = campreset.clamp((*c).a)
+        preset_store((*a).preset)
+        if (*a).preset == campreset.FAST {
+            set_status(a, "FAST")
+        } else if (*a).preset == campreset.BALANCED {
+            set_status(a, "BALANCED")
+        } else {
+            set_status(a, "ULTRA")
+        }
     } else if k == ui.C_FLIP {
         if !(*a).recording {
             flip_lens(a)
@@ -1907,7 +2016,7 @@ fn main() -> i32 {
     var s: fuishell.Shell = fuishell.shell_new()
     if !fuishell.shell_open(&s, "FirnCam", 480, 800) { return 1 }
     let f: *mut window.Window = fuishell.shell_window(&s)
-    let nthreads: u64 = par.init(3) // pool workers are raw-clone threads; the runtime keeps bionic's thread pointer
+    let nthreads: u64 = par.init(7) // pool workers are raw-clone threads; the runtime keeps bionic's thread pointer
 
     var a: App = App {
         nlens: 0, lens: 0, mode: M_PHOTO, manual: false, sl: [500, 500, 0], kind: 0, ready: false,
@@ -1920,7 +2029,7 @@ fn main() -> i32 {
         sw_t0: 0, sw_c0: 0, sw_ci: 0, sw_same: 10, sw_diff: 0, sw_guard: 0, cache_hit: false, dbuf: 0, dn: 0, dstage: 0, didx: 0,
         wop: 0, wdone: 0, wabort: 0, warg: 0, wstat: 0, wsave: 0 - 1, wtxt: 0, wres: 0, wseen: 0, wt0: 0, o_keep: 0.0f, o_first: false,
         defer_lens: 0 - 1, lost_at: 0, vok: false, wname: [0 as u8; 48], pexp: 0, piso: 0, pfoc: 0.0f, phave_e: false, phave_f: false,
-        pflash: false, sbuf: 0, scap: 0, sdbuf: 0, sdcap: 0, sptr: 0, sn: 0,
+        pflash: false, sbuf: 0, scap: 0, sdbuf: 0, sdcap: 0, sptr: 0, sn: 0, preset: campreset.ULTRA, pjob: camjob.job_new(), psaved: 0,
         chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, learn_x10: 0, learn_lens: 0 - 1, swept: false, sw_n: 0, sw_z: [0; 16], sw_f: [0; 16], sw_cw: [0; 16], sw_ph: [[0 as u8; 16]; 16], ph1: [0 as u8; 16], can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
@@ -1933,6 +2042,8 @@ fn main() -> i32 {
     var pf: camera.PreviewFrame = camera.preview_frame_new()
     var gen: u32 = 0 as u32
     a.disp = display_deg()
+    a.preset = preset_load()
+    u.preset = a.preset
     set_status(&a, "NO PERMISSION")
     var asked: bool = false
     var open: bool = true
