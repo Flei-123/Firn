@@ -61,12 +61,18 @@ function checkExtras(label, f, v) {
   const common = Object.keys(f.extras).filter((k) => v.extras[k] && f.hists[k] && v.hists[k] && total(f.hists[k]) > 0 && total(v.hists[k]) > 0)
   const eq = (k, get) => JSON.stringify(get(f.extras[k])) === JSON.stringify(get(v.extras[k]))
   const bad = (get) => common.filter((k) => !eq(k, get))
-  const LIGHT_SPILL_SHARE = 0.03
-  const kinds = [['biome cells', (x) => x.biomes, 0], ['light masks', (x) => x.masks, LIGHT_SPILL_SHARE], ['sky light arrays', (x) => x.sky, LIGHT_SPILL_SHARE], ['block light arrays', (x) => x.blk, LIGHT_SPILL_SHARE], ['block entity list', (x) => x.bes, 0]]
+  const LIGHT_SPILL_RADIUS = 2
+  const parseKey = (k) => k.split(',').map((n) => parseInt(n, 10))
+  const drifted = common.filter((k) => !same_h(f.hists[k], v.hists[k])).map(parseKey)
+  const nearDrift = (k) => { const [x, z] = parseKey(k); return drifted.some(([dx, dz]) => Math.max(Math.abs(dx - x), Math.abs(dz - z)) <= LIGHT_SPILL_RADIUS) }
+  const lightCommon = common.filter((k) => !nearDrift(k))
+  const kinds = [['biome cells', (x) => x.biomes, false], ['light masks', (x) => x.masks, true], ['sky light arrays', (x) => x.sky, true], ['block light arrays', (x) => x.blk, true], ['block entity list', (x) => x.bes, false]]
   add(common.length >= 100, common.length + ' saved columns with extras present in both')
-  for (const [name, get, share] of kinds) {
-    const b = bad(get)
-    add(b.length <= common.length * share, name + ' equal to vanilla in ' + (common.length - b.length) + '/' + common.length + ' columns' + (b.length ? ' (first ' + b.slice(0, 3).join(' ') + ')' : ''))
+  add(lightCommon.length >= 100, lightCommon.length + ' columns compared for light (' + (common.length - lightCommon.length) + ' within ' + LIGHT_SPILL_RADIUS + ' columns of a fluid-drifted column skipped)')
+  for (const [name, get, isLight] of kinds) {
+    const pool = isLight ? lightCommon : common
+    const b = pool.filter((k) => !eq(k, get))
+    add(b.length === 0, name + ' equal to vanilla in ' + (pool.length - b.length) + '/' + pool.length + ' columns' + (b.length ? ' (first ' + b.slice(0, 3).join(' ') + ')' : ''))
   }
   const withBe = common.filter((k) => v.extras[k].bes.length > 0).length
   const withBiomes = common.filter((k) => new Set(v.extras[k].biomes).size > 1).length
