@@ -59,17 +59,19 @@ expect "upgrade reports stale project pins" "$F" upgrade; has "stale project lis
 
 expect "publish 0.1.3" publish 0.1.3
 cp "$PUB/stable/manifest.json" "$D/good.json"
-python3 -I - "$PUB/stable/manifest.json" <<'PY'
+python3 -I - "$PUB/stable/manifest.json" "$PUB/stable/manifest-0.1.3.json" <<'PY'
 import json, sys
-p = sys.argv[1]
-t = open(p).read()
-h = json.loads(t)["platforms"]["linux-x86_64"]["sha256"]
-open(p, "w").write(t.replace(h, ("0" if h[0] != "0" else "1") + h[1:]))
+for p in sys.argv[1:]:
+    t = open(p).read()
+    h = json.loads(t)["platforms"]["linux-x86_64"]["sha256"]
+    open(p, "w").write(t.replace(h, ("0" if h[0] != "0" else "1") + h[1:]))
 PY
+
 expect_fail "upgrade with a wrong hash fails" "$F" upgrade; has "hash error named" "SHA-256 mismatch"
 [ "$(current)" = 0.1.2 ] && ok "current stays 0.1.2 after bad hash" || bad "current stays 0.1.2 after bad hash"
 [ ! -e "$FIRN_HOME/versions/0.1.3" ] && [ -z "$(ls -A "$FIRN_HOME/versions" | grep stage)" ] && ok "nothing left of the bad download" || bad "nothing left of the bad download"
 cp "$D/good.json" "$PUB/stable/manifest.json"
+cp "$D/good.json" "$PUB/stable/manifest-0.1.3.json"
 
 printf '#!/bin/sh\necho broken >&2\nexit 3\n' > "$D/broken-firnc"; chmod +x "$D/broken-firnc"
 expect "publish broken 0.1.4" publish 0.1.4 "$D/broken-firnc"
