@@ -9,6 +9,7 @@ const portalMin = mcData.blocksByName.nether_portal.minStateId
 const obsidian = mcData.itemsByName.obsidian.id
 const flint = mcData.itemsByName.flint_and_steel.id
 const FX = parseInt(process.env.FRAME_X || '10', 10)
+const WAIT = parseInt(process.env.PORTAL_WAIT_MS || '2500', 10)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let current = 'login'
 let pos = null
@@ -50,13 +51,13 @@ async function run() {
   await sleep(1000)
   out.afterIgnite = out.portalBlocks
   move(FX + 0.5, 150, 0.5)
-  await sleep(2500)
+  await sleep(WAIT)
   out.nether = pos
   const there = pos
   move(there.x, there.y, there.z + 3)
   await sleep(1500)
   move(there.x, there.y, there.z)
-  await sleep(2500)
+  await sleep(WAIT)
   out.final = current
   out.back = pos
   finish()

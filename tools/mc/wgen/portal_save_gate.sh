@@ -31,7 +31,7 @@ mkfifo "$W/vanilla/in"; exec 3<>"$W/vanilla/in"
 VPID=$!
 for _ in $(seq 1 240); do grep -q 'Done (' "$W/vanilla/server.out" 2>/dev/null && break; sleep 1; done
 grep -q 'Done (' "$W/vanilla/server.out" || { echo "  FAIL  vanilla server start"; tail -n 5 "$W/vanilla/server.out"; exit 1; }
-FRAME_X=10 node tools/mc/wgen/portal_bot.cjs 127.0.0.1 "$VPORT" > "$W/bot1.json" 2>"$W/bot1.err"
+PORTAL_WAIT_MS=20000 FRAME_X=10 node tools/mc/wgen/portal_bot.cjs 127.0.0.1 "$VPORT" > "$W/bot1.json" 2>"$W/bot1.err"
 echo "save-all flush" >&3
 sleep 3
 echo stop >&3
