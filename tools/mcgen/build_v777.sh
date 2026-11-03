@@ -12,6 +12,8 @@ trap 'rm -rf "$D"' EXIT
 for v in 26.1 26.3; do
     mkdir -p "$D/j$v" "$D/x$v" "$D/o$v" "$D/jd$v"
     (cd "$D/x$v" && unzip -q -o "$JARS/server-$v.jar" 'META-INF/versions/*')
+    mkdir -p "$D/jardata$v"
+    (cd "$D/jardata$v" && unzip -q -o "$D/x$v/META-INF/versions/$v/server-$v.jar" 'data/minecraft/recipe/*' 'data/minecraft/tags/item/*')
     (cd "$D/j$v" && "$JDK/bin/java" -DbundlerMainClass=net.minecraft.data.Main -jar "$JARS/server-$v.jar" --reports --output "$D/o$v" >"$D/dg$v.log" 2>&1)
     CP="$D/x$v/META-INF/versions/$v/server-$v.jar:$(find "$D/j$v/libraries" -name '*.jar' | tr '\n' ':')"
     "$JDK/bin/javac" -cp "$CP" -d "$D/jd$v" "$ROOT/tools/mcgen/jar/JarDump.java"
@@ -19,10 +21,12 @@ for v in 26.1 26.3; do
 done
 rm -rf "$ROOT/tools/mcgen/data_extra"
 python3 "$ROOT/tools/mcgen/jar_report_to_mcdata.py" --reports "$D/o26.3/reports" --dump "$D/dump26.3.json" \
-    --base-data "$BASE" --base-reports "$D/o26.1/reports" --version 26.3 --protocol 777 \
+    --base-data "$BASE" --base-reports "$D/o26.1/reports" --version 26.3 --protocol 777 --jar-data "$D/jardata26.3" \
     --delta "$ROOT/tools/mcgen/deltas/26.3.json" --out "$ROOT/tools/mcgen/data_extra"
 python3 "$ROOT/tools/mcgen/overlay_data.py" "$BASE" "$ROOT/tools/mcgen/data_extra" "$D/data"
 python3 "$ROOT/tools/mcgen/gen_protocol.py" --all "$D/data" "$D/gen" all >/dev/null
 mkdir -p "$ROOT/lib/mc/v777"
 cp "$D/gen/v777/"*.fi "$ROOT/lib/mc/v777/"
 cp "$D/gen/mc_versions.fi" "$D/gen/mc_sem.fi" "$D/gen/mc_entity_layout.fi" "$ROOT/lib/mc/"
+python3 "$ROOT/tools/mcgen/gen_dig.py" "$D/data" 26.3 777 "$ROOT/lib/mc/v777/mc_dig_v777.fi"
+python3 "$ROOT/tools/mcgen/gen_recipes.py" "$D/data" 26.3 777 "$ROOT/lib/mc/v777/mc_rcp_v777.fi"
