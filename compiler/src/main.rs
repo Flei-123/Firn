@@ -126,6 +126,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod superopt;
 mod rotate;
 mod rotl;
 mod truncmask;
