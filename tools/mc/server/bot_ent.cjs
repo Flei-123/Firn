@@ -95,7 +95,7 @@ waitFor(() => res.obs.pos && res.dig.pos && res.dig.eid !== null && seesDigger()
     dig.write('block_dig', { status: 0, location: { x: bx, y: by, z: bz }, face: 1, sequence: 1 })
     setTimeout(() => {
       dig.write('block_dig', { status: 2, location: { x: bx, y: by, z: bz }, face: 1, sequence: 2 })
-      waitFor(itemSettled, 12000, () => {
+      waitFor(itemSettled, 45000, () => {
         setTimeout(() => {
           dig.write('position_look', { x: bx + 0.5, y: by, z: bz + 0.5, yaw: 0, pitch: 0, onGround: true })
           setTimeout(finish, 2500)
@@ -104,4 +104,4 @@ waitFor(() => res.obs.pos && res.dig.pos && res.dig.eid !== null && seesDigger()
     }, 1600)
   }, 2500)
 })
-setTimeout(finish, 40000)
+setTimeout(finish, 80000)

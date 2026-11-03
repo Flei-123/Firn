@@ -89,7 +89,7 @@ pub const MAX_NAME: usize = 64;
 /// Longest permitted VALUE, in octets.
 pub const MAX_VALUE: usize = 4096;
 /// The one prefix that is permitted without `--env-allow`.
-pub const DEFAULT_ALLOW: &str = "FIRN_";
+pub const DEFAULT_ALLOW: &str = crate::brand::ENV_ALLOW;
 
 /// One line of the manifest: which variable was read, with which value, and
 /// did it come from the environment or from the written default?

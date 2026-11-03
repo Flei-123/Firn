@@ -75,7 +75,7 @@ fn function_heat(m: &Module, idx: &HashMap<String, usize>, hot: &[Vec<bool>]) ->
             for inst in &b.insts {
                 if let Op::Call { name, .. } = &inst.op {
                     if let Some(&gi) = idx.get(name) {
-                        edges.push((ci, gi, w));
+                        edges.push((ci, gi, crate::pgo::weights::site_scale(w, inst.loc)));
                     }
                 }
             }
@@ -102,6 +102,10 @@ fn score_threshold(m: &Module, idx: &HashMap<String, usize>, hot: &[Vec<bool>], 
             let w = site_weight(&hot[ci], bi);
             for inst in &b.insts {
                 if let Some(gi) = call_target(m, idx, ci, inst) {
+                    let w = crate::pgo::weights::site_scale(w, inst.loc);
+                    if w == 0.0 {
+                        continue;
+                    }
                     let cost = m.funcs[gi].inst_count().max(1);
                     cands.push((heat[ci] * w / cost as f64, cost));
                 }
@@ -167,6 +171,10 @@ pub(crate) fn run(m: &mut Module, ctx: &mut HeatContext, changed: &mut Vec<usize
                             Some(g) => g,
                             None => continue,
                         };
+                        let w = crate::pgo::weights::site_scale(w, inst.loc);
+                        if w == 0.0 {
+                            continue;
+                        }
                         let cost = m.funcs[gi].inst_count().max(1);
                         if heat[ci] * w / (cost as f64) < threshold {
                             continue;

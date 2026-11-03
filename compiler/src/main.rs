@@ -10,6 +10,7 @@ mod layout_attrs;
 mod fx;
 mod parcodegen;
 mod parfn;
+mod pgo;
 mod alias;
 mod archsel;
 mod ast;
@@ -39,6 +40,8 @@ mod asm_dwarf;
 mod elfobj;
 mod comptime;
 mod env;
+mod brand;
+mod brand_compat;
 mod config;
 mod checkmode;
 mod stackguard;
@@ -304,10 +307,10 @@ fn usage() -> String {
          \n\
          Options:\n  \
          -o <path>          output file (default: input name without extension)\n  \
-         --package <dir>      compile the project from <dir>/firn.package\n  \
+         --package <dir>      compile the project from <dir>/{pkg}\n  \
          --package-info <dir> read the manifest of <dir> and report\n  \
-         --lock             write <dir>/firn.lock (only with --package)\n  \
-         --locked           build only if firn.lock fits (only with --package)\n  \
+         --lock             write <dir>/{lock} (only with --package)\n  \
+         --locked           build only if {lock} fits (only with --package)\n  \
          --emit=exe         produce an executable (default, calls as/ld)\n  \
          --emit=asm         write x86_64 assembler to the output\n  \
          --emit=fir         FIR text form (after optimization, if active)\n  \
@@ -342,7 +345,7 @@ fn usage() -> String {
          --list-passes      print the pass register with its labels\n  \
          --list-attrs       print the known attributes and their state\n  \
          --env-allow=<pre>  permit build time environment variables with this\n  \
-                              prefix (__env_or/__env_has; default: FIRN_)\n  \
+                              prefix (__env_or/__env_has; default: {envp})\n  \
          --env-log          print which environment variables were read\n  \
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
@@ -354,14 +357,19 @@ fn usage() -> String {
          --no-run           with --test: only build, do not run\n  \
          --keep-asm         keep the generated .s file\n  \
          --asm-intern       assemble with the built-in encoder (default for x86_64-linux)\n  \
-         --asm-as           assemble with the system `as` (or set FIRN_USE_AS=1)\n  \
+         --asm-as           assemble with the system `as` (or set {use_as}=1)\n  \
          --version          print the version\n  \
-         --print-sysroot    print the standard library directory ($FIRNLIB wins) and exit\n  \
+         --print-sysroot    print the standard library directory (${lib} wins) and exit\n  \
          -h, --help         this help\n",
         name = c,
         c = c,
         ver = config::VERSION,
         lang = config::LANG_NAME,
+        pkg = brand::PACKAGE_FILE,
+        lock = brand::LOCK_FILE,
+        envp = brand::ENV_ALLOW,
+        use_as = brand::USE_AS_ENV,
+        lib = brand::SYSROOT_ENV,
         ext = config::FILE_EXT
     )
 }
@@ -426,6 +434,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--list-attrs" => {
                 print!("{}", attrs::attrs_text());
                 std::process::exit(0);
+            }
+            _ if a.starts_with("--profile-") && pgo::parse_arg(a).is_some() => {
+                if let Some(Err(e)) = pgo::parse_arg(a) {
+                    return Err(e);
+                }
             }
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];
@@ -642,6 +655,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 fn main() {
+    brand_compat::apply_env_aliases();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         print!("{}", usage());
@@ -805,6 +819,10 @@ fn run(opts: &Options) -> i32 {
         }
     };
     let path = &input;
+    if let Err(e) = pgo::finish_config(opts.output.as_deref(), path).and_then(|_| pgo::check_target()) {
+        eprintln!("error: {}", e);
+        return 2;
+    }
     let cache_dir = cache_dir_for(opts);
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     let manifest_paths: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
@@ -863,6 +881,7 @@ fn run(opts: &Options) -> i32 {
             }
         };
         if opts.locked {
+            let lockpath = package::join(&dir, &crate::brand_compat::existing_name(&dir, lock::LOCKFILE, brand::LEGACY_LOCK_FILE));
             match std::fs::read_to_string(&lockpath) {
                 Ok(found) => {
                     if let Some(note) = lock::difference(&found, &computed) {
@@ -1252,6 +1271,7 @@ fn run(opts: &Options) -> i32 {
         }
     }
     tm.mark("prune");
+    pgo::hash::record(&module);
 
     // --- Optimizer ---
     if opts.optimize {
@@ -1346,6 +1366,7 @@ fn run(opts: &Options) -> i32 {
         };
         return emit_wasm(opts, &module, path, target_out_manifest, &mut tm, store, manifest);
     }
+    pgo::instrument::plan(&module);
     let emitted = match target::active() {
         target::Target::X86_64 => {
             codegen_x86::set_object_only(opts.only_object);
@@ -1414,6 +1435,7 @@ fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
         && !opts.no_cache
         && !buildcache::disabled_by_env()
         && !opts.stats
+        && !pgo::active()
         && !opts.timings
         && !opts.env_log
         && opts.header.is_none()
@@ -1498,8 +1520,8 @@ fn finish(
 ) -> i32 {
     let mut object = object;
     if let Some(h) = &opts.header {
-        let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or("firn");
-        let guard: String = format!("FIRN_{}_H", stem)
+        let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or(brand::CLI);
+        let guard: String = format!("{}_{}_H", brand::ENV_PREFIX, stem)
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
             .collect();
@@ -1513,7 +1535,7 @@ fn finish(
             .output
             .as_deref()
             .and_then(|o| Path::new(o).file_name().and_then(|x| x.to_str()))
-            .unwrap_or("firn.dll")
+            .unwrap_or(brand::DEFAULT_DLL)
             .to_string();
         if let Err(e) = std::fs::write(d, extfn::def_text(&dll).as_bytes()) {
             eprintln!("error: cannot write '{}': {}", d, e);
@@ -1734,7 +1756,7 @@ fn link_shared(obj: &Path, so: &Path, link: &buildcache::LinkInfo) -> Result<(),
         eprintln!("error: cannot write '{}': {}", ver.display(), e);
         return Err(2);
     }
-    let soname = so.file_name().and_then(|x| x.to_str()).unwrap_or("libfirn.so").to_string();
+    let soname = so.file_name().and_then(|x| x.to_str()).unwrap_or(brand::DEFAULT_SO).to_string();
     let mut cmd = Command::new(t.linker());
     cmd.arg("-shared")
         .arg("-Bsymbolic")
@@ -1766,7 +1788,7 @@ fn link_shared(obj: &Path, so: &Path, link: &buildcache::LinkInfo) -> Result<(),
 /// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
 fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
     let def = dll.with_extension("def");
-    let libname = dll.file_name().and_then(|x| x.to_str()).unwrap_or("firn.dll");
+    let libname = dll.file_name().and_then(|x| x.to_str()).unwrap_or(brand::DEFAULT_DLL);
     let text = format!("LIBRARY \"{}\"\nEXPORTS\n{}\n", libname, names.iter().map(|n| format!("    {}", n)).collect::<Vec<_>>().join("\n"));
     if let Err(e) = std::fs::write(&def, text.as_bytes()) {
         eprintln!("error: cannot write '{}': {}", def.display(), e);

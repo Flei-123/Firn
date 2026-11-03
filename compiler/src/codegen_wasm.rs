@@ -793,9 +793,11 @@ fn emit_inner(m: &Module, names: bool) -> Result<Output, String> {
     let li = img.put(b" (index=", 1);
     let ll = img.put(b" len=", 1);
     let lc = img.put(b")\n", 1);
-    let mo_txt: &[u8] = b"firn: stack overflow (the wasm32 shadow stack of 8 MiB is exhausted)\n";
+    let mo_msg = format!("{}: stack overflow (the wasm32 shadow stack of 8 MiB is exhausted)\n", crate::brand::CLI);
+    let mo_txt: &[u8] = mo_msg.as_bytes();
     let mo = img.put(mo_txt, 1);
-    let mf_txt: &[u8] = b"firn: futex wait in a program with a single thread would block forever\n";
+    let mf_msg = format!("{}: futex wait in a program with a single thread would block forever\n", crate::brand::CLI);
+    let mf_txt: &[u8] = mf_msg.as_bytes();
     let mf = img.put(mf_txt, 1);
     let mut msg_off: Vec<(String, u32)> = Vec::new();
     for s in &msgs {
