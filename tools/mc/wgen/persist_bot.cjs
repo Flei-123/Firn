@@ -6,6 +6,9 @@ const mc = require(path.join(root, 'minecraft-protocol'))
 const mcData = require(path.join(root, 'minecraft-data'))('1.20.1')
 
 const [host, portArg, mode, stateFile] = process.argv.slice(2)
+const DIM = process.env.PERSIST_DIM || 'overworld'
+const MIN_Y = DIM === 'overworld' ? -64 : 0
+const SECTIONS = DIM === 'overworld' ? 24 : 16
 const out = { mode, pos: null, time: null, gameMode: null, window: {}, changes: [], blocks: {}, errors: [] }
 const chunks = {}
 const overlay = {}
@@ -38,7 +41,7 @@ function indexChunk(data) {
   const buf = data.chunkData
   const o = { p: 0 }
   const secs = []
-  for (let sec = 0; sec < 24; sec++) {
+  for (let sec = 0; sec < SECTIONS; sec++) {
     o.p += 2
     secs.push(container(buf, o, 8))
     container(buf, o, 3)
@@ -50,8 +53,8 @@ function blockName(x, y, z) {
   if (o) return o
   const secs = chunks[`${x >> 4},${z >> 4}`]
   if (!secs) return 'unloaded'
-  const sec = (y + 64) >> 4
-  const idx = (((y + 64) & 15) * 16 + (z & 15)) * 16 + (x & 15)
+  const sec = (y - MIN_Y) >> 4
+  const idx = (((y - MIN_Y) & 15) * 16 + (z & 15)) * 16 + (x & 15)
   const b = mcData.blocksByStateId[entry(secs[sec], idx)]
   return b ? 'minecraft:' + b.name : 'unknown'
 }
