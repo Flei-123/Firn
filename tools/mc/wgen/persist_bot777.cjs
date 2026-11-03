@@ -6,8 +6,9 @@ const fs = require('fs')
 const [host, portArg, mode, stateFile] = process.argv.slice(2)
 const port = parseInt(portArg, 10)
 const PROTOCOL = 777
-const SECTIONS = 24
-const MIN_Y = -64
+const PERSIST_DIM = process.env.PERSIST_DIM || 'overworld'
+const SECTIONS = PERSIST_DIM === 'overworld' ? 24 : 16
+const MIN_Y = PERSIST_DIM === 'overworld' ? -64 : 0
 const GLOBAL_BITS = 16
 const BIOME_BITS = 7
 const STONE = 1
