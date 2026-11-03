@@ -127,7 +127,7 @@ public class WgFeatures {
                 case "levelEvent": return null;
                 case "gameEvent": return null;
                 case "setCurrentlyGenerating": return null;
-                case "getLevel": return null;
+                case "getLevel": return fakeLevel();
                 case "addFreshEntity": return true;
                 case "getRandom": return r.rnd;
                 case "getBrightness": return 0;
@@ -148,6 +148,32 @@ public class WgFeatures {
             throw new UnsupportedOperationException(n + "/" + argc);
         };
         return (WorldGenLevel) Proxy.newProxyInstance(WgFeatures.class.getClassLoader(), new Class<?>[]{WorldGenLevel.class}, h);
+    }
+
+    private static net.minecraft.server.level.ServerLevel fakeLevelInstance;
+
+    static synchronized net.minecraft.server.level.ServerLevel fakeLevel() {
+        if (fakeLevelInstance != null) return fakeLevelInstance;
+        try {
+            Class<?> uc = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field uf = uc.getDeclaredField("theUnsafe");
+            uf.setAccessible(true);
+            Object u = uf.get(null);
+            Method alloc = uc.getMethod("allocateInstance", Class.class);
+            net.minecraft.server.MinecraftServer server = (net.minecraft.server.MinecraftServer) alloc.invoke(u, net.minecraft.server.dedicated.DedicatedServer.class);
+            net.minecraft.world.level.storage.WorldData wd = (net.minecraft.world.level.storage.WorldData) Proxy.newProxyInstance(WgFeatures.class.getClassLoader(), new Class<?>[]{net.minecraft.world.level.storage.WorldData.class}, (px, mm, aa) -> mm.getName().equals("enabledFeatures") ? net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS : null);
+            java.lang.reflect.Field wf = net.minecraft.server.MinecraftServer.class.getDeclaredField("worldData");
+            wf.setAccessible(true);
+            wf.set(server, wd);
+            net.minecraft.server.level.ServerLevel lv = (net.minecraft.server.level.ServerLevel) alloc.invoke(u, net.minecraft.server.level.ServerLevel.class);
+            java.lang.reflect.Field sf = net.minecraft.server.level.ServerLevel.class.getDeclaredField("server");
+            sf.setAccessible(true);
+            sf.set(lv, server);
+            fakeLevelInstance = lv;
+            return lv;
+        } catch (ReflectiveOperationException ex) {
+            throw new RuntimeException(ex);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -275,7 +301,7 @@ public class WgFeatures {
                                 java.nio.file.Files.write(java.nio.file.Paths.get(System.getProperty("wg.cntlog")), ("CNT " + cx + " " + cz + " " + nx + " " + nz + " " + j + " " + n + " " + rnd.getCount() + " " + pfNames.get(pf) + "\n").getBytes(), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
                             }
                         } catch (RuntimeException ex) {
-                            if (dirOnly && !"end_spike".equals(pfNames.get(pf))) throw ex;
+                            if (dirOnly) throw ex;
                             failed.add(pfNames.get(pf) + ":" + ex.getClass().getSimpleName() + ":" + String.valueOf(ex.getMessage()).split("\n")[0]);
                         }
                     }
