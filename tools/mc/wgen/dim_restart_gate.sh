@@ -48,9 +48,11 @@ const b = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"))
 const errs = []
 if (a.final !== "minecraft:the_nether") errs.push("first run final " + a.final)
 if (b.final !== "minecraft:the_nether") errs.push("second run final " + b.final)
+const entry = b.events.filter((e) => /^(login|respawn)/.test(e))
+if (JSON.stringify(entry) !== JSON.stringify(["login minecraft:the_nether"])) errs.push("rejoin events " + JSON.stringify(entry))
 if (!(b.chunks["minecraft:the_nether"] >= 9)) errs.push("chunks " + JSON.stringify(b.chunks))
 if (a.errors.length || b.errors.length) errs.push("errors " + JSON.stringify([a.errors, b.errors]))
 if (errs.length) { console.log(errs.join("; ")); console.log(JSON.stringify(b)); process.exit(1) }
-' "$W/bot1.json" "$W/bot2.json" && echo "  ok    player rejoins in the saved dimension after restart" || { echo "  FAIL  dimension restart"; tail -n 5 "$W/run/out.log"; stop_server; exit 1; }
+' "$W/bot1.json" "$W/bot2.json" && echo "  ok    player logs in directly into the saved dimension after restart" || { echo "  FAIL  dimension restart"; tail -n 5 "$W/run/out.log"; stop_server; exit 1; }
 stop_server
 echo "mc/wgen dim restart: all ok"
