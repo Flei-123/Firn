@@ -63,6 +63,10 @@ impl<'a> Em<'a> {
                 let y = self.mat(plan, *b)?;
                 self.op(inst.ty, Op::Bin(*op, x, y))
             }
+            Op::Cast { src, from } => {
+                let x = self.mat(plan, *src)?;
+                self.op(inst.ty, Op::Cast { src: x, from: *from })
+            }
             _ => return None,
         };
         self.memo.insert(c, out);
@@ -169,9 +173,10 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         for t in &plan.tests {
             let n = em.mat(plan, t.n)?;
             let thr_k = plan.s + t.e - if t.r { 1 } else { 0 };
-            let thr = em.konst(FTy::U64, thr_k);
-            let cond = em.op(FTy::Bool, Op::Cmp { op: CmpOp::Gt, ty: FTy::U64, a: n, b: thr });
-            let d = em.op(FTy::U64, Op::Bin(BinOp::Sub, n, thr));
+            let thr = em.konst(t.ty, thr_k);
+            let cond = em.op(FTy::Bool, Op::Cmp { op: CmpOp::Gt, ty: t.ty, a: n, b: thr });
+            let dn = em.op(t.ty, Op::Bin(BinOp::Sub, n, thr));
+            let d = if t.ty == FTy::U64 { dn } else { em.op(FTy::U64, Op::Cast { src: dn, from: t.ty }) };
             lim = Some(match lim {
                 None => d,
                 Some(l) => {
@@ -285,10 +290,16 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         }
         let mut anext: Vec<Vec<Val>> = vec![Vec::new(); plan.accs.len()];
         let mut vmap: HashMap<(Val, u32), Val> = HashMap::default();
+        let forward = std::env::var_os("FIRN_NO_VEC_FORWARD").is_none();
+        let mut known: HashMap<(usize, u32), Val> = HashMap::default();
         for j in 0..UNROLL {
             for st in &plan.steps {
                 match st {
                     Step::Load { dst, key } => {
+                        if let Some(&v) = known.get(&(*key, j)) {
+                            vmap.insert((*dst, j), v);
+                            continue;
+                        }
                         let ptr = if j == 0 {
                             pphi[*key]
                         } else {
@@ -297,6 +308,9 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                         };
                         let v = em.simd(SimdKind::Load, vec![ptr], 0, FTy::V128);
                         vmap.insert((*dst, j), v);
+                        if forward {
+                            known.insert((*key, j), v);
+                        }
                     }
                     Step::Bin { dst, op, a, b } => {
                         let ty = em.f.val_types[*dst as usize];
@@ -315,6 +329,11 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                             em.op(FTy::Ptr, Op::PtrAdd { base: pphi[*key], off: o })
                         };
                         let v = operand(&vmap, &splats, plan, *val, j)?;
+                        if forward {
+                            let e = plan.keys[*key].e;
+                            known.retain(|&(k, kj), _| kj != j || k == *key || plan.keys[k].e != e);
+                            known.insert((*key, j), v);
+                        }
                         let loc = em.f.loc_stamp;
                         em.f.blocks[vl as usize].insts.push(Inst {
                             dst: None,
@@ -362,7 +381,8 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         let mut new_vals: HashMap<Val, Val> = HashMap::default();
         for iv in &plan.ivs {
             let init = em.mat(plan, iv.init)?;
-            let nv = em.op(FTy::U64, Op::Bin(BinOp::Add, init, cov));
+            let step = if plan.ity == FTy::U64 { cov } else { em.op(plan.ity, Op::Cast { src: cov, from: FTy::U64 }) };
+            let nv = em.op(plan.ity, Op::Bin(BinOp::Add, init, step));
             new_vals.insert(iv.phi, nv);
         }
         for (ai, a) in plan.accs.iter().enumerate() {
