@@ -1,0 +1,1623 @@
+const F_PERM: u32 = 64
+const S_PERM_N: u64 = 2400
+const S_PERM_TAB: u64 = 2408
+const S_PERM_SHD: u64 = 2416
+const S_PERM_MODE: u64 = 2424
+const S_PERM_DIRTY: u64 = 2432
+const S_PERM_VIOL: u64 = 2440
+const S_PERM_BYTES: u64 = 2448
+const S_PERM_SCANS: u64 = 2456
+const S_PERM_TRACED: u64 = 2464
+const PERM_MAX_BYTES: u64 = 134217728
+const S_HOOK: u64 = 2472
+const S_HOOK_GAP: u64 = 2480
+const S_HOOK_NEXT: u64 = 2488
+const S_HOOK_BUSY: u64 = 2496
+const S_HOOK_N: u64 = 2504
+const S_ARENA_CUR: u64 = 2512
+const S_ARENA_END: u64 = 2520
+const S_ARENA_OFF: u64 = 2528
+const GC_SYS_MADVISE: i64 = 28
+const GC_MADV_HUGEPAGE: i64 = 14
+const GC_ARENA_BYTES: u64 = 8388608
+const GC_ARENA_ALIGN: u64 = 2097152
+fn __gc_chunk_arena_take(n: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_ARENA_OFF) != 0 {
+        return __gc_mmap(n)
+    }
+    var cur: u64 = __gc_ld64(st + S_ARENA_CUR)
+    if cur == 0 || cur + n > __gc_ld64(st + S_ARENA_END) {
+        let raw: u64 = __gc_mmap(GC_ARENA_BYTES + GC_ARENA_ALIGN)
+        if raw == 0 {
+            return __gc_mmap(n)
+        }
+        let start: u64 = (raw + GC_ARENA_ALIGN - 1) / GC_ARENA_ALIGN * GC_ARENA_ALIGN
+        let r: i64 = syscall(GC_SYS_MADVISE, start as i64, GC_ARENA_BYTES as i64, GC_MADV_HUGEPAGE, 0, 0, 0)
+        if r != 0 {
+            __gc_st64(st + S_ARENA_OFF, 1)
+            __gc_munmap(raw, GC_ARENA_BYTES + GC_ARENA_ALIGN)
+            return __gc_mmap(n)
+        }
+        if start > raw {
+            __gc_munmap(raw, start - raw)
+        }
+        let tail: u64 = raw + GC_ARENA_BYTES + GC_ARENA_ALIGN - (start + GC_ARENA_BYTES)
+        if tail > 0 {
+            __gc_munmap(start + GC_ARENA_BYTES, tail)
+        }
+        cur = start
+        __gc_st64(st + S_ARENA_END, start + GC_ARENA_BYTES)
+    }
+    __gc_st64(st + S_ARENA_CUR, cur + n)
+    return cur
+}
+fn __gc_cpu_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let buf: u64 = st +% S_TIME
+    __gc_st64(buf, 0)
+    __gc_st64(buf +% 8, 0)
+    syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_THREAD_CPUTIME, buf as i64, 0, 0, 0, 0)
+    return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf +% 8)
+}
+fn __gc_vdso_find() -> u64 {
+    var path: [u8; 16] = "/proc/self/auxv\0"
+    var buf: [u64; 128] = [0; 128]
+    let fd: i64 = syscall(GC_SYS_OPEN, (&path) as u64 as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return 1
+    }
+    var len: u64 = 0
+    var more: bool = true
+    while more {
+        let n: i64 = syscall(GC_SYS_READ, fd, ((&buf) as u64 + len) as i64, (1024 - len) as i64, 0, 0, 0)
+        if n <= 0 {
+            more = false
+        } else {
+            len = len + n as u64
+            if len >= 1024 {
+                more = false
+            }
+        }
+    }
+    syscall(GC_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    var base: u64 = 0
+    var i: u64 = 0
+    while i + 16 <= len {
+        let t: u64 = buf[(i / 8) as usize]
+        let v: u64 = buf[(i / 8 + 1) as usize]
+        if t == 0 {
+            break
+        }
+        if t == 33 {
+            base = v
+        }
+        i = i + 16
+    }
+    if base == 0 || (base & 4095) != 0 {
+        return 1
+    }
+    if __gc_vd_w(base) != 1179403647 {
+        return 1
+    }
+    if __gc_vd_b(base + 4) != 2 || __gc_vd_b(base + 5) != 1 {
+        return 1
+    }
+    if __gc_vd_h(base + 18) != 62 {
+        return 1
+    }
+    let phoff: u64 = __gc_ld64(base +% 32)
+    let phentsize: u64 = __gc_vd_h(base + 54)
+    let phnum: u64 = __gc_vd_h(base + 56)
+    if phentsize != 56 || phnum == 0 || phnum > 32 || phoff > 4096 {
+        return 1
+    }
+    var load_off: u64 = 0
+    var have_load: bool = false
+    var dynp: u64 = 0
+    var k: u64 = 0
+    while k < phnum {
+        let ph: u64 = base + phoff + k * phentsize
+        let pt: u64 = __gc_vd_w(ph)
+        if pt == 1 && !have_load {
+            have_load = true
+            load_off = base + __gc_ld64(ph +% 8) - __gc_ld64(ph +% 16)
+        }
+        if pt == 2 {
+            dynp = base + __gc_ld64(ph +% 8)
+        }
+        k = k + 1
+    }
+    if !have_load || dynp == 0 {
+        return 1
+    }
+    var symtab: u64 = 0
+    var strtab: u64 = 0
+    var hash: u64 = 0
+    var d: u64 = dynp
+    var guard: u64 = 0
+    while guard < 64 {
+        let tag: u64 = __gc_ld64(d)
+        if tag == 0 {
+            break
+        }
+        let val: u64 = __gc_ld64(d +% 8)
+        if tag == 4 {
+            hash = load_off + val
+        }
+        if tag == 5 {
+            strtab = load_off + val
+        }
+        if tag == 6 {
+            symtab = load_off + val
+        }
+        d = d + 16
+        guard = guard + 1
+    }
+    if symtab == 0 || strtab == 0 || hash == 0 {
+        return 1
+    }
+    let nsym: u64 = __gc_vd_w(hash + 4)
+    var s: u64 = 0
+    while s < nsym && s < 256 {
+        let sy: u64 = symtab + s * 24
+        if (__gc_vd_b(sy + 4) & 15) == 2 && __gc_vd_h(sy + 6) != 0 && __gc_vd_is_name(strtab + __gc_vd_w(sy)) {
+            let code: u64 = load_off + __gc_ld64(sy +% 8)
+            if code > 1 {
+                return code
+            }
+        }
+        s = s + 1
+    }
+    return 1
+}
+struct GcHookCall { f: fn(u64) }
+fn __gc_hook_call(cell: u64, a: u64) {
+    var holder: [u64; 1] = [0; 1]
+    holder[0] = cell
+    let h: *mut GcHookCall = (&holder[0]) as *mut GcHookCall
+    let f: fn(u64) = (*h).f
+    f(a)
+}
+fn __gc_hook_run(st: u64, now: u64) -> u64 {
+    if __gc_ld64(st +% S_HOOK_BUSY) != 0 || __gc_ld64(st +% S_MULTI) != 0 {
+        return now
+    }
+    let gap: u64 = __gc_ld64(st +% S_HOOK_GAP)
+    __gc_st64(st +% S_HOOK_BUSY, 1)
+    __gc_st64(st +% S_HOOK_NEXT, now +% gap)
+    __gc_hook_call(st +% S_HOOK, 0)
+    let after: u64 = __gc_now_ns()
+    __gc_st64(st +% S_HOOK_NEXT, after +% gap)
+    __gc_st64(st +% S_HOOK_N, __gc_ld64(st +% S_HOOK_N) + 1)
+    __gc_st64(st +% S_HOOK_BUSY, 0)
+    return after
+}
+fn __gc_now_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let buf: u64 = st +% S_TIME
+    __gc_st64(buf, 0)
+    __gc_st64(buf +% 8, 0)
+    var code: u64 = __gc_ld64(st +% S_VDSO)
+    if code == 0 {
+        code = __gc_vdso_find()
+        __gc_st64(st +% S_VDSO, code)
+    }
+    if code > 1 {
+        __gc_vdso_call(st +% S_VDSO, GC_CLOCK_MONOTONIC, buf)
+    } else {
+        syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_MONOTONIC, buf as i64, 0, 0, 0, 0)
+    }
+    return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf +% 8)
+}
+fn __gc_diag_inc(off: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st +% off, __gc_ld64(st +% off) + 1)
+}
+fn gc_diag(i: u64) -> u64 {
+    if i > 6 {
+        return 0
+    }
+    if i == 6 {
+        return gc_allok_n()
+    }
+    return __gc_ld64(__gc_state() as u64 +% S_D_CN_RUHE +% i *% 8)
+}
+fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var block: u64 = 0
+    var total: u64 = 0
+    if class < CLASSES {
+        block = HEADER + __gc_classes_bytes(class)
+        total = CHUNK_BYTES
+    } else {
+        block = HEADER + (payload + 15) / 16 * 16
+        total = CHUNK_HEADER + block
+    }
+    let max: u64 = (*((st + S_MAXHEAP) as *mut u64))
+    if max != 0 && (*((st + S_HEAP) as *mut u64)) + total > max {
+        return 0
+    }
+    var p: u64 = 0
+    if class < CLASSES {
+        p = __gc_chunk_arena_take(total)
+    } else {
+        p = __gc_mmap(total)
+    }
+    if p == 0 {
+        return 0
+    }
+    let real: u64 = (total + 4095) / 4096 * 4096
+    let count: u64 = (real - CHUNK_HEADER) / block
+    *((p) as *mut u64) = (*((st + S_CHUNKS) as *mut u64))
+    *((p + 8) as *mut u64) = real
+    *((p + 16) as *mut u64) = block
+    *((p + 24) as *mut u64) = count
+    *((p + 32) as *mut u64) = CHUNK_HEADER
+    *((p + 40) as *mut u64) = class
+    if class < CLASSES {
+        *((p + 56) as *mut u64) = (4294967296 + block - 1) / block
+    }
+    *((st + S_CHUNKS) as *mut u64) = p
+    __gc_idx_add(p)
+    *((st + S_HEAP) as *mut u64) = (*((st + S_HEAP) as *mut u64)) + real
+    if p < (*((st + S_HEAPLO) as *mut u64)) {
+        *((st + S_HEAPLO) as *mut u64) = p
+    }
+    if p + real > (*((st + S_HEAPHI) as *mut u64)) {
+        *((st + S_HEAPHI) as *mut u64) = p + real
+    }
+    if class < CLASSES {
+        let header: u64 = st + S_FREE + class * 8
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = p + CHUNK_HEADER + i * block
+            *((b + HEADER) as *mut u64) = (*((header) as *mut u64))
+            *((header) as *mut u64) = b
+            i = i + 1
+        }
+    }
+    let ph: u64 = (*((st + S_PHASE) as *mut u64))
+    if ph == 0 {
+        __gc_diag_inc(S_D_CN_RUHE)
+    } else {
+        if ph == 1 {
+            __gc_diag_inc(S_D_CN_MARK)
+        } else {
+            __gc_diag_inc(S_D_CN_SWEEP)
+        }
+    }
+    return p
+}
+fn __gc_block_of(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if a < __gc_ld64(st +% S_HEAPLO) || a >= __gc_ld64(st +% S_HEAPHI) {
+        return 0
+    }
+    let cc: u64 = __gc_ld64(st +% S_CHUNK_CACHE)
+    let d0: u64 = cc +% CHUNK_HEADER
+    if cc != 0 && a >= d0 && a < __gc_ld64(cc +% 32) {
+        return d0 +% ((((a -% d0) *% __gc_ld64(cc +% 56)) >> 32) *% __gc_ld64(cc +% 16))
+    }
+    let bt: u64 = __gc_ld64(st +% S_BOCACHE)
+    if bt > 1 {
+        let c2: u64 = __gc_ld64(bt +% (((a >> 18) & (BOCACHE_N - 1)) *% 8))
+        let d2: u64 = c2 +% CHUNK_HEADER
+        if c2 != 0 && a >= d2 && a < __gc_ld64(c2 +% 32) {
+            __gc_st64(st +% S_CHUNK_CACHE, c2)
+            return d2 +% ((((a -% d2) *% __gc_ld64(c2 +% 56)) >> 32) *% __gc_ld64(c2 +% 16))
+        }
+    }
+    return __gc_block_of_slow(a)
+}
+fn __gc_block_of_slow(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if a < *((st +% S_HEAPLO) as *mut u64) {
+        return 0
+    }
+    if a >= *((st +% S_HEAPHI) as *mut u64) {
+        return 0
+    }
+    let cc: u64 = (*((st + S_CHUNK_CACHE) as *mut u64))
+    if cc != 0 {
+        let data0: u64 = cc + CHUNK_HEADER
+        let blk0: u64 = (*((cc + 16) as *mut u64))
+        let end0: u64 = data0 + blk0 * (*((cc + 24) as *mut u64))
+        if a >= data0 && a < end0 {
+            let m0: u64 = (*((cc + 56) as *mut u64))
+            if m0 != 0 {
+                return data0 + (((a - data0) * m0) >> 32) * blk0
+            }
+            return data0 + (a - data0) / blk0 * blk0
+        }
+    }
+    if a >= (*((st + S_GAPLO) as *mut u64)) && a < (*((st + S_GAPHI) as *mut u64)) {
+        return 0
+    }
+    if (*((st + S_IDXBAD) as *mut u64)) == 0 {
+        var bt: u64 = (*((st + S_BOCACHE) as *mut u64))
+        if bt == 0 {
+            bt = __gc_bocache()
+        }
+        var slot: u64 = 0
+        if bt > 1 {
+            slot = bt + ((a >> 18) & (BOCACHE_N - 1)) * 8
+            let c2: u64 = (*((slot) as *mut u64))
+            if c2 != 0 {
+                let data2: u64 = c2 + CHUNK_HEADER
+                let block2: u64 = (*((c2 + 16) as *mut u64))
+                if a >= data2 && a < data2 + block2 * (*((c2 + 24) as *mut u64)) {
+                    *((st + S_CHUNK_CACHE) as *mut u64) = c2
+                    let m2: u64 = (*((c2 + 56) as *mut u64))
+                    if m2 != 0 {
+                        return data2 + (((a - data2) * m2) >> 32) * block2
+                    }
+                    return data2 + (a - data2) / block2 * block2
+                }
+            }
+            if a >= (*((slot + BOCACHE_N * 8) as *mut u64)) && a < (*((slot + BOCACHE_N * 16) as *mut u64)) {
+                return 0
+            }
+        }
+        let ci: u64 = __gc_idx_chunk(a)
+        if ci == 0 {
+            if slot != 0 {
+                *((slot + BOCACHE_N * 8) as *mut u64) = (*((st + S_GAPLO) as *mut u64))
+                *((slot + BOCACHE_N * 16) as *mut u64) = (*((st + S_GAPHI) as *mut u64))
+            }
+            return 0
+        }
+        let datai: u64 = ci + CHUNK_HEADER
+        let blocki: u64 = (*((ci + 16) as *mut u64))
+        let endi: u64 = datai + blocki * (*((ci + 24) as *mut u64))
+        if a >= datai && a < endi {
+            *((st + S_CHUNK_CACHE) as *mut u64) = ci
+            if slot != 0 {
+                *((slot) as *mut u64) = ci
+            }
+            let mi: u64 = (*((ci + 56) as *mut u64))
+            if mi != 0 {
+                return datai + (((a - datai) * mi) >> 32) * blocki
+            }
+            return datai + (a - datai) / blocki * blocki
+        }
+        return 0
+    }
+    var c: u64 = (*((st + S_CHUNKS) as *mut u64))
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = (*((c + 16) as *mut u64))
+        let count: u64 = (*((c + 24) as *mut u64))
+        let end: u64 = data + block * count
+        if a >= data && a < end {
+            *((st + S_CHUNK_CACHE) as *mut u64) = c
+            let idx: u64 = (a - data) / block
+            return data + idx * block
+        }
+        c = (*((c) as *mut u64))
+    }
+    return 0
+}
+fn __gc_mark_push(obj: u64) {
+    let st: u64 = __gc_state() as u64
+    let len: u64 = (*((st + S_MLEN) as *mut u64))
+    let cap: u64 = (*((st + S_MKAP) as *mut u64))
+    if len >= cap {
+        *((st + S_OVERFLOW) as *mut u64) = 1
+    __gcp_burst(st, 0, 1)
+        *((st + S_NOV) as *mut u64) = (*((st + S_NOV) as *mut u64)) + 1
+        return
+    }
+    *(((*((st + S_MSTACK) as *mut u64)) + len * 8) as *mut u64) = obj
+    *((st + S_MLEN) as *mut u64) = len + 1
+}
+fn __gc_trace_slots(obj: u64) -> bool {
+    let n: u64 = __gc_ld64(obj)
+    let desc: u64 = __gc_ld64(obj +% 8)
+    let mask: u64 = desc >> 8
+    var i: u64 = __gc_ld64(obj +% 16)
+    if mask == 0 || i >= n {
+        __gc_st64(obj +% 16, 0)
+        return true
+    }
+    let step: u64 = desc & 255
+    let base: u64 = obj + SLOT_HEADER
+    var rest: u64 = SLOT_SLICE
+    if step == 1 {
+        while i < n && rest > 0 {
+            let v: u64 = __gc_ld64(base + i * 8)
+            if v != 0 {
+                __gc_mark(v)
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    } else {
+        while i < n && rest > 0 {
+            let e: u64 = base + i * step * 8
+            var j: u64 = 0
+            while j < step {
+                if ((mask >> j) & 1) != 0 {
+                    let v: u64 = __gc_ld64(e +% j *% 8)
+                    if v != 0 {
+                        __gc_mark(v)
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    }
+    if i >= n {
+        __gc_st64(obj +% 16, 0)
+        return true
+    }
+    __gc_st64(obj +% 16, i)
+    __gc_mark_push(obj)
+    return false
+}
+fn __gc_catchup() {
+    let st: u64 = __gc_state() as u64
+    var next: bool = true
+    while next {
+        next = false
+        if __gc_ld64(st +% S_OVERFLOW) == 0 {
+            return
+        }
+        __gc_st64(st +% S_OVERFLOW, 0)
+        var c: u64 = __gc_ld64(st +% S_CHUNKS)
+        while c != 0 {
+            let data: u64 = c + CHUNK_HEADER
+            let block: u64 = __gc_ld64(c +% 16)
+            let count: u64 = __gc_ld64(c +% 24)
+            var i: u64 = 0
+            while i < count {
+                let b: u64 = data + i * block
+                if __gc_ld32(b) != 0 && (__gc_ld32(b +% 4) & (M_MARK | F_PERM)) == 1 {
+                    __gc_trace(b + HEADER)
+                    __gc_drain()
+                    next = true
+                }
+                i = i + 1
+            }
+            c = __gc_ld64(c)
+        }
+    }
+}
+fn __gc_sweep() {
+    __gc_sweep_init()
+    while __gc_sweep_step(0) == 0 {
+    }
+    __gc_fin_all()
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st +% S_LIVE, __gc_ld64(st +% S_SWLEB))
+    __gc_st64(st +% S_LIVEBYTES, __gc_ld64(st +% S_SWLEBB))
+}
+fn __gc_scrub_deep(n: u64) {
+    var buffer: [u64; 512] = [0; 512]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 512 {
+        __gc_st64(p +% i *% 8, 0)
+        i = i + 1
+    }
+    if n > 0 {
+        __gc_scrub_deep(n - 1)
+    }
+}
+fn __gc_own_bottom(st: u64) -> u64 {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return __gc_ld64(st +% S_BOTTOM)
+    }
+    let b: u64 = __gc_ld64(tcb +% FT_BOTTOM)
+    if b == 0 {
+        return __gc_ld64(st +% S_BOTTOM)
+    }
+    return b
+}
+fn gc_bottom_swap(neu: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tcb: u64 = __thread_tcb()
+    if tcb != 0 && __gc_ld64(tcb +% FT_BOTTOM) != 0 {
+        let alt: u64 = __gc_ld64(tcb +% FT_BOTTOM)
+        __gc_st64(tcb +% FT_BOTTOM, neu)
+        return alt
+    }
+    let alt2: u64 = __gc_ld64(st +% S_BOTTOM)
+    __gc_st64(st +% S_BOTTOM, neu)
+    return alt2
+}
+fn __gc_collect_now() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_INIT) != 1 {
+        return 0
+    }
+    let t0: u64 = __gc_now_ns()
+    __gc_st64(st +% S_MLEN, 0)
+    __gc_st64(st +% S_OVERFLOW, 0)
+    __thread_lock_raw(st +% S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st +% S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    __gc_roots_scan()
+    __gc_threads_scan()
+    __gc_drain()
+    __gc_catchup()
+    __gc_perm_finish(st)
+    __gc_sweep()
+    if __gc_ld64(st + S_CARDON) != 0 && __gc_ld64(st + S_MULTI) == 0 {
+        __gc_cards_cycle_end(st)
+    }
+    __gc_st64(st + S_PAR, 2 - __gc_ld64(st + S_PAR))
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st + S_RUNS, __gc_ld64(st + S_RUNS) + 1)
+    __gc_st64(st + S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + duration)
+    let tf: u64 = st + S_PMAX_START + 4 * 8
+    if duration > __gc_ld64(tf) {
+        __gc_st64(tf, duration)
+    }
+    __gc_st64(st + S_TSUM_START + 4 * 8, __gc_ld64(st + S_TSUM_START + 4 * 8) + duration)
+    __gc_st64(st + S_TCNT_START + 4 * 8, __gc_ld64(st + S_TCNT_START + 4 * 8) + 1)
+    __gc_st64(st + S_FULL, __gc_ld64(st + S_FULL) + 1)
+    __gc_st64(st + S_TOTAL, __gc_ld64(st + S_TOTAL) + __gc_ld64(st + S_SINCE))
+    __gc_st64(st + S_SINCE, 0)
+    var limit: u64 = __gc_grow_limit(__gc_ld64(st + S_LIVEBYTES) + __gc_roots_bytes())
+    if limit < MIN_LIMIT {
+        limit = MIN_LIMIT
+    }
+    if limit > MAX_LIMIT {
+        limit = MAX_LIMIT
+    }
+    __gc_st64(st + S_LIMIT, limit)
+    return duration
+}
+fn __gc_chist_record(duration: u64) {
+    let st: u64 = __gc_state() as u64
+    let f: u64 = st +% S_CHIST + __gc_bucket(duration) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    if duration > __gc_ld64(st +% S_CSTOPMAX) {
+        __gc_st64(st +% S_CSTOPMAX, duration)
+    }
+}
+fn __gc_hist_record(duration: u64, ty: u64) {
+    let st: u64 = __gc_state() as u64
+    let i: u64 = __gc_bucket(duration)
+    let f: u64 = st +% S_HIST + (ty * HIST_FAECHER + i) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    if ty < 6 {
+        let g2: u64 = st +% S_HIST + (6 * HIST_FAECHER + i) * 8
+        __gc_st64(g2, __gc_ld64(g2) + 1)
+    }
+    if ty == 7 {
+        if duration > __gc_ld64(st +% S_STOPMAX) {
+            __gc_st64(st +% S_STOPMAX, duration)
+        }
+    }
+}
+fn gc_hist(ty: u64, i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    if ty >= HIST_TYPES {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 +% S_HIST +% (ty *% HIST_FAECHER +% i) *% 8)
+}
+fn gc_hist_reset() {
+    let st: u64 = __gc_state() as u64
+    var i: u64 = 0
+    while i < HIST_FAECHER * HIST_TYPES {
+        __gc_st64(st +% S_HIST +% i *% 8, 0)
+        i = i + 1
+    }
+    __gc_st64(st +% S_STOPMAX, 0)
+    var j: u64 = 0
+    while j < HIST_FAECHER {
+        __gc_st64(st +% S_CHIST +% j *% 8, 0)
+        j = j + 1
+    }
+    __gc_st64(st +% S_CSTOPMAX, 0)
+}
+fn gc_chist(i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 +% S_CHIST +% i *% 8)
+}
+fn gc_cpu_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_CSTOPMAX)
+}
+fn gc_set_cpu_clock(an: u64) {
+    __gc_st64(__gc_state() as u64 +% S_CPUUHR, an)
+}
+fn gc_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_STOPMAX)
+}
+fn __gc_pause_record_h(t0: u64, ty: u64, htyp: u64) {
+    let st: u64 = __gc_state() as u64
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st +% S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st +% S_PZYK) {
+        __gc_st64(st +% S_PZYK, duration)
+    }
+    if duration > __gc_ld64(st +% S_PAUSE_MAX) {
+        __gc_st64(st +% S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st +% S_PAUSE_TOTAL, __gc_ld64(st +% S_PAUSE_TOTAL) + duration)
+    let tfield: u64 = st +% S_PMAX_START + ty * 8
+    if duration > __gc_ld64(tfield) {
+        __gc_st64(tfield, duration)
+    }
+    if ty < 5 {
+        __gc_st64(st +% S_TSUM_START +% ty *% 8, __gc_ld64(st +% S_TSUM_START +% ty *% 8) + duration)
+        __gc_st64(st +% S_TCNT_START +% ty *% 8, __gc_ld64(st +% S_TCNT_START +% ty *% 8) + 1)
+    }
+    __gc_hist_record(duration, htyp)
+}
+fn __gc_pause_record_fin(t0: u64) {
+    let st: u64 = __gc_state() as u64
+    let t1: u64 = __gc_now_ns()
+    var duration: u64 = 0
+    if t1 > t0 {
+        duration = t1 - t0
+    }
+    __gc_st64(st +% S_PAUSE_LAST, duration)
+    if duration > __gc_ld64(st +% S_PZYK) {
+        __gc_st64(st +% S_PZYK, duration)
+    }
+    if duration > __gc_ld64(st +% S_PAUSE_MAX) {
+        __gc_st64(st +% S_PAUSE_MAX, duration)
+    }
+    __gc_st64(st +% S_PAUSE_TOTAL, __gc_ld64(st +% S_PAUSE_TOTAL) + duration)
+    if duration > __gc_ld64(st +% S_PMAX_FIN) {
+        __gc_st64(st +% S_PMAX_FIN, duration)
+    }
+    __gc_hist_record(duration, 6)
+}
+fn gc_overflows() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_NOV)
+}
+fn gc_full_runs() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_FULL)
+}
+fn gc_pause_max_ty(ty: u64) -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_PMAX_START +% ty *% 8)
+}
+fn __gc_cycle_start() {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_now_ns()
+    __gc_st64(st +% S_MLEN, 0)
+    __gc_st64(st +% S_OVERFLOW, 0)
+    __gc_scrub()
+    __thread_lock_raw(st +% S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st +% S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    __gc_roots_scan()
+    __gc_threads_scan()
+    __gc_st64(st +% S_SCHRT, __gc_ld64(st +% S_SINCE))
+    __gc_st64(st +% S_PZYK, 0)
+    __gc_st64(st +% S_PHASE, 1)
+    __gc_pause_record(t0, 0)
+}
+fn __gc_cycle_end() {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_now_ns()
+    __gc_drain()
+    __gc_catchup()
+    __gc_drain()
+    if __gc_ld64(st + S_CARDON) != 0 && __gc_ld64(st + S_MULTI) == 0 {
+        __gc_cards_cycle_end(st)
+    }
+    __gc_st64(st + S_LIVE, __gc_ld64(st + S_SWLEB))
+    __gc_st64(st + S_LIVEBYTES, __gc_ld64(st + S_SWLEBB))
+    var limit: u64 = __gc_grow_limit(__gc_ld64(st + S_LIVEBYTES) + __gc_roots_bytes())
+    if limit < MIN_LIMIT {
+        limit = MIN_LIMIT
+    }
+    if limit > MAX_LIMIT {
+        limit = MAX_LIMIT
+    }
+    __gc_st64(st + S_LIMIT, limit)
+    __gc_st64(st + S_TOTAL, __gc_ld64(st + S_TOTAL) + __gc_ld64(st + S_SINCE))
+    __gc_st64(st + S_SINCE, 0)
+    __gc_st64(st + S_SCHRT, 0)
+    __gc_st64(st + S_RUNS, __gc_ld64(st + S_RUNS) + 1)
+    __gc_st64(st + S_PAR, 2 - __gc_ld64(st + S_PAR))
+    __gc_st64(st + S_PHASE, 0)
+    __gc_pause_record(t0, 3)
+    __gc_st64(st + S_PAUSE_LAST, __gc_ld64(st + S_PZYK))
+}
+fn __gc_roots_rescan() {
+    let st: u64 = __gc_state() as u64
+    __thread_lock_raw(st +% S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st +% S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    __gc_roots_scan()
+    __gc_threads_scan()
+    __gc_drain()
+    __gc_catchup()
+    __gc_perm_finish(st)
+}
+fn __gc_perm_child(v: u64, verify: u64) {
+    if verify == 0 {
+        __gc_mark(v)
+        return
+    }
+    let b: u64 = __gc_block_of(v)
+    if b == 0 {
+        return
+    }
+    if __gc_ld32(b) == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    let zw: u32 = __gc_ld32(b +% 4)
+    if (zw & F_PERM) != 0 {
+        return
+    }
+    if (zw & M_MARK) == (__gc_ld64(st +% S_PAR) as u32) {
+        __gc_st64(st +% S_PERM_VIOL, __gc_ld64(st +% S_PERM_VIOL) + 1)
+    }
+}
+fn __gc_perm_walk(obj: u64, verify: u64) {
+    let st: u64 = __gc_state() as u64
+    let b: u64 = obj - HEADER
+    let zw: u32 = __gc_ld32(b +% 4)
+    let hlo: u64 = __gc_ld64(st +% S_HEAPLO)
+    let hhi: u64 = __gc_ld64(st +% S_HEAPHI)
+    if (zw & F_SLOTS) != 0 {
+        let n: u64 = __gc_ld64(obj)
+        let desc: u64 = __gc_ld64(obj +% 8)
+        let mask: u64 = desc >> 8
+        let step: u64 = desc & 255
+        if mask == 0 {
+            return
+        }
+        let base: u64 = obj + SLOT_HEADER
+        var i: u64 = 0
+        while i < n {
+            var j: u64 = 0
+            while j < step {
+                if ((mask >> j) & 1) != 0 {
+                    let v: u64 = __gc_ld64(base +% (i *% step +% j) *% 8)
+                    if v >= hlo && v < hhi {
+                        __gc_perm_child(v, verify)
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return
+    }
+    let tid: u64 = __gc_ld32(b) as u64
+    let tab: u64 = __gc_ld64(st +% S_TABLE)
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let entry: u64 = tab + 8 + (tid - 1) * 64
+    let n: u64 = __gc_ld64(entry +% 16)
+    let offs: u64 = __gc_ld64(entry +% 24)
+    var i: u64 = 0
+    while i < n {
+        let v: u64 = __gc_ld64(obj +% __gc_ld64(offs +% i *% 8))
+        if v >= hlo && v < hhi {
+            __gc_perm_child(v, verify)
+        }
+        i = i + 1
+    }
+}
+fn __gc_perm_scan(st: u64) {
+    let n: u64 = __gc_ld64(st +% S_PERM_N)
+    let tab: u64 = __gc_ld64(st +% S_PERM_TAB)
+    var sh: u64 = __gc_ld64(st +% S_PERM_SHD)
+    var dirty: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let b: u64 = __gc_ld64(tab +% i *% 16)
+        let words: u64 = (__gc_ld64(tab +% i *% 16 +% 8) - HEADER) / 8
+        let cur: u64 = b + HEADER
+        var w: u64 = 0
+        var diff: bool = false
+        while w + 1 < words {
+            if __gc_ld64(cur +% w *% 8) != __gc_ld64(sh +% w *% 8) || __gc_ld64(cur +% w *% 8 +% 8) != __gc_ld64(sh +% w *% 8 +% 8) {
+                diff = true
+                break
+            }
+            w = w + 2
+        }
+        if !diff && w < words {
+            if __gc_ld64(cur +% w *% 8) != __gc_ld64(sh +% w *% 8) {
+                diff = true
+            }
+        }
+        if diff && __gc_ld32(b) != 0 && (__gc_ld32(b +% 4) & F_PERM) != 0 {
+            dirty = dirty + 1
+            __gc_perm_walk(cur, 0)
+        }
+        sh = sh + words * 8
+        i = i + 1
+    }
+    __gc_st64(st +% S_PERM_DIRTY, dirty)
+    __gc_st64(st +% S_PERM_TRACED, __gc_ld64(st +% S_PERM_TRACED) + dirty)
+    __gc_st64(st +% S_PERM_SCANS, __gc_ld64(st +% S_PERM_SCANS) + 1)
+}
+fn __gc_perm_verify(st: u64) {
+    let n: u64 = __gc_ld64(st +% S_PERM_N)
+    let tab: u64 = __gc_ld64(st +% S_PERM_TAB)
+    var i: u64 = 0
+    while i < n {
+        let b: u64 = __gc_ld64(tab +% i *% 16)
+        if __gc_ld32(b) != 0 && (__gc_ld32(b +% 4) & F_PERM) != 0 {
+            __gc_perm_walk(b + HEADER, 1)
+        }
+        i = i + 1
+    }
+}
+fn __gc_perm_finish(st: u64) {
+    let mode: u64 = __gc_ld64(st +% S_PERM_MODE)
+    if mode == 0 {
+        return
+    }
+    __gc_perm_scan(st)
+    __gc_drain()
+    __gc_catchup()
+    __gc_drain()
+    if mode == 2 {
+        __gc_perm_verify(st)
+    }
+}
+fn gc_perm_seal(mode: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if mode == 0 || mode > 2 {
+        return 0
+    }
+    if __gc_ld64(st +% S_INIT) != 1 || __gc_ld64(st +% S_PERM_MODE) != 0 || __gc_ld64(st +% S_MULTI) != 0 {
+        return 0
+    }
+    gc_collect()
+    if __gc_ld64(st +% S_PHASE) != 0 {
+        return 0
+    }
+    var n: u64 = 0
+    var bytes: u64 = 0
+    var c: u64 = __gc_ld64(st +% S_CHUNKS)
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c +% 16)
+        let count: u64 = __gc_ld64(c +% 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            if __gc_ld32(b) != 0 && (__gc_ld32(b +% 4) & F_WART) == 0 {
+                n = n + 1
+                bytes = bytes + block - HEADER
+            }
+            i = i + 1
+        }
+        c = __gc_ld64(c)
+    }
+    if n == 0 || bytes > PERM_MAX_BYTES {
+        return 0
+    }
+    let tab: u64 = __gc_mmap(n * 16)
+    if tab == 0 {
+        return 0
+    }
+    let shd: u64 = __gc_mmap(bytes)
+    if shd == 0 {
+        __gc_munmap(tab, n * 16)
+        return 0
+    }
+    var k: u64 = 0
+    var sh: u64 = shd
+    c = __gc_ld64(st +% S_CHUNKS)
+    while c != 0 {
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c +% 16)
+        let count: u64 = __gc_ld64(c +% 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let zw: u32 = __gc_ld32(b +% 4)
+            if __gc_ld32(b) != 0 && (zw & F_WART) == 0 {
+                __gc_st64(tab +% k *% 16, b)
+                __gc_st64(tab +% k *% 16 +% 8, block)
+                var w: u64 = 0
+                let words: u64 = (block - HEADER) / 8
+                while w < words {
+                    __gc_st64(sh +% w *% 8, __gc_ld64(b +% HEADER +% w *% 8))
+                    w = w + 1
+                }
+                sh = sh + words * 8
+                __gc_st32(b +% 4, (zw & M_WITHOUT_MARK) | 1 | F_PERM)
+                k = k + 1
+            }
+            i = i + 1
+        }
+        c = __gc_ld64(c)
+    }
+    __gc_st64(st +% S_PERM_N, n)
+    __gc_st64(st +% S_PERM_TAB, tab)
+    __gc_st64(st +% S_PERM_SHD, shd)
+    __gc_st64(st +% S_PERM_BYTES, bytes)
+    __gc_st64(st +% S_PERM_MODE, mode)
+    return n
+}
+fn gc_perm_diag(k: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if k == 0 {
+        return __gc_ld64(st +% S_PERM_MODE)
+    }
+    if k == 1 {
+        return __gc_ld64(st +% S_PERM_N)
+    }
+    if k == 2 {
+        return __gc_ld64(st +% S_PERM_BYTES)
+    }
+    if k == 3 {
+        return __gc_ld64(st +% S_PERM_SCANS)
+    }
+    if k == 4 {
+        return __gc_ld64(st +% S_PERM_DIRTY)
+    }
+    if k == 5 {
+        return __gc_ld64(st +% S_PERM_TRACED)
+    }
+    return __gc_ld64(st +% S_PERM_VIOL)
+}
+fn __gc_cycle_step() {
+    let st: u64 = __gc_state() as u64
+    let phase: u64 = __gc_ld64(st +% S_PHASE)
+    if phase == 1 {
+        __gc_diag_inc(S_D_SCH_MARK)
+        var t0: u64 = __gc_now_ns()
+        if __gc_ld64(st +% S_HOOK) != 0 && t0 >= __gc_ld64(st +% S_HOOK_NEXT) {
+            t0 = __gc_hook_run(st, t0)
+        }
+        var n: u64 = __gc_ld64(st +% S_SLICE)
+        if n == 0 {
+            n = SLICE_TRACE
+        }
+        var budget: u64 = __gc_ld64(st +% S_ZBUDGET)
+        if budget == 0 {
+            budget = TIME_BUDGET_NS
+        }
+        var probe: u64 = TIME_PROBE
+        __gcp_burst(st, t0, 0)
+        while __gc_ld64(st +% S_MLEN) > 0 && n > 0 {
+            let len: u64 = __gc_ld64(st +% S_MLEN) - 1
+            __gc_st64(st +% S_MLEN, len)
+            let obj: u64 = __gc_ld64(__gc_ld64(st +% S_MSTACK) +% len *% 8)
+            __gc_trace(obj)
+            n = n - 1
+            probe = probe - 1
+            if probe == 0 {
+                probe = TIME_PROBE
+                if __gc_now_ns() - t0 >= budget {
+                    n = 0
+                }
+            }
+        }
+        __gc_pause_record(t0, 1)
+        if __gc_ld64(st +% S_MLEN) == 0 {
+            if __gc_ld64(st +% S_OVERFLOW) != 0 {
+                let t1: u64 = __gc_now_ns()
+                __gc_catchup()
+                __gc_pause_record_h(t1, 1, 5)
+            }
+            if __gc_ld64(st +% S_MLEN) == 0 {
+                __gc_roots_rescan()
+            }
+            if __gc_ld64(st +% S_MLEN) == 0 {
+                __gc_sweep_init()
+                __gc_st64(st +% S_PHASE, 2)
+            }
+        }
+        return
+    }
+    if phase == 2 {
+        __gc_diag_inc(S_D_SCH_SWEEP)
+        var t0: u64 = __gc_now_ns()
+        if __gc_ld64(st +% S_HOOK) != 0 && t0 >= __gc_ld64(st +% S_HOOK_NEXT) {
+            t0 = __gc_hook_run(st, t0)
+        }
+        let done: u64 = __gc_sweep_step(t0)
+        __gc_pause_record(t0, 2)
+        if done == 1 {
+            if __gc_ld64(st +% S_FINQ) != 0 {
+                __gc_st64(st +% S_PHASE, 3)
+            } else {
+                __gc_cycle_end()
+            }
+        }
+        return
+    }
+    if phase == 3 {
+        if __gc_fin_slice() == 1 {
+            __gc_cycle_end()
+        }
+        return
+    }
+}
+fn __gc_cycle_done() {
+    let st: u64 = __gc_state() as u64
+    let phase: u64 = __gc_ld64(st +% S_PHASE)
+    if phase == 1 {
+        __gc_drain()
+        __gc_catchup()
+        __gc_roots_rescan()
+        __gc_sweep_init()
+        __gc_st64(st +% S_PHASE, 2)
+    }
+    if __gc_ld64(st +% S_PHASE) == 2 {
+        while __gc_sweep_step(0) == 0 {
+        }
+        __gc_st64(st +% S_PHASE, 3)
+    }
+    if __gc_ld64(st +% S_PHASE) == 3 {
+        __gc_fin_all()
+        __gc_cycle_end()
+    }
+}
+fn __gc_alloc_locked(st: u64) {
+    if __gc_ld64(st +% S_INIT) == 0 {
+        __gc_abort(70)
+    }
+    __gc_error_fin_alloc()
+}
+fn __gc_barrier(field: *mut u8, value: *mut u8) {
+    let st: u64 = __gc_state() as u64
+    if (field as u64) == 0 && (value as u64) == 0 {
+        return
+    }
+    __gc_st64(st + S_BARRIEREN, __gc_ld64(st + S_BARRIEREN) + 1)
+    if __gc_ld64(st + S_CARDON) != 0 {
+        __gc_card_mark(st, field as u64)
+    }
+    if __gc_ld64(st + S_PHASE) != 0 {
+        __gc_barrier_cycle(st, value)
+    }
+}
+fn __gc_barrier_slow(field: *mut u8, value: *mut u8) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_CARDON) != 0 {
+        __gc_card_mark(st, field as u64)
+    }
+    if __gc_ld64(st + S_PHASE) != 0 {
+        __gc_barrier_cycle(st, value)
+    }
+}
+fn __gc_barrier_cycle(st: u64, value: *mut u8) {
+    if __gc_ld64(st +% S_INIT) != 1 {
+        __gc_error_fin_again()
+    }
+    if __gc_ld64(st + S_MULTI) != 0 {
+        __thread_lock(st + S_LOCK)
+        __gc_mark(value as u64)
+        __thread_unlock(st + S_LOCK)
+        return
+    }
+    __gc_mark(value as u64)
+}
+fn gc_finalizer_set(p: *mut u8, kind: u64) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    if kind == 0 || kind > KIND_MAX {
+        return false
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return false
+    }
+    if b + HEADER != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, (zw & (M_MARK | F_PERM)) | F_FIN | ((kind as u32) << 8))
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_FIN_REG, __gc_ld64(st + S_FIN_REG) + 1)
+    return true
+}
+fn gc_finalizer_delete(p: *mut u8) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    let b: u64 = __gc_block_of(a)
+    if b == 0 {
+        return false
+    }
+    if b + HEADER != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) == 0 {
+        return false
+    }
+    if (zw & F_WART) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, zw & (M_MARK | F_PERM))
+    return true
+}
+fn __gc_weak_present() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st +% S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    let n: u64 = __gc_ld64(tab)
+    var i: u64 = 0
+    while i < n {
+        if __gc_ld64(tab + 8 + i * 64 + 32) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+fn gc_collect() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_INIT) != 1 {
+        if __gc_ld64(st + S_INIT) == 2 {
+            __gc_error_fin_collect()
+        }
+        return 0
+    }
+    let multi: u64 = __gc_ld64(st + S_MULTI)
+    if multi != 0 {
+        __thread_safepoint()
+        __thread_lock(st + S_LOCK)
+        __gc_stw_an()
+    }
+    if __gc_ld64(st + S_PHASE) != 0 {
+        __gc_cycle_done()
+    }
+    __gc_scrub()
+    let d: u64 = __gc_collect_now()
+    if multi != 0 {
+        __gc_stw_out()
+        __thread_unlock(st + S_LOCK)
+    }
+    return d
+}
+fn gc_refs_to(holder: u64, target: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st +% S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u64 = __gc_ld32(b) as u64
+            if tid != 0 && tid <= __gc_ld64(tab) {
+                if holder == 0 || tid == holder {
+                    let obj: u64 = b + HEADER
+                    let entry: u64 = tab + 8 + (tid - 1) * 64
+                    let n: u64 = __gc_ld64(entry +% 16)
+                    let offs: u64 = __gc_ld64(entry +% 24)
+                    var k: u64 = 0
+                    while k < n {
+                        let z: u64 = __gc_ld64(obj +% __gc_ld64(offs +% k *% 8))
+                        if z > HEADER && __gc_block_of(z) == z - HEADER {
+                            if __gc_ld32(z - HEADER) as u64 == target {
+                                hits = hits + 1
+                            }
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+fn gc_slot_refs_to(target: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st +% S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c +% 16)
+        let count: u64 = __gc_ld64(c +% 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u64 = __gc_ld32(b) as u64
+            if tid != 0 && (__gc_ld32(b +% 4) & F_SLOTS) != 0 {
+                let obj: u64 = b + HEADER
+                let n: u64 = __gc_ld64(obj)
+                let desc: u64 = __gc_ld64(obj +% 8)
+                let mask: u64 = desc >> 8
+                if mask != 0 {
+                    let step: u64 = desc & 255
+                    let base: u64 = obj + SLOT_HEADER
+                    var k: u64 = 0
+                    while k < n {
+                        var j: u64 = 0
+                        while j < step {
+                            if ((mask >> j) & 1) != 0 {
+                                let v: u64 = __gc_ld64(base +% (k *% step +% j) *% 8)
+                                if v > HEADER {
+                                    if __gc_block_of(v) == v - HEADER {
+                                        if __gc_ld32(v - HEADER) as u64 == target {
+                                            hits = hits + 1
+                                        }
+                                    }
+                                }
+                            }
+                            j = j + 1
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+fn gc_pause_reset() {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st +% S_PAUSE_MAX, 0)
+    __gc_st64(st +% S_PZYK, 0)
+    __gc_st64(st +% S_STOPMAX, 0)
+    __gc_st64(st +% S_CSTOPMAX, 0)
+    var i: u64 = 0
+    while i < 5 {
+        __gc_st64(st +% S_PMAX_START +% i *% 8, 0)
+        i = i + 1
+    }
+    __gc_st64(st +% S_PMAX_FIN, 0)
+}
+fn gc_set_step_hook(code: u64, gap_ns: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st +% S_HOOK_GAP, gap_ns)
+    __gc_st64(st +% S_HOOK_NEXT, 0)
+    __gc_st64(st +% S_HOOK, code)
+}
+fn gc_step_hook_count() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_HOOK_N)
+}
+fn __thread_tcb() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_THREAD_TAB) == 0 {
+        return 0
+    }
+    return __thread_self() as u64
+}
+fn __thread_lock_slow(a: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st +% S_SPERR_W, __gc_ld64(st +% S_SPERR_W) + 1)
+    __thread_blocked_an()
+    var c: u64 = __thread_swap(a, 2)
+    while c != 0 {
+        __thread_futex_wait(a, 2)
+        c = __thread_swap(a, 2)
+    }
+    __thread_blocked_out()
+}
+fn __thread_state_report(z: u64) {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    __thread_lock_raw(st +% S_REGSPERRE)
+    let g: u64 = __gc_save_regs() as u64
+    var i: u64 = 0
+    while i < 6 {
+        __gc_st64(tcb +% FT_REGS +% i *% 8, __gc_ld64(g +% S_REGS +% i *% 8))
+        i = i + 1
+    }
+    __thread_unlock_raw(st +% S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_st64(tcb +% FT_SP, sp)
+    __gc_st64(tcb +% FT_STATE, z)
+}
+fn __thread_blocked_out() {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return
+    }
+    __gc_st64(tcb +% FT_STATE, Z_LAUFEND)
+    __thread_safepoint()
+}
+fn __thread_safepoint() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_STOPP) == 0 {
+        return
+    }
+    __thread_park()
+}
+fn __thread_park() {
+    let st: u64 = __gc_state() as u64
+    __thread_state_report(Z_GEPARKT)
+    while __gc_ld64(st +% S_STOPP) != 0 {
+        __thread_futex_wait(st +% S_STOPP, 1)
+    }
+    let tcb: u64 = __thread_tcb()
+    if tcb != 0 {
+        __gc_st64(tcb +% FT_STATE, Z_LAUFEND)
+    }
+}
+fn __gc_threads_scan() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_MULTI) == 0 {
+        return
+    }
+    let tab: u64 = __gc_ld64(st +% S_THREAD_TAB)
+    if tab == 0 {
+        return
+    }
+    let slf: u64 = __thread_tcb()
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
+    var i: u64 = 0
+    while i < hi {
+        let t: u64 = tab + i * FT_BYTES
+        let z: u64 = __gc_ld64(t +% FT_STATE)
+        if t != slf && z != Z_FREE {
+            __gc_scan(t + FT_REGS, t + FT_REGS + 48)
+            __gc_scan(t + FT_RES, t + FT_RES + 8)
+            if z != Z_DEAD {
+                let sp: u64 = __gc_ld64(t +% FT_SP)
+                let bottom: u64 = __gc_ld64(t +% FT_BOTTOM)
+                if sp != 0 && bottom > sp && (__gc_ld64(t + FT_HOST) != 1 || __thread_stack_mapped(sp, bottom)) {
+                    __gc_scan(sp, bottom)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+fn thread_init() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st +% S_THREAD_TAB) != 0 {
+        return true
+    }
+    if __gc_ld64(st +% S_INIT) != 1 {
+        if !gc_init() {
+            return false
+        }
+    }
+    let tab: u64 = __gc_mmap(THREAD_MAX * FT_BYTES)
+    if tab == 0 {
+        return false
+    }
+    __gc_st64(tab + FT_SELF, tab)
+    __gc_st64(tab + FT_STATE, Z_LAUFEND)
+    __gc_st64(tab + FT_BOTTOM, __gc_ld64(st + S_BOTTOM))
+    __gc_st64(tab + FT_TID, __thread_gettid())
+    __gc_st64(st + S_MAIN, tab)
+    __gc_st64(st + S_THREAD_MAX, THREAD_MAX)
+    __gc_st64(st + S_THREAD_HI, 1)
+    __gc_st64(st + S_THREAD_N, 1)
+    if __gc_ld64(st + S_STAPELN) == 0 {
+        __gc_st64(st + S_STAPELN, STACK_BYTES)
+    }
+    if syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tab as i64, 0, 0, 0, 0) == THREAD_NO_SLOT {
+        __gc_munmap(tab, THREAD_MAX * FT_BYTES)
+        __gc_st64(st + S_MAIN, 0)
+        __gc_st64(st + S_THREAD_HI, 0)
+        __gc_st64(st + S_THREAD_N, 0)
+        return false
+    }
+    __gc_st64(st + S_THREAD_TAB, tab)
+    return true
+}
+fn thread_count() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_THREAD_N)
+}
+fn thread_started() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_THREAD_TOTAL)
+}
+fn thread_multi_threaded() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_MULTI)
+}
+fn gc_stw_runs() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_STW_N)
+}
+fn gc_stw_wait_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_STW_MAX)
+}
+fn gc_stw_work_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_STW_WORK_MAX)
+}
+fn gc_stw_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_STW_NS)
+}
+fn gc_lock_maintenance() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_SPERR_W)
+}
+fn gc_local_refills() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_LOCAL_N)
+}
+fn gc_set_local(an: u64) {
+    __gc_st64(__gc_state() as u64 +% S_LOCAL, an)
+}
+fn gc_local() -> u64 {
+    return __gc_ld64(__gc_state() as u64 +% S_LOCAL)
+}
+fn __thread_block_local(tcb: u64, class: u64) -> u64 {
+    let header: u64 = tcb + FT_FREE + class * 8
+    let b: u64 = __gc_ld64(header)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(header, __gc_ld64(b +% HEADER))
+    __gc_st64(tcb +% FT_FREIN, __gc_ld64(tcb +% FT_FREIN) - 1)
+    return b
+}
+fn __thread_refill(tcb: u64, class: u64, size: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let source: u64 = st +% S_FREE + class * 8
+    let target: u64 = tcb + FT_FREE + class * 8
+    var n: u64 = 0
+    while n < SCHWUNG {
+        var b: u64 = __gc_ld64(source)
+        if b == 0 {
+            if __gc_chunk_new(class, size) == 0 {
+                n = SCHWUNG
+            } else {
+                b = __gc_ld64(source)
+            }
+        }
+        if b != 0 {
+            __gc_st64(source, __gc_ld64(b +% HEADER))
+            __gc_st64(b +% HEADER, __gc_ld64(target))
+            __gc_st64(target, b)
+            __gc_st64(tcb +% FT_FREIN, __gc_ld64(tcb +% FT_FREIN) + 1)
+            n = n + 1
+        } else {
+            n = SCHWUNG
+        }
+    }
+    __gc_st64(st +% S_LOCAL_N, __gc_ld64(st +% S_LOCAL_N) + 1)
+    return __gc_ld64(target)
+}
+fn __thread_lists_back(tcb: u64) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(tcb +% FT_FREIN) == 0 {
+        return
+    }
+    var k: u64 = 0
+    while k < CLASSES {
+        let header: u64 = tcb + FT_FREE + k * 8
+        var b: u64 = __gc_ld64(header)
+        while b != 0 {
+            let n: u64 = __gc_ld64(b +% HEADER)
+            __gc_st64(b +% HEADER, __gc_ld64(st +% S_FREE +% k *% 8))
+            __gc_st64(st +% S_FREE +% k *% 8, b)
+            b = n
+        }
+        __gc_st64(header, 0)
+        k = k + 1
+    }
+    __gc_st64(tcb +% FT_FREIN, 0)
+}
+fn thread_channel_new(cap: u64) -> u64 {
+    if cap == 0 {
+        return 0
+    }
+    let bytes: u64 = KA_DATA + cap * 8
+    let k: u64 = __gc_mmap(bytes)
+    if k == 0 {
+        return 0
+    }
+    __gc_st64(k +% KA_CAP, cap)
+    __gc_st64(k +% KA_BYTES, bytes)
+    return k
+}
+fn thread_channel_free(k: u64) {
+    if k == 0 {
+        return
+    }
+    __gc_munmap(k, __gc_ld64(k +% KA_BYTES))
+}
+fn thread_channel_send(k: u64, v: u64) {
+    let cap: u64 = __gc_ld64(k +% KA_CAP)
+    var done: bool = false
+    while !done {
+        __thread_lock(k + KA_LOCK)
+        if __gc_ld64(k +% KA_USED) < cap {
+            let s: u64 = __gc_ld64(k +% KA_TAIL)
+            __gc_st64(k +% KA_DATA +% s *% 8, v)
+            __gc_st64(k +% KA_TAIL, (s + 1) % cap)
+            __gc_st64(k +% KA_USED, __gc_ld64(k +% KA_USED) + 1)
+            __thread_unlock(k + KA_LOCK)
+            __thread_futex_wake(k + KA_USED, THREAD_MAX)
+            done = true
+        } else {
+            __thread_unlock(k + KA_LOCK)
+            __thread_blocked_an()
+            __thread_futex_wait(k + KA_USED, cap)
+            __thread_blocked_out()
+        }
+    }
+}
+fn thread_channel_receive(k: u64) -> u64 {
+    let cap: u64 = __gc_ld64(k +% KA_CAP)
+    var out: u64 = 0
+    var done: bool = false
+    while !done {
+        __thread_lock(k + KA_LOCK)
+        if __gc_ld64(k +% KA_USED) > 0 {
+            let h: u64 = __gc_ld64(k +% KA_HEADER)
+            out = __gc_ld64(k +% KA_DATA +% h *% 8)
+            __gc_st64(k +% KA_HEADER, (h + 1) % cap)
+            __gc_st64(k +% KA_USED, __gc_ld64(k +% KA_USED) - 1)
+            __thread_unlock(k + KA_LOCK)
+            __thread_futex_wake(k + KA_USED, THREAD_MAX)
+            done = true
+        } else {
+            __thread_unlock(k + KA_LOCK)
+            __thread_blocked_an()
+            __thread_futex_wait(k + KA_USED, 0)
+            __thread_blocked_out()
+        }
+    }
+    return out
+}
+fn thread_channel_used(k: u64) -> u64 {
+    return __gc_ld64(k +% KA_USED)
+}
+fn __thread_entry(tcb: u64) -> i32 {
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
+    if __gc_ld64(tcb +% FT_KIND) == GCP_KIND {
+        return __gcp_helper_main(tcb)
+    }
+    __gc_st64(tcb + FT_STATE, Z_LAUFEND)
+    let r: u64 = __thread_work(__gc_ld64(tcb + FT_KIND), __gc_ld64(tcb + FT_ARG))
+    __gc_st64(tcb + FT_RES, r)
+    __thread_lists_back_locked(tcb)
+    __gc_st64(tcb + FT_STATE, Z_DEAD)
+    let st: u64 = __gc_state() as u64
+    __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
+    return 0
+}
