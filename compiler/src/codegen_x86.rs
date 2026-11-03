@@ -2150,6 +2150,12 @@ fn emit_bin(
             e.line("ror eax, cl");
             store_dst(e, fr, d, "rax");
         }
+        BinOp::Rotl => {
+            load_full(e, fr, "rax", a);
+            load_full(e, fr, "rcx", b);
+            e.line(&format!("rol {}, cl", reg("rax", bits)));
+            store_dst(e, fr, d, "rax");
+        }
         BinOp::Shl | BinOp::Shr => {
             // Widen the left operand exactly, so that `shr`/`sar` pull the right
             // bits along for 8/16-bit types too.

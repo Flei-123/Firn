@@ -126,6 +126,8 @@ mod sema_generic;
 mod sema_match;
 mod peephole;
 mod rotate;
+mod rotl;
+mod ifconv;
 mod bitsel;
 mod bswapload;
 mod buildcache;

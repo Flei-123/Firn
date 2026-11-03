@@ -93,6 +93,10 @@ thread_local! {
 }
 
 /// Copy of the table for worker threads (`parfn.rs`).
+fn range_div_enabled() -> bool {
+    std::env::var_os("FIRN_NO_RANGEDIV").is_none()
+}
+
 pub(crate) fn len_getters_get() -> HashMap<String, i128> {
     LEN_GETTERS.with(|g| g.borrow().clone())
 }
@@ -460,6 +464,23 @@ impl<'a> Ana<'a> {
                 } else {
                     None
                 }
+            }
+            Op::Bin(BinOp::Div, a, b) | Op::CheckedDiv { op: BinOp::Div, a, b, .. } if range_div_enabled() => {
+                let k = cst(*b)?;
+                if k == 0 || k == -1 {
+                    return None;
+                }
+                let ra = self.range_x(*a, at, depth, use_facts, ex)?;
+                let (x, y) = (ra.0 / k, ra.1 / k);
+                Some((x.min(y), x.max(y)))
+            }
+            Op::Bin(BinOp::Shr, a, b) if signed && range_div_enabled() => {
+                let k = cst(*b)?;
+                if k < 0 || k >= t.bits() as i128 {
+                    return None;
+                }
+                let ra = self.range_x(*a, at, depth, use_facts, ex)?;
+                Some((ra.0 >> k, ra.1 >> k))
             }
             // ROUND 89's checked index hands back an index below the length.
             Op::CheckedIdx { len, .. } => Some((0, (*len as i128) - 1)),
