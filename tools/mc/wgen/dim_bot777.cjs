@@ -103,7 +103,7 @@ function onPosition(body) {
   c.at += 24
   const yaw = body.readFloatBE(c.at), pitch = body.readFloatBE(c.at + 4)
   out.events.push(`position ${current} ${x} ${y} ${z}`)
-  send(C2S.teleportConfirm, varint(id))
+  send(C2S.teleportConfirm, Buffer.concat([varint(id), f64(x), f64(y), f64(z), f32(yaw), f32(pitch)]))
   send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(yaw), f32(pitch), Buffer.from([1])]))
   if (!started) {
     started = true

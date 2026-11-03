@@ -109,7 +109,7 @@ function onPosition(body) {
   const yaw = body.readFloatBE(c.at), pitch = body.readFloatBE(c.at + 4)
   pos = { x, y, z }
   out.events.push(`position ${current} ${x.toFixed(2)} ${y.toFixed(2)} ${z.toFixed(2)}`)
-  send(C2S.teleportConfirm, varint(id))
+  send(C2S.teleportConfirm, Buffer.concat([varint(id), f64(x), f64(y), f64(z), f32(yaw), f32(pitch)]))
   send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(yaw), f32(pitch), Buffer.from([1])]))
   if (!started) {
     started = true
@@ -127,12 +127,12 @@ async function until(cond, ms) { const t0 = Date.now(); while (!cond() && Date.n
 const respawns = () => out.events.filter((e) => /^respawn/.test(e)).length
 const place = (x, y, z) => send(C2S.blockPlace, Buffer.concat([varint(0), packPos(x, y - 1, z), varint(1), f32(0.5), f32(1), f32(0.5), Buffer.from([0, 0]), varint(++seq)]))
 const give = (slot, id, n) => send(C2S.creativeSlot, Buffer.concat([i16(slot), varint(n), varint(id), varint(0), varint(0)]))
-const move = (x, y, z) => send(C2S.chatCommand, str(`tp ${x} ${y} ${z}`))
+const move = (x, y, z) => send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(0), f32(0), Buffer.from([1])]))
 
 async function run() {
   setTimeout(finish, 110000)
   await sleep(1500)
-  send(C2S.chatCommand, str('tp 10.5 150 3.5'))
+  move(10.5, 150, 3.5)
   await sleep(1500)
   give(36, OBSIDIAN, 64)
   give(37, FLINT, 1)
