@@ -6762,7 +6762,15 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
     let bits = oty.bits().max(8);
     let oa = ra.opnd_w(a, bits);
     let ob = ra.opnd_w(bb, bits);
-    if ra.a.imm(a).is_some() || (oa.contains('[') && ob.contains('[')) {
+    let mut op = op;
+    if imm_left_swappable(ra, a, bb, &ob) {
+        op = swap_cmp(op);
+        if oa == "0" && !ob.contains('[') {
+            e.line(&format!("test {}, {}", ob, ob));
+        } else {
+            e.line(&format!("cmp {}, {}", ob, oa));
+        }
+    } else if ra.a.imm(a).is_some() || (oa.contains('[') && ob.contains('[')) {
         ra.load_full(e, "rax", a);
         e.line(&format!("cmp {}, {}", rn("rax", bits), ob));
     } else {
@@ -6789,6 +6797,23 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
         e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
     }
     Ok(())
+}
+
+fn imm_left_swappable(ra: &Ra, a: Val, b: Val, ob: &str) -> bool {
+    ra.a.imm(a).is_some()
+        && ra.a.imm(b).is_none()
+        && (!ob.contains('[') || ob.contains("ptr"))
+        && std::env::var_os("FIRN_NO_CMPSWAP").is_none()
+}
+
+fn swap_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Ge => CmpOp::Le,
+        o => o,
+    }
 }
 
 /// The counter jump (fallthrough optimization: target and fallthrough swap).
