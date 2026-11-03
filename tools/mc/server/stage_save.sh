@@ -16,12 +16,14 @@ else
     mkfifo "$W/vsave/in"; exec 4<>"$W/vsave/in"
     ( cd "$W/vsave" && exec java -Xmx1G -jar "$JARS/server-1.20.1.jar" --nogui < "$W/vsave/in" > server.out 2>&1 ) &
     SVPID=$!
-    "$W/mcsrv" --port "$SFPORT" --world "$W/vsave/fworld" --ticks 900 > "$W/fs.out" 2>&1 &
+    "$W/mcsrv" --port "$SFPORT" --world "$W/vsave/fworld" --ticks 1500 > "$W/fs.out" 2>&1 &
     for i in $(seq 1 120); do grep -q 'Done (' "$W/vsave/server.out" 2>/dev/null && break; sleep 1; done
+    for i in $(seq 1 120); do grep -q 'listening on' "$W/fs.out" 2>/dev/null && break; sleep 1; done
+    grep -q 'listening on' "$W/fs.out" || { echo "  FAIL  firn save server did not start"; ERR=1; }
     grep -q 'Done (' "$W/vsave/server.out" || { echo "  FAIL  vanilla save server did not start"; ERR=1; }
-    BOT_HISTS=1 BOT_FULL=1 BOT_SECONDS=10 $BOT 127.0.0.1 $SVPORT join VSave > "$W/sv.json" &
+    BOT_HISTS=1 BOT_FULL=1 BOT_SETTLE_MS=4000 BOT_SECONDS=10 $BOT 127.0.0.1 $SVPORT join VSave > "$W/sv.json" &
     B1=$!
-    BOT_HISTS=1 BOT_FULL=1 BOT_SECONDS=10 $BOT 127.0.0.1 $SFPORT join FSave > "$W/sf.json" &
+    BOT_HISTS=1 BOT_FULL=1 BOT_SETTLE_MS=4000 BOT_SECONDS=10 $BOT 127.0.0.1 $SFPORT join FSave > "$W/sf.json" &
     B2=$!
     wait $B1 $B2
     node "$TOOLS/check.cjs" world "$W/sf.json" "$W/sv.json" firn-save | report

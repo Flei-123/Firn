@@ -54,6 +54,7 @@ if [ -n "$LIB_DIRS" ]; then
 else
     git archive "$COMMIT" lib | tar -x -C "$W"
 fi
+bash "$ROOT/tools/release/portable_lib.sh" "$W" "$ROOT"
 FIRN_TOOL=$W/firn-tool
 FIRNLIB=$ROOT/lib "${TOOL_FIRNC:-$FIRNC}" "$ROOT/tools/toolchain/firn_main.fi" -o "$FIRN_TOOL" >&2
 ENTRIES=()
@@ -65,6 +66,8 @@ pack() {
     cp -a "$W/lib" "$top/lib"
     cp "$bin" "$top/bin/firnc$ext"
     [ -n "$tool" ] && cp "$tool" "$top/bin/firn$ext"
+    mkdir -p "$top/src"
+    git show "$COMMIT:bin/firnc1.fi" > "$top/src/firnc1.fi"
     echo "$VERSION" > "$top/VERSION"
     echo "$plat" > "$top/PLATFORM"
     echo "$COMMIT" > "$top/COMMIT"
