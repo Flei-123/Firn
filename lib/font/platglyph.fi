@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import font.raster
+import font.fontprov
+
+export { pg_compose, pg_reset, pg_stat, PG_HIT, PG_MISS, PG_FAIL, PG_BYTES }
+
+const SLOT_BITS: u64 = 12
+const OCCUPIED: u64 = 9223372036854775808
+const MULT: u64 = 11400714819323198485
+const SCRATCH: usize = 65536
+const MAX_SIZE: f64 = 96.0
+const HDR: u64 = 48
+
+const H_KEY: u64 = 0
+const H_W: u64 = 8
+const H_H: u64 = 16
+const H_LEFT: u64 = 24
+const H_TOP: u64 = 32
+const H_SIZE: u64 = 40
+
+const PG_HIT: usize = 0
+const PG_MISS: usize = 1
+const PG_FAIL: usize = 2
+const PG_BYTES: usize = 3
+
+static mut G_TABLE: u64 = 0
+static mut G_SCRATCH: u64 = 0
+static mut G_ST: [u64; 4] = [0; 4]
+
+#[no_gc]
+fn pg_stat(i: usize) -> u64 { return G_ST[i] }
+
+#[no_gc]
+fn pg_reset() {
+    if G_TABLE != 0 {
+        var i: u64 = 0
+        let n: u64 = (1 as u64) << SLOT_BITS
+        while i < n {
+            let e: u64 = *((G_TABLE + i * 8) as *mut u64)
+            if e != 0 { rt.heap_free(e, ((*((e + H_SIZE) as *mut u64)) as usize)) }
+            i = i + 1
+        }
+        rt.heap_free(G_TABLE, (n * 8) as usize)
+        G_TABLE = 0
+    }
+    var j: usize = 0
+    while j < 4 {
+        G_ST[j] = 0
+        j = j + 1
+    }
+}
+
+#[no_gc]
+fn floor_i(v: f64) -> i64 {
+    let t: i64 = v as i64
+    if (t as f64) > v { return t - 1 }
+    return t
+}
+
+#[no_gc]
+fn key_of(cp: u32, size: f64, weight: u32, slant: u32, qx: u32) -> u64 {
+    var sq: f64 = size * 8.0 + 0.5
+    if sq < 0.0 { sq = 0.0 }
+    if sq > 100000.0 { sq = 100000.0 }
+    return (cp as u64) | ((weight as u64) << 21) | ((slant as u64) << 31) | ((qx as u64) << 33) |
+        ((sq as u64) << 36) | OCCUPIED
+}
+
+#[no_gc]
+fn render(k: u64, cp: u32, size: f64, weight: u32, slant: u32, qx: u32, slot_p: u64) -> u64 {
+    if G_SCRATCH == 0 { G_SCRATCH = rt.heap_alloc(SCRATCH) }
+    if G_SCRATCH == 0 { return 0 }
+    var meta: [i32; 4] = [0; 4]
+    let n: i64 = fontprov.prov_glyph(cp, size, weight, slant, qx, G_SCRATCH, SCRATCH, &meta[0])
+    var bw: usize = 0
+    var bh: usize = 0
+    if n > 0 && meta[0] > 0 && meta[1] > 0 && (meta[0] as usize) * (meta[1] as usize) <= SCRATCH {
+        bw = meta[0] as usize
+        bh = meta[1] as usize
+    } else if n < 0 {
+        G_ST[PG_FAIL] = G_ST[PG_FAIL] + 1
+        return 0
+    }
+    let total: usize = (HDR as usize) + bw * bh
+    let e: u64 = rt.heap_alloc(total)
+    if e == 0 { return 0 }
+    *(e as *mut u64) = k
+    *((e + H_W) as *mut u64) = bw as u64
+    *((e + H_H) as *mut u64) = bh as u64
+    *((e + H_LEFT) as *mut i64) = meta[2] as i64
+    *((e + H_TOP) as *mut i64) = meta[3] as i64
+    *((e + H_SIZE) as *mut u64) = total as u64
+    var ci: usize = 0
+    while ci < bw * bh {
+        *((e + HDR + (ci as u64)) as *mut u8) = *((G_SCRATCH + (ci as u64)) as *mut u8)
+        ci = ci + 1
+    }
+    let old: u64 = *(slot_p as *mut u64)
+    if old != 0 {
+        G_ST[PG_BYTES] = G_ST[PG_BYTES] - *((old + H_SIZE) as *mut u64)
+        rt.heap_free(old, ((*((old + H_SIZE) as *mut u64)) as usize))
+    }
+    *(slot_p as *mut u64) = e
+    G_ST[PG_BYTES] = G_ST[PG_BYTES] + (total as u64)
+    return e
+}
+
+#[no_gc]
+fn pg_compose(ra: *mut raster.Raster, cp: u32, size: f64, weight: u32, slant: u32,
+    pen: f64, base_y: f64) -> bool {
+    if size < 1.0 || size > MAX_SIZE { return false }
+    var ax: i64 = floor_i(pen)
+    var qx: i64 = ((pen - (ax as f64)) * 4.0 + 0.5) as i64
+    if qx >= 4 {
+        qx = 0
+        ax = ax + 1
+    }
+    let ay: i64 = floor_i(base_y + 0.5)
+    if G_TABLE == 0 { G_TABLE = rt.heap_alloc(((1 as u64) << SLOT_BITS) as usize * 8) }
+    if G_TABLE == 0 { return false }
+    let k: u64 = key_of(cp, size, weight, slant, qx as u32)
+    let slot_p: u64 = G_TABLE + ((k *% MULT) >> (64 - SLOT_BITS)) * 8
+    var e: u64 = *(slot_p as *mut u64)
+    if e != 0 && *(e as *mut u64) == k {
+        G_ST[PG_HIT] = G_ST[PG_HIT] + 1
+    } else {
+        G_ST[PG_MISS] = G_ST[PG_MISS] + 1
+        e = render(k, cp, size, weight, slant, qx as u32, slot_p)
+        if e == 0 { return false }
+    }
+    let bw: usize = ((*((e + H_W) as *mut u64)) as usize)
+    let bh: usize = ((*((e + H_H) as *mut u64)) as usize)
+    if bw == 0 || bh == 0 { return true }
+    raster.raster_add_coverage(ra, ax + *((e + H_LEFT) as *mut i64), ay - *((e + H_TOP) as *mut i64),
+        bw, bh, e + HDR)
+    return true
+}
