@@ -1,0 +1,199 @@
+'use strict'
+const net = require('net')
+const zlib = require('zlib')
+
+const [host, portArg] = process.argv.slice(2)
+const port = parseInt(portArg, 10)
+const PROTOCOL = 777
+const C2S = { teleportConfirm: 0, chatCommand: 7, tickEnd: 13, keepAlive: 28, positionLook: 31 }
+const S2C = { mapChunk: 46, login: 50, position: 73, respawn: 84, keepAlive: 45, disconnect: 0x1d }
+
+const out = { events: [], chunks: {}, errors: [] }
+const DIM_NAMES = ['minecraft:overworld', 'minecraft:the_nether', 'minecraft:the_end']
+let current = 'login'
+let done = false
+let started = false
+let threshold = -1
+let state = 'login'
+let acc = Buffer.alloc(0)
+let tickTimer = null
+
+function varint(n) {
+  const b = []
+  let v = n >>> 0
+  do {
+    let x = v & 127
+    v >>>= 7
+    if (v) x |= 128
+    b.push(x)
+  } while (v)
+  return Buffer.from(b)
+}
+
+function str(s) {
+  const b = Buffer.from(s, 'utf8')
+  return Buffer.concat([varint(b.length), b])
+}
+
+function f64(n) { const b = Buffer.alloc(8); b.writeDoubleBE(n); return b }
+function f32(n) { const b = Buffer.alloc(4); b.writeFloatBE(n); return b }
+
+
+class Cur {
+  constructor(buf, at = 0) { this.buf = buf; this.at = at }
+  u8() { return this.buf[this.at++] }
+  i16() { const v = this.buf.readInt16BE(this.at); this.at += 2; return v }
+  i32() { const v = this.buf.readInt32BE(this.at); this.at += 4; return v }
+  i64() { const v = this.buf.readBigInt64BE(this.at); this.at += 8; return v }
+  f64() { const v = this.buf.readDoubleBE(this.at); this.at += 8; return v }
+  varint() {
+    let r = 0, s = 0, b
+    do { b = this.buf[this.at++]; r |= (b & 127) << s; s += 7 } while (b & 128)
+    return r >>> 0
+  }
+  varlong() {
+    let r = 0n, s = 0n, b
+    do { b = this.buf[this.at++]; r |= BigInt(b & 127) << s; s += 7n } while (b & 128)
+    return r
+  }
+  string() { const n = this.varint(); const s = this.buf.toString('utf8', this.at, this.at + n); this.at += n; return s }
+}
+function send(id, body) {
+  const payload = Buffer.concat([varint(id), body])
+  let frame
+  if (threshold < 0) frame = Buffer.concat([varint(payload.length), payload])
+  else if (payload.length < threshold) frame = Buffer.concat([varint(payload.length + 1), Buffer.from([0]), payload])
+  else {
+    const z = zlib.deflateSync(payload)
+    const head = varint(payload.length)
+    frame = Buffer.concat([varint(head.length + z.length), head, z])
+  }
+  sock.write(frame)
+}
+
+
+function onLogin(body) {
+  const c = new Cur(body)
+  c.i32()
+  c.u8()
+  const nw = c.varint()
+  for (let i = 0; i < nw; i++) c.string()
+  c.varint()
+  c.varint()
+  c.varint()
+  c.u8()
+  c.u8()
+  c.u8()
+  c.varint()
+  current = c.string()
+  out.events.push('login ' + current)
+}
+
+function onRespawn(body) {
+  const c = new Cur(body)
+  c.varint()
+  current = c.string()
+  out.events.push('respawn ' + current)
+}
+
+function onPosition(body) {
+  const c = new Cur(body)
+  const id = c.varint()
+  const x = c.f64(), y = c.f64(), z = c.f64()
+  c.at += 24
+  const yaw = body.readFloatBE(c.at), pitch = body.readFloatBE(c.at + 4)
+  out.events.push(`position ${current} ${x} ${y} ${z}`)
+  send(C2S.teleportConfirm, Buffer.concat([varint(id), f64(x), f64(y), f64(z), f32(yaw), f32(pitch)]))
+  send(C2S.positionLook, Buffer.concat([f64(x), f64(y), f64(z), f32(yaw), f32(pitch), Buffer.from([1])]))
+  if (!started) {
+    started = true
+    tickTimer = setInterval(() => send(C2S.tickEnd, Buffer.alloc(0)), 50)
+    run()
+  }
+}
+
+const cmds = [
+  'tp 9 52 9',
+  'execute in minecraft:the_nether run tp 8 70 8',
+  'execute in minecraft:overworld run tp 0 120 0',
+  'execute in minecraft:the_end run tp 100 49 0',
+  'execute in minecraft:the_nether run tp 8 70 8',
+]
+if (process.env.DIM_CMDS) { cmds.length = 0; cmds.push(...JSON.parse(process.env.DIM_CMDS)) }
+
+function run() {
+  cmds.forEach((cmd, i) => setTimeout(() => send(C2S.chatCommand, str(cmd)), 3000 + i * 6000))
+  setTimeout(finish, 3000 + cmds.length * 6000 + 4000)
+}
+
+function onPlay(id, body) {
+  if (id === S2C.keepAlive) send(C2S.keepAlive, body.subarray(0, 8))
+  else if (id === S2C.login) onLogin(body)
+  else if (id === S2C.respawn) onRespawn(body)
+  else if (id === S2C.position) onPosition(body)
+  else if (id === S2C.mapChunk) out.chunks[current] = (out.chunks[current] || 0) + 1
+  else if (id === S2C.disconnect) out.errors.push('disconnect ' + body.toString('hex'))
+}
+
+function onPacket(id, body) {
+  if (state === 'login') {
+    if (id === 3) threshold = new Cur(body).varint()
+    else if (id === 2) { send(3, Buffer.alloc(0)); state = 'config' }
+    else if (id === 0) { out.errors.push('login disconnect ' + body.toString('utf8')); finish() }
+    return
+  }
+  if (state === 'config') {
+    if (id === 15) send(7, varint(0))
+    else if (id === 4) send(4, body)
+    else if (id === 3) { send(3, Buffer.alloc(0)); state = 'play' }
+    else if (id === 2) { out.errors.push('config disconnect'); finish() }
+    return
+  }
+  onPlay(id, body)
+}
+
+function finish() {
+  if (done) return
+  done = true
+  if (tickTimer) clearInterval(tickTimer)
+  out.final = current
+  console.log(JSON.stringify(out))
+  try { sock.destroy() } catch (e) {}
+  setTimeout(() => process.exit(0), 200)
+}
+
+const sock = net.connect(port, host)
+sock.on('connect', () => {
+  const h = Buffer.concat([varint(PROTOCOL), str(host), Buffer.from([port >> 8, port & 255]), varint(2)])
+  send(0, h)
+  const md5 = require('crypto').createHash('md5').update('OfflinePlayer:DimBot').digest()
+  md5[6] = (md5[6] & 0x0f) | 0x30
+  md5[8] = (md5[8] & 0x3f) | 0x80
+  send(0, Buffer.concat([str('DimBot'), md5]))
+})
+sock.on('data', (d) => {
+  acc = Buffer.concat([acc, d])
+  for (;;) {
+    let len = 0, shift = 0, p = 0, b
+    do {
+      if (p >= acc.length) return
+      b = acc[p++]
+      len |= (b & 127) << shift
+      shift += 7
+    } while (b & 128)
+    if (acc.length < p + len) return
+    let payload = acc.subarray(p, p + len)
+    acc = acc.subarray(p + len)
+    if (threshold >= 0) {
+      const c = new Cur(payload)
+      const u = c.varint()
+      payload = u === 0 ? payload.subarray(c.at) : zlib.inflateSync(payload.subarray(c.at))
+    }
+    const c = new Cur(payload)
+    const id = c.varint()
+    try { onPacket(id, payload.subarray(c.at)) } catch (e) { out.errors.push(`packet ${id}: ${e.message}`) }
+  }
+})
+sock.on('error', (e) => { out.errors.push('socket ' + e.message); finish() })
+sock.on('close', finish)
+setTimeout(finish, 70000)

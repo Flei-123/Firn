@@ -10,6 +10,7 @@ mod layout_attrs;
 mod fx;
 mod parcodegen;
 mod parfn;
+mod pgo;
 mod alias;
 mod archsel;
 mod ast;
@@ -60,6 +61,7 @@ mod gc;
 mod gc_names;
 mod ifexpr;
 mod gc_lower;
+mod gc_ext;
 mod iface;
 mod impls;
 mod core;
@@ -128,6 +130,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod superopt;
 mod rotate;
 mod rotl;
 mod truncmask;
@@ -339,6 +342,8 @@ fn usage() -> String {
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
+         --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
+         --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
          --list-passes      print the pass register with its labels\n  \
@@ -399,6 +404,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut env_allow: Vec<String> = Vec::new();
     let mut env_log = false;
     own::apply_env()?;
+    gc_ext::apply_env()?;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -433,6 +439,19 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--list-attrs" => {
                 print!("{}", attrs::attrs_text());
                 std::process::exit(0);
+            }
+            "--gc-cards" => gc_ext::set_cards(true),
+            _ if a.starts_with("--gc-runtime=") => {
+                let v = &a["--gc-runtime=".len()..];
+                match gc_ext::parse(v) {
+                    Some(p) => gc_ext::set_profile(p),
+                    None => return Err(format!("unknown gc runtime '{}' (allowed: {})", v, gc_ext::ALLOWED)),
+                }
+            }
+            _ if a.starts_with("--profile-") && pgo::parse_arg(a).is_some() => {
+                if let Some(Err(e)) = pgo::parse_arg(a) {
+                    return Err(e);
+                }
             }
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];
@@ -813,6 +832,10 @@ fn run(opts: &Options) -> i32 {
         }
     };
     let path = &input;
+    if let Err(e) = pgo::finish_config(opts.output.as_deref(), path).and_then(|_| pgo::check_target()) {
+        eprintln!("error: {}", e);
+        return 2;
+    }
     let cache_dir = cache_dir_for(opts);
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     let manifest_paths: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
@@ -1261,6 +1284,7 @@ fn run(opts: &Options) -> i32 {
         }
     }
     tm.mark("prune");
+    pgo::hash::record(&module);
 
     // --- Optimizer ---
     if opts.optimize {
@@ -1355,6 +1379,7 @@ fn run(opts: &Options) -> i32 {
         };
         return emit_wasm(opts, &module, path, target_out_manifest, &mut tm, store, manifest);
     }
+    pgo::instrument::plan(&module);
     let emitted = match target::active() {
         target::Target::X86_64 => {
             codegen_x86::set_object_only(opts.only_object);
@@ -1423,6 +1448,7 @@ fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
         && !opts.no_cache
         && !buildcache::disabled_by_env()
         && !opts.stats
+        && !pgo::active()
         && !opts.timings
         && !opts.env_log
         && opts.header.is_none()

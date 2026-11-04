@@ -76,6 +76,19 @@ if [ -z "${WG_NO_GEN:-}" ]; then
     bash tools/mc/wgen/scan_gate.sh || ERR=1
     bash tools/mc/wgen/persist_gate.sh || ERR=1
     PERSIST_PROTO=777 bash tools/mc/wgen/persist_gate.sh || ERR=1
+    PERSIST_DIM=nether bash tools/mc/wgen/persist_gate.sh || ERR=1
+    PERSIST_DIM=nether PERSIST_PROTO=777 bash tools/mc/wgen/persist_gate.sh || ERR=1
+    PERSIST_DIM=end bash tools/mc/wgen/persist_gate.sh || ERR=1
+    PERSIST_DIM=end PERSIST_PROTO=777 bash tools/mc/wgen/persist_gate.sh || ERR=1
+    bash tools/mc/wgen/dim_gate.sh || ERR=1
+    DIM_PROTO=777 bash tools/mc/wgen/dim_gate.sh || ERR=1
+    bash tools/mc/wgen/dim_restart_gate.sh || ERR=1
+    DIM_PROTO=777 bash tools/mc/wgen/dim_restart_gate.sh || ERR=1
+    bash tools/mc/wgen/dim_order_gate.sh || ERR=1
+    DIM_PROTO=777 bash tools/mc/wgen/dim_order_gate.sh || ERR=1
+    bash tools/mc/wgen/portal_gate.sh || ERR=1
+    DIM_PROTO=777 bash tools/mc/wgen/portal_gate.sh || ERR=1
+    bash tools/mc/wgen/portal_save_gate.sh || ERR=1
 fi
 
 [ $ERR = 0 ] && echo "mc/wgen: all ok" || echo "mc/wgen: FAILED"

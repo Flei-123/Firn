@@ -1599,7 +1599,11 @@ pub(crate) fn runtime_source(
     } else {
         s.push_str("// __thread_work is declared by the program itself\n");
     }
-    s.push_str(RUNTIME);
+    if crate::gc_ext::active() {
+        s.push_str(&crate::gc_ext::runtime(RUNTIME));
+    } else {
+        s.push_str(RUNTIME);
+    }
     if with_collections {
         s.push_str(RUNTIME_VEC);
         s.push_str(RUNTIME_MAP);

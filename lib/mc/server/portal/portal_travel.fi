@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.math
+import mc.server.sv_state
+import mc.server.sv_dim
+import mc.server.sv_dimsrv
+import mc.server.sv_travel
+import mc.server.portal.portal_ctx
+import mc.server.portal.portal_shape
+import mc.server.portal.portal_forcer
+
+export { portal_phase, portal_ignite }
+
+const WAIT_SURVIVAL: i32 = 80
+const WAIT_CREATIVE: i32 = 1
+const COOLDOWN: i32 = 10
+const BORDER_OVERWORLD: f64 = 29999984.0
+const BORDER_NETHER: f64 = 3749998.0
+const PLAYER_WIDTH: f64 = 0.6
+const PLAYER_HEIGHT: f64 = 1.8
+const EPS: f64 = 0.00001
+
+fn floor_i32(v: f64) -> i32 {
+    return math.floor(v) as i32
+}
+
+fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn touching_portal(c: *mut portal_ctx.PortalCtx, s: *mut sv_state.Session, ox: *mut i32, oy: *mut i32, oz: *mut i32) -> bool {
+    let half: f64 = PLAYER_WIDTH / 2.0
+    let x0: i32 = floor_i32((*s).x - half + EPS)
+    let x1: i32 = floor_i32((*s).x + half - EPS)
+    let y0: i32 = floor_i32((*s).y + EPS)
+    let y1: i32 = floor_i32((*s).y + PLAYER_HEIGHT - EPS)
+    let z0: i32 = floor_i32((*s).z - half + EPS)
+    let z1: i32 = floor_i32((*s).z + half - EPS)
+    var x: i32 = x0
+    while x <= x1 {
+        var y: i32 = y0
+        while y <= y1 {
+            var z: i32 = z0
+            while z <= z1 {
+                if portal_ctx.is_portal(c, portal_ctx.state_at(c, x, y, z)) {
+                    *ox = x
+                    *oy = y
+                    *oz = z
+                    return true
+                }
+                z = z + 1
+            }
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return false
+}
+
+fn axis_coord(axis: i32, x: f64, z: f64) -> f64 {
+    if axis == portal_ctx.AXIS_X { return x }
+    return z
+}
+
+fn rect_corner_coord(axis: i32, r: *mut portal_forcer.Rect) -> i32 {
+    if axis == portal_ctx.AXIS_X { return (*r).x }
+    return (*r).z
+}
+
+fn transfer(root: *mut sv_state.Server, s: *mut sv_state.Session, srv: *mut sv_state.Server, ex: i32, ey: i32, ez: i32) {
+    var dest_kind: i32 = sv_dim.DIM_NETHER
+    var to_nether: bool = true
+    if (*s).dim == sv_dim.DIM_NETHER {
+        dest_kind = sv_dim.DIM_OVERWORLD
+        to_nether = false
+    } else if (*s).dim != sv_dim.DIM_OVERWORLD {
+        return
+    }
+    let dest: *mut sv_state.Server = sv_dimsrv.dimsrv_get(root, dest_kind)
+    if dest as u64 == 0 as u64 { return }
+    var c: portal_ctx.PortalCtx = portal_ctx.ctx_new(srv)
+    var dc: portal_ctx.PortalCtx = portal_ctx.ctx_new(dest)
+    let entry_state: i32 = portal_ctx.state_at(&c, ex, ey, ez)
+    let axis: i32 = portal_ctx.portal_axis_of(&c, entry_state)
+    var scale: f64 = 8.0
+    var limit: f64 = BORDER_OVERWORLD
+    if to_nether {
+        scale = 0.125
+        limit = BORDER_NETHER
+    }
+    let tx: i32 = floor_i32(clamp_f64((*s).x * scale, 0.0 - limit, limit))
+    let tz: i32 = floor_i32(clamp_f64((*s).z * scale, 0.0 - limit, limit))
+    let ty: i32 = floor_i32((*s).y)
+    var target: portal_forcer.Rect = portal_forcer.Rect { x: 0, y: 0, z: 0, axis: axis, size1: 2, size2: 3 }
+    if !portal_forcer.find_portal_around(&dc, tx, ty, tz, to_nether, &target) {
+        if !portal_forcer.create_portal(&dc, tx, ty, tz, axis, &target) { return }
+    }
+    let entry: portal_forcer.Rect = portal_forcer.rect_around(&c, ex, ey, ez, entry_state, axis)
+    var rel_x: f64 = 0.5
+    let span1: f64 = (entry.size1 as f64) - PLAYER_WIDTH
+    if span1 > 0.0 {
+        let corner: f64 = (rect_corner_coord(axis, &entry) as f64) + PLAYER_WIDTH / 2.0
+        rel_x = clamp_f64((axis_coord(axis, (*s).x, (*s).z) - corner) / span1, 0.0, 1.0)
+    }
+    var rel_y: f64 = 0.0
+    let span2: f64 = (entry.size2 as f64) - PLAYER_HEIGHT
+    if span2 > 0.0 { rel_y = clamp_f64(((*s).y - (entry.y as f64)) / span2, 0.0, 1.0) }
+    var other_pos: f64 = (*s).x
+    var other_corner: i32 = entry.x
+    if axis == portal_ctx.AXIS_X {
+        other_pos = (*s).z
+        other_corner = entry.z
+    }
+    let rel_z: f64 = other_pos - ((other_corner as f64) + 0.5)
+    let target_state: i32 = portal_ctx.state_at(&dc, target.x, target.y, target.z)
+    var target_axis: i32 = portal_ctx.AXIS_X
+    if portal_ctx.is_portal(&dc, target_state) { target_axis = portal_ctx.portal_axis_of(&dc, target_state) }
+    let along: f64 = PLAYER_WIDTH / 2.0 + ((target.size1 as f64) - PLAYER_WIDTH) * rel_x
+    let up: f64 = ((target.size2 as f64) - PLAYER_HEIGHT) * rel_y
+    let across: f64 = 0.5 + rel_z
+    var nx: f64 = (target.x as f64) + across
+    var nz: f64 = (target.z as f64) + along
+    if target_axis == portal_ctx.AXIS_X {
+        nx = (target.x as f64) + along
+        nz = (target.z as f64) + across
+    }
+    var yaw: f32 = (*s).yaw
+    if axis != target_axis { yaw = yaw + 90.0f }
+    sv_travel.travel_portal(root, s, dest_kind, nx, (target.y as f64) + up, nz, yaw, (*s).pitch)
+}
+
+fn wait_ticks(s: *mut sv_state.Session) -> i32 {
+    if (*s).gamemode == 1 { return WAIT_CREATIVE }
+    return WAIT_SURVIVAL
+}
+
+fn portal_phase(ctx: u64) {
+    let root: *mut sv_state.Server = ctx as *mut sv_state.Server
+    var i: usize = 0
+    while i < sv_state.MAX_SESSIONS {
+        let s: *mut sv_state.Session = sv_state.session_at(root, i)
+        i = i + 1
+        if !(*s).used || !(*s).joined || (*s).closing || (*s).gamemode == 3 { continue }
+        if (*s).dim != sv_dim.DIM_OVERWORLD && (*s).dim != sv_dim.DIM_NETHER { continue }
+        let srv: *mut sv_state.Server = sv_state.srv_dim(root, s)
+        var c: portal_ctx.PortalCtx = portal_ctx.ctx_new(srv)
+        var ex: i32 = 0
+        var ey: i32 = 0
+        var ez: i32 = 0
+        var inside: bool = touching_portal(&c, s, &ex, &ey, &ez)
+        if inside && (*s).portal_cd > 0 {
+            (*s).portal_cd = COOLDOWN
+            inside = false
+        }
+        if inside {
+            let t: i32 = (*s).portal_time
+            (*s).portal_time = t + 1
+            if t >= wait_ticks(s) {
+                (*s).portal_time = wait_ticks(s)
+                (*s).portal_cd = COOLDOWN
+                transfer(root, s, srv, ex, ey, ez)
+            }
+        } else if (*s).portal_time > 0 {
+            (*s).portal_time = (*s).portal_time - 4
+            if (*s).portal_time < 0 { (*s).portal_time = 0 }
+        }
+        if (*s).portal_cd > 0 { (*s).portal_cd = (*s).portal_cd - 1 }
+    }
+}
+
+fn portal_ignite(srv: *mut sv_state.Server, s: *mut sv_state.Session, x: i32, y: i32, z: i32) -> bool {
+    if (*srv).dim_kind != sv_dim.DIM_OVERWORLD && (*srv).dim_kind != sv_dim.DIM_NETHER { return false }
+    var c: portal_ctx.PortalCtx = portal_ctx.ctx_new(srv)
+    if portal_ctx.state_at(&c, x, y, z) != 0 { return false }
+    let near: bool = portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x + 1, y, z)) || portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x - 1, y, z)) ||
+    portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x, y + 1, z)) || portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x, y - 1, z)) ||
+    portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x, y, z + 1)) || portal_ctx.is_obsidian(&c, portal_ctx.state_at(&c, x, y, z - 1))
+    if !near { return false }
+    var shape: portal_shape.Shape = portal_shape.shape_new(&c, x, y, z, portal_ctx.AXIS_X)
+    if !portal_shape.find_empty_shape(&c, x, y, z, &shape) { return false }
+    portal_shape.shape_create_blocks(&c, &shape)
+    return true
+}

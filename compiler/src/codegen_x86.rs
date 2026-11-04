@@ -416,12 +416,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov rdi, rsp");
     e.line("and rsp, -16");
     e.line(&format!("call {}", label("main")));
+    crate::pgo::instrument::emit_dump_call(&mut e);
     e.line("mov edi, eax");
     // A dynamically linked image (`#[link_lib]`, std.dynlib) may have
     // threads of its own that a foreign library started (Mesa's llvmpipe):
     // `exit` would end only this one and leave the process alive and hung.
     // `exit_group` ends all. A static image keeps `exit` bit for bit.
-    if crate::extfn::link_libs().is_empty() {
+    if crate::extfn::link_libs().is_empty() && !(crate::gc_ext::active() && crate::gc::runtime_active()) {
         e.line("mov eax, 60");
     } else {
         e.line("mov eax, 231");
@@ -599,6 +600,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
             e.raw(".text");
             e.raw(&crate::so_thunk::runtime_asm()?);
         }
+        crate::pgo::instrument::emit_runtime(&mut e);
         e.raw(".section .note.GNU-stack,\"\",@progbits");
     }
     clk.mark("cg tail");
@@ -998,6 +1000,9 @@ pub(crate) fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     for b in &f.blocks {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
+        if let Some(l) = crate::pgo::instrument::counter_line(&f.name, f.blocks.len(), b.id as usize) {
+            e.line(&l);
+        }
         emit_block(e, f, &fr, b, &mut site)?;
     }
     // ROUND 64: `DW_AT_high_pc` needs an address at the end of the function,
@@ -1845,6 +1850,7 @@ fn emit_inst(
                 load_full(e, fr, SYS_REGS[k], *a);
             }
             load_full(e, fr, "rax", args[0]);
+            crate::pgo::instrument::emit_exit_hook_call(e);
             e.line("syscall");
             if let Some(d) = i.dst {
                 store_dst(e, fr, d, "rax");

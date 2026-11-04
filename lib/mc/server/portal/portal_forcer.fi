@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MPL-2.0
+import mc.server.sv_state
+import mc.server.sv_edits
+import mc.server.sv_dim
+import mc.server.portal.portal_ctx
+import mc.server.portal.portal_search
+
+export { Rect, find_portal_around, create_portal, rect_around }
+
+struct Rect {
+    x: i32,
+    y: i32,
+    z: i32,
+    axis: i32,
+    size1: i32,
+    size2: i32,
+}
+
+fn run_len(c: *mut portal_ctx.PortalCtx, want: i32, x: i32, y: i32, z: i32, dx: i32, dy: i32, dz: i32, max: i32) -> i32 {
+    var n: i32 = 0
+    while n < max && portal_ctx.state_at(c, x + dx * (n + 1), y + dy * (n + 1), z + dz * (n + 1)) == want { n = n + 1 }
+    return n
+}
+
+fn column_ok(c: *mut portal_ctx.PortalCtx, want: i32, x: i32, z: i32, y0: i32, y1: i32) -> bool {
+    var y: i32 = y0
+    while y <= y1 {
+        if portal_ctx.state_at(c, x, y, z) != want { return false }
+        y = y + 1
+    }
+    return true
+}
+
+fn rect_around(c: *mut portal_ctx.PortalCtx, x: i32, y: i32, z: i32, want: i32, axis: i32) -> Rect {
+    var ax: i32 = 0
+    var az: i32 = 0
+    if axis == portal_ctx.AXIS_X { ax = 1 } else { az = 1 }
+    let left: i32 = run_len(c, want, x, y, z, 0 - ax, 0, 0 - az, 21)
+    let right: i32 = run_len(c, want, x, y, z, ax, 0, az, 21)
+    var down: i32 = 0
+    var up: i32 = 0
+    var ok: bool = true
+    while ok && down < 21 {
+        var k: i32 = 0 - left
+        while k <= right {
+            if portal_ctx.state_at(c, x + ax * k, y - down - 1, z + az * k) != want { ok = false }
+            k = k + 1
+        }
+        if ok { down = down + 1 }
+    }
+    ok = true
+    while ok && up < 21 {
+        var k: i32 = 0 - left
+        while k <= right {
+            if portal_ctx.state_at(c, x + ax * k, y + up + 1, z + az * k) != want { ok = false }
+            k = k + 1
+        }
+        if ok { up = up + 1 }
+    }
+    return Rect { x: x - ax * left, y: y - down, z: z - az * left, axis: axis, size1: left + right + 1, size2: down + up + 1 }
+}
+
+fn find_portal_around(c: *mut portal_ctx.PortalCtx, x: i32, y: i32, z: i32, to_nether: bool, out: *mut Rect) -> bool {
+    var radius: i32 = 128
+    if to_nether { radius = 16 }
+    var best: portal_search.Best = portal_search.best_new()
+    portal_search.scan_edits(c, x, y, z, radius, &best)
+    portal_search.scan_saved_chunks(c, x, y, z, radius, &best)
+    if best.d < 0 as i64 { return false }
+    let st: i32 = portal_ctx.state_at(c, best.x, best.y, best.z)
+    *out = rect_around(c, best.x, best.y, best.z, st, portal_ctx.portal_axis_of(c, st))
+    return true
+}
+
+fn can_host_frame(c: *mut portal_ctx.PortalCtx, x: i32, y: i32, z: i32, dx: i32, dz: i32, off: i32) -> bool {
+    let cx: i32 = 0 - dz
+    let cz: i32 = dx
+    var i: i32 = 0 - 1
+    while i < 3 {
+        var j: i32 = 0 - 1
+        while j < 4 {
+            let st: i32 = portal_ctx.state_at(c, x + dx * i + cx * off, y + j, z + dz * i + cz * off)
+            if j < 0 && !portal_ctx.is_solid(c, st) { return false }
+            if j >= 0 && !portal_ctx.can_portal_replace(c, st) { return false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn dist_sq(ax: i32, ay: i32, az: i32, bx: i32, by: i32, bz: i32) -> i64 {
+    let dx: i64 = (ax - bx) as i64
+    let dy: i64 = (ay - by) as i64
+    let dz: i64 = (az - bz) as i64
+    return dx * dx + dy * dy + dz * dz
+}
+
+struct Spiral {
+    x: i32,
+    z: i32,
+    leg: i32,
+    leg_size: i32,
+    leg_index: i32,
+    legs: i32,
+}
+
+fn spiral_next(sp: *mut Spiral) -> bool {
+    var d: i32 = ((*sp).leg + 4) % 4
+    if d == 0 { (*sp).x = (*sp).x + 1 }
+    if d == 1 { (*sp).z = (*sp).z + 1 }
+    if d == 2 { (*sp).x = (*sp).x - 1 }
+    if d == 3 { (*sp).z = (*sp).z - 1 }
+    if (*sp).leg_index >= (*sp).leg_size {
+        if (*sp).leg >= (*sp).legs { return false }
+        (*sp).leg = (*sp).leg + 1
+        (*sp).leg_index = 0
+        (*sp).leg_size = (*sp).leg / 2 + 1
+    }
+    (*sp).leg_index = (*sp).leg_index + 1
+    return true
+}
+
+fn create_portal(c: *mut portal_ctx.PortalCtx, x: i32, y: i32, z: i32, axis: i32, out: *mut Rect) -> bool {
+    var dx: i32 = 0
+    var dz: i32 = 0
+    if axis == portal_ctx.AXIS_X { dx = 1 } else { dz = 1 }
+    let cx: i32 = 0 - dz
+    let cz: i32 = dx
+    let min_y: i32 = (*(*c).srv).world.min_y
+    var logical: i32 = (*(*c).srv).world.height
+    if (*(*c).srv).dim_kind == sv_dim.DIM_NETHER { logical = 128 }
+    let top: i32 = min_y + logical - 1
+    var best: i64 = 0 - 1
+    var bx: i32 = 0
+    var by: i32 = 0
+    var bz: i32 = 0
+    var alt: i64 = 0 - 1
+    var ax: i32 = 0
+    var ay: i32 = 0
+    var az: i32 = 0
+    var sp: Spiral = Spiral { x: x, z: z + 1, leg: 0 - 1, leg_size: 0, leg_index: 0, legs: 64 }
+    while spiral_next(&sp) {
+        var h: i32 = portal_ctx.top_block_y(c, sp.x, sp.z, top)
+        if h > top { h = top }
+        var yy: i32 = h
+        while yy >= min_y {
+            if portal_ctx.can_portal_replace(c, portal_ctx.state_at(c, sp.x, yy, sp.z)) {
+                let start: i32 = yy
+                while yy > min_y && portal_ctx.can_portal_replace(c, portal_ctx.state_at(c, sp.x, yy - 1, sp.z)) { yy = yy - 1 }
+                if yy + 4 <= top {
+                    let diff: i32 = start - yy
+                    if diff <= 0 || diff >= 3 {
+                        if can_host_frame(c, sp.x, yy, sp.z, dx, dz, 0) {
+                            let d: i64 = dist_sq(x, y, z, sp.x, yy, sp.z)
+                            if can_host_frame(c, sp.x, yy, sp.z, dx, dz, 0 - 1) && can_host_frame(c, sp.x, yy, sp.z, dx, dz, 1) && (best < 0 as i64 || best > d) {
+                                best = d
+                                bx = sp.x
+                                by = yy
+                                bz = sp.z
+                            }
+                            if best < 0 as i64 && (alt < 0 as i64 || alt > d) {
+                                alt = d
+                                ax = sp.x
+                                ay = yy
+                                az = sp.z
+                            }
+                        }
+                    }
+                }
+            }
+            yy = yy - 1
+        }
+    }
+    if best < 0 as i64 && alt >= 0 as i64 {
+        best = alt
+        bx = ax
+        by = ay
+        bz = az
+    }
+    if best < 0 as i64 {
+        var lo: i32 = min_y + 1
+        if lo < 70 { lo = 70 }
+        let hi: i32 = top - 9
+        if hi < lo { return false }
+        bx = x
+        bz = z
+        by = y
+        if by < lo { by = lo }
+        if by > hi { by = hi }
+        let obsidian: i32 = portal_ctx.obsidian_state(c)
+        var i: i32 = 0 - 1
+        while i < 2 {
+            var j: i32 = 0
+            while j < 2 {
+                var k: i32 = 0 - 1
+                while k < 3 {
+                    var st: i32 = 0
+                    if k < 0 { st = obsidian }
+                    portal_ctx.set_block(c, bx + j * dx + i * cx, by + k, bz + j * dz + i * cz, st)
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    let obs: i32 = portal_ctx.obsidian_state(c)
+    var fi: i32 = 0 - 1
+    while fi < 3 {
+        var fj: i32 = 0 - 1
+        while fj < 4 {
+            if fi == 0 - 1 || fi == 2 || fj == 0 - 1 || fj == 3 { portal_ctx.set_block(c, bx + fi * dx, by + fj, bz + fi * dz, obs) }
+            fj = fj + 1
+        }
+        fi = fi + 1
+    }
+    let pst: i32 = portal_ctx.portal_state(c, axis)
+    var pi: i32 = 0
+    while pi < 2 {
+        var pj: i32 = 0
+        while pj < 3 {
+            portal_ctx.set_block(c, bx + pi * dx, by + pj, bz + pi * dz, pst)
+            pj = pj + 1
+        }
+        pi = pi + 1
+    }
+    *out = Rect { x: bx, y: by, z: bz, axis: axis, size1: 2, size2: 3 }
+    return true
+}

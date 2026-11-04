@@ -113,7 +113,7 @@ pub fn run(f: &mut Func) -> usize {
     if std::env::var_os("FIRN_NO_UNROLL").is_some() {
         return 0;
     }
-    if f.constant_time || !f.secret.is_empty() || !f.has_phi() {
+    if f.constant_time || !f.secret.is_empty() || !f.has_phi() || crate::pgo::weights::func_cold(f) {
         return 0;
     }
     let mut n = 0;
@@ -135,7 +135,7 @@ pub fn run_partial(f: &mut Func) -> usize {
     if std::env::var_os("FIRN_NO_UNROLL").is_some() || std::env::var_os("FIRN_NO_UNROLL_PARTIAL").is_some() {
         return 0;
     }
-    if f.constant_time || !f.secret.is_empty() || !f.has_phi() {
+    if f.constant_time || !f.secret.is_empty() || !f.has_phi() || crate::pgo::weights::func_cold(f) {
         return 0;
     }
     let n = 0;

@@ -103,7 +103,7 @@ pub fn run(f: &mut Func) -> usize {
     if crate::target::active() != crate::target::Target::X86_64 {
         return 0;
     }
-    if std::env::var_os("FIRN_NO_VECTORIZE").is_some() {
+    if std::env::var_os("FIRN_NO_VECTORIZE").is_some() || crate::pgo::weights::func_cold(f) {
         return 0;
     }
     let original = f.blocks.len();

@@ -27,7 +27,9 @@ const label = (s) => (s ? mcData.items[s.id].name + '*' + s.n : null)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const wire = (nm, n) => (n && n > 0 ? { present: true, itemId: mcData.itemsByName[nm].id, itemCount: n, nbtData: undefined } : { present: false })
 
-c.on('error', (e) => errors.push(String(e.message)))
+c.on('error', (e) => { errors.push(String(e.message)); if (process.env.INV_DEBUG) console.error('error', e.message) })
+c.on('end', (r) => { if (process.env.INV_DEBUG) console.error('end', r) })
+c.on('kick_disconnect', (p) => { if (process.env.INV_DEBUG) console.error('kick', JSON.stringify(p)) })
 c.on('packet', (d, meta) => {
   if (meta.state !== 'play') return
   if (meta.name === 'position') {
@@ -43,6 +45,8 @@ c.on('packet', (d, meta) => {
   } else if (meta.name === 'set_slot') {
     if (d.windowId === -1 && d.slot === -1) { cursor = toStack(d.item); fulls++ }
     else if (d.windowId === 0) { stateId = d.stateId; slots[d.slot] = toStack(d.item) }
+  } else if (meta.name === 'login') {
+    gm = d.gameMode
   } else if (meta.name === 'game_state_change' && d.reason === 3) {
     gm = d.gameMode
     const w = gmWaiters
@@ -87,6 +91,7 @@ async function hop() {
 }
 
 async function runScenario(sc, mode) {
+  if (process.env.INV_DEBUG) console.error(Date.now() % 1000000, mode, sc.name, 'gm', gm, 'fulls', fulls)
   await setMode('creative')
   await clearAll()
   for (const [k, [nm, n]] of Object.entries(sc.seed)) c.write('set_creative_slot', { slot: parseInt(k, 10), item: wire(nm, n) })
