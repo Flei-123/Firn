@@ -8,7 +8,9 @@
 #   uniform vec2/int/... -> one std140 block `P` at set 0 binding 0 (u_size, u_srcsize, u_nspot, u_spot[8], u_shape[32]; 672 octets)
 #   uniform sampler2D    -> set 0 binding 1 (u_atlas), 2 (u_stream), 3 (u_src)
 #   flat in/out vec4 v_x -> explicit locations 0..6 (c0 c1 g p t clip k), out vec4 o -> location 0
-# The .spv files are committed; the tests do not need the tools. Needs glslangValidator + spirv-val.
+# After glslang every module goes through spirv-opt (inlining, SSA rewrite, dead code) so that a loop- and call-free
+# executor (the SWR shader VM of the Osum libvulkan) can lower the whole shader.
+# The .spv files are committed; the tests do not need the tools. Needs glslangValidator + spirv-val + spirv-opt.
 set -e
 cd "$(dirname "$0")"
 conv() {
@@ -33,7 +35,11 @@ conv ../gpu_vs.glsl > "$T/gpu_vk.vert"
 conv ../gpu_fs.glsl > "$T/gpu_vk.frag"
 conv ../gpu_fs_photo.glsl > "$T/gpu_vk_photo.frag"
 for s in gpu_vk.vert gpu_vk.frag gpu_vk_photo.frag; do
-    glslangValidator -V --target-env vulkan1.0 -o "$s.spv" "$T/$s" > "$T/$s.log" 2>&1 || { cat "$T/$s.log"; exit 1; }
+    glslangValidator -V --target-env vulkan1.0 -o "$T/$s.raw.spv" "$T/$s" > "$T/$s.log" 2>&1 || { cat "$T/$s.log"; exit 1; }
+    spirv-opt --target-env=vulkan1.0 --merge-return --inline-entry-points-exhaustive --eliminate-dead-functions \
+        --eliminate-local-multi-store --eliminate-local-single-block --eliminate-local-single-store --simplify-instructions \
+        --ssa-rewrite --eliminate-dead-code-aggressive --eliminate-dead-branches --merge-blocks \
+        "$T/$s.raw.spv" -o "$s.spv"
     spirv-val --target-env vulkan1.0 "$s.spv"
 done
 ls -l *.spv
