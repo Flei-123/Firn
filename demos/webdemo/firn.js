@@ -466,11 +466,14 @@ const firnTag = document.currentScript;
         tag.onload = tag.onerror = () => done();
         document.head.appendChild(tag);
     });
-    await Promise.all([loadScript('webaudio.js'), loadScript('webfaces.js')]);
+    await Promise.all([loadScript('webaudio.js'), loadScript('webfaces.js'), loadScript('webfont.js')]);
     const audioNames = ['open', 'room', 'push', 'queued', 'pause', 'flush', 'close', 'state', 'mode', 'played', 'latency'];
     Object.assign(env, window.firnWebAudio
         ? window.firnWebAudio(() => mem, q.get('audio') === 'script')
         : Object.fromEntries(audioNames.map((n) => ['firn_web_audio_' + n, () => 0])));
+    Object.assign(env, window.firnWebFont
+        ? window.firnWebFont(() => mem)
+        : { firn_web_text_probe: () => 0, firn_web_text_advance: () => 0, firn_web_text_pair: () => 0, firn_web_text_vmetrics: () => 0, firn_web_text_glyph: () => -1 });
     const facesUrl = new URL(q.get('faces') || firnTag.dataset.faces || 'pdffonts.pack', firnTag.src || location.href).href;
     Object.assign(env, window.firnWebFaces
         ? window.firnWebFaces(() => mem, facesUrl)
@@ -524,6 +527,12 @@ const firnTag = document.currentScript;
     const fp = x.firn_web_alloc(font.length);
     bytes(fp, font.length).set(font);
     if (!ev(x.firn_web_font(fp, font.length))) console.error('firn: the font was refused');
+    if (typeof x.firn_web_font_backend === 'function') {
+        let want = q.get('fontBackend') || firnTag.dataset.fontBackend || '';
+        try { want = want || localStorage.getItem('firn.fontBackend') || ''; } catch (e) { /* no storage */ }
+        window.firnFontBackend = want === 'platform' ? 'platform' : 'embedded';
+        x.firn_web_font_backend(want === 'platform' ? 1 : 0);
+    }
 
     // The size: CSS pixels, the device ratio in per mille, bit 0 = dark.
     const fixed = q.has('w') && q.has('h');
