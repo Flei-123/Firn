@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/crypto/keyring.fi -- Orbit account master key, subkeys and sealed records (docs/ORBIT-KEYS-SPEC.md sections 3 and 4).
+import std.rt
+import std.crypto.hkdf
+import std.crypto.chacha
+import std.crypto.random
+import std.crypto.keyaad
+
+export {
+    AMK_LEN, SUBKEY_LEN, KID_LEN, REC_OVERHEAD, REC_VERSION, REC_MAX_PLAIN,
+    RecId, rec_id, kr_amk_generate, kr_prk, kr_kid, kr_subkey, kr_name_ok,
+    kr_blob_epoch, kr_record_seal_with, kr_record_seal, kr_record_open,
+}
+
+const AMK_LEN: usize = 32
+const SUBKEY_LEN: usize = 32
+const KID_LEN: usize = 8
+const REC_VERSION: u64 = 1
+const REC_SALT_LEN: usize = 16
+const REC_OVERHEAD: usize = 37
+const REC_MAX_PLAIN: usize = 16777216
+const ACCT_MAX: usize = 64
+const NAME_MAX: usize = 32
+const OID_MAX: usize = 255
+const SALT_AMK: str = "ORBIT-AMK-v1"
+const INFO_KID: str = "orbit/kid/v1"
+const INFO_SUB: str = "orbit/sub/v1/"
+const INFO_REC: str = "orbit/rec/v1"
+const AAD_REC: str = "ORBIT-REC1"
+
+struct RecId {
+    epoch: u64,
+    acct: u64,
+    acctn: usize,
+    class: u64,
+    classn: usize,
+    oid: u64,
+    oidn: usize,
+    objver: u64,
+}
+
+fn rec_id(epoch: u64, acct: u64, acctn: usize, class: u64, classn: usize,
+    oid: u64, oidn: usize, objver: u64) -> RecId {
+    return RecId { epoch: epoch, acct: acct, acctn: acctn, class: class,
+        classn: classn, oid: oid, oidn: oidn, objver: objver }
+}
+
+fn kr_amk_generate(out: u64) -> bool {
+    return random.random_bytes(out, AMK_LEN)
+}
+
+fn kr_prk(amk: u64, out: u64) {
+    hkdf.hkdf_extract(SALT_AMK.p as u64, SALT_AMK.n, amk, AMK_LEN, out)
+}
+
+fn kr_kid(amk: u64, out: u64) -> bool {
+    var prk: [u8; 32] = [0; 32]
+    kr_prk(amk, (&prk[0]) as u64)
+    return hkdf.hkdf_expand((&prk[0]) as u64, 32, INFO_KID.p as u64, INFO_KID.n, out, KID_LEN)
+}
+
+fn kr_name_ok(p: u64, n: usize) -> bool {
+    if n == 0 || n > NAME_MAX {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        let ok: bool = (c >= 97 as u8 && c <= 122 as u8) || (c >= 48 as u8 && c <= 57 as u8)
+            || c == 45 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn kr_subkey(amk: u64, name: u64, namen: usize, out: u64) -> bool {
+    if !kr_name_ok(name, namen) {
+        return false
+    }
+    var prk: [u8; 32] = [0; 32]
+    kr_prk(amk, (&prk[0]) as u64)
+    var info: [u8; 48] = [0; 48]
+    var at: usize = keyaad.aad_tag((&info[0]) as u64, 0, INFO_SUB)
+    at = keyaad.aad_raw((&info[0]) as u64, at, name, namen)
+    return hkdf.hkdf_expand((&prk[0]) as u64, 32, (&info[0]) as u64, at, out, SUBKEY_LEN)
+}
+
+fn kr_blob_epoch(blob: u64, n: usize) -> u64 {
+    if n < 5 {
+        return 0
+    }
+    return ((rt.ld8(blob, 1) as u64) << 24) | ((rt.ld8(blob, 2) as u64) << 16)
+        | ((rt.ld8(blob, 3) as u64) << 8) | (rt.ld8(blob, 4) as u64)
+}
+
+fn id_ok(id: *mut RecId) -> bool {
+    return (*id).epoch >= 1 && (*id).epoch <= 4294967295 && (*id).acctn >= 1
+        && (*id).acctn <= ACCT_MAX && kr_name_ok((*id).class, (*id).classn)
+        && (*id).oidn >= 1 && (*id).oidn <= OID_MAX && (*id).objver <= 4294967295
+}
+
+fn record_aad(id: *mut RecId, out: u64) -> usize {
+    var at: usize = keyaad.aad_tag(out, 0, AAD_REC)
+    at = keyaad.aad_u8(out, at, REC_VERSION)
+    at = keyaad.aad_u32(out, at, (*id).epoch)
+    at = keyaad.aad_lp8(out, at, (*id).acct, (*id).acctn)
+    at = keyaad.aad_lp8(out, at, (*id).class, (*id).classn)
+    at = keyaad.aad_lp8(out, at, (*id).oid, (*id).oidn)
+    return keyaad.aad_u32(out, at, (*id).objver)
+}
+
+fn record_key(salt: u64, subkey: u64, out: u64) -> bool {
+    return hkdf.hkdf(salt, REC_SALT_LEN, subkey, SUBKEY_LEN, INFO_REC.p as u64, INFO_REC.n,
+        out, 32)
+}
+
+fn kr_record_seal_with(salt: u64, subkey: u64, id: *mut RecId, plain: u64, n: usize,
+    out: u64) -> usize {
+    if !id_ok(id) || n > REC_MAX_PLAIN {
+        return 0
+    }
+    var aad: [u8; 352] = [0; 352]
+    let an: usize = record_aad(id, (&aad[0]) as u64)
+    var key: [u8; 32] = [0; 32]
+    if !record_key(salt, subkey, (&key[0]) as u64) {
+        return 0
+    }
+    var nonce: [u8; 12] = [0; 12]
+    var at: usize = keyaad.aad_u8(out, 0, REC_VERSION)
+    at = keyaad.aad_u32(out, at, (*id).epoch)
+    at = keyaad.aad_raw(out, at, salt, REC_SALT_LEN)
+    chacha.aead_seal((&key[0]) as u64, (&nonce[0]) as u64, (&aad[0]) as u64, an, plain, n,
+        out + at as u64)
+    return n + REC_OVERHEAD
+}
+
+fn kr_record_seal(subkey: u64, id: *mut RecId, plain: u64, n: usize, out: u64) -> usize {
+    var salt: [u8; 16] = [0; 16]
+    if !random.random_bytes((&salt[0]) as u64, REC_SALT_LEN) {
+        return 0
+    }
+    return kr_record_seal_with((&salt[0]) as u64, subkey, id, plain, n, out)
+}
+
+fn kr_record_open(subkey: u64, id: *mut RecId, rec: u64, rn: usize, out: u64) -> i64 {
+    if !id_ok(id) || rn < REC_OVERHEAD || rn - REC_OVERHEAD > REC_MAX_PLAIN {
+        return -1
+    }
+    if rt.ld8(rec, 0) != 1 as u8 || kr_blob_epoch(rec, rn) != (*id).epoch {
+        return -1
+    }
+    var aad: [u8; 352] = [0; 352]
+    let an: usize = record_aad(id, (&aad[0]) as u64)
+    var key: [u8; 32] = [0; 32]
+    if !record_key(rec + 5 as u64, subkey, (&key[0]) as u64) {
+        return -1
+    }
+    var nonce: [u8; 12] = [0; 12]
+    if !chacha.aead_open((&key[0]) as u64, (&nonce[0]) as u64, (&aad[0]) as u64, an,
+        rec + 21 as u64, rn - 21, out) {
+        return -1
+    }
+    return (rn - REC_OVERHEAD) as i64
+}

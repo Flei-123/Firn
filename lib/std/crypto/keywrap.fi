@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/crypto/keywrap.fi -- wraps of the Orbit account master key: device, passphrase, recovery key, local store (docs/ORBIT-KEYS-SPEC.md sections 6 and 10).
+import std.rt
+import std.crypto.hkdf
+import std.crypto.chacha
+import std.crypto.x25519
+import std.crypto.argon2
+import std.crypto.random
+import std.crypto.keyaad
+import std.crypto.keyring
+
+export {
+    WRAP_DEV_LEN, WRAP_PW_LEN, WRAP_RK_LEN, LOCAL_LEN, PW_M_DEFAULT, PW_T_DEFAULT,
+    kw_pw_params_ok, kw_dev_seal_with, kw_dev_seal, kw_dev_open,
+    kw_pw_seal_with, kw_pw_seal, kw_pw_open, kw_rk_seal_with, kw_rk_seal, kw_rk_open,
+    kw_local_seal_with, kw_local_seal, kw_local_open,
+}
+
+const WRAP_DEV_LEN: usize = 85
+const WRAP_PW_LEN: usize = 76
+const WRAP_RK_LEN: usize = 69
+const LOCAL_LEN: usize = 104
+const PW_M_DEFAULT: usize = 65536
+const PW_T_DEFAULT: usize = 3
+const PW_M_MIN: usize = 8192
+const PW_M_MAX: usize = 262144
+const PW_T_MAX: usize = 10
+const ACCT_MAX: usize = 64
+const AAD_WDEV: str = "ORBIT-WDEV1"
+const AAD_WPW: str = "ORBIT-WPW1"
+const AAD_WRK: str = "ORBIT-WRK1"
+const AAD_LOCAL: str = "ORBIT-LOCAL1"
+const INFO_WDEV: str = "orbit/wrap-dev/v1"
+const INFO_WPW: str = "orbit/wrap-pw/v1"
+const INFO_WRK: str = "orbit/wrap-rk/v1"
+const INFO_LOCAL: str = "orbit/local/v1"
+const SALT_PW: str = "ORBIT-PW-v1"
+const SALT_LOCAL: str = "ORBIT-LOCAL-v1"
+
+fn all_zero(p: u64, n: usize) -> bool {
+    var acc: u8 = 0 as u8
+    var i: usize = 0
+    while i < n {
+        acc = acc | rt.ld8(p, i)
+        i = i + 1
+    }
+    return acc == 0 as u8
+}
+
+fn acct_ok(n: usize) -> bool {
+    return n >= 1 && n <= ACCT_MAX
+}
+
+fn kw_pw_params_ok(m_kib: usize, t: usize, p: usize) -> bool {
+    return m_kib >= PW_M_MIN && m_kib <= PW_M_MAX && t >= 1 && t <= PW_T_MAX && p == 1
+}
+
+fn aead_zero_nonce_seal(key: u64, aad: u64, an: usize, plain: u64, n: usize, out: u64) {
+    var nonce: [u8; 12] = [0; 12]
+    chacha.aead_seal(key, (&nonce[0]) as u64, aad, an, plain, n, out)
+}
+
+fn aead_zero_nonce_open(key: u64, aad: u64, an: usize, ct: u64, n: usize, out: u64) -> bool {
+    var nonce: [u8; 12] = [0; 12]
+    return chacha.aead_open(key, (&nonce[0]) as u64, aad, an, ct, n, out)
+}
+
+fn dev_key(eph_pub: u64, dev_pub: u64, shared: u64, out: u64) -> bool {
+    var salt: [u8; 64] = [0; 64]
+    rt.mem_copy((&salt[0]) as u64, eph_pub, 32)
+    rt.mem_copy((&salt[32]) as u64, dev_pub, 32)
+    return hkdf.hkdf((&salt[0]) as u64, 64, shared, 32, INFO_WDEV.p as u64, INFO_WDEV.n, out, 32)
+}
+
+fn dev_aad(epoch: u64, acct: u64, acctn: usize, dev_pub: u64, out: u64) -> usize {
+    var at: usize = keyaad.aad_tag(out, 0, AAD_WDEV)
+    at = keyaad.aad_u8(out, at, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    at = keyaad.aad_lp8(out, at, acct, acctn)
+    return keyaad.aad_raw(out, at, dev_pub, 32)
+}
+
+fn kw_dev_seal_with(eph_sec: u64, dev_pub: u64, epoch: u64, acct: u64, acctn: usize,
+    amk: u64, out: u64) -> bool {
+    if epoch < 1 || epoch > 4294967295 || !acct_ok(acctn) {
+        return false
+    }
+    var eph_pub: [u8; 32] = [0; 32]
+    var shared: [u8; 32] = [0; 32]
+    if !x25519.x25519_base(eph_sec, (&eph_pub[0]) as u64)
+        || !x25519.x25519(eph_sec, dev_pub, (&shared[0]) as u64)
+        || all_zero((&shared[0]) as u64, 32) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !dev_key((&eph_pub[0]) as u64, dev_pub, (&shared[0]) as u64, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = dev_aad(epoch, acct, acctn, dev_pub, (&aad[0]) as u64)
+    var at: usize = keyaad.aad_u8(out, 0, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    at = keyaad.aad_raw(out, at, (&eph_pub[0]) as u64, 32)
+    aead_zero_nonce_seal((&key[0]) as u64, (&aad[0]) as u64, an, amk, 32, out + at as u64)
+    return true
+}
+
+fn kw_dev_seal(dev_pub: u64, epoch: u64, acct: u64, acctn: usize, amk: u64, out: u64) -> bool {
+    var eph: [u8; 32] = [0; 32]
+    if !random.random_bytes((&eph[0]) as u64, 32) {
+        return false
+    }
+    return kw_dev_seal_with((&eph[0]) as u64, dev_pub, epoch, acct, acctn, amk, out)
+}
+
+fn kw_dev_open(dev_sec: u64, blob: u64, bn: usize, acct: u64, acctn: usize,
+    amk_out: u64) -> bool {
+    if bn != WRAP_DEV_LEN || rt.ld8(blob, 0) != 1 as u8 || !acct_ok(acctn) {
+        return false
+    }
+    let epoch: u64 = keyring.kr_blob_epoch(blob, bn)
+    if epoch < 1 {
+        return false
+    }
+    var dev_pub: [u8; 32] = [0; 32]
+    var shared: [u8; 32] = [0; 32]
+    if !x25519.x25519_base(dev_sec, (&dev_pub[0]) as u64)
+        || !x25519.x25519(dev_sec, blob + 5 as u64, (&shared[0]) as u64)
+        || all_zero((&shared[0]) as u64, 32) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !dev_key(blob + 5 as u64, (&dev_pub[0]) as u64, (&shared[0]) as u64, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = dev_aad(epoch, acct, acctn, (&dev_pub[0]) as u64, (&aad[0]) as u64)
+    return aead_zero_nonce_open((&key[0]) as u64, (&aad[0]) as u64, an, blob + 37 as u64, 48,
+        amk_out)
+}
+
+fn pw_key(pw: u64, pwn: usize, salt: u64, m_kib: usize, t: usize, p: usize,
+    hsalt: str, info: str, out: u64) -> bool {
+    if !kw_pw_params_ok(m_kib, t, p) || pwn == 0 {
+        return false
+    }
+    var raw: [u8; 32] = [0; 32]
+    if !argon2.argon2id(pw, pwn, salt, 16, 0, 0, 0, 0, t, m_kib, p, (&raw[0]) as u64, 32) {
+        return false
+    }
+    return hkdf.hkdf(hsalt.p as u64, hsalt.n, (&raw[0]) as u64, 32, info.p as u64, info.n, out, 32)
+}
+
+fn pw_params_put(out: u64, at: usize, m_kib: usize, t: usize, p: usize, salt: u64) -> usize {
+    var q: usize = keyaad.aad_u8(out, at, 1)
+    q = keyaad.aad_u32(out, q, m_kib as u64)
+    q = keyaad.aad_u8(out, q, t as u64)
+    q = keyaad.aad_u8(out, q, p as u64)
+    return keyaad.aad_raw(out, q, salt, 16)
+}
+
+fn pw_aad(epoch: u64, acct: u64, acctn: usize, m_kib: usize, t: usize, p: usize,
+    salt: u64, out: u64) -> usize {
+    var at: usize = keyaad.aad_tag(out, 0, AAD_WPW)
+    at = keyaad.aad_u8(out, at, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    at = keyaad.aad_lp8(out, at, acct, acctn)
+    return pw_params_put(out, at, m_kib, t, p, salt)
+}
+
+fn kw_pw_seal_with(pw: u64, pwn: usize, salt: u64, m_kib: usize, t: usize, p: usize,
+    epoch: u64, acct: u64, acctn: usize, amk: u64, out: u64) -> bool {
+    if epoch < 1 || epoch > 4294967295 || !acct_ok(acctn) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !pw_key(pw, pwn, salt, m_kib, t, p, SALT_PW, INFO_WPW, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = pw_aad(epoch, acct, acctn, m_kib, t, p, salt, (&aad[0]) as u64)
+    var at: usize = keyaad.aad_u8(out, 0, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    at = pw_params_put(out, at, m_kib, t, p, salt)
+    aead_zero_nonce_seal((&key[0]) as u64, (&aad[0]) as u64, an, amk, 32, out + at as u64)
+    return true
+}
+
+fn kw_pw_seal(pw: u64, pwn: usize, m_kib: usize, t: usize, epoch: u64, acct: u64,
+    acctn: usize, amk: u64, out: u64) -> bool {
+    var salt: [u8; 16] = [0; 16]
+    if !random.random_bytes((&salt[0]) as u64, 16) {
+        return false
+    }
+    return kw_pw_seal_with(pw, pwn, (&salt[0]) as u64, m_kib, t, 1, epoch, acct, acctn, amk, out)
+}
+
+fn be32(p: u64, at: usize) -> usize {
+    return (((rt.ld8(p, at) as u64) << 24) | ((rt.ld8(p, at + 1) as u64) << 16)
+        | ((rt.ld8(p, at + 2) as u64) << 8) | (rt.ld8(p, at + 3) as u64)) as usize
+}
+
+fn kw_pw_open(pw: u64, pwn: usize, blob: u64, bn: usize, acct: u64, acctn: usize,
+    amk_out: u64) -> bool {
+    if bn != WRAP_PW_LEN || rt.ld8(blob, 0) != 1 as u8 || rt.ld8(blob, 5) != 1 as u8
+        || !acct_ok(acctn) {
+        return false
+    }
+    let epoch: u64 = keyring.kr_blob_epoch(blob, bn)
+    let m_kib: usize = be32(blob, 6)
+    let t: usize = rt.ld8(blob, 10) as usize
+    let p: usize = rt.ld8(blob, 11) as usize
+    if epoch < 1 || !kw_pw_params_ok(m_kib, t, p) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !pw_key(pw, pwn, blob + 12 as u64, m_kib, t, p, SALT_PW, INFO_WPW, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = pw_aad(epoch, acct, acctn, m_kib, t, p, blob + 12 as u64, (&aad[0]) as u64)
+    return aead_zero_nonce_open((&key[0]) as u64, (&aad[0]) as u64, an, blob + 28 as u64, 48,
+        amk_out)
+}
+
+fn rk_aad(epoch: u64, acct: u64, acctn: usize, out: u64) -> usize {
+    var at: usize = keyaad.aad_tag(out, 0, AAD_WRK)
+    at = keyaad.aad_u8(out, at, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    return keyaad.aad_lp8(out, at, acct, acctn)
+}
+
+fn rk_key(rk: u64, salt: u64, out: u64) -> bool {
+    return hkdf.hkdf(salt, 16, rk, 32, INFO_WRK.p as u64, INFO_WRK.n, out, 32)
+}
+
+fn kw_rk_seal_with(rk: u64, salt: u64, epoch: u64, acct: u64, acctn: usize, amk: u64,
+    out: u64) -> bool {
+    if epoch < 1 || epoch > 4294967295 || !acct_ok(acctn) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !rk_key(rk, salt, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 96] = [0; 96]
+    let an: usize = rk_aad(epoch, acct, acctn, (&aad[0]) as u64)
+    var at: usize = keyaad.aad_u8(out, 0, 1)
+    at = keyaad.aad_u32(out, at, epoch)
+    at = keyaad.aad_raw(out, at, salt, 16)
+    aead_zero_nonce_seal((&key[0]) as u64, (&aad[0]) as u64, an, amk, 32, out + at as u64)
+    return true
+}
+
+fn kw_rk_seal(rk: u64, epoch: u64, acct: u64, acctn: usize, amk: u64, out: u64) -> bool {
+    var salt: [u8; 16] = [0; 16]
+    if !random.random_bytes((&salt[0]) as u64, 16) {
+        return false
+    }
+    return kw_rk_seal_with(rk, (&salt[0]) as u64, epoch, acct, acctn, amk, out)
+}
+
+fn kw_rk_open(rk: u64, blob: u64, bn: usize, acct: u64, acctn: usize, amk_out: u64) -> bool {
+    if bn != WRAP_RK_LEN || rt.ld8(blob, 0) != 1 as u8 || !acct_ok(acctn) {
+        return false
+    }
+    let epoch: u64 = keyring.kr_blob_epoch(blob, bn)
+    if epoch < 1 {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !rk_key(rk, blob + 5 as u64, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 96] = [0; 96]
+    let an: usize = rk_aad(epoch, acct, acctn, (&aad[0]) as u64)
+    return aead_zero_nonce_open((&key[0]) as u64, (&aad[0]) as u64, an, blob + 21 as u64, 48,
+        amk_out)
+}
+
+fn local_aad(acct: u64, acctn: usize, m_kib: usize, t: usize, p: usize, salt: u64,
+    out: u64) -> usize {
+    var at: usize = keyaad.aad_tag(out, 0, AAD_LOCAL)
+    at = keyaad.aad_u8(out, at, 1)
+    at = keyaad.aad_lp8(out, at, acct, acctn)
+    return pw_params_put(out, at, m_kib, t, p, salt)
+}
+
+fn kw_local_seal_with(pw: u64, pwn: usize, salt: u64, m_kib: usize, t: usize, p: usize,
+    acct: u64, acctn: usize, plain64: u64, out: u64) -> bool {
+    if !acct_ok(acctn) {
+        return false
+    }
+    var key: [u8; 32] = [0; 32]
+    if !pw_key(pw, pwn, salt, m_kib, t, p, SALT_LOCAL, INFO_LOCAL, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = local_aad(acct, acctn, m_kib, t, p, salt, (&aad[0]) as u64)
+    let at: usize = pw_params_put(out, keyaad.aad_u8(out, 0, 1), m_kib, t, p, salt)
+    aead_zero_nonce_seal((&key[0]) as u64, (&aad[0]) as u64, an, plain64, 64, out + at as u64)
+    return true
+}
+
+fn kw_local_seal(pw: u64, pwn: usize, m_kib: usize, t: usize, acct: u64, acctn: usize,
+    plain64: u64, out: u64) -> bool {
+    var salt: [u8; 16] = [0; 16]
+    if !random.random_bytes((&salt[0]) as u64, 16) {
+        return false
+    }
+    return kw_local_seal_with(pw, pwn, (&salt[0]) as u64, m_kib, t, 1, acct, acctn, plain64, out)
+}
+
+fn kw_local_open(pw: u64, pwn: usize, blob: u64, bn: usize, acct: u64, acctn: usize,
+    plain64_out: u64) -> bool {
+    if bn != LOCAL_LEN || rt.ld8(blob, 0) != 1 as u8 || rt.ld8(blob, 1) != 1 as u8
+        || !acct_ok(acctn) {
+        return false
+    }
+    let m_kib: usize = be32(blob, 2)
+    let t: usize = rt.ld8(blob, 6) as usize
+    let p: usize = rt.ld8(blob, 7) as usize
+    var key: [u8; 32] = [0; 32]
+    if !pw_key(pw, pwn, blob + 8 as u64, m_kib, t, p, SALT_LOCAL, INFO_LOCAL, (&key[0]) as u64) {
+        return false
+    }
+    var aad: [u8; 160] = [0; 160]
+    let an: usize = local_aad(acct, acctn, m_kib, t, p, blob + 8 as u64, (&aad[0]) as u64)
+    return aead_zero_nonce_open((&key[0]) as u64, (&aad[0]) as u64, an, blob + 24 as u64, 80,
+        plain64_out)
+}

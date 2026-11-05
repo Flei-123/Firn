@@ -1,0 +1,449 @@
+// expect_exit: 0
+import std.io
+import std.rt
+import std.json
+import std.str
+import std.crypto.ed25519
+import std.crypto.keyring
+import std.crypto.keywrap
+import std.crypto.keytext
+import std.crypto.keyident
+
+const VECTORS: str = __include_str("data/keyring-vectors.json")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, id: str.Span, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(" ")
+        io.print_line_bytes(id.p as u64, id.n)
+    }
+}
+
+fn checkl(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn get(d: *mut json.Json, o: u32, key: str) -> u32 {
+    return json.json_get(d, o, key.p as u64, key.n)
+}
+
+fn sget(d: *mut json.Json, o: u32, key: str) -> str.Span {
+    return json.json_string(d, get(d, o, key))
+}
+
+fn iget(d: *mut json.Json, o: u32, key: str) -> u64 {
+    return json.json_int(d, get(d, o, key)) as u64
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as i32) + 10
+    }
+    return -1
+}
+
+fn hex_decode(s: str.Span, out: u64, cap: usize) -> i64 {
+    if (s.n % 2) != 0 || s.n / 2 > cap {
+        return -1
+    }
+    var i: usize = 0
+    while i < s.n / 2 {
+        let hi: i32 = hexv(rt.ld8(s.p as u64, i * 2))
+        let lo: i32 = hexv(rt.ld8(s.p as u64, i * 2 + 1))
+        if hi < 0 || lo < 0 {
+            return -1
+        }
+        rt.st8(out, i, (hi * 16 + lo) as u8)
+        i = i + 1
+    }
+    return (s.n / 2) as i64
+}
+
+fn hget(d: *mut json.Json, o: u32, key: str, out: u64, cap: usize) -> usize {
+    let n: i64 = hex_decode(sget(d, o, key), out, cap)
+    if n < 0 {
+        return 0
+    }
+    return n as usize
+}
+
+fn flip(p: u64, at: usize) {
+    rt.st8(p, at, rt.ld8(p, at) ^ 1 as u8)
+}
+
+fn run_subkeys(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var amk: [u8; 32] = [0; 32]
+    var want: [u8; 32] = [0; 32]
+    var got: [u8; 32] = [0; 32]
+    var it: u32 = json.json_child(d, get(d, root, "subkeys"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "amk", (&amk[0]) as u64, 32)
+        hget(d, it, "kid", (&want[0]) as u64, 8)
+        check(t, "kid", id, keyring.kr_kid((&amk[0]) as u64, (&got[0]) as u64)
+            && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 8))
+        let names: u32 = get(d, it, "names")
+        var nm: u32 = json.json_child(d, names)
+        while nm != json.JSON_NONE {
+            let key: str.Span = json.json_key(d, nm)
+            hex_decode(json.json_string(d, nm), (&want[0]) as u64, 32)
+            check(t, "subkey", key, keyring.kr_subkey((&amk[0]) as u64, key.p as u64, key.n, (&got[0]) as u64)
+                && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 32))
+            nm = json.json_next(d, nm)
+        }
+        var bad: [u8; 3] = "A_b"
+        check(t, "subkey bad name", id, !keyring.kr_subkey((&amk[0]) as u64, (&bad[0]) as u64, 3, (&got[0]) as u64))
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_records(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var amk: [u8; 32] = [0; 32]
+    var key: [u8; 32] = [0; 32]
+    var salt: [u8; 16] = [0; 16]
+    var plain: [u8; 1100] = [0; 1100]
+    var want: [u8; 1200] = [0; 1200]
+    var got: [u8; 1200] = [0; 1200]
+    var back: [u8; 1100] = [0; 1100]
+    var acct: [u8; 64] = [0; 64]
+    var cls: [u8; 64] = [0; 64]
+    var oid: [u8; 300] = [0; 300]
+    var it: u32 = json.json_child(d, get(d, root, "records"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "amk", (&amk[0]) as u64, 32)
+        hget(d, it, "salt", (&salt[0]) as u64, 16)
+        let pn: usize = hget(d, it, "plain", (&plain[0]) as u64, 1100)
+        let wn: usize = hget(d, it, "rec", (&want[0]) as u64, 1200)
+        let an: usize = hget(d, it, "acct", (&acct[0]) as u64, 0)
+        let asp: str.Span = sget(d, it, "acct")
+        let csp: str.Span = sget(d, it, "class")
+        let osp: str.Span = sget(d, it, "oid")
+        rt.mem_copy((&acct[0]) as u64, asp.p as u64, asp.n)
+        rt.mem_copy((&cls[0]) as u64, csp.p as u64, csp.n)
+        rt.mem_copy((&oid[0]) as u64, osp.p as u64, osp.n)
+        var rid: keyring.RecId = keyring.rec_id(iget(d, it, "epoch"), (&acct[0]) as u64, asp.n,
+            (&cls[0]) as u64, csp.n, (&oid[0]) as u64, osp.n, iget(d, it, "objver"))
+        keyring.kr_subkey((&amk[0]) as u64, (&cls[0]) as u64, csp.n, (&key[0]) as u64)
+        let n: usize = keyring.kr_record_seal_with((&salt[0]) as u64, (&key[0]) as u64, &rid,
+            (&plain[0]) as u64, pn, (&got[0]) as u64)
+        check(t, "record seal", id, n == wn && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, wn))
+        let on: i64 = keyring.kr_record_open((&key[0]) as u64, &rid, (&want[0]) as u64, wn, (&back[0]) as u64)
+        check(t, "record open", id, on == pn as i64 && rt.mem_eq((&back[0]) as u64, (&plain[0]) as u64, pn))
+        let hops: [usize; 4] = [0, 3, 10, 25]
+        var k: usize = 0
+        while k < 4 {
+            if hops[k] < wn {
+                flip((&want[0]) as u64, hops[k])
+                check(t, "record flip", id, keyring.kr_record_open((&key[0]) as u64, &rid, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+                flip((&want[0]) as u64, hops[k])
+            }
+            k = k + 1
+        }
+        flip((&want[0]) as u64, wn - 1)
+        check(t, "record tag", id, keyring.kr_record_open((&key[0]) as u64, &rid, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+        flip((&want[0]) as u64, wn - 1)
+        var r2: keyring.RecId = rid
+        r2.objver = rid.objver ^ 1
+        check(t, "record objver", id, keyring.kr_record_open((&key[0]) as u64, &r2, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+        r2 = rid
+        flip((&acct[0]) as u64, 0)
+        check(t, "record acct", id, keyring.kr_record_open((&key[0]) as u64, &r2, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+        flip((&acct[0]) as u64, 0)
+        flip((&oid[0]) as u64, 0)
+        check(t, "record oid", id, keyring.kr_record_open((&key[0]) as u64, &r2, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+        flip((&oid[0]) as u64, 0)
+        r2.classn = 1
+        check(t, "record class", id, keyring.kr_record_open((&key[0]) as u64, &r2, (&want[0]) as u64, wn, (&back[0]) as u64) < 0)
+        check(t, "record short", id, keyring.kr_record_open((&key[0]) as u64, &rid, (&want[0]) as u64, 36, (&back[0]) as u64) < 0)
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_wraps(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var amk: [u8; 32] = [0; 32]
+    var out: [u8; 32] = [0; 32]
+    var a: [u8; 32] = [0; 32]
+    var b: [u8; 32] = [0; 32]
+    var salt: [u8; 16] = [0; 16]
+    var pw: [u8; 64] = [0; 64]
+    var want: [u8; 128] = [0; 128]
+    var got: [u8; 128] = [0; 128]
+    var acct: [u8; 16] = "0123456789abcdef"
+    var it: u32 = json.json_child(d, get(d, root, "wrap_dev"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "amk", (&amk[0]) as u64, 32)
+        hget(d, it, "eph_sec", (&a[0]) as u64, 32)
+        hget(d, it, "dev_pub", (&b[0]) as u64, 32)
+        let wn: usize = hget(d, it, "blob", (&want[0]) as u64, 128)
+        let ep: u64 = iget(d, it, "epoch")
+        check(t, "wrap_dev seal", id, keywrap.kw_dev_seal_with((&a[0]) as u64, (&b[0]) as u64, ep,
+            (&acct[0]) as u64, 16, (&amk[0]) as u64, (&got[0]) as u64) && wn == 85
+            && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 85))
+        hget(d, it, "dev_sec", (&a[0]) as u64, 32)
+        check(t, "wrap_dev open", id, keywrap.kw_dev_open((&a[0]) as u64, (&want[0]) as u64, wn,
+            (&acct[0]) as u64, 16, (&out[0]) as u64) && rt.mem_eq((&out[0]) as u64, (&amk[0]) as u64, 32))
+        flip((&want[0]) as u64, 60)
+        check(t, "wrap_dev flip", id, !keywrap.kw_dev_open((&a[0]) as u64, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        flip((&want[0]) as u64, 60)
+        flip((&want[0]) as u64, 2)
+        check(t, "wrap_dev epoch", id, !keywrap.kw_dev_open((&a[0]) as u64, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        flip((&want[0]) as u64, 2)
+        flip((&acct[0]) as u64, 3)
+        check(t, "wrap_dev acct", id, !keywrap.kw_dev_open((&a[0]) as u64, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        flip((&acct[0]) as u64, 3)
+        flip((&a[0]) as u64, 5)
+        check(t, "wrap_dev wrong key", id, !keywrap.kw_dev_open((&a[0]) as u64, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        it = json.json_next(d, it)
+    }
+    it = json.json_child(d, get(d, root, "wrap_pw"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "amk", (&amk[0]) as u64, 32)
+        hget(d, it, "salt", (&salt[0]) as u64, 16)
+        let pn: usize = hget(d, it, "pw", (&pw[0]) as u64, 64)
+        let wn: usize = hget(d, it, "blob", (&want[0]) as u64, 128)
+        let m: usize = iget(d, it, "m") as usize
+        let tt: usize = iget(d, it, "t") as usize
+        let ep: u64 = iget(d, it, "epoch")
+        check(t, "wrap_pw seal", id, keywrap.kw_pw_seal_with((&pw[0]) as u64, pn, (&salt[0]) as u64, m, tt, 1, ep,
+            (&acct[0]) as u64, 16, (&amk[0]) as u64, (&got[0]) as u64) && wn == 76
+            && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 76))
+        check(t, "wrap_pw open", id, keywrap.kw_pw_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn,
+            (&acct[0]) as u64, 16, (&out[0]) as u64) && rt.mem_eq((&out[0]) as u64, (&amk[0]) as u64, 32))
+        if m <= 8192 {
+            flip((&pw[0]) as u64, 0)
+            check(t, "wrap_pw wrong pass", id, !keywrap.kw_pw_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+            flip((&pw[0]) as u64, 0)
+            flip((&want[0]) as u64, 40)
+            check(t, "wrap_pw flip", id, !keywrap.kw_pw_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+            flip((&want[0]) as u64, 40)
+            rt.st8((&want[0]) as u64, 6, 255 as u8)
+            check(t, "wrap_pw memory limit", id, !keywrap.kw_pw_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        }
+        it = json.json_next(d, it)
+    }
+    it = json.json_child(d, get(d, root, "wrap_rk"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "amk", (&amk[0]) as u64, 32)
+        hget(d, it, "salt", (&salt[0]) as u64, 16)
+        hget(d, it, "rk", (&a[0]) as u64, 32)
+        let wn: usize = hget(d, it, "blob", (&want[0]) as u64, 128)
+        let ep: u64 = iget(d, it, "epoch")
+        check(t, "wrap_rk seal", id, keywrap.kw_rk_seal_with((&a[0]) as u64, (&salt[0]) as u64, ep,
+            (&acct[0]) as u64, 16, (&amk[0]) as u64, (&got[0]) as u64) && wn == 69
+            && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 69))
+        check(t, "wrap_rk open", id, keywrap.kw_rk_open((&a[0]) as u64, (&want[0]) as u64, wn,
+            (&acct[0]) as u64, 16, (&out[0]) as u64) && rt.mem_eq((&out[0]) as u64, (&amk[0]) as u64, 32))
+        flip((&want[0]) as u64, 30)
+        check(t, "wrap_rk flip", id, !keywrap.kw_rk_open((&a[0]) as u64, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        let sp: str.Span = sget(d, it, "text")
+        check(t, "rk text decode", id, keytext.kt_rk_decode(sp.p as u64, sp.n, (&b[0]) as u64) && rt.mem_eq((&a[0]) as u64, (&b[0]) as u64, 32))
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_text(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var rk: [u8; 32] = [0; 32]
+    var back: [u8; 32] = [0; 32]
+    var txt: [u8; 80] = [0; 80]
+    var it: u32 = json.json_child(d, get(d, root, "rk_text"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "rk")
+        hget(d, it, "rk", (&rk[0]) as u64, 32)
+        let sp: str.Span = sget(d, it, "text")
+        let n: usize = keytext.kt_rk_encode((&rk[0]) as u64, (&txt[0]) as u64)
+        check(t, "rk encode", id, n == 69 && n == sp.n && rt.mem_eq((&txt[0]) as u64, sp.p as u64, n))
+        check(t, "rk decode", id, keytext.kt_rk_decode(sp.p as u64, sp.n, (&back[0]) as u64) && rt.mem_eq((&back[0]) as u64, (&rk[0]) as u64, 32))
+        rt.mem_copy((&txt[0]) as u64, sp.p as u64, sp.n)
+        flip((&txt[0]) as u64, 7)
+        check(t, "rk typo", id, !keytext.kt_rk_decode((&txt[0]) as u64, sp.n, (&back[0]) as u64))
+        flip((&txt[0]) as u64, 7)
+        rt.st8((&txt[0]) as u64, 0, 48 as u8)
+        check(t, "rk digit zero", id, !keytext.kt_rk_decode((&txt[0]) as u64, sp.n, (&back[0]) as u64))
+        check(t, "rk short", id, !keytext.kt_rk_decode(sp.p as u64, sp.n - 5, (&back[0]) as u64))
+        var low: [u8; 69] = [0; 69]
+        var i: usize = 0
+        while i < 69 {
+            let c: u8 = rt.ld8(sp.p as u64, i)
+            low[i] = c
+            if c >= 65 as u8 && c <= 90 as u8 {
+                low[i] = c + 32 as u8
+            }
+            i = i + 1
+        }
+        check(t, "rk lower case", id, keytext.kt_rk_decode((&low[0]) as u64, 69, (&back[0]) as u64) && rt.mem_eq((&back[0]) as u64, (&rk[0]) as u64, 32))
+        it = json.json_next(d, it)
+    }
+    var data: [u8; 128] = [0; 128]
+    it = json.json_child(d, get(d, root, "fp"))
+    while it != json.JSON_NONE {
+        let dn: usize = hget(d, it, "data", (&data[0]) as u64, 128)
+        let sp: str.Span = sget(d, it, "text")
+        let n: usize = keytext.kt_fingerprint((&data[0]) as u64, dn, (&txt[0]) as u64)
+        check(t, "fingerprint", sp, n == 19 && n == sp.n && rt.mem_eq((&txt[0]) as u64, sp.p as u64, n))
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_ident(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let o: u32 = get(d, root, "ident")
+    var c: ed25519.Ctx = ed25519.ctx_new()
+    ed25519.ctx_init(&c)
+    var seed: [u8; 32] = [0; 32]
+    var nseed: [u8; 32] = [0; 32]
+    var spub: [u8; 32] = [0; 32]
+    var npub: [u8; 32] = [0; 32]
+    var xpub: [u8; 32] = [0; 32]
+    var bundle: [u8; 69] = [0; 69]
+    var want: [u8; 69] = [0; 69]
+    var sig: [u8; 64] = [0; 64]
+    var got: [u8; 64] = [0; 64]
+    var acct: [u8; 16] = "0123456789abcdef"
+    let id: str.Span = sget(d, o, "acct")
+    hget(d, o, "s_seed", (&seed[0]) as u64, 32)
+    hget(d, o, "new_seed", (&nseed[0]) as u64, 32)
+    hget(d, o, "s_pub", (&spub[0]) as u64, 32)
+    hget(d, o, "new_pub", (&npub[0]) as u64, 32)
+    hget(d, o, "x_pub", (&xpub[0]) as u64, 32)
+    hget(d, o, "bundle", (&want[0]) as u64, 69)
+    hget(d, o, "sig", (&sig[0]) as u64, 64)
+    keyident.ki_bundle((&xpub[0]) as u64, (&spub[0]) as u64, iget(d, o, "created"), (&bundle[0]) as u64)
+    check(t, "bundle", id, rt.mem_eq((&bundle[0]) as u64, (&want[0]) as u64, 69))
+    check(t, "bundle sign", id, keyident.ki_bundle_sign(&c, (&seed[0]) as u64, (&acct[0]) as u64, 16, (&bundle[0]) as u64, (&got[0]) as u64)
+        && rt.mem_eq((&got[0]) as u64, (&sig[0]) as u64, 64))
+    check(t, "bundle verify", id, keyident.ki_bundle_verify(&c, (&acct[0]) as u64, 16, (&bundle[0]) as u64, (&sig[0]) as u64))
+    flip((&bundle[0]) as u64, 40)
+    check(t, "bundle tamper", id, !keyident.ki_bundle_verify(&c, (&acct[0]) as u64, 16, (&bundle[0]) as u64, (&sig[0]) as u64))
+    flip((&bundle[0]) as u64, 40)
+    flip((&acct[0]) as u64, 0)
+    check(t, "bundle other account", id, !keyident.ki_bundle_verify(&c, (&acct[0]) as u64, 16, (&bundle[0]) as u64, (&sig[0]) as u64))
+    flip((&acct[0]) as u64, 0)
+    var rs: [u8; 64] = [0; 64]
+    hget(d, o, "rot_old", (&rs[0]) as u64, 64)
+    check(t, "rotation old", id, keyident.ki_rotation_sign(&c, (&seed[0]) as u64, (&acct[0]) as u64, 16, (&spub[0]) as u64, (&npub[0]) as u64, (&got[0]) as u64)
+        && rt.mem_eq((&got[0]) as u64, (&rs[0]) as u64, 64)
+        && keyident.ki_rotation_verify(&c, (&spub[0]) as u64, (&acct[0]) as u64, 16, (&spub[0]) as u64, (&npub[0]) as u64, (&rs[0]) as u64))
+    hget(d, o, "rot_new", (&rs[0]) as u64, 64)
+    check(t, "rotation new", id, keyident.ki_rotation_sign(&c, (&nseed[0]) as u64, (&acct[0]) as u64, 16, (&spub[0]) as u64, (&npub[0]) as u64, (&got[0]) as u64)
+        && rt.mem_eq((&got[0]) as u64, (&rs[0]) as u64, 64))
+    check(t, "rotation swapped keys", id, !keyident.ki_rotation_verify(&c, (&npub[0]) as u64, (&acct[0]) as u64, 16, (&npub[0]) as u64, (&spub[0]) as u64, (&rs[0]) as u64))
+}
+
+fn run_local(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var salt: [u8; 16] = [0; 16]
+    var pw: [u8; 64] = [0; 64]
+    var plain: [u8; 64] = [0; 64]
+    var want: [u8; 128] = [0; 128]
+    var got: [u8; 128] = [0; 128]
+    var out: [u8; 64] = [0; 64]
+    var acct: [u8; 16] = "0123456789abcdef"
+    var it: u32 = json.json_child(d, get(d, root, "local"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        hget(d, it, "salt", (&salt[0]) as u64, 16)
+        let pn: usize = hget(d, it, "pw", (&pw[0]) as u64, 64)
+        hget(d, it, "plain", (&plain[0]) as u64, 64)
+        let wn: usize = hget(d, it, "blob", (&want[0]) as u64, 128)
+        let m: usize = iget(d, it, "m") as usize
+        let tt: usize = iget(d, it, "t") as usize
+        check(t, "local seal", id, keywrap.kw_local_seal_with((&pw[0]) as u64, pn, (&salt[0]) as u64, m, tt, 1,
+            (&acct[0]) as u64, 16, (&plain[0]) as u64, (&got[0]) as u64) && wn == 104
+            && rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, 104))
+        check(t, "local open", id, keywrap.kw_local_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn,
+            (&acct[0]) as u64, 16, (&out[0]) as u64) && rt.mem_eq((&out[0]) as u64, (&plain[0]) as u64, 64))
+        flip((&pw[0]) as u64, 0)
+        check(t, "local wrong pass", id, !keywrap.kw_local_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        flip((&pw[0]) as u64, 0)
+        flip((&acct[0]) as u64, 1)
+        check(t, "local other account", id, !keywrap.kw_local_open((&pw[0]) as u64, pn, (&want[0]) as u64, wn, (&acct[0]) as u64, 16, (&out[0]) as u64))
+        flip((&acct[0]) as u64, 1)
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_random(t: *mut Tally) {
+    var amk: [u8; 32] = [0; 32]
+    var amk2: [u8; 32] = [0; 32]
+    var sec: [u8; 32] = [0; 32]
+    var pubk: [u8; 32] = [0; 32]
+    var blob: [u8; 128] = [0; 128]
+    var out: [u8; 32] = [0; 32]
+    var acct: [u8; 16] = "0123456789abcdef"
+    keyring.kr_amk_generate((&amk[0]) as u64)
+    keyring.kr_amk_generate((&amk2[0]) as u64)
+    checkl(t, "amk random differs", !rt.mem_eq((&amk[0]) as u64, (&amk2[0]) as u64, 32))
+    keyring.kr_amk_generate((&sec[0]) as u64)
+    var x: [u8; 1] = "x"
+    var xp: [u8; 32] = [0; 32]
+    checkl(t, "x25519 base", keyring.kr_kid((&amk[0]) as u64, (&xp[0]) as u64))
+    var zero: [u8; 32] = [0; 32]
+    checkl(t, "dev seal rejects zero public key", !keywrap.kw_dev_seal((&zero[0]) as u64, 1, (&acct[0]) as u64, 16, (&amk[0]) as u64, (&blob[0]) as u64))
+    var pw: [u8; 13] = "pass phrase 1"
+    checkl(t, "pw seal+open random", keywrap.kw_pw_seal((&pw[0]) as u64, 13, 8192, 1, 2, (&acct[0]) as u64, 16, (&amk[0]) as u64, (&blob[0]) as u64)
+        && keywrap.kw_pw_open((&pw[0]) as u64, 13, (&blob[0]) as u64, 76, (&acct[0]) as u64, 16, (&out[0]) as u64)
+        && rt.mem_eq((&out[0]) as u64, (&amk[0]) as u64, 32))
+    checkl(t, "pw below memory floor refused", !keywrap.kw_pw_seal((&pw[0]) as u64, 13, 1024, 1, 1, (&acct[0]) as u64, 16, (&amk[0]) as u64, (&blob[0]) as u64))
+    var plain: [u8; 5] = "hello"
+    var rec: [u8; 64] = [0; 64]
+    var key: [u8; 32] = [0; 32]
+    keyring.kr_subkey((&amk[0]) as u64, "notes".p as u64, 5, (&key[0]) as u64)
+    var rid: keyring.RecId = keyring.rec_id(1, (&acct[0]) as u64, 16, "notes".p as u64, 5, "n1".p as u64, 2, 1)
+    let n1: usize = keyring.kr_record_seal((&key[0]) as u64, &rid, (&plain[0]) as u64, 5, (&rec[0]) as u64)
+    var rec2: [u8; 64] = [0; 64]
+    let n2: usize = keyring.kr_record_seal((&key[0]) as u64, &rid, (&plain[0]) as u64, 5, (&rec2[0]) as u64)
+    checkl(t, "two seals of one object differ", n1 == 42 && n2 == 42 && !rt.mem_eq((&rec[0]) as u64, (&rec2[0]) as u64, 42))
+    var rk: [u8; 32] = [0; 32]
+    var txt: [u8; 80] = [0; 80]
+    var rk2: [u8; 32] = [0; 32]
+    keyring.kr_amk_generate((&rk[0]) as u64)
+    checkl(t, "rk random round trip", keytext.kt_rk_encode((&rk[0]) as u64, (&txt[0]) as u64) == 69
+        && keytext.kt_rk_decode((&txt[0]) as u64, 69, (&rk2[0]) as u64) && rt.mem_eq((&rk[0]) as u64, (&rk2[0]) as u64, 32))
+}
+
+fn main() -> i32 {
+    var d: json.Json = json.json_new()
+    defer json.json_free(&d)
+    let parsed: bool = json.json_parse(&d, VECTORS.p as u64, VECTORS.n) catch false
+    if !parsed {
+        io.print_line("FAIL the vectors are not JSON")
+        return 1
+    }
+    let root: u32 = json.json_root(&d)
+    var t: Tally = Tally { total: 0, fails: 0 }
+    run_subkeys(&t, &d, root)
+    run_records(&t, &d, root)
+    run_wraps(&t, &d, root)
+    run_text(&t, &d, root)
+    run_ident(&t, &d, root)
+    run_local(&t, &d, root)
+    run_random(&t)
+    var b: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&b)
+    rt.buf_push_dec_i64(&b, t.total)
+    rt.buf_push_bytes(&b, " checks, failures: ".p as u64, 19)
+    rt.buf_push_dec_i64(&b, t.fails)
+    io.print_line_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}
