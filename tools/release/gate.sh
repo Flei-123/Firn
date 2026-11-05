@@ -3,7 +3,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-STAGES="1 2 3 4 5 6 7 8 9 10 11 12"
+STAGES=$(seq -s " " 1 "$(bash tools/teststages/select.sh --count)")
 OUT=
 KNOWN=$ROOT/tools/release/known_red.txt
 FIXPOINT=1

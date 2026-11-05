@@ -1,7 +1,7 @@
 # test.sh stages
 
 `bash test.sh --stage N` runs one stage; `tools/teststages/run.sh [--heavy|--parallel|--list]` runs all.
-`stages.txt` maps section ids to stages (12 stages). An id may carry a shard: `3@2/8` runs shard 2 of 8 of section 3
+`stages.txt` maps section ids to stages (15 stages). An id may carry a shard: `3@2/8` runs shard 2 of 8 of section 3
 (programs are dealt round robin via TEST_SHARD_INDEX / TEST_SHARD_COUNT). One stage holds at most one shard of an id.
 Ids missing from stages.txt run in the last stage.
 
@@ -17,3 +17,5 @@ aarch64 run.sh, tools/checked/run.sh (sub_i8 message), fixpoint, js run, english
 Measured 25.10.2026 (12-stage layout, load 25-38, heavy queue waits included): stage 9: 1313 s (red: parser_compare, fixed; fmt/english are stage 12).
 Stages 6, 8, 10, 11, 12 ran 55+ min wall at this load (stage 8 section 3 shard 8: about 1180 s before section 34; stage 11 aarch64 974 of 999 identical).
 Stage 12 red: english (r59) and fmt (r48), both old.
+
+04.11.2026 stable gate (2 cores, nice 19): stages 5 and 6 hit the 180 min heavy cap. Measured 29.10. (stage5rest): section 69 2755 s, 81 932 s, 82 858 s, 83 636 s, 80 572 s. Stage 5 is now 5 + 13 + 14, stage 6 is 6 + 15.
