@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import rvemu.machine as mc
+
+export { read_word, write_word, flush_out }
+
+const UART_STATUS: u32 = 24576
+const FINISHER_PASS: u32 = 21845
+const FINISHER_FAIL: u32 = 13107
+const FLUSH_AT: usize = 4096
+
+fn region_word(base: u32, size: u32, data: u64, addr: u32) -> u32 {
+    return rt.ld32(data, ((addr - base) >> 2) as usize)
+}
+
+fn extra_read(m: *mut mc.Machine, addr: u32) -> u32 {
+    var i: usize = 0
+    let n: usize = vec_len[mc.Region](&(*m).regions)
+    while i < n {
+        let r: *mut mc.Region = vec_elem_ptr[mc.Region](&(*m).regions, i)
+        if addr -% (*r).base < (*r).size {
+            return region_word((*r).base, (*r).size, (*r).data, addr)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn read_slow(m: *mut mc.Machine, addr: u32) -> u32 {
+    if (*m).uart_on && (addr >> 8) == ((*m).uart_base >> 8) {
+        if ((addr >> 2) & 63) == 1 {
+            return UART_STATUS
+        }
+        return 0
+    }
+    if (*m).fin_on && (addr >> 12) == ((*m).fin_base >> 12) {
+        return 0
+    }
+    return extra_read(m, addr)
+}
+
+fn read_word(m: *mut mc.Machine, addr: u32) -> u32 {
+    let off: u32 = addr -% (*m).ram_base
+    if off < (*m).ram_size {
+        return rt.ld32((*m).ram, (off >> 2) as usize)
+    }
+    return read_slow(m, addr)
+}
+
+fn strobe_mask(strb: u32) -> u32 {
+    var mask: u32 = 0
+    if (strb & 1) != 0 {
+        mask = mask | 255
+    }
+    if (strb & 2) != 0 {
+        mask = mask | 65280
+    }
+    if (strb & 4) != 0 {
+        mask = mask | 16711680
+    }
+    if (strb & 8) != 0 {
+        mask = mask | 4278190080
+    }
+    return mask
+}
+
+fn store_masked(data: u64, index: usize, value: u32, strb: u32) {
+    if strb == 15 {
+        rt.st32(data, index, value)
+        return
+    }
+    let mask: u32 = strobe_mask(strb)
+    let old: u32 = rt.ld32(data, index)
+    rt.st32(data, index, (old & ~mask) | (value & mask))
+}
+
+fn flush_out(m: *mut mc.Machine) {
+    let n: usize = rt.buf_len(&(*m).out)
+    if n > 0 {
+        rt.write_everything(1, rt.buf_ptr(&(*m).out), n)
+        rt.buf_clear(&(*m).out)
+    }
+}
+
+fn finisher_write(m: *mut mc.Machine, addr: u32, data: u32) {
+    if ((addr >> 2) & 1023) != 0 || (*m).exit_valid {
+        return
+    }
+    let code: u32 = data & 65535
+    if code == FINISHER_PASS {
+        (*m).exit_valid = true
+        (*m).exit_code = 0
+    } else if code == FINISHER_FAIL {
+        (*m).exit_valid = true
+        (*m).exit_code = data >> 16
+    }
+}
+
+fn extra_write(m: *mut mc.Machine, addr: u32, data: u32, strb: u32) {
+    var i: usize = 0
+    let n: usize = vec_len[mc.Region](&(*m).regions)
+    while i < n {
+        let r: *mut mc.Region = vec_elem_ptr[mc.Region](&(*m).regions, i)
+        if addr -% (*r).base < (*r).size {
+            store_masked((*r).data, ((addr - (*r).base) >> 2) as usize, data, strb)
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn write_slow(m: *mut mc.Machine, addr: u32, data: u32, strb: u32) {
+    if (*m).uart_on && (addr >> 8) == ((*m).uart_base >> 8) {
+        if ((addr >> 2) & 63) == 0 && (strb & 1) != 0 {
+            rt.buf_push(&(*m).out, (data & 255) as u8)
+            if rt.buf_len(&(*m).out) >= FLUSH_AT {
+                flush_out(m)
+            }
+        }
+        return
+    }
+    if (*m).fin_on && (addr >> 12) == ((*m).fin_base >> 12) {
+        if strb != 0 {
+            finisher_write(m, addr, data)
+        }
+        return
+    }
+    extra_write(m, addr, data, strb)
+}
+
+fn write_word(m: *mut mc.Machine, addr: u32, data: u32, strb: u32) {
+    let off: u32 = addr -% (*m).ram_base
+    if off < (*m).ram_size {
+        store_masked((*m).ram, (off >> 2) as usize, data, strb)
+        return
+    }
+    write_slow(m, addr, data, strb)
+}

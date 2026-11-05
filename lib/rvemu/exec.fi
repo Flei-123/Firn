@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import rvemu.machine as mc
+import rvemu.bus as bus
+import rvemu.alu as alu
+import rvemu.semantics as sem
+
+export { step, run }
+
+const OP_LUI: u32 = 55
+const OP_AUIPC: u32 = 23
+const OP_JAL: u32 = 111
+const OP_JALR: u32 = 103
+const OP_BRANCH: u32 = 99
+const OP_LOAD: u32 = 3
+const OP_STORE: u32 = 35
+const OP_IMM: u32 = 19
+const OP_REG: u32 = 51
+const OP_FENCE: u32 = 15
+
+const FORMAT_I: u32 = 1
+const FORMAT_S: u32 = 2
+const FORMAT_U: u32 = 3
+
+fn log_commit(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, data: u32) {
+    let b: *mut rt.Buf = &(*m).commits
+    rt.buf_push_hex_u64(b, pc as u64, 8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_hex_u64(b, insn as u64, 8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_hex_u64(b, rd as u64, 8)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_hex_u64(b, data as u64, 8)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn trap(m: *mut mc.Machine, pc: u32) {
+    (*m).trap_pc = pc
+    (*m).status = mc.STATUS_TRAP
+}
+
+fn retire(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, data: u32, next_pc: u32) {
+    (*m).instret = (*m).instret + 1
+    (*m).pc = next_pc
+    if (*m).log_commits {
+        log_commit(m, pc, insn, rd, data)
+    }
+    if (*m).exit_valid {
+        (*m).status = mc.STATUS_EXIT
+    }
+}
+
+fn write_rd(m: *mut mc.Machine, rd: u32, v: u32) -> u32 {
+    if rd == 0 {
+        return 0
+    }
+    rt.st32((*m).regs, rd as usize, v)
+    return v
+}
+
+fn custom_imm(format: u32, insn: u32) -> u32 {
+    if format == FORMAT_I {
+        return alu.imm_i(insn)
+    }
+    if format == FORMAT_S {
+        return alu.imm_s(insn)
+    }
+    if format == FORMAT_U {
+        return alu.imm_u(insn)
+    }
+    return 0
+}
+
+fn try_custom(m: *mut mc.Machine, pc: u32, insn: u32) -> bool {
+    let n: usize = vec_len[mc.Custom](&(*m).custom)
+    var i: usize = 0
+    while i < n {
+        let c: *mut mc.Custom = vec_elem_ptr[mc.Custom](&(*m).custom, i)
+        if (insn & (*c).mask) == (*c).pattern {
+            let rs1: u32 = rt.ld32((*m).regs, ((insn >> 15) & 31) as usize)
+            let rs2: u32 = rt.ld32((*m).regs, ((insn >> 20) & 31) as usize)
+            let v: u32 = sem.eval_semantics(&(*c).code, rs1, rs2, custom_imm((*c).format, insn))
+            var rd: u32 = 0
+            var data: u32 = 0
+            if (*c).has_rd {
+                rd = (insn >> 7) & 31
+                data = write_rd(m, rd, v)
+            }
+            retire(m, pc, insn, rd, data, pc +% 4)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn alu_op(f3: u32, a: u32, b: u32, sub: bool, arith: bool) -> u32 {
+    if f3 == 0 {
+        if sub {
+            return a -% b
+        }
+        return a +% b
+    }
+    if f3 == 1 {
+        return a << (b & 31)
+    }
+    if f3 == 2 {
+        if (a as% i32) < (b as% i32) {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 3 {
+        if a < b {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 4 {
+        return a ^ b
+    }
+    if f3 == 5 {
+        if arith {
+            return alu.sra(a, b)
+        }
+        return a >> (b & 31)
+    }
+    if f3 == 6 {
+        return a | b
+    }
+    return a & b
+}
+
+fn muldiv(f3: u32, a: u32, b: u32) -> u32 {
+    if f3 == 0 {
+        return a *% b
+    }
+    if f3 == 1 {
+        return alu.mulh(a, b)
+    }
+    if f3 == 2 {
+        return alu.mulhsu(a, b)
+    }
+    if f3 == 3 {
+        return alu.mulhu(a, b)
+    }
+    if f3 == 4 {
+        return alu.div_signed(a, b)
+    }
+    if f3 == 5 {
+        return alu.div_unsigned(a, b)
+    }
+    if f3 == 6 {
+        return alu.rem_signed(a, b)
+    }
+    return alu.rem_unsigned(a, b)
+}
+
+fn branch_taken(f3: u32, a: u32, b: u32) -> i32 {
+    if f3 == 0 {
+        if a == b {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 1 {
+        if a != b {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 4 {
+        if (a as% i32) < (b as% i32) {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 5 {
+        if (a as% i32) >= (b as% i32) {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 6 {
+        if a < b {
+            return 1
+        }
+        return 0
+    }
+    if f3 == 7 {
+        if a >= b {
+            return 1
+        }
+        return 0
+    }
+    return -1
+}
+
+fn load_value(f3: u32, word: u32, addr: u32) -> u32 {
+    let shifted: u32 = word >> ((addr & 3) * 8)
+    if f3 == 0 {
+        return alu.sext8(shifted)
+    }
+    if f3 == 1 {
+        return alu.sext16(shifted)
+    }
+    if f3 == 4 {
+        return shifted & 255
+    }
+    if f3 == 5 {
+        return shifted & 65535
+    }
+    return shifted
+}
+
+fn aligned(f3: u32, addr: u32) -> bool {
+    let size: u32 = f3 & 3
+    if size == 0 {
+        return true
+    }
+    if size == 1 {
+        return (addr & 1) == 0
+    }
+    return (addr & 3) == 0
+}
+
+fn do_load(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, f3: u32, a: u32) {
+    let addr: u32 = a +% alu.imm_i(insn)
+    let legal: bool = f3 == 0 || f3 == 1 || f3 == 2 || f3 == 4 || f3 == 5
+    if !legal || !aligned(f3, addr) {
+        trap(m, pc)
+        return
+    }
+    let v: u32 = load_value(f3, bus.read_word(m, addr), addr)
+    (*m).loads = (*m).loads + 1
+    retire(m, pc, insn, rd, write_rd(m, rd, v), pc +% 4)
+}
+
+fn do_store(m: *mut mc.Machine, pc: u32, insn: u32, f3: u32, a: u32, b: u32) {
+    let addr: u32 = a +% alu.imm_s(insn)
+    if f3 > 2 || !aligned(f3, addr) {
+        trap(m, pc)
+        return
+    }
+    var data: u32 = b
+    var strb: u32 = 15
+    if f3 == 0 {
+        data = (b & 255) * 16843009
+        strb = 1 << (addr & 3)
+    } else if f3 == 1 {
+        data = (b & 65535) * 65537
+        strb = 3 << (addr & 3)
+    }
+    bus.write_word(m, addr, data, strb)
+    (*m).stores = (*m).stores + 1
+    retire(m, pc, insn, 0, 0, pc +% 4)
+}
+
+fn do_branch(m: *mut mc.Machine, pc: u32, insn: u32, f3: u32, a: u32, b: u32) {
+    let t: i32 = branch_taken(f3, a, b)
+    if t < 0 {
+        trap(m, pc)
+        return
+    }
+    var next: u32 = pc +% 4
+    if t == 1 {
+        next = pc +% alu.imm_b(insn)
+        if (next & 3) != 0 {
+            trap(m, pc)
+            return
+        }
+        (*m).branch_taken = (*m).branch_taken + 1
+    }
+    (*m).branches = (*m).branches + 1
+    retire(m, pc, insn, 0, 0, next)
+}
+
+fn do_reg(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, f3: u32, a: u32, b: u32) {
+    let f7: u32 = insn >> 25
+    if f7 == 1 && (*m).ext_m {
+        retire(m, pc, insn, rd, write_rd(m, rd, muldiv(f3, a, b)), pc +% 4)
+        return
+    }
+    let sub: bool = f7 == 32
+    if f7 != 0 && !(sub && (f3 == 0 || f3 == 5)) {
+        trap(m, pc)
+        return
+    }
+    retire(m, pc, insn, rd, write_rd(m, rd, alu_op(f3, a, b, sub, sub)), pc +% 4)
+}
+
+fn do_imm(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, f3: u32, a: u32) {
+    let f7: u32 = insn >> 25
+    if (f3 == 1 && f7 != 0) || (f3 == 5 && f7 != 0 && f7 != 32) {
+        trap(m, pc)
+        return
+    }
+    let v: u32 = alu_op(f3, a, alu.imm_i(insn), false, (insn & 1073741824) != 0)
+    retire(m, pc, insn, rd, write_rd(m, rd, v), pc +% 4)
+}
+
+fn do_jalr(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32, f3: u32, a: u32) {
+    let target: u32 = (a +% alu.imm_i(insn)) & 4294967294
+    if f3 != 0 || (target & 2) != 0 {
+        trap(m, pc)
+        return
+    }
+    retire(m, pc, insn, rd, write_rd(m, rd, pc +% 4), target)
+}
+
+fn do_jal(m: *mut mc.Machine, pc: u32, insn: u32, rd: u32) {
+    let target: u32 = pc +% alu.imm_j(insn)
+    if (target & 3) != 0 {
+        trap(m, pc)
+        return
+    }
+    retire(m, pc, insn, rd, write_rd(m, rd, pc +% 4), target)
+}
+
+fn step(m: *mut mc.Machine) {
+    let pc: u32 = (*m).pc
+    let insn: u32 = bus.read_word(m, pc)
+    if vec_len[mc.Custom](&(*m).custom) > 0 && try_custom(m, pc, insn) {
+        return
+    }
+    let op: u32 = insn & 127
+    let rd: u32 = (insn >> 7) & 31
+    let f3: u32 = (insn >> 12) & 7
+    let a: u32 = rt.ld32((*m).regs, ((insn >> 15) & 31) as usize)
+    let b: u32 = rt.ld32((*m).regs, ((insn >> 20) & 31) as usize)
+    if op == OP_IMM {
+        do_imm(m, pc, insn, rd, f3, a)
+    } else if op == OP_REG {
+        do_reg(m, pc, insn, rd, f3, a, b)
+    } else if op == OP_LOAD {
+        do_load(m, pc, insn, rd, f3, a)
+    } else if op == OP_STORE {
+        do_store(m, pc, insn, f3, a, b)
+    } else if op == OP_BRANCH {
+        do_branch(m, pc, insn, f3, a, b)
+    } else if op == OP_JAL {
+        do_jal(m, pc, insn, rd)
+    } else if op == OP_JALR {
+        do_jalr(m, pc, insn, rd, f3, a)
+    } else if op == OP_LUI {
+        retire(m, pc, insn, rd, write_rd(m, rd, alu.imm_u(insn)), pc +% 4)
+    } else if op == OP_AUIPC {
+        retire(m, pc, insn, rd, write_rd(m, rd, pc +% alu.imm_u(insn)), pc +% 4)
+    } else if op == OP_FENCE && f3 <= 1 {
+        retire(m, pc, insn, 0, 0, pc +% 4)
+    } else {
+        trap(m, pc)
+    }
+}
+
+fn run(m: *mut mc.Machine, max_instr: u64) {
+    while (*m).status == mc.STATUS_RUNNING {
+        if (*m).instret >= max_instr {
+            (*m).status = mc.STATUS_TIMEOUT
+            break
+        }
+        step(m)
+    }
+    bus.flush_out(m)
+}
