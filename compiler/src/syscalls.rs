@@ -171,6 +171,7 @@ const TABLE: &[(i64, A64)] = &[
     (33, A64::Dup3(24)),             // dup2      -> dup3
     (35, A64::Direct(101)),          // nanosleep
     (37, A64::AlarmItimer(103)),     // alarm     -> setitimer (firnc --test time limit)
+    (38, A64::Direct(103)),
     (39, A64::Direct(172)),          // getpid
     (41, A64::Direct(198)),          // socket
     (42, A64::Direct(203)),          // connect
@@ -230,15 +231,18 @@ const TABLE: &[(i64, A64)] = &[
     (90, A64::AtFdcwd(53)),          // chmod     -> fchmodat (Firn r64)
     (96, A64::Direct(169)),          // gettimeofday
     (97, A64::Direct(163)),          // getrlimit
+    (98, A64::Direct(165)),
     (102, A64::Direct(174)),         // getuid
     (107, A64::Direct(175)),         // geteuid
     // ROUND C-059: stood until now between 13 and 14 and thereby broke
     // the sorting of the table (a test of its own). Only moved.
     (109, A64::Direct(154)),         // setpgid   (std.process: set_group)
+    (110, A64::Direct(173)),
     (112, A64::Direct(157)),         // setsid    (std.process: detach)
     (121, A64::Direct(155)),         // getpgid   (std.process: the group is verified)
     (128, A64::Direct(137)),         // rt_sigtimedwait (std.process: swallow a SIGPIPE)
     (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
+    (157, A64::Direct(167)),
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
     // ROUND C-059 (Certus): lib/js/interp.fi sets the stack of the
     // interpreter (setrlimit(RLIMIT_STACK)). The same shape, different
@@ -247,6 +251,7 @@ const TABLE: &[(i64, A64)] = &[
     (186, A64::Direct(178)),         // gettid
     (200, A64::Direct(131)),         // tgkill
     (202, A64::Direct(98)),          // futex
+    (204, A64::Direct(123)),
     (217, A64::Direct(61)),          // getdents64
     (228, A64::Direct(113)),         // clock_gettime
     (231, A64::Direct(94)),          // exit_group
@@ -269,6 +274,7 @@ const TABLE: &[(i64, A64)] = &[
     (293, A64::Direct(59)),          // pipe2     (std.process)
     (294, A64::Direct(26)),          // inotify_init1 (desktop.watch, input.padsys)
     (318, A64::Direct(278)),         // getrandom
+    (319, A64::Direct(279)),
     (332, A64::Direct(291)),         // statx
 ];
 
@@ -367,6 +373,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (33, "dup2", Wasm::Missing(NO_FILES)),
     (35, "nanosleep", Wasm::Nanosleep),
     (37, "alarm", Wasm::Missing(NO_SIGNALS)),
+    (38, "setitimer", Wasm::Missing("a browser page has no interval timers")),
     // The one process of the page. 1 is as good a number as any, and it
     // is never 0 (which a caller could read as "the child").
     (39, "getpid", Wasm::Constant(1)),
@@ -408,19 +415,23 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (90, "chmod", Wasm::Missing(NO_FILES)),
     (96, "gettimeofday", Wasm::Missing("use clock_gettime (228), which the host provides")),
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
+    (98, "getrusage", Wasm::Missing("a browser page has no resource usage")),
     (102, "getuid", Wasm::Missing("a browser page has no users")),
     (107, "geteuid", Wasm::Missing("a browser page has no users")),
     (109, "setpgid", Wasm::Missing(NO_PROCESSES)),
+    (110, "getppid", Wasm::Missing(NO_PROCESSES)),
     (112, "setsid", Wasm::Missing(NO_PROCESSES)),
     (121, "getpgid", Wasm::Missing(NO_PROCESSES)),
     (128, "rt_sigtimedwait", Wasm::Missing(NO_SIGNALS)),
     (131, "sigaltstack", Wasm::Missing(NO_SIGNALS)),
+    (157, "prctl", Wasm::Missing(NO_PROCESSES)),
     (158, "arch_prctl", Wasm::Missing(NO_THREADS)),
     (160, "setrlimit", Wasm::Missing("a browser page has no resource limits")),
     // The one thread of the process.
     (186, "gettid", Wasm::Constant(1)),
     (200, "tgkill", Wasm::Missing(NO_SIGNALS)),
     (202, "futex", Wasm::Futex),
+    (204, "sched_getaffinity", Wasm::Missing(NO_THREADS)),
     (217, "getdents64", Wasm::Missing(NO_FILES)),
     (228, "clock_gettime", Wasm::ClockGettime),
     (231, "exit_group", Wasm::Exit),
@@ -440,6 +451,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (293, "pipe2", Wasm::Missing(NO_FILES)),
     (294, "inotify_init1", Wasm::Missing(NO_FILES)),
     (318, "getrandom", Wasm::Getrandom),
+    (319, "memfd_create", Wasm::Missing(NO_FILES)),
     (332, "statx", Wasm::Missing(NO_FILES)),
 ];
 

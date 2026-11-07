@@ -247,6 +247,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("IsWindow", "USER32.dll", 1),
     ("SetWindowTextW", "USER32.dll", 2),
     ("LoadCursorW", "USER32.dll", 2),
+    ("SetCursor", "USER32.dll", 1),
     ("SetProcessDpiAwarenessContext", "USER32.dll", 1),
     ("SetProcessDPIAware", "USER32.dll", 0),
     ("GetDpiForWindow", "USER32.dll", 1),
