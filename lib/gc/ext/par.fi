@@ -180,6 +180,14 @@ fn __gcp_push(st: u64, ctl: u64, ctx: u64, obj: u64) {
     __gc_st64(ctx +% GPX_TAIL, tail +% 1)
 }
 
+fn __gcp_mark_block(st: u64, ctl: u64, ctx: u64, b: u64, w: u64) {
+    let zw: u64 = w >> 32
+    let nw: u64 = (w & GCP_MASK32) | (((zw & (M_WITHOUT_MARK as u64)) | 1) << 32)
+    if __atomic_swap(b as *mut u64, w, nw) == w {
+        __gcp_push(st, ctl, ctx, b +% HEADER)
+    }
+}
+
 fn __gcp_mark(st: u64, ctl: u64, ctx: u64, a: u64) {
     let b: u64 = __gcp_block_of(ctx, a)
     if b == 0 {
@@ -189,14 +197,10 @@ fn __gcp_mark(st: u64, ctl: u64, ctx: u64, a: u64) {
     if (w & GCP_MASK32) == 0 {
         return
     }
-    let zw: u64 = w >> 32
-    if (zw & (M_MARK as u64)) != __gc_ld64(ctx +% GPX_PAR) {
+    if ((w >> 32) & (M_MARK as u64)) != __gc_ld64(ctx +% GPX_PAR) {
         return
     }
-    let nw: u64 = (w & GCP_MASK32) | (((zw & (M_WITHOUT_MARK as u64)) | 1) << 32)
-    if __atomic_swap(b as *mut u64, w, nw) == w {
-        __gcp_push(st, ctl, ctx, b +% HEADER)
-    }
+    __gcp_mark_block(st, ctl, ctx, b, w)
 }
 
 fn __gcp_trace_slots(st: u64, ctl: u64, ctx: u64, obj: u64) -> bool {
@@ -251,7 +255,8 @@ fn __gcp_trace_slots(st: u64, ctl: u64, ctx: u64, obj: u64) -> bool {
 fn __gcp_trace(st: u64, ctl: u64, ctx: u64, obj: u64) {
     let b: u64 = obj -% HEADER
     let zw: u32 = __gc_ld32(b +% 4)
-    let black: u32 = (2 - __gc_ld64(ctx +% GPX_PAR)) as u32
+    let par: u64 = __gc_ld64(ctx +% GPX_PAR)
+    let black: u32 = (2 -% par) as u32
     if (zw & F_SLOTS) != 0 {
         if __gcp_trace_slots(st, ctl, ctx, obj) {
             __gc_st32(b +% 4, (zw & M_WITHOUT_MARK) | black)
@@ -269,13 +274,63 @@ fn __gcp_trace(st: u64, ctl: u64, ctx: u64, obj: u64) {
     let offs: u64 = __gc_ld64(entry +% 24)
     let hlo: u64 = __gc_ld64(ctx +% GPX_HLO)
     let hhi: u64 = __gc_ld64(ctx +% GPX_HHI)
+    let bt: u64 = __gc_ld64(st +% S_BOCACHE)
+    var cd: u64 = 1
+    var ce: u64 = 0
+    var cm: u64 = 0
+    var cb: u64 = 0
+    let cc0: u64 = __gc_ld64(ctx +% GPX_CC)
+    if cc0 != 0 {
+        cd = cc0 +% CHUNK_HEADER
+        ce = __gc_ld64(cc0 +% 32)
+        cm = __gc_ld64(cc0 +% 56)
+        cb = __gc_ld64(cc0 +% 16)
+    }
     var i: u64 = 0
     while i < n {
-        let kind: u64 = __gc_ld64(obj +% __gc_ld64(offs +% (i *% 8)))
-        if kind >= hlo && kind < hhi {
-            __gcp_mark(st, ctl, ctx, kind)
-        }
+        let v: u64 = __gc_ld64(obj +% __gc_ld64(offs +% (i *% 8)))
         i = i +% 1
+        if v < hlo || v >= hhi {
+            continue
+        }
+        var nb: u64 = 0
+        if v >= cd && v < ce {
+            nb = cd +% ((((v -% cd) *% cm) >> 32) *% cb)
+        } else {
+            var slow: bool = true
+            if bt > 1 {
+                let c2: u64 = __gc_ld64(bt +% (((v >> 18) & (BOCACHE_N -% 1)) *% 8))
+                if c2 != 0 {
+                    let d2: u64 = c2 +% CHUNK_HEADER
+                    let e2: u64 = __gc_ld64(c2 +% 32)
+                    if v >= d2 && v < e2 {
+                        cd = d2
+                        ce = e2
+                        cm = __gc_ld64(c2 +% 56)
+                        cb = __gc_ld64(c2 +% 16)
+                        __gc_st64(ctx +% GPX_CC, c2)
+                        nb = d2 +% ((((v -% d2) *% cm) >> 32) *% cb)
+                        slow = false
+                    }
+                }
+            }
+            if slow {
+                __gcp_mark(st, ctl, ctx, v)
+                let cc: u64 = __gc_ld64(ctx +% GPX_CC)
+                if cc != 0 {
+                    cd = cc +% CHUNK_HEADER
+                    ce = __gc_ld64(cc +% 32)
+                    cm = __gc_ld64(cc +% 56)
+                    cb = __gc_ld64(cc +% 16)
+                }
+                continue
+            }
+        }
+        let w: u64 = __gc_ld64(nb)
+        if (w & GCP_MASK32) == 0 || ((w >> 32) & (M_MARK as u64)) != par {
+            continue
+        }
+        __gcp_mark_block(st, ctl, ctx, nb, w)
     }
 }
 
