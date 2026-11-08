@@ -20,6 +20,7 @@ mod atomic;
 mod fsqrt;
 mod fbits;
 mod fnaddr;
+mod constcheck;
 mod ptrarith;
 mod wrapcast;
 mod include;

@@ -43,6 +43,8 @@ pub(crate) const START: &[&str] = &[
 pub(crate) const TAIL: &[&str] = &[
     ".L__firn_segv:",
     "mov rax, qword ptr [rsi+16]",
+    "cmp rax, 4096",
+    "jb .L__firn_segv_null",
     "mov rcx, qword ptr [rdx+160]",
     "sub rax, rcx",
     "add rax, 1048576",
@@ -56,6 +58,15 @@ pub(crate) const TAIL: &[&str] = &[
     "mov eax, 231",
     "mov edi, 101",
     "syscall",
+    ".L__firn_segv_null:",
+    "mov eax, 1",
+    "mov edi, 2",
+    "lea rsi, [rip+.L__firn_null_msg]",
+    "mov edx, 31",
+    "syscall",
+    "mov eax, 231",
+    "mov edi, 101",
+    "syscall",
     ".L__firn_segv_other:",
     "ret",
     ".L__firn_sigret:",
@@ -63,6 +74,8 @@ pub(crate) const TAIL: &[&str] = &[
     "syscall",
     ".L__firn_so_msg:",
     ".byte 102,105,114,110,58,32,115,116,97,99,107,32,111,118,101,114,102,108,111,119,10",
+    ".L__firn_null_msg:",
+    ".byte 102,105,114,110,58,32,110,117,108,108,32,112,111,105,110,116,101,114,32,100,101,114,101,102,101,114,101,110,99,101,10",
 ];
 
 pub(crate) fn enabled() -> bool {
