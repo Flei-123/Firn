@@ -951,7 +951,7 @@ echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, aud
 "$FIRNC" --opt-level=dev -o "$W/editor_app" examples/fui_apps/editor/main.fi || exit 1
 FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 "$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
-cmp "$W/editor_light.png" tools/fui/golden/editor_light.png || { echo "editor golden differs"; exit 1; }
+cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"

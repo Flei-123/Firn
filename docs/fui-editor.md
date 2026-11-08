@@ -32,4 +32,4 @@ The sample document is `examples/fui_apps/data/editor_sample.fi` (loaded by name
 ## Gates
 
 - `bash tools/wasm/screenapps.sh editor` (use `LIM=0`): native shot vs headless Chromium, 0 differing pixels.
-- `tools/fui/run.sh` stage 18p7: model check, `FUI_AUDIT=1`, golden `tools/fui/golden/editor_light.png`.
+- `tools/fui/run.sh` stage 18p7: model check, `FUI_AUDIT=1`, golden `tools/fui/golden_editor/editor_light.png`.
