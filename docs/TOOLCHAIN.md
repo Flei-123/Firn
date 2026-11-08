@@ -58,5 +58,6 @@ Steps:
 2. Certus: `firn.toolchain` with `firn >=<first merged version>`; scripts take `FIRNC` > `firnc` from PATH (shim) > fork as explicit fallback.
 3. OrientOS: bump `vendor/firn/COMMIT` after `tools/firnpin/check.sh origin/main` and its gates; then `fetch-firnc.sh` reuses an installed toolchain
    whose `COMMIT` equals the pin (firnc1 is still built from `bin/firnc1.fi` of that commit).
+4. All consumers share one pin: `tools/pin/bump.sh VERSION` (docs/PIN-POLICY.md).
 4. Server: installed in `/root/.firn` from `/root/firn-publish/channels` (nightly 0.1.4808 on 03.11.), PATH via `/etc/profile.d/firn.sh`; stable needs a
    green `tools/release/gate.sh` stamp.
