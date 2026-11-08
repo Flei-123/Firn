@@ -5394,7 +5394,9 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                     }
                 }
                 Op::MmioLoad { .. } | Op::MmioStore { .. } => {
-                    return Some("MMIO access".into())
+                    if !mmio_allocated() {
+                        return Some("MMIO access".into());
+                    }
                 }
                 _ => {}
             }
@@ -8384,13 +8386,36 @@ fn emit_inst(
         // ROUND 52: unreachable — `unsupported_basic` sends every function
         // containing inline assembler or MMIO to the base path. As an error
         // rather than a silent branch, so that a later loosening flies up.
-        Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {
-            return Err(
-                "internal error: inline assembler/MMIO in the register-allocating path".to_string(),
-            )
+        Op::MmioLoad { addr } => emit_mmio_load(e, ra, i, *addr)?,
+        Op::MmioStore { addr, val } => emit_mmio_store(e, ra, ty, *addr, *val),
+        Op::Asm { .. } => {
+            return Err("internal error: inline assembler in the register-allocating path".to_string())
         }
     }
     Ok(())
+}
+
+pub(crate) fn mmio_allocated() -> bool {
+    std::env::var_os("FIRN_RA_MMIO").is_some_and(|v| v == "1")
+}
+
+fn emit_mmio_load(e: &mut Emitter, ra: &Ra, i: &Inst, addr: Val) -> Result<(), String> {
+    let d = i.dst.ok_or("internal error: mmio_load without target")?;
+    ra.load_full(e, "rcx", addr);
+    match i.ty.bits() {
+        8 | 16 => e.line(&format!("movzx eax, {} [rcx]", size_word(i.ty.bits()))),
+        32 => e.line("mov eax, dword ptr [rcx]"),
+        _ => e.line("mov rax, qword ptr [rcx]"),
+    }
+    ra.store_dst(e, d, "rax");
+    Ok(())
+}
+
+fn emit_mmio_store(e: &mut Emitter, ra: &Ra, ty: FTy, addr: Val, val: Val) {
+    ra.load_full(e, "rcx", addr);
+    ra.load_full(e, "rax", val);
+    let bits = ty.bits();
+    e.line(&format!("mov {} [rcx], {}", size_word(bits), rn("rax", bits)));
 }
 
 /// `lea target, [base + offset]` — the address computation of the processor
