@@ -6,7 +6,7 @@ build_parse_args() {
     TARGETS=""
     OUT=""
     VERIFY=0
-    LIMIT=0.5
+    LIMIT=
     OPT_OVERRIDE=""
     ANDROID_ABI=""
     DIR=.
@@ -33,6 +33,7 @@ build_select_targets() {
         done
     fi
     [ -z "$OPT_OVERRIDE" ] || APP_OPT=$OPT_OVERRIDE
+    LIMIT=${LIMIT:-$APP_LIMIT}
     manifest_validate
     if [ "$VERIFY" = 1 ]; then
         [[ " $APP_TARGETS " == *" native "* && " $APP_TARGETS " == *" web "* ]] || fui_die 2 "--verify needs the targets native and web"

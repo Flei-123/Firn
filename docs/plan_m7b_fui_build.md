@@ -18,6 +18,7 @@ Problems: app path and data dir are hard-wired to `examples/fui_apps`; page gene
 - `fui.app` (new, same `key value` style, only fUi keys):
   - `title <text>` window/page title (default: package name)
   - `size WxH` shot size (default 1100x700)
+  - `limit <pct>` allowed differing pixels for `--verify` (default 0.5)
   - `data <dir>` assets directory, by NAME only (default `data`)
   - `targets native web [android]` default targets
   - `android_id <reverse-dns>` (default `com.fleitec.fui.<package>`)
@@ -27,24 +28,26 @@ Problems: app path and data dir are hard-wired to `examples/fui_apps`; page gene
 
 ```
 fui new <name> [--dir D]
-fui build [dir] [--targets native,web,android] [--out dist] [--verify] [--limit PCT] [--opt LEVEL]
+fui build [dir] [--targets native,web,android] [--out dist] [--verify] [--limit PCT] [--opt LEVEL] [--abi ABI]
+fui verify [dir] [--out dist] [--limit PCT]
 fui targets
 ```
 
-- Thin dispatcher `tools/fui/cli/fui`; one module per verb in `tools/fui/cli/verbs/`, one per target in `tools/fui/cli/targets/` (`native.sh`, `web.sh`, `android.sh`). A target is any file there that defines `target_build` and `target_available`; `fui targets` lists the directory (registry = directory).
-- Shared helpers: `tools/fui/cli/lib/{manifest,log,env}.sh`.
+- Thin dispatcher `tools/fui/cli/fui`; one module per verb in `tools/fui/cli/verbs/`, one per target in `tools/fui/cli/targets/` (`native.sh`, `web.sh`, `android.sh`). A target is any file there that defines `<name>_build` and `<name>_available`; `fui targets` lists the directory (registry = directory).
+- Shared helpers: `tools/fui/cli/lib/{manifest,verify,log,env}.sh`.
 - Web building blocks move out of `tools/wasm/screenapps.sh` into `tools/wasm/weblib.sh` (site build, static server, headless shot). `screenapps.sh` sources it; behaviour unchanged.
 - Android target calls `tools/android/screenapp.sh` with `APP_MAIN` and `ASSETS_DIR` overrides.
 - Verify (`--verify`, needs native + web): native `--shot` light+dark vs web shot via `tools/wasm/screencmp.py`, limit 0.5 % (as `screenapps.sh`).
 
 ## Output layout
 
+Default `--out` is `<project>/dist`:
+
 ```
-dist/<package>/native/<package>            executable
-dist/<package>/native/data/...             assets
-dist/<package>/web/index.html + <package>.wasm + firn.js + fonts + data
-dist/<package>/android/<package>-<abi>.apk
-dist/<package>/verify/{web.png,native-*.png}   only with --verify
+dist/native/<package> + dist/native/data/    executable and assets
+dist/web/index.html, <package>.wasm, firn.js, fonts, assets (flat)
+dist/android/<package>-<abi>.apk
+dist/verify/{web.png,native-light.png,native-dark.png}   with --verify
 ```
 
 ## Exit codes

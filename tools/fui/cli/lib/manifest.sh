@@ -8,6 +8,7 @@ manifest_defaults() {
     APP_TARGETS="native web"
     APP_ANDROID_ID=com.fleitec.fui.$APP_PACKAGE
     APP_OPT=release-safe
+    APP_LIMIT=0.5
 }
 
 manifest_read_package() {
@@ -29,6 +30,7 @@ manifest_set() {
         targets) APP_TARGETS=$value ;;
         android_id) APP_ANDROID_ID=$value ;;
         opt) APP_OPT=$value ;;
+        limit) APP_LIMIT=$value ;;
         *) fui_die 5 "$APP_DIR/fui.app: unknown key '$key'" ;;
     esac
 }
@@ -48,6 +50,7 @@ manifest_validate() {
     local t
     [[ "$APP_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || fui_die 5 "fui.app: size must look like 1100x700, got '$APP_SIZE'"
     [[ " $MANIFEST_OPT_LEVELS " == *" $APP_OPT "* ]] || fui_die 5 "fui.app: opt must be one of: $MANIFEST_OPT_LEVELS"
+    [[ "$APP_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fui_die 5 "fui.app: limit must be a percentage like 0.5, got '$APP_LIMIT'"
     for t in $APP_TARGETS; do
         fui_is_target "$t" || fui_die 5 "fui.app: unknown target '$t' (known: $(fui_registered_targets | tr '\n' ' '))"
     done
