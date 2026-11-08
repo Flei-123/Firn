@@ -1118,6 +1118,10 @@ if [ -x /usr/lib/wine/wine64 ]; then
     FIRNC="$FIRNC" sh tools/fui/uiatextcom.sh >"$W/uiatextcom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiatextcom.log"
     if [ "$rc" != 0 ]; then echo "uiatextcom FAILED ($rc)"; exit 1; fi
+    rc=0
+    FIRNC="$FIRNC" bash tools/fui/appwin_wine.sh >"$W/appwin_wine.log" 2>&1 || rc=$?
+    tail -n 3 "$W/appwin_wine.log"
+    if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "appwin_wine FAILED ($rc)"; exit 1; fi
 else
     echo "  uiacom: wine missing, skipped"
 fi
