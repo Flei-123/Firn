@@ -1913,6 +1913,10 @@ echo "== 18q4. PAINT-ONLY FRAME + x-CUT RASTER WINDOW (r455 / r456) =="
 # the fast path. painter.round_rect cuts its raster window to the clip in x between the corners: same octets inside the clip.
 build rotpaint
 "$W/rotpaint"
+build painter_canvas
+"$W/painter_canvas"
+build painter_textapi
+"$W/painter_textapi"
 build xcut
 "$W/xcut"
 # r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);
