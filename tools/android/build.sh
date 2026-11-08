@@ -132,6 +132,11 @@ NDK=${NDK:-/root/android-ndk-min/android-ndk-r27c/toolchains/llvm/prebuilt/linux
 SDK=${SDK:-/root/android-sdk}
 BT=${BUILDTOOLS:-$SDK/build-tools/35.0.0}
 API=${API:-29}
+if [ "${ANDROID_CHECK:-0}" = 1 ]; then
+    [ -d "$NDK" ] || { echo "Android NDK not found: $NDK (set NDK)" >&2; exit 1; }
+    [ -x "$BT/aapt2" ] || { echo "Android build-tools not found: $BT (set SDK or BUILDTOOLS)" >&2; exit 1; }
+    exit 0
+fi
 CAMLIBS=""
 if [ $CAMERA -eq 1 ]; then CAMLIBS="-lcamera2ndk -lmediandk"; PERMS+=(android.permission.CAMERA); fi
 if [ $SPEECH -eq 1 ]; then CAMLIBS="$CAMLIBS -laaudio"; PERMS+=(android.permission.RECORD_AUDIO); fi

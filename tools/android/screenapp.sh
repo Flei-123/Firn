@@ -7,6 +7,7 @@
 # Inter (lib/fui/fonts) and the app assets (examples/fui_apps/data) travel in the APK's assets/;
 # plat.uifont and plat.assetio read them through the AssetManager. Default output:
 # /root/jarvis-android-builds/fui-screen/<app>-<abi>.apk, ABI x86_64 (emulator); `--abi arm64` for a phone.
+# Overrides (used by `fui build`): APP_MAIN, ASSETS_DIR, APP_ID, APP_TITLE, OUTDIR; FIRNC/NDK/SDK as in build.sh.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 APP=${1:?app}; shift
@@ -20,8 +21,13 @@ while [ $# -gt 0 ]; do
 done
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/screenapp.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
-cp lib/fui/fonts/Inter-*.ttf examples/fui_apps/data/* "$STAGE/"
+APP_MAIN=${APP_MAIN:-examples/fui_apps/$APP/main.fi}
+ASSETS_DIR=${ASSETS_DIR:-examples/fui_apps/data}
+APP_ID=${APP_ID:-com.fleitec.fui.$APP}
+APP_TITLE=${APP_TITLE:-fUi $APP}
+cp lib/fui/fonts/Inter-*.ttf "$STAGE/"
+cp "$ASSETS_DIR"/* "$STAGE/" 2>/dev/null || true
 OUTDIR=${OUTDIR:-/root/jarvis-android-builds/fui-screen}
 mkdir -p "$OUTDIR"
-bash tools/android/build.sh "examples/fui_apps/$APP/main.fi" --name "fUi $APP" --package "com.fleitec.fui.$APP" \
+bash tools/android/build.sh "$APP_MAIN" --name "$APP_TITLE" --package "$APP_ID" \
     --abi "$ABI" --assets "$STAGE" --out "$OUTDIR/$APP-$ABI.apk" ${ARGS[@]+"${ARGS[@]}"}
