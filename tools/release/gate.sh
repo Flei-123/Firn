@@ -7,20 +7,27 @@ STAGES=$(seq -s " " 1 "$(bash tools/teststages/select.sh --count)")
 OUT=
 KNOWN=$ROOT/tools/release/known_red.txt
 FIXPOINT=1
-usage() { echo "usage: gate.sh --out STAMP [--stages 'N ...'] [--known FILE] [--no-fixpoint]" >&2; exit 2; }
+KEEP_LOGS=
+usage() { echo "usage: gate.sh --out STAMP [--stages 'N ...'] [--known FILE] [--no-fixpoint] [--keep-logs DIR]" >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT=$2; shift 2 ;;
         --stages) STAGES=$2; shift 2 ;;
         --known) KNOWN=$2; shift 2 ;;
         --no-fixpoint) FIXPOINT=0; shift ;;
+        --keep-logs) KEEP_LOGS=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 [ -n "$OUT" ] || usage
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "working tree is not clean" >&2; exit 1; }
-LOGS=$(mktemp -d)
-trap 'rm -rf "$LOGS"' EXIT
+if [ -n "$KEEP_LOGS" ]; then
+    LOGS=$KEEP_LOGS
+    mkdir -p "$LOGS"
+else
+    LOGS=$(mktemp -d)
+    trap 'rm -rf "$LOGS"' EXIT
+fi
 COMMIT=$(git rev-parse HEAD)
 RESULT=green
 NEW_RED=()
