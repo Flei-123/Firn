@@ -1035,8 +1035,8 @@ build a11ylive
 # services: fui.services adapter (store, clipboard, open/save events, paths, queue, dialog answers) on the memory backend; no direct rt file calls outside the adapter
 build services
 "$W/services" | tail -n 1 | grep -q "SERVICES PASSED"
-if grep -rnE "rt\.(read_file|write_file)" lib/fui examples/fui_apps --include=*.fi | grep -vE "^lib/fui/(svcfile|safeout)\.fi:"; then
-    echo "direct rt file call outside fui.svcfile / fui.safeout"
+if grep -rnE "rt\.(read_file|write_file)" lib/fui examples/fui_apps --include=*.fi | grep -vE "^lib/fui/(svcpath|safeout)\.fi:"; then
+    echo "direct rt file call outside fui.svcpath / fui.safeout"
     exit 1
 fi
 

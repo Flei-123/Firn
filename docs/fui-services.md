@@ -24,15 +24,15 @@ The event queue holds 8 answers; further answers are refused. Native and web run
 | `lib/fui/svcq.fi` | answer queue |
 | `lib/fui/svcmem.fi` | memory backend (tests) |
 | `lib/fui/svcsys.fi` | clipboard copy and message boxes through `std.clipboard` / `std.dialog` (both have web twins) |
-| `lib/fui/svcfile.fi`, `lib/@web/fui/svcfile.fi` | raw path read/write; the only place that calls `rt.read_file` / `safeout` (web twin: false) |
+| `lib/fui/svcpath.fi`, `lib/@web/fui/svcpath.fi` | raw path read/write; the only place that calls `rt.read_file` / `safeout` (web twin: false) |
 | `lib/fui/svcplat.fi`, `lib/@web/fui/svcplat.fi` | file dialogs, paste request, storage; native: `std.dialog`, files under `$FUI_STORE_DIR` or `~/.local/share/fui`; web: `plat.webdialog`, `plat.webdownload`, `plat.host` store |
 | `lib/@web/fui/svctap.fi` | web event tap: `apphost` forwards `WE_DIALOG` / `WE_CLIP` to the adapter; registered on first request, so apps that never ask import no new host function |
 
-Gate: `tools/fui/run.sh` fails on any `rt.read_file` / `rt.write_file` in `lib/fui` or `examples/fui_apps` outside `svcfile.fi` / `safeout.fi`. Test: `tools/fui/services_main.fi`.
+Gate: `tools/fui/run.sh` fails on any `rt.read_file` / `rt.write_file` in `lib/fui` or `examples/fui_apps` outside `svcpath.fi` / `safeout.fi`. Test: `tools/fui/services_main.fi`.
 
 ## Rebinding to Firn lib/services
 
-Only `svcplat.fi` / `svcsys.fi` / `svcfile.fi` (and their web twins) call the platform. When Firn `lib/services` v1 lands on main, replace their bodies with its calls; `services.fi` and all apps stay unchanged. Status when written: `lib/services` does not exist yet.
+Only `svcplat.fi` / `svcsys.fi` (and the web `svcplat.fi`) call the platform, through Firn `services.svcfile/svcclip/svcdialog/svcstore`; `svcreply.fi` turns `services.svc` replies into the answer queue, `svcaccept.fi` turns dialog filters into an accept list. `services.fi` and all apps stay unchanged.
 
 ## Single Firn pin (M1, checked 08.11.2026)
 
