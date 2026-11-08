@@ -221,6 +221,26 @@ else
     bad "volatile.fi: firnc1 does not compile it"
 fi
 
+echo "== 7. MMIO in the register-allocating path (FIRN_RA_MMIO=1): one mov per access, order kept =="
+RAV=tools/freestanding/mmiora.fi
+RAWANT="mov dword ptr [rcx], eax|mov dword ptr [rcx], eax|mov eax, dword ptr [rcx]|mov eax, dword ptr [rcx]|mov eax, dword ptr [rcx]|mov byte ptr [rcx], al|movzx eax, byte ptr [rcx]|mov word ptr [rcx], ax|movzx eax, word ptr [rcx]|mov qword ptr [rcx], rax|mov rax, qword ptr [rcx]"
+for stage in "" "--opt-level=release-safe" "--opt-level=dev-fast"; do
+    name=${stage:---release-fast}
+    FIRN_RA_MMIO=1 FIRN_RA_STATS=1 "$FIRNC" --no-cache $stage --emit=asm "$RAV" -o "$TMPD/ra.s" 2> "$TMPD/ra.err" \
+        || { bad "mmiora.fi $name: does not compile"; continue; }
+    grep -q '^RA main ' "$TMPD/ra.err" && ok "mmiora.fi $name: main is register-allocated" \
+        || bad "mmiora.fi $name: main fell back to the base path"
+    got=$(awk '/^main:/{m=1;next} m&&/^(\.Lchksite|[A-Za-z_])/{m=0} m' "$TMPD/ra.s" \
+        | grep -F '[rcx]' | sed 's/^[[:space:]]*//' | paste -sd'|')
+    [ "$got" = "$RAWANT" ] && ok "mmiora.fi $name: 11 accesses, one mov each, in source order" \
+        || bad "mmiora.fi $name: accesses differ: $got"
+    FIRN_RA_MMIO=1 "$FIRNC" --no-cache $stage -o "$TMPD/ra" "$RAV" 2>/dev/null && "$TMPD/ra" >/dev/null 2>&1
+    [ "$?" = 19 ] && ok "mmiora.fi $name: runs, yields 19" || bad "mmiora.fi $name: wrong return value"
+done
+FIRN_RA_STATS=1 "$FIRNC" --no-cache --emit=asm "$RAV" -o "$TMPD/ra.s" 2> "$TMPD/ra.err"
+grep -q '^RA-BASE main reason=MMIO access' "$TMPD/ra.err" && ok "mmiora.fi without FIRN_RA_MMIO: base path (default unchanged)" \
+    || bad "mmiora.fi without FIRN_RA_MMIO: not on the base path"
+
 echo
 echo "FREESTANDING: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
