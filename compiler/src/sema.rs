@@ -2792,7 +2792,9 @@ constants declared before it, and '+ - * /'"
             return Type::Error;
         }
         crate::constcheck::check_operands(self, op, r, &lt);
-        self.binop_type(op, &lt, &rt, e.span)
+        let result = self.binop_type(op, &lt, &rt, e.span);
+        crate::constcheck::check_overflow(self, e, &result);
+        result
     }
 
     /// **ROUND 70** - the type rules of `a op b` with both operand types
