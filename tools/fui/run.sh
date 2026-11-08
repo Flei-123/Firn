@@ -1917,6 +1917,8 @@ build painter_canvas
 "$W/painter_canvas"
 build painter_textapi
 "$W/painter_textapi"
+build painter_backend
+"$W/painter_backend"
 build xcut
 "$W/xcut"
 # r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);
