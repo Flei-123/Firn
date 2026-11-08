@@ -1915,6 +1915,21 @@ build appctl2
 "$W/appctl2"
 
 echo
+echo "== 18q3. fui.appwin (MORE THAN ONE WINDOW) + LABEL WRAP IN CONTAINERS + app controls =="
+# lib/fui/appwin.fi: a second window shares the first one's loop (X11), is refused cleanly elsewhere (web);
+# lib/fui/appwrap.fi: a label wraps to the room of its container (card padding, siblings in a row).
+build appwin
+"$W/appwin"
+build appwrap
+"$W/appwrap"
+if command -v Xvfb >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1; then
+    build appwin_live
+    python3 -I tools/fui/appwin_live.py "$W/appwin_live"
+else
+    echo "  SKIP: no Xvfb/xdotool -- no live second window in this run"
+fi
+
+echo
 echo "== 12x. fui.app NODES (card, group box, separator, badge, image, icon) + TREE OVER 128 NODES =="
 build appnodes
 "$W/appnodes"

@@ -79,6 +79,7 @@ import fui.editor
 import fui.textbuf
 import fui.textarea
 import fui.listrow
+import fui.appwrap
 import fui.anim
 import fui.query
 import plat.fuiwirt
@@ -130,7 +131,7 @@ export {
     refresh_hz, fit_stat, frame_wait_ms, frame_stats_on, frame_stats_reset, frame_stat, frame_phase, FS_FRAMES, FS_AVG_US, FS_MAX_US, FS_SLOW, FS_IV_P95_US, FS_IV_MAX_US,
     app_paint, app_attach, app_key, app_char, app_press, app_act,
     app_done, app_host, app_theme, app_entry_box, app_entry_buf, app_scene, app_reduced_motion,
-    app_hook,
+    app_hook, app_hooks,
     ENTRIES_MAX, TEXT_CAP,
 }
 
@@ -146,6 +147,7 @@ const GAP: i64 = 14
 const ROW_GAP: i64 = 10
 const PAD: i64 = 16
 const ENTRY_W: usize = 240
+const WRAP_MIN_PT: f64 = 48.0
 // a text area: its width and one row's height in design points, the text it
 // holds (bytes; undo steps are as big, so a whole text can always be undone)
 const AREA_W: usize = 320
@@ -2685,6 +2687,7 @@ fn focus(a: *mut App) -> usize {
 // are editor.KEY_*, modifiers editor.MOD_*.
 
 fn app_host(a: *mut App) -> *mut fuiwirt.Host { return &(*a).w }
+fn app_hooks(a: *mut App) -> u64 { return (&(*a).hk) as u64 }
 fn app_theme(a: *mut App) -> *mut theme.Theme { return &(*a).m }
 fn app_scene(a: *mut App) -> *mut scene.Scene { return &(*a).sc }
 
@@ -2957,33 +2960,6 @@ fn paint_rects(a: *mut App, w: usize, h: usize, rs: *mut [i64; 16], m: usize) {
     }
 }
 
-// How many lines `p`/`n` needs at width `w` -- the loop of
-// painter.run_draw_wrapped without the drawing, so the count is the
-// picture's count.
-fn count_lines(z: *mut painter.Painter, r: *mut painter.TextRun, p: u64,
-    n: usize, w: f64) -> usize {
-    var lines: usize = 0
-    var i: usize = 0
-    while i < n && lines < 8 {
-        var j: usize = i
-        while j < n && rt.ld8(p, j) == 32 as u8 {
-            j = j + 1
-        }
-        if j >= n {
-            return lines
-        }
-        var next: usize = 0
-        let upto: usize = painter.run_line_upto(z, r, p + (i as u64), n - i,
-            w, &next)
-        if upto == 0 || next == 0 {
-            return lines + 1
-        }
-        lines = lines + 1
-        i = i + next
-    }
-    return lines
-}
-
 // A LABEL WIDER THAN THE WINDOW WRAPS. Measured, a flex item keeps its
 // text width, and a centred child wider than its column starts left of
 // the window -- the whole line then vanished (tools/fui/app_main.fi,
@@ -2995,6 +2971,7 @@ fn count_lines(z: *mut painter.Painter, r: *mut painter.TextRun, p: u64,
 // frame only scrolled a view. Its result (label sizes + wrap flags) depends on the node tree / texts (scene epoch), the width and the text scale only.
 // Same inputs as at the end of the last run = skip it: the labels keep their sizes, the caller styles as usual (return false).
 static mut FIT_EPOCH: u64 = 0
+static mut FIT_APP: u64 = 0
 static mut FIT_W: usize = 0
 static mut FIT_SCALE: usize = 0
 static mut FIT_VALID: bool = false
@@ -3010,17 +2987,41 @@ fn fit_stat(k: usize) -> i64 {
 fn fit_labels(a: *mut App, w: usize) -> bool {
     let sc0: *mut scene.Scene = &(*a).sc
     let scl: usize = (theme.theme_scale(&(*a).m) as usize) + 100000 * (theme.theme_text_scale(&(*a).m) as usize)
-    if FIT_VALID && FIT_EPOCH == scene.scene_epoch() && FIT_W == w && FIT_SCALE == scl && scene.scene_count(sc0) > 0 {
+    if FIT_VALID && FIT_APP == (a as u64) && FIT_EPOCH == scene.scene_epoch() && FIT_W == w && FIT_SCALE == scl && scene.scene_count(sc0) > 0 {
         FIT_HITS = FIT_HITS + 1
         return false
     }
     FIT_RUNS = FIT_RUNS + 1
     let r: bool = fit_labels_run(a, w)
     FIT_EPOCH = scene.scene_epoch()
+    FIT_APP = a as u64
     FIT_W = w
     FIT_SCALE = scl
     FIT_VALID = r
     return r
+}
+
+fn fit_label(a: *mut App, i: usize, room: f64, s: f64, z: *mut painter.Painter) {
+    let sc: *mut scene.Scene = &(*a).sc
+    var avail: f64 = room
+    if avail < WRAP_MIN_PT * s {
+        avail = WRAP_MIN_PT * s
+    }
+    if scene.node_pref_w(sc, i) <= avail {
+        return
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    let px: f64 = render.field_px(&(*a).c, e)
+    var r: painter.TextRun = render.text_run_of(&(*a).c, e, px)
+    var lines: usize = appwrap.count_lines(z, &r, widget.w_text(e), widget.w_text_len(e), avail)
+    if lines < 1 {
+        lines = 1
+    }
+    let lh: f64 = painter.run_line_height(z, &r)
+    let hh: f64 = scene.node_pref_h(sc, i) + ((lines - 1) as f64) * lh
+    scene.node_set_size(sc, i, avail / s, hh / s)
+    widget.w_set_text_lines(e, lines)
+    wrp_put(a, i, true)
 }
 
 fn fit_labels_run(a: *mut App, w: usize) -> bool {
@@ -3036,8 +3037,7 @@ fn fit_labels_run(a: *mut App, w: usize) -> bool {
         i = i + 1
     }
     let s: f64 = (theme.theme_scale(&(*a).m) as f64) / 1000.0
-    let avail: f64 = (w as f64) - 2.0 * (PAD as f64) * s
-    if avail <= 0.0 {
+    if (w as f64) <= 2.0 * (PAD as f64) * s {
         return false
     }
     scene.scene_style(sc, &(*a).sh)
@@ -3045,21 +3045,8 @@ fn fit_labels_run(a: *mut App, w: usize) -> bool {
     let z: *mut painter.Painter = render.ctx_painter(&(*a).c)
     i = 0
     while i < n {
-        if scene.node_kind(sc, i) == scene.N_TEXT
-        && scene.node_pref_w(sc, i) > avail {
-            let e: *mut widget.Widget = scene.node_widget(sc, i)
-            let px: f64 = render.field_px(&(*a).c, e)
-            var r: painter.TextRun = render.text_run_of(&(*a).c, e, px)
-            var lines: usize = count_lines(z, &r, widget.w_text(e),
-                widget.w_text_len(e), avail)
-            if lines < 1 {
-                lines = 1
-            }
-            let lh: f64 = painter.run_line_height(z, &r)
-            let hh: f64 = scene.node_pref_h(sc, i) + ((lines - 1) as f64) * lh
-            scene.node_set_size(sc, i, avail / s, hh / s)
-            widget.w_set_text_lines(e, lines)
-            wrp_put(a, i, true)
+        if scene.node_kind(sc, i) == scene.N_TEXT {
+            fit_label(a, i, appwrap.label_width(sc, i, w as f64, s), s, z)
         }
         i = i + 1
     }

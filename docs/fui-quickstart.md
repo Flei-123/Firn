@@ -251,11 +251,61 @@ the compiler looks into a **platform directory** of the library first
 program that imports `window.window` gets X11 without a symlink of its own.
 A `window/backend.fi` next to the program still wins (search step 2).
 
+## Standard controls
+
+`import fui.appctl` next to `fui.app`. A callback is `fn(a: *mut app.App, id: usize)`
+and runs when the user changed the control (never for a `set_*` call).
+
+| Call | What it does |
+|---|---|
+| `appctl.checkbox(a, text, on, on_change) -> id` | check box; `appctl.checked(a, id)` / `appctl.set_checked(a, id, on)` |
+| `appctl.radio(a, group, text, on, on_change) -> id` | radio button; same group = exclusive |
+| `appctl.slider(a, name, lo, hi, init, on_change) -> id` | slider; `appctl.value(a, id)` / `appctl.set_value(a, id, v)` |
+| `appctl.dropdown(a, name, on_change) -> id` | drop-down; fill with `appctl.dropdown_add(a, id, text)` |
+| `app.list(a)` + `app.list_item(a, icon, text, detail, badge, on_pick)` | list of rows (close with `app.end(a)`); `app.chosen(a, list) -> row` |
+
+`tools/fui/appwrap_main.fi` drives a check box, a slider and a list.
+
+## More than one window
+
+`import fui.appwin`. The extra windows share the first window's event loop.
+
+```
+fn closed(a: *mut app.App) {}
+
+fn open_second(a: *mut app.App) {
+    let b: *mut app.App = appwin.open("Second", 300, 160)
+    if b as u64 == 0 {
+        return
+    }
+    app.label(b, "Hello again", 0)
+    appwin.on_close(b, closed)
+}
+```
+
+| Call | What it does |
+|---|---|
+| `appwin.supported() -> bool` | true on X11; false on web, Android, Windows (not built yet) |
+| `appwin.open(title, w, h) -> *mut App` | a new window, built like the first one; `0` when unsupported or 8 windows are open |
+| `appwin.close(b)` | close that window only (`app.quit(b)` does the same) |
+| `appwin.on_close(b, f)` | `f(b)` runs after the window is gone (close button, `close`, `quit`) |
+| `appwin.alive(b)` / `appwin.count()` / `appwin.at(i)` | which extra windows exist |
+
+Closing the first window ends the program and closes the others.
+In the browser `appwin.open` refuses cleanly (returns `0`): one page, one app.
+Menu popups and the on-screen keyboard follow the first window only.
+`tools/fui/appwin_main.fi` (model) and `tools/fui/appwin_live.py` (a real X server) check it.
+
+## Wrapping labels
+
+A label wider than the room it stands in wraps (up to 64 lines). The room is
+the window minus the padding of every container around the label, and in a row
+minus its siblings. Texts are limited to 256 octets.
+
 ## Limits today
 
 * 128 nodes per window, 8 text fields, 256 octets per text (a text area: 4096).
-* One window per program (several windows: `lib/plat/fuiwin.fi`
-  `window_step` / `window_wait_many`).
+* Several windows on X11 only (`fui.appwin`, at most 8 per program).
 * A click into a text field puts the caret at the click; a drag selects. (Shift+click
   extends nothing yet: the host hook carries no modifier keys.)
 * A text area counts against the same 8 text-field slots; it has no tabs and no
