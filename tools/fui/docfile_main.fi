@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.docfile
+import fui.editor
+import fui.services
+
+static mut BAD: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  FAIL  ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn same_str(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+fn same(b: *mut rt.Buf, s: str) -> bool {
+    return same_str(rt.buf_str(b), s)
+}
+
+fn test_commands() {
+    let ctrl: u32 = editor.MOD_CTRL
+    let shift: u32 = editor.MOD_SHIFT
+    check(docfile.command_of(15 as u32, 0 as u32) == docfile.CMD_OPEN, "command: control character 15 is open")
+    check(docfile.command_of(111 as u32, ctrl) == docfile.CMD_OPEN, "command: ctrl+o is open")
+    check(docfile.command_of(19 as u32, 0 as u32) == docfile.CMD_SAVE, "command: control character 19 is save")
+    check(docfile.command_of(115 as u32, ctrl) == docfile.CMD_SAVE, "command: ctrl+s is save")
+    check(docfile.command_of(19 as u32, shift) == docfile.CMD_SAVE_AS, "command: shift+control character 19 is save as")
+    check(docfile.command_of(83 as u32, ctrl | shift) == docfile.CMD_SAVE_AS, "command: ctrl+shift+s is save as")
+    check(docfile.command_of(111 as u32, 0 as u32) == docfile.CMD_NONE, "command: plain o is text")
+    check(docfile.command_of(115 as u32, 0 as u32) == docfile.CMD_NONE, "command: plain s is text")
+    check(docfile.command_of(97 as u32, ctrl) == docfile.CMD_NONE, "command: ctrl+a is not ours")
+}
+
+fn test_dirty() {
+    docfile.reset()
+    check(!docfile.dirty(3, "x"), "dirty: unmarked slot is clean")
+    docfile.mark(3, "alpha")
+    check(!docfile.dirty(3, "alpha"), "dirty: same text is clean")
+    check(docfile.dirty(3, "alpha!"), "dirty: changed text is dirty")
+    check(!docfile.dirty(4, "alpha!"), "dirty: slots are independent")
+    docfile.mark(3, "alpha!")
+    check(!docfile.dirty(3, "alpha!"), "dirty: mark resets the baseline")
+    docfile.mark(9999, "z")
+    check(!docfile.dirty(9999, "q"), "dirty: slot out of range is ignored")
+    docfile.set_name(2, "two.md")
+    check(same_str(docfile.name(2), "two.md") && docfile.name(5).n == 0, "name: per slot")
+}
+
+fn test_guard() {
+    docfile.reset()
+    docfile.mark(1, "base")
+    check(docfile.guard(1, "base"), "guard: clean passes without a question")
+    services.script_answer(services.ANS_NO)
+    check(!docfile.guard(1, "base+edit"), "guard: dirty and answer no blocks")
+    services.script_answer(services.ANS_YES)
+    check(docfile.guard(1, "base+edit"), "guard: dirty and answer yes passes")
+}
+
+fn test_open() {
+    docfile.reset()
+    services.memory_reset()
+    var ev: services.SvcEvent = services.event_new()
+    var slot: usize = 99
+    check(services.write_path("a.md", "hello".p as u64, 5), "open: seed file")
+    docfile.mark(1, "old")
+    services.script_answer(services.ANS_NO)
+    check(!docfile.request_open(1, "old edited", "Open", "") && !docfile.waiting(), "open: dirty and declined starts nothing")
+    check(docfile.take(&ev, &slot) == docfile.ACT_NONE, "open: nothing queued after decline")
+    services.script_pick("a.md")
+    services.script_answer(services.ANS_YES)
+    check(docfile.request_open(1, "old edited", "Open", "") && docfile.waiting(), "open: dirty and confirmed starts a request")
+    check(!docfile.request_open(1, "old", "Open", ""), "open: second request while waiting is refused")
+    check(docfile.take(&ev, &slot) == docfile.ACT_LOADED && slot == 1, "open: loaded for the requesting slot")
+    check(same(&ev.data, "hello") && same_str(docfile.name(1), "a.md"), "open: data and name")
+    check(!docfile.waiting(), "open: not waiting afterwards")
+    services.script_pick("")
+    check(docfile.request_open(1, "hello", "Open", "") && docfile.take(&ev, &slot) == docfile.ACT_FAILED, "open: cancel is a failure")
+    check(same_str(docfile.name(1), "a.md"), "open: cancel keeps the name")
+    services.script_pick("absent.md")
+    check(docfile.request_open(1, "hello", "Open", "") && docfile.take(&ev, &slot) == docfile.ACT_FAILED, "open: unreadable file is a failure")
+    services.event_free(&ev)
+}
+
+fn test_save() {
+    docfile.reset()
+    services.memory_reset()
+    var ev: services.SvcEvent = services.event_new()
+    var out: rt.Buf = rt.buf_new()
+    var slot: usize = 99
+    docfile.mark(2, "v1")
+    services.script_pick("note.md")
+    check(docfile.request_save(2, "Title.md", "v2", false) && docfile.waiting(), "save: request starts")
+    check(docfile.take(&ev, &slot) == docfile.ACT_SAVED && slot == 2, "save: saved for the requesting slot")
+    check(services.read_path("note.md", &out) && same(&out, "v2"), "save: file content")
+    check(same_str(docfile.name(2), "note.md") && !docfile.dirty(2, "v2") && docfile.dirty(2, "v3"), "save: name and baseline updated")
+    services.script_pick("")
+    check(docfile.request_save(2, "Title.md", "v3", true) && docfile.take(&ev, &slot) == docfile.ACT_FAILED, "save as: cancel is a failure")
+    check(same_str(docfile.name(2), "note.md") && docfile.dirty(2, "v3"), "save as: cancel keeps name and stays dirty")
+    services.script_pick("copy.md")
+    check(docfile.request_save(2, "Title.md", "v3", true) && docfile.take(&ev, &slot) == docfile.ACT_SAVED, "save as: new name saved")
+    check(same_str(docfile.name(2), "copy.md") && !docfile.dirty(2, "v3"), "save as: name switches")
+    check(!docfile.request_save(70, "x.md", "t", false), "save: slot out of range is refused")
+    rt.buf_free(&out)
+    services.event_free(&ev)
+}
+
+fn test_roundtrip_and_store() {
+    docfile.reset()
+    services.memory_reset()
+    var ev: services.SvcEvent = services.event_new()
+    var out: rt.Buf = rt.buf_new()
+    var slot: usize = 0
+    services.script_pick("round.md")
+    check(docfile.request_save(0, "r.md", "# Round\n\ntrip", false) && docfile.take(&ev, &slot) == docfile.ACT_SAVED, "round trip: save")
+    check(docfile.request_open(0, "# Round\n\ntrip", "Open", "") && docfile.take(&ev, &slot) == docfile.ACT_LOADED, "round trip: open")
+    check(same(&ev.data, "# Round\n\ntrip"), "round trip: same text")
+    check(services.store_set("notes.last_file", "round.md".p as u64, 8), "store: remember last file")
+    check(services.store_get("notes.last_file", &out) && same(&out, "round.md"), "store: read last file")
+    check(services.clip_copy("round.md") && services.clip_request() && services.next(&ev) && ev.kind == services.EV_CLIP && same(&ev.data, "round.md"), "clipboard: name copied")
+    rt.buf_free(&out)
+    services.event_free(&ev)
+}
+
+fn main() -> i32 {
+    services.use_memory(true)
+    check(docfile.init("docfile-test"), "init: app name accepted")
+    check(!docfile.init("bad name"), "init: invalid app name refused")
+    test_commands()
+    test_dirty()
+    test_guard()
+    test_open()
+    test_save()
+    test_roundtrip_and_store()
+    if BAD != 0 {
+        say("DOCFILE FAILED\n")
+        return 1
+    }
+    say("DOCFILE PASSED\n")
+    return 0
+}

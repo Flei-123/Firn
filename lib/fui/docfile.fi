@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.hash
+import services.svc
+import fui.services
+import fui.editor
+
+export {
+    CMD_NONE, CMD_OPEN, CMD_SAVE, CMD_SAVE_AS, ACT_NONE, ACT_LOADED, ACT_SAVED, ACT_FAILED,
+    init, command_of, mark, dirty, name, set_name, guard, request_open, request_save, take, waiting, reset,
+}
+
+const SLOTS: usize = 64
+const CELL: usize = 64
+const CMD_NONE: u32 = 0
+const CMD_OPEN: u32 = 1
+const CMD_SAVE: u32 = 2
+const CMD_SAVE_AS: u32 = 3
+const ACT_NONE: u32 = 0
+const ACT_LOADED: u32 = 1
+const ACT_SAVED: u32 = 2
+const ACT_FAILED: u32 = 3
+const PENDING_NONE: u32 = 0
+const PENDING_OPEN: u32 = 1
+const PENDING_SAVE: u32 = 2
+const LETTER_O: u32 = 111
+const LETTER_S: u32 = 115
+const CASE_GAP: u32 = 32
+const CTRL_LETTER_BASE: u32 = 96
+const DISCARD_TITLE: str = "Unsaved changes"
+const DISCARD_TEXT: str = "Discard the unsaved changes?"
+const SAVE_TITLE: str = "Save"
+
+static mut D_HASH: [u64; 64] = [0; 64]
+static mut D_MARKED: [bool; 64] = [false; 64]
+static mut D_NAME: [u64; 64] = [0; 64]
+static mut P_KIND: u32 = 0
+static mut P_SLOT: usize = 0
+static mut P_HASH: u64 = 0
+
+fn init(app: str) -> bool {
+    return svc.set_app(app) == svc.OK
+}
+
+fn reset() {
+    var i: usize = 0
+    while i < SLOTS {
+        D_MARKED[i] = false
+        D_HASH[i] = 0 as u64
+        if D_NAME[i] != 0 as u64 {
+            rt.buf_clear(D_NAME[i] as *mut rt.Buf)
+        }
+        i = i + 1
+    }
+    P_KIND = PENDING_NONE
+}
+
+fn lower_letter(cp: u32, mods: u32) -> u32 {
+    if cp >= 1 as u32 && cp <= 26 as u32 {
+        return cp + CTRL_LETTER_BASE
+    }
+    if (mods & editor.MOD_CTRL) == 0 as u32 {
+        return 0 as u32
+    }
+    if cp >= 65 as u32 && cp <= 90 as u32 {
+        return cp + CASE_GAP
+    }
+    return cp
+}
+
+fn command_of(cp: u32, mods: u32) -> u32 {
+    let letter: u32 = lower_letter(cp, mods)
+    if letter == LETTER_O {
+        return CMD_OPEN
+    }
+    if letter != LETTER_S {
+        return CMD_NONE
+    }
+    let shifted: bool = (mods & editor.MOD_SHIFT) != 0 as u32 || cp == 83 as u32
+    if shifted {
+        return CMD_SAVE_AS
+    }
+    return CMD_SAVE
+}
+
+fn text_hash(text: str) -> u64 {
+    return hash.fnv1a64(text.p as u64, text.n)
+}
+
+fn valid(slot: usize) -> bool {
+    return slot < SLOTS
+}
+
+fn mark(slot: usize, text: str) {
+    if !valid(slot) {
+        return
+    }
+    D_HASH[slot] = text_hash(text)
+    D_MARKED[slot] = true
+}
+
+fn dirty(slot: usize, text: str) -> bool {
+    if !valid(slot) || !D_MARKED[slot] {
+        return false
+    }
+    return D_HASH[slot] != text_hash(text)
+}
+
+fn cell(slot: usize) -> *mut rt.Buf {
+    if D_NAME[slot] == 0 as u64 {
+        let b: *mut rt.Buf = rt.heap_alloc(CELL) as *mut rt.Buf
+        *b = rt.buf_new()
+        D_NAME[slot] = b as u64
+    }
+    return D_NAME[slot] as *mut rt.Buf
+}
+
+fn name(slot: usize) -> str {
+    if !valid(slot) || D_NAME[slot] == 0 as u64 {
+        return ""
+    }
+    return rt.buf_str(D_NAME[slot] as *mut rt.Buf)
+}
+
+fn set_name(slot: usize, file: str) {
+    if !valid(slot) {
+        return
+    }
+    let b: *mut rt.Buf = cell(slot)
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, file.p as u64, file.n)
+}
+
+fn guard(slot: usize, text: str) -> bool {
+    if !dirty(slot, text) {
+        return true
+    }
+    return services.confirm(DISCARD_TITLE, DISCARD_TEXT)
+}
+
+fn request_open(slot: usize, text: str, title: str, filters: str) -> bool {
+    if P_KIND != PENDING_NONE || !guard(slot, text) {
+        return false
+    }
+    P_KIND = PENDING_OPEN
+    P_SLOT = slot
+    if services.open_request(title, filters) {
+        return true
+    }
+    P_KIND = PENDING_NONE
+    return false
+}
+
+fn request_save(slot: usize, suggest: str, text: str, save_as: bool) -> bool {
+    if P_KIND != PENDING_NONE || !valid(slot) {
+        return false
+    }
+    var target: str = name(slot)
+    if save_as || target.n == 0 {
+        target = suggest
+    }
+    P_KIND = PENDING_SAVE
+    P_SLOT = slot
+    P_HASH = text_hash(text)
+    if services.save_request(SAVE_TITLE, target, text.p as u64, text.n) {
+        return true
+    }
+    P_KIND = PENDING_NONE
+    return false
+}
+
+fn waiting() -> bool {
+    return P_KIND != PENDING_NONE
+}
+
+fn take_opened(ev: *mut services.SvcEvent, slot: *mut usize) -> u32 {
+    P_KIND = PENDING_NONE
+    if (*ev).status == 0 as u32 {
+        return ACT_FAILED
+    }
+    *slot = P_SLOT
+    set_name(P_SLOT, rt.buf_str(&(*ev).name))
+    return ACT_LOADED
+}
+
+fn take_saved(ev: *mut services.SvcEvent, slot: *mut usize) -> u32 {
+    let at: usize = P_SLOT
+    P_KIND = PENDING_NONE
+    if (*ev).status == 0 as u32 {
+        return ACT_FAILED
+    }
+    set_name(at, rt.buf_str(&(*ev).name))
+    if valid(at) {
+        D_HASH[at] = P_HASH
+        D_MARKED[at] = true
+    }
+    *slot = at
+    return ACT_SAVED
+}
+
+fn take(ev: *mut services.SvcEvent, slot: *mut usize) -> u32 {
+    if P_KIND == PENDING_NONE || !services.next(ev) {
+        return ACT_NONE
+    }
+    if (*ev).kind == services.EV_OPENED && P_KIND == PENDING_OPEN {
+        return take_opened(ev, slot)
+    }
+    if (*ev).kind == services.EV_SAVED && P_KIND == PENDING_SAVE {
+        return take_saved(ev, slot)
+    }
+    return ACT_NONE
+}
