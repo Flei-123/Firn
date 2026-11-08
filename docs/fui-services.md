@@ -36,18 +36,18 @@ Only `svcplat.fi` / `svcsys.fi` / `svcfile.fi` (and their web twins) call the pl
 
 ## Single Firn pin (M1, checked 08.11.2026)
 
-| Consumer | How it gets Firn | State |
+Policy and bump script exist on main: `docs/PIN-POLICY.md`, `tools/pin/bump.sh`, registry `tools/pin/repos.txt` (osum, certus, fui, firnchat). fUi's own pin is `examples/fui_apps/firn.toolchain` (`firn 0.1.4898`).
+
+| Consumer | How it gets Firn before the first bump | Gap for fUi |
 |---|---|---|
 | fUi | lives in the Firn repo (`lib/fui`) | source of truth |
-| Osum | `vendor/firn/COMMIT` = `33b67b5e7`, `firn.toolchain` = `firn 0.1.4894`, `tools/firnpin/check.sh`, `vendor/firn/fetch-firnc.sh` | patches all upstream |
-| Certus (certus-ui) | `vendor/firn/COMMIT` = `7893ea2c8d74...` (hash not in the current Firn history), `firn.toolchain` = `firn 0.1.4893`, own partial fUi copy `.fui-win` (17 files vs 249 in `lib/fui`) for the Windows build | stale copy, r63 |
-| Certus (/root/certus, old checkout) | `COMMIT` = `52a13e75...` (old private history) | do not use |
-| FirnChat | no pin file; `build.sh` takes `$FIRNC`, a firnc in PATH, or a Firn checkout (`$FIRNLIB`, `~/firn`) | unpinned |
+| Osum | `firn.toolchain` 0.1.4894, `vendor/firn/COMMIT` 33b67b5e7 | none, patches all upstream |
+| Certus (certus-ui) | `firn.toolchain` 0.1.4893, `vendor/firn/COMMIT` 7893ea2c... (not in current Firn history), own partial fUi copy `.fui-win` (17 of 249 `lib/fui` files) for the Windows build | `.fui-win` must go: every Certus-only fUi patch must be upstream in `lib/fui`, then Windows builds use the shared `$FIRNLIB` (r63) |
+| /root/certus (old checkout) | `COMMIT` 52a13e75... (old private history) | do not use |
+| FirnChat | no pin file; `build.sh` takes `$FIRNC`, a firnc in PATH, or a Firn checkout | needs `firn.toolchain` (registry already lists it) |
 
-What fUi needs for one shared pin (nightly 0.1.4889+; newest toolchain installed: 0.1.4898):
-1. A version stamp consumers can read from fUi itself (revision of `lib/fui`), so `check.sh` can compare it with `firn.toolchain`.
-2. No consumer-only patches: every Certus patch (`0001-fui-painter-fontreq` and others) must be upstream in `lib/fui`, then `.fui-win` is deleted and Windows builds use `$FIRNLIB`.
-3. One pin file format for all four consumers (Osum's `firn.toolchain` + `COMMIT`); FirnChat gets one.
-4. One bump script that sets `COMMIT` + `firn.toolchain` in every consumer (Firn plan, step 3 of "Top 10").
-5. fUi API freeze list (stable names in `fui.app`, `fui.kit`, `fui.services`) so a bump does not break consumers silently.
-6. Compatibility smoke per consumer after a bump: Osum `fuiscene` build, Certus Windows build, FirnChat build.
+What fUi still needs for one shared pin (nightly 0.1.4889+; newest installed 0.1.4898):
+1. Remove `.fui-win` in Certus (above), so the pin really covers fUi code.
+2. A smoke in `tools/pin/smoke/` that builds one app using `fui.services` for web and native (notes), so a bump catches adapter breakage.
+3. Keep the services adapter the only platform entry of apps, so a bump of `lib/services` changes one file set, not the apps.
+4. FirnChat `firn.toolchain` file.
