@@ -64,5 +64,8 @@ for app in "${APPS[@]}"; do
         --window-size=1100,700 --virtual-time-budget=15000 --screenshot="$OUT/$app-web.png" \
         "http://127.0.0.1:$PORT/$app.html?w=1100&h=700" >"$OUT/$app-chrome.log" 2>&1
     python3 -I tools/wasm/screencmp.py "$LIM" "$app" "$OUT/$app-web.png" "$OUT/$app-native-light.png" "$OUT/$app-native-dark.png" || fail=1
+    if [ "$app" = editor ]; then
+        python3 -I tools/wasm/editorcheck.py "$OUT/site" editor || fail=1
+    fi
 done
 exit $fail
