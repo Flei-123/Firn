@@ -945,7 +945,7 @@ if command -v chromium >/dev/null 2>&1; then
 else
     echo "  chromium missing -- skipped"
 fi
-echo "== 18p6. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, audit, native golden =="
+echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, audit, native golden =="
 "$FIRNC" --opt-level=dev -o "$W/editor_check" examples/fui_apps/editor/editor_check_main.fi || exit 1
 "$W/editor_check" --data examples/fui_apps/data || exit 1
 "$FIRNC" --opt-level=dev -o "$W/editor_app" examples/fui_apps/editor/main.fi || exit 1
