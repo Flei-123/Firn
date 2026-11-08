@@ -49,5 +49,8 @@ for app in "${APPS[@]}"; do
     [ -f "$OUT/site/$app.wasm" ] || continue
     web_shot "$app.html" "$OUT/$app-web.png" 1100 700 "$OUT/$app-chrome.log"
     python3 -I tools/wasm/screencmp.py "$LIM" "$app" "$OUT/$app-web.png" "$OUT/$app-native-light.png" "$OUT/$app-native-dark.png" || fail=1
+    if [ "$app" = editor ]; then
+        python3 -I tools/wasm/editorcheck.py "$OUT/site" editor || fail=1
+    fi
 done
 exit $fail

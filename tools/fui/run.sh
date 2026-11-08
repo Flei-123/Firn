@@ -1120,6 +1120,10 @@ if [ -x /usr/lib/wine/wine64 ]; then
     FIRNC="$FIRNC" sh tools/fui/uiatextcom.sh >"$W/uiatextcom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiatextcom.log"
     if [ "$rc" != 0 ]; then echo "uiatextcom FAILED ($rc)"; exit 1; fi
+    rc=0
+    FIRNC="$FIRNC" bash tools/fui/appwin_wine.sh >"$W/appwin_wine.log" 2>&1 || rc=$?
+    tail -n 3 "$W/appwin_wine.log"
+    if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "appwin_wine FAILED ($rc)"; exit 1; fi
 else
     echo "  uiacom: wine missing, skipped"
 fi
@@ -1915,6 +1919,12 @@ echo "== 18q4. PAINT-ONLY FRAME + x-CUT RASTER WINDOW (r455 / r456) =="
 # the fast path. painter.round_rect cuts its raster window to the clip in x between the corners: same octets inside the clip.
 build rotpaint
 "$W/rotpaint"
+build painter_canvas
+"$W/painter_canvas"
+build painter_textapi
+"$W/painter_textapi"
+build painter_backend
+"$W/painter_backend"
 build xcut
 "$W/xcut"
 # r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);
