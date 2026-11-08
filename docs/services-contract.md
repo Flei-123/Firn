@@ -123,6 +123,8 @@ A call whose capability is missing answers `NO_BACKEND` and changes nothing (the
   std.dialog filter `"Files|*.png;*.jpg|All files|*"`; the browser hands it to `<input accept>`.
 - A browser gives a file's NAME and CONTENT, never a path; so does the contract on every backend (`r.name` = base name).
 - File size: native reads up to 256 MiB per file (more = `FAILED` item).
+- Reply queue: 28-octet record head, then name and data, each padded to 4 octets, so every head is 4-aligned
+  (aarch64 / wasm loads stay aligned for names of any length).
 
 ## Firn-page contract (Certus) compatibility
 
@@ -130,9 +132,16 @@ No new host import. The browser backend uses only imports that `demos/webdemo/fi
 (`firn_web_dialog_file`, `firn_web_dialog_message`, `firn_web_download`, `firn_web_clip_write/read`,
 `firn_web_store_get/set`) and the exports `firn_web_dialog` / `firn_web_clip` of `plat.web`. A page that does not import
 `lib/services` has exactly the imports it had: Firn-page contract v1 (6 `firn`, 1 `env`, 5 `certus.fetch*`) is
-unchanged. Certus does not answer the `firn_web_*` service imports yet, so a services page does not start there;
-proposal for Certus (projects_kb/certus/FIRN-WEB.md): an ADDITIVE capability `services` (contract v1.1) that answers
-the seven imports above, declared per page (meta tag), refused otherwise.
+unchanged. Certus does not answer the `firn_web_*` service imports yet, so a services page does not start there.
+
+### Proposal (not agreed with Certus): capability `services`, contract v1.1
+
+- ADDITIVE: contract v1 pages stay valid; nothing changes for a page that does not ask for it.
+- A page declares it (meta tag `firn-capabilities` containing `services`); Certus then answers the seven imports above
+  and calls the exports `firn_web_dialog` / `firn_web_clip` for the async answers. Undeclared use is refused at load.
+- Certus answers: file open through its own file chooser (name + content, never a path), save as a download, clipboard
+  text only, storage per page origin and app name, message/confirm as modal browser dialogs.
+- Tracked for Certus in projects_kb/certus/FIRN-WEB.md; until it lands, `svc.caps()` on a v1 host is what the page sees.
 
 ## OrientOS backend (spec, not built)
 
@@ -143,8 +152,10 @@ a `clipd` service (text only in v1), storage as files under `/user/<app>/service
 
 ## Tests
 
-- `tests/6710_services_contract.fi`: the conformance test, ONE source: per capability "works" or "answers
+- `tools/services/conformance.fi`: the conformance test, ONE source: per capability "works" or "answers
   NO_BACKEND"; storage round trip; async file/clip replies (native: queued at once; browser: host events simulated
   through `svc.host_event`).
+- `tests/6705_services_headless.fi` (test.sh section 3, every build level): starts itself with its own `APPKIT_HOME`
+  and no display; headless capabilities, storage inside `APPKIT_HOME`, reply queue with odd name/data lengths.
 - `tools/services/conformance.sh`: runs it natively (no display; stand-in zenity + clipboard helper) and as
   `wasm32-browser` under `tools/wasm/run.mjs` (which answers the service imports with in-memory stand-ins).
