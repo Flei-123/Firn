@@ -353,6 +353,8 @@ echo "== 18t. DAS MEHRZEILIGE TEXTFELD (lib/fui/textarea.fi) =="
 # section 18p (app_main, "notes").
 build textarea
 "$W/textarea"
+build textarea_edit
+"$W/textarea_edit"
 
 echo
 echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
