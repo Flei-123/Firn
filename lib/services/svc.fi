@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.str
+import services.svcos
+
+export {
+    OK, CANCELED, NO_BACKEND, FAILED, BUSY, NOT_FOUND, INVALID, status_name,
+    CAP_FILE_OPEN, CAP_FILE_SAVE, CAP_CLIP_WRITE, CAP_CLIP_READ, CAP_DIALOG, CAP_STORAGE, CAP_ASYNC_HOST,
+    caps, has, backend_name,
+    OP_FILE_ITEM, OP_FILE_END, OP_CLIP_TEXT, HOST_DIALOG, HOST_CLIP,
+    Reply, reply_new, reply_free, poll, pending, open_requests, host_event,
+    set_app, app_name, valid_name, next_id, push_reply,
+}
+
+const OK: i32 = 0
+const CANCELED: i32 = 1
+const NO_BACKEND: i32 = 2
+const FAILED: i32 = 3
+const BUSY: i32 = 4
+const NOT_FOUND: i32 = 5
+const INVALID: i32 = 6
+
+const CAP_FILE_OPEN: u32 = 1
+const CAP_FILE_SAVE: u32 = 2
+const CAP_CLIP_WRITE: u32 = 4
+const CAP_CLIP_READ: u32 = 8
+const CAP_DIALOG: u32 = 16
+const CAP_STORAGE: u32 = 32
+const CAP_ASYNC_HOST: u32 = 64
+
+const OP_FILE_ITEM: u32 = 1
+const OP_FILE_END: u32 = 2
+const OP_CLIP_TEXT: u32 = 3
+
+const HOST_DIALOG: u32 = 16
+const HOST_CLIP: u32 = 14
+
+const NAME_MAX: usize = 64
+const RECORD_HEAD: usize = 28
+
+struct Reply {
+    id: u32,
+    op: u32,
+    status: i32,
+    index: u32,
+    name: rt.Buf,
+    data: rt.Buf,
+}
+
+static mut g_queue: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut g_head: usize = 0
+static mut g_count: usize = 0
+static mut g_last_id: u32 = 0
+static mut g_app: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn status_name(s: i32) -> str {
+    if s == OK { return "ok" }
+    if s == CANCELED { return "canceled" }
+    if s == NO_BACKEND { return "no-backend" }
+    if s == FAILED { return "failed" }
+    if s == BUSY { return "busy" }
+    if s == NOT_FOUND { return "not-found" }
+    if s == INVALID { return "invalid" }
+    return "unknown"
+}
+
+fn caps() -> u32 {
+    return svcos.os_caps()
+}
+
+fn has(cap: u32) -> bool {
+    return (caps() & cap) == cap
+}
+
+fn backend_name() -> str {
+    return svcos.os_name()
+}
+
+fn valid_name(s: str) -> bool {
+    let n: usize = s.length()
+    if n == 0 || n > NAME_MAX || rt.ld8(s.p as u64, 0) == 46 as u8 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if !name_octet(rt.ld8(s.p as u64, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn name_octet(c: u8) -> bool {
+    if c >= 48 as u8 && c <= 57 as u8 { return true }
+    if c >= 65 as u8 && c <= 90 as u8 { return true }
+    if c >= 97 as u8 && c <= 122 as u8 { return true }
+    return c == 46 as u8 || c == 95 as u8 || c == 45 as u8
+}
+
+fn set_app(name: str) -> i32 {
+    if !valid_name(name) {
+        return INVALID
+    }
+    rt.buf_clear(&g_app)
+    rt.buf_push_bytes(&g_app, name.p as u64, name.length())
+    return OK
+}
+
+fn app_name() -> str {
+    if rt.buf_len(&g_app) == 0 {
+        return "firn-app"
+    }
+    return rt.buf_str(&g_app)
+}
+
+fn next_id() -> u32 {
+    g_last_id = g_last_id + 1 as u32
+    if g_last_id == 0 as u32 {
+        g_last_id = 1 as u32
+    }
+    return g_last_id
+}
+
+fn reply_new() -> Reply {
+    return Reply { id: 0 as u32, op: 0 as u32, status: 0, index: 0 as u32, name: rt.buf_new(), data: rt.buf_new() }
+}
+
+fn reply_free(r: *mut Reply) {
+    rt.buf_free(&(*r).name)
+    rt.buf_free(&(*r).data)
+}
+
+fn push_u32(v: u32) {
+    rt.buf_push(&g_queue, (v & 255 as u32) as u8)
+    rt.buf_push(&g_queue, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(&g_queue, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(&g_queue, (v >> 24) as u8)
+}
+
+fn push_reply(id: u32, op: u32, status: i32, index: u32, name: str, p: u64, n: usize) {
+    push_u32(id)
+    push_u32(op)
+    push_u32(status as u32)
+    push_u32(index)
+    push_u32(name.length() as u32)
+    push_u32(n as u32)
+    push_u32((n as u64 >> 32) as u32)
+    rt.buf_push_bytes(&g_queue, name.p as u64, name.length())
+    if n > 0 {
+        rt.buf_push_bytes(&g_queue, p, n)
+    }
+    g_count = g_count + 1
+}
+
+fn poll(r: *mut Reply) -> bool {
+    if g_count == 0 {
+        return false
+    }
+    let at: u64 = rt.buf_ptr(&g_queue) + g_head as u64
+    (*r).id = rt.ld32(at, 0)
+    (*r).op = rt.ld32(at, 1)
+    (*r).status = rt.ld32(at, 2) as i32
+    (*r).index = rt.ld32(at, 3)
+    let nn: usize = rt.ld32(at, 4) as usize
+    let dn: usize = (rt.ld32(at, 5) as u64 | (rt.ld32(at, 6) as u64 << 32)) as usize
+    rt.buf_clear(&(*r).name)
+    rt.buf_clear(&(*r).data)
+    rt.buf_push_bytes(&(*r).name, at + RECORD_HEAD as u64, nn)
+    rt.buf_push_bytes(&(*r).data, at + (RECORD_HEAD + nn) as u64, dn)
+    g_head = g_head + RECORD_HEAD + nn + dn
+    g_count = g_count - 1
+    if g_count == 0 {
+        rt.buf_clear(&g_queue)
+        g_head = 0
+    }
+    return true
+}
+
+fn pending() -> usize {
+    return g_count
+}
+
+fn open_requests() -> usize {
+    return svcos.os_open_requests()
+}
+
+fn host_event(kind: u32, status: u32, id: u32, q: str, p: u64, n: usize) -> bool {
+    return svcos.os_host_event(kind, status, id, q, p, n)
+}
