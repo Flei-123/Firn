@@ -18,7 +18,7 @@ impl<'a> Em<'a> {
         self.f.push(self.cur, ty, op)
     }
 
-    fn konst(&mut self, ty: FTy, k: i128) -> Val {
+    fn make_const(&mut self, ty: FTy, k: i128) -> Val {
         self.op(ty, Op::Const(k))
     }
 
@@ -48,7 +48,7 @@ impl<'a> Em<'a> {
         };
         let inst: Inst = self.f.blocks[plan.chain[pos]].insts[ii].clone();
         let out = match &inst.op {
-            Op::Const(k) => self.konst(inst.ty, *k),
+            Op::Const(k) => self.make_const(inst.ty, *k),
             Op::Load { addr } => {
                 let a = self.mat(plan, *addr)?;
                 self.op(inst.ty, Op::Load { addr: a })
@@ -79,14 +79,14 @@ impl<'a> Em<'a> {
         let lane = if let Some(k) = plan.consts.get(&c) {
             let m = if plan.ebits == 32 { (*k as u64) & 0xffff_ffff } else { *k as u64 };
             let w = if plan.ebits == 32 { m | (m << 32) } else { m };
-            self.konst(FTy::U64, w as i128)
+            self.make_const(FTy::U64, w as i128)
         } else {
             let x = self.mat(plan, c)?;
             let u = if ty == FTy::U64 { x } else { self.op(FTy::U64, Op::Cast { src: x, from: ty }) };
             if plan.ebits == 32 {
-                let mask = self.konst(FTy::U64, 0xffff_ffff);
+                let mask = self.make_const(FTy::U64, 0xffff_ffff);
                 let lo = self.op(FTy::U64, Op::Bin(BinOp::And, u, mask));
-                let sh = self.konst(FTy::U64, 32);
+                let sh = self.make_const(FTy::U64, 32);
                 let hi = self.op(FTy::U64, Op::Bin(BinOp::Shl, lo, sh));
                 self.op(FTy::U64, Op::Bin(BinOp::Or, lo, hi))
             } else {
@@ -101,21 +101,21 @@ impl<'a> Em<'a> {
         let x = self.mat(plan, init)?;
         let u = if ty == FTy::U64 { x } else { self.op(FTy::U64, Op::Cast { src: x, from: ty }) };
         if plan.ebits == 32 {
-            let mask = self.konst(FTy::U64, 0xffff_ffff);
+            let mask = self.make_const(FTy::U64, 0xffff_ffff);
             let lo = self.op(FTy::U64, Op::Bin(BinOp::And, u, mask));
-            let hi_c = self.konst(FTy::U64, (ident & 0xffff_ffff_0000_0000) as i128);
+            let hi_c = self.make_const(FTy::U64, (ident & 0xffff_ffff_0000_0000) as i128);
             let first = self.op(FTy::U64, Op::Bin(BinOp::Or, lo, hi_c));
-            let rest = self.konst(FTy::U64, ident as i128);
+            let rest = self.make_const(FTy::U64, ident as i128);
             Some(self.simd(SimdKind::FromU64, vec![first, rest], 0, FTy::V128))
         } else {
-            let rest = self.konst(FTy::U64, ident as i128);
+            let rest = self.make_const(FTy::U64, ident as i128);
             Some(self.simd(SimdKind::FromU64, vec![u, rest], 0, FTy::V128))
         }
     }
 
     fn ident_vec(&mut self, op: BinOp) -> Val {
         if op == BinOp::And {
-            let m = self.konst(FTy::U64, u64::MAX as i128);
+            let m = self.make_const(FTy::U64, u64::MAX as i128);
             self.simd(SimdKind::FromU64, vec![m, m], 0, FTy::V128)
         } else {
             self.simd(SimdKind::Zero, vec![], 0, FTy::V128)
@@ -173,7 +173,7 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         for t in &plan.tests {
             let n = em.mat(plan, t.n)?;
             let thr_k = plan.s + t.e - if t.r { 1 } else { 0 };
-            let thr = em.konst(t.ty, thr_k);
+            let thr = em.make_const(t.ty, thr_k);
             let cond = em.op(FTy::Bool, Op::Cmp { op: CmpOp::Gt, ty: t.ty, a: n, b: thr });
             let dn = em.op(t.ty, Op::Bin(BinOp::Sub, n, thr));
             let d = if t.ty == FTy::U64 { dn } else { em.op(FTy::U64, Op::Cast { src: dn, from: t.ty }) };
@@ -189,11 +189,11 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
             em.cur = next;
         }
         let lim = lim?;
-        let one = em.konst(FTy::U64, 1);
+        let one = em.make_const(FTy::U64, 1);
         let lm1 = em.op(FTy::U64, Op::Bin(BinOp::Sub, lim, one));
-        let sh = em.konst(FTy::U64, shift);
+        let sh = em.make_const(FTy::U64, shift);
         let vi = em.op(FTy::U64, Op::Bin(BinOp::Shr, lm1, sh));
-        let zero = em.konst(FTy::U64, 0);
+        let zero = em.make_const(FTy::U64, 0);
         let nz = em.op(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::U64, a: vi, b: zero });
         let pc2 = em.f.add_block();
         em.branch(nz, pc2, h);
@@ -203,14 +203,14 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         let mut pinit: Vec<Val> = Vec::new();
         for k in &plan.keys {
             let b = em.mat(plan, k.base)?;
-            let off = em.konst(FTy::I64, (plan.s + k.c) * k.e as i128);
+            let off = em.make_const(FTy::I64, (plan.s + k.c) * k.e as i128);
             pinit.push(em.op(FTy::Ptr, Op::PtrAdd { base: b, off }));
         }
         let mut lo: Vec<Val> = Vec::new();
         let mut hi: Vec<Val> = Vec::new();
         for (i, k) in plan.keys.iter().enumerate() {
             let l = em.op(FTy::U64, Op::Cast { src: pinit[i], from: FTy::Ptr });
-            let ek = em.konst(FTy::U64, k.e as i128);
+            let ek = em.make_const(FTy::U64, k.e as i128);
             let span = em.op(FTy::U64, Op::Bin(BinOp::Mul, cov, ek));
             let hh = em.op(FTy::U64, Op::Bin(BinOp::Add, l, span));
             lo.push(l);
@@ -241,7 +241,7 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                 };
                 let a = em.mat(plan, addr)?;
                 let au = em.op(FTy::U64, Op::Cast { src: a, from: FTy::Ptr });
-                let szc = em.konst(FTy::U64, sz);
+                let szc = em.make_const(FTy::U64, sz);
                 let ae = em.op(FTy::U64, Op::Bin(BinOp::Add, au, szc));
                 any_of(&mut em, &[Cnd::Le(ae, lo[sk]), Cnd::Le(hi[sk], au)]);
             }
@@ -303,7 +303,7 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                         let ptr = if j == 0 {
                             pphi[*key]
                         } else {
-                            let o = em.konst(FTy::I64, (j * 16) as i128);
+                            let o = em.make_const(FTy::I64, (j * 16) as i128);
                             em.op(FTy::Ptr, Op::PtrAdd { base: pphi[*key], off: o })
                         };
                         let v = em.simd(SimdKind::Load, vec![ptr], 0, FTy::V128);
@@ -325,7 +325,7 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
                         let ptr = if j == 0 {
                             pphi[*key]
                         } else {
-                            let o = em.konst(FTy::I64, (j * 16) as i128);
+                            let o = em.make_const(FTy::I64, (j * 16) as i128);
                             em.op(FTy::Ptr, Op::PtrAdd { base: pphi[*key], off: o })
                         };
                         let v = operand(&vmap, &splats, plan, *val, j)?;
@@ -353,12 +353,12 @@ pub(crate) fn apply(f: &mut Func, plan: &Plan) -> bool {
         }
         let mut pnext: Vec<Val> = Vec::new();
         for (i, k) in plan.keys.iter().enumerate() {
-            let o = em.konst(FTy::I64, (chunk * k.e) as i128);
+            let o = em.make_const(FTy::I64, (chunk * k.e) as i128);
             pnext.push(em.op(FTy::Ptr, Op::PtrAdd { base: pphi[i], off: o }));
         }
-        let one = em.konst(FTy::U64, 1);
+        let one = em.make_const(FTy::U64, 1);
         let cnt_next = em.op(FTy::U64, Op::Bin(BinOp::Sub, cnt, one));
-        let zero = em.konst(FTy::U64, 0);
+        let zero = em.make_const(FTy::U64, 0);
         let again = em.op(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::U64, a: cnt_next, b: zero });
         let vx = em.f.add_block();
         em.f.blocks[vl as usize].term = Term::BrCond { cond: again, then_bb: vl, else_bb: vx };

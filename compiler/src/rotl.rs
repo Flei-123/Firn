@@ -43,19 +43,19 @@ impl Tables {
         Tables { consts, bins }
     }
 
-    fn konst(&self, v: Val, w: i128) -> Option<i128> {
+    fn make_const(&self, v: Val, w: i128) -> Option<i128> {
         self.consts.get(&v).map(|c| c.rem_euclid(w))
     }
 
     fn is_neg_of(&self, m: Val, k: Val, w: i128) -> bool {
         match self.bins.get(&m) {
-            Some((BinOp::Sub, c, x, _)) if *x == k => self.konst(*c, w) == Some(0),
+            Some((BinOp::Sub, c, x, _)) if *x == k => self.make_const(*c, w) == Some(0),
             _ => false,
         }
     }
 
     fn complementary(&self, k: Val, m: Val, w: i128) -> bool {
-        if let (Some(a), Some(b)) = (self.konst(k, w), self.konst(m, w)) {
+        if let (Some(a), Some(b)) = (self.make_const(k, w), self.make_const(m, w)) {
             return a != 0 && (a + b) % w == 0;
         }
         self.is_neg_of(m, k, w) || self.is_neg_of(k, m, w)
@@ -76,7 +76,7 @@ impl Tables {
                 continue;
             }
             let disjoint_needed = op != BinOp::Or;
-            if disjoint_needed && self.konst(k, w).is_none() {
+            if disjoint_needed && self.make_const(k, w).is_none() {
                 continue;
             }
             return Some((x, k));
