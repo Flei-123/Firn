@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    UndoLog, UndoStep, ul_create, ul_destroy, ul_reset,
+    ul_boundary, ul_record, ul_can_undo, ul_can_redo,
+    ul_undo_step, ul_redo_step, ul_next_is_group, ul_read, ul_bytes_used,
+}
+
+const HEADER_BYTES: usize = 48
+const TRAILER_BYTES: usize = 8
+const FLAG_GROUP_START: u64 = 1
+const FIELD_FLAGS: u64 = 8
+const FIELD_POS: u64 = 16
+const FIELD_REMOVED: u64 = 24
+const FIELD_INSERTED: u64 = 32
+const FIELD_CARET: u64 = 40
+
+struct UndoLog {
+    buf: *mut u8,
+    cap: usize,
+    lo: u64,
+    at: u64,
+    hi: u64,
+    pending: u32,
+}
+
+struct UndoStep {
+    pos: usize,
+    removed: usize,
+    inserted: usize,
+    caret_before: usize,
+    group_start: bool,
+    removed_off: u64,
+    inserted_off: u64,
+}
+
+const STRUCT_BYTES: usize = 64
+
+fn ul_create(cap: usize) -> *mut UndoLog {
+    let u: *mut UndoLog = rt.heap_alloc(STRUCT_BYTES) as *mut UndoLog
+    if u as usize == 0 {
+        return u
+    }
+    (*u).buf = rt.heap_alloc(cap) as *mut u8
+    if (*u).buf as usize == 0 {
+        rt.heap_free(u as u64, STRUCT_BYTES)
+        return 0 as *mut UndoLog
+    }
+    (*u).cap = cap
+    (*u).lo = 0
+    (*u).at = 0
+    (*u).hi = 0
+    (*u).pending = 1
+    return u
+}
+
+fn ul_destroy(u: *mut UndoLog) {
+    if u as usize == 0 {
+        return
+    }
+    rt.heap_free((*u).buf as u64, (*u).cap)
+    rt.heap_free(u as u64, STRUCT_BYTES)
+}
+
+#[no_gc]
+fn ul_reset(u: *mut UndoLog) {
+    (*u).lo = (*u).at
+    (*u).hi = (*u).at
+    (*u).pending = 1
+}
+
+#[no_gc]
+fn ul_boundary(u: *mut UndoLog) { (*u).pending = 1 }
+
+#[no_gc]
+fn ul_bytes_used(u: *mut UndoLog) -> usize { return ((*u).hi - (*u).lo) as usize }
+
+#[no_gc]
+fn ul_can_undo(u: *mut UndoLog) -> bool { return (*u).at > (*u).lo }
+
+#[no_gc]
+fn ul_can_redo(u: *mut UndoLog) -> bool { return (*u).at < (*u).hi }
+
+#[no_gc]
+fn copy_bytes(dst: u64, src: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((dst + i as u64) as *mut u8) = *((src + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn phys(u: *mut UndoLog, off: u64) -> usize {
+    return (off % ((*u).cap as u64)) as usize
+}
+
+#[no_gc]
+fn ring_write(u: *mut UndoLog, off: u64, src: u64, n: usize) {
+    if n == 0 {
+        return
+    }
+    let start: usize = phys(u, off)
+    var first: usize = (*u).cap - start
+    if first > n {
+        first = n
+    }
+    copy_bytes((*u).buf as u64 + start as u64, src, first)
+    if first < n {
+        copy_bytes((*u).buf as u64, src + first as u64, n - first)
+    }
+}
+
+#[no_gc]
+fn ul_read(u: *mut UndoLog, off: u64, dst: u64, n: usize) {
+    if n == 0 {
+        return
+    }
+    let start: usize = phys(u, off)
+    var first: usize = (*u).cap - start
+    if first > n {
+        first = n
+    }
+    copy_bytes(dst, (*u).buf as u64 + start as u64, first)
+    if first < n {
+        copy_bytes(dst + first as u64, (*u).buf as u64, n - first)
+    }
+}
+
+#[no_gc]
+fn get64(u: *mut UndoLog, off: u64) -> u64 {
+    var v: u64 = 0
+    ul_read(u, off, (&v) as u64, 8)
+    return v
+}
+
+#[no_gc]
+fn put64(u: *mut UndoLog, off: u64, v: u64) {
+    var w: u64 = v
+    ring_write(u, off, (&w) as u64, 8)
+}
+
+#[no_gc]
+fn drop_oldest_group(u: *mut UndoLog) {
+    (*u).lo = (*u).lo + get64(u, (*u).lo)
+    while (*u).lo < (*u).at && (get64(u, (*u).lo + FIELD_FLAGS) & FLAG_GROUP_START) == 0 {
+        (*u).lo = (*u).lo + get64(u, (*u).lo)
+    }
+}
+
+#[no_gc]
+fn make_room(u: *mut UndoLog, need: usize) {
+    while (((*u).at - (*u).lo) as usize) + need > (*u).cap && (*u).at > (*u).lo {
+        drop_oldest_group(u)
+    }
+}
+
+#[no_gc]
+fn try_merge(u: *mut UndoLog, pos: usize, new_p: u64, new_n: usize) -> bool {
+    if (*u).pending != 0 || (*u).at <= (*u).lo {
+        return false
+    }
+    if (((*u).at - (*u).lo) as usize) + new_n > (*u).cap {
+        return false
+    }
+    let total: u64 = get64(u, (*u).at - 8)
+    let start: u64 = (*u).at - total
+    if get64(u, start + FIELD_REMOVED) != 0 {
+        return false
+    }
+    let ins: u64 = get64(u, start + FIELD_INSERTED)
+    if get64(u, start + FIELD_POS) + ins != pos as u64 {
+        return false
+    }
+    let tail: u64 = (*u).at - 8
+    ring_write(u, tail, new_p, new_n)
+    let total2: u64 = total + new_n as u64
+    put64(u, tail + new_n as u64, total2)
+    put64(u, start, total2)
+    put64(u, start + FIELD_INSERTED, ins + new_n as u64)
+    (*u).at = (*u).at + new_n as u64
+    (*u).hi = (*u).at
+    return true
+}
+
+#[no_gc]
+fn ul_record(u: *mut UndoLog, pos: usize, old_p: u64, old_n: usize,
+    new_p: u64, new_n: usize, caret_before: usize) {
+    if (*u).buf as usize == 0 || (old_n == 0 && new_n == 0) {
+        return
+    }
+    (*u).hi = (*u).at
+    if old_n == 0 && try_merge(u, pos, new_p, new_n) {
+        return
+    }
+    let need: usize = HEADER_BYTES + old_n + new_n + TRAILER_BYTES
+    if need > (*u).cap {
+        ul_reset(u)
+        return
+    }
+    make_room(u, need)
+    var flags: u64 = 0
+    if (*u).pending != 0 || (*u).at == (*u).lo {
+        flags = FLAG_GROUP_START
+    }
+    let o: u64 = (*u).at
+    put64(u, o, need as u64)
+    put64(u, o + FIELD_FLAGS, flags)
+    put64(u, o + FIELD_POS, pos as u64)
+    put64(u, o + FIELD_REMOVED, old_n as u64)
+    put64(u, o + FIELD_INSERTED, new_n as u64)
+    put64(u, o + FIELD_CARET, caret_before as u64)
+    ring_write(u, o + HEADER_BYTES as u64, old_p, old_n)
+    ring_write(u, o + (HEADER_BYTES + old_n) as u64, new_p, new_n)
+    put64(u, o + (need - TRAILER_BYTES) as u64, need as u64)
+    (*u).at = o + need as u64
+    (*u).hi = (*u).at
+    (*u).pending = 0
+}
+
+#[no_gc]
+fn load_step(u: *mut UndoLog, start: u64, st: *mut UndoStep) {
+    let removed: usize = get64(u, start + FIELD_REMOVED) as usize
+    (*st).pos = get64(u, start + FIELD_POS) as usize
+    (*st).removed = removed
+    (*st).inserted = get64(u, start + FIELD_INSERTED) as usize
+    (*st).caret_before = get64(u, start + FIELD_CARET) as usize
+    (*st).group_start = (get64(u, start + FIELD_FLAGS) & FLAG_GROUP_START) != 0
+    (*st).removed_off = start + HEADER_BYTES as u64
+    (*st).inserted_off = (*st).removed_off + removed as u64
+}
+
+#[no_gc]
+fn ul_undo_step(u: *mut UndoLog, st: *mut UndoStep) -> bool {
+    if (*u).at <= (*u).lo {
+        return false
+    }
+    let start: u64 = (*u).at - get64(u, (*u).at - 8)
+    load_step(u, start, st)
+    (*u).at = start
+    (*u).pending = 1
+    return true
+}
+
+#[no_gc]
+fn ul_redo_step(u: *mut UndoLog, st: *mut UndoStep) -> bool {
+    if (*u).at >= (*u).hi {
+        return false
+    }
+    let start: u64 = (*u).at
+    load_step(u, start, st)
+    (*u).at = start + get64(u, start)
+    (*u).pending = 1
+    return true
+}
+
+#[no_gc]
+fn ul_next_is_group(u: *mut UndoLog) -> bool {
+    if (*u).at >= (*u).hi {
+        return true
+    }
+    return (get64(u, (*u).at + FIELD_FLAGS) & FLAG_GROUP_START) != 0
+}

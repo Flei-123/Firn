@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MPL-2.0
+import fui.viewport
+
+export {
+    View, view_new, view_set_metrics, view_set_box, view_content_h, view_visible_rows,
+    view_scroll_max, view_clamp, view_wheel, view_scroll_to_row, view_over,
+    view_moving, view_touch_down, view_touch_move, view_touch_up, view_tick,
+}
+
+const FLING_DP: f64 = 160.0
+const FLING_MIN_PX_S: f64 = 120.0
+const TRACK_HORIZON_US: i64 = 100000
+const TRACK_REST_US: i64 = 80000
+const TRACK_MIN_SPAN_US: i64 = 4000
+const TRACK_N: usize = 16
+
+struct View {
+    row_h: f64,
+    view_h: f64,
+    width: f64,
+    scroll_y: f64,
+    px_pt: f64,
+    row_k: f64,
+    bar_off: bool,
+    kin: viewport.Viewport,
+    tr_y: [f64; 16],
+    tr_t: [i64; 16],
+    tr_n: usize,
+    tr_pos: f64,
+}
+
+#[no_gc]
+fn view_new() -> View {
+    return View {
+        row_h: 16.0, view_h: 0.0, width: 0.0, scroll_y: 0.0, px_pt: 0.0, row_k: 0.0,
+        bar_off: false,
+        kin: viewport.viewport_new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        tr_y: [0.0; 16], tr_t: [0; 16], tr_n: 0, tr_pos: 0.0,
+    }
+}
+
+fn view_set_metrics(v: *mut View, px_pt: f64, row_k: f64, bar: bool) {
+    (*v).px_pt = px_pt
+    (*v).row_k = row_k
+    (*v).bar_off = !bar
+}
+
+fn view_set_box(v: *mut View, w: f64, h: f64, row_h: f64) {
+    (*v).width = w
+    (*v).view_h = h
+    if row_h >= 1.0 {
+        (*v).row_h = row_h
+    }
+}
+
+fn view_content_h(v: *mut View, rows: usize) -> f64 {
+    return (rows as f64) * (*v).row_h
+}
+
+fn view_visible_rows(v: *mut View) -> usize {
+    let k: usize = ((*v).view_h / (*v).row_h) as usize
+    if k < 1 {
+        return 1
+    }
+    return k
+}
+
+fn view_scroll_max(v: *mut View, rows: usize) -> f64 {
+    let mx: f64 = view_content_h(v, rows) - (*v).view_h
+    if mx < 0.0 {
+        return 0.0
+    }
+    return mx
+}
+
+fn view_clamp(v: *mut View, rows: usize) {
+    let mx: f64 = view_scroll_max(v, rows)
+    if (*v).scroll_y > mx {
+        (*v).scroll_y = mx
+    }
+    if (*v).scroll_y < 0.0 {
+        (*v).scroll_y = 0.0
+    }
+}
+
+fn kin_sync(v: *mut View, rows: usize) {
+    var w: f64 = (*v).width
+    if w < 1.0 {
+        w = 1.0
+    }
+    viewport.viewport_set_bar(&(*v).kin, 0)
+    viewport.viewport_set_rect(&(*v).kin, 0.0, 0.0, w, (*v).view_h)
+    viewport.viewport_set_content(&(*v).kin, w, view_content_h(v, rows))
+    viewport.viewport_set_overscroll(&(*v).kin, true)
+}
+
+fn kin_stop(v: *mut View, rows: usize) {
+    kin_sync(v, rows)
+    viewport.viewport_set_offset(&(*v).kin, 0.0, (*v).scroll_y)
+    viewport.viewport_set_overscroll(&(*v).kin, false)
+}
+
+fn view_wheel(v: *mut View, rows: usize, dy: f64) {
+    (*v).scroll_y = (*v).scroll_y + dy
+    view_clamp(v, rows)
+    kin_stop(v, rows)
+}
+
+fn view_scroll_to_row(v: *mut View, rows: usize, row: usize) {
+    let top: f64 = (row as f64) * (*v).row_h
+    if top < (*v).scroll_y {
+        (*v).scroll_y = top
+    }
+    if top + (*v).row_h > (*v).scroll_y + (*v).view_h {
+        (*v).scroll_y = top + (*v).row_h - (*v).view_h
+    }
+    view_clamp(v, rows)
+    kin_stop(v, rows)
+}
+
+fn view_over(v: *mut View) -> f64 { return viewport.viewport_over_y(&(*v).kin) }
+
+fn view_moving(v: *mut View) -> bool { return viewport.viewport_moving(&(*v).kin) }
+
+fn track_add(v: *mut View, us: i64) {
+    var n: usize = (*v).tr_n
+    if n >= TRACK_N {
+        var i: usize = 1
+        while i < TRACK_N {
+            (*v).tr_y[i - 1] = (*v).tr_y[i]
+            (*v).tr_t[i - 1] = (*v).tr_t[i]
+            i = i + 1
+        }
+        n = TRACK_N - 1
+    }
+    (*v).tr_y[n] = (*v).tr_pos
+    (*v).tr_t[n] = us
+    (*v).tr_n = n + 1
+}
+
+fn track_velocity(v: *mut View, us: i64) -> f64 {
+    let n: usize = (*v).tr_n
+    if n < 2 {
+        return 0.0
+    }
+    let t_last: i64 = (*v).tr_t[n - 1]
+    if us - t_last > TRACK_REST_US {
+        return 0.0
+    }
+    var i: usize = n - 1
+    while i > 0 && t_last - (*v).tr_t[i - 1] <= TRACK_HORIZON_US {
+        i = i - 1
+    }
+    let span: i64 = t_last - (*v).tr_t[i]
+    if span < TRACK_MIN_SPAN_US {
+        return 0.0
+    }
+    return ((*v).tr_y[n - 1] - (*v).tr_y[i]) / ((span as f64) / 1000000.0)
+}
+
+fn view_touch_down(v: *mut View, rows: usize, us: i64) {
+    kin_sync(v, rows)
+    viewport.viewport_set_offset(&(*v).kin, 0.0, (*v).scroll_y)
+    (*v).tr_n = 0
+    (*v).tr_pos = 0.0
+    track_add(v, us)
+}
+
+fn view_touch_move(v: *mut View, rows: usize, dy: f64, now_ms: i64, us: i64) {
+    kin_sync(v, rows)
+    viewport.viewport_set_offset(&(*v).kin, 0.0, (*v).scroll_y)
+    viewport.viewport_drag(&(*v).kin, 0.0, 0.0 - dy, now_ms)
+    (*v).scroll_y = viewport.viewport_off_y(&(*v).kin)
+    (*v).tr_pos = (*v).tr_pos + dy
+    track_add(v, us)
+}
+
+fn view_touch_up(v: *mut View, now_ms: i64, us: i64) {
+    let vel: f64 = track_velocity(v, us)
+    var speed: f64 = vel
+    if speed < 0.0 {
+        speed = 0.0 - speed
+    }
+    if speed < FLING_MIN_PX_S || viewport.viewport_over_y(&(*v).kin) != 0.0 {
+        return
+    }
+    var ppi: f64 = FLING_DP
+    if (*v).px_pt > 0.0 {
+        ppi = FLING_DP * (*v).px_pt
+    }
+    viewport.viewport_fling_android(&(*v).kin, 0.0, 0.0 - vel / 1000.0, now_ms, ppi)
+}
+
+fn view_tick(v: *mut View, rows: usize, now_ms: i64) {
+    if !viewport.viewport_moving(&(*v).kin) {
+        return
+    }
+    kin_sync(v, rows)
+    viewport.viewport_tick(&(*v).kin, now_ms)
+    (*v).scroll_y = viewport.viewport_off_y(&(*v).kin)
+}
