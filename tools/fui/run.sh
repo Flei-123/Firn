@@ -952,6 +952,8 @@ echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, aud
 FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 "$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
 cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
+echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
+FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
@@ -1118,6 +1120,10 @@ if [ -x /usr/lib/wine/wine64 ]; then
     FIRNC="$FIRNC" sh tools/fui/uiatextcom.sh >"$W/uiatextcom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiatextcom.log"
     if [ "$rc" != 0 ]; then echo "uiatextcom FAILED ($rc)"; exit 1; fi
+    rc=0
+    FIRNC="$FIRNC" bash tools/fui/appwin_wine.sh >"$W/appwin_wine.log" 2>&1 || rc=$?
+    tail -n 3 "$W/appwin_wine.log"
+    if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "appwin_wine FAILED ($rc)"; exit 1; fi
 else
     echo "  uiacom: wine missing, skipped"
 fi
@@ -1913,6 +1919,12 @@ echo "== 18q4. PAINT-ONLY FRAME + x-CUT RASTER WINDOW (r455 / r456) =="
 # the fast path. painter.round_rect cuts its raster window to the clip in x between the corners: same octets inside the clip.
 build rotpaint
 "$W/rotpaint"
+build painter_canvas
+"$W/painter_canvas"
+build painter_textapi
+"$W/painter_textapi"
+build painter_backend
+"$W/painter_backend"
 build xcut
 "$W/xcut"
 # r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);
