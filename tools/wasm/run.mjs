@@ -16,6 +16,7 @@
 //     node tools/wasm/run.mjs prog.wasm < input > output; echo $?
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { servicesHost } from './services_host.mjs';
 
 const file = process.argv[2];
 if (!file) {
@@ -113,7 +114,7 @@ let code = 0;
 try {
     const { instance } = await WebAssembly.instantiate(fs.readFileSync(file), {
         firn,
-        env: new Proxy(faceHost(), {
+        env: new Proxy({ ...faceHost(), ...servicesHost(() => memory) }, {
             get(target, name) {
                 if (name in target) return target[name];
                 return () => {
