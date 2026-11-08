@@ -809,7 +809,7 @@ fn optimize_with_taken(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         clk.add2("rotate", t, n > 0);
     }
-    if cfg.runs("rotl") && crate::rotl::enabled() && crate::target::active() == crate::target::Target::X86_64 {
+    if cfg.runs("rotl") && crate::rotl::enabled() && matches!(crate::target::active(), crate::target::Target::X86_64 | crate::target::Target::Aarch64) {
         let t = std::time::Instant::now();
         let mut n = 0usize;
         for f in m.funcs.iter_mut() {

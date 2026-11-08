@@ -77,6 +77,13 @@ pub(crate) fn analyse(f: &Func, consts: &HashMap<Val, i128>) -> AddrFold {
             }
             let (base, off) = match &pa.op {
                 Op::PtrAdd { base, off } => (*base, *off),
+                Op::Bin(BinOp::Add, x, y) if pa.ty.bits() == 64 && !pa.ty.is_float() => {
+                    if consts.contains_key(y) || !consts.contains_key(x) {
+                        (*x, *y)
+                    } else {
+                        (*y, *x)
+                    }
+                }
                 _ => continue,
             };
             if defs.get(off as usize) == Some(&1) {

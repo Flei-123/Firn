@@ -200,6 +200,7 @@ pub(crate) struct Frame {
     /// above the outgoing argument area and below the value slots.
     saved_at: u64,
     pub(crate) fold: crate::a64addr::AddrFold,
+    pub(crate) shifts: crate::a64shift::ShiftFold,
 }
 
 /// Marker in `Frame::slot`: this value has NO slot, it lives in a register
@@ -361,7 +362,9 @@ fn layout(f: &Func) -> Frame {
     // (`size - slot`), and the arguments from the bottom. The gap in between
     // was padding until this round.
     let saved_bytes = align_up(8 * (ra.saved.len() + ra.fsaved.len()) as u64, 16);
-    let fold = crate::a64addr::analyse(f, &consts);
+    let mut fold = crate::a64addr::analyse(f, &consts);
+    let shifts = crate::a64shift::analyse(f, &consts);
+    fold.dead.extend(shifts.dead.iter().copied());
     Frame {
         slot,
         alloca_off,
@@ -371,6 +374,7 @@ fn layout(f: &Func) -> Frame {
         ra,
         saved_at: outgoing,
         fold,
+        shifts,
     }
 }
 
@@ -1559,6 +1563,15 @@ fn emit_switch(e: &mut Emitter, f: &Func, fr: &Frame, term: &Term) -> Result<(),
 // -------------------------------------------------------------- instructions
 
 /// Emits the comparison (flags only) and returns the condition code that holds when `a op b` is true.
+fn narrow_value(c: i64, ty: FTy) -> i64 {
+    let shift = 64 - ty.bits().max(8);
+    if ty.signed() {
+        (c << shift) >> shift
+    } else {
+        ((c as u64) << shift >> shift) as i64
+    }
+}
+
 fn emit_cmp_flags(e: &mut Emitter, fr: &Frame, op: CmpOp, oty: FTy, a: Val, b: Val) -> &'static str {
     if oty.is_float() {
         // `fcmp` sets N/Z/C/V so that the UNORDERED case (NaN) is
@@ -1603,6 +1616,7 @@ fn emit_cmp_flags(e: &mut Emitter, fr: &Frame, op: CmpOp, oty: FTy, a: Val, b: V
             cmp_imm(e, ra, bits, c)
         }
         Some(c) if oty.bits().max(8) >= bits => cmp_imm(e, ra, bits, c),
+        Some(c) => cmp_imm(e, ra, bits, narrow_value(c, oty)),
         _ => {
             let rb = src_ext(e, fr, b, oty, bits, B);
             e.line(&format!("cmp {}, {}", rw(ra, bits), rw(rb, bits)));
@@ -2606,6 +2620,21 @@ fn emit_bin(
         fcommit(e, fr, d, rd, single);
         return Ok(());
     }
+    if let Some(sh) = fr.shifts.fused.get(&d) {
+        let m = match op {
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::And => "and",
+            BinOp::Or => "orr",
+            _ => "eor",
+        };
+        let ro = src(e, fr, sh.other, A);
+        let rs = src(e, fr, sh.source, B);
+        let rd = dreg(fr, d, A);
+        e.line(&format!("{} {}, {}, {}, {} #{}", m, rw(rd, bits), rw(ro, bits), rw(rs, bits), sh.mnemonic, sh.amount));
+        commit(e, fr, d, rd);
+        return Ok(());
+    }
     match op {
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
             // For these the low order bits do not depend on the width, which
@@ -2703,7 +2732,24 @@ fn emit_bin(
             }
         }
         BinOp::Rotl => {
-            return Err("internal error: 'rotl' is only generated for x86-64".to_string());
+            let ra = src(e, fr, a, A);
+            let rd = dreg(fr, d, A);
+            match fr.ra.imm(b) {
+                Some(k) => {
+                    let k = (k as u64 % bits as u64) as u32;
+                    if k == 0 {
+                        e.line(&format!("mov {}, {}", rw(rd, bits), rw(ra, bits)));
+                    } else {
+                        e.line(&format!("ror {}, {}, #{}", rw(rd, bits), rw(ra, bits), bits - k));
+                    }
+                }
+                None => {
+                    let rb = src(e, fr, b, B);
+                    e.line(&format!("neg {}, {}", rw(B, bits), rw(rb, bits)));
+                    e.line(&format!("ror {}, {}, {}", rw(rd, bits), rw(ra, bits), rw(B, bits)));
+                }
+            }
+            commit(e, fr, d, rd);
         }
         BinOp::Rotr32 => {
             // r837: rotate the low 32 bits right; a write to a `w` register
