@@ -35,6 +35,7 @@ mod x86enc;
 mod asm_intern;
 mod asm_x86;
 mod a64addr;
+mod a64ext;
 mod a64shift;
 mod a64enc;
 mod asm_a64;

@@ -201,6 +201,7 @@ pub(crate) struct Frame {
     saved_at: u64,
     pub(crate) fold: crate::a64addr::AddrFold,
     pub(crate) shifts: crate::a64shift::ShiftFold,
+    zloaded: HashMap<Val, u32>,
 }
 
 /// Marker in `Frame::slot`: this value has NO slot, it lives in a register
@@ -363,7 +364,7 @@ fn layout(f: &Func) -> Frame {
     // was padding until this round.
     let saved_bytes = align_up(8 * (ra.saved.len() + ra.fsaved.len()) as u64, 16);
     let mut fold = crate::a64addr::analyse(f, &consts);
-    let shifts = crate::a64shift::analyse(f, &consts);
+    let shifts = crate::a64shift::analyse(f, &consts, &fold.dead);
     fold.dead.extend(shifts.dead.iter().copied());
     Frame {
         slot,
@@ -375,6 +376,7 @@ fn layout(f: &Func) -> Frame {
         saved_at: outgoing,
         fold,
         shifts,
+        zloaded: crate::a64ext::zero_extended_loads(f),
     }
 }
 
@@ -655,6 +657,11 @@ fn src_ext(
     scratch: &'static str,
 ) -> &'static str {
     if ty.bits().max(8) >= bits {
+        if let Some(r) = fr.ra.reg(v) {
+            return r;
+        }
+    }
+    if !ty.signed() && fr.zloaded.get(&v).map_or(false, |w| *w <= ty.bits().max(8)) {
         if let Some(r) = fr.ra.reg(v) {
             return r;
         }

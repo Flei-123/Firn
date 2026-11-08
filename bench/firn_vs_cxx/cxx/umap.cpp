@@ -19,6 +19,6 @@ int main() {
             sum += it->second;
         }
     }
-    printf("%llu %llu\n", (unsigned long long)hits, (unsigned long long)sum);
+    printf("%llu\n%llu\n", (unsigned long long)hits, (unsigned long long)sum);
     return 0;
 }

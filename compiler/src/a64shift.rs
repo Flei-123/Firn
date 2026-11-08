@@ -32,7 +32,7 @@ fn commutes(op: BinOp) -> bool {
     !matches!(op, BinOp::Sub)
 }
 
-pub(crate) fn analyse(f: &Func, consts: &HashMap<Val, i128>) -> ShiftFold {
+pub(crate) fn analyse(f: &Func, consts: &HashMap<Val, i128>, folded_away: &HashSet<Val>) -> ShiftFold {
     let mut out = ShiftFold::default();
     if std::env::var_os("FIRN_A64_NO_SHIFTFOLD").is_some() || !f.secret.is_empty() || f.constant_time {
         return out;
@@ -60,7 +60,7 @@ pub(crate) fn analyse(f: &Func, consts: &HashMap<Val, i128>) -> ShiftFold {
                 (Some(d), 32 | 64) if !user.ty.is_float() => (d, user.ty.bits()),
                 _ => continue,
             };
-            if defs.get(dst as usize) != Some(&1) {
+            if folded_away.contains(&dst) || defs.get(dst as usize) != Some(&1) {
                 continue;
             }
             let prev = &b.insts[k - 1];
