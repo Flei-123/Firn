@@ -1030,6 +1030,14 @@ build a11yhide
 build a11ylive
 "$W/a11ylive" | tail -n 3 | grep -q "A11YLIVE PASSED"
 
+# services: fui.services adapter (store, clipboard, open/save events, paths, queue, dialog answers) on the memory backend; no direct rt file calls outside the adapter
+build services
+"$W/services" | tail -n 1 | grep -q "SERVICES PASSED"
+if grep -rnE "rt\.(read_file|write_file)" lib/fui examples/fui_apps --include=*.fi | grep -vE "^lib/fui/(svcfile|safeout)\.fi:"; then
+    echo "direct rt file call outside fui.svcfile / fui.safeout"
+    exit 1
+fi
+
 # apptb: toolbar overflow (items fold behind "...", panel with copies, widening unfolds, a11y)
 build apptb
 "$W/apptb" | tail -n 3 | grep -q "APPTB PASSED"
