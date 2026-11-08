@@ -941,10 +941,17 @@ build mdscroll
 "$W/mdscroll"
 echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
 if command -v chromium >/dev/null 2>&1; then
-    FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form || exit 1
+    FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form editor || exit 1
 else
     echo "  chromium missing -- skipped"
 fi
+echo "== 18p6. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, audit, native golden =="
+"$FIRNC" --opt-level=dev -o "$W/editor_check" examples/fui_apps/editor/editor_check_main.fi || exit 1
+"$W/editor_check" --data examples/fui_apps/data || exit 1
+"$FIRNC" --opt-level=dev -o "$W/editor_app" examples/fui_apps/editor/main.fi || exit 1
+FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
+"$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
+cmp "$W/editor_light.png" tools/fui/golden/editor_light.png || { echo "editor golden differs"; exit 1; }
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
