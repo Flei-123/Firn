@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import services.svc
+import services.svcdir
+import services.svcmut
+
+export {
+    reset, resolve, list, make_dir, write_file, read_file, rename, remove, node_count, NONE, MAX_NODES,
+}
+
+const MAX_NODES: usize = 512
+const NONE: usize = 4294967295
+const DATA_LIMIT: usize = 4194304
+const FLAG_USED: u32 = 1
+const FLAG_DIR: u32 = 2
+const SLASH: u8 = 47
+const BASE_MTIME_NS: i64 = 1700000000000000000
+const TICK_NS: i64 = 60000000000
+
+static mut T_PARENT: [usize; 512] = [0; 512]
+static mut T_NAME_AT: [usize; 512] = [0; 512]
+static mut T_NAME_LEN: [usize; 512] = [0; 512]
+static mut T_DATA_AT: [usize; 512] = [0; 512]
+static mut T_DATA_LEN: [usize; 512] = [0; 512]
+static mut T_FLAGS: [u32; 512] = [0; 512]
+static mut T_MTIME: [i64; 512] = [0; 512]
+static mut T_NAMES: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut T_DATA: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut T_USED: usize = 0
+static mut T_CLOCK: i64 = 0
+
+fn reset() {
+    rt.buf_clear(&T_NAMES)
+    rt.buf_clear(&T_DATA)
+    var i: usize = 0
+    while i < MAX_NODES {
+        T_FLAGS[i] = 0 as u32
+        i = i + 1
+    }
+    T_FLAGS[0] = FLAG_USED | FLAG_DIR
+    T_PARENT[0] = 0
+    T_NAME_LEN[0] = 0
+    T_MTIME[0] = BASE_MTIME_NS
+    T_USED = 1
+    T_CLOCK = 0
+}
+
+fn ensure() {
+    if T_USED == 0 {
+        reset()
+    }
+}
+
+fn node_count() -> usize {
+    ensure()
+    var n: usize = 0
+    var i: usize = 0
+    while i < T_USED {
+        if (T_FLAGS[i] & FLAG_USED) != 0 as u32 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn name_of(i: usize) -> str {
+    return str { p: (rt.buf_ptr(&T_NAMES) + T_NAME_AT[i] as u64) as *mut u8, n: T_NAME_LEN[i] }
+}
+
+fn same(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+fn is_dir_node(i: usize) -> bool {
+    return (T_FLAGS[i] & FLAG_DIR) != 0 as u32
+}
+
+fn touch(i: usize) {
+    T_CLOCK = T_CLOCK + TICK_NS
+    T_MTIME[i] = BASE_MTIME_NS + T_CLOCK
+}
+
+fn child_of(parent: usize, name: str) -> usize {
+    var i: usize = 1
+    while i < T_USED {
+        if (T_FLAGS[i] & FLAG_USED) != 0 as u32 && T_PARENT[i] == parent && same(name_of(i), name) {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn has_children(parent: usize) -> bool {
+    var i: usize = 1
+    while i < T_USED {
+        if (T_FLAGS[i] & FLAG_USED) != 0 as u32 && T_PARENT[i] == parent {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn set_name(i: usize, name: str) {
+    T_NAME_AT[i] = rt.buf_len(&T_NAMES)
+    T_NAME_LEN[i] = name.n
+    rt.buf_push_bytes(&T_NAMES, name.p as u64, name.n)
+}
+
+fn free_slot() -> usize {
+    var i: usize = 1
+    while i < T_USED {
+        if (T_FLAGS[i] & FLAG_USED) == 0 as u32 {
+            return i
+        }
+        i = i + 1
+    }
+    if T_USED == MAX_NODES {
+        return NONE
+    }
+    T_USED = T_USED + 1
+    return T_USED - 1
+}
+
+fn alloc_node(parent: usize, name: str, flags: u32) -> usize {
+    let i: usize = free_slot()
+    if i == NONE {
+        return NONE
+    }
+    T_FLAGS[i] = FLAG_USED | flags
+    T_PARENT[i] = parent
+    T_DATA_AT[i] = 0
+    T_DATA_LEN[i] = 0
+    set_name(i, name)
+    touch(i)
+    return i
+}
+
+fn resolve(path: str) -> usize {
+    ensure()
+    var cur: usize = 0
+    var i: usize = 0
+    while i < path.n {
+        while i < path.n && rt.ld8(path.p as u64, i) == SLASH {
+            i = i + 1
+        }
+        if i >= path.n {
+            break
+        }
+        let start: usize = i
+        while i < path.n && rt.ld8(path.p as u64, i) != SLASH {
+            i = i + 1
+        }
+        if !is_dir_node(cur) {
+            return NONE
+        }
+        cur = child_of(cur, str { p: (path.p as u64 + start as u64) as *mut u8, n: i - start })
+        if cur == NONE {
+            return NONE
+        }
+    }
+    return cur
+}
+
+fn split_last(path: str, name: *mut str) -> usize {
+    var end: usize = path.n
+    while end > 0 && rt.ld8(path.p as u64, end - 1) == SLASH {
+        end = end - 1
+    }
+    var at: usize = end
+    while at > 0 && rt.ld8(path.p as u64, at - 1) != SLASH {
+        at = at - 1
+    }
+    *name = str { p: (path.p as u64 + at as u64) as *mut u8, n: end - at }
+    return resolve(str { p: path.p, n: at })
+}
+
+fn target_parent(path: str, name: *mut str) -> i32 {
+    ensure()
+    let parent: usize = split_last(path, name)
+    if (*name).n == 0 || !svcmut.valid_name(*name) {
+        return svc.INVALID
+    }
+    if parent == NONE {
+        return svc.NOT_FOUND
+    }
+    if !is_dir_node(parent) {
+        return svc.NOT_DIR
+    }
+    return svc.OK
+}
+
+fn list(path: str, out: *mut rt.Buf) -> i32 {
+    let at: usize = resolve(path)
+    if at == NONE {
+        return svc.NOT_FOUND
+    }
+    if !is_dir_node(at) {
+        return svc.NOT_DIR
+    }
+    var e: svcdir.DirEntry = svcdir.entry_new()
+    var i: usize = 1
+    while i < T_USED {
+        if (T_FLAGS[i] & FLAG_USED) != 0 as u32 && T_PARENT[i] == at {
+            e.name = name_of(i)
+            e.is_dir = is_dir_node(i)
+            e.size = T_DATA_LEN[i] as u64
+            e.mtime_ns = T_MTIME[i]
+            svcdir.push_entry(out, &e)
+        }
+        i = i + 1
+    }
+    return svc.OK
+}
+
+fn make_dir(path: str) -> i32 {
+    var name: str = ""
+    let st: i32 = target_parent(path, &name)
+    if st != svc.OK {
+        return st
+    }
+    let parent: usize = split_last(path, &name)
+    if child_of(parent, name) != NONE {
+        return svc.EXISTS
+    }
+    if alloc_node(parent, name, FLAG_DIR) == NONE {
+        return svc.FAILED
+    }
+    return svc.OK
+}
+
+fn write_file(path: str, p: u64, n: usize) -> i32 {
+    var name: str = ""
+    let st: i32 = target_parent(path, &name)
+    if st != svc.OK {
+        return st
+    }
+    if n > DATA_LIMIT || rt.buf_len(&T_DATA) + n > DATA_LIMIT {
+        return svc.FAILED
+    }
+    let parent: usize = split_last(path, &name)
+    var at: usize = child_of(parent, name)
+    if at != NONE && is_dir_node(at) {
+        return svc.INVALID
+    }
+    if at == NONE {
+        at = alloc_node(parent, name, 0 as u32)
+        if at == NONE {
+            return svc.FAILED
+        }
+    }
+    T_DATA_AT[at] = rt.buf_len(&T_DATA)
+    T_DATA_LEN[at] = n
+    rt.buf_push_bytes(&T_DATA, p, n)
+    touch(at)
+    return svc.OK
+}
+
+fn read_file(path: str, out: *mut rt.Buf) -> i32 {
+    let at: usize = resolve(path)
+    if at == NONE {
+        return svc.NOT_FOUND
+    }
+    if is_dir_node(at) {
+        return svc.INVALID
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&T_DATA) + T_DATA_AT[at] as u64, T_DATA_LEN[at])
+    return svc.OK
+}
+
+fn inside(node: usize, ancestor: usize) -> bool {
+    var cur: usize = node
+    while true {
+        if cur == ancestor {
+            return true
+        }
+        if cur == 0 {
+            return false
+        }
+        cur = T_PARENT[cur]
+    }
+    return false
+}
+
+fn rename(from: str, to: str) -> i32 {
+    let src: usize = resolve(from)
+    if src == NONE {
+        return svc.NOT_FOUND
+    }
+    if src == 0 {
+        return svc.INVALID
+    }
+    var name: str = ""
+    let st: i32 = target_parent(to, &name)
+    if st != svc.OK {
+        return st
+    }
+    let parent: usize = split_last(to, &name)
+    if child_of(parent, name) != NONE {
+        return svc.EXISTS
+    }
+    if inside(parent, src) {
+        return svc.INVALID
+    }
+    T_PARENT[src] = parent
+    set_name(src, name)
+    touch(src)
+    return svc.OK
+}
+
+fn remove(path: str) -> i32 {
+    let at: usize = resolve(path)
+    if at == NONE {
+        return svc.NOT_FOUND
+    }
+    if at == 0 {
+        return svc.INVALID
+    }
+    if is_dir_node(at) && has_children(at) {
+        return svc.NOT_EMPTY
+    }
+    T_FLAGS[at] = 0 as u32
+    return svc.OK
+}
