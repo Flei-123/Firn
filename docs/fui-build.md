@@ -81,3 +81,6 @@ fui targets
 - Pixel compare: `tools/wasm/screencmp.py` (the better of the light and dark native shot counts).
 - Gate: `bash tools/fui/fuibuild.sh` (stage 18p8 of `tools/fui/run.sh`).
 - The apps `editor`, `notes`, `files` in `examples/fui_apps/` carry the same two manifests: `fui build examples/fui_apps/editor --targets native,web --verify --out /tmp/x`.
+- The apps `fm` and `files` verify at `limit 0.5` and measure 0.00 %. Both go through `fui.appshot.finish`, which sets the launcher look (`kitcolor.kit_navy`) natively and registers it with `app.set_look` so the page applies the same look when the browser picks light or dark. Without it the page ended on the plain theme (blue selection) while the native shot was green.
+- `fm` needs a file system: `fsbackend.native_available()` (`CAP_DIR_LIST` and `CAP_DIR_MUTATE`) decides between the real tree and the in-memory sample tree (`fui.memtree`, seed `examples/fui_apps/data/fm_seed.txt`). A page has a picked tree only, so it runs on the sample tree.
+- Golden: `tools/fui/golden_fm/fm_light.png` (native `--sample` shot, checked in run.sh stage 18p7b).

@@ -959,6 +959,8 @@ echo "== 18p7b. FILE MANAGER (examples/fui_apps/fm, fui.fsbackend, fui.memtree, 
 "$W/fm_check" --sample --data examples/fui_apps/data || exit 1
 "$FIRNC" --opt-level=dev -o "$W/fm_app" examples/fui_apps/fm/main.fi || exit 1
 FUI_AUDIT=1 "$W/fm_app" --sample --data examples/fui_apps/data || exit 1
+"$W/fm_app" --theme light --size 1100x700 --sample --data examples/fui_apps/data --shot "$W/fm_light.png" || exit 1
+cmp "$W/fm_light.png" tools/fui/golden_fm/fm_light.png || { echo "fm golden differs"; exit 1; }
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
