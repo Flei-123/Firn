@@ -14,7 +14,8 @@ trap 'rm -rf "$W"' EXIT
 SRC="$ROOT/tools/services/conformance.fi"
 CAPS_ALL_NATIVE=191
 CAPS_HEADLESS=160
-CAPS_WEB=127
+CAPS_WEB=511
+CAPS_WINDOWS_HEADLESS=172
 fails=0
 
 make_fakes() {
@@ -85,9 +86,37 @@ run_wasm() {
     fi
 }
 
+run_windows() {
+    local level="$1" exe="$W/win-$level.exe"
+    if ! command -v wine > /dev/null || ! command -v xvfb-run > /dev/null; then
+        echo "SKIP windows $level: wine or xvfb-run missing"; return
+    fi
+    if ! "$FIRNC" --target=x86_64-windows --opt-level="$level" "$SRC" -o "$exe" > "$W/winbuild-$level.log" 2>&1; then
+        echo "FAIL windows $level: build"; tail -n 5 "$W/winbuild-$level.log"; fails=$((fails + 1)); return
+    fi
+    ( cd "$W" && WINEPREFIX="$W/wineprefix" WINEDEBUG=-all FIRN_SERVICES_HEADLESS=1 \
+        timeout 300 xvfb-run -a wine "$exe" > "$W/win-raw-$level.log" 2>&1 )
+    local rc=$?
+    WINEPREFIX="$W/wineprefix" wineserver -k > /dev/null 2>&1
+    grep -E '^(ok|FAIL|services)' "$W/win-raw-$level.log" > "$W/win-$level.log"
+    expect "windows $level headless" "$W/win-$level.log" $rc "$CAPS_WINDOWS_HEADLESS"
+}
+
+compile_android() {
+    local target="$1"
+    if "$FIRNC" --target="$target" --pic -c "$SRC" -o "$W/android-$target.o" > "$W/android-$target.log" 2>&1; then
+        echo "PASS android $target: compiles"
+    else
+        echo "FAIL android $target: build"; tail -n 5 "$W/android-$target.log"; fails=$((fails + 1))
+    fi
+}
+
 for level in $LEVELS; do
     run_native "$level"
     run_wasm "$level"
 done
+run_windows "${WINE_LEVEL:-dev}"
+compile_android x86_64-android
+compile_android aarch64-android
 echo "services conformance: $fails failing runs"
 [ "$fails" -eq 0 ]

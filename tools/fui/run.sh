@@ -1197,6 +1197,8 @@ build kitrtl
 "$W/kitrtl" | tail -n 3
 build qrview
 "$W/qrview" | tail -n 3
+build webview
+"$W/webview" | tail -n 3 | grep -q "WEBVIEW PASSED"
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="

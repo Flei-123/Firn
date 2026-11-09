@@ -30,6 +30,9 @@ export function servicesHost(memoryOf) {
         firn_web_dialog_file() {
             return 1;
         },
+        firn_web_dialog_dir() {
+            return 1;
+        },
         firn_web_dialog_message(kind, tp, tn, xp, xn, buttons) {
             return buttons === BTNS_YES_NO ? ANS_YES : ANS_OK;
         },
