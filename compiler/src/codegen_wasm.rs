@@ -269,6 +269,7 @@ struct Image {
     /// method table label -> the function symbols in it, in order
     tables: HashMap<String, Vec<String>>,
     base: [u32; 4],
+    max_align: [u64; 4],
 }
 
 impl Image {
@@ -309,6 +310,7 @@ impl Image {
                     if let Some(s) = sec {
                         let len = self.secs[s].len() as u64;
                         self.secs[s].resize(align_up(len, a) as usize, 0);
+                        self.max_align[s] = self.max_align[s].max(a);
                     }
                 }
                 ".quad" => {
@@ -383,6 +385,7 @@ impl Image {
     fn put(&mut self, bytes: &[u8], align: u64) -> u32 {
         let len = self.secs[3].len() as u64;
         self.secs[3].resize(align_up(len, align) as usize, 0);
+        self.max_align[3] = self.max_align[3].max(align);
         let off = self.secs[3].len() as u32;
         self.secs[3].extend_from_slice(bytes);
         off
@@ -806,7 +809,7 @@ fn emit_inner(m: &Module, names: bool) -> Result<Output, String> {
     // Lay the four sections out one behind the other.
     let mut at = DATA_BASE as u64;
     for s in 0..4 {
-        at = align_up(at, 16);
+        at = align_up(at, img.max_align[s].max(16));
         img.base[s] = at as u32;
         at += img.secs[s].len() as u64;
     }
@@ -3788,6 +3791,14 @@ impl<'a> Fx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_section_remembers_the_widest_alignment_asked_of_it() {
+        let mut img = Image::default();
+        img.parse(".section .bss,\"aw\",@nobits\n    .p2align 6\nG_LINE:\n    .zero 8\n").expect("parse");
+        assert_eq!(img.max_align[2], 64);
+        assert_eq!(img.max_align[1], 0);
+    }
 
     /// `.asciz` is `.ascii` plus a closing zero octet: the class names in the
     /// type table of the collector are written that way (gc.rs::ty_table_asm).

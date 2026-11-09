@@ -43,7 +43,7 @@ fn preds_of(f: &Func, x: usize) -> Vec<usize> {
     out
 }
 
-fn konst(f: &mut Func, at: usize, ty: FTy, c: i128) -> Val {
+fn make_const(f: &mut Func, at: usize, ty: FTy, c: i128) -> Val {
     let v = f.new_val_pub(ty);
     f.blocks[at].insts.insert(0, Inst::new(Some(v), ty, Op::Const(c)));
     v
@@ -63,7 +63,7 @@ fn free_at_start(f: &mut Func, b: usize, h: Val, free_fn: &str) {
 fn reuse_one(f: &mut Func, p: &Plan, a: &Alloc, h: Val, exits: &[(usize, usize)], free_fn: &str) {
     let entry = pos_of(f, f.entry());
     let ty = f.val_ty(h);
-    let zero = konst(f, entry, ty, 0);
+    let zero = make_const(f, entry, ty, 0);
     let mut hv = h;
     let mut at_path: Vec<Val> = vec![h];
     let mut scope: Vec<usize> = vec![p.path[0]];

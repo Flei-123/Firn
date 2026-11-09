@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.str
+import std.io
+import services.svc
+import services.svcfile
+import services.svcclip
+import services.svcdialog
+import services.svcstore
+
+static mut failures: i32 = 0
+static mut checks: i32 = 0
+
+const CLIP_TEXT: str = "services clip \u{2713}"
+
+fn check(name: str, ok: bool) {
+    checks = checks + 1
+    if ok {
+        io.println_str("ok   " + name)
+    } else {
+        failures = failures + 1
+        io.println_str("FAIL " + name)
+    }
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn expect_missing(name: str, s: i32) {
+    check(name + " answers no-backend without its capability", s == svc.NO_BACKEND)
+}
+
+fn async_host() -> bool {
+    return svc.has(svc.CAP_ASYNC_HOST)
+}
+
+fn check_status_names() {
+    check("status names", svc.status_name(svc.OK) == "ok" && svc.status_name(svc.CANCELED) == "canceled"
+        && svc.status_name(svc.NO_BACKEND) == "no-backend" && svc.status_name(svc.FAILED) == "failed"
+        && svc.status_name(svc.BUSY) == "busy" && svc.status_name(svc.NOT_FOUND) == "not-found"
+        && svc.status_name(svc.INVALID) == "invalid")
+}
+
+fn check_app_names() {
+    check("app name rules", svc.set_app("") == svc.INVALID && svc.set_app(".hidden") == svc.INVALID
+        && svc.set_app("a/b") == svc.INVALID && svc.set_app("firn-svc-conformance") == svc.OK
+        && svc.app_name() == "firn-svc-conformance")
+}
+
+fn check_caps() {
+    let web: bool = svc.backend_name() == "web"
+    check("backend name known", web || svc.backend_name() == "native")
+    check("async host exactly on web", async_host() == web)
+    check("storage everywhere", svc.has(svc.CAP_STORAGE))
+}
+
+fn stored(key: str, want: str) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    let s: i32 = svcstore.get(key, &out)
+    let ok: bool = s == svc.OK && rt.buf_str(&out) == want
+    rt.buf_free(&out)
+    return ok
+}
+
+fn check_storage() {
+    svcstore.remove("greeting")
+    var out: rt.Buf = rt.buf_new()
+    check("storage absent key", svcstore.get("greeting", &out) == svc.NOT_FOUND && rt.buf_len(&out) == 0)
+    check("storage set", svcstore.set("greeting", "h\u{e9}llo world") == svc.OK)
+    check("storage get", stored("greeting", "h\u{e9}llo world"))
+    check("storage overwrite", svcstore.set("greeting", "second") == svc.OK && stored("greeting", "second"))
+    check("storage has", svcstore.has("greeting"))
+    check("storage empty value removes", svcstore.set("greeting", "") == svc.OK && !svcstore.has("greeting"))
+    check("storage remove absent is ok", svcstore.remove("greeting") == svc.OK)
+    check("storage bad keys", svcstore.set("../x", "v") == svc.INVALID && svcstore.get("", &out) == svc.INVALID
+        && svcstore.remove(".k") == svc.INVALID)
+    var big: rt.Buf = rt.buf_new()
+    while rt.buf_len(&big) <= svcstore.VALUE_MAX {
+        rt.buf_push(&big, 120 as u8)
+    }
+    check("storage value limit", svcstore.set("big", rt.buf_str(&big)) == svc.INVALID)
+    rt.buf_free(&big)
+    rt.buf_free(&out)
+}
+
+fn next_reply(r: *mut svc.Reply) -> bool {
+    return svc.poll(r)
+}
+
+fn check_clipboard() {
+    if !svc.has(svc.CAP_CLIP_WRITE) {
+        expect_missing("clipboard copy", svcclip.copy_text(CLIP_TEXT))
+    } else {
+        check("clipboard copy", svcclip.copy_text(CLIP_TEXT) == svc.OK)
+    }
+    var id: u32 = 0 as u32
+    if !svc.has(svc.CAP_CLIP_READ) {
+        expect_missing("clipboard paste", svcclip.paste_text(&id))
+        return
+    }
+    check("clipboard paste request", svcclip.paste_text(&id) == svc.OK && id != 0 as u32)
+    if async_host() {
+        var other: u32 = 0 as u32
+        check("clipboard second paste busy", svcclip.paste_text(&other) == svc.BUSY)
+        check("clipboard host answer taken", svc.host_event(svc.HOST_CLIP, 1 as u32, 0 as u32, "text/plain;charset=utf-8",
+            CLIP_TEXT.p as u64, CLIP_TEXT.length()))
+    }
+    var r: svc.Reply = svc.reply_new()
+    check("clipboard reply", next_reply(&r) && r.id == id && r.op == svc.OP_CLIP_TEXT && r.status == svc.OK
+        && rt.buf_str(&r.data) == CLIP_TEXT)
+    svc.reply_free(&r)
+}
+
+fn host_file(index: u32, name: str, data: str) {
+    svc.host_event(svc.HOST_DIALOG, 1 as u32, index, name, data.p as u64, data.length())
+}
+
+fn check_file_items(id: u32) {
+    var r: svc.Reply = svc.reply_new()
+    check("file item a", next_reply(&r) && r.id == id && r.op == svc.OP_FILE_ITEM && r.status == svc.OK
+        && r.index == 0 as u32 && rt.buf_str(&r.name) == "a.txt" && rt.buf_str(&r.data) == "alpha")
+    check("file item b", next_reply(&r) && r.id == id && r.op == svc.OP_FILE_ITEM && r.index == 1 as u32
+        && rt.buf_str(&r.name) == "b.txt" && rt.buf_str(&r.data) == "beta")
+    check("file end", next_reply(&r) && r.id == id && r.op == svc.OP_FILE_END && r.status == svc.OK
+        && r.index == 2 as u32)
+    svc.reply_free(&r)
+}
+
+fn check_file_open() {
+    var id: u32 = 0 as u32
+    if !svc.has(svc.CAP_FILE_OPEN) {
+        expect_missing("file open", svcfile.open(".txt", true, &id))
+        return
+    }
+    check("file open request", svcfile.open(".txt,.md", true, &id) == svc.OK && id != 0 as u32)
+    if async_host() {
+        var other: u32 = 0 as u32
+        check("file second open busy", svcfile.open("", false, &other) == svc.BUSY)
+        check("file host ignores colour answer", !svc.host_event(svc.HOST_DIALOG, 1 as u32, 0 as u32, "color", 0, 0))
+        host_file(0 as u32, "a.txt", "alpha")
+        host_file(1 as u32, "b.txt", "beta")
+        svc.host_event(svc.HOST_DIALOG, 2 as u32, 0 as u32, "", 0, 0)
+    }
+    check_file_items(id)
+    check_file_cancel()
+}
+
+fn check_file_cancel() {
+    var id: u32 = 0 as u32
+    check("file open again", svcfile.open("", false, &id) == svc.OK)
+    if async_host() {
+        svc.host_event(svc.HOST_DIALOG, 0 as u32, 0 as u32, "", 0, 0)
+    }
+    var r: svc.Reply = svc.reply_new()
+    check("file canceled", next_reply(&r) && r.id == id && r.op == svc.OP_FILE_END && r.status == svc.CANCELED
+        && r.index == 0 as u32)
+    svc.reply_free(&r)
+}
+
+fn check_file_save() {
+    let body: str = "saved by services"
+    check("file save bad name", svcfile.save("", "text/plain", body.p as u64, body.length()) == svc.INVALID)
+    if !svc.has(svc.CAP_FILE_SAVE) {
+        expect_missing("file save", svcfile.save("out.txt", "text/plain", body.p as u64, body.length()))
+        return
+    }
+    check("file save", svcfile.save("out.txt", "text/plain", body.p as u64, body.length()) == svc.OK)
+}
+
+fn check_dialogs() {
+    var a: i32 = 0
+    var yes: bool = false
+    check("dialog bad kind", svcdialog.message(9, "t", "x", svcdialog.BTNS_OK, &a) == svc.INVALID)
+    if !svc.has(svc.CAP_DIALOG) {
+        expect_missing("dialog message", svcdialog.message(svcdialog.KIND_INFO, "t", "x", svcdialog.BTNS_OK, &a))
+        expect_missing("dialog confirm", svcdialog.confirm("t", "x", &yes))
+        return
+    }
+    check("dialog message", svcdialog.message(svcdialog.KIND_INFO, "Services", "hello", svcdialog.BTNS_OK, &a) == svc.OK
+        && a == svcdialog.ANS_OK)
+    check("dialog confirm", svcdialog.confirm("Services", "sure?", &yes) == svc.OK && yes)
+}
+
+fn main() -> i32 {
+    check_status_names()
+    check_app_names()
+    check_caps()
+    check_storage()
+    check_clipboard()
+    check_file_open()
+    check_file_save()
+    check_dialogs()
+    check("queue drained", svc.pending() == 0 && svc.open_requests() == 0)
+    var line: rt.Buf = rt.buf_new()
+    push(&line, "services " + svc.backend_name() + " caps ")
+    rt.buf_push_dec_u64(&line, svc.caps() as u64)
+    push(&line, ": ")
+    rt.buf_push_dec_u64(&line, checks as u64)
+    push(&line, " checks, ")
+    rt.buf_push_dec_u64(&line, failures as u64)
+    push(&line, " failures")
+    io.println_str(rt.buf_str(&line))
+    rt.buf_free(&line)
+    if failures > 0 {
+        return 1
+    }
+    return 0
+}

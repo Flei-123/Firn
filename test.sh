@@ -2336,9 +2336,10 @@ else
     grep -E '^DEVIATION' "$WORK/diff148.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 149. memory-safety UB probes recorded per build level (tools/safety/run.sh against tools/safety/expected.txt, docs/SAFETY.md; tools/safety/pe.sh: Windows .rodata read-only) =="
+echo "== 149. memory-safety UB probes recorded per build level (tools/safety/run.sh against tools/safety/expected.txt, docs/SAFETY.md; tools/safety/pe.sh: Windows .rodata read-only; tools/safety/fuzz_frontend.py: mutated programs must never crash a front-end) =="
 FIRNC="$FIRNC" bash tools/safety/run.sh > "$WORK/safety149.log" 2>&1 && F149RC=0 || F149RC=$?
 FIRNC="$FIRNC" bash tools/safety/pe.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
+FIRNC="$FIRNC" python3 -I tools/safety/fuzz_frontend.py --runs 80 --seed 7 >> "$WORK/safety149.log" 2>&1 || F149RC=1
 if [ "$F149RC" -eq 0 ]; then
     ok
     tail -2 "$WORK/safety149.log" | sed 's/^/ /'

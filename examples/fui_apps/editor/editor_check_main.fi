@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.painter
+import fui.app
+import fui.appctl
+import fui.editor
+import fui.services
+import plat.fuiwirt
+import plat.sysfont
+import editor_app
+import editor_state
+import editor_files
+import editor_find
+
+static mut BAD: usize = 0
+static mut FONT: u64 = 0
+
+struct Surface {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+}
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn same(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+fn starts(a: str, b: str) -> bool {
+    return a.n >= b.n && rt.mem_eq(a.p as u64, b.p as u64, b.n)
+}
+
+fn surface_for(a: *mut app.App) -> *mut Surface {
+    let s: *mut Surface = rt.heap_alloc(65536) as *mut Surface
+    (*s).cv = canvas.canvas_new()
+    (*s).z = painter.painter_new()
+    let ok: bool = canvas.canvas_init(&(*s).cv, editor_app.WINDOW_W, editor_app.WINDOW_H)
+    let ok2: bool = painter.painter_init(&(*s).z, &(*s).cv, editor_app.WINDOW_W, editor_app.WINDOW_H)
+    painter.painter_set_font(&(*s).z, FONT)
+    app.app_attach(a as u64, &(*s).z)
+    return s
+}
+
+fn frame(a: *mut app.App) {
+    fuiwirt.host_bind(app.app_host(a))
+    app.app_paint(a as u64, editor_app.WINDOW_W, editor_app.WINDOW_H)
+    fuiwirt.host_painted(app.app_host(a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host(a))
+    let t: bool = editor_app.tick(a as u64, 0)
+}
+
+fn body(a: *mut app.App) -> str {
+    return app.text(a, (*editor_state.st()).text)
+}
+
+fn type_text(a: *mut app.App, s: str) {
+    app.set_focus(a, (*editor_state.st()).text)
+    var i: usize = 0
+    while i < s.n {
+        let ch: u8 = *((s.p as u64 + i as u64) as *mut u8)
+        let used: bool = app.app_char(a as u64, ch as u32, 0 as u32)
+        i = i + 1
+    }
+    frame(a)
+}
+
+fn test_start(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    check(starts(body(a), "import std.rt"), "start: the sample document is loaded")
+    check(!(*s).dirty, "start: not modified")
+    check(starts(app.text(a, (*s).name), "editor_sample.fi  |  firn"), "start: name and language in the status bar")
+    check(same(app.text(a, (*s).pos), "Ln 1, Col 1"), "start: caret position shown")
+}
+
+fn test_edit(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    type_text(a, "x")
+    check((*s).dirty, "edit: typing marks the document modified")
+    check(same(app.text(a, (*s).dirty_mark), "modified"), "edit: status bar shows it")
+    check(same(app.text(a, (*s).pos), "Ln 1, Col 2"), "edit: caret position follows typing")
+}
+
+fn test_new(a: *mut app.App) {
+    let before: usize = body(a).n
+    editor_files.request_new(a)
+    frame(a)
+    check(appctl.dialog_open(a), "new: a modified document asks before it is dropped")
+    appctl.dialog_answer(a, appctl.ANS_CANCEL)
+    frame(a)
+    check(body(a).n == before, "new: cancel keeps the text")
+    editor_files.request_new(a)
+    frame(a)
+    appctl.dialog_answer(a, appctl.ANS_OK)
+    frame(a)
+    check(body(a).n == 0 && !(*editor_state.st()).dirty, "new: confirm clears the text")
+    check(same(app.text(a, (*editor_state.st()).pos), "Ln 1, Col 1"), "new: position reset")
+}
+
+fn test_files(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    check(services.write_path("notes.md", "# Title\nline two\n".p as u64, 17), "files: memory file written")
+    services.script_pick("notes.md")
+    editor_files.request_open(a)
+    frame(a)
+    check(same(body(a), "# Title\nline two\n"), "open: file content loaded through the services event")
+    check(!(*s).dirty && starts(app.text(a, (*s).name), "notes.md  |  markdown"), "open: name, language, not modified")
+    type_text(a, "!")
+    services.script_pick("copy.md")
+    editor_files.request_save(a)
+    frame(a)
+    var out: rt.Buf = rt.buf_new()
+    let read: bool = services.read_path("copy.md", &out)
+    check(read && rt.buf_len(&out) == 18 && !(*s).dirty, "save: text written through the services event, modified flag cleared")
+    rt.buf_free(&out)
+    check(starts(app.text(a, (*s).name), "copy.md"), "save: the document takes the new name")
+}
+
+fn test_direct_save(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    check(services.write_path("/docs/direct.md", "abc".p as u64, 3), "direct: memory file written")
+    services.script_pick("/docs/direct.md")
+    editor_files.request_open(a)
+    frame(a)
+    check((*s).has_path && same(body(a), "abc"), "direct: a picked file with a path is remembered")
+    type_text(a, "d")
+    editor_files.request_save(a)
+    frame(a)
+    var out: rt.Buf = rt.buf_new()
+    let read: bool = services.read_path("/docs/direct.md", &out)
+    check(read && rt.buf_len(&out) == 4 && !(*s).dirty, "direct: save writes the same path without a dialog")
+    rt.buf_free(&out)
+    check(!appctl.dialog_open(a), "direct: no dialog was shown")
+}
+
+fn test_close_guard(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    editor_files.set_dirty(false)
+    check(editor_files.close_guard(a), "close: an unmodified document closes at once")
+    type_text(a, "y")
+    check(!editor_files.close_guard(a), "close: a modified document keeps the window open")
+    frame(a)
+    check(appctl.dialog_open(a), "close: it asks first")
+    appctl.dialog_answer(a, appctl.ANS_CANCEL)
+    frame(a)
+    check(!app.app_done(a as u64), "close: cancel keeps the editor running")
+    check(!editor_files.close_guard(a), "close: asks again")
+    frame(a)
+    appctl.dialog_answer(a, appctl.ANS_OK)
+    frame(a)
+    check(app.app_done(a as u64), "close: confirm quits")
+}
+
+fn test_find(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    app.set_text(a, (*s).text, "one two one two one")
+    app.set_text(a, (*s).find_entry, "two")
+    check(editor_find.find_next(a), "find: next finds")
+    var caret: usize = 0
+    var anchor: usize = 0
+    let ok: bool = app.text_caret(a, (*s).text, &caret, &anchor)
+    check(anchor == 4 && caret == 7, "find: the match is selected")
+    check(editor_find.find_next(a), "find: next again")
+    let ok2: bool = app.text_caret(a, (*s).text, &caret, &anchor)
+    check(anchor == 12 && caret == 15, "find: second match")
+    check(editor_find.find_next(a), "find: wraps around")
+    let ok3: bool = app.text_caret(a, (*s).text, &caret, &anchor)
+    check(anchor == 4, "find: back at the first match")
+    check(editor_find.find_prev(a), "find: previous wraps to the last")
+    let ok4: bool = app.text_caret(a, (*s).text, &caret, &anchor)
+    check(anchor == 12, "find: previous goes to the last match")
+    app.set_text(a, (*s).replace_entry, "2")
+    editor_find.replace_all(a)
+    check(same(body(a), "one 2 one 2 one"), "replace: all occurrences replaced")
+    check((*s).dirty, "replace: modified")
+    app.set_text(a, (*s).find_entry, "one")
+    app.set_text_caret(a, (*s).text, 0, 0)
+    editor_find.find_next(a)
+    app.set_text(a, (*s).replace_entry, "1")
+    editor_find.replace_one(a)
+    check(starts(body(a), "1 2 one"), "replace: one occurrence replaced and the next one selected")
+}
+
+fn test_goto(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    app.set_text(a, (*s).text, "a\nbb\nccc\ndddd\n")
+    editor_find.go_to_line(a, 3)
+    frame(a)
+    var caret: usize = 0
+    var anchor: usize = 0
+    let ok: bool = app.text_caret(a, (*s).text, &caret, &anchor)
+    check(caret == 5, "goto: caret at the start of line 3")
+    check(same(app.text(a, (*s).pos), "Ln 3, Col 1"), "goto: position shown")
+}
+
+fn main(start: u64) -> i32 {
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("editor: no font (DejaVu Sans)\n")
+        return 9
+    }
+    FONT = fs as u64
+    services.use_memory(true)
+    let a: *mut app.App = editor_app.build(start)
+    let s: *mut Surface = surface_for(a)
+    frame(a)
+    frame(a)
+    test_start(a)
+    test_edit(a)
+    test_new(a)
+    test_files(a)
+    test_direct_save(a)
+    test_find(a)
+    test_goto(a)
+    test_close_guard(a)
+    if BAD == 0 {
+        say("editor: all checks passed\n")
+        return 0
+    }
+    say("editor: checks FAILED\n")
+    return 1
+}

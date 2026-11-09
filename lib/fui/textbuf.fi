@@ -49,6 +49,8 @@
 // except the two with a measuring callback is `#[no_gc]` -- so the file
 // may also be used from a thread without a collector.
 
+import fui.undolog
+
 export {
     TextBuf,
     tb_new, tb_init,
@@ -67,6 +69,8 @@ export {
     tb_u16_of, tb_byte_from_u16, tb_u16_len,
     tb_cp_at, tb_cp_encode,
     tb_drag, tb_set_drag, tb_secret, tb_set_secret, tb_ime_next, tb_set_ime_next,
+    tb_journal, tb_set_journal,
+    tb_rev, tb_dirty_pre, tb_dirty_suf, tb_clear_dirty,
 }
 
 struct TextBuf {
@@ -81,13 +85,19 @@ struct TextBuf {
     ime_next: u32, // 1 = the on-screen keyboard's action key says "Next" (a form's first fields) instead of "Done"
     drag: u32, // 0 none, 1 caret dragged, 2 start handle, 3 end handle
     scroll: f64, // horizontal offset in pixels (for long texts)
+    jr: u64,
+    rev: u64,
+    dirty_on: u32,
+    dirty_pre: usize,
+    dirty_suf: usize,
 }
 
 #[no_gc]
 fn tb_new() -> TextBuf {
     return TextBuf {
         p: 0, n: 0, cap: 0, caret: 0, anchor: 0, comp_a: 0, comp_b: 0,
-        secret: 0, ime_next: 0, drag: 0, scroll: 0.0,
+        secret: 0, ime_next: 0, drag: 0, scroll: 0.0, jr: 0,
+        rev: 0, dirty_on: 0, dirty_pre: 0, dirty_suf: 0,
     }
 }
 
@@ -100,6 +110,50 @@ fn tb_init(t: *mut TextBuf, p: u64, cap: usize) {
     (*t).anchor = 0
     (*t).comp_a = 0
     (*t).comp_b = 0
+}
+
+#[no_gc]
+fn tb_journal(t: *mut TextBuf) -> u64 { return (*t).jr }
+
+#[no_gc]
+fn tb_set_journal(t: *mut TextBuf, u: u64) { (*t).jr = u }
+
+#[no_gc]
+fn tb_rev(t: *mut TextBuf) -> u64 { return (*t).rev }
+
+#[no_gc]
+fn tb_dirty_pre(t: *mut TextBuf) -> usize { return (*t).dirty_pre }
+
+#[no_gc]
+fn tb_dirty_suf(t: *mut TextBuf) -> usize { return (*t).dirty_suf }
+
+#[no_gc]
+fn tb_clear_dirty(t: *mut TextBuf) { (*t).dirty_on = 0 }
+
+#[no_gc]
+fn mark_dirty(t: *mut TextBuf, pre: usize, suf: usize) {
+    (*t).rev = (*t).rev + 1
+    if (*t).dirty_on == 0 {
+        (*t).dirty_on = 1
+        (*t).dirty_pre = pre
+        (*t).dirty_suf = suf
+        return
+    }
+    if pre < (*t).dirty_pre {
+        (*t).dirty_pre = pre
+    }
+    if suf < (*t).dirty_suf {
+        (*t).dirty_suf = suf
+    }
+}
+
+#[no_gc]
+fn journal_record(t: *mut TextBuf, a: usize, b: usize, p: u64, n: usize) {
+    if (*t).jr == 0 {
+        return
+    }
+    undolog.ul_record((*t).jr as *mut undolog.UndoLog, a, (*t).p + a as u64,
+        b - a, p, n, (*t).caret)
 }
 
 // -------------------------------------------------------------- reading
@@ -273,6 +327,7 @@ fn tb_set_text(t: *mut TextBuf, p: u64, n0: usize) {
     if n > (*t).cap {
         n = (*t).cap
     }
+    journal_record(t, 0, (*t).n, p, n)
     var i: usize = 0
     while i < n {
         *(((*t).p + i as u64) as *mut u8) = *((p + i as u64) as *mut u8)
@@ -283,15 +338,18 @@ fn tb_set_text(t: *mut TextBuf, p: u64, n0: usize) {
     (*t).anchor = n
     (*t).comp_a = 0
     (*t).comp_b = 0
+    mark_dirty(t, 0, 0)
 }
 
 #[no_gc]
 fn tb_clear(t: *mut TextBuf) {
+    journal_record(t, 0, (*t).n, (*t).p, 0)
     (*t).n = 0
     (*t).caret = 0
     (*t).anchor = 0
     (*t).comp_a = 0
     (*t).comp_b = 0
+    mark_dirty(t, 0, 0)
 }
 
 // Somebody wrote DIRECTLY into the buffer (the input method does that)
@@ -300,6 +358,10 @@ fn tb_clear(t: *mut TextBuf) {
 // afterwards with `tb_set_range`.
 #[no_gc]
 fn tb_set_len(t: *mut TextBuf, n0: usize) {
+    if (*t).jr != 0 {
+        undolog.ul_reset((*t).jr as *mut undolog.UndoLog)
+    }
+    mark_dirty(t, 0, 0)
     var n: usize = n0
     if n > (*t).cap {
         n = (*t).cap
@@ -362,6 +424,7 @@ fn tb_replace(t: *mut TextBuf, a0: usize, b0: usize, p: u64,
     if alt - weg + n > (*t).cap {
         return false
     }
+    journal_record(t, a, b, p, n)
     // Move the rest behind `b`. Both directions are possible, so take
     // the safe one: backwards from the back, forwards from the front.
     if n > weg {
@@ -387,6 +450,7 @@ fn tb_replace(t: *mut TextBuf, a0: usize, b0: usize, p: u64,
         j = j + 1
     }
     (*t).n = alt - weg + n
+    mark_dirty(t, a, (*t).n - (a + n))
     (*t).caret = a + n
     (*t).anchor = a + n
     // A floating range that touches the area is over with this; what

@@ -93,11 +93,14 @@ import fui.glyphcache
 import str.linebreak
 import fui.textcurve
 import fui.gpu
+import fui.fontback
 
 export {
     Painter, raster_window, painter_new, painter_init, painter_free, painter_ok,
-    painter_canvas, painter_swap_canvas, painter_set_font, painter_font, painter_clear,
+    painter_canvas, painter_set_canvas, painter_raster, painter_swap_canvas, painter_set_font, painter_font, painter_clear,
     painter_set_font_slot, painter_font_slot, FONT_SLOTS,
+    painter_set_backend, painter_backend, painter_reset_backend,
+    painter_set_backend_ctx, painter_backend_ctx,
     painter_fill_raster, fill_raster_gradient, painter_set_band,
     surface, round_rect, round_ring, border_col, mit_alpha, clip_rows,
     round_rect_grad, round_rect_radial, mix_argb,
@@ -166,6 +169,7 @@ struct Painter {
     // WEIGHT FACES (r252): real faces for other weights (Inter 500/600/700 ...).
     wface: [u64; 4],
     wface_w: [usize; 4],
+    back: fontback.FontBackend,
     fb_col: [usize; 3], // 1 per fallback slot that is a colour bitmap face
     emoji_any: usize, // 1 when a fallback face is a colour bitmap font (CBDT)
 }
@@ -177,7 +181,7 @@ fn painter_new() -> Painter {
         scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
         bt: 0, bx: 0, bcap: 0, bn: 0, blev: 0 as u8, bvn: 0,
         gs: gsub.gsub_new(), gs_fm: 0, fslot: [0 as u64; 4], fb: [0 as u64; 3],
-        wface: [0 as u64; 4], wface_w: [0 as usize; 4], fb_col: [0 as usize; 3], emoji_any: 0,
+        wface: [0 as u64; 4], wface_w: [0 as usize; 4], back: fontback.fbk_default(), fb_col: [0 as usize; 3], emoji_any: 0,
     }
 }
 
@@ -257,10 +261,40 @@ fn painter_swap_canvas(z: *mut Painter, cv: *mut canvas.Canvas) -> *mut canvas.C
 }
 
 #[no_gc]
+fn painter_set_canvas(z: *mut Painter, cv: *mut canvas.Canvas) {
+    (*z).cv = cv as u64
+}
+
+#[no_gc]
+fn painter_raster(z: *mut Painter) -> *mut raster.Raster {
+    return &(*z).ra
+}
+
+#[no_gc]
 fn painter_set_font(z: *mut Painter, fm: u64) { (*z).fm = fm }
 
 #[no_gc]
 fn painter_font(z: *mut Painter) -> u64 { return (*z).fm }
+
+fn painter_set_backend(z: *mut Painter, b: fontback.FontBackend) {
+    (*z).back = fontback.fbk_custom(b)
+}
+
+fn painter_backend(z: *mut Painter) -> *mut fontback.FontBackend {
+    return &(*z).back
+}
+
+fn painter_reset_backend(z: *mut Painter) {
+    (*z).back = fontback.fbk_default()
+}
+
+fn painter_set_backend_ctx(z: *mut Painter, ctx: u64) {
+    fontback.fbk_set_ctx(&(*z).back, ctx)
+}
+
+fn painter_backend_ctx(z: *mut Painter) -> u64 {
+    return fontback.fbk_ctx(&(*z).back)
+}
 
 // THE FONT SLOTS. A style says `font_id` 1..3 ("the monospace face", "the
 // bold face"); the program says once which font set that is. The main font
@@ -301,7 +335,7 @@ fn painter_set_fallback(z: *mut Painter, i: usize, fm: u64) {
         while k < FB_SLOTS {
             let f: u64 = (*z).fb[k]
             (*z).fb_col[k] = 0
-            if f != 0 && metrics.fm_present(f) &&
+            if f != 0 && fontback.fbk_present(&(*z).back, f) &&
             cbdt.cbdt_ok(metrics.fontset_font(f)) {
                 any = 1
                 (*z).fb_col[k] = 1
@@ -355,7 +389,7 @@ fn face_sel(z: *mut Painter, r: *mut TextRun, out_w: *mut usize) -> u64 {
     var i: usize = 0
     while i < WFACE_SLOTS {
         let f: u64 = (*z).wface[i]
-        if f != 0 && metrics.fm_present(f) {
+        if f != 0 && fontback.fbk_present(&(*z).back, f) {
             let fw: usize = (*z).wface_w[i]
             var d: usize = 0
             if w > fw {
@@ -378,16 +412,16 @@ fn face_sel(z: *mut Painter, r: *mut TextRun, out_w: *mut usize) -> u64 {
 // True when the main font or a fallback face has a glyph for `cp` (always true without a font).
 #[no_gc]
 fn glyph_present(z: *mut Painter, cp: u32) -> bool {
-    if cp < 128 as u32 || !metrics.fm_present((*z).fm) {
+    if cp < 128 as u32 || !fontback.fbk_present(&(*z).back, (*z).fm) {
         return true
     }
-    if metrics.fm_has((*z).fm, cp) {
+    if fontback.fbk_has(&(*z).back, (*z).fm, cp) {
         return true
     }
     var j: usize = 0
     while j < FB_SLOTS {
         let g: u64 = (*z).fb[j]
-        if g != 0 && metrics.fm_present(g) && metrics.fm_has(g, cp) {
+        if g != 0 && fontback.fbk_present(&(*z).back, g) && fontback.fbk_has(&(*z).back, g, cp) {
             return true
         }
         j = j + 1
@@ -400,6 +434,12 @@ fn glyph_present(z: *mut Painter, cp: u32) -> bool {
 // When none has it, the face itself (its .notdef box).
 #[no_gc]
 fn fb_pick(z: *mut Painter, r: *mut TextRun, cp: u32) -> u64 {
+    if (*z).back.custom != 0 {
+        let alt: u64 = fontback.fbk_pick(&(*z).back, (*z).fm, cp)
+        if alt != (*z).fm {
+            return alt
+        }
+    }
     if (*z).fb[0] == 0 && (*z).wface[0] == 0 {
         return (*z).fm
     }
@@ -414,23 +454,23 @@ fn fb_pick(z: *mut Painter, r: *mut TextRun, cp: u32) -> u64 {
         var j: usize = 0
         while j < FB_SLOTS {
             let g: u64 = (*z).fb[j]
-            if g != 0 && (*z).fb_col[j] != 0 && metrics.fm_present(g) &&
-            metrics.fm_has(g, cp) {
+            if g != 0 && (*z).fb_col[j] != 0 && fontback.fbk_present(&(*z).back, g) &&
+            fontback.fbk_has(&(*z).back, g, cp) {
                 return g
             }
             j = j + 1
         }
     }
-    if metrics.fm_present(prim) && metrics.fm_has(prim, cp) {
+    if fontback.fbk_present(&(*z).back, prim) && fontback.fbk_has(&(*z).back, prim, cp) {
         return prim
     }
-    if prim != (*z).fm && metrics.fm_present((*z).fm) && metrics.fm_has((*z).fm, cp) {
+    if prim != (*z).fm && fontback.fbk_present(&(*z).back, (*z).fm) && fontback.fbk_has(&(*z).back, (*z).fm, cp) {
         return (*z).fm
     }
     var i: usize = 0
     while i < FB_SLOTS {
         let f: u64 = (*z).fb[i]
-        if f != 0 && metrics.fm_present(f) && metrics.fm_has(f, cp) {
+        if f != 0 && fontback.fbk_present(&(*z).back, f) && fontback.fbk_has(&(*z).back, f, cp) {
             return f
         }
         i = i + 1
@@ -1841,8 +1881,8 @@ fn run_line_height(z: *mut Painter, r: *mut TextRun) -> f64 {
     if (*r).line_height > 0.0 {
         return (*r).line_height
     }
-    return metrics.fm_ascent((*z).fm, (*r).size)
-    +metrics.fm_descent((*z).fm, (*r).size)
+    return fontback.fbk_ascent(&(*z).back, (*z).fm, (*r).size)
+    +fontback.fbk_descent(&(*z).back, (*z).fm, (*r).size)
 }
 
 // THE KERNING BETWEEN TWO CHARACTERS, or zero when it is switched off.
@@ -1860,7 +1900,7 @@ fn pair_core(z: *mut Painter, r: *mut TextRun, a: u32, b: u32) -> f64 {
     if fa != fb_pick(z, r, b) {
         return 0.0 // never kern across two faces
     }
-    return metrics.fm_kern(fa, (*r).size, a, b)
+    return fontback.fbk_pair_adjust(&(*z).back, fa, (*r).size, a, b)
 }
 
 // HOW FAR THE PEN MOVES AFTER ONE CHARACTER.
@@ -1879,7 +1919,7 @@ fn pair_core(z: *mut Painter, r: *mut TextRun, a: u32, b: u32) -> f64 {
 #[no_gc]
 fn advance_of(z: *mut Painter, r: *mut TextRun, cp: u32,
     nxt: u32) -> f64 {
-    var a: f64 = metrics.fm_advance(fb_pick(z, r, cp), (*r).size, cp)
+    var a: f64 = fontback.fbk_advance(&(*z).back, fb_pick(z, r, cp), (*r).size, cp)
     if cp == 32 as u32 {
         a = a + (*r).word_spacing
     }
@@ -1906,7 +1946,7 @@ fn next_cp(p: u64, n: usize, i: usize, adv: usize) -> u32 {
 #[no_gc]
 fn run_width(z: *mut Painter, r: *mut TextRun, p: u64,
     n: usize) -> f64 {
-    if !metrics.fm_present((*z).fm) || n == 0 {
+    if !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return 0.0
     }
     let k: usize = bidi_prepare(z, r, p, n)
@@ -1934,7 +1974,7 @@ fn run_width(z: *mut Painter, r: *mut TextRun, p: u64,
 #[no_gc]
 fn run_fits_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     room: f64) -> usize {
-    if !metrics.fm_present((*z).fm) {
+    if !fontback.fbk_present(&(*z).back, (*z).fm) {
         return n
     }
     let k: usize = bidi_prepare(z, r, p, n)
@@ -2017,7 +2057,7 @@ fn ellipsis_w(z: *mut Painter, r: *mut TextRun) -> f64 {
 fn run_fits_ellipsis(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     room: f64, gekuerzt: *mut bool) -> usize {
     *gekuerzt = false
-    if !metrics.fm_present((*z).fm) || n == 0 {
+    if !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return n
     }
     // If everything fits, there is nothing to do -- and that is the frequent case.
@@ -2038,7 +2078,7 @@ fn run_fits_ellipsis(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
 fn run_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
     base_y: f64, w: f64, col: u32, p: u64, n: usize,
     align: u32) -> f64 {
-    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+    if (*z).ok == 0 || !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return x
     }
     if w <= 0.0 {
@@ -2089,7 +2129,7 @@ fn run_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
 fn run_line_upto(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     room: f64, to: *mut usize) -> usize {
     *to = n
-    if !metrics.fm_present((*z).fm) || n == 0 {
+    if !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return n
     }
     let k: usize = bidi_prepare(z, r, p, n)
@@ -2256,7 +2296,7 @@ fn run_line_count(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
 fn run_draw_wrapped(z: *mut Painter, r: *mut TextRun, x: f64,
     base_y: f64, w: f64, lines_h: f64, col: u32, p: u64, n: usize,
     align: u32, max_lines: usize) -> usize {
-    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+    if (*z).ok == 0 || !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return 0
     }
     if w <= 0.0 || max_lines == 0 {
@@ -2534,7 +2574,7 @@ fn fill_raster_gradient(z: *mut Painter, wx: f64, wy: f64, top: u32,
 // centred text with tracking still sits in the middle.
 fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
     w: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
-    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+    if (*z).ok == 0 || !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return x
     }
     let k: usize = bidi_prepare(z, r, p, n)
@@ -2553,7 +2593,7 @@ fn run_draw(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
 // and is painted pixel for pixel as before the bidi round.
 fn run_draw_ltr(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
     w: f64, col: u32, p: u64, n: usize, align: u32) -> f64 {
-    if (*z).ok == 0 || !metrics.fm_present((*z).fm) || n == 0 {
+    if (*z).ok == 0 || !fontback.fbk_present(&(*z).back, (*z).fm) || n == 0 {
         return x
     }
     var nn: usize = n
@@ -2718,8 +2758,8 @@ fn paint_run_base(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
         textcurve.tc_apply(&(*z).ra, textcurve.tc_bucket(mit_alpha(col)))
     }
     if (*r).grad_on != 0 {
-        let asc: f64 = metrics.fm_ascent((*z).fm, (*r).size)
-        let dsc: f64 = metrics.fm_descent((*z).fm, (*r).size)
+        let asc: f64 = fontback.fbk_ascent(&(*z).back, (*z).fm, (*r).size)
+        let dsc: f64 = fontback.fbk_descent(&(*z).back, (*z).fm, (*r).size)
         fill_raster_gradient(z, wx, wy, col, (*r).grad_col,
             base_y - asc, base_y + dsc)
     } else {
@@ -3160,8 +3200,8 @@ fn paint_run_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, sx: f64,
         }
     }
     if (*r).grad_on != 0 {
-        let asc: f64 = metrics.fm_ascent((*z).fm, sz)
-        let dsc: f64 = metrics.fm_descent((*z).fm, sz)
+        let asc: f64 = fontback.fbk_ascent(&(*z).back, (*z).fm, sz)
+        let dsc: f64 = fontback.fbk_descent(&(*z).back, (*z).fm, sz)
         glyphs_gpu(g, z, r, vis, p, nn, sx, base_y, 0.0, 0.0, theme.opaque(col),
             true, theme.opaque((*r).grad_col), base_y - asc, base_y + dsc)
         return
@@ -3347,12 +3387,12 @@ fn paint_run_kept(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
 
 #[no_gc]
 fn font_ascent(z: *mut Painter, size: f64) -> f64 {
-    return metrics.fm_ascent((*z).fm, size)
+    return fontback.fbk_ascent(&(*z).back, (*z).fm, size)
 }
 
 #[no_gc]
 fn font_descent(z: *mut Painter, size: f64) -> f64 {
-    return metrics.fm_descent((*z).fm, size)
+    return fontback.fbk_descent(&(*z).back, (*z).fm, size)
 }
 
 // How wide does the text get? The number every layout rests on.
@@ -3390,8 +3430,8 @@ fn text_fits_upto(z: *mut Painter, p: u64, n: usize, size: f64,
 // at `fm_ascent`).
 #[no_gc]
 fn text_baseline_mid(z: *mut Painter, y: f64, h: f64, size: f64) -> f64 {
-    let a: f64 = metrics.fm_ascent((*z).fm, size)
-    let d: f64 = metrics.fm_descent((*z).fm, size)
+    let a: f64 = fontback.fbk_ascent(&(*z).back, (*z).fm, size)
+    let d: f64 = fontback.fbk_descent(&(*z).back, (*z).fm, size)
     let b: f64 = y + (h + a - d) / 2.0
     let t: f64 = ((b + 0.5) as i64) as f64
     return t
@@ -3612,7 +3652,7 @@ fn run_is_bidi(z: *mut Painter) -> bool { return (*z).bn > 0 }
 fn bidi_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> usize {
     (*z).bn = 0
     if (*z).bt == 0 || (*z).bx == 0 || n == 0
-    || !metrics.fm_present((*z).fm) {
+    || !fontback.fbk_present(&(*z).back, (*z).fm) {
         return 0
     }
     if !bidi_reserve(z, n) {

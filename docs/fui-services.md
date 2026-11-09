@@ -24,15 +24,33 @@ The event queue holds 8 answers; further answers are refused. Native and web run
 | `lib/fui/svcq.fi` | answer queue |
 | `lib/fui/svcmem.fi` | memory backend (tests) |
 | `lib/fui/svcsys.fi` | clipboard copy and message boxes through `std.clipboard` / `std.dialog` (both have web twins) |
-| `lib/fui/svcfile.fi`, `lib/@web/fui/svcfile.fi` | raw path read/write; the only place that calls `rt.read_file` / `safeout` (web twin: false) |
+| `lib/fui/svcpath.fi`, `lib/@web/fui/svcpath.fi` | raw path read/write; the only place that calls `rt.read_file` / `safeout` (web twin: false) |
 | `lib/fui/svcplat.fi`, `lib/@web/fui/svcplat.fi` | file dialogs, paste request, storage; native: `std.dialog`, files under `$FUI_STORE_DIR` or `~/.local/share/fui`; web: `plat.webdialog`, `plat.webdownload`, `plat.host` store |
 | `lib/@web/fui/svctap.fi` | web event tap: `apphost` forwards `WE_DIALOG` / `WE_CLIP` to the adapter; registered on first request, so apps that never ask import no new host function |
 
-Gate: `tools/fui/run.sh` fails on any `rt.read_file` / `rt.write_file` in `lib/fui` or `examples/fui_apps` outside `svcfile.fi` / `safeout.fi`. Test: `tools/fui/services_main.fi`.
+Gate: `tools/fui/run.sh` fails on any `rt.read_file` / `rt.write_file` in `lib/fui` or `examples/fui_apps` outside `svcpath.fi` / `safeout.fi`. Test: `tools/fui/services_main.fi`.
+
+## fui.docfile (lib/fui/docfile.fi)
+
+Open / Save / Save as with a dirty check on top of `fui.services`, for apps that edit one text per slot (notes: one slot per note).
+
+| Call | Meaning |
+|---|---|
+| `init(app)` | sets the services app name (`set_app`) |
+| `command_of(cp, mods)` | Ctrl+O / Ctrl+S / Ctrl+Shift+S from a char event (control characters 15 / 19 and ctrl+letter) |
+| `mark(slot, text)` / `dirty(slot, text)` | baseline hash per slot (64 slots); unmarked = clean |
+| `name(slot)` / `set_name` | file name of the slot, default for the next save |
+| `guard(slot, text)` | dirty: asks `services.confirm`; true = go on |
+| `request_open(slot, text, title, filters)` | guard, then the open dialog (web: browser file picker) |
+| `request_save(slot, suggest, text, save_as)` | save dialog, with the slot name or `suggest` (web: download) |
+| `take(ev, slot)` | after a request: `ACT_LOADED` (data in `ev.data`, name set), `ACT_SAVED` (baseline and name updated), `ACT_FAILED`, `ACT_NONE` |
+| `waiting()` | a request is in flight (use it as the wake wait of `fui.app`) |
+
+One request at a time. Notes polls `take` at the start of each paint (Ctrl+O replaces the open note, Ctrl+S / Ctrl+Shift+S save it, last file in store key `notes.last_file`); Files polls in `app.set_extra_wake` (Ctrl+O copies the chosen name to the clipboard, fills the search box, store key `files.last_open`). Test: `tools/fui/docfile_main.fi`.
 
 ## Rebinding to Firn lib/services
 
-Only `svcplat.fi` / `svcsys.fi` / `svcfile.fi` (and their web twins) call the platform. When Firn `lib/services` v1 lands on main, replace their bodies with its calls; `services.fi` and all apps stay unchanged. Status when written: `lib/services` does not exist yet.
+Only `svcplat.fi` / `svcsys.fi` (and the web `svcplat.fi`) call the platform, through Firn `services.svcfile/svcclip/svcdialog/svcstore`; `svcreply.fi` turns `services.svc` replies into the answer queue, `svcaccept.fi` turns dialog filters into an accept list. `services.fi` and all apps stay unchanged.
 
 ## Single Firn pin (M1, checked 08.11.2026)
 

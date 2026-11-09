@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.app
+import fui.appctl
+import fui.services
+import editor_state
+import editor_status
+
+export {
+    new_doc, load_text, request_new, request_open, request_save, request_save_as,
+    poll, set_dirty, answer_discard, close_guard, DEFAULT_NAME
+}
+
+const FILTERS: str = "Text files|*.txt;*.md;*.fi;*.json;*.toml;*.c;*.rs;*.js|"
+const DEFAULT_NAME: str = "untitled.txt"
+const RECENT_KEY: str = "editor.recent"
+const SLASH: u8 = 47
+const BACKSLASH: u8 = 92
+
+fn set_dirty(on: bool) {
+    (*editor_state.st()).dirty = on
+}
+
+fn remember_recent(name: str) {
+    if name.n == 0 {
+        return
+    }
+    services.store_set(RECENT_KEY, name.p as u64, name.n)
+}
+
+fn set_path(a: *mut app.App, name: str) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    rt.buf_clear(&(*s).path)
+    rt.buf_push_bytes(&(*s).path, name.p as u64, name.n)
+    (*s).has_path = false
+    editor_status.set_name(a, name)
+}
+
+fn is_real_path(name: str) -> bool {
+    var i: usize = 0
+    while i < name.n {
+        let ch: u8 = rt.ld8(name.p as u64, i)
+        if ch == SLASH || ch == BACKSLASH {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn load_text(a: *mut app.App, name: str, p: u64, n: usize) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    app.set_text(a, (*s).text, str { p: p as *mut u8, n: n })
+    app.set_text_caret(a, (*s).text, 0, 0)
+    app.set_focus(a, (*s).text)
+    set_path(a, name)
+    set_dirty(false)
+}
+
+fn new_doc(a: *mut app.App) {
+    load_text(a, "", 0, 0)
+}
+
+fn leave_ok(a: *mut app.App, ans: u32) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    let pend: u32 = (*s).pending
+    (*s).pending = editor_state.PEND_NONE
+    if ans != appctl.ANS_OK {
+        return
+    }
+    if pend == editor_state.PEND_NEW {
+        new_doc(a)
+    }
+    if pend == editor_state.PEND_OPEN {
+        ask_open(a)
+    }
+    if pend == editor_state.PEND_QUIT {
+        app.quit(a)
+    }
+}
+
+fn answer_discard(a: *mut app.App, pend: u32) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    if !(*s).dirty {
+        (*s).pending = pend
+        leave_ok(a, appctl.ANS_OK)
+        return
+    }
+    (*s).pending = pend
+    if !appctl.confirm(a, "Unsaved changes", "Discard the changes of this document?", leave_ok) {
+        (*s).pending = editor_state.PEND_NONE
+    }
+}
+
+fn request_new(a: *mut app.App) {
+    answer_discard(a, editor_state.PEND_NEW)
+}
+
+fn notice(a: *mut app.App, text: str) {
+    let ok: bool = appctl.message(a, "Editor", text, leave_none)
+}
+
+fn leave_none(a: *mut app.App, ans: u32) {}
+
+fn ask_open(a: *mut app.App) {
+    if !services.open_request("Open file", FILTERS) {
+        notice(a, "No file dialog is available here.")
+        return
+    }
+    (*editor_state.st()).waiting = true
+}
+
+fn request_open(a: *mut app.App) {
+    answer_discard(a, editor_state.PEND_OPEN)
+}
+
+fn request_save_as(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    var name: str = rt.buf_str(&(*s).path)
+    if name.n == 0 {
+        name = DEFAULT_NAME
+    }
+    let body: str = app.text(a, (*s).text)
+    if !services.save_request("Save file", name, body.p as u64, body.n) {
+        notice(a, "Saving is not available here.")
+        return
+    }
+    (*s).waiting = true
+}
+
+fn request_save(a: *mut app.App) {
+    let s: *mut editor_state.Ed = editor_state.st()
+    if !(*s).has_path {
+        request_save_as(a)
+        return
+    }
+    let body: str = app.text(a, (*s).text)
+    if !services.write_path(rt.buf_str(&(*s).path), body.p as u64, body.n) {
+        notice(a, "The file could not be saved.")
+        return
+    }
+    set_dirty(false)
+}
+
+fn close_guard(a: *mut app.App) -> bool {
+    if !(*editor_state.st()).dirty {
+        return true
+    }
+    answer_discard(a, editor_state.PEND_QUIT)
+    return false
+}
+
+fn on_opened(a: *mut app.App, ev: *mut services.SvcEvent) {
+    if (*ev).status == 0 as u32 {
+        return
+    }
+    let name: str = rt.buf_str(&(*ev).name)
+    if rt.buf_len(&(*ev).data) >= editor_state.TEXT_CAP {
+        notice(a, "The file is too large for this editor.")
+        return
+    }
+    load_text(a, name, rt.buf_ptr(&(*ev).data), rt.buf_len(&(*ev).data))
+    (*editor_state.st()).has_path = is_real_path(name)
+    remember_recent(name)
+}
+
+fn on_saved(a: *mut app.App, ev: *mut services.SvcEvent) {
+    if (*ev).status == 0 as u32 {
+        return
+    }
+    let name: str = rt.buf_str(&(*ev).name)
+    set_path(a, name)
+    set_dirty(false)
+    remember_recent(name)
+}
+
+fn poll(a: *mut app.App) -> bool {
+    let s: *mut editor_state.Ed = editor_state.st()
+    var ev: services.SvcEvent = services.event_new()
+    var got: bool = false
+    while services.next(&ev) {
+        got = true
+        if ev.kind == services.EV_OPENED {
+            on_opened(a, &ev)
+        }
+        if ev.kind == services.EV_SAVED {
+            on_saved(a, &ev)
+        }
+    }
+    services.event_free(&ev)
+    if got {
+        (*s).waiting = false
+    }
+    return got
+}

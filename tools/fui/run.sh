@@ -353,6 +353,8 @@ echo "== 18t. DAS MEHRZEILIGE TEXTFELD (lib/fui/textarea.fi) =="
 # section 18p (app_main, "notes").
 build textarea
 "$W/textarea"
+build textarea_edit
+"$W/textarea_edit"
 
 echo
 echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
@@ -939,10 +941,19 @@ build mdscroll
 "$W/mdscroll"
 echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
 if command -v chromium >/dev/null 2>&1; then
-    FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form || exit 1
+    FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form editor || exit 1
 else
     echo "  chromium missing -- skipped"
 fi
+echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, audit, native golden =="
+"$FIRNC" --opt-level=dev -o "$W/editor_check" examples/fui_apps/editor/editor_check_main.fi || exit 1
+"$W/editor_check" --data examples/fui_apps/data || exit 1
+"$FIRNC" --opt-level=dev -o "$W/editor_app" examples/fui_apps/editor/main.fi || exit 1
+FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
+"$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
+cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
+echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
+FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
@@ -1033,8 +1044,11 @@ build a11ylive
 # services: fui.services adapter (store, clipboard, open/save events, paths, queue, dialog answers) on the memory backend; no direct rt file calls outside the adapter
 build services
 "$W/services" | tail -n 1 | grep -q "SERVICES PASSED"
-if grep -rnE "rt\.(read_file|write_file)" lib/fui examples/fui_apps --include=*.fi | grep -vE "^lib/fui/(svcfile|safeout)\.fi:"; then
-    echo "direct rt file call outside fui.svcfile / fui.safeout"
+# docfile: open/save/save as slots with dirty confirm over fui.services (memory backend), shortcut decoding
+build docfile
+"$W/docfile" | tail -n 1 | grep -q "DOCFILE PASSED"
+if grep -rnE "rt\.(read_file|write_file)" lib/fui examples/fui_apps --include=*.fi | grep -vE "^lib/fui/(svcpath|safeout)\.fi:"; then
+    echo "direct rt file call outside fui.svcpath / fui.safeout"
     exit 1
 fi
 
@@ -1106,6 +1120,10 @@ if [ -x /usr/lib/wine/wine64 ]; then
     FIRNC="$FIRNC" sh tools/fui/uiatextcom.sh >"$W/uiatextcom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiatextcom.log"
     if [ "$rc" != 0 ]; then echo "uiatextcom FAILED ($rc)"; exit 1; fi
+    rc=0
+    FIRNC="$FIRNC" bash tools/fui/appwin_wine.sh >"$W/appwin_wine.log" 2>&1 || rc=$?
+    tail -n 3 "$W/appwin_wine.log"
+    if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "appwin_wine FAILED ($rc)"; exit 1; fi
 else
     echo "  uiacom: wine missing, skipped"
 fi
@@ -1901,6 +1919,12 @@ echo "== 18q4. PAINT-ONLY FRAME + x-CUT RASTER WINDOW (r455 / r456) =="
 # the fast path. painter.round_rect cuts its raster window to the clip in x between the corners: same octets inside the clip.
 build rotpaint
 "$W/rotpaint"
+build painter_canvas
+"$W/painter_canvas"
+build painter_textapi
+"$W/painter_textapi"
+build painter_backend
+"$W/painter_backend"
 build xcut
 "$W/xcut"
 # r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);

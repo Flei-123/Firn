@@ -1,0 +1,698 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.textbuf
+import fui.painter
+
+export {
+    LineIndex, ix_new, ix_init, ix_free, ix_set_measure, ix_bind_painter,
+    ix_set_visual, ix_invalidate, ix_set_width, ix_width, ix_relayout, ix_count,
+    ix_start, ix_end, ix_limit, ix_is_soft, ix_line_of, ix_x_of, ix_pos_at,
+    ix_line_rtl, ix_painter, ix_run, ix_width_of, ix_byte_at, ix_find_lf,
+    ix_has_visual, ix_set_font, ix_set_tint, ix_tinted, ix_tint_at,
+}
+
+const LINES_MAX: usize = 1048576
+const LINES_START: usize = 256
+const FIT_PROBE: usize = 64
+const TAIL_REWIND: usize = 2
+
+struct LineIndex {
+    limit: usize,
+    cap: usize,
+    n: usize,
+    start: *mut usize,
+    end: *mut usize,
+    tmp_cap: usize,
+    tmp_n: usize,
+    tmp_start: *mut usize,
+    tmp_end: *mut usize,
+    width: f64,
+    meas: fn(u64, u64, usize) -> f64,
+    mctx: u64,
+    z: u64,
+    font: u64,
+    run: painter.TextRun,
+    vis: u32,
+    vctx: u64,
+    vx: fn(u64, u64, usize, usize) -> f64,
+    vhit: fn(u64, u64, usize, f64) -> usize,
+    vrtl: fn(u64, u64, usize) -> bool,
+    valid: bool,
+    seen_rev: u64,
+    seen_len: usize,
+    seen_width: f64,
+    seen_run: painter.TextRun,
+    tint: fn(u64, u64, u64, usize, u64, usize, *mut usize) -> u32,
+    tctx: u64,
+    tinted: bool,
+}
+
+fn meas_none(ctx: u64, p: u64, n: usize) -> f64 { return 0.0 }
+fn vx_none(ctx: u64, p: u64, n: usize, i: usize) -> f64 { return 0.0 }
+fn vhit_none(ctx: u64, p: u64, n: usize, x: f64) -> usize { return 0 }
+fn vrtl_none(ctx: u64, p: u64, n: usize) -> bool { return false }
+fn tint_none(ctx: u64, rc: u64, p: u64, n: usize, rev: u64, pos: usize, end: *mut usize) -> u32 { return 0 as u32 }
+
+#[no_gc]
+fn ix_new() -> LineIndex {
+    return LineIndex {
+        limit: LINES_MAX, cap: 0, n: 0, start: 0 as *mut usize, end: 0 as *mut usize,
+        tmp_cap: 0, tmp_n: 0, tmp_start: 0 as *mut usize, tmp_end: 0 as *mut usize,
+        width: 0.0, meas: meas_none, mctx: 0, z: 0, font: 0, run: painter.run_new(14.0),
+        vis: 0, vctx: 0, vx: vx_none, vhit: vhit_none, vrtl: vrtl_none,
+        valid: false, seen_rev: 0, seen_len: 0, seen_width: 0.0,
+        seen_run: painter.run_new(14.0),
+        tint: tint_none, tctx: 0, tinted: false,
+    }
+}
+
+fn grow(arr: *mut *mut usize, old_cap: usize, new_cap: usize, used: usize) -> bool {
+    let fresh: u64 = rt.heap_alloc(new_cap * 8)
+    if fresh == 0 {
+        return false
+    }
+    if (*arr) as usize != 0 {
+        rt.mem_copy(fresh, (*arr) as u64, used * 8)
+        rt.heap_free((*arr) as u64, old_cap * 8)
+    }
+    *arr = fresh as *mut usize
+    return true
+}
+
+fn ensure_main(ix: *mut LineIndex, need: usize) -> bool {
+    if need <= (*ix).cap {
+        return true
+    }
+    var c: usize = (*ix).cap * 2
+    if c < need {
+        c = need
+    }
+    if c < LINES_START {
+        c = LINES_START
+    }
+    if !grow(&(*ix).start, (*ix).cap, c, (*ix).n) {
+        return false
+    }
+    if !grow(&(*ix).end, (*ix).cap, c, (*ix).n) {
+        return false
+    }
+    (*ix).cap = c
+    return true
+}
+
+fn ensure_tmp(ix: *mut LineIndex, need: usize) -> bool {
+    if need <= (*ix).tmp_cap {
+        return true
+    }
+    var c: usize = (*ix).tmp_cap * 2
+    if c < need {
+        c = need
+    }
+    if c < LINES_START {
+        c = LINES_START
+    }
+    if !grow(&(*ix).tmp_start, (*ix).tmp_cap, c, (*ix).tmp_n) {
+        return false
+    }
+    if !grow(&(*ix).tmp_end, (*ix).tmp_cap, c, (*ix).tmp_n) {
+        return false
+    }
+    (*ix).tmp_cap = c
+    return true
+}
+
+fn ix_init(ix: *mut LineIndex, limit: usize) -> bool {
+    if limit != 0 && limit < LINES_MAX {
+        (*ix).limit = limit
+    }
+    (*ix).n = 0
+    (*ix).valid = false
+    return ensure_main(ix, 1) && ensure_tmp(ix, 1)
+}
+
+fn free_pair(a: *mut *mut usize, b: *mut *mut usize, cap: usize) {
+    if (*a) as usize != 0 {
+        rt.heap_free((*a) as u64, cap * 8)
+        *a = 0 as *mut usize
+    }
+    if (*b) as usize != 0 {
+        rt.heap_free((*b) as u64, cap * 8)
+        *b = 0 as *mut usize
+    }
+}
+
+fn ix_free(ix: *mut LineIndex) {
+    free_pair(&(*ix).start, &(*ix).end, (*ix).cap)
+    free_pair(&(*ix).tmp_start, &(*ix).tmp_end, (*ix).tmp_cap)
+    (*ix).cap = 0
+    (*ix).tmp_cap = 0
+    (*ix).n = 0
+    (*ix).valid = false
+}
+
+#[no_gc]
+fn ix_invalidate(ix: *mut LineIndex) { (*ix).valid = false }
+
+fn ix_set_measure(ix: *mut LineIndex, m: fn(u64, u64, usize) -> f64, ctx: u64) {
+    (*ix).meas = m
+    (*ix).mctx = ctx
+    (*ix).valid = false
+}
+
+fn ix_set_visual(ix: *mut LineIndex, ctx: u64, x: fn(u64, u64, usize, usize) -> f64,
+    hit: fn(u64, u64, usize, f64) -> usize, rtl: fn(u64, u64, usize) -> bool) {
+    (*ix).vctx = ctx
+    (*ix).vx = x
+    (*ix).vhit = hit
+    (*ix).vrtl = rtl
+    (*ix).vis = 1
+}
+
+fn ix_has_visual(ix: *mut LineIndex) -> bool { return (*ix).vis != 0 }
+
+fn ix_set_tint(ix: *mut LineIndex, ctx: u64, f: fn(u64, u64, u64, usize, u64, usize, *mut usize) -> u32) {
+    (*ix).tint = f
+    (*ix).tctx = ctx
+    (*ix).tinted = true
+}
+
+fn ix_tinted(ix: *mut LineIndex) -> bool { return (*ix).tinted }
+
+fn ix_tint_at(ix: *mut LineIndex, rc: u64, p: u64, n: usize, rev: u64, pos: usize, end: *mut usize) -> u32 {
+    let f: fn(u64, u64, u64, usize, u64, usize, *mut usize) -> u32 = (*ix).tint
+    return f((*ix).tctx, rc, p, n, rev, pos, end)
+}
+
+fn font_in(ix: *mut LineIndex) -> u64 {
+    let z: *mut painter.Painter = (*ix).z as *mut painter.Painter
+    let old: u64 = painter.painter_font(z)
+    if (*ix).font != 0 {
+        painter.painter_set_font(z, (*ix).font)
+    }
+    return old
+}
+
+fn font_out(ix: *mut LineIndex, old: u64) {
+    if (*ix).font != 0 {
+        painter.painter_set_font((*ix).z as *mut painter.Painter, old)
+    }
+}
+
+fn meas_painter(ctx: u64, p: u64, n: usize) -> f64 {
+    let ix: *mut LineIndex = ctx as *mut LineIndex
+    if (*ix).z == 0 || n == 0 {
+        return 0.0
+    }
+    let old: u64 = font_in(ix)
+    let w: f64 = painter.run_width((*ix).z as *mut painter.Painter, &(*ix).run, p, n)
+    font_out(ix, old)
+    return w
+}
+
+fn vis_x(ctx: u64, p: u64, n: usize, i: usize) -> f64 {
+    let ix: *mut LineIndex = ctx as *mut LineIndex
+    let old: u64 = font_in(ix)
+    let x: f64 = painter.run_caret_x((*ix).z as *mut painter.Painter, &(*ix).run, p, n, i)
+    font_out(ix, old)
+    return x
+}
+
+fn vis_hit(ctx: u64, p: u64, n: usize, x: f64) -> usize {
+    let ix: *mut LineIndex = ctx as *mut LineIndex
+    let old: u64 = font_in(ix)
+    let hit: usize = painter.run_hit((*ix).z as *mut painter.Painter, &(*ix).run, p, n, x)
+    font_out(ix, old)
+    return hit
+}
+
+fn vis_rtl(ctx: u64, p: u64, n: usize) -> bool {
+    let ix: *mut LineIndex = ctx as *mut LineIndex
+    let old: u64 = font_in(ix)
+    let rtl: bool = painter.run_para_rtl((*ix).z as *mut painter.Painter, &(*ix).run, p, n)
+    font_out(ix, old)
+    return rtl
+}
+
+fn ix_set_font(ix: *mut LineIndex, fm: u64) {
+    (*ix).font = fm
+}
+
+fn ix_bind_painter(ix: *mut LineIndex, z: *mut painter.Painter, r: *mut painter.TextRun) {
+    (*ix).z = z as u64
+    (*ix).run = *r
+    (*ix).meas = meas_painter
+    (*ix).mctx = ix as u64
+    ix_set_visual(ix, ix as u64, vis_x, vis_hit, vis_rtl)
+}
+
+fn ix_painter(ix: *mut LineIndex) -> *mut painter.Painter { return (*ix).z as *mut painter.Painter }
+
+fn ix_run(ix: *mut LineIndex) -> *mut painter.TextRun { return &(*ix).run }
+
+fn ix_set_width(ix: *mut LineIndex, w: f64) { (*ix).width = w }
+
+fn ix_width(ix: *mut LineIndex) -> f64 { return (*ix).width }
+
+fn gs(ix: *mut LineIndex, i: usize) -> usize {
+    return *(((*ix).start as u64 + (i * 8) as u64) as *mut usize)
+}
+
+fn ge(ix: *mut LineIndex, i: usize) -> usize {
+    return *(((*ix).end as u64 + (i * 8) as u64) as *mut usize)
+}
+
+fn ps(ix: *mut LineIndex, i: usize, v: usize) {
+    *(((*ix).start as u64 + (i * 8) as u64) as *mut usize) = v
+}
+
+fn pe(ix: *mut LineIndex, i: usize, v: usize) {
+    *(((*ix).end as u64 + (i * 8) as u64) as *mut usize) = v
+}
+
+fn ix_byte_at(t: *mut textbuf.TextBuf, i: usize) -> u8 {
+    if i >= textbuf.tb_len(t) {
+        return 0 as u8
+    }
+    return *((textbuf.tb_ptr(t) + i as u64) as *mut u8)
+}
+
+fn ix_width_of(ix: *mut LineIndex, t: *mut textbuf.TextBuf, a: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0
+    }
+    let f: fn(u64, u64, usize) -> f64 = (*ix).meas
+    return f((*ix).mctx, textbuf.tb_ptr(t) + a as u64, n)
+}
+
+fn snap_down(t: *mut textbuf.TextBuf, a: usize, q0: usize) -> usize {
+    var q: usize = q0
+    while q > 0 && !textbuf.tb_is_boundary(t, a + q) {
+        q = q - 1
+    }
+    return q
+}
+
+fn fit_gallop(ix: *mut LineIndex, t: *mut textbuf.TextBuf, a: usize, x: f64,
+    lo: *mut usize, hi: *mut usize) {
+    var probe: usize = FIT_PROBE
+    while probe < *hi {
+        let q: usize = snap_down(t, a, probe)
+        if q <= *lo {
+            probe = probe * 2
+        } else if ix_width_of(ix, t, a, q) <= x {
+            *lo = q
+            probe = probe * 2
+        } else {
+            *hi = q
+            return
+        }
+    }
+}
+
+fn fit_bisect(ix: *mut LineIndex, t: *mut textbuf.TextBuf, a: usize, x: f64,
+    lo0: usize, hi0: usize) -> usize {
+    var lo: usize = lo0
+    var hi: usize = hi0
+    while hi - lo > 1 {
+        let mid: usize = (lo + hi) / 2
+        var q: usize = snap_down(t, a, mid)
+        if q <= lo {
+            q = mid
+            while q < hi && !textbuf.tb_is_boundary(t, a + q) {
+                q = q + 1
+            }
+            if q >= hi {
+                break
+            }
+        }
+        if ix_width_of(ix, t, a, q) <= x {
+            lo = q
+        } else {
+            hi = q
+        }
+    }
+    return lo
+}
+
+fn fit_x(ix: *mut LineIndex, t: *mut textbuf.TextBuf, a: usize, rest: usize,
+    x: f64) -> usize {
+    var lo: usize = 0
+    var hi: usize = rest
+    fit_gallop(ix, t, a, x, &lo, &hi)
+    if hi == rest && ix_width_of(ix, t, a, rest) <= x {
+        return rest
+    }
+    return fit_bisect(ix, t, a, x, lo, hi)
+}
+
+fn ix_find_lf(t: *mut textbuf.TextBuf, from: usize, len: usize) -> usize {
+    var i: usize = from
+    while i < len {
+        if ix_byte_at(t, i) == 10 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return len
+}
+
+fn cut_after_space(t: *mut textbuf.TextBuf, seg: usize, brk: usize) -> usize {
+    if ix_byte_at(t, brk) == 32 as u8 {
+        return brk + 1
+    }
+    var j: usize = brk
+    while j > seg + 1 {
+        if ix_byte_at(t, j - 1) == 32 as u8 {
+            return j
+        }
+        j = j - 1
+    }
+    return brk
+}
+
+fn wrap_end(ix: *mut LineIndex, t: *mut textbuf.TextBuf, seg: usize, hend: usize) -> usize {
+    if (*ix).width <= 0.0 {
+        return hend
+    }
+    let rest: usize = hend - seg
+    let k: usize = fit_x(ix, t, seg, rest, (*ix).width)
+    if k >= rest {
+        return hend
+    }
+    var end: usize = textbuf.tb_next(t, seg)
+    if k > 0 {
+        end = cut_after_space(t, seg, seg + k)
+    }
+    if end <= seg {
+        end = textbuf.tb_next(t, seg)
+    }
+    if end > hend {
+        end = hend
+    }
+    return end
+}
+
+fn push_tmp(ix: *mut LineIndex, a: usize, b: usize) -> bool {
+    if !ensure_tmp(ix, (*ix).tmp_n + 1) {
+        return false
+    }
+    *(((*ix).tmp_start as u64 + ((*ix).tmp_n * 8) as u64) as *mut usize) = a
+    *(((*ix).tmp_end as u64 + ((*ix).tmp_n * 8) as u64) as *mut usize) = b
+    (*ix).tmp_n = (*ix).tmp_n + 1
+    return true
+}
+
+fn old_start_index(ix: *mut LineIndex, old_pos: usize) -> usize {
+    var lo: usize = 0
+    var hi: usize = (*ix).n
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        if gs(ix, mid) < old_pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo < (*ix).n && gs(ix, lo) == old_pos {
+        return lo
+    }
+    return (*ix).n
+}
+
+struct Resume {
+    active: bool,
+    old_min: usize,
+    delta: i64,
+    first: usize,
+}
+
+fn converged(ix: *mut LineIndex, rs: *mut Resume, s: usize) -> usize {
+    if !(*rs).active {
+        return (*ix).n
+    }
+    let o: i64 = (s as i64) - (*rs).delta
+    if o < ((*rs).old_min as i64) {
+        return (*ix).n
+    }
+    let j: usize = old_start_index(ix, o as usize)
+    if j < (*rs).first {
+        return (*ix).n
+    }
+    return j
+}
+
+fn generate(ix: *mut LineIndex, t: *mut textbuf.TextBuf, from: usize,
+    rs: *mut Resume, base: usize) -> usize {
+    let len: usize = textbuf.tb_len(t)
+    (*ix).tmp_n = 0
+    var pos: usize = from
+    while true {
+        if base + (*ix).tmp_n + 1 >= (*ix).limit {
+            push_tmp(ix, pos, len)
+            return (*ix).n
+        }
+        let hend: usize = ix_find_lf(t, pos, len)
+        var seg: usize = pos
+        if hend == seg {
+            push_tmp(ix, seg, seg)
+        }
+        while seg < hend {
+            let end: usize = wrap_end(ix, t, seg, hend)
+            push_tmp(ix, seg, end)
+            seg = end
+            let j: usize = converged(ix, rs, seg)
+            if seg < hend && j < (*ix).n {
+                return j
+            }
+        }
+        if hend >= len {
+            return (*ix).n
+        }
+        pos = hend + 1
+        let jh: usize = converged(ix, rs, pos)
+        if jh < (*ix).n {
+            return jh
+        }
+    }
+    return (*ix).n
+}
+
+fn splice(ix: *mut LineIndex, j0: usize, jt: usize, delta: i64) -> bool {
+    let old_n: usize = (*ix).n
+    let tail: usize = old_n - jt
+    let new_n: usize = j0 + (*ix).tmp_n + tail
+    if !ensure_main(ix, new_n) {
+        return false
+    }
+    let dst: usize = j0 + (*ix).tmp_n
+    if dst > jt {
+        var i: usize = tail
+        while i > 0 {
+            i = i - 1
+            ps(ix, dst + i, ((gs(ix, jt + i) as i64) + delta) as usize)
+            pe(ix, dst + i, ((ge(ix, jt + i) as i64) + delta) as usize)
+        }
+    } else {
+        var i: usize = 0
+        while i < tail {
+            ps(ix, dst + i, ((gs(ix, jt + i) as i64) + delta) as usize)
+            pe(ix, dst + i, ((ge(ix, jt + i) as i64) + delta) as usize)
+            i = i + 1
+        }
+    }
+    var k: usize = 0
+    while k < (*ix).tmp_n {
+        ps(ix, j0 + k, *(((*ix).tmp_start as u64 + (k * 8) as u64) as *mut usize))
+        pe(ix, j0 + k, *(((*ix).tmp_end as u64 + (k * 8) as u64) as *mut usize))
+        k = k + 1
+    }
+    (*ix).n = new_n
+    return true
+}
+
+fn run_same(a: *mut painter.TextRun, b: *mut painter.TextRun) -> bool {
+    return (*a).size == (*b).size && (*a).tracking == (*b).tracking
+        && (*a).word_spacing == (*b).word_spacing && (*a).kerning == (*b).kerning
+        && (*a).weight == (*b).weight && (*a).slant == (*b).slant
+        && (*a).dir == (*b).dir
+}
+
+fn cache_hit(ix: *mut LineIndex, t: *mut textbuf.TextBuf) -> bool {
+    return (*ix).valid && (*ix).seen_rev == textbuf.tb_rev(t)
+        && (*ix).seen_len == textbuf.tb_len(t) && (*ix).seen_width == (*ix).width
+        && run_same(&(*ix).seen_run, &(*ix).run)
+}
+
+fn needs_full(ix: *mut LineIndex) -> bool {
+    return !(*ix).valid || (*ix).seen_width != (*ix).width
+        || !run_same(&(*ix).seen_run, &(*ix).run) || (*ix).n == 0
+}
+
+fn remember(ix: *mut LineIndex, t: *mut textbuf.TextBuf) {
+    (*ix).valid = true
+    (*ix).seen_rev = textbuf.tb_rev(t)
+    (*ix).seen_len = textbuf.tb_len(t)
+    (*ix).seen_width = (*ix).width
+    (*ix).seen_run = (*ix).run
+    textbuf.tb_clear_dirty(t)
+}
+
+fn ix_line_of_raw(ix: *mut LineIndex, pos: usize) -> usize {
+    if (*ix).n == 0 {
+        return 0
+    }
+    var lo: usize = 0
+    var hi: usize = (*ix).n - 1
+    while lo < hi {
+        let mid: usize = (lo + hi + 1) / 2
+        if gs(ix, mid) <= pos {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo
+}
+
+fn layout_full(ix: *mut LineIndex, t: *mut textbuf.TextBuf) {
+    var rs: Resume = Resume { active: false, old_min: 0, delta: 0, first: 0 }
+    generate(ix, t, 0, &rs, 0)
+    splice(ix, 0, (*ix).n, 0)
+}
+
+fn layout_incremental(ix: *mut LineIndex, t: *mut textbuf.TextBuf) {
+    let old_len: usize = (*ix).seen_len
+    let len: usize = textbuf.tb_len(t)
+    var pre: usize = textbuf.tb_dirty_pre(t)
+    if pre > old_len {
+        pre = old_len
+    }
+    var suf: usize = textbuf.tb_dirty_suf(t)
+    if suf > old_len {
+        suf = old_len
+    }
+    var j0: usize = ix_line_of_raw(ix, pre)
+    if j0 >= TAIL_REWIND {
+        j0 = j0 - TAIL_REWIND
+    } else {
+        j0 = 0
+    }
+    let delta: i64 = (len as i64) - (old_len as i64)
+    var rs: Resume = Resume { active: true, old_min: old_len - suf, delta: delta, first: j0 }
+    let jt: usize = generate(ix, t, gs(ix, j0), &rs, j0)
+    splice(ix, j0, jt, delta)
+}
+
+fn ix_relayout(ix: *mut LineIndex, t: *mut textbuf.TextBuf) {
+    if cache_hit(ix, t) {
+        return
+    }
+    if needs_full(ix) {
+        layout_full(ix, t)
+    } else {
+        layout_incremental(ix, t)
+    }
+    remember(ix, t)
+}
+
+fn ix_count(ix: *mut LineIndex) -> usize { return (*ix).n }
+fn ix_start(ix: *mut LineIndex, i: usize) -> usize { return gs(ix, i) }
+fn ix_end(ix: *mut LineIndex, i: usize) -> usize { return ge(ix, i) }
+
+fn ix_is_soft(ix: *mut LineIndex, i: usize) -> bool {
+    return i + 1 < (*ix).n && gs(ix, i + 1) == ge(ix, i)
+}
+
+fn ix_limit(ix: *mut LineIndex, t: *mut textbuf.TextBuf, i: usize) -> usize {
+    let e: usize = ge(ix, i)
+    if ix_is_soft(ix, i) && e > gs(ix, i) {
+        return textbuf.tb_prev(t, e)
+    }
+    return e
+}
+
+fn ix_line_of(ix: *mut LineIndex, pos: usize) -> usize {
+    return ix_line_of_raw(ix, pos)
+}
+
+fn ascii_only(t: *mut textbuf.TextBuf, a: usize, b: usize) -> bool {
+    var i: usize = a
+    while i < b {
+        if ix_byte_at(t, i) >= 128 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn use_visual(ix: *mut LineIndex, t: *mut textbuf.TextBuf, a: usize, b: usize) -> bool {
+    return (*ix).vis != 0 && !ascii_only(t, a, b)
+}
+
+fn ix_line_rtl(ix: *mut LineIndex, t: *mut textbuf.TextBuf, i: usize) -> bool {
+    let a: usize = gs(ix, i)
+    let b: usize = ge(ix, i)
+    if !use_visual(ix, t, a, b) {
+        return false
+    }
+    let f: fn(u64, u64, usize) -> bool = (*ix).vrtl
+    return f((*ix).vctx, textbuf.tb_ptr(t) + a as u64, b - a)
+}
+
+fn ix_x_of(ix: *mut LineIndex, t: *mut textbuf.TextBuf, i: usize, pos: usize) -> f64 {
+    let a: usize = gs(ix, i)
+    let b: usize = ge(ix, i)
+    if use_visual(ix, t, a, b) {
+        var p: usize = pos
+        if p > b {
+            p = b
+        }
+        if p < a {
+            p = a
+        }
+        let f: fn(u64, u64, usize, usize) -> f64 = (*ix).vx
+        return f((*ix).vctx, textbuf.tb_ptr(t) + a as u64, b - a, p - a)
+    }
+    if pos <= a {
+        return 0.0
+    }
+    return ix_width_of(ix, t, a, pos - a)
+}
+
+fn hit_visual(ix: *mut LineIndex, t: *mut textbuf.TextBuf, i: usize, x: f64) -> usize {
+    let a: usize = gs(ix, i)
+    let b: usize = ge(ix, i)
+    let f: fn(u64, u64, usize, f64) -> usize = (*ix).vhit
+    var pos: usize = a + f((*ix).vctx, textbuf.tb_ptr(t) + a as u64, b - a, x)
+    let lim: usize = ix_limit(ix, t, i)
+    if pos > lim {
+        pos = lim
+    }
+    return pos
+}
+
+fn ix_pos_at(ix: *mut LineIndex, t: *mut textbuf.TextBuf, i: usize, x: f64) -> usize {
+    let a: usize = gs(ix, i)
+    let b: usize = ix_limit(ix, t, i)
+    if use_visual(ix, t, a, ge(ix, i)) {
+        return hit_visual(ix, t, i, x)
+    }
+    if x <= 0.0 || b <= a {
+        return a
+    }
+    let rest: usize = b - a
+    let k: usize = fit_x(ix, t, a, rest, x)
+    if k >= rest {
+        return b
+    }
+    let kn: usize = textbuf.tb_next(t, a + k) - a
+    if kn <= rest {
+        let w0: f64 = ix_width_of(ix, t, a, k)
+        let w1: f64 = ix_width_of(ix, t, a, kn)
+        if x - w0 > w1 - x {
+            return a + kn
+        }
+    }
+    return a + k
+}

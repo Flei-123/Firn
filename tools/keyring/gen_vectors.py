@@ -166,7 +166,7 @@ def main():
     out["wrap_dev"] = wd
 
     wp = []
-    pcases = [("correct horse battery".encode(), 8192, 1, 1, 1), ("pässwörd-ünïcode 123".encode(), 8192, 2, 1, 2),
+    pcases = [("correct horse battery".encode(), 8192, 1, 1, 1), ("p\u00e4ssw\u00f6rd-\u00fcn\u00efcode 123".encode(), 8192, 2, 1, 2),
               (b"x" * 40 + b"0123456789", 16384, 1, 1, 3),
               ("default parameters ok".encode(), 65536, 3, 1, 4)]
     for i, (pw, m, t, p, ep) in enumerate(pcases):
@@ -202,7 +202,7 @@ def main():
     out["fp"] = [{"data": pat(n, n).hex(), "text": fp_text(pat(n, n))} for n in (0, 1, 32, 69, 100)]
 
     lc = []
-    for i, (pw, m, t) in enumerate([("local pass phrase".encode(), 8192, 1), ("ünï 2nd pass".encode(), 16384, 2)]):
+    for i, (pw, m, t) in enumerate([("local pass phrase".encode(), 8192, 1), ("\u00fcn\u00ef 2nd pass".encode(), 16384, 2)]):
         salt = b"orbit-local-salt" if i == 0 else b"orbit-local-sal2"
         plain = pat(64, 90 + i)
         lc.append({"id": f"local{i}", "acct": "0123456789abcdef", "pw": pw.hex(), "salt": salt.hex(), "m": m, "t": t,

@@ -1593,6 +1593,7 @@ constants declared before it, and '+ - * /'"
                 if ty.is_error() || rt.is_error() {
                     return;
                 }
+                crate::constcheck::check_operands(self, *op, value, &ty);
                 let got = self.binop_type(*op, &ty, &rt, *span);
                 if !assignable(&got, &ty) {
                     self.dg.error(
@@ -2151,7 +2152,7 @@ constants declared before it, and '+ - * /'"
     /// expression of a program would make the type checker run the program.
     /// What is recognised here is what a reader would call a constant index:
     /// a literal, a `const`, a cast or a negation of one.
-    fn literal_index(&self, e: &Expr) -> Option<i128> {
+    pub(crate) fn literal_index(&self, e: &Expr) -> Option<i128> {
         match &e.kind {
             ExprKind::Int(v) => Some(*v),
             ExprKind::Cast(inner, _) => self.literal_index(inner),
@@ -2790,7 +2791,10 @@ constants declared before it, and '+ - * /'"
         if lt.is_error() || rt.is_error() {
             return Type::Error;
         }
-        self.binop_type(op, &lt, &rt, e.span)
+        crate::constcheck::check_operands(self, op, r, &lt);
+        let result = self.binop_type(op, &lt, &rt, e.span);
+        crate::constcheck::check_overflow(self, e, &result);
+        result
     }
 
     /// **ROUND 70** - the type rules of `a op b` with both operand types

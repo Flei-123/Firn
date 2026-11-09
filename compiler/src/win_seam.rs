@@ -1399,6 +1399,33 @@ fn __win_utimens(path: u64, ts: u64, flags: i64) -> i64 {
     return 0
 }
 
+fn __win_covers_allocation(addr: i64, len: i64) -> bool {
+    var mbi: [i64; 8] = [0; 8]
+    if VirtualQuery(addr as u64, (&mbi[0]) as u64, 48) == 0 {
+        return false
+    }
+    let base: i64 = mbi[1]
+    if addr != base {
+        return false
+    }
+    var p: i64 = addr
+    var total: i64 = 0
+    while true {
+        if VirtualQuery(p as u64, (&mbi[0]) as u64, 48) == 0 {
+            return len >= total
+        }
+        if mbi[1] != base || mbi[3] <= 0 {
+            return len >= total
+        }
+        total = total + mbi[3]
+        if total > len {
+            return false
+        }
+        p = mbi[0] + mbi[3]
+    }
+    return len >= total
+}
+
 fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
     if nr == 28 {
         // madvise(addr, len, MADV_NORMAL) as the collector's "is this range still mapped" probe (r506: the stack of a host
@@ -1535,8 +1562,9 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         return p as i64
     }
     if nr == 11 {
-        // munmap: whole reservations go back, a piece of one is decommitted.
-        if VirtualFree(a1 as u64, 0, 32768) == 0 {
+        if __win_covers_allocation(a1, a2) {
+            VirtualFree(a1 as u64, 0, 32768)
+        } else {
             VirtualFree(a1 as u64, a2 as u64, 16384)
         }
         return 0

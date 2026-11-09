@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.str
+import std.fs
+import std.dialog
+import std.clipboard
+import plat.fileio
+import services.svc
+
+export {
+    os_name, os_caps, os_open_requests, os_host_event,
+    os_file_open, os_file_save, os_clip_copy, os_clip_paste, os_message, os_confirm,
+}
+
+const FILE_MAX: usize = 268435456
+
+fn os_name() -> str {
+    return "native"
+}
+
+fn dialogs_available() -> bool {
+    return dialog.backend_name() != "none"
+}
+
+fn clipboard_available() -> bool {
+    return clipboard.backend_name() != "none"
+}
+
+fn os_caps() -> u32 {
+    var c: u32 = svc.CAP_STORAGE | svc.CAP_DIR_LIST
+    if dialogs_available() {
+        c = c | svc.CAP_FILE_OPEN | svc.CAP_FILE_SAVE | svc.CAP_DIALOG
+    } else if fileio.fio_available() {
+        c = c | svc.CAP_FILE_SAVE
+    }
+    if clipboard_available() {
+        c = c | svc.CAP_CLIP_WRITE | svc.CAP_CLIP_READ
+    }
+    return c
+}
+
+fn os_open_requests() -> usize {
+    return 0
+}
+
+fn os_host_event(kind: u32, status: u32, id: u32, q: str, p: u64, n: usize) -> bool {
+    return false
+}
+
+fn push_ext_patterns(out: *mut rt.Buf, accept: str) {
+    var start: usize = 0
+    var i: usize = 0
+    let n: usize = accept.length()
+    while i <= n {
+        if i == n || rt.ld8(accept.p as u64, i) == 44 as u8 {
+            if i > start {
+                if rt.buf_len(out) > 6 {
+                    rt.buf_push(out, 59 as u8)
+                }
+                rt.buf_push(out, 42 as u8)
+                rt.buf_push_bytes(out, accept.p as u64 + start as u64, i - start)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+fn filters_of(accept: str, out: *mut rt.Buf) {
+    if accept.length() == 0 {
+        return
+    }
+    rt.buf_push_bytes(out, "Files|".p as u64, 6)
+    push_ext_patterns(out, accept)
+    let tail: str = "|All files|*"
+    rt.buf_push_bytes(out, tail.p as u64, tail.length())
+}
+
+fn base_name(path: str) -> str {
+    var i: usize = path.length()
+    while i > 0 {
+        if rt.ld8(path.p as u64, i - 1) == 47 as u8 {
+            return str { p: (path.p as u64 + i as u64) as *mut u8, n: path.length() - i }
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn reply_file(id: u32, index: u32, path: str) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(path, &data) catch 4294967295
+    var ok: bool = got != 4294967295 && rt.buf_len(&data) <= FILE_MAX
+    if ok {
+        svc.push_reply(id, svc.OP_FILE_ITEM, svc.OK, index, base_name(path), rt.buf_ptr(&data), rt.buf_len(&data))
+    } else {
+        svc.push_reply(id, svc.OP_FILE_ITEM, svc.FAILED, index, base_name(path), 0, 0)
+    }
+    rt.buf_free(&data)
+    return ok
+}
+
+fn reply_paths(id: u32, paths: str) -> u32 {
+    var count: u32 = 0 as u32
+    var start: usize = 0
+    var i: usize = 0
+    let n: usize = paths.length()
+    while i <= n {
+        if i == n || rt.ld8(paths.p as u64, i) == 10 as u8 {
+            if i > start {
+                let one: str = str { p: (paths.p as u64 + start as u64) as *mut u8, n: i - start }
+                reply_file(id, count, one)
+                count = count + 1 as u32
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn os_file_open(accept: str, multiple: bool, id: *mut u32) -> i32 {
+    if !dialogs_available() {
+        return svc.NO_BACKEND
+    }
+    var filters: rt.Buf = rt.buf_new()
+    filters_of(accept, &filters)
+    var out: rt.Buf = rt.buf_new()
+    var r: i32 = 0
+    if multiple {
+        r = dialog.open_files("Open", "", rt.buf_str(&filters), &out)
+    } else {
+        r = dialog.open_file("Open", "", rt.buf_str(&filters), &out)
+    }
+    rt.buf_free(&filters)
+    *id = svc.next_id()
+    var count: u32 = 0 as u32
+    if r == dialog.OK {
+        count = reply_paths(*id, rt.buf_str(&out))
+    }
+    rt.buf_free(&out)
+    svc.push_reply(*id, svc.OP_FILE_END, end_status(r), count, "", 0, 0)
+    return svc.OK
+}
+
+fn end_status(r: i32) -> i32 {
+    if r >= dialog.OK && r <= dialog.FAILED {
+        return r
+    }
+    return svc.FAILED
+}
+
+fn os_file_save(name: str, mime: str, p: u64, n: usize) -> i32 {
+    if !dialogs_available() {
+        if fileio.fio_available() {
+            return ok_or_failed(fileio.fio_share(p, n, name, mime))
+        }
+        return svc.NO_BACKEND
+    }
+    var path: rt.Buf = rt.buf_new()
+    let r: i32 = dialog.save_file("Save", "", name, "", &path)
+    var s: i32 = end_status(r)
+    if r == dialog.OK {
+        let done: bool = fs.write_atomic(rt.buf_str(&path), p, n) catch false
+        s = ok_or_failed(done)
+    }
+    rt.buf_free(&path)
+    return s
+}
+
+fn ok_or_failed(ok: bool) -> i32 {
+    if ok {
+        return svc.OK
+    }
+    return svc.FAILED
+}
+
+fn os_clip_copy(s: str) -> i32 {
+    if !clipboard_available() {
+        return svc.NO_BACKEND
+    }
+    return ok_or_failed(clipboard.copy_text(s))
+}
+
+fn os_clip_paste(id: *mut u32) -> i32 {
+    if !clipboard_available() {
+        return svc.NO_BACKEND
+    }
+    *id = svc.next_id()
+    var out: rt.Buf = rt.buf_new()
+    if clipboard.paste_text(&out) {
+        svc.push_reply(*id, svc.OP_CLIP_TEXT, svc.OK, 0 as u32, "text/plain", rt.buf_ptr(&out), rt.buf_len(&out))
+    } else {
+        svc.push_reply(*id, svc.OP_CLIP_TEXT, svc.NOT_FOUND, 0 as u32, "text/plain", 0, 0)
+    }
+    rt.buf_free(&out)
+    return svc.OK
+}
+
+fn os_message(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    if !dialogs_available() {
+        return svc.NO_BACKEND
+    }
+    return end_status(dialog.message(kind, title, text, buttons, answer))
+}
+
+fn os_confirm(title: str, text: str, yes: *mut bool) -> i32 {
+    if !dialogs_available() {
+        return svc.NO_BACKEND
+    }
+    return end_status(dialog.confirm(title, text, yes))
+}

@@ -285,7 +285,7 @@ fn open_second(a: *mut app.App) {
 
 | Call | What it does |
 |---|---|
-| `appwin.supported() -> bool` | true on X11; false on web, Android, Windows (not built yet) |
+| `appwin.supported() -> bool` | true on X11 and Windows (same loop code, checked under Wine); false on web and Android (one Activity, no extra top-level windows) |
 | `appwin.open(title, w, h) -> *mut App` | a new window, built like the first one; `0` when unsupported or 8 windows are open |
 | `appwin.close(b)` | close that window only (`app.quit(b)` does the same) |
 | `appwin.on_close(b, f)` | `f(b)` runs after the window is gone (close button, `close`, `quit`) |
