@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.services
+import fui.termpaint
+import term.term
+import term.terminput
+import term.termback
+import term.termgrid
+import term.termsel
+import term.termstate
+import term.termtext
+
+export {
+    TermWidget, tw_new, tw_free, tw_set_backend, tw_send, tw_pump, tw_fit, tw_scroll, tw_snap_bottom,
+    tw_set_focus, tw_exited, tw_title, tw_term, tw_has_selection, tw_screen_text,
+}
+
+const WIDGET_BYTES: usize = 2048
+const READ_CAP: usize = 4096
+const MAX_CHUNKS: usize = 32
+const MIN_COLS: usize = 2
+const MIN_ROWS: usize = 1
+const EXIT_NOTICE: str = "\r\n[process exited]\r\n"
+
+struct TermWidget {
+    term: *mut termstate.Term,
+    back: termback.Backend,
+    has_back: bool,
+    sel: termsel.Sel,
+    fr: termpaint.Frame,
+    node: usize,
+    focus: bool,
+    dragging: bool,
+    moved: bool,
+    clicks: u32,
+    click_us: i64,
+    click_line: usize,
+    click_col: usize,
+    button_down: bool,
+    measured: bool,
+    closed: bool,
+    notified: bool,
+    paste_wait: bool,
+    scrolled_seen: u64,
+    out: rt.Buf,
+    rd: u64,
+    ev: services.SvcEvent,
+    text_buf: rt.Buf,
+    text_gen: u64,
+}
+
+fn tw_new(cols: usize, rows: usize, scrollback: usize) -> *mut TermWidget {
+    let tw: *mut TermWidget = rt.heap_alloc(WIDGET_BYTES) as *mut TermWidget
+    (*tw).term = term.term_new(cols, rows, scrollback)
+    (*tw).back = termback.backend_none()
+    (*tw).has_back = false
+    (*tw).sel = termsel.sel_new()
+    (*tw).fr = termpaint.frame_new()
+    (*tw).node = 0
+    (*tw).focus = true
+    (*tw).dragging = false
+    (*tw).moved = false
+    (*tw).clicks = 0
+    (*tw).click_us = 0
+    (*tw).click_line = 0
+    (*tw).click_col = 0
+    (*tw).button_down = false
+    (*tw).measured = false
+    (*tw).closed = false
+    (*tw).notified = false
+    (*tw).paste_wait = false
+    (*tw).scrolled_seen = 0
+    (*tw).out = rt.buf_new()
+    (*tw).rd = rt.heap_alloc(READ_CAP)
+    (*tw).ev = services.event_new()
+    (*tw).text_buf = rt.buf_new()
+    (*tw).text_gen = 0
+    return tw
+}
+
+fn tw_free(tw: *mut TermWidget) {
+    if (*tw).has_back { termback.back_close(&(*tw).back) }
+    term.term_free((*tw).term)
+    rt.buf_free(&(*tw).out)
+    rt.buf_free(&(*tw).text_buf)
+    services.event_free(&(*tw).ev)
+    rt.heap_free((*tw).rd, READ_CAP)
+    rt.heap_free(tw as u64, WIDGET_BYTES)
+}
+
+fn tw_screen_text(tw: *mut TermWidget) -> str {
+    let gen: u64 = term.term_gen((*tw).term)
+    if gen != (*tw).text_gen || rt.buf_len(&(*tw).text_buf) == 0 {
+        rt.buf_clear(&(*tw).text_buf)
+        termtext.screen_text(term.term_grid((*tw).term), &(*tw).text_buf)
+        (*tw).text_gen = gen
+    }
+    return rt.buf_str(&(*tw).text_buf)
+}
+
+fn tw_term(tw: *mut TermWidget) -> *mut termstate.Term { return (*tw).term }
+
+fn tw_title(tw: *mut TermWidget) -> str { return term.term_title((*tw).term) }
+
+fn tw_exited(tw: *mut TermWidget) -> bool { return (*tw).closed }
+
+fn tw_has_selection(tw: *mut TermWidget) -> bool { return termsel.sel_active(&(*tw).sel) }
+
+fn tw_set_backend(tw: *mut TermWidget, b: termback.Backend) {
+    if (*tw).has_back { termback.back_close(&(*tw).back) }
+    (*tw).back = b
+    (*tw).has_back = true
+    (*tw).closed = false
+    (*tw).notified = false
+    termback.back_resize(&(*tw).back, term.term_cols((*tw).term), term.term_rows((*tw).term))
+}
+
+fn tw_send(tw: *mut TermWidget) {
+    if rt.buf_len(&(*tw).out) == 0 { return }
+    if (*tw).has_back && !(*tw).closed {
+        termback.back_write(&(*tw).back, rt.buf_ptr(&(*tw).out), rt.buf_len(&(*tw).out))
+    }
+    rt.buf_clear(&(*tw).out)
+}
+
+fn flush_replies(tw: *mut TermWidget) {
+    let n: usize = term.term_reply_len((*tw).term)
+    if n == 0 { return }
+    if (*tw).has_back && !(*tw).closed {
+        termback.back_write(&(*tw).back, term.term_reply_ptr((*tw).term), n)
+    }
+    term.term_reply_clear((*tw).term)
+}
+
+fn scrolled_total(tw: *mut TermWidget) -> u64 {
+    let g: *mut termgrid.Grid = term.term_grid((*tw).term)
+    return (*g).sb_len as u64 + (*g).dropped
+}
+
+fn tw_scroll(tw: *mut TermWidget, delta: i64) {
+    let g: *mut termgrid.Grid = term.term_grid((*tw).term)
+    var v: i64 = (*tw).fr.view_off as i64 + delta
+    if v < 0 { v = 0 }
+    if v > (*g).sb_len as i64 { v = (*g).sb_len as i64 }
+    (*tw).fr.view_off = v as usize
+}
+
+fn tw_snap_bottom(tw: *mut TermWidget) { (*tw).fr.view_off = 0 }
+
+fn keep_view_on_output(tw: *mut TermWidget) {
+    let total: u64 = scrolled_total(tw)
+    if (*tw).fr.view_off > 0 && !term.term_is_alt((*tw).term) && total > (*tw).scrolled_seen {
+        tw_scroll(tw, (total - (*tw).scrolled_seen) as i64)
+    }
+    (*tw).scrolled_seen = total
+    if term.term_is_alt((*tw).term) { (*tw).fr.view_off = 0 }
+}
+
+fn note_exit(tw: *mut TermWidget) {
+    (*tw).closed = true
+    if (*tw).notified { return }
+    (*tw).notified = true
+    term.term_feed_str((*tw).term, EXIT_NOTICE)
+}
+
+fn tw_pump(tw: *mut TermWidget) -> bool {
+    if !(*tw).has_back || (*tw).closed { return false }
+    var got: bool = false
+    var i: usize = 0
+    while i < MAX_CHUNKS {
+        let n: i64 = termback.back_read(&(*tw).back, (*tw).rd, READ_CAP)
+        if n < 0 {
+            note_exit(tw)
+            got = true
+            break
+        }
+        if n == 0 { break }
+        term.term_feed((*tw).term, (*tw).rd, n as usize)
+        got = true
+        i = i + 1
+    }
+    flush_replies(tw)
+    if !(*tw).closed && !termback.back_alive(&(*tw).back) {
+        if termback.back_read(&(*tw).back, (*tw).rd, READ_CAP) <= 0 {
+            note_exit(tw)
+            got = true
+        }
+    }
+    if got { keep_view_on_output(tw) }
+    return got
+}
+
+fn tw_fit(tw: *mut TermWidget, w: f64, h: f64) {
+    let f: *mut termpaint.Frame = &(*tw).fr
+    var cols: usize = ((w - termpaint.PAD * 2.0) / (*f).cw) as usize
+    var rows: usize = ((h - termpaint.PAD * 2.0) / (*f).ch) as usize
+    if cols < MIN_COLS { cols = MIN_COLS }
+    if rows < MIN_ROWS { rows = MIN_ROWS }
+    if cols == term.term_cols((*tw).term) && rows == term.term_rows((*tw).term) { return }
+    term.term_resize((*tw).term, cols, rows)
+    if (*tw).has_back { termback.back_resize(&(*tw).back, cols, rows) }
+    termsel.sel_clear(&(*tw).sel)
+    tw_scroll(tw, 0)
+}
+
+fn tw_set_focus(tw: *mut TermWidget, on: bool) {
+    if (*tw).focus == on { return }
+    (*tw).focus = on
+    if !term.term_focus_report((*tw).term) { return }
+    terminput.encode_focus(on, &(*tw).out)
+    tw_send(tw)
+}

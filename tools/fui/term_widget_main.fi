@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.a11y
+import fui.scene
+import fui.services
+import fui.terminteract
+import fui.termax
+import fui.termwstate
+import fui.termpaint
+import plat.fuiwirt
+import term.term
+import term.terminput
+import term.termloop
+
+static mut BAD: usize = 0
+
+const CELL_W: f64 = 8.0
+const CELL_H: f64 = 16.0
+const VIEW_W: f64 = 8.0 * 20.0 + 8.0
+const VIEW_H: f64 = 16.0 * 5.0 + 8.0
+const KEY_ENTER: u32 = 7
+const KEY_UP: u32 = 10
+
+fn say(s: str) { rt.write_everything(1, s.p as u64, s.n) }
+
+fn check(ok: bool, what: str) {
+    if ok { say("  ok    ") } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn sent_is(l: *mut termloop.Loop, want: str) -> bool {
+    return termloop.loop_sent_len(l) == want.n && rt.mem_eq(termloop.loop_sent_ptr(l), want.p as u64, want.n)
+}
+
+fn forget(l: *mut termloop.Loop) { rt.buf_clear(&(*l).sent) }
+
+fn cell_x(col: usize) -> f64 { return termpaint.PAD + CELL_W * (col as f64) + 1.0 }
+
+fn cell_y(row: usize) -> f64 { return termpaint.PAD + CELL_H * (row as f64) + 1.0 }
+
+fn setup(l: *mut termloop.Loop) -> *mut termwstate.TermWidget {
+    let tw: *mut termwstate.TermWidget = termwstate.tw_new(20, 5, 100)
+    termwstate.tw_set_backend(tw, termloop.loop_backend(l))
+    (*tw).fr.cw = CELL_W
+    (*tw).fr.ch = CELL_H
+    (*tw).fr.w = VIEW_W
+    (*tw).fr.h = VIEW_H
+    (*tw).measured = true
+    return tw
+}
+
+fn test_keys(tw: *mut termwstate.TermWidget, l: *mut termloop.Loop) {
+    terminteract.tw_char(tw as u64, 108 as u32, 0 as u32)
+    terminteract.tw_key(tw as u64, KEY_ENTER, 0 as u32)
+    check(sent_is(l, "l\r"), "char + enter reach the backend as bytes")
+    forget(l)
+    terminteract.tw_key(tw as u64, KEY_UP, 0 as u32)
+    check(sent_is(l, "\x1b[A"), "arrow up is ESC [ A")
+    forget(l)
+    terminteract.tw_char(tw as u64, 99 as u32, terminput.M_CTRL)
+    check(sent_is(l, "\x03"), "ctrl+c is 0x03")
+    forget(l)
+    termwstate.tw_set_focus(tw, false)
+    check(!terminteract.tw_char(tw as u64, 97 as u32, 0 as u32), "unfocused widget leaves keys alone")
+    termwstate.tw_set_focus(tw, true)
+}
+
+fn test_screen(tw: *mut termwstate.TermWidget, l: *mut termloop.Loop) {
+    termloop.loop_push(l, "hello world\r\nsecond\r\n")
+    check(termwstate.tw_pump(tw), "pump feeds script bytes")
+    check(termwstate.tw_screen_text(tw).n > 0, "screen text is not empty")
+    termloop.loop_push(l, "\x1b[6n")
+    termwstate.tw_pump(tw)
+    check(sent_is(l, "\x1b[3;1R"), "cursor report goes back to the backend")
+    forget(l)
+}
+
+fn test_selection(tw: *mut termwstate.TermWidget, l: *mut termloop.Loop) {
+    services.use_memory(true)
+    terminteract.tw_pointer(tw as u64, fuiwirt.HOOK_DOWN, cell_x(0), cell_y(0))
+    terminteract.tw_pointer(tw as u64, fuiwirt.HOOK_MOVE, cell_x(4), cell_y(0))
+    terminteract.tw_pointer(tw as u64, fuiwirt.HOOK_UP, cell_x(4), cell_y(0))
+    check(termwstate.tw_has_selection(tw), "drag selects")
+    check(terminteract.tw_copy(tw), "copy puts text on the clipboard")
+    terminteract.tw_pointer(tw as u64, fuiwirt.HOOK_DOWN, cell_x(1), cell_y(1))
+    terminteract.tw_pointer(tw as u64, fuiwirt.HOOK_UP, cell_x(1), cell_y(1))
+    check(!termwstate.tw_has_selection(tw), "plain click clears the selection")
+    check(terminteract.tw_paste(tw) && terminteract.tw_poll_paste(tw), "paste request is answered")
+    check(sent_is(l, "hello"), "pasted text reaches the backend")
+    forget(l)
+}
+
+fn test_scroll_and_resize(tw: *mut termwstate.TermWidget, l: *mut termloop.Loop) {
+    var i: usize = 0
+    while i < 12 {
+        termloop.loop_push(l, "line\r\n")
+        i = i + 1
+    }
+    termwstate.tw_pump(tw)
+    terminteract.tw_wheel(tw as u64, cell_x(1), cell_y(1), 0.0, 0.0 - 1.0)
+    check((*tw).fr.view_off == 3, "wheel up scrolls three lines into the scrollback")
+    terminteract.tw_key(tw as u64, KEY_ENTER, 0 as u32)
+    check((*tw).fr.view_off == 0, "typing snaps back to the bottom")
+    forget(l)
+    termwstate.tw_fit(tw, CELL_W * 30.0 + 8.0, CELL_H * 8.0 + 8.0)
+    check(term.term_cols(termwstate.tw_term(tw)) == 30 && term.term_rows(termwstate.tw_term(tw)) == 8, "fit resizes the grid")
+    check(termloop.loop_size_cols(l) == 30 && termloop.loop_size_rows(l) == 8, "fit resizes the backend")
+}
+
+fn test_ax(tw: *mut termwstate.TermWidget) {
+    var sc: scene.Scene = scene.scene_new()
+    var ax: a11y.A11y = a11y.a11y_new()
+    let root: usize = scene.scene_box(&sc, scene.SCENE_NONE, 0 as u32, 0 as u32, 0 as u32, 0 as u32)
+    let n: usize = termax.tax_terminal(&sc, &ax, root, tw)
+    check(n != scene.SCENE_NONE && a11y.a11y_role(&sc, &ax, n) == a11y.ROLE_TERMINAL, "node has the terminal role")
+    check(a11y.ROLE_COUNT == 37, "role count is 37")
+}
+
+fn main() -> i32 {
+    let l: *mut termloop.Loop = termloop.loop_new(false)
+    let tw: *mut termwstate.TermWidget = setup(l)
+    test_keys(tw, l)
+    test_screen(tw, l)
+    test_selection(tw, l)
+    test_scroll_and_resize(tw, l)
+    test_ax(tw)
+    if BAD != 0 {
+        say("term_widget: FAILED\n")
+        return 1
+    }
+    say("term_widget: all checks passed\n")
+    return 0
+}

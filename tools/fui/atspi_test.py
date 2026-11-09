@@ -26,7 +26,7 @@ ROLE = {
     "tabpanel": 39, "menu": 33, "menuitem": 35, "toolbar": 63, "scrollbar": 48,
     "separator": 50, "group": 39, "heading": 83, "link": 88, "image": 27, "tooltip": 64,
     "status": 54, "menuitemcheckbox": 8, "menuitemradio": 45, "dialog": 16,
-    "alertdialog": 2, "generic": 20, "columnheader": 25,
+    "alertdialog": 2, "generic": 20, "columnheader": 25, "terminal": 60, "document": 95,
 }
 STATE = {"focusable": 11, "focused": 12, "selected": 23, "checked": 4, "mixed": 32,
          "pressed": 20, "expanded": 10, "collapsed": 5}
