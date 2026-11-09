@@ -11,11 +11,22 @@
 #      way; the Firn server counts its own peak and bytes
 #   C  both ends in Firn, one process, one loop: the epoll backend and the
 #      poll backend (2n sockets)
-import asyncio, os, subprocess, sys, time
+import asyncio, os, resource, subprocess, sys, time
 
 prog = sys.argv[1]
 n = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
 bad = 0
+FDS_PER_CONNECTION = 2
+FD_HEADROOM = 256
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+needed = n * FDS_PER_CONNECTION + FD_HEADROOM
+if soft < needed:
+    target = needed if hard == resource.RLIM_INFINITY else min(hard, needed)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    soft = target
+if soft < needed:
+    print("  FAIL open file limit %d is below the %d this check needs" % (soft, needed))
+    sys.exit(1)
 def ok(m): print("  ok  ", m)
 def fail(m):
     global bad
