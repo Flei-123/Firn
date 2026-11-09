@@ -22,7 +22,7 @@ Two sides meet in one struct, `webview.Backend` (a table of function pointers pl
 
 | Item | v0 |
 |---|---|
-| Module | `fui.webview` (model, tick, input), `fui.webview_stub` (stub backend), `fui.webview_ax` (a11y), `fui.webview_svc` (services adapter), `fui.webview_node` (window glue for `fui.app`) |
+| Module | `fui.webview_types` (records, constants, `Backend`), `fui.webview` (model, tick, input), `fui.webview_stub` (stub backend), `fui.webview_ax` (a11y), `fui.webview_svc` (services adapter), `fui.webview_node` (window glue for `fui.app`) |
 | Node | `app.custom` node of kind `widget.KIND_TILE` with a painter (`scene.node_set_draw`); focusable, in the Tab chain |
 | Model | `webview.WebView`, value struct owned by the app; one per node; holds the `Backend`, the pixel buffer, state, event queue, caret rect |
 | Create | `webview.webview_open(&wv, &backend, w, h)` -> bool; `webview_close(&wv)` frees the buffer and calls `Backend.destroy` once |
@@ -51,7 +51,7 @@ The widget forwards input to the backend untransformed, as one record per event 
 | `IN_FOCUS`, `IN_BLUR` | none |
 | `IN_REPLY` | `a` = request id, `b` = status (1 ok, 0 cancelled/failed), `text` = payload |
 
-`Backend.input` returns true when the page used the event. Unused keys stay with the app (shortcuts). Reserved keys are never forwarded in v0: Tab / Shift+Tab (focus leaves the widget, no keyboard trap) and Escape while no page text input is active. `mods` use the `editor` modifier bits. Events are forwarded only while the widget is focused (keys, chars, IME) or under the pointer / captured (pointer, wheel).
+`Backend.input` returns true when the page used the event. Unused keys stay with the app (shortcuts). Tab / Shift+Tab are never forwarded in v0 (focus leaves the widget, no keyboard trap); every other key goes to the page while focused. `mods` use the `editor` modifier bits. Events are forwarded only while the widget is focused (keys, chars, IME) or under the pointer / captured (pointer, wheel).
 
 ### 2.4 Tick hook
 
@@ -59,11 +59,11 @@ The widget forwards input to the backend untransformed, as one record per event 
 
 ### 2.5 IME routing
 
-While focused and the backend has `CAP_IME`: the host IME layer (`fui.ime`) sends preedit and commit to the widget (`webview_preedit`, `webview_commit`), which forward `IN_PREEDIT` / `IN_COMMIT`. The backend reports the caret as a rectangle in widget-local pixels (`Backend.caret(ud, &rect) -> bool`, polled after each tick and after every forwarded key); the widget converts it to window coordinates and calls `ime.ime_set_spot` (through the glue hook `spot(ud, x, y, h)`). Without `CAP_IME`, committed text arrives as `IN_CHAR` per code point.
+While focused and the backend has `CAP_IME`: the host IME layer (`fui.ime`) sends preedit and commit to the widget (`webview_preedit`, `webview_commit`), which forward `IN_PREEDIT` / `IN_COMMIT`. The backend reports the caret as a rectangle in widget-local pixels (`Backend.caret(ud, &rect) -> bool`, polled after each tick and after every forwarded key); the widget converts it to window coordinates and calls `ime.ime_set_spot` (through the hook `webview_on_spot`; `fui.webview_node` stores the window-space spot). Without `CAP_IME`, committed text arrives as `IN_CHAR` per code point.
 
 ### 2.6 Services adapter
 
-The page never reaches fUi directly. The backend emits request events; `fui.webview_svc` maps them to `fui.services` and answers with `IN_REPLY` (the request id is echoed).
+The page never reaches fUi directly. The backend emits request events (`a` = request id, echoed in the reply); `fui.webview_svc` (`svc_attach`, `svc_poll` once per frame while an answer is pending) maps them to `fui.services` and answers with `IN_REPLY` (the request id is echoed).
 
 | Backend event | `fui.services` call | Reply |
 |---|---|---|
@@ -79,7 +79,7 @@ Navigation: `EV_NAV` (absolute href of a clicked link, or a load request from th
 
 ### 2.7 Other backend events (information, no reply)
 
-`EV_TITLE`, `EV_LOADED` (a = ok, b = document height), `EV_HOVER` (href under pointer or empty), `EV_CURSOR` (cursor kind, forwarded to `fui.cursorreq`), `EV_SCROLLED`, `EV_RESIZED`, `EV_OVERFLOW`. Numbers 1..8 equal the Certus `EV_*` constants of `glass.webview`, so the adapter needs no mapping. The app reads the last title / hover / scroll / document height from the model (`webview_title`, `webview_hover`, `webview_scroll`, `webview_doc_height`).
+`EV_TITLE`, `EV_LOADED` (a = ok, b = document height), `EV_HOVER` (href under pointer or empty), `EV_CURSOR` (cursor kind, stored: `webview_cursor`; `fui.cursorreq` knows only the arrow shape today), `EV_SCROLLED`, `EV_RESIZED`, `EV_OVERFLOW`. Numbers 1..8 equal the Certus `EV_*` constants of `glass.webview`, so the adapter needs no mapping. The app reads the last title / hover / scroll / document height from the model (`webview_title`, `webview_hover`, `webview_scroll`, `webview_doc_height`).
 
 ### 2.8 Size, DPI, focus, lifecycle
 
@@ -137,10 +137,11 @@ Rules for the Glass side: single-threaded API called from the UI thread; `WebVie
 | Check | File |
 |---|---|
 | Contract and widget model against the stub backend | `tools/fui/webview_main.fi` (in `tools/fui/run.sh`) |
-| Demo app (stub backend, flag `--certus` for the Glass adapter once present) | `examples/fui_apps/webview_demo` |
+| Demo app (stub backend; `--shot` works headless; the Glass adapter variant `FUI_WEBVIEW_CERTUS` waits for the Certus adapter file, see section 6) | `examples/fui_apps/webview_demo` |
 
 ## 6. Versioning and open points
 
 - v0 (this document): buffer surface, raw input, tick, IME routing, services map, one a11y node, stub backend.
 - v1: URL load and navigation policy per origin, `Backend.ax`, `SURFACE_CANVAS`, scale, touch, `EV_STORE_*`, script bridge (`postMessage` <-> `EV_MESSAGE`), crash page.
+- Not wired yet (fUi side): the `fui.app` host IME sink only feeds the focused text field, so `webview_preedit` / `webview_commit` are driven by tests and by apps that own the host IME hook; `app.set_ime_sink` for custom nodes is the next step. `FUI_WEBVIEW_CERTUS` needs `lib/embed/webview_fui.fi` in the Certus repo (fills `Backend` from `glass.webview`) and a build that sees both library roots.
 - Licensing: the Glass side is GPL-2.0, fUi is MPL-2.0; the adapter sits in the Certus repo so that no Glass code enters the Firn repo (roadmap r26).
