@@ -98,10 +98,10 @@ included() {
         | sed 's|^\(.*\)/[^/]*:__include_[a-z]*("\([^"]*\)")$|\1/\2|' \
         | sort -u | while IFS= read -r g; do [ -f "$g" ] && echo "$g"; done
 }
-tar -chf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' ! -xtype l | sed 's|^\./||') \
+tar -cf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' ! -xtype l | sed 's|^\./||') \
     $(ls tests/data/include_* 2>/dev/null) $(included) \
     | tar -xf - -C "$MIRROR"
-( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') 2>/dev/null )
+( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi' -type f) 2>/dev/null )
 mrc=$?
 # 3 = single sources REFUSED (unknown character, unbalanced brackets --
 # the deliberately broken negative tests). Everything else is a failure.
