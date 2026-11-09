@@ -103,7 +103,7 @@ echo
 echo "== 2. the four outcomes =="
 has "$TMPD/mixed.json" '"name":"adds_up","status":"pass"' "a case that passes"
 has "$TMPD/mixed.json" '"name":"overflows","status":"fail"' "a case that panics"
-has "$TMPD/mixed.json" '"name":"writes_to_null","status":"fail"' "a case that dies"
+has "$TMPD/mixed.json" '"name":"dies_by_signal","status":"fail"' "a case that dies"
 has "$TMPD/mixed.json" '"name":"prints_and_passes","status":"pass"' "a case that prints"
 has "$TMPD/mixed.json" '"signal":11' "the signal of the crash is reported"
 has "$TMPD/mixed.json" '"exit":101' "the exit code of the panic is reported"
@@ -130,10 +130,10 @@ else
         *) bad "$file:$line points at '$text', expected the addition" ;;
     esac
     # The declaration is the fallback for a case that dies without a message.
-    dline=$(sed -n 's/.*"name":"writes_to_null"[^}]*"line":\([0-9]*\).*/\1/p' "$TMPD/mixed.json")
+    dline=$(sed -n 's/.*"name":"dies_by_signal"[^}]*"line":\([0-9]*\).*/\1/p' "$TMPD/mixed.json")
     dtext=$(sed -n "${dline}p" "$CASES/mixed.fi")
     case "$dtext" in
-        "fn writes_to_null"*)
+        "fn dies_by_signal"*)
             ok
             echo "   the case without a message is reported at its declaration, line $dline"
             ;;
