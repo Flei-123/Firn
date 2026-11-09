@@ -24,6 +24,8 @@ The contract WRAPS what exists; it builds nothing twice:
 | `services.svcstore` | `lib/services/svcstore.fi` | `get`, `set`, `remove`, `has` |
 | `services.svcdir` | `lib/services/svcdir.fi` | `list`, `pick`, `next_entry`, `push_entry`, `DirEntry` |
 | backend (native) | `lib/services/svcos.fi` | wraps std.dialog / std.clipboard / std.fs / plat.fileio |
+| backend (Windows) | `lib/services/svcos.fi` (same file as native) | `std.dialog` win32 (comdlg32 / user32), `std.clipboard` win32, `plat.fileio` |
+| backend (Android) | `lib/services/svcos.fi` with `lib/@android/std/*` | dialogs answer `NO_BACKEND` (no windowless picker), clipboard `std.clipboard`, `plat.fileio` share |
 | backend (browser) | `lib/@web/services/svcos.fi` | wraps plat.webdialog / webclip / webdownload / plat.web store; `from_web_event` |
 | backend (OrientOS) | spec only (below) | |
 
@@ -117,6 +119,15 @@ A file item is any WE_DIALOG while a file open is waiting, except `"color"`, `"n
 
 `svc.has(cap) -> bool`, `svc.backend_name() -> str` (`"native"`, `"web"`).
 A call whose capability is missing answers `NO_BACKEND` and changes nothing (the conformance test checks exactly that).
+
+## Windows and Android
+
+- Windows: the native backend, unchanged. `tools/services/conformance.sh` builds the conformance program with
+  `--target=x86_64-windows` and runs it under Wine on a private Xvfb with `FIRN_SERVICES_HEADLESS=1`
+  (that env var removes the dialog capabilities on every native system): caps 172 (storage, dir list, clipboard),
+  25 checks. The real comdlg32 dialogs are covered by `tools/dialog/dialog_check_win.py`.
+- Android: compile check for `x86_64-android` and `aarch64-android` only. Android has no windowless dialog, so a
+  document picker needs the window layer (`onActivityResult`) and is not built; there has been no emulator run.
 
 ## Directory listing in the browser
 
