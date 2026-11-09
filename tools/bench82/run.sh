@@ -193,7 +193,7 @@ echo
 
 # --------------------------------------------- 5. the compiler on itself
 echo "== the compiler on itself =="
-# Measured as CPU TIME of the compiler process (user+system, getrusage), not as
+# Measured as CPU TIME of a plain --no-cache compile (--timings costs about 4x the CPU), user+system via getrusage, not as
 # wall time: on a shared machine the wall clock also counts every moment the
 # process waited for a core. The remaining speed of the machine is divided out
 # by a reference (below), so the limit is a RATIO and not a number of ms.
@@ -203,10 +203,13 @@ firnc, out, timings = sys.argv[1:4]
 def cpu_ms():
     r = resource.getrusage(resource.RUSAGE_CHILDREN)
     return (r.ru_utime + r.ru_stime) * 1000.0
-before = cpu_ms()
 with open(timings, "w") as err:
     rc = subprocess.run([firnc, "--timings", "--opt-level=release-fast", "-o", out,
                          "bin/firnc1.fi"], stdout=subprocess.DEVNULL, stderr=err).returncode
+before = cpu_ms()
+if rc == 0:
+    rc = subprocess.run([firnc, "--no-cache", "--opt-level=release-fast", "-o", out,
+                         "bin/firnc1.fi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 print("%.0f" % (cpu_ms() - before) if rc == 0 else "999999")
 PY
 )

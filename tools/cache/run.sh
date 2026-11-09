@@ -192,13 +192,15 @@ REAL_AS=$(command -v as)
 mkdir -p "$T/fakebin"
 printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "GNU assembler (fake) 9.9"; exit 0; fi\nexec %s "$@"\n' "$REAL_AS" > "$T/fakebin/as"
 chmod +x "$T/fakebin/as"
-PATH="$T/fakebin:$PATH" "$FIRNC" main.fi -o ov1 2> ov1.log
+FIRN_USE_AS=1 "$FIRNC" main.fi -o ov0 2> /dev/null
+FIRN_USE_AS=1 "$FIRNC" --no-cache main.fi -o ov_plain 2> /dev/null
+FIRN_USE_AS=1 PATH="$T/fakebin:$PATH" "$FIRNC" main.fi -o ov1 2> ov1.log
 [ "$(evo ov1.log)" = "cache: hit cache: objsave " ]; check "other assembler version = object miss" $?
-PATH="$T/fakebin:$PATH" "$FIRNC" main.fi -o ov2 2> ov2.log
+FIRN_USE_AS=1 PATH="$T/fakebin:$PATH" "$FIRNC" main.fi -o ov2 2> ov2.log
 [ "$(evo ov2.log)" = "cache: hit cache: objload " ]; check "other assembler version cached on its own" $?
-"$FIRNC" main.fi -o ov3 2> ov3.log
+FIRN_USE_AS=1 "$FIRNC" main.fi -o ov3 2> ov3.log
 [ "$(evo ov3.log)" = "cache: hit cache: objload " ]; check "original assembler object still there" $?
-cmp -s ov1 o_plain && cmp -s ov2 o_plain && cmp -s ov3 o_plain; check "all identical to uncached" $?
+cmp -s ov1 ov_plain && cmp -s ov2 ov_plain && cmp -s ov3 ov_plain; check "all identical to uncached" $?
 rm -rf "$FIRN_CACHE_DIR"
 "$FIRNC" main.fi -o od0 2> /dev/null
 f=$(ls "$FIRN_CACHE_DIR"/objects/*.o | head -1)
