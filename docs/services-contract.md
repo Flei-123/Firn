@@ -23,6 +23,7 @@ The contract WRAPS what exists; it builds nothing twice:
 | `services.svcdialog` | `lib/services/svcdialog.fi` | `message`, `confirm` |
 | `services.svcstore` | `lib/services/svcstore.fi` | `get`, `set`, `remove`, `has` |
 | `services.svcdir` | `lib/services/svcdir.fi` | `list`, `pick`, `next_entry`, `push_entry`, `DirEntry` |
+| `services.svcmut` | `lib/services/svcmut.fi` | `make_dir`, `rename`, `remove` (file or empty folder), `valid_name`; new statuses `EXISTS`, `NOT_EMPTY`; web `NO_BACKEND` |
 | backend (native) | `lib/services/svcos.fi` | wraps std.dialog / std.clipboard / std.fs / plat.fileio |
 | backend (Windows) | `lib/services/svcos.fi` (same file as native) | `std.dialog` win32 (comdlg32 / user32), `std.clipboard` win32, `plat.fileio` |
 | backend (Android) | `lib/services/svcos.fi` with `lib/@android/std/*` | dialogs answer `NO_BACKEND` (no windowless picker), clipboard `std.clipboard`, `plat.fileio` share |
