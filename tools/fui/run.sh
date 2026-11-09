@@ -952,6 +952,13 @@ echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, aud
 FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 "$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
 cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
+echo "== 18p7b. FILE MANAGER (examples/fui_apps/fm, fui.fsbackend, fui.memtree, services.svcmut): model checks, audit =="
+"$FIRNC" --opt-level=dev -o "$W/memtree_check" tools/fui/memtree_main.fi || exit 1
+"$W/memtree_check" || exit 1
+"$FIRNC" --opt-level=dev -o "$W/fm_check" examples/fui_apps/fm/fm_check_main.fi || exit 1
+"$W/fm_check" --sample --data examples/fui_apps/data || exit 1
+"$FIRNC" --opt-level=dev -o "$W/fm_app" examples/fui_apps/fm/main.fi || exit 1
+FUI_AUDIT=1 "$W/fm_app" --sample --data examples/fui_apps/data || exit 1
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 build navmock
