@@ -11,6 +11,8 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
 ONLY=${1:-}
+PART=${MC_PART:-}
+case "$PART" in ""|libs-a|libs-b|play) ;; *) echo "MC_PART must be libs-a, libs-b or play"; exit 2 ;; esac
 export MC_VANILLA=${MC_VANILLA:-0}
 FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
@@ -21,7 +23,7 @@ case " $ONLY " in
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
 # fails otherwise): format with `build/firnfmt -w <file>`; this builds it into a temp dir.
-if [ -z "$ONLY" ]; then
+if [ -z "$ONLY" ] && { [ -z "$PART" ] || [ "$PART" = libs-a ]; }; then
     FT=$(mktemp -d)
     trap 'rm -rf "$FT"' EXIT
     if FIRNLIB="$(pwd)/lib" "$FIRNC" -o "$FT/firnfmt" tools/fmt/firnfmt.fi 2>"$FT/err"; then
@@ -30,16 +32,25 @@ if [ -z "$ONLY" ]; then
         else echo "  FAIL  not formatted (run firnfmt -w):"; echo "$bad" | head -10 | sed 's/^/        /'; ERR=$((ERR+1)); fi
     else echo "  FAIL  cannot build tools/fmt/firnfmt.fi"; head -5 "$FT/err"; ERR=$((ERR+1)); fi
 fi
-if [ -z "$ONLY" ]; then
+if [ -z "$ONLY" ] && { [ -z "$PART" ] || [ "$PART" = libs-a ]; }; then
     bash tools/mc/testmc.sh || ERR=$((ERR+1))
 fi
+LIB_INDEX=-1
 for s in tools/mc/*/run.sh; do
     [ -f "$s" ] || continue
+    [ "$PART" = play ] && continue
+    LIB_INDEX=$((LIB_INDEX + 1))
+    [ "$PART" = libs-a ] && [ $((LIB_INDEX % 2)) -ne 0 ] && continue
+    [ "$PART" = libs-b ] && [ $((LIB_INDEX % 2)) -ne 1 ] && continue
     lib=$(basename "$(dirname "$s")")
     [ -n "$ONLY" ] && [ "$ONLY" != "$lib" ] && continue
     echo "== mc/$lib =="
     bash "$s" || ERR=$((ERR+1))
 done
+if [ -n "$PART" ] && [ "$PART" != play ]; then
+    if [ $ERR -eq 0 ]; then echo "RESULT mc $PART: ok"; else echo "RESULT mc $PART: $ERR failing parts"; fi
+    exit $ERR
+fi
 # Windows build under Wine (cross-compile, login, window, raw mouse, F11, GUI exe + bank + log, recv-timeout seam): ~4 min, needs wine + Xvfb + java.
 if [ -z "$ONLY" ] || [ "$ONLY" = wine ]; then
     echo "== mc/wine =="

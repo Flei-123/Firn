@@ -17,7 +17,7 @@ what a lost optimisation looks like — and not the noise.
 | `minquota_aes_dec.txt` | 685.3 MiB/s | 320 | unchanged |
 | `minquota_cfb8.txt` | 25.7 MiB/s | 14 | unchanged |
 | `minquota_deflate.txt` | 11.5 MiB/s | 6.5 | unchanged — round 87's DEFLATE work shows on real text, not on this generated corpus (docs/ROUND87.md §2) |
-| `maxquota_self_ratio.txt` | **6.8 x** (11.4 s CPU / 1.7 s reference, load average 9) | **10.0** | **round 87 limit was 5,000 ms wall; the input has since grown (41,616 lines in lib/firnc1 alone) and the same compiler needs 11-12 s on the old and the new main, so that wall limit (scaled by load) was red on every run.** Now the ceiling is a RATIO of CPU times: the self compile (user+system of the process) divided by a fixed pure-Python loop (best of five). A busy machine slows both; a slower compiler only the numerator. |
+| `maxquota_self_ratio.txt` | **17.3-21.0 x** (31 s CPU / 1.8 s reference, load average 30, two runs 09.11.2026) | **30.0** | measured as CPU of a plain `--no-cache` compile of bin/firnc1.fi: `--timings` multiplies the CPU time by about 4 (135 s vs 34 s) and made the old limit read 65-70 x. The input and the compiler passes (ownership, parallel codegen, 49.6k lines in bin/firnc1.fi) have grown since round 87, about 1.4 x the worst measured 21. Previous text:  |
 
 Raising a limit that the round did not move would only add flakiness without
 protecting anything new, so the crypto and DEFLATE limits stay where round 82
