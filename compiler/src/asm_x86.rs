@@ -1957,6 +1957,7 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             a.sections[SEC_TEXT].align,
             a.sections[SEC_DATA].align,
             a.sections[SEC_RODATA].align,
+            a.sections[SEC_BSS].align,
         ],
     );
     let own_debug = !a.sections[SEC_DEBUG_INFO].bytes.is_empty();
@@ -2064,6 +2065,25 @@ mod tests {
         let obj = assemble_to_object(text).expect("object");
         assert!(obj.windows(11).any(|w| w == b".debug_info"));
         assert!(obj.windows(13).any(|w| w == b".debug_abbrev"));
+    }
+
+    fn nobits_alignment(elf: &[u8]) -> u64 {
+        let shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        let shnum = u16::from_le_bytes(elf[0x3c..0x3e].try_into().unwrap()) as usize;
+        for i in 0..shnum {
+            let h = &elf[shoff + i * 64..shoff + (i + 1) * 64];
+            if u32::from_le_bytes(h[4..8].try_into().unwrap()) == 8 {
+                return u64::from_le_bytes(h[48..56].try_into().unwrap());
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn bss_section_keeps_the_alignment_of_its_statics() {
+        let text = ".section .bss,\"aw\",@nobits\n    .p2align 3\nG_WORD:\n    .zero 16\n.text\n";
+        let obj = assemble_to_object(text).expect("object");
+        assert_eq!(nobits_alignment(&obj), 8);
     }
 
     /// The octets `as` produces (objdump of the same lines), checked in by hand

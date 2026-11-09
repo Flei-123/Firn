@@ -346,7 +346,7 @@ pub fn standard_sections(
     rodata: Vec<u8>,
     aligns: [u64; 3],
 ) -> Vec<OutSec> {
-    standard_sections_bss(text, data, rodata, 0, aligns)
+    standard_sections_bss(text, data, rodata, 0, [aligns[0], aligns[1], aligns[2], 1])
 }
 
 /// Like [`standard_sections`], but with a `.bss` of `bss_size` octets.
@@ -355,7 +355,7 @@ pub fn standard_sections_bss(
     data: Vec<u8>,
     rodata: Vec<u8>,
     bss_size: usize,
-    aligns: [u64; 3],
+    aligns: [u64; 4],
 ) -> Vec<OutSec> {
     vec![
         OutSec {
@@ -377,7 +377,7 @@ pub fn standard_sections_bss(
         OutSec {
             name: ".bss".into(),
             bytes: vec![0u8; bss_size],
-            align: 1,
+            align: aligns[3].max(1),
             kind: SHT_NOBITS,
             flags: SHF_ALLOC | SHF_WRITE,
             relocs: Vec::new(),

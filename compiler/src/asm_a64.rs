@@ -534,6 +534,7 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
             a.sections[SEC_TEXT].align,
             a.sections[SEC_DATA].align,
             a.sections[SEC_RODATA].align,
+            a.sections[SEC_BSS].align,
         ],
     );
     for s in 0..N_SEC {
