@@ -301,6 +301,63 @@ const firnTag = document.currentScript;
             try { inp.click(); } catch (e) { inp.remove(); return 0; }
             return 1;
         },
+        firn_web_dialog_dir() {
+            const MAX_ENTRIES = 100000;
+            let count = 0;
+            const item = (path, isDir, size, modified) => {
+                if (count >= MAX_ENTRIES) return;
+                count++;
+                const rec = new Uint8Array(16);
+                const view = new DataView(rec.buffer);
+                view.setBigUint64(0, BigInt(size), true);
+                view.setBigInt64(8, BigInt(Math.trunc(modified)), true);
+                ev(x.firn_web_dialog(...give(path), ...give(rec), 3, isDir ? 1 : 0));
+            };
+            const end = () => ev(x.firn_web_dialog(0, 0, 0, 0, 4, count));
+            const cancel = () => ev(x.firn_web_dialog(0, 0, 0, 0, 5, 0));
+            const walk = async (handle, path) => {
+                item(path, true, 0, 0);
+                for await (const [name, child] of handle.entries()) {
+                    if (child.kind === 'directory') {
+                        await walk(child, path + '/' + name);
+                    } else {
+                        const file = await child.getFile();
+                        item(path + '/' + name, false, file.size, file.lastModified);
+                    }
+                }
+            };
+            if (window.showDirectoryPicker) {
+                window.showDirectoryPicker().then(async (handle) => {
+                    await walk(handle, handle.name);
+                    end();
+                }, cancel);
+                return 1;
+            }
+            const inp = document.createElement('input');
+            inp.type = 'file';
+            inp.id = 'firn-dialog-dir';
+            inp.webkitdirectory = true;
+            inp.style.cssText = 'position:fixed;left:-100px;top:-100px;opacity:0';
+            document.body.appendChild(inp);
+            inp.addEventListener('change', () => {
+                const files = Array.from(inp.files);
+                inp.remove();
+                if (!files.length) { cancel(); return; }
+                const seen = new Set();
+                for (const file of files) {
+                    const parts = file.webkitRelativePath.split('/');
+                    for (let i = 1; i < parts.length; i++) {
+                        const dir = parts.slice(0, i).join('/');
+                        if (!seen.has(dir)) { seen.add(dir); item(dir, true, 0, 0); }
+                    }
+                    item(file.webkitRelativePath, false, file.size, file.lastModified);
+                }
+                end();
+            });
+            inp.addEventListener('cancel', () => { inp.remove(); cancel(); });
+            try { inp.click(); } catch (e) { inp.remove(); return 0; }
+            return 1;
+        },
         firn_web_notify(tp, tn, bp, bn, ip, inn, tagp, tagn) {
             if (typeof Notification === 'undefined') return 0;
             if (Notification.permission === 'default') { Notification.requestPermission(); return 0; }

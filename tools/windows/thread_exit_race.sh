@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
 export FIRNLIB="$(pwd)/lib"
-export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all
+export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn} WINEDEBUG=-all
 N=${1:-300}
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 "$FIRNC" --target=x86_64-windows --opt-level=dev-fast -o "$W/t.exe" tools/windows/thread_exit_race.fi 2>&1 | grep -v RWX

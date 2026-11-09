@@ -73,7 +73,7 @@ PY
 [ $? -eq 0 ] || RC=1
 "$FIRNC" --opt-level=dev-fast -o "$D/chainprobe" tools/fontfb/chainprobe.fi || { echo "FAIL compile chainprobe"; exit 1; }
 if ! python3 -I -c "import regex" 2>/dev/null; then
-    timeout 90 python3 -m pip install -q --disable-pip-version-check --target "$D/pk" regex >/dev/null 2>&1
+    timeout 90 python3 -m pip install -q --disable-pip-version-check --target "$D/pk" regex==2026.2.19 >/dev/null 2>&1
 fi
 PYTHONPATH="$D/pk" python3 -u tools/fontfb/chain_check.py "$D/chainprobe" || RC=1
 bash tools/grapheme/run.sh || RC=1

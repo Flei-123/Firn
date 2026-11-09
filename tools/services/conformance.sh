@@ -14,7 +14,7 @@ trap 'rm -rf "$W"' EXIT
 SRC="$ROOT/tools/services/conformance.fi"
 CAPS_ALL_NATIVE=191
 CAPS_HEADLESS=160
-CAPS_WEB=127
+CAPS_WEB=511
 fails=0
 
 make_fakes() {
