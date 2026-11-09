@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+export {
+    Parser, parser_new, feed, take_replay,
+    ACT_NONE, ACT_PRINT, ACT_EXEC, ACT_CSI, ACT_ESC, ACT_OSC,
+    PARAMS_MAX, OSC_MAX, param, param_colon,
+}
+
+const ST_GROUND: u32 = 0
+const ST_ESC: u32 = 1
+const ST_ESC_INT: u32 = 2
+const ST_CSI: u32 = 3
+const ST_CSI_INT: u32 = 4
+const ST_CSI_IGNORE: u32 = 5
+const ST_OSC: u32 = 6
+const ST_OSC_ESC: u32 = 7
+const ST_STR: u32 = 8
+const ST_STR_ESC: u32 = 9
+
+const ACT_NONE: u32 = 0
+const ACT_PRINT: u32 = 1
+const ACT_EXEC: u32 = 2
+const ACT_CSI: u32 = 3
+const ACT_ESC: u32 = 4
+const ACT_OSC: u32 = 5
+
+const PARAMS_MAX: usize = 16
+const OSC_MAX: usize = 512
+const PARAM_CAP: i32 = 65535
+const REPLACEMENT: u32 = 0xFFFD
+
+struct Parser {
+    state: u32,
+    utf_need: u32,
+    utf_cp: u32,
+    cp: u32,
+    fin: u32,
+    marker: u32,
+    inter: u32,
+    np: usize,
+    params: [i32; 16],
+    colon_mask: u32,
+    cur: i32,
+    have_cur: bool,
+    osc: [u8; 512],
+    osc_len: usize,
+    replay: i32,
+}
+
+fn parser_new() -> Parser {
+    return Parser {
+        state: ST_GROUND, utf_need: 0 as u32, utf_cp: 0 as u32, cp: 0 as u32, fin: 0 as u32,
+        marker: 0 as u32, inter: 0 as u32, np: 0, params: [0 as i32; 16], colon_mask: 0 as u32,
+        cur: 0 as i32, have_cur: false, osc: [0 as u8; 512], osc_len: 0, replay: -1 as i32,
+    }
+}
+
+fn param(p: *mut Parser, i: usize, dflt: i32) -> i32 {
+    if i >= (*p).np { return dflt }
+    let v: i32 = (*p).params[i]
+    if v < 0 as i32 { return dflt }
+    return v
+}
+
+fn param_colon(p: *mut Parser, i: usize) -> bool {
+    return ((*p).colon_mask >> (i as u32)) & (1 as u32) != 0 as u32
+}
+
+fn clear_seq(p: *mut Parser) {
+    (*p).marker = 0 as u32
+    (*p).inter = 0 as u32
+    (*p).np = 0
+    (*p).colon_mask = 0 as u32
+    (*p).cur = 0 as i32
+    (*p).have_cur = false
+}
+
+fn push_param(p: *mut Parser, colon: bool) {
+    var v: i32 = -1 as i32
+    if (*p).have_cur { v = (*p).cur }
+    if (*p).np < PARAMS_MAX {
+        (*p).params[(*p).np] = v
+        if colon { (*p).colon_mask = (*p).colon_mask | ((1 as u32) << ((*p).np as u32)) }
+        (*p).np = (*p).np + 1
+    }
+    (*p).cur = 0 as i32
+    (*p).have_cur = false
+}
+
+fn start_lead(p: *mut Parser, b: u32) {
+    (*p).utf_need = 0 as u32
+    if b >= 0xC2 && b <= 0xDF {
+        (*p).utf_need = 1 as u32
+        (*p).utf_cp = b & 0x1F
+    } else if b >= 0xE0 && b <= 0xEF {
+        (*p).utf_need = 2 as u32
+        (*p).utf_cp = b & 0x0F
+    } else if b >= 0xF0 && b <= 0xF4 {
+        (*p).utf_need = 3 as u32
+        (*p).utf_cp = b & 0x07
+    }
+}
+
+fn print_action(p: *mut Parser, cp: u32) -> u32 {
+    (*p).cp = cp
+    return ACT_PRINT
+}
+
+fn feed_utf8(p: *mut Parser, b: u32) -> u32 {
+    if (*p).utf_need > 0 as u32 {
+        if (b & 0xC0) == 0x80 {
+            (*p).utf_cp = ((*p).utf_cp << 6) | (b & 0x3F)
+            (*p).utf_need = (*p).utf_need - 1
+            if (*p).utf_need > 0 as u32 { return ACT_NONE }
+            let cp: u32 = (*p).utf_cp
+            if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) || cp < 0x80 {
+                return print_action(p, REPLACEMENT)
+            }
+            return print_action(p, cp)
+        }
+        start_lead(p, b)
+        return print_action(p, REPLACEMENT)
+    }
+    start_lead(p, b)
+    if (*p).utf_need == 0 as u32 { return print_action(p, REPLACEMENT) }
+    return ACT_NONE
+}
+
+fn exec_action(p: *mut Parser, b: u32) -> u32 {
+    (*p).cp = b
+    return ACT_EXEC
+}
+
+fn take_replay(p: *mut Parser) -> i32 {
+    let v: i32 = (*p).replay
+    (*p).replay = -1 as i32
+    return v
+}
+
+fn feed_ground(p: *mut Parser, b: u32) -> u32 {
+    if b >= 0x80 { return feed_utf8(p, b) }
+    if (*p).utf_need > 0 as u32 {
+        (*p).utf_need = 0 as u32
+        (*p).replay = b as i32
+        return print_action(p, REPLACEMENT)
+    }
+    if b == 0x1B {
+        (*p).state = ST_ESC
+        clear_seq(p)
+        return ACT_NONE
+    }
+    if b < 0x20 { return exec_action(p, b) }
+    if b == 0x7F { return ACT_NONE }
+    return print_action(p, b)
+}
+
+fn finish_esc(p: *mut Parser, b: u32) -> u32 {
+    (*p).fin = b
+    (*p).state = ST_GROUND
+    return ACT_ESC
+}
+
+fn feed_esc(p: *mut Parser, b: u32) -> u32 {
+    if b < 0x20 { return exec_action(p, b) }
+    if b == 0x5B {
+        (*p).state = ST_CSI
+        clear_seq(p)
+        return ACT_NONE
+    }
+    if b == 0x5D {
+        (*p).state = ST_OSC
+        (*p).osc_len = 0
+        return ACT_NONE
+    }
+    if b == 0x50 || b == 0x5F || b == 0x5E || b == 0x58 {
+        (*p).state = ST_STR
+        return ACT_NONE
+    }
+    if b >= 0x20 && b <= 0x2F {
+        (*p).inter = b
+        (*p).state = ST_ESC_INT
+        return ACT_NONE
+    }
+    if b >= 0x30 && b <= 0x7E { return finish_esc(p, b) }
+    (*p).state = ST_GROUND
+    return ACT_NONE
+}
+
+fn feed_esc_int(p: *mut Parser, b: u32) -> u32 {
+    if b < 0x20 { return exec_action(p, b) }
+    if b >= 0x20 && b <= 0x2F { return ACT_NONE }
+    if b >= 0x30 && b <= 0x7E { return finish_esc(p, b) }
+    (*p).state = ST_GROUND
+    return ACT_NONE
+}
+
+fn finish_csi(p: *mut Parser, b: u32) -> u32 {
+    if (*p).have_cur || (*p).np > 0 { push_param(p, false) }
+    (*p).fin = b
+    (*p).state = ST_GROUND
+    return ACT_CSI
+}
+
+fn csi_digit(p: *mut Parser, d: i32) {
+    var v: i32 = 0 as i32
+    if (*p).have_cur { v = (*p).cur }
+    v = v * 10 as i32 + d
+    if v > PARAM_CAP { v = PARAM_CAP }
+    (*p).cur = v
+    (*p).have_cur = true
+}
+
+fn feed_csi(p: *mut Parser, b: u32) -> u32 {
+    if b < 0x20 { return exec_action(p, b) }
+    if b >= 0x30 && b <= 0x39 {
+        csi_digit(p, (b - 0x30) as i32)
+        return ACT_NONE
+    }
+    if b == 0x3B {
+        push_param(p, false)
+        return ACT_NONE
+    }
+    if b == 0x3A {
+        push_param(p, true)
+        return ACT_NONE
+    }
+    if b >= 0x3C && b <= 0x3F {
+        if (*p).np == 0 && !(*p).have_cur && (*p).marker == 0 as u32 {
+            (*p).marker = b
+        } else {
+            (*p).state = ST_CSI_IGNORE
+        }
+        return ACT_NONE
+    }
+    if b >= 0x20 && b <= 0x2F {
+        (*p).inter = b
+        (*p).state = ST_CSI_INT
+        return ACT_NONE
+    }
+    if b >= 0x40 && b <= 0x7E { return finish_csi(p, b) }
+    (*p).state = ST_GROUND
+    return ACT_NONE
+}
+
+fn feed_csi_int(p: *mut Parser, b: u32) -> u32 {
+    if b < 0x20 { return exec_action(p, b) }
+    if b >= 0x20 && b <= 0x2F { return ACT_NONE }
+    if b >= 0x40 && b <= 0x7E { return finish_csi(p, b) }
+    (*p).state = ST_CSI_IGNORE
+    return ACT_NONE
+}
+
+fn feed_csi_ignore(p: *mut Parser, b: u32) -> u32 {
+    if b < 0x20 { return exec_action(p, b) }
+    if b >= 0x40 && b <= 0x7E { (*p).state = ST_GROUND }
+    return ACT_NONE
+}
+
+fn feed_osc(p: *mut Parser, b: u32) -> u32 {
+    if b == 0x07 {
+        (*p).state = ST_GROUND
+        return ACT_OSC
+    }
+    if b == 0x1B {
+        (*p).state = ST_OSC_ESC
+        return ACT_NONE
+    }
+    if b >= 0x20 && (*p).osc_len < OSC_MAX {
+        (*p).osc[(*p).osc_len] = b as u8
+        (*p).osc_len = (*p).osc_len + 1
+    }
+    return ACT_NONE
+}
+
+fn feed_osc_esc(p: *mut Parser, b: u32) -> u32 {
+    if b == 0x5C {
+        (*p).state = ST_GROUND
+        return ACT_OSC
+    }
+    (*p).state = ST_ESC
+    return feed_esc(p, b)
+}
+
+fn feed_str(p: *mut Parser, b: u32) -> u32 {
+    if b == 0x1B { (*p).state = ST_STR_ESC }
+    return ACT_NONE
+}
+
+fn feed_str_esc(p: *mut Parser, b: u32) -> u32 {
+    if b == 0x5C {
+        (*p).state = ST_GROUND
+        return ACT_NONE
+    }
+    (*p).state = ST_ESC
+    return feed_esc(p, b)
+}
+
+fn feed(p: *mut Parser, byte: u8) -> u32 {
+    let b: u32 = byte as u32
+    if b == 0x18 || b == 0x1A {
+        (*p).state = ST_GROUND
+        (*p).utf_need = 0 as u32
+        return ACT_NONE
+    }
+    let s: u32 = (*p).state
+    if s == ST_GROUND { return feed_ground(p, b) }
+    if s == ST_ESC { return feed_esc(p, b) }
+    if s == ST_ESC_INT { return feed_esc_int(p, b) }
+    if s == ST_CSI { return feed_csi(p, b) }
+    if s == ST_CSI_INT { return feed_csi_int(p, b) }
+    if s == ST_CSI_IGNORE { return feed_csi_ignore(p, b) }
+    if s == ST_OSC { return feed_osc(p, b) }
+    if s == ST_OSC_ESC { return feed_osc_esc(p, b) }
+    if s == ST_STR { return feed_str(p, b) }
+    return feed_str_esc(p, b)
+}

@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: MPL-2.0
+import term.vtparse
+import term.termgrid
+import term.termedit
+import term.termcursor
+import term.termstate
+import term.termsgr
+import term.termmodes
+
+export { dispatch_csi }
+
+const MARK_PRIVATE: u32 = 0x3F
+const MARK_GREATER: u32 = 0x3E
+const REPEAT_MAX: usize = 4096
+
+fn count(p: *mut vtparse.Parser, i: usize) -> usize {
+    let v: i32 = vtparse.param(p, i, 1 as i32)
+    if v < 1 as i32 { return 1 }
+    return v as usize
+}
+
+fn param_index(p: *mut vtparse.Parser, i: usize, dflt: i32) -> usize {
+    let v: i32 = vtparse.param(p, i, dflt)
+    if v < 1 as i32 { return 0 }
+    return (v - 1 as i32) as usize
+}
+
+fn report_cursor(t: *mut termstate.Term) {
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    var row: usize = (*g).cy
+    if (*g).origin { row = row - (*g).top }
+    termstate.reply_str(t, "\x1b[")
+    termstate.reply_num(t, (row + 1) as i64)
+    termstate.reply_str(t, ";")
+    termstate.reply_num(t, ((*g).cx + 1) as i64)
+    termstate.reply_str(t, "R")
+}
+
+fn report_status(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    let kind: i32 = vtparse.param(p, 0, 0 as i32)
+    if kind == 5 as i32 { termstate.reply_str(t, "\x1b[0n") }
+    else if kind == 6 as i32 { report_cursor(t) }
+}
+
+fn report_window(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    if vtparse.param(p, 0, 0 as i32) != 18 as i32 { return }
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    termstate.reply_str(t, "\x1b[8;")
+    termstate.reply_num(t, (*g).rows as i64)
+    termstate.reply_str(t, ";")
+    termstate.reply_num(t, (*g).cols as i64)
+    termstate.reply_str(t, "t")
+}
+
+fn set_scroll_region(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    let top: usize = param_index(p, 0, 1 as i32)
+    var bot: usize = (*g).rows - 1
+    if vtparse.param(p, 1, 0 as i32) > 0 as i32 { bot = param_index(p, 1, 1 as i32) }
+    termcursor.set_region(g, top, bot)
+}
+
+fn repeat_last(t: *mut termstate.Term, n: usize) {
+    if (*t).last_cp == 0 as u32 { return }
+    var k: usize = n
+    if k > REPEAT_MAX { k = REPEAT_MAX }
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    var i: usize = 0
+    while i < k {
+        termcursor.put_char(g, (*t).last_cp)
+        i = i + 1
+    }
+}
+
+fn cursor_move(g: *mut termgrid.Grid, fin: u32, n: usize) -> bool {
+    if fin == 0x41 { termcursor.move_up(g, n) }
+    else if fin == 0x42 || fin == 0x65 { termcursor.move_down(g, n) }
+    else if fin == 0x43 || fin == 0x61 { termcursor.move_right(g, n) }
+    else if fin == 0x44 { termcursor.move_left(g, n) }
+    else if fin == 0x45 {
+        termcursor.move_down(g, n)
+        termcursor.carriage_return(g)
+    }
+    else if fin == 0x46 {
+        termcursor.move_up(g, n)
+        termcursor.carriage_return(g)
+    }
+    else { return false }
+    return true
+}
+
+fn cursor_set(t: *mut termstate.Term, g: *mut termgrid.Grid, fin: u32) -> bool {
+    let p: *mut vtparse.Parser = &(*t).parser
+    if fin == 0x47 || fin == 0x60 { termcursor.cursor_col(g, param_index(p, 0, 1 as i32)) }
+    else if fin == 0x64 { termcursor.cursor_row(g, param_index(p, 0, 1 as i32)) }
+    else if fin == 0x48 || fin == 0x66 {
+        termcursor.cursor_to(g, param_index(p, 0, 1 as i32), param_index(p, 1, 1 as i32))
+    }
+    else { return false }
+    return true
+}
+
+fn edit_op(t: *mut termstate.Term, g: *mut termgrid.Grid, fin: u32) -> bool {
+    let p: *mut vtparse.Parser = &(*t).parser
+    let n: usize = count(p, 0)
+    if fin == 0x40 { termedit.insert_chars(g, n) }
+    else if fin == 0x50 { termedit.delete_chars(g, n) }
+    else if fin == 0x58 { termedit.erase_chars(g, n) }
+    else if fin == 0x4C { termedit.insert_lines(g, n) }
+    else if fin == 0x4D { termedit.delete_lines(g, n) }
+    else if fin == 0x53 { termedit.scroll_up(g, n) }
+    else if fin == 0x54 { termedit.scroll_down(g, n) }
+    else if fin == 0x4A { termedit.erase_display(g, vtparse.param(p, 0, 0 as i32)) }
+    else if fin == 0x4B { termedit.erase_line(g, vtparse.param(p, 0, 0 as i32)) }
+    else { return false }
+    return true
+}
+
+fn tab_op(t: *mut termstate.Term, g: *mut termgrid.Grid, fin: u32) -> bool {
+    let p: *mut vtparse.Parser = &(*t).parser
+    if fin == 0x49 { termcursor.tab_forward(g, count(p, 0)) }
+    else if fin == 0x5A { termcursor.tab_back(g, count(p, 0)) }
+    else if fin == 0x67 {
+        let k: i32 = vtparse.param(p, 0, 0 as i32)
+        if k == 3 as i32 { termcursor.clear_tab(g, true) }
+        else if k == 0 as i32 { termcursor.clear_tab(g, false) }
+    }
+    else { return false }
+    return true
+}
+
+fn standard(t: *mut termstate.Term, fin: u32) {
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    let p: *mut vtparse.Parser = &(*t).parser
+    if cursor_move(g, fin, count(p, 0)) { return }
+    if cursor_set(t, g, fin) { return }
+    if edit_op(t, g, fin) { return }
+    if tab_op(t, g, fin) { return }
+    if fin == 0x6D { termsgr.apply_sgr(t) }
+    else if fin == 0x68 { termmodes.apply_standard_modes(t, true) }
+    else if fin == 0x6C { termmodes.apply_standard_modes(t, false) }
+    else if fin == 0x6E { report_status(t) }
+    else if fin == 0x72 { set_scroll_region(t) }
+    else if fin == 0x73 { termcursor.save_cursor(g) }
+    else if fin == 0x75 { termcursor.restore_cursor(g) }
+    else if fin == 0x63 { termstate.reply_str(t, "\x1b[?1;2c") }
+    else if fin == 0x74 { report_window(t) }
+    else if fin == 0x62 { repeat_last(t, count(p, 0)) }
+}
+
+fn private(t: *mut termstate.Term, fin: u32) {
+    if fin == 0x68 { termmodes.apply_private_modes(t, true) }
+    else if fin == 0x6C { termmodes.apply_private_modes(t, false) }
+}
+
+fn greater(t: *mut termstate.Term, fin: u32) {
+    if fin == 0x63 { termstate.reply_str(t, "\x1b[>0;10;1c") }
+}
+
+fn dispatch_csi(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    if (*p).inter != 0 as u32 { return }
+    let fin: u32 = (*p).fin
+    if (*p).marker == 0 as u32 { standard(t, fin) }
+    else if (*p).marker == MARK_PRIVATE { private(t, fin) }
+    else if (*p).marker == MARK_GREATER { greater(t, fin) }
+    termgrid.touch(termstate.cur(t))
+}

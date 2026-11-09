@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import term.vtparse
+import term.termgrid
+import term.termcursor
+import term.termstate
+
+export { exec_control, dispatch_esc, dispatch_osc, translate, reset_state }
+
+const C0_BEL: u32 = 7
+const C0_BS: u32 = 8
+const C0_HT: u32 = 9
+const C0_LF: u32 = 10
+const C0_VT: u32 = 11
+const C0_FF: u32 = 12
+const C0_CR: u32 = 13
+const C0_SO: u32 = 14
+const C0_SI: u32 = 15
+const OSC_TITLE_BOTH: u32 = 0
+const OSC_TITLE_ICON: u32 = 1
+const OSC_TITLE: u32 = 2
+
+static ACS_MAP: [u32; 31] = [
+    0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0xB0, 0xB1, 0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514,
+    0x253C, 0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534, 0x252C, 0x2502, 0x2264, 0x2265,
+    0x3C0, 0x2260, 0xA3, 0xB7,
+]
+
+fn translate(t: *mut termstate.Term, cp: u32) -> u32 {
+    var acs: bool = (*t).g0_acs
+    if (*t).shifted { acs = (*t).g1_acs }
+    if acs && cp >= 0x60 && cp <= 0x7E { return ACS_MAP[(cp - 0x60) as usize] }
+    return cp
+}
+
+fn exec_control(t: *mut termstate.Term, c: u32) {
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    if c == C0_BEL { (*t).bell = (*t).bell + 1 as u64 }
+    else if c == C0_BS { termcursor.backspace(g) }
+    else if c == C0_HT { termcursor.tab_forward(g, 1) }
+    else if c == C0_LF || c == C0_VT || c == C0_FF { termcursor.linefeed(g) }
+    else if c == C0_CR { termcursor.carriage_return(g) }
+    else if c == C0_SO { (*t).shifted = true }
+    else if c == C0_SI { (*t).shifted = false }
+    termgrid.touch(g)
+}
+
+fn designate(t: *mut termstate.Term, inter: u32, fin: u32) {
+    let acs: bool = fin == 0x30
+    if inter == 0x28 { (*t).g0_acs = acs }
+    else if inter == 0x29 { (*t).g1_acs = acs }
+}
+
+fn reset_state(t: *mut termstate.Term) {
+    termgrid.grid_reset(&(*t).main)
+    termgrid.grid_reset(&(*t).alt)
+    (*t).use_alt = false
+    (*t).app_cursor = false
+    (*t).app_keypad = false
+    (*t).bracketed = false
+    (*t).cursor_visible = true
+    (*t).focus_report = false
+    (*t).mouse_mode = termstate.MOUSE_OFF
+    (*t).mouse_sgr = false
+    (*t).g0_acs = false
+    (*t).g1_acs = false
+    (*t).shifted = false
+}
+
+fn dispatch_esc(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    let g: *mut termgrid.Grid = termstate.cur(t)
+    let fin: u32 = (*p).fin
+    if (*p).inter != 0 as u32 {
+        designate(t, (*p).inter, fin)
+        return
+    }
+    if fin == 0x37 { termcursor.save_cursor(g) }
+    else if fin == 0x38 { termcursor.restore_cursor(g) }
+    else if fin == 0x44 { termcursor.linefeed(g) }
+    else if fin == 0x45 {
+        termcursor.carriage_return(g)
+        termcursor.linefeed(g)
+    }
+    else if fin == 0x4D { termcursor.reverse_index(g) }
+    else if fin == 0x48 { termcursor.set_tab(g) }
+    else if fin == 0x63 { reset_state(t) }
+    else if fin == 0x3D { (*t).app_keypad = true }
+    else if fin == 0x3E { (*t).app_keypad = false }
+    termgrid.touch(g)
+}
+
+const OSC_NO_CODE: u32 = 0xFFFFFFFF
+
+fn osc_semicolon(p: *mut vtparse.Parser) -> usize {
+    var i: usize = 0
+    while i < (*p).osc_len && (*p).osc[i] != 59 as u8 { i = i + 1 }
+    return i
+}
+
+fn osc_code(p: *mut vtparse.Parser, end: usize) -> u32 {
+    if end == 0 { return OSC_NO_CODE }
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < end {
+        let d: u8 = (*p).osc[i]
+        if d < 48 as u8 || d > 57 as u8 { return OSC_NO_CODE }
+        v = v * 10 as u32 + (d - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+fn set_title(t: *mut termstate.Term, from: usize) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    var n: usize = 0
+    var i: usize = from
+    while i < (*p).osc_len && n < termstate.TITLE_MAX {
+        (*t).title[n] = (*p).osc[i]
+        n = n + 1
+        i = i + 1
+    }
+    (*t).title_len = n
+    (*t).title_gen = (*t).title_gen + 1 as u64
+}
+
+fn dispatch_osc(t: *mut termstate.Term) {
+    let p: *mut vtparse.Parser = &(*t).parser
+    let end: usize = osc_semicolon(p)
+    if end >= (*p).osc_len { return }
+    let code: u32 = osc_code(p, end)
+    if code == OSC_TITLE_BOTH || code == OSC_TITLE || code == OSC_TITLE_ICON {
+        set_title(t, end + 1)
+    }
+}
