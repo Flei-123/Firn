@@ -28,7 +28,7 @@ raw = os.path.join(td, "alsa-out.raw")
 conf = os.path.join(td, "asound.conf")
 open(conf, "w").write('pcm.null { type null }\npcm.!default {\n    type file\n    slave.pcm "null"\n    file "%s"\n    format "raw"\n}\n' % raw)
 env = dict(os.environ, WINEPREFIX=os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-firn")), WINEDEBUG="-all",
-           ALSA_CONFIG_PATH=conf)
+           ALSA_CONFIG_PATH=conf, FIRN_WIN_AUDIO="waveout")
 env.pop("PULSE_SERVER", None)
 env.setdefault("DISPLAY", ":0")
 

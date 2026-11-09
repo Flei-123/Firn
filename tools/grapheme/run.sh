@@ -16,7 +16,7 @@ python3 -I tools/grapheme/gen.py --check || rc=1
 "$FIRNC" --opt-level=dev-fast -o "$D/probe" tools/grapheme/probe.fi || { echo "FAIL compile probe"; exit 1; }
 # optional reference: regex module (own copy under $D, nothing installed system-wide)
 if ! python3 -I -c "import regex" 2>/dev/null; then
-    timeout 90 python3 -m pip install -q --disable-pip-version-check --target "$D/pk" regex >/dev/null 2>&1
+    timeout 90 python3 -m pip install -q --disable-pip-version-check --target "$D/pk" regex==2026.2.19 >/dev/null 2>&1
 fi
 python3 - "$D/probe" "$D" "$(pwd)" <<'PY' || rc=1
 import os, random, struct, subprocess, sys
