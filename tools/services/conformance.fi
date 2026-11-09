@@ -7,6 +7,7 @@ import services.svcfile
 import services.svcclip
 import services.svcdialog
 import services.svcstore
+import services.svcdir
 
 static mut failures: i32 = 0
 static mut checks: i32 = 0
@@ -158,6 +159,83 @@ fn check_file_cancel() {
     svc.reply_free(&r)
 }
 
+fn push_le64(b: *mut rt.Buf, v: u64) {
+    for i in 0..8 {
+        rt.buf_push(b, ((v >> (8 * i as u64)) & 255 as u64) as u8)
+    }
+}
+
+fn host_dir_item(is_dir: bool, path: str, size: u64) {
+    var rec: rt.Buf = rt.buf_new()
+    push_le64(&rec, size)
+    push_le64(&rec, 1500 as u64)
+    var flag: u32 = 0 as u32
+    if is_dir {
+        flag = 1 as u32
+    }
+    svc.host_event(svc.HOST_DIALOG, svc.DIALOG_DIR_ITEM, flag, path, rt.buf_ptr(&rec), 16)
+    rt.buf_free(&rec)
+}
+
+fn list_names(path: str, out: *mut rt.Buf) -> i32 {
+    rt.buf_clear(out)
+    return svcdir.list(path, out)
+}
+
+fn count_entries(buf: *mut rt.Buf) -> usize {
+    var pos: usize = 0
+    var n: usize = 0
+    var e: svcdir.DirEntry = svcdir.entry_new()
+    while svcdir.next_entry(buf, &pos, &e) {
+        n = n + 1
+    }
+    return n
+}
+
+fn check_dir_tree() {
+    var out: rt.Buf = rt.buf_new()
+    var pos: usize = 0
+    var e: svcdir.DirEntry = svcdir.entry_new()
+    check("dir list root", list_names("/", &out) == svc.OK && count_entries(&out) == 1)
+    check("dir root entry", svcdir.next_entry(&out, &pos, &e) && e.name == "proj" && e.is_dir)
+    check("dir list proj", list_names("/proj/", &out) == svc.OK && count_entries(&out) == 2)
+    pos = 0
+    check("dir file entry", svcdir.next_entry(&out, &pos, &e) && e.name == "a.txt" && !e.is_dir)
+    check("dir file size", e.size == 5 as u64)
+    check("dir file mtime", e.mtime_ns == 1500000000)
+    check("dir list sub", list_names("/proj/sub", &out) == svc.OK && count_entries(&out) == 1)
+    check("dir list file", list_names("/proj/a.txt", &out) == svc.NOT_DIR)
+    check("dir list missing", list_names("/proj/nope", &out) == svc.NOT_FOUND)
+    check("dir list relative", list_names("proj", &out) == svc.NOT_FOUND)
+    rt.buf_free(&out)
+}
+
+fn check_dir_pick() {
+    var id: u32 = 0 as u32
+    if !svc.has(svc.CAP_DIR_PICK) {
+        check("dir pick no backend", svcdir.pick(&id) == svc.NO_BACKEND && id == 0 as u32)
+        return
+    }
+    check("dir pick request", svcdir.pick(&id) == svc.OK && id != 0 as u32)
+    var other: u32 = 0 as u32
+    check("dir second pick busy", svcdir.pick(&other) == svc.BUSY)
+    host_dir_item(true, "proj", 0 as u64)
+    host_dir_item(false, "proj/a.txt", 5 as u64)
+    host_dir_item(true, "proj/sub", 0 as u64)
+    host_dir_item(false, "proj/sub/b.txt", 7 as u64)
+    check("dir host end taken", svc.host_event(svc.HOST_DIALOG, svc.DIALOG_DIR_END, 4 as u32, "", 0, 0))
+    var r: svc.Reply = svc.reply_new()
+    check("dir picked reply", next_reply(&r) && r.id == id && r.op == svc.OP_DIR_PICKED && r.status == svc.OK
+        && r.index == 4 as u32 && rt.buf_str(&r.name) == "/proj")
+    check_dir_tree()
+    check("dir pick again", svcdir.pick(&id) == svc.OK)
+    host_dir_item(true, "other", 0 as u64)
+    svc.host_event(svc.HOST_DIALOG, svc.DIALOG_DIR_CANCEL, 0 as u32, "", 0, 0)
+    check("dir canceled reply", next_reply(&r) && r.id == id && r.op == svc.OP_DIR_PICKED && r.status == svc.CANCELED)
+    svc.reply_free(&r)
+    check_dir_tree()
+}
+
 fn check_file_save() {
     let body: str = "saved by services"
     check("file save bad name", svcfile.save("", "text/plain", body.p as u64, body.length()) == svc.INVALID)
@@ -190,6 +268,7 @@ fn main() -> i32 {
     check_clipboard()
     check_file_open()
     check_file_save()
+    check_dir_pick()
     check_dialogs()
     check("queue drained", svc.pending() == 0 && svc.open_requests() == 0)
     var line: rt.Buf = rt.buf_new()

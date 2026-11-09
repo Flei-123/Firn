@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.webview_types
+
+export {
+    Stub, stub_new, stub_free, stub_backend, stub_push_event, stub_kill, stub_pixel,
+    stub_input_count, stub_scroll, stub_typed, stub_last_reply_id, stub_last_reply_status,
+    stub_last_reply_text, stub_size, stub_scale, stub_ticks, stub_destroyed,
+    LINK_W, LINK_H, LINK_HREF,
+}
+
+const LINK_W: f64 = 64.0
+const LINK_H: f64 = 24.0
+const LINK_HREF: str = "https://example.org/next"
+const QUEUE_LIMIT: usize = 65536
+const EVENT_HEADER_BYTES: usize = 16
+const WHEEL_STEP: f64 = 20.0
+const CHAR_ADVANCE: f64 = 8.0
+const CARET_PAD: f64 = 4.0
+const CARET_H: f64 = 16.0
+const INPUT_KINDS: usize = 16
+const FRAME_ALPHA: u32 = 4278190080
+
+struct Stub {
+    caps: u32,
+    w: u32,
+    h: u32,
+    scale: u32,
+    base: u32,
+    scroll: u32,
+    dirty: bool,
+    dead: bool,
+    destroyed: bool,
+    focused: bool,
+    over_link: bool,
+    typed: u32,
+    ticks: u32,
+    reply_id: u32,
+    reply_status: u32,
+    reply_text: rt.Buf,
+    queue: rt.Buf,
+    read_pos: usize,
+    counts: [u32; 16],
+}
+
+fn stub_new(caps: u32) -> *mut Stub {
+    let s: *mut Stub = rt.heap_alloc(512) as *mut Stub
+    (*s).caps = caps
+    (*s).w = 0
+    (*s).h = 0
+    (*s).scale = 1000
+    (*s).base = 0
+    (*s).scroll = 0
+    (*s).dirty = false
+    (*s).dead = false
+    (*s).destroyed = false
+    (*s).focused = false
+    (*s).over_link = false
+    (*s).typed = 0
+    (*s).ticks = 0
+    (*s).reply_id = 0
+    (*s).reply_status = 0
+    (*s).reply_text = rt.buf_new()
+    (*s).queue = rt.buf_new()
+    (*s).read_pos = 0
+    (*s).counts = [0 as u32; 16]
+    return s
+}
+
+fn stub_free(s: *mut Stub) {
+    rt.buf_free(&(*s).reply_text)
+    rt.buf_free(&(*s).queue)
+    rt.heap_free(s as u64, 512)
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn get_u32(b: *mut rt.Buf, at: usize) -> u32 {
+    let p: u64 = rt.buf_ptr(b)
+    return rt.ld8(p, at) as u32 | ((rt.ld8(p, at + 1) as u32) << 8) | ((rt.ld8(p, at + 2) as u32) << 16) | ((rt.ld8(p, at + 3) as u32) << 24)
+}
+
+fn stub_push_event(s: *mut Stub, kind: u32, a: u32, b: u32, p: u64, n: usize) {
+    if rt.buf_len(&(*s).queue) + EVENT_HEADER_BYTES + n > QUEUE_LIMIT {
+        return
+    }
+    put_u32(&(*s).queue, kind)
+    put_u32(&(*s).queue, a)
+    put_u32(&(*s).queue, b)
+    put_u32(&(*s).queue, n as u32)
+    if n > 0 {
+        rt.buf_push_bytes(&(*s).queue, p, n)
+    }
+}
+
+fn stub_kill(s: *mut Stub) {
+    (*s).dead = true
+}
+
+fn hash_of(p: u64, n: usize) -> u32 {
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u32)) *% (16777619 as u32)
+        i = i + 1
+    }
+    return h
+}
+
+fn stub_pixel(s: *mut Stub, x: u32, y: u32) -> u32 {
+    let r: u32 = (x + (*s).scroll) & 255 as u32
+    let g: u32 = y & 255 as u32
+    return FRAME_ALPHA | (r << 16) | (g << 8) | ((*s).base & 255 as u32)
+}
+
+fn stub_create(ud: u64, w: u32, h: u32) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    (*s).w = w
+    (*s).h = h
+    (*s).dirty = true
+    return true
+}
+
+fn stub_destroy(ud: u64) {
+    let s: *mut Stub = ud as *mut Stub
+    (*s).destroyed = true
+}
+
+fn stub_load(ud: u64, kind: u32, p: u64, n: usize) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    if kind == webview_types.LOAD_URL && ((*s).caps & webview_types.CAP_URL) == 0 as u32 {
+        return false
+    }
+    (*s).base = hash_of(p, n)
+    (*s).scroll = 0
+    (*s).dirty = true
+    stub_push_event(s, webview_types.EV_TITLE, 0 as u32, 0 as u32, p, n)
+    stub_push_event(s, webview_types.EV_LOADED, 1 as u32, (*s).h * 4, 0, 0)
+    return true
+}
+
+fn stub_resize(ud: u64, w: u32, h: u32, scale: u32) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    (*s).w = w
+    (*s).h = h
+    (*s).scale = scale
+    (*s).dirty = true
+    return true
+}
+
+fn stub_paint(ud: u64, px: u64, stride: usize, cap: usize, damage: *mut webview_types.DamageRect) -> u32 {
+    let s: *mut Stub = ud as *mut Stub
+    if stride < ((*s).w as usize) * 4 || cap < stride * ((*s).h as usize) {
+        return webview_types.RENDER_BUFFER_TOO_SMALL
+    }
+    var y: u32 = 0
+    while y < (*s).h {
+        let row: u64 = px + (y as usize * stride) as u64
+        var x: u32 = 0
+        while x < (*s).w {
+            rt.st32(row, x as usize, stub_pixel(s, x, y))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*damage).x = 0 as u32
+    (*damage).y = 0 as u32
+    (*damage).w = (*s).w
+    (*damage).h = (*s).h
+    (*s).dirty = false
+    return webview_types.RENDER_CHANGED
+}
+
+fn in_link(x: f64, y: f64) -> bool {
+    return x >= 0.0 && y >= 0.0 && x < LINK_W && y < LINK_H
+}
+
+fn on_move(s: *mut Stub, x: f64, y: f64) {
+    let over: bool = in_link(x, y)
+    if over == (*s).over_link {
+        return
+    }
+    (*s).over_link = over
+    if over {
+        stub_push_event(s, webview_types.EV_CURSOR, 1 as u32, 0 as u32, 0, 0)
+        stub_push_event(s, webview_types.EV_HOVER, 0 as u32, 0 as u32, LINK_HREF.p as u64, LINK_HREF.n)
+    } else {
+        stub_push_event(s, webview_types.EV_CURSOR, 0 as u32, 0 as u32, 0, 0)
+        stub_push_event(s, webview_types.EV_HOVER, 0 as u32, 0 as u32, 0, 0)
+    }
+}
+
+fn on_wheel(s: *mut Stub, dy: f64) {
+    var next: f64 = (*s).scroll as f64 + dy * WHEEL_STEP
+    if next < 0.0 {
+        next = 0.0
+    }
+    (*s).scroll = next as u32
+    (*s).dirty = true
+    stub_push_event(s, webview_types.EV_SCROLLED, (*s).scroll, 0 as u32, 0, 0)
+}
+
+fn on_reply(s: *mut Stub, input: *mut webview_types.Input) {
+    (*s).reply_id = (*input).id
+    (*s).reply_status = (*input).status
+    rt.buf_clear(&(*s).reply_text)
+    rt.buf_push_bytes(&(*s).reply_text, rt.buf_ptr(&(*input).text), rt.buf_len(&(*input).text))
+}
+
+fn stub_input(ud: u64, input: *mut webview_types.Input) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    let k: u32 = (*input).kind
+    if (k as usize) < INPUT_KINDS {
+        (*s).counts[k as usize] = (*s).counts[k as usize] + 1
+    }
+    if k == webview_types.IN_MOVE {
+        on_move(s, (*input).x, (*input).y)
+        return true
+    }
+    if k == webview_types.IN_UP && in_link((*input).x, (*input).y) {
+        stub_push_event(s, webview_types.EV_NAV, 0 as u32, 0 as u32, LINK_HREF.p as u64, LINK_HREF.n)
+        return true
+    }
+    if k == webview_types.IN_WHEEL {
+        on_wheel(s, (*input).dy)
+        return true
+    }
+    if k == webview_types.IN_CHAR {
+        (*s).typed = (*s).typed + 1
+        return true
+    }
+    if k == webview_types.IN_COMMIT {
+        (*s).typed = (*s).typed + rt.buf_len(&(*input).text) as u32
+        return true
+    }
+    if k == webview_types.IN_PREEDIT {
+        return true
+    }
+    if k == webview_types.IN_FOCUS || k == webview_types.IN_BLUR {
+        (*s).focused = k == webview_types.IN_FOCUS
+        return true
+    }
+    if k == webview_types.IN_REPLY {
+        on_reply(s, input)
+        return true
+    }
+    return k == webview_types.IN_KEY_DOWN || k == webview_types.IN_KEY_UP || k == webview_types.IN_DOWN || k == webview_types.IN_UP
+}
+
+fn stub_tick(ud: u64, now_us: i64) -> u32 {
+    let s: *mut Stub = ud as *mut Stub
+    if (*s).dead {
+        return webview_types.TICK_DEAD
+    }
+    (*s).ticks = (*s).ticks + 1
+    if (*s).dirty {
+        return webview_types.TICK_DIRTY
+    }
+    return webview_types.TICK_IDLE
+}
+
+fn stub_next_event(ud: u64, ev: *mut webview_types.Event) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    let total: usize = rt.buf_len(&(*s).queue)
+    if (*s).read_pos + EVENT_HEADER_BYTES > total {
+        rt.buf_clear(&(*s).queue)
+        (*s).read_pos = 0
+        return false
+    }
+    let at: usize = (*s).read_pos
+    let n: usize = get_u32(&(*s).queue, at + 12) as usize
+    (*ev).kind = get_u32(&(*s).queue, at)
+    (*ev).a = get_u32(&(*s).queue, at + 4)
+    (*ev).b = get_u32(&(*s).queue, at + 8)
+    rt.buf_clear(&(*ev).text)
+    if n > 0 {
+        rt.buf_push_bytes(&(*ev).text, rt.buf_ptr(&(*s).queue) + (at + EVENT_HEADER_BYTES) as u64, n)
+    }
+    (*s).read_pos = at + EVENT_HEADER_BYTES + n
+    return true
+}
+
+fn stub_caret(ud: u64, r: *mut webview_types.Rect) -> bool {
+    let s: *mut Stub = ud as *mut Stub
+    if !(*s).focused {
+        return false
+    }
+    (*r).x = CARET_PAD + ((*s).typed as f64) * CHAR_ADVANCE
+    (*r).y = CARET_PAD
+    (*r).w = 1.0
+    (*r).h = CARET_H
+    return true
+}
+
+fn stub_wait_ms(ud: u64, now_us: i64) -> i64 {
+    return 0 - 1
+}
+
+fn stub_backend(s: *mut Stub) -> webview_types.Backend {
+    return webview_types.Backend { ud: s as u64, caps: (*s).caps, create: stub_create, destroy: stub_destroy,
+        load: stub_load, resize: stub_resize, paint: stub_paint, input: stub_input, tick: stub_tick,
+        next_event: stub_next_event, caret: stub_caret, wait_ms: stub_wait_ms }
+}
+
+fn stub_input_count(s: *mut Stub, kind: u32) -> u32 {
+    if (kind as usize) >= INPUT_KINDS {
+        return 0 as u32
+    }
+    return (*s).counts[kind as usize]
+}
+
+fn stub_scroll(s: *mut Stub) -> u32 { return (*s).scroll }
+fn stub_typed(s: *mut Stub) -> u32 { return (*s).typed }
+fn stub_last_reply_id(s: *mut Stub) -> u32 { return (*s).reply_id }
+fn stub_last_reply_status(s: *mut Stub) -> u32 { return (*s).reply_status }
+fn stub_last_reply_text(s: *mut Stub) -> str { return rt.buf_str(&(*s).reply_text) }
+fn stub_scale(s: *mut Stub) -> u32 { return (*s).scale }
+fn stub_ticks(s: *mut Stub) -> u32 { return (*s).ticks }
+fn stub_destroyed(s: *mut Stub) -> bool { return (*s).destroyed }
+
+fn stub_size(s: *mut Stub, w: *mut u32, h: *mut u32) {
+    *w = (*s).w
+    *h = (*s).h
+}

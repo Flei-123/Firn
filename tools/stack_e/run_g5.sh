@@ -10,6 +10,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 export FIRNLIB="$(pwd)/lib"
 rc=0
+export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}
 # G5: Windows DLL (x86_64-windows, Wine) and aarch64 .so (qemu-aarch64): integer, pointer, f32/f64 exports, more arguments than registers.
 # The Wine tiers share ~/.wine-firn: never run two Wine stages at once.
 if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; then
@@ -18,22 +19,22 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/wd.dll" tools/stack_e/lib_win.fi || { echo "FAIL dll $lvl"; rc=1; continue; }
         [ -e "$D/wd.def" ] || [ -e "$D/wd.o" ] && { echo "FAIL dll $lvl: temp files left"; rc=1; }
         x86_64-w64-mingw32-objdump -p "$D/wd.dll" | grep -q 'wd_gc_chains' || { echo "FAIL dll $lvl: export missing"; rc=1; }
-        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_win.exe wd.dll win 2>&1 | grep -q 'all ok') && echo "ok  Windows DLL under Wine ($lvl)" || { echo "FAIL DLL host (wine, $lvl)"; rc=1; }
+        (cd "$D" && WINEDEBUG=-all timeout 120 wine host_win.exe wd.dll win 2>&1 | grep -q 'all ok') && echo "ok  Windows DLL under Wine ($lvl)" || { echo "FAIL DLL host (wine, $lvl)"; rc=1; }
     done
     "$FIRNC" --shared --target=x86_64-windows -o "$D/rt.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt"; rc=1; }
-    (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_win.exe rt.dll rt 2>&1 | grep -q 'all ok') && echo "ok  runtime (heap, jobs, GC on 4 threads) in a Windows DLL" || { echo "FAIL DLL runtime (wine)"; rc=1; }
+    (cd "$D" && WINEDEBUG=-all timeout 120 wine host_win.exe rt.dll rt 2>&1 | grep -q 'all ok') && echo "ok  runtime (heap, jobs, GC on 4 threads) in a Windows DLL" || { echo "FAIL DLL runtime (wine)"; rc=1; }
     # floats and stack arguments: Win64 thunk (rcx/rdx/r8/r9 | xmm0-3 | stack  ->  System V placement), same C host as the .so tiers
     x86_64-w64-mingw32-gcc -O1 -o "$D/host_abi.exe" tools/stack_e/host_abi.c || { echo "FAIL mingw host_abi"; rc=1; }
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/abi.dll" tools/stack_e/lib_abi.fi || { echo "FAIL dll lib_abi $lvl"; rc=1; continue; }
-        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_abi.exe abi.dll 2>&1 | grep -q 'host_abi: all ok') && echo "ok  Windows DLL floats + stack arguments under Wine ($lvl)" || { echo "FAIL DLL float/stack ABI (wine, $lvl)"; rc=1; }
+        (cd "$D" && WINEDEBUG=-all timeout 120 wine host_abi.exe abi.dll 2>&1 | grep -q 'host_abi: all ok') && echo "ok  Windows DLL floats + stack arguments under Wine ($lvl)" || { echo "FAIL DLL float/stack ABI (wine, $lvl)"; rc=1; }
     done
     # structs by value in DLL exports (r506): sizes 1-8 in the slot, odd sizes via a pointer, 12/16 as two words, 24 as a pointer,
     # float words, struct results in rax / through the hidden pointer; the same C host would pass them to a mingw-built library
     x86_64-w64-mingw32-gcc -O1 -o "$D/host_struct.exe" tools/stack_e/host_struct.c || { echo "FAIL mingw host_struct"; rc=1; }
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/st.dll" tools/stack_e/lib_struct.fi || { echo "FAIL dll lib_struct $lvl"; rc=1; continue; }
-        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_struct.exe st.dll 2>&1 | grep -q 'host_struct: all ok') && echo "ok  Windows DLL structs by value under Wine ($lvl)" || { echo "FAIL DLL struct ABI (wine, $lvl)"; rc=1; }
+        (cd "$D" && WINEDEBUG=-all timeout 120 wine host_struct.exe st.dll 2>&1 | grep -q 'host_struct: all ok') && echo "ok  Windows DLL structs by value under Wine ($lvl)" || { echo "FAIL DLL struct ABI (wine, $lvl)"; rc=1; }
     done
     # host threads of their own in a DLL (r506): 4 CreateThread threads attach/detach in two waves (entries recycled), jobs + GC
     x86_64-w64-mingw32-gcc -O1 -o "$D/hat.exe" tools/stack_e/host_attach_win.c || { echo "FAIL mingw host_attach_win"; rc=1; }
@@ -41,7 +42,7 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rta.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (attach) $lvl"; rc=1; continue; }
         ok=1
         for rep in 1 2 3; do
-            (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hat.exe rta.dll 2>&1 | tail -1 | grep -q 'ok  host_attach') || { echo "FAIL DLL attached host threads (wine, $lvl, run $rep)"; rc=1; ok=0; break; }
+            (cd "$D" && WINEDEBUG=-all timeout 300 wine hat.exe rta.dll 2>&1 | tail -1 | grep -q 'ok  host_attach') || { echo "FAIL DLL attached host threads (wine, $lvl, run $rep)"; rc=1; ok=0; break; }
         done
         [ $ok = 1 ] && echo "ok  Windows DLL attached host threads under Wine ($lvl)"
     done
@@ -50,12 +51,12 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rtn.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (noattach) $lvl"; rc=1; continue; }
         # keep the Wine output: a FAIL here was seen once under load 39 and did not reproduce in 24 reruns, so show why next time
-        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll > "$D/hna.out" 2>&1; echo "exit $?" >> "$D/hna.out"); tail -2 "$D/hna.out" | head -1 | grep -q 'ok  host_noattach' && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; tail -n 5 "$D/hna.out" | sed 's/^/      /'; rc=1; }
+        (cd "$D" && WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll > "$D/hna.out" 2>&1; echo "exit $?" >> "$D/hna.out"); tail -2 "$D/hna.out" | head -1 | grep -q 'ok  host_noattach' && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; tail -n 5 "$D/hna.out" | sed 's/^/      /'; rc=1; }
     done
     # r576: stale host-thread stacks that the host re-mapped (no-access / guard / read-write) must not be scanned (VirtualQuery over every region)
     x86_64-w64-mingw32-gcc -O1 -o "$D/hrm.exe" tools/stack_e/host_remap_win.c || { echo "FAIL mingw host_remap_win"; rc=1; }
     "$FIRNC" --shared --target=x86_64-windows -o "$D/rtr.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (remap)"; rc=1; }
-    (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hrm.exe rtr.dll 2>&1 | tail -1 | grep -q 'ok  host_remap') && echo "ok  Windows DLL: stale host stacks re-mapped by the host are not scanned" || { echo "FAIL DLL re-mapped stale stack (wine)"; rc=1; }
+    (cd "$D" && WINEDEBUG=-all timeout 300 wine hrm.exe rtr.dll 2>&1 | tail -1 | grep -q 'ok  host_remap') && echo "ok  Windows DLL: stale host stacks re-mapped by the host are not scanned" || { echo "FAIL DLL re-mapped stale stack (wine)"; rc=1; }
     # --def: module definition of the exports; dlltool turns it into an import library that links against the DLL
     "$FIRNC" --shared --target=x86_64-windows --def="$D/wdx.def" -o "$D/wd.dll" tools/stack_e/lib_win.fi || { echo "FAIL dll --def"; rc=1; }
     grep -q "^EXPORTS" "$D/wdx.def" && grep -q wd_gc_chains "$D/wdx.def" || { echo "FAIL --def: EXPORTS/wd_gc_chains missing"; rc=1; }
@@ -64,7 +65,7 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
     # r570: ten v128 parameters (Win64 hands them over as pointers; the thunk puts the ones beyond xmm7 on the stack, 16 aligned)
     x86_64-w64-mingw32-gcc -O1 -o "$D/hv.exe" tools/stack_e/host_v128stack.c || { echo "FAIL mingw host_v128stack"; rc=1; }
     "$FIRNC" --shared --target=x86_64-windows --opt-level=dev-fast -o "$D/v128s.dll" tools/stack_e/lib_v128stack.fi || { echo "FAIL dll lib_v128stack"; rc=1; }
-    (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hv.exe v128s.dll 2>&1 | tail -1 | grep -q 'ok  host_v128stack') && echo "ok  Windows DLL ten v128 parameters under Wine" || { echo "FAIL DLL v128 stack parameters (wine)"; rc=1; }
+    (cd "$D" && WINEDEBUG=-all timeout 300 wine hv.exe v128s.dll 2>&1 | tail -1 | grep -q 'ok  host_v128stack') && echo "ok  Windows DLL ten v128 parameters under Wine" || { echo "FAIL DLL v128 stack parameters (wine)"; rc=1; }
 else echo "skip  Windows DLL (no wine / mingw)"; fi
 if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/null && [ -d /usr/aarch64-linux-gnu/lib ]; then
     aarch64-linux-gnu-gcc -O1 -fstack-protector-all -o "$D/host_a64" tools/stack_e/host_a64.c -ldl || { echo "FAIL aarch64 gcc host"; rc=1; }

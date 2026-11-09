@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.services
+import fui.webview
+import fui.webview_types
+
+export { SvcLink, svc_link_new, svc_link_free, svc_attach, svc_poll }
+
+const LINE_END: u8 = 10
+const OPEN_TITLE: str = "Open"
+const SAVE_TITLE: str = "Save"
+const NO_TEXT: str = ""
+
+struct SvcLink {
+    wv: *mut webview.WebView,
+    clip_id: u32,
+    open_id: u32,
+    save_id: u32,
+    ev: services.SvcEvent,
+}
+
+fn svc_link_new() -> SvcLink {
+    return SvcLink { wv: 0 as u64 as *mut webview.WebView, clip_id: 0, open_id: 0, save_id: 0, ev: services.event_new() }
+}
+
+fn svc_link_free(l: *mut SvcLink) {
+    services.event_free(&(*l).ev)
+}
+
+fn text_of(ev: *mut webview_types.Event) -> str {
+    return rt.buf_str(&(*ev).text)
+}
+
+fn line_end(s: str) -> usize {
+    var i: usize = 0
+    while i < s.n && rt.ld8(s.p as u64, i) != LINE_END {
+        i = i + 1
+    }
+    return i
+}
+
+fn head_of(s: str) -> str {
+    return str { p: s.p, n: line_end(s) }
+}
+
+fn tail_of(s: str) -> str {
+    let at: usize = line_end(s)
+    if at >= s.n {
+        return NO_TEXT
+    }
+    return str { p: rt.ptr_of(s.p as u64 + (at + 1) as u64), n: s.n - at - 1 }
+}
+
+fn reply(l: *mut SvcLink, id: u32, status: u32, p: u64, n: usize) {
+    webview.webview_reply((*l).wv, id, status, p, n)
+}
+
+fn reply_status(l: *mut SvcLink, id: u32, ok: bool) {
+    var status: u32 = 0
+    if ok {
+        status = 1
+    }
+    reply(l, id, status, 0, 0)
+}
+
+fn allowed(l: *mut SvcLink, bit: u32) -> bool {
+    return (webview.webview_perms((*l).wv) & bit) != 0 as u32
+}
+
+fn on_clip_read(l: *mut SvcLink, id: u32) {
+    if !allowed(l, webview_types.PERM_CLIP) || !services.clip_request() {
+        reply_status(l, id, false)
+        return
+    }
+    (*l).clip_id = id
+}
+
+fn on_open(l: *mut SvcLink, id: u32, filters: str) {
+    if !allowed(l, webview_types.PERM_FILES) || !services.open_request(OPEN_TITLE, filters) {
+        reply_status(l, id, false)
+        return
+    }
+    (*l).open_id = id
+}
+
+fn on_save(l: *mut SvcLink, id: u32, body: str) {
+    let data: str = tail_of(body)
+    if !allowed(l, webview_types.PERM_FILES) || !services.save_request(SAVE_TITLE, head_of(body), data.p as u64, data.n) {
+        reply_status(l, id, false)
+        return
+    }
+    (*l).save_id = id
+}
+
+fn on_dialog(l: *mut SvcLink, kind: u32, id: u32, body: str) {
+    if !allowed(l, webview_types.PERM_DIALOG) {
+        reply_status(l, id, false)
+        return
+    }
+    if kind == webview_types.EV_CONFIRM {
+        reply_status(l, id, services.confirm(head_of(body), tail_of(body)))
+        return
+    }
+    services.message(services.KIND_INFO, head_of(body), tail_of(body), services.BTNS_OK)
+    reply_status(l, id, true)
+}
+
+fn handle(ud: u64, ev: *mut webview_types.Event) {
+    let l: *mut SvcLink = ud as *mut SvcLink
+    let k: u32 = (*ev).kind
+    let body: str = text_of(ev)
+    if k == webview_types.EV_CLIP_WRITE {
+        if allowed(l, webview_types.PERM_CLIP) {
+            services.clip_copy(body)
+        }
+    } else if k == webview_types.EV_CLIP_READ {
+        on_clip_read(l, (*ev).a)
+    } else if k == webview_types.EV_OPEN_FILE {
+        on_open(l, (*ev).a, body)
+    } else if k == webview_types.EV_SAVE_FILE {
+        on_save(l, (*ev).a, body)
+    } else if k == webview_types.EV_CONFIRM || k == webview_types.EV_ALERT {
+        on_dialog(l, k, (*ev).a, body)
+    } else {
+        reply_status(l, (*ev).a, false)
+    }
+}
+
+fn svc_attach(l: *mut SvcLink, wv: *mut webview.WebView) {
+    (*l).wv = wv
+    webview.webview_on_service(wv, l as u64, handle)
+}
+
+fn pending_any(l: *mut SvcLink) -> bool {
+    return (*l).clip_id != 0 as u32 || (*l).open_id != 0 as u32 || (*l).save_id != 0 as u32
+}
+
+fn answer(l: *mut SvcLink) {
+    let ev: *mut services.SvcEvent = &(*l).ev
+    var id: u32 = 0
+    if (*ev).kind == services.EV_CLIP {
+        id = (*l).clip_id
+        (*l).clip_id = 0
+    } else if (*ev).kind == services.EV_OPENED {
+        id = (*l).open_id
+        (*l).open_id = 0
+    } else if (*ev).kind == services.EV_SAVED {
+        id = (*l).save_id
+        (*l).save_id = 0
+    }
+    if id == 0 as u32 {
+        return
+    }
+    reply(l, id, (*ev).status, rt.buf_ptr(&(*ev).data), rt.buf_len(&(*ev).data))
+}
+
+fn svc_poll(l: *mut SvcLink) -> bool {
+    if !pending_any(l) || services.pending() == 0 {
+        return false
+    }
+    if !services.next(&(*l).ev) {
+        return false
+    }
+    answer(l)
+    return true
+}

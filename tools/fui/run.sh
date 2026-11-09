@@ -961,6 +961,11 @@ echo "== 18p7b. FILE MANAGER (examples/fui_apps/fm, fui.fsbackend, fui.memtree, 
 FUI_AUDIT=1 "$W/fm_app" --sample --data examples/fui_apps/data || exit 1
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
+echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
+for n in term_vt term_input term_pty; do
+    "$FIRNC" --opt-level=dev -o "$W/$n" tools/fui/${n}_main.fi || exit 1
+    "$W/$n" || exit 1
+done
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
@@ -1199,6 +1204,8 @@ build kitrtl
 "$W/kitrtl" | tail -n 3
 build qrview
 "$W/qrview" | tail -n 3
+build webview
+"$W/webview" | tail -n 3 | grep -q "WEBVIEW PASSED"
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="

@@ -14,7 +14,7 @@ if ! command -v wine >/dev/null || ! command -v x86_64-w64-mingw32-ld >/dev/null
     exit 0
 fi
 W=$(mktemp -d)
-export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-firn}" WINEDEBUG=-all
+export WINEPREFIX="${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}" WINEDEBUG=-all
 trap 'wineserver -k >/dev/null 2>&1 || true; rm -rf "$W"' EXIT
 FIRNLIB="$(pwd)/lib" "$FIRNC" --target=x86_64-windows -o "$W/probe.exe" tools/audio/wasapi/main.fi
 FIRNLIB="$(pwd)/lib" "$FIRNC" --target=x86_64-windows -o "$W/sink.exe" tools/desktop/sink_main.fi

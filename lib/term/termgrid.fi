@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export {
+    Grid, grid_new, grid_free, grid_ok, grid_resize, grid_reset,
+    phys_row, abs_phys, cell_ix, blank_row, copy_row_cells, touch,
+    cell_cp, cell_fg, cell_bg, cell_flags, row_wrapped, abs_lines,
+    screen_cp, screen_fg, screen_bg, screen_flags,
+    set_cell, get_flags, set_flags,
+    F_BOLD, F_DIM, F_ITALIC, F_UNDERLINE, F_INVERSE, F_STRIKE, F_WIDE, F_TAIL, F_HIDDEN,
+    COLOR_DEFAULT, COLOR_INDEXED, COLOR_RGB, color_indexed, color_rgb, color_kind, color_value,
+    TAB_WIDTH,
+}
+
+const CELL_U32: usize = 4
+const CELL_BYTES: usize = 16
+const TAB_WIDTH: usize = 8
+
+const F_BOLD: u32 = 1
+const F_DIM: u32 = 2
+const F_ITALIC: u32 = 4
+const F_UNDERLINE: u32 = 8
+const F_INVERSE: u32 = 16
+const F_STRIKE: u32 = 32
+const F_WIDE: u32 = 64
+const F_TAIL: u32 = 128
+const F_HIDDEN: u32 = 256
+
+const COLOR_DEFAULT: u32 = 0
+const COLOR_INDEXED: u32 = 1
+const COLOR_RGB: u32 = 2
+
+struct Grid {
+    cols: usize,
+    rows: usize,
+    sb_max: usize,
+    cap: usize,
+    data: u64,
+    wrap: u64,
+    tabs: u64,
+    head: usize,
+    sb_len: usize,
+    cx: usize,
+    cy: usize,
+    pending: bool,
+    fg: u32,
+    bg: u32,
+    flags: u32,
+    top: usize,
+    bot: usize,
+    gen: u64,
+    dropped: u64,
+    origin: bool,
+    autowrap: bool,
+    insert: bool,
+    s_cx: usize,
+    s_cy: usize,
+    s_fg: u32,
+    s_bg: u32,
+    s_flags: u32,
+    s_pending: bool,
+    s_origin: bool,
+}
+
+fn color_indexed(i: u32) -> u32 { return (COLOR_INDEXED << 24) | (i & 0xFF) }
+
+fn color_rgb(rgb: u32) -> u32 { return (COLOR_RGB << 24) | (rgb & 0xFFFFFF) }
+
+fn color_kind(c: u32) -> u32 { return c >> 24 }
+
+fn color_value(c: u32) -> u32 { return c & 0xFFFFFF }
+
+fn touch(g: *mut Grid) { (*g).gen = (*g).gen + 1 as u64 }
+
+fn grid_ok(g: *mut Grid) -> bool { return (*g).data != 0 as u64 && (*g).wrap != 0 as u64 && (*g).tabs != 0 as u64 }
+
+fn init_tabs(g: *mut Grid) {
+    var x: usize = 0
+    while x < (*g).cols {
+        var v: u8 = 0 as u8
+        if x % TAB_WIDTH == 0 { v = 1 as u8 }
+        rt.st8((*g).tabs, x, v)
+        x = x + 1
+    }
+}
+
+fn alloc_storage(g: *mut Grid, cols: usize, rows: usize, sb_max: usize) {
+    (*g).cols = cols
+    (*g).rows = rows
+    (*g).sb_max = sb_max
+    (*g).cap = rows + sb_max
+    (*g).data = rt.heap_alloc((*g).cap * cols * CELL_BYTES)
+    (*g).wrap = rt.heap_alloc((*g).cap)
+    (*g).tabs = rt.heap_alloc(cols)
+}
+
+fn release_storage(data: u64, wrap: u64, tabs: u64, cap: usize, cols: usize) {
+    if data != 0 as u64 { rt.heap_free(data, cap * cols * CELL_BYTES) }
+    if wrap != 0 as u64 { rt.heap_free(wrap, cap) }
+    if tabs != 0 as u64 { rt.heap_free(tabs, cols) }
+}
+
+fn grid_new(cols: usize, rows: usize, sb_max: usize) -> Grid {
+    var c: usize = cols
+    var r: usize = rows
+    if c < 1 { c = 1 }
+    if r < 1 { r = 1 }
+    var g: Grid = Grid {
+        cols: 0, rows: 0, sb_max: 0, cap: 0, data: 0 as u64, wrap: 0 as u64, tabs: 0 as u64,
+        head: 0, sb_len: 0, cx: 0, cy: 0, pending: false, fg: 0 as u32, bg: 0 as u32, flags: 0 as u32,
+        top: 0, bot: r - 1, gen: 1 as u64, dropped: 0 as u64, origin: false, autowrap: true, insert: false,
+        s_cx: 0, s_cy: 0, s_fg: 0 as u32, s_bg: 0 as u32, s_flags: 0 as u32, s_pending: false, s_origin: false,
+    }
+    alloc_storage(&g, c, r, sb_max)
+    if grid_ok(&g) { init_tabs(&g) }
+    return g
+}
+
+fn grid_free(g: *mut Grid) {
+    release_storage((*g).data, (*g).wrap, (*g).tabs, (*g).cap, (*g).cols)
+    (*g).data = 0 as u64
+    (*g).wrap = 0 as u64
+    (*g).tabs = 0 as u64
+}
+
+fn grid_reset(g: *mut Grid) {
+    rt.mem_set((*g).data, 0 as u8, (*g).cap * (*g).cols * CELL_BYTES)
+    rt.mem_set((*g).wrap, 0 as u8, (*g).cap)
+    (*g).head = 0
+    (*g).sb_len = 0
+    (*g).cx = 0
+    (*g).cy = 0
+    (*g).pending = false
+    (*g).fg = 0 as u32
+    (*g).bg = 0 as u32
+    (*g).flags = 0 as u32
+    (*g).top = 0
+    (*g).bot = (*g).rows - 1
+    (*g).origin = false
+    (*g).autowrap = true
+    (*g).insert = false
+    init_tabs(g)
+    touch(g)
+}
+
+fn phys_row(g: *mut Grid, y: usize) -> usize { return ((*g).head + y) % (*g).cap }
+
+fn abs_phys(g: *mut Grid, line: usize) -> usize {
+    return ((*g).head + (*g).cap - (*g).sb_len + line) % (*g).cap
+}
+
+fn abs_lines(g: *mut Grid) -> usize { return (*g).sb_len + (*g).rows }
+
+fn cell_ix(g: *mut Grid, phys: usize, x: usize) -> usize { return (phys * (*g).cols + x) * CELL_U32 }
+
+fn cell_cp(g: *mut Grid, line: usize, x: usize) -> u32 {
+    return rt.ld32((*g).data, cell_ix(g, abs_phys(g, line), x))
+}
+
+fn cell_fg(g: *mut Grid, line: usize, x: usize) -> u32 {
+    return rt.ld32((*g).data, cell_ix(g, abs_phys(g, line), x) + 1)
+}
+
+fn cell_bg(g: *mut Grid, line: usize, x: usize) -> u32 {
+    return rt.ld32((*g).data, cell_ix(g, abs_phys(g, line), x) + 2)
+}
+
+fn cell_flags(g: *mut Grid, line: usize, x: usize) -> u32 {
+    return rt.ld32((*g).data, cell_ix(g, abs_phys(g, line), x) + 3)
+}
+
+fn row_wrapped(g: *mut Grid, line: usize) -> bool {
+    return rt.ld8((*g).wrap, abs_phys(g, line)) != 0 as u8
+}
+
+fn screen_cp(g: *mut Grid, y: usize, x: usize) -> u32 { return cell_cp(g, (*g).sb_len + y, x) }
+
+fn screen_fg(g: *mut Grid, y: usize, x: usize) -> u32 { return cell_fg(g, (*g).sb_len + y, x) }
+
+fn screen_bg(g: *mut Grid, y: usize, x: usize) -> u32 { return cell_bg(g, (*g).sb_len + y, x) }
+
+fn screen_flags(g: *mut Grid, y: usize, x: usize) -> u32 { return cell_flags(g, (*g).sb_len + y, x) }
+
+fn get_flags(g: *mut Grid, phys: usize, x: usize) -> u32 {
+    return rt.ld32((*g).data, cell_ix(g, phys, x) + 3)
+}
+
+fn set_flags(g: *mut Grid, phys: usize, x: usize, f: u32) {
+    rt.st32((*g).data, cell_ix(g, phys, x) + 3, f)
+}
+
+fn set_cell(g: *mut Grid, phys: usize, x: usize, cp: u32, fg: u32, bg: u32, flags: u32) {
+    let i: usize = cell_ix(g, phys, x)
+    rt.st32((*g).data, i, cp)
+    rt.st32((*g).data, i + 1, fg)
+    rt.st32((*g).data, i + 2, bg)
+    rt.st32((*g).data, i + 3, flags)
+}
+
+fn blank_row(g: *mut Grid, phys: usize) {
+    let n: usize = (*g).cols
+    if (*g).bg == 0 as u32 {
+        rt.mem_set((*g).data + (cell_ix(g, phys, 0) * 4) as u64, 0 as u8, n * CELL_BYTES)
+    } else {
+        var x: usize = 0
+        while x < n {
+            set_cell(g, phys, x, 0 as u32, 0 as u32, (*g).bg, 0 as u32)
+            x = x + 1
+        }
+    }
+    rt.st8((*g).wrap, phys, 0 as u8)
+}
+
+fn copy_row_cells(src: u64, sp: usize, sc: usize, dst: u64, dp: usize, dc: usize) {
+    var n: usize = sc
+    if dc < n { n = dc }
+    rt.mem_copy(dst + (dp * dc * CELL_BYTES) as u64, src + (sp * sc * CELL_BYTES) as u64, n * CELL_BYTES)
+    if dc < sc && n > 0 {
+        let last: usize = (dp * dc + n - 1) * CELL_U32
+        let f: u32 = rt.ld32(dst, last + 3)
+        if (f & F_WIDE) != 0 as u32 {
+            rt.st32(dst, last, 0 as u32)
+            rt.st32(dst, last + 3, f & (0xFFFFFFFF ^ F_WIDE))
+        }
+    }
+}
+
+fn old_phys(head: usize, cap: usize, sb: usize, line: usize) -> usize { return (head + cap - sb + line) % cap }
+
+fn resize_shift(g: *mut Grid, nr: usize) -> usize {
+    if (*g).cy >= nr { return (*g).cy - nr + 1 }
+    return 0
+}
+
+fn resize_pull(g: *mut Grid, nr: usize) -> usize {
+    if nr <= (*g).rows { return 0 }
+    var p: usize = nr - (*g).rows
+    if (*g).sb_len < p { p = (*g).sb_len }
+    return p
+}
+
+fn grid_resize(g: *mut Grid, ncols: usize, nrows: usize) {
+    var nc: usize = ncols
+    var nr: usize = nrows
+    if nc < 1 { nc = 1 }
+    if nr < 1 { nr = 1 }
+    if nc == (*g).cols && nr == (*g).rows { return }
+    let od: u64 = (*g).data
+    let ow: u64 = (*g).wrap
+    let ot: u64 = (*g).tabs
+    let ocap: usize = (*g).cap
+    let ocols: usize = (*g).cols
+    let orows: usize = (*g).rows
+    let ohead: usize = (*g).head
+    let osb: usize = (*g).sb_len
+    let shift: usize = resize_shift(g, nr)
+    let pull: usize = resize_pull(g, nr)
+    let a0: usize = osb + shift - pull
+    var nsb: usize = a0
+    if nsb > (*g).sb_max { nsb = (*g).sb_max }
+    let first: usize = a0 - nsb
+    alloc_storage(g, nc, nr, (*g).sb_max)
+    var i: usize = 0
+    while i < nsb {
+        let sp: usize = old_phys(ohead, ocap, osb, first + i)
+        copy_row_cells(od, sp, ocols, (*g).data, i, nc)
+        rt.st8((*g).wrap, i, rt.ld8(ow, sp))
+        i = i + 1
+    }
+    var y: usize = 0
+    while y < nr {
+        if a0 + y < osb + orows {
+            let sp: usize = old_phys(ohead, ocap, osb, a0 + y)
+            copy_row_cells(od, sp, ocols, (*g).data, nsb + y, nc)
+            rt.st8((*g).wrap, nsb + y, rt.ld8(ow, sp))
+        }
+        y = y + 1
+    }
+    release_storage(od, ow, ot, ocap, ocols)
+    (*g).head = nsb
+    (*g).sb_len = nsb
+    (*g).cy = ((*g).cy + pull) - shift
+    if (*g).cx >= nc { (*g).cx = nc - 1 }
+    (*g).pending = false
+    (*g).top = 0
+    (*g).bot = nr - 1
+    (*g).s_cx = 0
+    (*g).s_cy = 0
+    init_tabs(g)
+    touch(g)
+}
