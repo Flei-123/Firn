@@ -953,8 +953,8 @@ FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 "$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
 cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
 echo "== 18p7b. FILE MANAGER (examples/fui_apps/fm, fui.fsbackend, fui.memtree, services.svcmut): model checks, audit =="
-"$FIRNC" --opt-level=dev -o "$W/memtree_check" tools/fui/memtree_main.fi || exit 1
-"$W/memtree_check" || exit 1
+"$FIRNC" --opt-level=dev -o "$W/memtree" tools/fui/memtree_main.fi || exit 1
+"$W/memtree" || exit 1
 "$FIRNC" --opt-level=dev -o "$W/fm_check" examples/fui_apps/fm/fm_check_main.fi || exit 1
 "$W/fm_check" --sample --data examples/fui_apps/data || exit 1
 "$FIRNC" --opt-level=dev -o "$W/fm_app" examples/fui_apps/fm/main.fi || exit 1
@@ -964,10 +964,14 @@ cmp "$W/fm_light.png" tools/fui/golden_fm/fm_light.png || { echo "fm golden diff
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
-for n in term_vt term_input term_pty term_widget; do
-    "$FIRNC" --opt-level=dev -o "$W/$n" tools/fui/${n}_main.fi || exit 1
-    "$W/$n" || exit 1
-done
+"$FIRNC" --opt-level=dev -o "$W/term_vt" tools/fui/term_vt_main.fi || exit 1
+"$W/term_vt" || exit 1
+"$FIRNC" --opt-level=dev -o "$W/term_input" tools/fui/term_input_main.fi || exit 1
+"$W/term_input" || exit 1
+"$FIRNC" --opt-level=dev -o "$W/term_pty" tools/fui/term_pty_main.fi || exit 1
+"$W/term_pty" || exit 1
+"$FIRNC" --opt-level=dev -o "$W/term_widget" tools/fui/term_widget_main.fi || exit 1
+"$W/term_widget" || exit 1
 echo "== 18p9b. terminal widget demo app (examples/fui_apps/terminal): scripted shot vs golden =="
 "$FIRNC" --opt-level=dev -o "$W/terminal_app" examples/fui_apps/terminal/main.fi || exit 1
 "$W/terminal_app" --theme dark --size 900x560 --shot "$W/terminal_dark.png" || exit 1
