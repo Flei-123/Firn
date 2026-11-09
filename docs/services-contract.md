@@ -22,7 +22,7 @@ The contract WRAPS what exists; it builds nothing twice:
 | `services.svcclip` | `lib/services/svcclip.fi` | `copy_text`, `paste_text` |
 | `services.svcdialog` | `lib/services/svcdialog.fi` | `message`, `confirm` |
 | `services.svcstore` | `lib/services/svcstore.fi` | `get`, `set`, `remove`, `has` |
-| `services.svcdir` | `lib/services/svcdir.fi` | `list`, `next_entry`, `push_entry`, `DirEntry` |
+| `services.svcdir` | `lib/services/svcdir.fi` | `list`, `pick`, `next_entry`, `push_entry`, `DirEntry` |
 | backend (native) | `lib/services/svcos.fi` | wraps std.dialog / std.clipboard / std.fs / plat.fileio |
 | backend (browser) | `lib/@web/services/svcos.fi` | wraps plat.webdialog / webclip / webdownload / plat.web store; `from_web_event` |
 | backend (OrientOS) | spec only (below) | |
@@ -59,6 +59,7 @@ Numbers 0-3 are the ones of `std.dialog`.
 | `svcdialog.confirm(title, text, yes: *mut bool) -> i32` | sync | |
 | `svcstore.get(key, out: *mut rt.Buf) -> i32`, `set(key, value: str)`, `remove(key)`, `has(key) -> bool` | sync | |
 | `svcdir.list(path, out: *mut rt.Buf) -> i32` | sync | `OK`, `NOT_FOUND`, `DENIED`, `NOT_DIR`, `INVALID`, `NO_BACKEND` (web) |
+| `svcdir.pick(id: *mut u32) -> i32` | **async** | web only: the user picks a directory, its tree becomes listable (see below); native `NO_BACKEND` |
 | `svcdir.next_entry(buf, pos: *mut usize, e: *mut DirEntry) -> bool` | sync | records `name`, `is_dir`, `is_link`, `broken`, `size`, `mtime_ns`; name valid while `buf` lives |
 
 ASYNC = request + reply. The request returns `OK` and a request id (> 0) and the result comes as one or more
@@ -110,11 +111,23 @@ A file item is any WE_DIALOG while a file open is waiting, except `"color"`, `"n
 | 8 | `CAP_CLIP_READ` | same | yes | no | yes (async, may ask permission) | clipd |
 | 16 | `CAP_DIALOG` | dialog backend | yes | no | yes (alert/confirm) | dialogd |
 | 32 | `CAP_STORAGE` | yes | yes | yes | yes | yes |
-| 128 | `CAP_DIR_LIST` | yes | yes | no (`NO_BACKEND`) | no | no |
+| 128 | `CAP_DIR_LIST` | yes | yes | yes (picked tree only) | no | no |
+| 256 | `CAP_DIR_PICK` | no | no | yes | no | no |
 | 64 | `CAP_ASYNC_HOST` | no | no | no | yes: replies need host events | yes |
 
 `svc.has(cap) -> bool`, `svc.backend_name() -> str` (`"native"`, `"web"`).
 A call whose capability is missing answers `NO_BACKEND` and changes nothing (the conformance test checks exactly that).
+
+## Directory listing in the browser
+
+A page has no file system, so `svcdir.list` works on a VIRTUAL tree the user hands over with `svcdir.pick(&id)`:
+
+- Path form: `/<picked name>/sub/file`; `/` lists the picked directory. Relative paths answer `NOT_FOUND`.
+- Reply `svc.OP_DIR_PICKED`: `status` `OK` (`index` = entries, `name` = `/<picked name>`) or `CANCELED` (the old tree stays).
+- Picker: `showDirectoryPicker` when the browser has it, else `<input webkitdirectory>` (empty directories are missing there).
+- Host answers (`svc.HOST_DIALOG`): `status` `DIALOG_DIR_ITEM` (3: `q` = path relative to the pick, `id` 1 = directory,
+  `p/n` = 16 octets size + mtime in ms, little endian), `DIALOG_DIR_END` (4, `id` = count), `DIALOG_DIR_CANCEL` (5).
+- Limits: 100000 entries per pick; one pick at a time (`BUSY`). Host import `firn_web_dialog_dir` (module `plat.webdir`).
 
 ## Rules and limits
 
