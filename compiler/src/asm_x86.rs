@@ -719,6 +719,10 @@ impl Asm {
                 "ret" => Inst::Ret,
                 "syscall" => Inst::Syscall,
                 "hlt" => Inst::Hlt,
+                "pause" => Inst::RepString(&[0xF3, 0x90]),
+                "cli" => Inst::RepString(&[0xFA]),
+                "sti" => Inst::RepString(&[0xFB]),
+                "iretq" => Inst::RepString(&[0x48, 0xCF]),
                 "cld" => Inst::Cld,
                 "ud2" => Inst::Ud2,
                 "nop" => Inst::Nop,
@@ -767,6 +771,9 @@ impl Asm {
         // Two operands
         if ops.len() == 2 {
             let (a, b) = (&ops[0], &ops[1]);
+            if let Some(bytes) = port_io_bytes(m, a, b) {
+                return Ok((Inst::RepString(bytes), syms));
+            }
             // Prefix instructions
             if let Some(rest) = m.strip_prefix("lock ") {
                 let dst = p(a, 64)?;
@@ -1560,6 +1567,18 @@ fn width_hint_of(o: &Opnd) -> Option<u16> {
     }
 }
 
+fn port_io_bytes(m: &str, a: &str, b: &str) -> Option<&'static [u8]> {
+    match (m, a.trim(), b.trim()) {
+        ("out", "dx", "al") => Some(&[0xEE]),
+        ("out", "dx", "ax") => Some(&[0x66, 0xEF]),
+        ("out", "dx", "eax") => Some(&[0xEF]),
+        ("in", "al", "dx") => Some(&[0xEC]),
+        ("in", "ax", "dx") => Some(&[0x66, 0xED]),
+        ("in", "eax", "dx") => Some(&[0xED]),
+        _ => None,
+    }
+}
+
 fn reg_of(o: &Opnd) -> Option<(u8, u16)> {
     match o {
         Opnd::Reg(r, b) => Some((*r, *b)),
@@ -2050,6 +2069,25 @@ mod tests {
     fn text_of(s: &str) -> String {
         let a = assemble(&format!(".intel_syntax noprefix\n.text\n{}\n", s)).expect("assembles");
         a.sections[SEC_TEXT].bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn port_io_and_pause_match_as() {
+        let cases: &[(&str, &str)] = &[
+            ("out dx, al", "ee"),
+            ("out dx, ax", "66 ef"),
+            ("out dx, eax", "ef"),
+            ("in al, dx", "ec"),
+            ("in ax, dx", "66 ed"),
+            ("in eax, dx", "ed"),
+            ("pause", "f3 90"),
+            ("cli", "fa"),
+            ("sti", "fb"),
+            ("iretq", "48 cf"),
+        ];
+        for (line, want) in cases {
+            assert_eq!(text_of(line), *want, "{}", line);
+        }
     }
 
     #[test]

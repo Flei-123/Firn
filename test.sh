@@ -257,6 +257,16 @@ FAILED=""
 
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); FAILED="$FAILED\n  $1"; echo "  FAIL  $1"; }
+run_mc_part() {
+    local part=$1
+    if MC_PART="$part" bash tools/mc/run.sh > "$WORK/mc-$part.log" 2>&1; then
+        ok
+        grep -E '^(RESULT|mc tests)' "$WORK/mc-$part.log" | sed 's/^/ /'
+    else
+        bad "tools/mc/run.sh $part failed (see .test-work/mc-$part.log)"
+        grep -E 'FAIL|RESULT' "$WORK/mc-$part.log" | head -10 | sed 's/^/   /' || true
+    fi
+}
 
 echo "== 1. build the compiler =="
 cargo build --release --manifest-path compiler/Cargo.toml
@@ -1031,18 +1041,18 @@ else
     grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /' || true
 fi
 
-echo "== 38b. Minecraft libraries (tools/mc/run.sh, docs/MC-LIBS.md) =="
+echo "== 38b. Minecraft libraries, tests and first half of the cross-checks (tools/mc/run.sh, docs/MC-LIBS.md) =="
 # Every lib/mc/mc_*.fi has tests in tests/*_mc_*.fi (three build stages) and a
 # cross-check against an independent python / node reference in tools/mc/<lib>/.
 # No network, no Java here: the end-to-end run against a real 1.20.1 server is
 # tools/mcclient/run.sh and is started by hand (it needs the official server JAR).
-if bash tools/mc/run.sh > "$WORK/mc.log" 2>&1; then
-    ok
-    grep -E '^(RESULT|mc tests)' "$WORK/mc.log" | sed 's/^/ /'
-else
-    bad "tools/mc/run.sh failed (see .test-work/mc.log)"
-    grep -E 'FAIL|RESULT' "$WORK/mc.log" | head -10 | sed 's/^/   /' || true
-fi
+run_mc_part libs-a
+
+echo "== 38c. Minecraft libraries, second half of the cross-checks (tools/mc/run.sh) =="
+run_mc_part libs-b
+
+echo "== 38d. Minecraft play runs against the real server (tools/mc/run.sh, Xvfb, java, wine) =="
+run_mc_part play
 
 echo "== 39. foreign functions in both directions (tools/extfn/run.sh, ROUND 75) =="
 # Round 75 built `extern fn` and a proof script for it, and then did not

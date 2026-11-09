@@ -1,7 +1,7 @@
 # test.sh stages
 
 `bash test.sh --stage N` runs one stage; `tools/teststages/run.sh [--heavy|--parallel|--list]` runs all.
-`stages.txt` maps section ids to stages (15 stages). An id may carry a shard: `3@2/8` runs shard 2 of 8 of section 3
+`stages.txt` maps section ids to stages (18 stages; 38b, 38c and 38d are the three parts of tools/mc/run.sh, MC_PART=libs-a|libs-b|play). An id may carry a shard: `3@2/8` runs shard 2 of 8 of section 3
 (programs are dealt round robin via TEST_SHARD_INDEX / TEST_SHARD_COUNT). One stage holds at most one shard of an id.
 Ids missing from stages.txt run in the last stage.
 

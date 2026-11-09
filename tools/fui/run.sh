@@ -964,10 +964,14 @@ cmp "$W/fm_light.png" tools/fui/golden_fm/fm_light.png || { echo "fm golden diff
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
 echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
-for n in term_vt term_input term_pty; do
+for n in term_vt term_input term_pty term_widget; do
     "$FIRNC" --opt-level=dev -o "$W/$n" tools/fui/${n}_main.fi || exit 1
     "$W/$n" || exit 1
 done
+echo "== 18p9b. terminal widget demo app (examples/fui_apps/terminal): scripted shot vs golden =="
+"$FIRNC" --opt-level=dev -o "$W/terminal_app" examples/fui_apps/terminal/main.fi || exit 1
+"$W/terminal_app" --theme dark --size 900x560 --shot "$W/terminal_dark.png" || exit 1
+cmp "$W/terminal_dark.png" tools/fui/golden_term/terminal_dark.png || { echo "terminal golden differs"; exit 1; }
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"

@@ -18,7 +18,8 @@ Goal: a terminal emulator widget for fUi apps. Same source for X11 now, OrientOS
 | backend | `lib/term/termback.fi` | yes | backend interface (read, write, resize, alive, close) |
 | pty | `lib/term/pty.fi` (+ `lib/@web`, `lib/@windows` stubs) | no | Linux pty by raw syscalls |
 | loop | `lib/term/termloop.fi` | yes | scripted backend for tests and web without a shell |
-| widget | `lib/fui/termwidget.fi` | no | paint, keys, pointer, wheel, selection, clipboard, a11y |
+| widget | `lib/fui/termwstate.fi` (state, pump, fit), `termpaint.fi`, `terminteract.fi`, `termwidget.fi` (`tw_attach`), `termax.fi` (a11y) | no | paint, keys, pointer, wheel, selection, clipboard, a11y |
+| pty link | `lib/term/termpty.fi` | no | `Backend` over `pty.fi` |
 
 ## Parser (vtparse)
 
@@ -76,8 +77,8 @@ The pty child is `setsid` + controlling tty + `TERM=xterm-256color`, `COLORTERM=
 
 - Cell metrics from the mono face (`app.use_mono_face`, slot `face.MONO_SLOT`): width = advance of `M`, height = line height. Grid size = floor(area / cell) and follows resize (backend resize + `term_resize`).
 - Paint: per row, runs of equal attributes in one `painter.text`; backgrounds filled per run; cursor (block, hollow when unfocused), selection overlay, scrollback offset indicator; inverse and dim resolved in the widget. Palette: theme-aware 16 colours, xterm cube for 16..255.
-- Plug into `fui.app` through `set_ctl` (paint) + `set_keys` + `set_wheel` + `set_motion` + `set_pump`; a node provides the focus area and the a11y role.
-- a11y: new role `ROLE_TERMINAL` (AT-SPI `ATSPI_ROLE_TERMINAL`, UIA Document, web `role="log"` with live off); the node text is the visible screen text.
+- Plug into `fui.app` through `app.custom` + `node_set_draw` + `set_keys` + `set_wheel` + `set_motion` + `set_extra_wake` (clipboard answers) + `set_pump` (pty fd, only when the backend has one; set the backend BEFORE `tw_attach`); a node provides the focus area and the a11y role.
+- a11y: new role `ROLE_TERMINAL` = 36, `ROLE_COUNT` 37 (AT-SPI `ATSPI_ROLE_TERMINAL` 60, UIA Document, no web mapping yet); the node text is the visible screen text.
 
 ## Tests
 
@@ -85,8 +86,8 @@ The pty child is `setsid` + controlling tty + `TERM=xterm-256color`, `COLORTERM=
 |---|---|
 | `tools/fui/term_vt_main.fi` | parser + grid + modes with fed sequences, asserts cells |
 | `tools/fui/term_pty_main.fi` | real pty: `echo` through `/bin/sh`, input encoding round trip, exit status, resize |
-| `tools/fui/term_render_main.fi` | scripted session -> canvas -> PNG, compared to `tools/fui/golden_term/` |
-| `examples/fui_apps/terminal` | demo app: `--shot` and `--script "echo hi"` headless |
+| `tools/fui/term_widget_main.fi` | widget logic on the scripted backend: keys, replies, selection, copy / paste, wheel, fit, a11y role |
+| `examples/fui_apps/terminal` | demo app: pty shell on X11; `--shot` / `--script` use the scripted backend (`term_sample.fi`); golden `tools/fui/golden_term/terminal_dark.png` (run.sh 18p9b) |
 
 ## Limits (honest)
 
@@ -94,3 +95,10 @@ The pty child is `setsid` + controlling tty + `TERM=xterm-256color`, `COLORTERM=
 - Wide characters use a static width table, not the full Unicode East Asian Width.
 - Fonts: fixed cell grid, mono face only; emoji use the fallback face if present.
 - Scrollback default 2000 lines per terminal (cap 100000).
+
+## Widget limits (v1)
+
+- The host forwards only arrows, Home / End, PgUp / PgDn, Delete, Backspace, Enter, Tab, Esc, F2, F5 as key events: Insert and other F-keys do not reach the terminal yet.
+- The pointer hook carries no modifiers: Shift-forces-selection is not possible; with mouse reporting on, selection is off.
+- No cursor blink, output while scrolled back keeps the view anchored, wide / box-drawing glyphs depend on the fallback face, underline / strike lines are drawn but faint in the golden.
+- Web: `termloop` only (pty stub), WebSocket backend not built.

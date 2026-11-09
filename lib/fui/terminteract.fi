@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.app
+import fui.services
+import fui.termkeys
+import fui.termpaint
+import fui.termwstate
+import plat.fuiwirt
+import term.term
+import term.terminput
+import term.termgrid
+import term.termsel
+import term.termstate
+
+export { tw_key, tw_char, tw_pointer, tw_wheel, tw_poll_paste, tw_copy, tw_paste, tw_hit }
+
+const DOUBLE_CLICK_US: i64 = 400000
+const WHEEL_LINES: f64 = 3.0
+const SCROLL_STEP: i64 = 1
+const CHAR_LOWER_C: u32 = 99
+const CHAR_LOWER_V: u32 = 118
+const CASE_BIT: u32 = 32
+const CLIP_OK: u32 = 1
+
+fn tw_hit(tw: *mut termwstate.TermWidget, x: f64, y: f64) -> bool {
+    let f: *mut termpaint.Frame = &(*tw).fr
+    return x >= (*f).ox && y >= (*f).oy && x < (*f).ox + (*f).w && y < (*f).oy + (*f).h
+}
+
+fn cell_col(tw: *mut termwstate.TermWidget, x: f64) -> usize {
+    let f: *mut termpaint.Frame = &(*tw).fr
+    let v: f64 = (x - (*f).ox - termpaint.PAD) / (*f).cw
+    if v < 0.0 { return 0 }
+    var c: usize = v as usize
+    if c >= term.term_cols((*tw).term) { c = term.term_cols((*tw).term) - 1 }
+    return c
+}
+
+fn cell_row(tw: *mut termwstate.TermWidget, y: f64) -> usize {
+    let f: *mut termpaint.Frame = &(*tw).fr
+    let v: f64 = (y - (*f).oy - termpaint.PAD) / (*f).ch
+    if v < 0.0 { return 0 }
+    var r: usize = v as usize
+    if r >= term.term_rows((*tw).term) { r = term.term_rows((*tw).term) - 1 }
+    return r
+}
+
+fn abs_line(tw: *mut termwstate.TermWidget, row: usize) -> usize {
+    let g: *mut termgrid.Grid = term.term_grid((*tw).term)
+    return (*g).sb_len - (*tw).fr.view_off + row
+}
+
+fn tw_copy(tw: *mut termwstate.TermWidget) -> bool {
+    if !termsel.sel_active(&(*tw).sel) { return false }
+    var b: rt.Buf = rt.buf_new()
+    termsel.sel_text(&(*tw).sel, term.term_grid((*tw).term), &b)
+    var ok: bool = false
+    if rt.buf_len(&b) > 0 { ok = services.clip_copy(rt.buf_str(&b)) }
+    rt.buf_free(&b)
+    return ok
+}
+
+fn tw_paste(tw: *mut termwstate.TermWidget) -> bool {
+    (*tw).paste_wait = services.clip_request()
+    return (*tw).paste_wait
+}
+
+fn tw_poll_paste(tw: *mut termwstate.TermWidget) -> bool {
+    if !(*tw).paste_wait || services.pending() == 0 { return false }
+    if !services.next(&(*tw).ev) { return false }
+    if (*tw).ev.kind != services.EV_CLIP { return false }
+    (*tw).paste_wait = false
+    if (*tw).ev.status != CLIP_OK { return false }
+    terminput.encode_paste(term.term_bracketed((*tw).term), rt.buf_ptr(&(*tw).ev.data), rt.buf_len(&(*tw).ev.data), &(*tw).out)
+    termwstate.tw_send(tw)
+    termwstate.tw_snap_bottom(tw)
+    return true
+}
+
+fn page_scroll(tw: *mut termwstate.TermWidget, tk: u32) -> bool {
+    if term.term_is_alt((*tw).term) { return false }
+    var page: i64 = term.term_rows((*tw).term) as i64 - 1
+    if page < 1 { page = 1 }
+    if tk == terminput.TK_PGUP { termwstate.tw_scroll(tw, page) } else { termwstate.tw_scroll(tw, 0 - page) }
+    return true
+}
+
+fn tw_key(ud: u64, key: u32, mods: u32) -> bool {
+    let tw: *mut termwstate.TermWidget = ud as *mut termwstate.TermWidget
+    if !(*tw).focus { return false }
+    let tk: u32 = termkeys.map_key(key)
+    if tk == 0 as u32 { return false }
+    if (mods & terminput.M_SHIFT) != 0 as u32 && (tk == terminput.TK_PGUP || tk == terminput.TK_PGDN) {
+        if page_scroll(tw, tk) { return true }
+    }
+    if !terminput.encode_key(term.term_app_cursor((*tw).term), tk, mods, &(*tw).out) { return false }
+    termwstate.tw_send(tw)
+    termwstate.tw_snap_bottom(tw)
+    return true
+}
+
+fn is_clip_chord(cp: u32, mods: u32, letter: u32) -> bool {
+    let both: u32 = terminput.M_CTRL | terminput.M_SHIFT
+    return (mods & both) == both && (cp | CASE_BIT) == letter
+}
+
+fn tw_char(ud: u64, cp: u32, mods: u32) -> bool {
+    let tw: *mut termwstate.TermWidget = ud as *mut termwstate.TermWidget
+    if !(*tw).focus { return false }
+    if is_clip_chord(cp, mods, CHAR_LOWER_C) {
+        tw_copy(tw)
+        return true
+    }
+    if is_clip_chord(cp, mods, CHAR_LOWER_V) {
+        tw_paste(tw)
+        return true
+    }
+    terminput.encode_char(cp, mods, &(*tw).out)
+    termwstate.tw_send(tw)
+    termwstate.tw_snap_bottom(tw)
+    return true
+}
+
+fn report_mouse(tw: *mut termwstate.TermWidget, kind: u32, button: u32, x: f64, y: f64) -> bool {
+    let t: *mut termstate.Term = (*tw).term
+    if !terminput.encode_mouse(term.term_mouse_mode(t), term.term_mouse_sgr(t), kind, button, cell_col(tw, x) as u32,
+        cell_row(tw, y) as u32, 0 as u32, &(*tw).out) {
+        return false
+    }
+    termwstate.tw_send(tw)
+    return true
+}
+
+fn press_count(tw: *mut termwstate.TermWidget, line: usize, col: usize) -> u32 {
+    let now: i64 = app.mono_us()
+    var n: u32 = 1
+    if (*tw).clicks > 0 as u32 && now - (*tw).click_us < DOUBLE_CLICK_US && line == (*tw).click_line && col == (*tw).click_col {
+        n = (*tw).clicks + 1 as u32
+        if n > 3 as u32 { n = 1 }
+    }
+    (*tw).clicks = n
+    (*tw).click_us = now
+    (*tw).click_line = line
+    (*tw).click_col = col
+    return n
+}
+
+fn select_mode(clicks: u32) -> u32 {
+    if clicks == 2 as u32 { return termsel.SEL_WORD }
+    if clicks == 3 as u32 { return termsel.SEL_LINE }
+    return termsel.SEL_CHAR
+}
+
+fn pointer_down(tw: *mut termwstate.TermWidget, x: f64, y: f64) -> bool {
+    if !tw_hit(tw, x, y) {
+        termwstate.tw_set_focus(tw, false)
+        return false
+    }
+    termwstate.tw_set_focus(tw, true)
+    (*tw).button_down = true
+    if term.term_mouse_mode((*tw).term) != term.MOUSE_OFF {
+        return report_mouse(tw, terminput.MK_PRESS, terminput.BTN_LEFT, x, y)
+    }
+    let line: usize = abs_line(tw, cell_row(tw, y))
+    let col: usize = cell_col(tw, x)
+    let clicks: u32 = press_count(tw, line, col)
+    termsel.sel_begin(&(*tw).sel, term.term_grid((*tw).term), line, col, select_mode(clicks))
+    (*tw).dragging = true
+    (*tw).moved = false
+    return true
+}
+
+fn edge_scroll(tw: *mut termwstate.TermWidget, y: f64) {
+    let f: *mut termpaint.Frame = &(*tw).fr
+    if y < (*f).oy { termwstate.tw_scroll(tw, SCROLL_STEP) }
+    if y > (*f).oy + (*f).h { termwstate.tw_scroll(tw, 0 - SCROLL_STEP) }
+}
+
+fn pointer_move(tw: *mut termwstate.TermWidget, x: f64, y: f64) -> bool {
+    if (*tw).dragging {
+        edge_scroll(tw, y)
+        (*tw).moved = true
+        termsel.sel_drag(&(*tw).sel, term.term_grid((*tw).term), abs_line(tw, cell_row(tw, y)), cell_col(tw, x))
+        return true
+    }
+    if !(*tw).focus || !tw_hit(tw, x, y) { return false }
+    var button: u32 = terminput.BTN_NONE
+    if (*tw).button_down { button = terminput.BTN_LEFT }
+    return report_mouse(tw, terminput.MK_MOVE, button, x, y)
+}
+
+fn pointer_up(tw: *mut termwstate.TermWidget, x: f64, y: f64) -> bool {
+    let was: bool = (*tw).button_down
+    (*tw).button_down = false
+    if !was { return false }
+    if (*tw).dragging {
+        (*tw).dragging = false
+        if !(*tw).moved && (*tw).clicks == 1 as u32 { termsel.sel_clear(&(*tw).sel) }
+        return true
+    }
+    return report_mouse(tw, terminput.MK_RELEASE, terminput.BTN_LEFT, x, y)
+}
+
+fn tw_pointer(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let tw: *mut termwstate.TermWidget = ud as *mut termwstate.TermWidget
+    if kind == fuiwirt.HOOK_DOWN { return pointer_down(tw, x, y) }
+    if kind == fuiwirt.HOOK_UP { return pointer_up(tw, x, y) }
+    if kind == fuiwirt.HOOK_MOVE { return pointer_move(tw, x, y) }
+    return false
+}
+
+fn wheel_reports(tw: *mut termwstate.TermWidget, x: f64, y: f64, ny: f64) -> bool {
+    var button: u32 = terminput.BTN_WHEEL_DOWN
+    var notches: f64 = ny
+    if ny < 0.0 {
+        button = terminput.BTN_WHEEL_UP
+        notches = 0.0 - ny
+    }
+    var n: usize = notches as usize
+    if n < 1 { n = 1 }
+    var sent: bool = false
+    var i: usize = 0
+    while i < n {
+        if report_mouse(tw, terminput.MK_PRESS, button, x, y) { sent = true }
+        i = i + 1
+    }
+    return sent
+}
+
+fn wheel_arrows(tw: *mut termwstate.TermWidget, ny: f64) -> bool {
+    var key: u32 = terminput.TK_DOWN
+    var notches: f64 = ny
+    if ny < 0.0 {
+        key = terminput.TK_UP
+        notches = 0.0 - ny
+    }
+    var n: usize = (notches * WHEEL_LINES) as usize
+    if n < 1 { n = 1 }
+    var i: usize = 0
+    while i < n {
+        terminput.encode_key(term.term_app_cursor((*tw).term), key, 0 as u32, &(*tw).out)
+        i = i + 1
+    }
+    termwstate.tw_send(tw)
+    return true
+}
+
+fn tw_wheel(ud: u64, x: f64, y: f64, nx: f64, ny: f64) -> bool {
+    let tw: *mut termwstate.TermWidget = ud as *mut termwstate.TermWidget
+    if !tw_hit(tw, x, y) || ny == 0.0 { return false }
+    if term.term_mouse_mode((*tw).term) != term.MOUSE_OFF { return wheel_reports(tw, x, y, ny) }
+    if term.term_is_alt((*tw).term) { return wheel_arrows(tw, ny) }
+    termwstate.tw_scroll(tw, (0.0 - ny * WHEEL_LINES) as i64)
+    return true
+}
