@@ -12,8 +12,8 @@ LEVELS=${LEVELS:-"dev release-safe release-fast"}
 W=$(mktemp -d "${TMPDIR:-/tmp}/firn-services.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 SRC="$ROOT/tools/services/conformance.fi"
-CAPS_ALL_NATIVE=63
-CAPS_HEADLESS=32
+CAPS_ALL_NATIVE=191
+CAPS_HEADLESS=160
 CAPS_WEB=127
 fails=0
 
