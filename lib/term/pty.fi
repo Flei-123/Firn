@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+
+export { Pty, pty_open, pty_read, pty_write, pty_resize, pty_alive, pty_close, pty_supported }
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_POLL: i64 = 7
+const SYS_IOCTL: i64 = 16
+const SYS_DUP2: i64 = 33
+const SYS_FORK: i64 = 57
+const SYS_EXECVE: i64 = 59
+const SYS_WAIT4: i64 = 61
+const SYS_KILL: i64 = 62
+const SYS_SETSID: i64 = 112
+const SYS_EXIT_GROUP: i64 = 231
+
+const TIOCGPTN: i64 = 0x80045430
+const TIOCSPTLCK: i64 = 0x40045431
+const TIOCSWINSZ: i64 = 0x5414
+const TIOCSCTTY: i64 = 0x540E
+const O_RDWR: i64 = 2
+const O_NOCTTY: i64 = 0x100
+const O_NONBLOCK: i64 = 0x800
+const O_CLOEXEC: i64 = 0x80000
+const WNOHANG: i64 = 1
+const POLLOUT: i32 = 4
+const EAGAIN: i64 = 11
+const SIGHUP: i64 = 1
+const SIGKILL: i64 = 9
+const ARGV_MAX: usize = 4
+const ENV_BLOB: str = "TERM=xterm-256color\0COLORTERM=truecolor\0PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0HOME=/root\0"
+
+struct Pty {
+    fd: i64,
+    pid: i64,
+    exited: bool,
+}
+
+fn pty_supported() -> bool { return true }
+
+fn open_master() -> i64 {
+    let path: str = "/dev/ptmx\0"
+    return syscall(SYS_OPEN, path.p as i64, O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK, 0, 0, 0, 0)
+}
+
+fn slave_path(master: i64, out: *mut [u8; 32]) -> bool {
+    var n: [u32; 1] = [0 as u32]
+    var unlock: [u32; 1] = [0 as u32]
+    if syscall(SYS_IOCTL, master, TIOCSPTLCK, (&unlock[0]) as i64, 0, 0, 0) < 0 { return false }
+    if syscall(SYS_IOCTL, master, TIOCGPTN, (&n[0]) as i64, 0, 0, 0) < 0 { return false }
+    let prefix: str = "/dev/pts/"
+    var len: usize = 0
+    while len < prefix.n {
+        (*out)[len] = rt.ld8(prefix.p as u64, len)
+        len = len + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, n[0] as u64)
+    var i: usize = 0
+    while i < rt.buf_len(&b) && len < 30 {
+        (*out)[len] = rt.buf_at(&b, i)
+        len = len + 1
+        i = i + 1
+    }
+    (*out)[len] = 0 as u8
+    rt.buf_free(&b)
+    return true
+}
+
+fn set_size(fd: i64, cols: usize, rows: usize) -> bool {
+    var ws: [u16; 4] = [rows as u16, cols as u16, 0 as u16, 0 as u16]
+    return syscall(SYS_IOCTL, fd, TIOCSWINSZ, (&ws[0]) as i64, 0, 0, 0) >= 0
+}
+
+fn pointer_table(blob: u64, count: usize) -> u64 {
+    let table: u64 = rt.heap_alloc((count + 1) * 8)
+    var off: usize = 0
+    var i: usize = 0
+    while i < count {
+        rt.st64(table, i, blob + off as u64)
+        off = off + rt.c_length(blob + off as u64) + 1
+        i = i + 1
+    }
+    return table
+}
+
+fn count_strings(blob: str) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < blob.n {
+        if rt.ld8(blob.p as u64, i) == 0 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn child_exec(slave: i64, master: i64, prog: u64, argv: u64, envp: u64) {
+    syscall(SYS_SETSID, 0, 0, 0, 0, 0, 0)
+    syscall(SYS_IOCTL, slave, TIOCSCTTY, 0, 0, 0, 0)
+    syscall(SYS_DUP2, slave, 0, 0, 0, 0, 0)
+    syscall(SYS_DUP2, slave, 1, 0, 0, 0, 0)
+    syscall(SYS_DUP2, slave, 2, 0, 0, 0, 0)
+    if slave > 2 { syscall(SYS_CLOSE, slave, 0, 0, 0, 0, 0) }
+    syscall(SYS_CLOSE, master, 0, 0, 0, 0, 0)
+    syscall(SYS_EXECVE, prog as i64, argv as i64, envp as i64, 0, 0, 0)
+    syscall(SYS_EXIT_GROUP, 127, 0, 0, 0, 0)
+}
+
+fn argv_blob(argv: str) -> u64 {
+    let blob: u64 = rt.heap_alloc(argv.n + 1)
+    rt.mem_copy(blob, argv.p as u64, argv.n)
+    return blob
+}
+
+fn pty_open(p: *mut Pty, argv: str, cols: usize, rows: usize) -> bool {
+    (*p).fd = 0 - 1
+    (*p).pid = 0 - 1
+    (*p).exited = false
+    let master: i64 = open_master()
+    if master < 0 { return false }
+    var path: [u8; 32] = [0 as u8; 32]
+    if !slave_path(master, &path) || !set_size(master, cols, rows) {
+        syscall(SYS_CLOSE, master, 0, 0, 0, 0, 0)
+        return false
+    }
+    let slave: i64 = syscall(SYS_OPEN, (&path[0]) as i64, O_RDWR | O_NOCTTY, 0, 0, 0, 0)
+    if slave < 0 {
+        syscall(SYS_CLOSE, master, 0, 0, 0, 0, 0)
+        return false
+    }
+    let blob: u64 = argv_blob(argv)
+    let argc: usize = count_strings(argv)
+    let table: u64 = pointer_table(blob, argc)
+    let envp: u64 = pointer_table(ENV_BLOB.p as u64, count_strings(ENV_BLOB))
+    let kid: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+    if kid == 0 { child_exec(slave, master, rt.ld64(table, 0), table, envp) }
+    syscall(SYS_CLOSE, slave, 0, 0, 0, 0, 0)
+    rt.heap_free(table, (argc + 1) * 8)
+    rt.heap_free(envp, (count_strings(ENV_BLOB) + 1) * 8)
+    rt.heap_free(blob, argv.n + 1)
+    if kid < 0 {
+        syscall(SYS_CLOSE, master, 0, 0, 0, 0, 0)
+        return false
+    }
+    (*p).fd = master
+    (*p).pid = kid
+    return true
+}
+
+fn pty_read(p: *mut Pty, buf: u64, cap: usize) -> i64 {
+    let r: i64 = syscall(SYS_READ, (*p).fd, buf as i64, cap as i64, 0, 0, 0)
+    if r > 0 { return r }
+    if r == 0 - EAGAIN { return 0 }
+    return 0 - 1
+}
+
+fn pty_write(p: *mut Pty, buf: u64, n: usize) -> bool {
+    var done: usize = 0
+    while done < n {
+        let r: i64 = syscall(SYS_WRITE, (*p).fd, (buf + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r > 0 {
+            done = done + r as usize
+        } else if r == 0 - EAGAIN {
+            var pfd: [i32; 2] = [(*p).fd as i32, POLLOUT]
+            syscall(SYS_POLL, (&pfd[0]) as i64, 1, 1000, 0, 0, 0)
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+fn pty_resize(p: *mut Pty, cols: usize, rows: usize) -> bool { return set_size((*p).fd, cols, rows) }
+
+fn pty_alive(p: *mut Pty) -> bool {
+    if (*p).exited || (*p).pid < 0 { return false }
+    var st: [i32; 1] = [0 as i32]
+    let r: i64 = syscall(SYS_WAIT4, (*p).pid, (&st[0]) as i64, WNOHANG, 0, 0, 0)
+    if r == (*p).pid || r < 0 { (*p).exited = true }
+    return !(*p).exited
+}
+
+fn pty_close(p: *mut Pty) {
+    if (*p).fd >= 0 { syscall(SYS_CLOSE, (*p).fd, 0, 0, 0, 0, 0) }
+    if (*p).pid > 0 && !(*p).exited {
+        syscall(SYS_KILL, (*p).pid, SIGHUP, 0, 0, 0, 0)
+        syscall(SYS_KILL, (*p).pid, SIGKILL, 0, 0, 0, 0)
+        var st: [i32; 1] = [0 as i32]
+        syscall(SYS_WAIT4, (*p).pid, (&st[0]) as i64, 0, 0, 0, 0)
+    }
+    (*p).fd = 0 - 1
+    (*p).pid = 0 - 1
+    (*p).exited = true
+}

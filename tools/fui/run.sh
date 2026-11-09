@@ -954,6 +954,11 @@ FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
+echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
+for n in term_vt term_input term_pty; do
+    "$FIRNC" --opt-level=dev -o "$W/$n" tools/fui/${n}_main.fi || exit 1
+    "$W/$n" || exit 1
+done
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
