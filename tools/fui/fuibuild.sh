@@ -4,7 +4,7 @@
 #
 #   bash tools/fui/fuibuild.sh
 #
-# A fresh project from `fui new` (every template) and the apps editor, notes, files, fm: native + web build from ONE source,
+# A fresh project from `fui new` (every template) and the apps editor, notes, files, fm, svcdemo: native + web build from ONE source,
 # native --shot against the Chromium shot of the web build (limit 0.5 %), layout of dist/, exit codes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -72,7 +72,7 @@ for t in blank settings files; do
     grep -h "^RESULT" "$D/last.log"
 done
 
-for app in editor notes files fm; do
+for app in editor notes files fm svcdemo; do
     expect_exit 0 "build + verify $app" $FUI build "$ROOT/examples/fui_apps/$app" --targets native,web --verify --out "$D/out-$app"
     grep -h "^RESULT" "$D/last.log"
     expect_file "$D/out-$app/native/$app"

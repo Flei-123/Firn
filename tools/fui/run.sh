@@ -966,6 +966,8 @@ FUI_AUDIT=1 "$W/fm_app" --sample --data examples/fui_apps/data || exit 1
 cmp "$W/fm_light.png" tools/fui/golden_fm/fm_light.png || { echo "fm golden differs"; exit 1; }
 echo "== 18p8. fui new / fui build (tools/fui/cli): native + web from ONE source, pixel gate, exit codes =="
 FIRNC="$FIRNC" bash tools/fui/fuibuild.sh || exit 1
+echo "== 18p8b. services conformance (tools/services/conformance.sh): native, web, Windows (Wine), Android compile =="
+FIRNC="$FIRNC" LEVELS=dev bash tools/services/conformance.sh || exit 1
 echo "== 18p9. terminal core (lib/term): vt parser + grid, input encoding + selection, real pty =="
 "$FIRNC" --opt-level=dev -o "$W/term_vt" tools/fui/term_vt_main.fi || exit 1
 "$W/term_vt" || exit 1

@@ -157,6 +157,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
         done
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/dialog_main.exe" tools/dialog/dialog_main.fi || true
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/pilot.exe" tools/dialog/pilot_main.fi || true
+        build "--target=x86_64-windows --opt-level=dev-fast" "$WB/svc_live.exe" tools/services/win_live_main.fi || true
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/t2220.exe" tests/2220_desktop_watch.fi || true
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/t2221.exe" tests/2221_appkit_ipc.fi || true
         if have x86_64-w64-mingw32-gcc; then
@@ -210,6 +211,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
         step "15c. std.dialog as a Windows program: Wine's comdlg32 / shell32 / user32 dialogs, pressed by a second program"
         if have Xvfb; then
             run python3 tools/dialog/dialog_check_win.py "$WB/dialog_main.exe" "$WB/pilot.exe"
+        else
+            echo "  SKIP  Xvfb missing"
+        fi
+
+        step "15d. services (file, message, confirm, clipboard) as a Windows program: the real dialogs, pressed by the pilot"
+        if have Xvfb; then
+            run python3 tools/services/win_live.py "$WB/svc_live.exe" "$WB/pilot.exe"
         else
             echo "  SKIP  Xvfb missing"
         fi

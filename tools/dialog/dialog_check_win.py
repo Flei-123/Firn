@@ -13,34 +13,24 @@ not checked: Wine does not honour it).  Without Wine or Xvfb the checks SKIP.
 
 This is Wine's comdlg32, not Microsoft's; a real Windows machine is the missing proof (docs/DIALOG.md, B1).
 """
-import os, shutil, subprocess, sys, tempfile, time
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import winpilot
 
 if len(sys.argv) < 3:
     print("usage: dialog_check_win.py <dialog_main.exe> <pilot.exe>")
     sys.exit(2)
-MAIN, PILOT = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
-WINE = shutil.which("wine") or shutil.which("wine64")
-for tool, ok in (("wine", WINE), ("Xvfb", shutil.which("Xvfb"))):
-    if not ok:
-        print("  SKIP  %s is not installed: the Windows dialogs were not run here" % tool)
-        sys.exit(0)
+missing = winpilot.tools_missing()
+if missing:
+    print("  SKIP  %s is not installed: the Windows dialogs were not run here" % missing)
+    sys.exit(0)
 
-FAILED = []
-def check(name, cond, extra=""):
-    print(("  OK    " if cond else "  FAIL  ") + name + ((" -- " + str(extra)[:300]) if (extra and not cond) else ""))
-    if not cond:
-        FAILED.append(name)
+session = winpilot.Session(sys.argv[1], sys.argv[2])
+checks = winpilot.Checks()
+check = checks.check
+td = session.dir
+zpath = winpilot.zpath
 
-NUM = 120 + (os.getpid() % 60)
-DISP = ":%d" % NUM
-xvfb = subprocess.Popen(["Xvfb", DISP, "-screen", "0", "1024x768x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-for _ in range(50):
-    if os.path.exists("/tmp/.X11-unix/X%d" % NUM):
-        break
-    time.sleep(0.1)
-ENV = dict(os.environ, DISPLAY=DISP, WINEDEBUG="-all")
-ENV.setdefault("WINEPREFIX", os.path.join(os.path.expanduser("~"), ".wine-firn"))
-td = tempfile.mkdtemp(prefix="dlgwin-")
 
 def parse(out):
     r = {}
@@ -49,24 +39,14 @@ def parse(out):
         r["STATUS"] = head[7:]
         if rest.startswith("VALUE "):
             r["VALUE"] = rest[6:].rstrip("\n")
+    elif out.startswith("TIMEOUT"):
+        r["TIMEOUT"] = "1"
     return r
 
-def run(args, title, steps, timeout=60):
-    """One dialog: dialog_main shows it, the pilot presses it. Returns the parsed answer of dialog_main."""
-    outp = os.path.join(td, "out.txt")
-    with open(outp, "w") as f:
-        main = subprocess.Popen([WINE, MAIN] + args, env=ENV, stdout=f, stderr=subprocess.DEVNULL)
-    pil = subprocess.run([WINE, PILOT, title, steps], env=ENV, capture_output=True, text=True, timeout=timeout)
-    try:
-        main.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        main.kill()
-        subprocess.run(["wineserver", "-k"], env=ENV)
-        return {"TIMEOUT": "1", "pilot": pil.stdout.strip() + pil.stderr.strip()}
-    return parse(open(outp).read())
 
-def zpath(p):
-    return "Z:" + p.replace("\\", "/")
+def run(args, title, steps, timeout=60):
+    return parse(session.run(args, title, steps, timeout))
+
 
 # ---- message boxes (IDYES 6, IDNO 7, IDOK 1, IDCANCEL 2)
 check("confirm: Yes", run(["confirm"], "dlg-confirm", "wait;cmd:6") == {"STATUS": "ok", "VALUE": "yes"})
@@ -111,8 +91,5 @@ check("font: OK gives a family and a size", r.get("STATUS") == "ok" and r.get("V
 r = run(["font"], "Font", "wait;sleep:800;cmd:2")
 check("font: Cancel", r == {"STATUS": "canceled"}, r)
 
-subprocess.run(["wineserver", "-k"], env=ENV)
-xvfb.terminate(); xvfb.wait()
-shutil.rmtree(td, ignore_errors=True)
-print("dialog (Windows, Wine): %d failed" % len(FAILED) if FAILED else "dialog (Windows, Wine): all checks passed")
-sys.exit(1 if FAILED else 0)
+session.close()
+sys.exit(checks.finish("dialog (Windows, Wine)"))

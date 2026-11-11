@@ -161,30 +161,120 @@ describe_source() {
     fi
 }
 
+TREE_FIELD_SEP=$'\x1f'
+NO_PIN=-
+
+tree_pin() {
+    local pin
+    pin=$(head -n 1 "$1/.firn/pin" 2>/dev/null)
+    printf '%s' "${pin:-$NO_PIN}"
+}
+
+tree_row() {
+    local IFS=$TREE_FIELD_SEP
+    TREE_ROWS+=("$*")
+}
+
 walk_tree() {
     local indent=$1 name path ver here desc
     while read -r name path ver; do
         desc=$(describe_source "$name" "$path")
         if [ ! -d "$path" ]; then
-            printf '%s%s (%s) [missing: run firn fetch]\n' "$indent" "$name" "$desc"
+            tree_row "$indent" "$name" "" "" "$NO_PIN" "$desc" missing
             continue
         fi
         here=$PWD
         cd "$path" || exit 125
-        printf '%s%s %s (%s)\n' "$indent" "$name" "$(dep_version .)" "$desc"
+        ver=$(dep_version .)
         case $VISITED in
-        *"|$(pwd -P)|"*) printf '%s  (*)\n' "$indent" ;;
-        *) VISITED="$VISITED|$(pwd -P)|"; walk_tree "$indent  " ;;
+        *"|$(pwd -P)|"*)
+            tree_row "$indent" "$name" "$ver" "$(pwd -P)" "$(tree_pin .)" "$desc" seen
+            ;;
+        *)
+            tree_row "$indent" "$name" "$ver" "$(pwd -P)" "$(tree_pin .)" "$desc" walk
+            VISITED="$VISITED|$(pwd -P)|"
+            walk_tree "$indent  "
+            ;;
         esac
         cd "$here" || exit 125
     done < <(needs_lines)
 }
 
+tree_choose() {
+    local name=$1 best="" n ver real pin entry
+    for entry in "${TREE_COPIES[@]}"; do
+        IFS=$TREE_FIELD_SEP read -r n ver real pin <<< "$entry"
+        [ "$n" = "$name" ] || continue
+        [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$ver" | sort -V | tail -n 1)" = "$ver" ] && best=$ver
+    done
+    TREE_BEST[$name]=$best
+    local first="" same=1
+    for entry in "${TREE_COPIES[@]}"; do
+        IFS=$TREE_FIELD_SEP read -r n ver real pin <<< "$entry"
+        [ "$n" = "$name" ] && [ "$ver" = "$best" ] || continue
+        if [ -z "$first" ]; then
+            first=$pin
+            TREE_WINNER[$name]=$real
+        else
+            [ "$pin" = "$first" ] && [ "$first" != "$NO_PIN" ] || same=0
+            [ "$real" \< "${TREE_WINNER[$name]}" ] && TREE_WINNER[$name]=$real
+        fi
+    done
+    [ $same = 1 ] || TREE_WINNER[$name]=
+}
+
+tree_mark() {
+    local name=$1 ver=$2 real=$3
+    [ "${TREE_DIRS[$name]:-0}" -gt 1 ] || return 0
+    if [ "$ver" != "${TREE_BEST[$name]}" ]; then
+        printf ' [not used: %s wins]' "${TREE_BEST[$name]}"
+    elif [ -z "${TREE_WINNER[$name]}" ]; then
+        printf ' [conflict: same version, different content]'
+    elif [ "$real" = "${TREE_WINNER[$name]}" ]; then
+        printf ' [used]'
+    else
+        printf ' [not used: same package as the used copy]'
+    fi
+}
+
+tree_prepare() {
+    local row indent name ver real pin desc flag seen=""
+    TREE_COPIES=()
+    declare -gA TREE_DIRS=() TREE_BEST=() TREE_WINNER=()
+    for row in "${TREE_ROWS[@]}"; do
+        IFS=$TREE_FIELD_SEP read -r indent name ver real pin desc flag <<< "$row"
+        [ "$flag" != missing ] || continue
+        case $seen in *"$TREE_FIELD_SEP$name$TREE_FIELD_SEP$real$TREE_FIELD_SEP"*) continue ;; esac
+        seen="$seen$TREE_FIELD_SEP$name$TREE_FIELD_SEP$real$TREE_FIELD_SEP"
+        TREE_DIRS[$name]=$(( ${TREE_DIRS[$name]:-0} + 1 ))
+        TREE_COPIES+=("$name$TREE_FIELD_SEP$ver$TREE_FIELD_SEP$real$TREE_FIELD_SEP$pin")
+    done
+    for name in "${!TREE_DIRS[@]}"; do
+        [ "${TREE_DIRS[$name]}" -gt 1 ] && tree_choose "$name"
+    done
+}
+
+tree_print() {
+    local row indent name ver real pin desc flag
+    for row in "${TREE_ROWS[@]}"; do
+        IFS=$TREE_FIELD_SEP read -r indent name ver real pin desc flag <<< "$row"
+        if [ "$flag" = missing ]; then
+            printf '%s%s (%s) [missing: run firn fetch]\n' "$indent" "$name" "$desc"
+            continue
+        fi
+        printf '%s%s %s (%s)%s\n' "$indent" "$name" "$ver" "$desc" "$(tree_mark "$name" "$ver" "$real")"
+        [ "$flag" != seen ] || printf '%s  (*)\n' "$indent"
+    done
+}
+
 cmd_tree() {
     [ -f firn.package ] || die "no ./firn.package here"
     VISITED="|$(pwd -P)|"
+    TREE_ROWS=()
     printf '%s %s\n' "$(pkg_name)" "$(dep_version .)"
     walk_tree "  "
+    tree_prepare
+    tree_print
 }
 
 pkg_ensure() {
