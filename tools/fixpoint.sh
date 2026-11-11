@@ -132,8 +132,10 @@ if [ "${FIXPOINT_STAGES_ONLY:-0}" = 1 ]; then
 fi
 
 # --- the self-compiled compiler over the whole corpus ----------------------
+corpus_t0=$SECONDS
 FIRNC1="$F2" bash tools/self_compare.sh > "$TMPD"/fixpoint_corpus.txt 2>&1
 krc=$?
+echo "CORPUS TIME: $((SECONDS - corpus_t0)) s"
 sed 's/^/  /' "$TMPD"/fixpoint_corpus.txt
 if [ "$krc" -ne 0 ]; then
     echo "STAGE 2 does NOT behave like stage 1 on the corpus"

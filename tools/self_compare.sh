@@ -165,6 +165,7 @@ echo "DEFER:              $defer_count"
 echo "COMPTIME:           $comptime"
 echo "CODEGEN MISSING:    $codegen  (floating point, more than six arguments)"
 echo "SKIPPED:            $skipped  (firnc0 does not compile the file on its own)"
+echo "ELAPSED:            $((SECONDS - started)) s"
 if [ -n "$first" ]; then
     echo "first deviation: $first"
     exit 1

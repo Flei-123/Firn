@@ -674,17 +674,17 @@ else
 fi
 
 echo "== 16. the compiler in Firn compiles, the result runs (tools/self_compare.sh) =="
-bash tools/self_compare.sh > "$WORK/self_compare.log" 2>&1 && SBRC=0 || SBRC=$?
+SELF_COMPARE_SHARD="${TEST_SHARD_INDEX:-0}/${TEST_SHARD_COUNT:-1}" bash tools/self_compare.sh > "$WORK/self_compare.log" 2>&1 && SBRC=0 || SBRC=$?
 if [ "$SBRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERING|FAULTY|CODEGEN)' "$WORK/self_compare.log" | sed 's/^/   /' || true
+    grep -E '^(SAME|DIFFERING|FAULTY|CODEGEN|ELAPSED)' "$WORK/self_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/self_compare.sh failed (see .test-work/self_compare.log)"
     tail -20 "$WORK/self_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 17. the fixpoint: Firn compiles itself (tools/fixpoint.sh) =="
-bash tools/fixpoint.sh > "$WORK/fixpoint.log" 2>&1 && FPRC=0 || FPRC=$?
+SELF_COMPARE_SHARD="${TEST_SHARD_INDEX:-0}/${TEST_SHARD_COUNT:-1}" bash tools/fixpoint.sh > "$WORK/fixpoint.log" 2>&1 && FPRC=0 || FPRC=$?
 if [ "$FPRC" -eq 0 ]; then
     ok
     grep -E '^(STAGE|FIXPOINT|CORPUS)' "$WORK/fixpoint.log" | sed 's/^/   /' || true

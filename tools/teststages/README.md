@@ -19,3 +19,8 @@ Stages 6, 8, 10, 11, 12 ran 55+ min wall at this load (stage 8 section 3 shard 8
 Stage 12 red: english (r59) and fmt (r48), both old.
 
 04.11.2026 stable gate (2 cores, nice 19): stages 5 and 6 hit the 180 min heavy cap. Measured 29.10. (stage5rest): section 69 2755 s, 81 932 s, 82 858 s, 83 636 s, 80 572 s. Stage 5 is now 5 + 13 + 14, stage 6 is 6 + 15.
+
+11.11.2026 stable gate: stage 10 (sections 16 + 17) hit the 180 min heavy cap at load 30+. Section 17 (fixpoint.sh without
+FIXPOINT_STAGES_ONLY) runs the whole corpus through self_compare a second time with .firnc2, so stage 10 held two full corpus
+passes (section 16 alone: 3830 s). Sections 16 and 17 now run in 3 shards (SELF_COMPARE_SHARD from TEST_SHARD_INDEX/COUNT):
+stages 10, 19, 20. self_compare prints ELAPSED, fixpoint prints CORPUS TIME.
