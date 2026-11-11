@@ -14,7 +14,8 @@ trap 'rm -rf "$W"' EXIT
 ERR=0
 command -v node >/dev/null && [ -d "$NM/prismarine-block" ] || { echo "SKIP: node or prismarine-block missing"; exit 0; }
 GEN=$W/gen
-python3 tools/mcgen/gen_protocol.py --all "$NM/minecraft-data/minecraft-data/data" "$GEN" all 2>/dev/null || { echo "FAIL generator"; exit 1; }
+python3 tools/mcgen/overlay_data.py "$NM/minecraft-data/minecraft-data/data" tools/mcgen/data_extra "$W/data" || { echo "FAIL overlay"; exit 1; }
+python3 tools/mcgen/gen_protocol.py --all "$W/data" "$GEN" all 2>/dev/null || { echo "FAIL generator"; exit 1; }
 for f in $(cd "$GEN" && ls v*/mc_reg_v*.fi mc_sem.fi); do
     cmp -s "$GEN/$f" "lib/mc/$f" || { echo "  FAIL  lib/mc/$f differs from the generator output"; ERR=1; }
 done

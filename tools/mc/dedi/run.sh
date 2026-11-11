@@ -89,7 +89,7 @@ check "help" "grep -q 'Available commands' $R2/out.log"
 
 echo "== D join, whitelist, ops"
 (HOLD_MS=2500 $PROBE join 127.0.0.1 $P2 Bot1 >/dev/null &)
-sleep 1.2
+wait_for $R2/out.log 'Bot1 joined the game' 100
 cmd "$R2" "list"
 check "join logged" "grep -q 'Bot1 joined the game' $R2/out.log"
 check "leave logged" "wait_for $R2/out.log 'Bot1 left the game' 30"
@@ -112,7 +112,7 @@ cmd "$R2" "deop Bot1"
 check "deop" "grep -q 'no longer a server operator' $R2/out.log && ! grep -q Bot1 $R2/ops.json"
 cmd "$R2" "whitelist off"
 (HOLD_MS=3000 $PROBE join 127.0.0.1 $P2 Kicked >/dev/null &)
-sleep 1.2
+wait_for $R2/out.log 'Kicked joined the game' 100
 cmd "$R2" "kick Kicked bad manners"
 check "kick" "wait_for $R2/out.log 'Kicked Kicked: bad manners' 20"
 check "stop 0" "stop_and_wait $R2 && [ \"\$(cat $R2/exit.code)\" = 0 ]"
