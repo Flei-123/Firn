@@ -31,7 +31,7 @@ fi
 python3 - "$ROOT/tools/mcgen/versions.json" > "$D/versions.txt" <<'PY'
 import json, sys
 for k, v in json.load(open(sys.argv[1]))["versions"].items():
-    print(k, v.get("nmp", v["data"]), v["protocol"])
+    print(k, v.get("nmp", v["data"]), v["protocol"], v.get("fixture_data", "-"))
 PY
 MODES=("" "--no-opt" "--opt-level=dev-fast" "--opt-level=release-safe")
 mi=0
@@ -39,9 +39,13 @@ for mode in "${MODES[@]}"; do
     FIRNLIB=$ROOT/lib "$FIRNC" $mode -o "$D/sc$mi" "$ROOT/tools/mc/encode/check.fi" >"$D/cc$mi.log" 2>&1 || { cat "$D/cc$mi.log"; echo "FAIL compile check [$mode]"; rc=1; }
     mi=$((mi + 1))
 done
-while read -r key nmpv proto; do
+while read -r key nmpv proto fxdata; do
     [ -n "$ONLY" ] && [ "$ONLY" != "$proto" ] && continue
-    NODE_PATH=$NM node "$ROOT/tools/mcgen/gen_fixtures.cjs" "$D/fx$proto" "$nmpv" 4 >"$D/fx.log" 2>&1 || { cat "$D/fx.log"; echo "FAIL fixtures $key"; rc=1; continue; }
+    fxenv=()
+    if [ "$fxdata" != "-" ]; then
+        fxenv=(MC_DATA_VERSION="$fxdata" MC_PROTOCOL_JSON="$ROOT/tools/mcgen/data_extra/pc/$nmpv/protocol.json")
+    fi
+    env "${fxenv[@]}" NODE_PATH=$NM node "$ROOT/tools/mcgen/gen_fixtures.cjs" "$D/fx$proto" "$nmpv" 4 >"$D/fx.log" 2>&1 || { cat "$D/fx.log"; echo "FAIL fixtures $key"; rc=1; continue; }
     tail -1 "$D/fx.log" | sed "s/^/  [$key] /"
     mi=0
     for mode in "${MODES[@]}"; do

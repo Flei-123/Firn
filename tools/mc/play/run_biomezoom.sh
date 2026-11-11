@@ -330,13 +330,15 @@ def dist(a, b): return max(abs(a[c] - b[c]) for c in range(3))
 # (b) tint off: one flat colour left and right of the biome border, no border rows
 o = st["WOFF"]
 if dist(o["L"], o["R"]) > 6 or dist(o["L2"], o["R2"]) > 6: bad(f"tint OFF: water colour differs left/right ({o['L']} vs {o['R']})")
+if min(o["L"]) < 200: bad(f"tint OFF: water is too dark to scale the tint check ({o['L']})")
 if o["rows"] >= 10: bad(f"tint OFF: found a biome border in {o['rows']} rows")
+def lit(rgb): return tuple(round(rgb[c] * o["L"][c] / 255) for c in range(3))
 # (a) tint on: water colour follows the biome (swamp 617B64 left, warm_ocean 43D5EE right), border straight without zoom, jagged with zoom
 for n in ("WZ0B0", "WZ1B0", "WZ1B2", "WZ1B2b", "WG", "WV"):
     s = st[n]
     if dist(s["L"], s["R"]) < 40: bad(f"{n}: water colour does not follow the biome ({s['L']} vs {s['R']})")
-    # looking south the screen left is +x: warm_ocean 43D5EE (67,213,238) left, swamp 617B64 (97,123,100) right; the white texture takes the exact tint colour (+-3)
-    if dist(s["L"], (67, 213, 238)) > 3 or dist(s["R"], (97, 123, 100)) > 3: bad(f"{n}: water colour is not the biome tint (left {s['L']} want 43D5EE, right {s['R']} want 617B64)")
+    # looking south the screen left is +x: warm_ocean 43D5EE (67,213,238) left, swamp 617B64 (97,123,100) right; the white texture takes the tint colour times the lightmap level of the untinted run WOFF (+-3)
+    if dist(s["L"], lit((67, 213, 238))) > 3 or dist(s["R"], lit((97, 123, 100))) > 3: bad(f"{n}: water colour is not the biome tint (left {s['L']} want 43D5EE, right {s['R']} want 617B64)")
 a = st["WZ0B0"]; b = st["WZ1B0"]
 if a["rows"] < 60 or b["rows"] < 60: bad(f"water: too few border rows (zoom off {a['rows']}, on {b['rows']})")
 if a["range"] > 1.5: bad(f"water zoom OFF border is not straight (p5..p95 range {a['range']} px)")

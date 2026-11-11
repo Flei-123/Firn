@@ -98,7 +98,11 @@ The pty child is `setsid` + controlling tty + `TERM=xterm-256color`, `COLORTERM=
 
 ## Widget limits (v1)
 
-- The host forwards only arrows, Home / End, PgUp / PgDn, Delete, Backspace, Enter, Tab, Esc, F2, F5 as key events: Insert and other F-keys do not reach the terminal yet.
-- The pointer hook carries no modifiers: Shift-forces-selection is not possible; with mouse reporting on, selection is off.
-- No cursor blink, output while scrolled back keeps the view anchored, wide / box-drawing glyphs depend on the fallback face, underline / strike lines are drawn but faint in the golden.
+- The host forwards Insert and F1-F12 as `editor.KEYX_INSERT` / `KEYX_FN_BASE + n`; F2 and F5 keep their codes 101 / 100.
+- `app.pointer_mods()` gives the modifiers of the last button press (Linux / Windows host; Web and Android report none): Ctrl / Alt / Shift go into mouse reports, Shift forces selection while mouse reporting is on. No primary selection (middle click paste).
+- The widget fills its container (grow + stretch), so the grid follows the window; `stty size` follows a resize.
+- The cursor blinks (530 ms) while focused; the phase restarts on input and output; `--no-blink` turns it off (gates).
+- `app.set_pump` serves several pumps (`fui.pumpmux`): with more than one watched descriptor the window loop polls every 10 ms.
+- Output while scrolled back keeps the view anchored, wide / box-drawing glyphs depend on the fallback face, underline / strike lines are drawn but faint in the golden.
+- Live gate: `tools/fui/term_x11.sh` (Xvfb + xdotool + xwd, skips without them): typing, F-keys, resize, selection, copy / paste, mouse reports, wheel, alt screen, pager, exit reaping, idle CPU, blink.
 - Web: `termloop` only (pty stub), WebSocket backend not built.

@@ -979,6 +979,11 @@ echo "== 18p9b. terminal widget demo app (examples/fui_apps/terminal): scripted 
 "$FIRNC" --opt-level=dev -o "$W/terminal_app" examples/fui_apps/terminal/main.fi || exit 1
 "$W/terminal_app" --theme dark --size 900x560 --shot "$W/terminal_dark.png" || exit 1
 cmp "$W/terminal_dark.png" tools/fui/golden_term/terminal_dark.png || { echo "terminal golden differs"; exit 1; }
+echo "== 18p9c. pump multiplexer (app.set_pump serves several pumps) =="
+"$FIRNC" --opt-level=dev -o "$W/pumpmux" tools/fui/pumpmux_main.fi || exit 1
+"$W/pumpmux" || exit 1
+echo "== 18p9d. terminal in a real X11 window (Xvfb, xdotool): keys, resize, selection, clipboard, mouse, wheel, alt screen, exit =="
+FIRNC="$FIRNC" PROOF_DIR="${BELEGE:-$W/belege}/term_x11" bash tools/fui/term_x11.sh || exit 1
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
