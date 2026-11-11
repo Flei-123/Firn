@@ -42,6 +42,7 @@ build_select_targets() {
 
 build_check_available() {
     local t
+    [ "$VERIFY" = 0 ] || verify_check_tools
     for t in $APP_TARGETS; do
         . "$FUI_CLI/targets/$t.sh"
         "${t}_available" || fui_die 4 "target '$t' is unavailable on this machine"

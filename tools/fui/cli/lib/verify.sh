@@ -9,8 +9,13 @@ verify_native_shots() {
     done
 }
 
-verify_run() {
+verify_check_tools() {
     command -v chromium >/dev/null || fui_die 4 "chromium not found (needed for --verify)"
+    command -v python3 >/dev/null || fui_die 4 "python3 not found (needed for --verify)"
+}
+
+verify_run() {
+    verify_check_tools
     mkdir -p "$OUT/verify"
     verify_native_shots
     web_serve_start "$OUT/web"

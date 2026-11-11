@@ -4,6 +4,7 @@
 declare -A SEEN_SOURCE
 declare -A SEEN_BY
 declare -A SEEN_DIR
+declare -A SEEN_VERSION
 VISITED=
 LOCKED=0
 QUIET=0
@@ -29,18 +30,21 @@ source_descriptor() {
 }
 
 register_source() {
-    local name=$1 desc=$2 by=$3 dir=$4
+    local name=$1 desc=$2 by=$3 dir=$4 version=$5
     if [ -z "${SEEN_SOURCE[$name]:-}" ]; then
         SEEN_SOURCE[$name]=$desc
         SEEN_BY[$name]=$by
         SEEN_DIR[$name]=$dir
+        SEEN_VERSION[$name]=$version
         return 0
     fi
     if [ "${SEEN_SOURCE[$name]}" != "$desc" ]; then
-        die "conflict: dependency '$name' resolves to '${SEEN_SOURCE[$name]}' (via ${SEEN_BY[$name]:-the project}) and to '$desc' (via ${by:-the project})"
+        [ "${SEEN_VERSION[$name]}" != "$version" ] && return 0
+        die "conflict: dependency '$name' $version resolves to '${SEEN_SOURCE[$name]}' (via ${SEEN_BY[$name]:-the project}) and to '$desc' (via ${by:-the project}); give them different versions or use one source"
     fi
     [ "${SEEN_DIR[$name]}" = "$dir" ] && return 0
-    die "dependency '$name' is checked out twice (via ${SEEN_BY[$name]:-the project} and via ${by:-the project}); the compiler accepts one directory per package: point both needs at the same path"
+    case $desc in git*) return 0 ;; esac
+    die "dependency '$name' is checked out twice (via ${SEEN_BY[$name]:-the project} and via ${by:-the project}); two path directories with the same version are two packages: point both needs at the same path"
 }
 
 dep_fetch_one() {
@@ -52,6 +56,7 @@ dep_fetch_one() {
         return 0
     fi
     if [ -d "$DEPS_DIR/$name" ] && [ "$(pkg_tree_hash "$DEPS_DIR/$name")" = "$want" ]; then
+        dep_mark "$name" "$want"
         say "have    $label ${rev:0:12}"
         return 0
     fi
@@ -61,6 +66,7 @@ dep_fetch_one() {
         rm -rf "${DEPS_DIR:?}/$name"
         die "checksum mismatch for $label at ${rev:0:12}: expected $want, got $got"
     fi
+    dep_mark "$name" "$want"
     say "fetched $label ${rev:0:12}"
 }
 
@@ -75,7 +81,7 @@ walk_fetch() {
     done < <(deps_rows)
     while read -r name path ver; do
         [ -d "$path" ] || die "dependency '$name' of ${label:-the project} points to '$path', which does not exist"
-        register_source "$name" "$(source_descriptor "$name" "$path")" "${label%/}" "$(cd "$path" && pwd -P)"
+        register_source "$name" "$(source_descriptor "$name" "$path")" "${label%/}" "$(cd "$path" && pwd -P)" "$(dep_version "$path")"
         local here=$PWD
         cd "$path" || die "cannot enter $path"
         walk_fetch "$label$name/"
@@ -90,6 +96,7 @@ cmd_fetch() {
     SEEN_SOURCE=()
     SEEN_BY=()
     SEEN_DIR=()
+    SEEN_VERSION=()
     local a
     for a in "$@"; do
         case $a in
@@ -106,7 +113,14 @@ cmd_fetch() {
 verify_one() {
     local label=$1 name=$2 hash=$3 got=
     [ -d "$DEPS_DIR/$name" ] && got=$(pkg_tree_hash "$DEPS_DIR/$name")
-    if [ -n "$got" ] && [ "$got" = "$hash" ]; then echo "ok      $label"; return 0; fi
+    if [ -n "$got" ] && [ "$got" = "$hash" ]; then
+        if [ "$(cat "$DEPS_DIR/$name/.firn/pin" 2>/dev/null)" != "$hash" ]; then
+            echo "FAILED  $label (pin marker missing or stale: run firn fetch)"
+            return 1
+        fi
+        echo "ok      $label"
+        return 0
+    fi
     echo "FAILED  $label (expected $hash, got ${got:-missing})"
     return 1
 }

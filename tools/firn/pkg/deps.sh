@@ -32,6 +32,10 @@ deps_rows() {
 
 deps_row() { deps_rows | awk -v n="$1" '$1 == n { print; exit }'; }
 
+dep_mark() {
+    mkdir -p "$DEPS_DIR/$1/.firn" && printf '%s\n' "$2" > "$DEPS_DIR/$1/.firn/pin"
+}
+
 dep_install() {
     local name=$1 url=$2 rev=$3
     if ! store_has "$url" "$rev"; then
@@ -59,6 +63,7 @@ dep_pin() {
     dep_install_or_die "$name" "$url" "$rev"
     [ -f "$DEPS_DIR/$name/firn.package" ] || { rm -rf "${DEPS_DIR:?}/$name"; die "'$name' ($url) has no firn.package (not a Firn package)"; }
     hash=$(pkg_tree_hash "$DEPS_DIR/$name")
+    dep_mark "$name" "$hash"
     deps_put "$name" "$url" "${ref:-$NO_VALUE}" "$rev" "$hash"
     PINNED_REV=$rev
     PINNED_HASH=$hash

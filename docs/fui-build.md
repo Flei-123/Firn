@@ -54,12 +54,14 @@ Data is found by name: native via `$FUI_DATA_DIR`, then `<exe>/data`; web and An
 ## Commands
 
 ```
-fui new <name> [--dir DIR]
+fui new <name> [--template counter|blank|settings|files] [--dir DIR]
 fui build [DIR] [--targets native,web,android] [--out DIR] [--verify] [--limit PCT] [--opt LEVEL] [--abi ABI]
 fui verify [DIR] [--out DIR] [--limit PCT]
 fui targets
 ```
 
+- `fui new` templates: `counter` (default: label, button, data file), `blank` (one label), `settings` and `files` (copies of `examples/fui_apps/tpl_settings` / `tpl_files` with their slim icon set). A template is a folder in `tools/fui/cli/template/` (`size` = window size, optional `source` = repo folder whose `*.fi` files are copied); `common/` is added to every one.
+- `--verify` checks for chromium and python3 BEFORE building (exit 4).
 - `--out` defaults to `<DIR>/dist`; layout `native/`, `web/`, `android/`, `verify/`.
 - `android` needs the NDK and SDK build-tools (`NDK`, `SDK`, see tools/android/build.sh); output `android/<package>-<abi>.apk`, default ABI x86_64, `--abi arm64` for a phone.
 - `fui targets` lists the registered targets (one file per target in `tools/fui/cli/targets/`) and whether they work on this machine.

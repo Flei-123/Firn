@@ -2,7 +2,7 @@
 verb_help() {
     cat <<USAGE
 usage:
-  fui new <name> [--dir DIR]
+  fui new <name> [--template counter|blank|settings|files] [--dir DIR]
   fui build [DIR] [--targets native,web,android] [--out DIR] [--verify] [--limit PCT] [--opt LEVEL] [--abi ABI]
   fui verify [DIR] [--out DIR] [--limit PCT]
   fui targets
