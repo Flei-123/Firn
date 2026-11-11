@@ -19,6 +19,7 @@ The object cache key already hashes the compiler binary (`compiler/src/buildcach
 | `firn upgrade` | newest of the channel; no-op when pinned; lists projects whose pin is older |
 | `firn upgrade --pin VER` / `--unpin` | hold / release a version |
 | `firn list`, `firn use VER`, `firn version`, `firn doctor` | inspect / switch / check (PATH, shims, selftest) |
+| `firn prune [--keep N] [--dry-run] [--repos FILE]` | delete installed versions except `current`, the N newest (default 3), the config pin and every version named by a `firn.toolchain` in the working directory, in `~/.firn/projects` or in a registry file (default `tools/pin/repos.txt` of the working directory) |
 | `firn channel URL [NAME]` | channel address (`file://`, `http://`, `https://`) |
 | `firn build ARGS`, `firn run FILE ARGS` | pass-through to the chosen `firnc` |
 
@@ -44,6 +45,8 @@ Downgrade protection: every manifest has `min_version`; the client stores the hi
 Test: `bash tools/fmt/premerge_check.sh` (temporary git repo: unformatted new/modified/committed file is rejected and listed, formatted passes, `--fix`, skips, hook install and push blocking); `tools/fmt/run.sh` step 7 runs it.
 
 ## Tests
+`bash tools/toolchain/prune_test.sh` covers `firn prune` (fake `FIRN_HOME` in a temp dir).
+
 `bash tools/toolchain/run.sh` (temp dirs, trap cleanup): two+ fake versions, bootstrap over `file://` and `http://127.0.0.1`, shims, run/build, upgrade, list, project pins and ranges, stale-pin report, wrong hash, broken compiler (selftest), pin/unpin, use, floor/replayed manifest. Windows under Wine: not yet (no Windows firnc archive, `fs` has no Windows twin).
 
 ## Plan: Certus and OrientOS on `firn upgrade` (not switched yet)

@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.io
+import std.fs
+import std.fsx
+import std.pystr
+import toolchain.tcver
+import toolchain.tcpaths
+import toolchain.tcconfig
+import toolchain.tcproject
+import toolchain.tcbrand
+
+const DEFAULT_KEEP: usize = 3
+const BAD_COUNT: i64 = -1
+const DEFAULT_REPOS: str = "tools/pin/repos.txt"
+
+struct Plan {
+    keep: Vec[str],
+    why: Vec[str],
+}
+
+fn plan_new() -> Plan {
+    return Plan { keep: vec_new[str](), why: vec_new[str]() }
+}
+
+fn plan_free(p: *mut Plan) {
+    vec_free[str](&(*p).keep)
+    vec_free[str](&(*p).why)
+}
+
+fn plan_has(p: *mut Plan, v: str) -> bool {
+    for i in 0..vec_len[str](&(*p).keep) {
+        if *vec_elem_ptr[str](&(*p).keep, i) == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn plan_add(p: *mut Plan, v: str, why: str) {
+    if v.length() == 0 || plan_has(p, v) {
+        return
+    }
+    vec_push[str](&(*p).keep, v)
+    vec_push[str](&(*p).why, why)
+}
+
+fn plan_reason(p: *mut Plan, v: str) -> str {
+    for i in 0..vec_len[str](&(*p).keep) {
+        if *vec_elem_ptr[str](&(*p).keep, i) == v {
+            return *vec_elem_ptr[str](&(*p).why, i)
+        }
+    }
+    return ""
+}
+
+fn parse_count(s: str) -> i64 {
+    if s.length() == 0 {
+        return BAD_COUNT
+    }
+    var n: i64 = 0
+    for i in 0..s.length() {
+        let c: u8 = s.chars(i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return BAD_COUNT
+        }
+        n = n * 10 + (c - 48 as u8) as i64
+        if n > 1000000 {
+            return BAD_COUNT
+        }
+    }
+    return n
+}
+
+fn resolve_spec(spec: str) -> str {
+    if tcver.spec_is_exact(spec) {
+        return pystr.strip(spec)
+    }
+    return tcproject.best_installed(spec)
+}
+
+fn plan_pin_file(p: *mut Plan, file: str, why: str) {
+    if file.length() == 0 || !fs.is_file(file) {
+        return
+    }
+    let pin: tcproject.Pin = tcproject.read_pin(file)
+    if pin.err.length() > 0 {
+        return
+    }
+    let v: str = resolve_spec(pin.spec)
+    if tcpaths.is_installed(v) {
+        plan_add(p, v, why + " " + file)
+    }
+}
+
+fn plan_projects(p: *mut Plan) {
+    var lines: Vec[str] = vec_new[str]()
+    pystr.splitlines(tcpaths.read_text(tcpaths.projects_path()), &lines)
+    for i in 0..vec_len[str](&lines) {
+        plan_pin_file(p, pystr.strip(*vec_elem_ptr[str](&lines, i)), "project")
+    }
+    vec_free[str](&lines)
+}
+
+fn plan_registry(p: *mut Plan, registry: str) {
+    if !fs.is_file(registry) {
+        return
+    }
+    var lines: Vec[str] = vec_new[str]()
+    pystr.splitlines(tcpaths.read_text(registry), &lines)
+    for i in 0..vec_len[str](&lines) {
+        var cols: Vec[str] = vec_new[str]()
+        pystr.split_ws(pystr.strip(*vec_elem_ptr[str](&lines, i)), &cols)
+        if vec_len[str](&cols) >= 3 && !pystr.startswith(*vec_elem_ptr[str](&cols, 0), "#") {
+            let dir: str = tcpaths.join(*vec_elem_ptr[str](&cols, 1), *vec_elem_ptr[str](&cols, 2))
+            plan_pin_file(p, fsx.normpath(tcpaths.join(dir, tcbrand.TOOLCHAIN_FILE)), "registry")
+        }
+        vec_free[str](&cols)
+    }
+    vec_free[str](&lines)
+}
+
+fn plan_newest(p: *mut Plan, all: *mut Vec[str], count: usize) {
+    var picked: Plan = plan_new()
+    for round in 0..count {
+        var best: str = ""
+        for i in 0..vec_len[str](all) {
+            let v: str = *vec_elem_ptr[str](all, i)
+            if !plan_has(&picked, v) && (best.length() == 0 || tcver.ver_cmp(v, best) > 0) {
+                best = v
+            }
+        }
+        plan_add(&picked, best, "newest")
+        plan_add(p, best, "newest")
+    }
+    plan_free(&picked)
+}
+
+fn build_plan(p: *mut Plan, all: *mut Vec[str], count: usize, registry: str) {
+    plan_add(p, tcpaths.current_version(), "current")
+    plan_add(p, tcconfig.config_get("pin"), "pinned")
+    plan_pin_file(p, tcproject.find_file(fsx.cwd()), "project")
+    plan_projects(p)
+    plan_registry(p, registry)
+    plan_newest(p, all, count)
+}
+
+fn remove_version(v: str) -> bool {
+    let gone: bool = fs.remove_tree(tcpaths.version_dir(v)) catch false
+    return gone
+}
+
+fn verb_of(dry: bool) -> str {
+    if dry {
+        return "to remove"
+    }
+    return "removed"
+}
+
+fn cmd_prune(keep: str, dry: bool, repos: str) -> i32 {
+    var count: usize = DEFAULT_KEEP
+    if keep.length() > 0 {
+        let n: i64 = parse_count(keep)
+        if n < 0 {
+            io.eprint_line(tcbrand.CLI + ": prune --keep needs a number")
+            return 2
+        }
+        count = n as usize
+    }
+    var registry: str = repos
+    if registry.length() == 0 {
+        registry = DEFAULT_REPOS
+    }
+    var all: Vec[str] = vec_new[str]()
+    tcproject.installed(&all)
+    var plan: Plan = plan_new()
+    build_plan(&plan, &all, count, registry)
+    var removed: usize = 0
+    var failed: usize = 0
+    for i in 0..vec_len[str](&all) {
+        let v: str = *vec_elem_ptr[str](&all, i)
+        let why: str = plan_reason(&plan, v)
+        if why.length() > 0 {
+            io.print_line("keep    " + v + " (" + why + ")")
+        } else if dry {
+            io.print_line("remove  " + v + " (dry run)")
+            removed = removed + 1
+        } else if remove_version(v) {
+            io.print_line("removed " + v)
+            removed = removed + 1
+        } else {
+            io.eprint_line(tcbrand.CLI + ": cannot remove " + v)
+            failed = failed + 1
+        }
+    }
+    let kept: usize = vec_len[str](&all) - removed - failed
+    let verb: str = verb_of(dry)
+    io.print_line("prune: " + tcver.u64_text(removed as u64) + " " + verb + ", " + tcver.u64_text(kept as u64) + " kept")
+    plan_free(&plan)
+    vec_free[str](&all)
+    if failed > 0 {
+        return 1
+    }
+    return 0
+}

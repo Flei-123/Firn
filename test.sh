@@ -832,6 +832,15 @@ else
     tail -20 "$WORK/testkit.log" | sed 's/^/   /' || true
 fi
 
+echo "== 21d. firn prune: keeps current, newest N, pinned versions (tools/toolchain/prune_test.sh) =="
+if bash tools/toolchain/prune_test.sh > "$WORK/prune.log" 2>&1; then
+    ok
+    tail -1 "$WORK/prune.log" | sed 's/^/   /' || true
+else
+    bad "tools/toolchain/prune_test.sh failed (see .test-work/prune.log)"
+    tail -20 "$WORK/prune.log" | sed 's/^/   /' || true
+fi
+
 echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
 # firnfmt, written in Firn. Proven is: the token stream and the syntax tree
 # stay unchanged over the WHOLE tree, a second run changes nothing, the
