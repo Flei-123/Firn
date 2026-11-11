@@ -15,7 +15,8 @@
 'use strict'
 const fs = require('fs')
 const path = require('path')
-const { playToClient } = require('./codec.cjs')
+const { playToClient, writeVarint } = require('./codec.cjs')
+const { genPackedDelta, genPositionPath } = require('./paths.cjs')
 const { EntityTracker } = require('../../mcclient/ref_entities.cjs')
 
 const release = process.argv[2]
@@ -78,6 +79,9 @@ function build (name, over) {
   const p = {}
   for (const f of fieldsOf(name)) {
     if (over && over[f.name] !== undefined) { p[f.name] = over[f.name]; continue }
+    if (f.name === 'packed') { Object.assign(p, genPackedDelta(ri, pick)); continue }
+    if (f.name === 'pathType') { Object.assign(p, genPositionPath(ri, genPos)); continue }
+    if (f.name === 'delta' || f.name === 'path') continue
     if (typeof f.type === 'string') {
       p[f.name] = genScalar(f.type, f.name)
     } else if (f.type[0] === 'switch') { // 1.8 spawn_entity velocity: only with objectData != 0
@@ -98,23 +102,31 @@ const live = [] // ids of entities that should exist
 let nextId = 1
 let ok = 0
 // 1.21.2+ (protocol 768+): minecraft-data still lists the old entity_teleport layout, the game sends
-// id, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground = sync_entity_position + an i32 before the last octet
+// id, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground
 const TELEPORT_V21 = V.protocol >= 768
-// returns { body, flags }: the random flags are part of the packet AND of the reference parameters (bit 0..2 x y z, 3 yaw, 4 pitch relative)
-function teleportV21Body (params) {
-  const sync = Buffer.from(codec.serialize('sync_entity_position', params))
-  const flags = Buffer.alloc(4)
-  const fl = ri(-2147483648, 2147483647)
-  flags.writeInt32BE(fl, 0)
-  return { body: Buffer.concat([sync.subarray(0, sync.length - 1), flags, sync.subarray(sync.length - 1)]), flags: fl }
+function teleportV21Params (entityId) {
+  const params = { entityId, onGround: rnd() < 0.5 }
+  for (const n of ['x', 'y', 'z', 'dx', 'dy', 'dz']) params[n] = genScalar('f64', n)
+  for (const n of ['yaw', 'pitch']) params[n] = genScalar('f32', n)
+  params.flags = ri(-2147483648, 2147483647)
+  return params
+}
+function teleportV21Body (p) {
+  const head = Buffer.alloc(5)
+  const idLen = writeVarint(p.entityId, head, 0)
+  const tail = Buffer.alloc(6 * 8 + 2 * 4 + 4 + 1)
+  let at = 0
+  for (const n of ['x', 'y', 'z', 'dx', 'dy', 'dz']) { tail.writeDoubleBE(p[n], at); at += 8 }
+  for (const n of ['yaw', 'pitch']) { tail.writeFloatBE(p[n], at); at += 4 }
+  tail.writeInt32BE(p.flags, at); at += 4
+  tail.writeUInt8(p.onGround ? 1 : 0, at)
+  return Buffer.concat([head.subarray(0, idLen), tail])
 }
 function emit (name, params) {
   let body
   if (name === 'entity_teleport' && TELEPORT_V21) {
-    params = build('sync_entity_position', { entityId: params.entityId })
-    const t = teleportV21Body(params)
-    body = t.body
-    params = Object.assign({ v21: true, flags: t.flags }, params)
+    params = Object.assign({ v21: true }, teleportV21Params(params.entityId))
+    body = teleportV21Body(params)
   } else {
     body = codec.serialize(name, params)
   }

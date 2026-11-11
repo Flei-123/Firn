@@ -44,6 +44,18 @@ class EntityTracker {
   delta (v) { return this.fixed ? v / 32 : v / 4096 }
   angle (v) { return ((v & 255) * 360) / 256 }
 
+  packedDeltaSum (p) {
+    const steps = p.packed >> 1
+    const sum = { x: 0, y: 0, z: 0 }
+    for (let i = 0; i < Math.max(steps, 1); i++) {
+      const suffix = steps === 0 ? '' : String(i)
+      sum.x += this.delta(p.delta['dX' + suffix]); sum.y += this.delta(p.delta['dY' + suffix]); sum.z += this.delta(p.delta['dZ' + suffix])
+    }
+    return sum
+  }
+
+  lastPathPoint (p) { return p.pathType === 0 ? p.path : p.path[p.path.length - 1] }
+
   spawn (p, kind, uuidKey) {
     const uuid = uuidKey && p[uuidKey] !== undefined ? uuidHex(p[uuidKey]) : null
     const e = {
@@ -88,7 +100,8 @@ class EntityTracker {
         this.count.teleport++
         const e = this.ents.get(p.entityId)
         if (!e) { this.count.miss++; return }
-        e.x = p.x; e.y = p.y; e.z = p.z
+        const at = p.path === undefined ? p : this.lastPathPoint(p)
+        e.x = at.x; e.y = at.y; e.z = at.z
         e.yaw = p.yaw; e.pitch = p.pitch
         e.ground = !!p.onGround
         return
@@ -98,9 +111,15 @@ class EntityTracker {
         this.count.move++
         const e = this.ents.get(p.entityId)
         if (!e) { this.count.miss++; return }
-        e.x = e.x + this.delta(p.dX); e.y = e.y + this.delta(p.dY); e.z = e.z + this.delta(p.dZ)
+        if (p.packed === undefined) {
+          e.x = e.x + this.delta(p.dX); e.y = e.y + this.delta(p.dY); e.z = e.z + this.delta(p.dZ)
+          e.ground = !!p.onGround
+        } else {
+          const sum = this.packedDeltaSum(p)
+          e.x = e.x + sum.x; e.y = e.y + sum.y; e.z = e.z + sum.z
+          e.ground = (p.packed & 1) !== 0
+        }
         if (name === 'entity_move_look') { e.yaw = this.angle(p.yaw); e.pitch = this.angle(p.pitch) }
-        e.ground = !!p.onGround
         return
       }
       case 'entity_look': {

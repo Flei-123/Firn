@@ -3,12 +3,24 @@
 // serializer where it supports the version, else the protodef compiler on minecraft-data's
 // protocol.json (same approach and same two helper types as tools/mcgen/gen_fixtures.cjs).
 'use strict'
+const fs = require('fs')
+const path = require('path')
 const mcData = require('minecraft-data')
 const nbt = require('prismarine-nbt')
 const { createSerializer } = require('minecraft-protocol/src/transforms/serializer')
 const { ProtoDefCompiler } = require('protodef').Compiler
 const { Serializer } = require('protodef')
 const nmpVersions = require('minecraft-protocol/src/version').supportedVersions
+
+const EXTRA_DATA_DIR = path.join(__dirname, '..', '..', 'mcgen', 'data_extra', 'pc')
+
+function loadProtocolData (version) {
+  const data = mcData(version)
+  if (data) return data
+  const file = path.join(EXTRA_DATA_DIR, version, 'protocol.json')
+  if (!fs.existsSync(file)) throw new Error('no minecraft-data and no extra data for ' + version)
+  return { protocol: JSON.parse(fs.readFileSync(file, 'utf8')) }
+}
 
 function writeVarint (v, buffer, offset) {
   v >>>= 0
@@ -123,7 +135,7 @@ function customProtocol (proto, state, direction) {
 
 // serializer of the play packets the SERVER sends (toClient); returns { data, serialize(name, params) -> body without id }
 function playToClient (version) {
-  const data = mcData(version)
+  const data = loadProtocolData(version)
   const proto = data.protocol
   const viaNmp = nmpVersions.includes(version) && !JSON.stringify(proto).includes('"registryEntryHolder",')
   const ser = viaNmp
@@ -141,4 +153,4 @@ function playToClient (version) {
     }
   }
 }
-module.exports = { playToClient }
+module.exports = { playToClient, writeVarint }
