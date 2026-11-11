@@ -117,6 +117,7 @@ mod panic_rt;
 mod panic_rt_a64;
 mod lock;
 mod package;
+mod package_pin;
 mod package_world;
 mod prof;
 mod parser;

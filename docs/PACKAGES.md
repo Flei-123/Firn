@@ -47,10 +47,17 @@ Every git fetch goes through a bare mirror in `$FIRN_PKG_CACHE` (default `~/.cac
 
 A dependency with its own `firn.deps` fetches its git dependencies into its own `.firn/deps` (nested; its `needs` lines point there). `firn fetch` walks the whole graph (path and git packages, every package once).
 
-Conflicts are detected before the compiler runs:
+## Diamond dependencies: one version per package
 
-- same name, different source or commit in two places: `conflict: dependency 'x' resolves to ... and to ...`.
-- same name, same commit, but two checkouts: `dependency 'x' is checked out twice`. The compiler allows one directory per package (`package 'x' comes from two directories`). Workaround: point both `needs` at the same path, for example `needs txt .firn/deps/util/.firn/deps/txt` in the root. Two siblings that both depend on the same git package cannot be unified without a compiler change (roadmap).
+Two dependents may need the same package (`app -> a -> txt`, `app -> b -> txt`). A build contains ONE `txt`. The rules, the same in `firnc0` and `firnc1`:
+
+1. Different versions: the highest wins (`docs/ROUND93.md`). A `needs NAME PATH VERSION` line is a wish: the winner has to be at least that version with the same first number, otherwise `dependency 'txt' is version 1.0.0, needed is 0.1.0 or higher with the same first number` (at the line of the `needs`).
+2. Same version, same content: one package. `firn fetch` writes the tree hash of every git checkout to `<checkout>/.firn/pin` (not part of the tree hash). Two directories with the same name, the same version and the same non-empty pin are the same package; the smaller root path wins, whatever the order the edges were found in, so `firn.lock` is deterministic and lists the package once.
+3. Same version, different content (different pin, a pin on one side only, or two path directories): `package 'txt' comes from two directories with version 0.1.0`.
+
+`firn fetch` checks the same rules before the compiler runs (`conflict: dependency 'txt' 0.1.0 resolves to ... and to ...`: same version from two different git sources, or `is checked out twice`: two path directories). Different versions from different sources pass and are left to rule 1. `firn verify` also checks the pin marker (`pin marker missing or stale: run firn fetch`).
+
+Each dependent still keeps its own nested checkout in `.firn/deps` (cheap, from the cache); only one of them is compiled. The compiler trusts the pin file: it is as good as the last `firn fetch`/`firn verify`.
 
 ## Example
 
@@ -63,8 +70,8 @@ firn test                                                          # passed 1, f
 
 ## Checks
 
-`bash tools/firn/add_check.sh` (31 checks: pins, transitive deps, hash mismatch, offline, update, remove, conflict, example) and `bash tools/firn/test_firn.sh` (driver, 21 checks).
+`bash tools/firn/add_check.sh` (pins, transitive deps, diamonds, hash mismatch, offline, update, remove, conflict, example) and `bash tools/firn/test_firn.sh` (driver, 21 checks).
 
 ## Not there yet
 
-Registry/index and semver ranges, publishing, docs generator, LSP, vendoring, patch overrides, flat sharing of transitive git packages. See the ecosystem items in the roadmap.
+Registry/index and semver ranges, publishing, docs generator, LSP, vendoring, patch overrides. See the ecosystem items in the roadmap.

@@ -952,6 +952,9 @@ echo "== 18p7. THE EDITOR PROOF APP (examples/fui_apps/editor): model check, aud
 FUI_AUDIT=1 "$W/editor_app" --data examples/fui_apps/data || exit 1
 "$W/editor_app" --theme light --size 1100x700 --data examples/fui_apps/data --shot "$W/editor_light.png" || exit 1
 cmp "$W/editor_light.png" tools/fui/golden_editor/editor_light.png || { echo "editor golden differs"; exit 1; }
+echo "== 18p7a. IconButton in the app API (fui.appicon): named button, hover, click =="
+build appicon
+"$W/appicon" || exit 1
 echo "== 18p7b. FILE MANAGER (examples/fui_apps/fm, fui.fsbackend, fui.memtree, services.svcmut): model checks, audit =="
 "$FIRNC" --opt-level=dev -o "$W/memtree" tools/fui/memtree_main.fi || exit 1
 "$W/memtree" || exit 1
@@ -976,6 +979,11 @@ echo "== 18p9b. terminal widget demo app (examples/fui_apps/terminal): scripted 
 "$FIRNC" --opt-level=dev -o "$W/terminal_app" examples/fui_apps/terminal/main.fi || exit 1
 "$W/terminal_app" --theme dark --size 900x560 --shot "$W/terminal_dark.png" || exit 1
 cmp "$W/terminal_dark.png" tools/fui/golden_term/terminal_dark.png || { echo "terminal golden differs"; exit 1; }
+echo "== 18p9c. pump multiplexer (app.set_pump serves several pumps) =="
+"$FIRNC" --opt-level=dev -o "$W/pumpmux" tools/fui/pumpmux_main.fi || exit 1
+"$W/pumpmux" || exit 1
+echo "== 18p9d. terminal in a real X11 window (Xvfb, xdotool): keys, resize, selection, clipboard, mouse, wheel, alt screen, exit =="
+FIRNC="$FIRNC" PROOF_DIR="${BELEGE:-$W/belege}/term_x11" bash tools/fui/term_x11.sh || exit 1
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
@@ -1216,6 +1224,8 @@ build qrview
 "$W/qrview" | tail -n 3
 build webview
 "$W/webview" | tail -n 3 | grep -q "WEBVIEW PASSED"
+build webview_ime
+"$W/webview_ime" | tail -n 3 | grep -q "WEBVIEW IME PASSED"
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="

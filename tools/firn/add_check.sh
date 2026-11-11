@@ -5,7 +5,7 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 FIRN=$ROOT/tools/firn/firn
 export FIRN_ROOT=$ROOT FIRNLIB=$ROOT/lib
-FIRNC=$ROOT/compiler/target/release/firnc; [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
+FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}; [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNC
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -61,6 +61,39 @@ ck "conflicting revisions are reported" '"$FIRN" add txt "file://$T/txt" v2 >/de
 ck "remove drops needs, row and checkout" '"$FIRN" remove txt >/dev/null && ! grep -q "^needs    txt" firn.package && ! grep -q "^txt " firn.deps && [ ! -e .firn/deps/txt ]'
 ck "remove of an unknown name fails" '! "$FIRN" remove txt >/dev/null 2>&1'
 ck "build works after remove" '"$FIRN" build . -o ./appbin4 >/dev/null 2>&1 && [ "$(./appbin4)" = "5 8" ]'
+
+mk_user() { ( cd "$T" && "$FIRN" new --lib "$1" > /dev/null && cd "$1" && "$FIRN" add txt "file://$T/txt" "$2" > /dev/null && printf 'import txt\n\nfn f(a: i32) -> i32 {\n    return txt.add(a, a)\n}\n' > "src/$1.fi" ) && commit_repo "$T/$1" init v1; }
+mk_consumer() { ( cd "$T" && "$FIRN" new "$1" > /dev/null && cd "$1" && shift && for u in "$@"; do "$FIRN" add "$u" "file://$T/$u" v1 > /dev/null 2>&1 || true; done && printf 'import std.io\nimport %s\nimport %s\n\nfn main() -> i32 {\n    io.fmt_print_line(f"{%s.f(3)} {%s.f(4)}")\n    return 0\n}\n' "$1" "$2" "$1" "$2" > src/main.fi ); }
+
+cd "$T"
+mk_user ua v1; mk_user ub v1
+mk_consumer d1 ua ub
+cd d1
+ck "diamond: one git package via two siblings (same commit) builds" '"$FIRN" build . -o ./d1bin >/dev/null 2>"$T/err" && [ "$(./d1bin)" = "6 8" ]'
+ck "diamond: the lock names the shared package once" '[ "$(grep -c "^package txt " firn.lock)" = 1 ]'
+cp firn.lock d1.lock
+ck "diamond: locked rebuild is reproducible" '"$FIRN" build . -o ./d1bin2 --locked >/dev/null 2>&1 && cmp -s d1.lock firn.lock && cmp -s d1bin d1bin2'
+ck "diamond: verify accepts both checkouts" '"$FIRN" verify >/dev/null && [ -f .firn/deps/ua/.firn/deps/txt/.firn/pin ] && cmp -s .firn/deps/ua/.firn/deps/txt/.firn/pin .firn/deps/ub/.firn/deps/txt/.firn/pin'
+ck "diamond: verify catches a missing pin marker" 'rm .firn/deps/ua/.firn/deps/txt/.firn/pin && ! "$FIRN" verify >/dev/null 2>&1 && "$FIRN" fetch >/dev/null && "$FIRN" verify >/dev/null'
+
+cd "$T"
+( cd txt && sed -i 's/^version[[:space:]].*/version  0.2.0/' firn.package && git commit -qam v3 && git tag v3 ) > /dev/null
+( cd txt && sed -i 's/^version[[:space:]].*/version  1.0.0/' firn.package && git commit -qam v4 && git tag v4 ) > /dev/null
+mk_user uc v3; mk_user ud v4
+mk_consumer d2 ua uc
+cd d2
+ck "diamond: compatible versions resolve to the higher one" '"$FIRN" build . -o ./d2bin >/dev/null 2>"$T/err" && [ "$(./d2bin)" = "106 108" ] && grep -q "^package txt 0.2.0 " firn.lock && [ "$(grep -c "^package txt " firn.lock)" = 1 ]'
+cd "$T"
+mk_consumer d3 ua ud
+cd d3
+ck "diamond: an incompatible major version is a clear error" '! "$FIRN" build . -o ./d3bin >/dev/null 2>"$T/err" && grep -q "needed is 0.1.0 or higher with the same first number" "$T/err"'
+cd "$T"
+mk_user ue v1
+( cd txt && git checkout -q v1 && printf 'fn add(a: i32, b: i32) -> i32 {\n    return a + b + 1\n}\n' > src/txt.fi && git commit -qam v1b && git tag v1b && git checkout -q main ) > /dev/null
+( cd "$T" && "$FIRN" new --lib uf > /dev/null && cd uf && "$FIRN" add txt "file://$T/txt" v1b > /dev/null && printf 'import txt\n\nfn f(a: i32) -> i32 {\n    return txt.add(a, a)\n}\n' > src/uf.fi ) && commit_repo "$T/uf" init v1
+mk_consumer d4 ue uf
+cd d4
+ck "diamond: same version, different source is a conflict" '! "$FIRN" build . -o ./d4bin >/dev/null 2>"$T/err" && grep -q "conflict: dependency .txt. 0.1.0" "$T/err"'
 
 cd "$ROOT/examples/pkg_demo/app"
 ck "example project builds and runs" 'd=$(mktemp -d) && "$FIRN" build . -o "$d/app" >/dev/null 2>&1 && [ "$("$d/app")" = "hello, world!" ]; rm -rf "$d" firn.lock'

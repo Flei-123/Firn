@@ -36,6 +36,13 @@ Downgrade protection: every manifest has `min_version`; the client stores the hi
 - `install.sh URL [channel]`: POSIX bootstrap (curl or file), checks SHA-256, then lets `firn` install itself and writes the shims.
 - Platforms: linux-x86_64 built here; linux-aarch64 / windows-x86_64 only via `--firnc-for` (no cross-built firnc0 yet).
 
+## Merge check: formatting before main
+`bash tools/fmt/premerge.sh [BASE]` runs `firnfmt -c` over every `.fi` file changed against `BASE` (default `origin/main`; committed, modified and untracked files; symlinks and `tests/lexneg/` are skipped). It lists the unformatted files and exits 1; `--fix` formats them. The formatter is built once per call with `$FIRNC`, `compiler/target/release/firnc` or `firnc` from `PATH` (`FIRNFMT=<bin>` skips the build).
+
+`bash tools/fmt/install_hook.sh` installs a `pre-push` hook that runs it when the push updates `refs/heads/main` (`FIRN_SKIP_FMT=1` skips; a foreign hook is only replaced with `--force`; with a shared `core.hooksPath` it goes into that directory). Run `premerge.sh` before every merge to main, also without the hook.
+
+Test: `bash tools/fmt/premerge_check.sh` (temporary git repo: unformatted new/modified/committed file is rejected and listed, formatted passes, `--fix`, skips, hook install and push blocking); `tools/fmt/run.sh` step 7 runs it.
+
 ## Tests
 `bash tools/toolchain/run.sh` (temp dirs, trap cleanup): two+ fake versions, bootstrap over `file://` and `http://127.0.0.1`, shims, run/build, upgrade, list, project pins and ranges, stale-pin report, wrong hash, broken compiler (selftest), pin/unpin, use, floor/replayed manifest. Windows under Wine: not yet (no Windows firnc archive, `fs` has no Windows twin).
 

@@ -4,7 +4,7 @@
 #
 #   bash tools/fui/fuibuild.sh
 #
-# A fresh project from `fui new` and the apps editor, notes, files: native + web build from ONE source,
+# A fresh project from `fui new` (every template) and the apps editor, notes, files, fm: native + web build from ONE source,
 # native --shot against the Chromium shot of the web build (limit 0.5 %), layout of dist/, exit codes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -39,6 +39,15 @@ expect_exit 0 "new" $FUI new probe
 for f in firn.package fui.app main.fi .gitignore data/greeting.json; do expect_file "$D/probe/$f"; done
 expect_exit 2 "new refuses a non-empty folder" $FUI new probe
 expect_exit 2 "new rejects a bad name" $FUI new Bad-Name
+expect_exit 2 "new rejects an unknown template" $FUI new probe_x --template nope
+for t in blank settings files; do
+    expect_exit 0 "new --template $t" $FUI new "tpl_$t" --template "$t"
+    for f in firn.package fui.app main.fi .gitignore; do expect_file "$D/tpl_$t/$f"; done
+done
+expect_file "$D/tpl_settings/ds_icons_set.fi"
+expect_file "$D/tpl_files/ds_icons_set.fi"
+expect_exit 0 "new --dir" $FUI new viadir --dir "$D/elsewhere/viadir"
+expect_file "$D/elsewhere/viadir/main.fi"
 expect_exit 5 "build without manifest" $FUI build "$D"
 expect_exit 2 "build unknown option" $FUI build probe --bogus
 expect_exit 2 "build unknown target" $FUI build probe --targets bogus
@@ -58,7 +67,12 @@ expect_file "$D/out-probe/web/probe.wasm"
 expect_exit 3 "pixel gate fails above the limit" $FUI verify probe --out "$D/out-probe" --limit -1
 expect_exit 0 "verify an existing build" $FUI verify probe --out "$D/out-probe"
 
-for app in editor notes files; do
+for t in blank settings files; do
+    expect_exit 0 "build + verify template $t" $FUI build "tpl_$t" --targets native,web --verify --out "$D/out-tpl-$t"
+    grep -h "^RESULT" "$D/last.log"
+done
+
+for app in editor notes files fm; do
     expect_exit 0 "build + verify $app" $FUI build "$ROOT/examples/fui_apps/$app" --targets native,web --verify --out "$D/out-$app"
     grep -h "^RESULT" "$D/last.log"
     expect_file "$D/out-$app/native/$app"

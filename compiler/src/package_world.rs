@@ -13,6 +13,7 @@
 //! deliberate: everything new hangs off the manifest, nothing changes without.
 
 use crate::package::{self, Manifest};
+use crate::package_pin;
 
 /// One loaded package.
 pub struct Package {
@@ -269,6 +270,16 @@ impl World {
                             }
                         }
                     } else if !package::version_higher(&old, &new) {
+                        if package_pin::same_pin(&self.packages[k].root, &self.packages[i].root) {
+                            if self.packages[i].root < self.packages[k].root {
+                                for w in winner.iter_mut() {
+                                    if *w == k {
+                                        *w = i;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         // Same name, same version, two directories. There is
                         // no reason to prefer one, so nothing gets guessed.
                         let (a, b) = if self.packages[k].root <= self.packages[i].root {
