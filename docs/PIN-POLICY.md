@@ -24,6 +24,7 @@ bash tools/pin/bump.sh 0.1.N --repo osum=<wt> --repo certus=<wt> --repo fui=<wt>
 - Installs the version if missing (`firn install`), writes the pin files, runs every smoke, commits only with `--commit` and only where the smoke passed. Exit code 1 lists the failing repos.
 - Use worktrees (`--repo NAME=PATH`), never dirty main checkouts. Push each repo from its worktree after the smoke and the repo's own gate.
 - `--only osum,certus` limits the run, `--no-smoke` only writes the files.
+- If `<repo>/docs/firn-pin.md` exists, its line `Firn toolchain pin VER (COMMIT)` is rewritten and committed with the pin; a missing file is skipped. Test: `bash tools/pin/test.sh` (includes a mutant that must be caught).
 
 ## Stable channel
 - `tools/release/gate.sh --out STAMP [--keep-logs DIR]` runs all stages of `tools/teststages/stages.txt` plus the fixpoint. Items listed in `tools/release/known_red.txt` do not fail the gate; every line there must have a roadmap item.

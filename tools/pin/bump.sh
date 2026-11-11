@@ -36,6 +36,14 @@ write_pin() {
         echo "$SOURCE_COMMIT" > "$repo/vendor/firn/COMMIT"
         CHANGED+=(vendor/firn/COMMIT)
     fi
+    update_pin_doc "$repo"
+}
+
+update_pin_doc() {
+    local doc=$1/docs/firn-pin.md
+    [ -f "$doc" ] || return 0
+    sed -i -E "s/^(Firn toolchain pin )[0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)/\1$VERSION ($SOURCE_COMMIT)/" "$doc"
+    CHANGED+=(docs/firn-pin.md)
 }
 
 commit_pin() {
