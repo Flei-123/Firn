@@ -75,6 +75,7 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 
 same=0
+started=$SECONDS
 REF_TIMEOUT_FACTOR=10
 # Per-run timeout in seconds: 20 on an idle machine, scaled up with the load
 # (load average per core, at most x6) so that a busy server does not turn
