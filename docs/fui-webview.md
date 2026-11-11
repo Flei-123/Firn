@@ -143,5 +143,23 @@ Rules for the Glass side: single-threaded API called from the UI thread; `WebVie
 
 - v0 (this document): buffer surface, raw input, tick, IME routing, services map, one a11y node, stub backend.
 - v1: URL load and navigation policy per origin, `Backend.ax`, `SURFACE_CANVAS`, scale, touch, `EV_STORE_*`, script bridge (`postMessage` <-> `EV_MESSAGE`), crash page.
-- Not wired yet (fUi side): the `fui.app` host IME sink only feeds the focused text field, so `webview_preedit` / `webview_commit` are driven by tests and by apps that own the host IME hook; `app.set_ime_sink` for custom nodes is the next step. `FUI_WEBVIEW_CERTUS` needs `lib/embed/webview_fui.fi` in the Certus repo (fills `Backend` from `glass.webview`) and a build that sees both library roots.
+- Host IME sink (r659, X11 and Windows hosts through `fui.app`): `app.set_ime_sink(a, ud, active, pre, commit, end, spot)` (module `fui.imesink`) routes preedit, commit, cancel and the caret spot of the platform input method to a custom node while `active(ud)` is true; the focused text field is bypassed. `fui.webview_node` registers itself (active = widget focused), so `fuiime.enable()` in the program is all an app needs (the demo does it). A click while a preedit stands ends it (empty `IN_PREEDIT`); the host asks the node for the spot each pump (`webview_on_spot` -> window pixels). Without `CAP_IME` the preedit is refused and commits become `IN_CHAR` per code point. Test: `tools/fui/webview_ime_main.fi` (run.sh 18p2). The web host has no IME hook (the browser owns text input there) and the WebView is native-only in v0, so composition events are not wired.
+- Certus adapter (r660): `lib/embed/webview_fui.fi` in the Certus repo fills `Backend` from `glass.webview` (see section 7). Demo build: `FUI_WEBVIEW_CERTUS=<certus tree> examples/fui_apps/webview_demo/certus.sh`.
 - Licensing: the Glass side is GPL-2.0, fUi is MPL-2.0; the adapter sits in the Certus repo so that no Glass code enters the Firn repo (roadmap r26).
+
+## 7. Certus adapter (r660) and contract deltas
+
+`lib/embed/webview_fui.fi` (Certus repo, GPL-2.0) imports `fui.webview_types` and `glass.webview*`; `adapter_new()` is a value struct the caller keeps in a scanned stack frame (Glass GC rule), `adapter_backend(&ad)` returns the `Backend` (`ud` = the adapter). Caps: `CAP_IME | CAP_CLIP | CAP_DIALOG | CAP_URL`.
+
+| Delta | Adapter behaviour |
+|---|---|
+| Modifier bits | fUi SHIFT 1 / CTRL 4 / ALT 8 -> Glass SHIFT 1 / CTRL 2 / ALT 4 |
+| Keys | fUi `KEY_UP/DOWN/PGUP/PGDN/HOME/END` -> `GK_*`; `KEY_BACKSPACE` -> Glass 8; others stay with the app. Ctrl+A / Ctrl+C need letter keys with mods, which fUi does not send as keys yet (gap) |
+| Space | `IN_CHAR` 32 without text focus -> `GK_SPACE` (page down) |
+| Wheel | notches -> `webview_wheel_notches` (40 px per notch) |
+| Preedit | `cursor` -1 -> caret at end; empty text clears |
+| Tick | `TICK_DIRTY` when `webview_tick` stepped or the view is dirty; never `TICK_DEAD` in-process |
+| Events | 1..8 pass through; Glass 9 (`IME_SPOT`) and 10 (`FOCUS`) are dropped; 11 -> `EV_CLIP_WRITE`; 12 -> `EV_CLIP_READ` (a = id); 13 -> `EV_CONFIRM` / `EV_ALERT` with `a` = request id and text `title\nmessage` (title = last page title); `DIALOG_PROMPT` dropped |
+| Reply | `IN_REPLY` with status 1 -> `webview_clipboard_answer`; dialog replies have no Glass receiver (page has no scripts) |
+| Scale | ignored (Glass v0) |
+| Library roots | `FUI_WEBVIEW_CERTUS=<tree> bash examples/fui_apps/webview_demo/certus.sh <out>` composes Certus `.flib2` with this checkout's `fui` and `plat`; the Certus pin (0.1.4950) has no `fui.webview_types`, so the Certus test `tools/glass/webview_fui_test.sh` overlays it from `FUI_SRC` until the pin moves |
