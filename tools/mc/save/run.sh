@@ -68,8 +68,8 @@ oracle() {
     cp -r "$1/world" "$d/world"
     botarg=""
     [ "$5" = 1 ] && botarg="--bot $TOOLS/join_bot.cjs"
-    p=$(( $(port_of $2) + RANDOM % 8 + 2 ))
-    python3 -I "$TOOLS/oracle.py" --jar "$(jar_of $2)" --java "$(java_of $2)" --dir "$d" --port $p --picks "$W/picks_$2.txt" --out "$d.res" --wrap "${ORACLE_WRAP-$HEAVY}" $botarg > "$d.log" 2>&1
+    p=$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    python3 -I "$TOOLS/oracle.py" --jar "$(jar_of $2)" --java "$(java_of $2)" --dir "$d" --port $p --picks "$W/picks_$2.txt" --out "$d.res" --wrap "${ORACLE_WRAP-}" $botarg > "$d.log" 2>&1
     rc=$?
     if [ $rc = 0 ]; then
         okl "$3: vanilla answers $(grep -o 'picks=[0-9]*' "$d.log") block checks as expected; $(grep -o 'log_chunk_problems=[0-9]*' "$d.log")" "$2"

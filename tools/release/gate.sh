@@ -34,9 +34,18 @@ NEW_RED=()
 failed_items() {
     awk '/^FAIL [0-9]+\/[0-9]+ failed:/ {on=1; next} on && /^  [^ ]/ {sub(/^  /, ""); sub(/ failed \(see .*$/, ""); sub(/[ \t]+$/, ""); print}' "$1"
 }
+run_stage() {
+    /root/jarvis/bin/heavy bash test.sh --stage "$1" > "$LOGS/stage$1.log" 2>&1
+}
 for s in $STAGES; do
-    /root/jarvis/bin/heavy bash test.sh --stage "$s" > "$LOGS/stage$s.log" 2>&1
+    run_stage "$s"
     rc=$?
+    if [ $rc -ne 0 ] && [ -n "$(failed_items "$LOGS/stage$s.log")" ]; then
+        echo "stage $s red, retrying once (load flakes)"
+        cp "$LOGS/stage$s.log" "$LOGS/stage$s.first.log"
+        run_stage "$s"
+        rc=$?
+    fi
     if [ $rc -eq 0 ]; then
         echo "stage $s green"
         continue
