@@ -282,6 +282,15 @@ else
 fi
 
 echo
+echo "== 7. pre-merge check and pre-push hook (tools/fmt/premerge_check.sh) =="
+if FIRNFMT="$FMT" bash tools/fmt/premerge_check.sh > "$TMPD/premerge.log" 2>&1; then
+    tail -1 "$TMPD/premerge.log" | sed 's/^/   /'
+else
+    cat "$TMPD/premerge.log"
+    note "tools/fmt/premerge_check.sh failed"
+fi
+
+echo
 if [ "$FAIL" -eq 0 ]; then
     echo "FMT: everything passed"
     exit 0
