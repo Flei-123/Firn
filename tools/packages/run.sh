@@ -23,8 +23,8 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 
-FIRNC="$ROOT/compiler/target/release/firnc"
-FC1="$ROOT/.firnc1"
+FIRNC="${FIRNC:-$ROOT/compiler/target/release/firnc}"
+FC1="${FC1:-$ROOT/.firnc1}"
 export FIRNLIB="$ROOT/lib"
 
 if [ ! -x "$FIRNC" ]; then
@@ -611,6 +611,77 @@ check "and a wish the winner cannot meet is a conflict"
 sed -i 's|^needs    geo   ../geo2$|needs    geo   ../geo2 1.0.0|' "$P8/text/firn.package"
 beide conflict --package "$P8/app" -o "$WORK/conflict.bin"
 expect_error conflict "dependency 'geo' is version 0.3.0, needed is 1.0.0 or higher with the same first number"
+
+# --- 32b: diamond -- the same pinned package out of two directories ------
+#
+# `firn fetch` writes `.firn/pin` (the tree hash) into every git checkout.
+# Two directories with the same name, the same version and the same pin are
+# ONE package: the smaller root wins, in both compilers, whatever the order
+# the edges were found in. Without equal pins it stays an error.
+
+pinned_copy() {
+    local dir
+    dir=$(copy_pkg "$1")
+    cp -r "$dir/geo" "$dir/geo2"
+    printf 'needs    geo   ../geo2\n' >> "$dir/text/firn.package"
+    for d in geo geo2; do
+        mkdir -p "$dir/$d/.firn"
+        printf '%s\n' "$2" > "$dir/$d/.firn/pin"
+    done
+    echo "$dir"
+}
+
+lock_both() {
+    local tag=$1 dir=$2 r0 r1
+    rm -f "$dir/app/firn.lock"
+    "$FIRNC" --package "$dir/app" -o "$WORK/$tag.0.bin" --lock > "$WORK/$tag.log" 2>&1
+    r0=$?
+    cp "$dir/app/firn.lock" "$WORK/$tag.lock.0" 2>/dev/null
+    rm -f "$dir/app/firn.lock"
+    "$FC1" --package "$dir/app" -o "$WORK/$tag.1.bin" --lock >> "$WORK/$tag.log" 2>&1
+    r1=$?
+    cp "$dir/app/firn.lock" "$WORK/$tag.lock.1" 2>/dev/null
+    LOCK_RC="$r0/$r1"
+}
+
+check_unified() {
+    local tag=$1
+    if [ "$LOCK_RC" != "0/0" ]; then
+        bad "exit $LOCK_RC" "$(head -4 "$WORK/$tag.log")"
+    elif ! cmp -s "$WORK/$tag.lock.0" "$WORK/$tag.lock.1"; then
+        bad "the lock files differ" "$(diff "$WORK/$tag.lock.0" "$WORK/$tag.lock.1" | head -4)"
+    elif ! grep -q '^package geo 0.2.0 ../geo ' "$WORK/$tag.lock.0"; then
+        bad "the lock file does not name geo out of ../geo" "$(grep '^package geo' "$WORK/$tag.lock.0")"
+    elif [ "$("$WORK/$tag.0.bin")" != "12 14 3" ] || [ "$("$WORK/$tag.1.bin")" != "12 14 3" ]; then
+        bad "the program does not print '12 14 3'"
+    else
+        good
+    fi
+}
+
+check "diamond: equal pins unify two directories"
+PB=$(pinned_copy l_pin_same abc123)
+lock_both pinsame "$PB"
+check_unified pinsame
+
+check "diamond: winner independent of the edge order"
+PC=$(pinned_copy l_pin_order abc123)
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo2|' "$PC/app/firn.package"
+sed -i 's|^needs    geo   ../geo2$|needs    geo   ../geo|' "$PC/text/firn.package"
+lock_both pinorder "$PC"
+check_unified pinorder
+
+check "diamond: different pins stay an error"
+PD=$(pinned_copy l_pin_diff abc123)
+printf 'other456\n' > "$PD/geo2/.firn/pin"
+beide pindiff --package "$PD/app" -o "$WORK/pindiff.bin"
+expect_error pindiff "package 'geo' comes from two directories with version 0.2.0"
+
+check "diamond: a pin on one side only stays an error"
+PE=$(pinned_copy l_pin_one abc123)
+rm -f "$PE/geo2/.firn/pin"
+beide pinone --package "$PE/app" -o "$WORK/pinone.bin"
+expect_error pinone "package 'geo' comes from two directories with version 0.2.0"
 
 # --- 33/34: the two ways to get the fourth word wrong --------------------
 
