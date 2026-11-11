@@ -51,10 +51,9 @@ as -o "$WORK/impl.o" tools/extfn/impl.s || { echo "assembling impl.s failed"; ex
 run_direction1() { # $1 = compiler binary, $2 = label prefix, $3 = source, $4 = expected
     local firnc=$1 label=$2 src=$3 expected=$4
     local obj="$WORK/${label}.o"
-    "$firnc" "tools/extfn/$src" -o "$WORK/${label}" > /dev/null 2>"$WORK/${label}.build.log"
-    # Expected to fail at `ld` (no libc linked) -- the object file is what
-    # this test wants; the failure log is proof the symbol truly stayed
-    # unresolved until we supply it ourselves.
+    "$firnc" -c "tools/extfn/$src" -o "$obj" > /dev/null 2>"$WORK/${label}.build.log"
+    # '-c' stops before the link: the symbol stays unresolved until
+    # impl.o supplies it below.
     if [ ! -f "$obj" ]; then
         echo "FAIL  $label  (no object file produced, see $WORK/${label}.build.log)"
         fail=$((fail + 1))
