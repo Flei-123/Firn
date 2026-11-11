@@ -57,6 +57,8 @@ Two dependents may need the same package (`app -> a -> txt`, `app -> b -> txt`).
 
 `firn fetch` checks the same rules before the compiler runs (`conflict: dependency 'txt' 0.1.0 resolves to ... and to ...`: same version from two different git sources, or `is checked out twice`: two path directories). Different versions from different sources pass and are left to rule 1. `firn verify` also checks the pin marker (`pin marker missing or stale: run firn fetch`).
 
+`firn tree` marks the outcome of these rules for every package that occurs in more than one directory: `[used]` (the copy the compiler uses), `[not used: 0.2.0 wins]` (a lower version), `[not used: same package as the used copy]` (same version and pin, larger root path) and `[conflict: same version, different content]` (rule 3; no copy is used). A package that occurs once has no mark.
+
 Each dependent still keeps its own nested checkout in `.firn/deps` (cheap, from the cache); only one of them is compiled. The compiler trusts the pin file: it is as good as the last `firn fetch`/`firn verify`.
 
 ## Example

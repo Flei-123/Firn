@@ -117,7 +117,7 @@ A file item is any WE_DIALOG while a file open is waiting, except `"color"`, `"n
 | 32 | `CAP_STORAGE` | yes | yes | yes | yes | yes |
 | 128 | `CAP_DIR_LIST` | yes | yes | yes (picked tree only) | no | no |
 | 256 | `CAP_DIR_PICK` | no | no | yes | no | no |
-| 512 | `CAP_DIR_MUTATE` | yes | no | no | no | no |
+| 512 | `CAP_DIR_MUTATE` | yes | yes | no | no | no |
 | 64 | `CAP_ASYNC_HOST` | no | no | no | yes: replies need host events | yes |
 
 `svc.has(cap) -> bool`, `svc.backend_name() -> str` (`"native"`, `"web"`).
@@ -125,10 +125,20 @@ A call whose capability is missing answers `NO_BACKEND` and changes nothing (the
 
 ## Windows and Android
 
-- Windows: the native backend, unchanged. `tools/services/conformance.sh` builds the conformance program with
+- Windows: the native backend, unchanged: `GetOpenFileName` / `GetSaveFileName` (file), `MessageBox` (message, confirm),
+  the clipboard of user32. `tools/services/conformance.sh` builds the conformance program with
   `--target=x86_64-windows` and runs it under Wine on a private Xvfb with `FIRN_SERVICES_HEADLESS=1`
-  (that env var removes the dialog capabilities on every native system): caps 172 (storage, dir list, clipboard),
-  25 checks. The real comdlg32 dialogs are covered by `tools/dialog/dialog_check_win.py`.
+  (that env var removes the dialog capabilities on every native system): caps 684 (storage, dir list and mutate,
+  clipboard), 25 checks.
+- Windows with the REAL dialogs: `tools/services/win_live.py` runs `tools/services/win_live_main.fi` (one service call
+  per run: `svcfile.open` / `save`, `svcdialog.message` / `confirm`, `svcclip`) under Wine, caps 703. A second program,
+  `tools/dialog/pilot_main.fi`, finds the dialog window by its title (`Open`, `Save`, `svc-message`, `svc-confirm`) and
+  presses it with window messages (`WM_COMMAND` 1 = OK, 2 = Cancel, 6 = Yes, 7 = No; `WM_SETTEXT` into the file name box
+  1148). 21 checks: caps full and headless; open (typed name, Cancel, two names for `multiple`), save (typed path writes
+  the content, Cancel writes nothing), all four message kinds, every button set and answer, confirm Yes / No,
+  clipboard copy then paste. `conformance.sh` runs it after the headless leg; `tools/desktop/run.sh` step 15d too.
+  Folder choice has no service call on desktop (`svcdir.pick` is browser and Android only); `std.dialog.pick_folder`
+  is covered by `tools/dialog/dialog_check_win.py`. The dialogs are Wine's comdlg32, not Microsoft's.
 - Android: compile check for `x86_64-android` and `aarch64-android` only. Android has no windowless dialog, so a
   document picker needs the window layer (`onActivityResult`) and is not built; there has been no emulator run.
 

@@ -74,6 +74,8 @@ ck "diamond: the lock names the shared package once" '[ "$(grep -c "^package txt
 cp firn.lock d1.lock
 ck "diamond: locked rebuild is reproducible" '"$FIRN" build . -o ./d1bin2 --locked >/dev/null 2>&1 && cmp -s d1.lock firn.lock && cmp -s d1bin d1bin2'
 ck "diamond: verify accepts both checkouts" '"$FIRN" verify >/dev/null && [ -f .firn/deps/ua/.firn/deps/txt/.firn/pin ] && cmp -s .firn/deps/ua/.firn/deps/txt/.firn/pin .firn/deps/ub/.firn/deps/txt/.firn/pin'
+ck "diamond: tree marks one used copy and one duplicate" 'out=$("$FIRN" tree) && [ "$(grep -c "\[used\]" <<< "$out")" = 1 ] && [ "$(grep -c "\[not used: same package as the used copy\]" <<< "$out")" = 1 ] && grep -q "^    txt 0.1.0 .*\[used\]" <<< "$out"'
+ck "diamond: tree marks no package that occurs once" 'out=$("$FIRN" tree) && ! grep "^  u[ab] " <<< "$out" | grep -q "\["'
 ck "diamond: verify catches a missing pin marker" 'rm .firn/deps/ua/.firn/deps/txt/.firn/pin && ! "$FIRN" verify >/dev/null 2>&1 && "$FIRN" fetch >/dev/null && "$FIRN" verify >/dev/null'
 
 cd "$T"
@@ -83,6 +85,7 @@ mk_user uc v3; mk_user ud v4
 mk_consumer d2 ua uc
 cd d2
 ck "diamond: compatible versions resolve to the higher one" '"$FIRN" build . -o ./d2bin >/dev/null 2>"$T/err" && [ "$(./d2bin)" = "106 108" ] && grep -q "^package txt 0.2.0 " firn.lock && [ "$(grep -c "^package txt " firn.lock)" = 1 ]'
+ck "diamond: tree marks the higher version as used" 'out=$("$FIRN" tree) && grep -q "txt 0.2.0 .*\[used\]" <<< "$out" && grep -q "txt 0.1.0 .*\[not used: 0.2.0 wins\]" <<< "$out"'
 cd "$T"
 mk_consumer d3 ua ud
 cd d3
@@ -94,6 +97,8 @@ mk_user ue v1
 mk_consumer d4 ue uf
 cd d4
 ck "diamond: same version, different source is a conflict" '! "$FIRN" build . -o ./d4bin >/dev/null 2>"$T/err" && grep -q "conflict: dependency .txt. 0.1.0" "$T/err"'
+
+ck "diamond: tree marks a conflict" 'out=$("$FIRN" tree) && [ "$(grep -c "\[conflict: same version, different content\]" <<< "$out")" = 2 ]'
 
 cd "$ROOT/examples/pkg_demo/app"
 ck "example project builds and runs" 'd=$(mktemp -d) && "$FIRN" build . -o "$d/app" >/dev/null 2>&1 && [ "$("$d/app")" = "hello, world!" ]; rm -rf "$d" firn.lock'

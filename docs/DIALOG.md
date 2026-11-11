@@ -256,6 +256,7 @@ bus.
 | zenity / kdialog / service command lines and answers, backend choice | test 2380: stand-in scripts, 8 environments | real run (Linux), a mutation made it fail |
 | the fUi dialogs | `tools/dialog/dialog_check.py`: Xvfb, xdotool, screenshots, WM_DELETE_WINDOW | real run, 30 checks |
 | Windows dialogs | `tools/dialog/dialog_check_win.py`: Wine 8 (real comdlg32 / shell32 / user32) + a pilot program that presses the buttons | real run, 19 checks (not on Microsoft's Windows) |
+| Windows services | `tools/services/win_live.py`: the service layer (`svcfile`, `svcdialog`, `svcclip`) on the same Wine dialogs, pressed by the same pilot | real run, 21 checks (not on Microsoft's Windows) |
 | browser | `tools/dialog/check_webdialog.cjs`: Chromium (Playwright) | real run, 17 checks |
 | toast on Linux | `tools/dialog/toast_check.py`: a notification server written with libdbus | real run |
 | orient-portald | `tools/portald/portald_check.py`: dbus-daemon + dbus-python, gdbus, dbus-send | real run, 32 checks |

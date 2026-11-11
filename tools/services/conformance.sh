@@ -12,10 +12,10 @@ LEVELS=${LEVELS:-"dev release-safe release-fast"}
 W=$(mktemp -d "${TMPDIR:-/tmp}/firn-services.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 SRC="$ROOT/tools/services/conformance.fi"
-CAPS_ALL_NATIVE=191
-CAPS_HEADLESS=160
+CAPS_ALL_NATIVE=703
+CAPS_HEADLESS=672
 CAPS_WEB=511
-CAPS_WINDOWS_HEADLESS=172
+CAPS_WINDOWS_HEADLESS=684
 fails=0
 
 make_fakes() {
@@ -100,6 +100,23 @@ run_windows() {
     WINEPREFIX="$W/wineprefix" wineserver -k > /dev/null 2>&1
     grep -E '^(ok|FAIL|services)' "$W/win-raw-$level.log" > "$W/win-$level.log"
     expect "windows $level headless" "$W/win-$level.log" $rc "$CAPS_WINDOWS_HEADLESS"
+    run_windows_dialogs "$level"
+}
+
+run_windows_dialogs() {
+    local level="$1" live="$W/win-live-$level.exe" pilot="$W/win-pilot.exe"
+    if ! "$FIRNC" --target=x86_64-windows --opt-level="$level" "$ROOT/tools/services/win_live_main.fi" -o "$live" > "$W/winlive-build-$level.log" 2>&1 \
+        || ! "$FIRNC" --target=x86_64-windows --opt-level="$level" "$ROOT/tools/dialog/pilot_main.fi" -o "$pilot" >> "$W/winlive-build-$level.log" 2>&1; then
+        echo "FAIL windows $level dialogs: build"; tail -n 5 "$W/winlive-build-$level.log"; fails=$((fails + 1)); return
+    fi
+    export WINEPREFIX="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn"
+    timeout 600 python3 "$ROOT/tools/services/win_live.py" "$live" "$pilot" > "$W/winlive-$level.log" 2>&1
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "PASS windows $level dialogs: $(tail -n 1 "$W/winlive-$level.log")"
+    else
+        echo "FAIL windows $level dialogs (rc $rc)"; grep -v '^  OK' "$W/winlive-$level.log" | tail -n 20; fails=$((fails + 1))
+    fi
 }
 
 compile_android() {
