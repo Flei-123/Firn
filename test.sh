@@ -832,6 +832,16 @@ else
     tail -20 "$WORK/testkit.log" | sed 's/^/   /' || true
 fi
 
+echo "== 21c2. pin tools: check_all + blobs.sh (tools/pin/check_all_test.sh); fleet state is reported, not gated =="
+if bash tools/pin/check_all_test.sh > "$WORK/pin.log" 2>&1; then
+    ok
+    tail -1 "$WORK/pin.log" | sed 's/^/   /' || true
+else
+    bad "tools/pin/check_all_test.sh failed (see .test-work/pin.log)"
+    tail -20 "$WORK/pin.log" | sed 's/^/   /' || true
+fi
+bash tools/pin/check_all.sh 2>&1 | grep -E '^(  FAIL|SUMMARY)' | sed 's/^/   fleet: /' || true
+
 echo "== 21d. firn prune: keeps current, newest N, pinned versions (tools/toolchain/prune_test.sh) =="
 if bash tools/toolchain/prune_test.sh > "$WORK/prune.log" 2>&1; then
     ok

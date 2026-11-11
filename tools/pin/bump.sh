@@ -32,9 +32,9 @@ write_pin() {
     local repo=$1 pin_dir=$2
     echo "firn $VERSION" > "$repo/$pin_dir/firn.toolchain"
     CHANGED+=("$pin_dir/firn.toolchain")
-    if [ -f "$repo/vendor/firn/COMMIT" ]; then
-        echo "$SOURCE_COMMIT" > "$repo/vendor/firn/COMMIT"
-        CHANGED+=(vendor/firn/COMMIT)
+    if [ -f "$repo/vendor/net/BLOBS" ]; then
+        bash "$HERE/blobs.sh" "$repo" "$VERSION" || return 1
+        CHANGED+=(vendor/net/BLOBS)
     fi
     update_pin_doc "$repo"
 }
@@ -64,7 +64,7 @@ while read -r name default_path pin_dir <&3; do
     echo "== $name ($repo)"
     [ -d "$repo" ] || { echo "   missing"; FAILED+=("$name:missing"); continue; }
     CHANGED=()
-    write_pin "$repo" "$pin_dir"
+    write_pin "$repo" "$pin_dir" || { FAILED+=("$name:pin"); continue; }
     if [ $SMOKE = 1 ]; then
         if bash "$HERE/smoke/$name.sh" "$repo" "$VERSION" < /dev/null; then
             echo "   smoke ok"
