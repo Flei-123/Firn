@@ -31,7 +31,7 @@ TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 
 export FIRNLIB="$(pwd)/lib"
-FIRNC=compiler/target/release/firnc
+FIRNC=${FIRNC:-compiler/target/release/firnc}
 SOURCE=bin/firnc1.fi
 
 if [ ! -x "$FIRNC" ]; then
