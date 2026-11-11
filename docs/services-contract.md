@@ -29,7 +29,7 @@ The contract WRAPS what exists; it builds nothing twice:
 | backend (Windows) | `lib/services/svcos.fi` (same file as native) | `std.dialog` win32 (comdlg32 / user32), `std.clipboard` win32, `plat.fileio` |
 | backend (Android) | `lib/services/svcos.fi` with `lib/@android/std/*` | dialogs answer `NO_BACKEND` (no windowless picker), clipboard `std.clipboard`, `plat.fileio` share |
 | backend (browser) | `lib/@web/services/svcos.fi` | wraps plat.webdialog / webclip / webdownload / plat.web store; `from_web_event` |
-| backend (OrientOS) | spec only (below) | |
+| backend (OrientOS) | not in this repo: Osum `kernel/user/services/svcosum.fi` (below) | |
 
 Apps import the four service modules (and `svc` for `poll`); `svcos` is picked by the compiler's platform directory
 (`lib/@web/` first for `wasm32-browser`, like `std.clipboard`). fUi binds through its own adapter `lib/fui/services*.fi`.
@@ -107,29 +107,52 @@ A file item is any WE_DIALOG while a file open is waiting, except `"color"`, `"n
 
 `svc.caps() -> u32`, a bit set, decided at run time (a native program without a display has no dialogs):
 
-| bit | const | native Linux | Windows | Android | browser | OrientOS (spec) |
+| bit | const | native Linux | Windows | Android | browser | OrientOS (Osum `svcosum`) |
 |---|---|---|---|---|---|---|
-| 1 | `CAP_FILE_OPEN` | dialog backend (zenity/kdialog/dialogd) | yes | no | yes | dialogd |
-| 2 | `CAP_FILE_SAVE` | dialog backend | yes | `fio_available()` | yes (download) | dialogd |
-| 4 | `CAP_CLIP_WRITE` | `std.clipboard` backend != none | yes | no (window layer only) | yes | clipd |
-| 8 | `CAP_CLIP_READ` | same | yes | no | yes (async, may ask permission) | clipd |
-| 16 | `CAP_DIALOG` | dialog backend | yes | no | yes (alert/confirm) | dialogd |
+| 1 | `CAP_FILE_OPEN` | dialog backend (zenity/kdialog/dialogd) | yes | no | yes | with `/bin/dialogd` |
+| 2 | `CAP_FILE_SAVE` | dialog backend | yes | `fio_available()` (share sheet) | yes (download) | with `/bin/dialogd` |
+| 4 | `CAP_CLIP_WRITE` | `std.clipboard` backend != none | yes | no (window layer only) | yes | with `xfer` |
+| 8 | `CAP_CLIP_READ` | same | yes | no | yes (async, may ask permission) | with `xfer` |
+| 16 | `CAP_DIALOG` | dialog backend | yes | no | yes (alert/confirm) | with `/bin/dialogd` |
 | 32 | `CAP_STORAGE` | yes | yes | yes | yes | yes |
-| 128 | `CAP_DIR_LIST` | yes | yes | yes (picked tree only) | no | no |
-| 256 | `CAP_DIR_PICK` | no | no | yes | no | no |
-| 512 | `CAP_DIR_MUTATE` | yes | yes | no | no | no |
-| 64 | `CAP_ASYNC_HOST` | no | no | no | yes: replies need host events | yes |
+| 64 | `CAP_ASYNC_HOST` | no | no | no | yes: replies need host events | yes (declared; replies queued at once today) |
+| 128 | `CAP_DIR_LIST` | yes | yes | yes (app files dir) | yes (picked tree only) | no |
+| 256 | `CAP_DIR_PICK` | no | no | no | yes | no |
+| 512 | `CAP_DIR_MUTATE` | yes | yes | yes (app files dir) | no | no |
+
+Measured by `tools/services/conformance.sh`: Linux 703 with helpers / 672 headless, Windows 684 headless (Wine), browser 511.
+Android is derived from `os_caps` (672, plus 2 when `fio_available()`), not measured on a device.
 
 `svc.has(cap) -> bool`, `svc.backend_name() -> str` (`"native"`, `"web"`).
 A call whose capability is missing answers `NO_BACKEND` and changes nothing (the conformance test checks exactly that).
+
+## Target x service x status
+
+`ok` = runs and is checked by the named gate; `compile` = only compiled; `no` = answers `NO_BACKEND`; `-` = not built.
+
+| service | native Linux | Windows (Wine) | browser | Android | OrientOS (Osum) |
+|---|---|---|---|---|---|
+| file open | ok (dialog helper) | ok (comdlg32 under Wine, `win_live.py`, `dialog_check_win.py`) | ok (upload) | no | ok (`dialogd`, Osum gate `svcconf`) |
+| file save | ok | ok | ok (download) | compile (share sheet, needs `fio_available()`) | ok |
+| clipboard | ok (`xclip` stand-in) | ok (headless caps) | ok (async) | no | ok (`xfer`) |
+| dialog (message/confirm) | ok | ok | ok | no | ok (`dialogd`) |
+| storage | ok | ok | ok (localStorage) | compile | ok |
+| dir list | ok | ok | ok (picked tree) | compile | - |
+| dir pick | no | no | ok | no | - |
+| dir mutate | ok | ok | no | compile | - |
+| gate | `conformance.sh` (dev, release-safe, release-fast) | `conformance.sh` + Wine | `conformance.sh` + `tools/wasm/run.mjs` | `conformance.sh` compile | Osum `svcconf`, `servicesguest` |
+
+One fUi app on all of them: `examples/fui_apps/svcdemo` (open, save, copy, paste, message, confirm, storage counter, directory
+list through `fui.services`); `fui build examples/fui_apps/svcdemo --targets native,web --verify` is part of
+`tools/fui/fuibuild.sh`.
 
 ## Windows and Android
 
 - Windows: the native backend, unchanged: `GetOpenFileName` / `GetSaveFileName` (file), `MessageBox` (message, confirm),
   the clipboard of user32. `tools/services/conformance.sh` builds the conformance program with
   `--target=x86_64-windows` and runs it under Wine on a private Xvfb with `FIRN_SERVICES_HEADLESS=1`
-  (that env var removes the dialog capabilities on every native system): caps 684 (storage, dir list and mutate,
-  clipboard), 25 checks.
+  (that env var removes the dialog capabilities on every native system): caps 684 (storage, clipboard, dir list, dir
+  mutate), 25 checks.
 - Windows with the REAL dialogs: `tools/services/win_live.py` runs `tools/services/win_live_main.fi` (one service call
   per run: `svcfile.open` / `save`, `svcdialog.message` / `confirm`, `svcclip`) under Wine, caps 703. A second program,
   `tools/dialog/pilot_main.fi`, finds the dialog window by its title (`Open`, `Save`, `svc-message`, `svc-confirm`) and
@@ -139,8 +162,16 @@ A call whose capability is missing answers `NO_BACKEND` and changes nothing (the
   clipboard copy then paste. `conformance.sh` runs it after the headless leg; `tools/desktop/run.sh` step 15d too.
   Folder choice has no service call on desktop (`svcdir.pick` is browser and Android only); `std.dialog.pick_folder`
   is covered by `tools/dialog/dialog_check_win.py`. The dialogs are Wine's comdlg32, not Microsoft's.
-- Android: compile check for `x86_64-android` and `aarch64-android` only. Android has no windowless dialog, so a
-  document picker needs the window layer (`onActivityResult`) and is not built; there has been no emulator run.
+- Android: `conformance.sh` compiles the conformance program for `x86_64-android` and `aarch64-android` (`--pic -c`);
+  `tools/fui/run.sh` stage 18p8b runs it, so a break of the Android build of `lib/services` turns the full run red.
+  There has been no emulator run.
+- Android gap (documented, not built): no windowless file picker or message dialog. `lib/@android/std/dialogos.fi`
+  and `lib/@android/std/clipboard.fi` answer `NO_BACKEND` / `false`, so `CAP_FILE_OPEN`, `CAP_DIALOG` and both clipboard
+  bits are off; `svcfile.save` works through the share sheet only when `fileio.fio_available()`. A real picker needs the
+  window layer (`startActivityForResult` for `ACTION_OPEN_DOCUMENT` / `ACTION_CREATE_DOCUMENT`, answer in
+  `onActivityResult`), an Activity-side `ClipboardManager` call for the clipboard and an `AlertDialog` for message/confirm;
+  all three answer asynchronously, so the Android backend must set `CAP_ASYNC_HOST` and feed `svc.host_event`.
+  Tracked in the fUi roadmap together with the Android app host (r87).
 
 ## Directory listing in the browser
 
@@ -184,12 +215,26 @@ unchanged. Certus does not answer the `firn_web_*` service imports yet, so a ser
   text only, storage per page origin and app name, message/confirm as modal browser dialogs.
 - Tracked for Certus in projects_kb/certus/FIRN-WEB.md; until it lands, `svc.caps()` on a v1 host is what the page sees.
 
-## OrientOS backend (spec, not built)
+## OrientOS backend
 
-`lib/@orientos/services/svcos.fi` once Osum has a platform directory: file open/save and dialogs through the fUi
-dialog service `dialogd` (the same line protocol `std.dialog` uses on Linux, `FIRN_DIALOG=service`), clipboard through
-a `clipd` service (text only in v1), storage as files under `/user/<app>/services/`. Async like the browser
-(`CAP_ASYNC_HOST`): requests go to the service, answers come as host events into `svc.host_event`.
+Firn has no OrientOS platform directory: `compiler/src/target.rs` `platform_dir()` knows `@web`, `@android`, `@windows`
+and `@linux` only, Osum builds with its own profiles (kernel / app) from the Firn pin in `vendor/firn`, and Firn module
+names are global by last component. So the backend is NOT `lib/@orientos/services/svcos.fi`; it lives in the Osum repo
+(`docs/services-orientos.md` there) behind the same call shapes:
+
+| Firn contract | Osum | state |
+|---|---|---|
+| `lib/services/svc*.fi` (rules, queue) | `lib/services/svcrules.fi`, `svcqueue.fi` (same status codes 0-6, same 28-octet reply heads) | done |
+| `svcos` backend | `kernel/user/services/svcosum.fi`: `caps copy_text paste_text message confirm file_open file_save store_* poll pending` | done, gate `svcconf` (41 checks), `servicesguest` |
+| file open/save, message, confirm | `/bin/dialogd` started per request, answer in `<app folder>/services/dialog-<id>.reply` (answer line, name line, content); same line protocol as `std.dialog` with `FIRN_DIALOG=service` | done |
+| clipboard (text, 16 KiB) | transfer service `kernel/user/xfer.fi` (`set_text`, `get_text`, bus op SET/GET); there is no `clipd` | done |
+| storage | files `/data/<app>/services/<key>`, atomic via `/.tmp` + rename (NOT `/user/<app>/...`) | done |
+| `svcdir` / `svcmut` | none | missing: `CAP_DIR_LIST`/`CAP_DIR_MUTATE` stay off; fUi apps must use `fui.fsbackend` memory mode |
+| `svc.host_event` | none | missing: replies are queued before the call returns |
+
+Differences from the native backend: `file_save` also queues `OP_FILE_ITEM` (name) + `OP_FILE_END`; one item for
+`multiple`; no `BUSY`. Merging the two code bases (Osum modules named like the Firn ones, Firn `lib/@osum/` directory
+selected by a new target) needs a compiler target and an Osum pin lift: roadmap items in the fUi project.
 
 ## Tests
 
