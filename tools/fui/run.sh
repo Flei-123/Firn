@@ -1219,6 +1219,8 @@ build qrview
 "$W/qrview" | tail -n 3
 build webview
 "$W/webview" | tail -n 3 | grep -q "WEBVIEW PASSED"
+build webview_ime
+"$W/webview_ime" | tail -n 3 | grep -q "WEBVIEW IME PASSED"
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
