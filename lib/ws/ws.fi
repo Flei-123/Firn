@@ -34,6 +34,7 @@ import std.crypto.sha1
 import std.crypto.random
 import std.time
 import tls.tls
+import net.transport as tr
 import tls.x509
 import tls.trust
 import net.dns
@@ -258,60 +259,23 @@ fn utf8_complete(u: *mut Utf8) -> bool {
 // ------------------------------------------------------------ The client
 
 struct Client {
-    conn: net.Conn,
-    secure: bool,
-    t: tls.Tls,
-    store: x509.Store,
-    inb: rt.Buf,
-    inpos: usize,
+    tp: tr.Transport,
     open: bool,
     close_code: u32,
     max: usize,
 }
 
 fn client_new() -> Client {
-    return Client { conn: net.conn_from_fd(0 - 1), secure: false, t: tls.tls_new(),
-        store: x509.store_new(), inb: rt.buf_new(), inpos: 0, open: false,
+    return Client { tp: tr.tp_new(), open: false,
         close_code: 0, max: 16777216 }
 }
 
 fn client_free(c: *mut Client) {
-    if (*c).secure { tls.tls_free(&(*c).t) }
-    x509.store_free(&(*c).store)
-    rt.buf_free(&(*c).inb)
-    if net.conn_is_open(&(*c).conn) { net.close(&(*c).conn) }
+    tr.tp_free(&(*c).tp)
 }
 
 fn is_open(c: *mut Client) -> bool { return (*c).open }
 fn close_code(c: *mut Client) -> u32 { return (*c).close_code }
-
-fn raw_write(c: *mut Client, p: u64, n: usize) -> bool {
-    if (*c).secure {
-        let ok: bool = tls.tls_write(&(*c).t, p, n) catch false
-        return ok
-    }
-    let k: usize = net.write_all(&(*c).conn, p, n) catch 0
-    return k == n
-}
-
-// More octets into `inb`. False at the end of the stream or on an error.
-fn raw_fill(c: *mut Client) -> bool {
-    if (*c).inpos > 0 && (*c).inpos == (*c).inb.len {
-        rt.buf_clear(&(*c).inb)
-        (*c).inpos = 0
-    }
-    let have: usize = (*c).inb.len
-    rt.buf_reserve(&(*c).inb, have + 16384)
-    var k: usize = 0
-    if (*c).secure {
-        k = tls.tls_read(&(*c).t, (*c).inb.ptr + have as u64, 16384) catch 0
-    } else {
-        k = net.read(&(*c).conn, (*c).inb.ptr + have as u64, 16384) catch 0
-    }
-    if k == 0 { return false }
-    rt.buf_set_len(&(*c).inb, have + k)
-    return true
-}
 
 fn push_str(b: *mut rt.Buf, s: str) {
     rt.buf_push_bytes(b, s.p as u64, s.n)
@@ -330,7 +294,7 @@ fn handshake(c: *mut Client, host: str, path: str) -> WsError!bool {
     push_str(&req, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ")
     rt.buf_push_bytes(&req, key.ptr, key.len)
     push_str(&req, "\r\n\r\n")
-    let sent: bool = raw_write(c, req.ptr, req.len)
+    let sent: bool = tr.tp_write(&(*c).tp, req.ptr, req.len)
     rt.buf_free(&req)
     if !sent {
         rt.buf_free(&key)
@@ -340,22 +304,22 @@ fn handshake(c: *mut Client, host: str, path: str) -> WsError!bool {
     var end: usize = 0
     while end == 0 {
         var i: usize = 0
-        while i + 4 <= (*c).inb.len {
-            if rt.ld8((*c).inb.ptr, i) == 13 as u8 && rt.ld8((*c).inb.ptr, i + 1) == 10 as u8
-            && rt.ld8((*c).inb.ptr, i + 2) == 13 as u8 && rt.ld8((*c).inb.ptr, i + 3) == 10 as u8 {
+        while i + 4 <= (*c).tp.inb.len {
+            if rt.ld8((*c).tp.inb.ptr, i) == 13 as u8 && rt.ld8((*c).tp.inb.ptr, i + 1) == 10 as u8
+            && rt.ld8((*c).tp.inb.ptr, i + 2) == 13 as u8 && rt.ld8((*c).tp.inb.ptr, i + 3) == 10 as u8 {
                 end = i + 4
                 break
             }
             i = i + 1
         }
         if end == 0 {
-            if (*c).inb.len > 16384 || !raw_fill(c) {
+            if (*c).tp.inb.len > 16384 || !tr.tp_fill(&(*c).tp) {
                 rt.buf_free(&key)
                 return WsError::Handshake
             }
         }
     }
-    let head: str = str { p: (*c).inb.ptr as *mut u8, n: end }
+    let head: str = str { p: (*c).tp.inb.ptr as *mut u8, n: end }
     var want: rt.Buf = rt.buf_new()
     accept_key(str { p: key.ptr as *mut u8, n: key.len }, &want)
     rt.buf_free(&key)
@@ -385,7 +349,7 @@ fn handshake(c: *mut Client, host: str, path: str) -> WsError!bool {
         i = i + 1
     }
     rt.buf_free(&want)
-    (*c).inpos = end
+    (*c).tp.inpos = end
     if !ok101 || !found { return WsError::Handshake }
     (*c).open = true
     return true
@@ -394,9 +358,9 @@ fn handshake(c: *mut Client, host: str, path: str) -> WsError!bool {
 // ws:// -- a numeric IPv4 address, the Host header, the path.
 fn connect(c: *mut Client, addr: u32, port: u16, host: str, path: str) -> WsError!bool {
     var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) { return WsError::Io }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
+    (*c).tp.conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&(*c).tp.conn) { return WsError::Io }
+    let nd: bool = net.set_no_delay(&(*c).tp.conn, true) catch false
     return handshake(c, host, path)
 }
 
@@ -406,15 +370,15 @@ fn connect(c: *mut Client, addr: u32, port: u16, host: str, path: str) -> WsErro
 fn connect_tls(c: *mut Client, addr: u32, port: u16, host: str, path: str,
     roots: u64, rn: usize, now: u64) -> WsError!bool {
     var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) { return WsError::Io }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
-    x509.store_load_pem(&(*c).store, roots, rn)
-    if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) {
+    (*c).tp.conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&(*c).tp.conn) { return WsError::Io }
+    let nd: bool = net.set_no_delay(&(*c).tp.conn, true) catch false
+    x509.store_load_pem(&(*c).tp.store, roots, rn)
+    if !tls.tls_init(&(*c).tp.t, &(*c).tp.conn, &(*c).tp.store, host.p as u64, host.n, now) {
         return WsError::Tls
     }
-    (*c).secure = true
-    let ok: bool = tls.tls_handshake(&(*c).t) catch false
+    (*c).tp.secure = true
+    let ok: bool = tls.tls_handshake(&(*c).tp.t) catch false
     if !ok { return WsError::Tls }
     return handshake(c, host, path)
 }
@@ -485,23 +449,23 @@ fn connect_url(c: *mut Client, url: str) -> WsError!bool {
         addr = o.addr[0]
     }
     var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port as u16, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) {
+    (*c).tp.conn = net.connect_tcp_err(addr, port as u16, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&(*c).tp.conn) {
         rt.buf_free(&pathb)
         rt.buf_free(&hostb)
         return WsError::Io
     }
-    let nd2: bool = net.set_no_delay(&(*c).conn, true) catch false
+    let nd2: bool = net.set_no_delay(&(*c).tp.conn, true) catch false
     if tls_on {
-        trust.trust_load_system(&(*c).store)
+        trust.trust_load_system(&(*c).tp.store)
         let now: u64 = (time.now_unix_ms() / 1000) as u64
-        if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) {
+        if !tls.tls_init(&(*c).tp.t, &(*c).tp.conn, &(*c).tp.store, host.p as u64, host.n, now) {
             rt.buf_free(&pathb)
             rt.buf_free(&hostb)
             return WsError::Tls
         }
-        (*c).secure = true
-        let ok: bool = tls.tls_handshake(&(*c).t) catch false
+        (*c).tp.secure = true
+        let ok: bool = tls.tls_handshake(&(*c).tp.t) catch false
         if !ok {
             rt.buf_free(&pathb)
             rt.buf_free(&hostb)
@@ -556,7 +520,7 @@ fn send_frame(c: *mut Client, op: u32, p: u64, n: usize) -> bool {
     if !random.random_bytes((&mask[0]) as u64, 4) { return false }
     var out: rt.Buf = rt.buf_new()
     write_frame(&out, op, true, p, n, (&mask[0]) as u64)
-    let ok: bool = raw_write(c, out.ptr, out.len)
+    let ok: bool = tr.tp_write(&(*c).tp, out.ptr, out.len)
     rt.buf_free(&out)
     return ok
 }
@@ -591,8 +555,8 @@ fn close(c: *mut Client, code: u32) {
         rt.buf_free(&scratch)
         (*c).open = false
     }
-    if (*c).secure { tls.tls_close(&(*c).t) }
-    if net.conn_is_open(&(*c).conn) { net.close(&(*c).conn) }
+    if (*c).tp.secure { tls.tls_close(&(*c).tp.t) }
+    if net.conn_is_open(&(*c).tp.conn) { net.close(&(*c).tp.conn) }
 }
 
 // The next whole MESSAGE into `out` (cleared first). Pings are answered
@@ -605,12 +569,12 @@ fn recv(c: *mut Client, out: *mut rt.Buf) -> WsError!u32 {
     var u: Utf8 = utf8_new()
     while true {
         var f: Frame = frame_new()
-        let base: u64 = (*c).inb.ptr + (*c).inpos as u64
-        let have: usize = (*c).inb.len - (*c).inpos
+        let base: u64 = (*c).tp.inb.ptr + (*c).tp.inpos as u64
+        let have: usize = (*c).tp.inb.len - (*c).tp.inpos
         let r: i32 = parse_frame(base, have, &f)
         if r == PARSE_ERROR { return WsError::Protocol }
         if r == PARSE_MORE || (have as u64) < (f.hlen as u64) + f.plen {
-            if !raw_fill(c) {
+            if !tr.tp_fill(&(*c).tp) {
                 (*c).open = false
                 return WsError::Closed
             }
@@ -619,7 +583,7 @@ fn recv(c: *mut Client, out: *mut rt.Buf) -> WsError!u32 {
         if f.masked { return WsError::Protocol } // a server never masks
         let pl: usize = f.plen as usize
         let pp: u64 = base + f.hlen as u64
-        (*c).inpos = (*c).inpos + f.hlen + pl
+        (*c).tp.inpos = (*c).tp.inpos + f.hlen + pl
         if f.op == OP_PING {
             send_frame(c, OP_PONG, pp, pl)
             continue
@@ -685,7 +649,7 @@ fn send_fragmented(c: *mut Client, op: u32, p: u64, n: usize, frag: usize) -> bo
         first = false
         at = at + k
     }
-    let ok: bool = raw_write(c, out.ptr, out.len)
+    let ok: bool = tr.tp_write(&(*c).tp, out.ptr, out.len)
     rt.buf_free(&out)
     return ok
 }
@@ -702,8 +666,8 @@ fn send_close_frame(c: *mut Client, code: u32) -> bool {
 // `close` waits for as long as the socket lets it). The socket timeout is
 // set on the connection, so this holds for plain and TLS connections alike.
 fn close_timeout(c: *mut Client, code: u32, ms: u64) {
-    if net.conn_is_open(&(*c).conn) {
-        net.set_timeout(&(*c).conn, ms) catch false
+    if net.conn_is_open(&(*c).tp.conn) {
+        net.set_timeout(&(*c).tp.conn, ms) catch false
     }
     close(c, code)
 }

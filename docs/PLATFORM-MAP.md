@@ -23,7 +23,8 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 ## Net (lib/net, lib/tls, lib/ws, lib/http, lib/async)
 - `net/http.fi` | blocking HTTP(S) client, redirects, gzip/br/zstd bodies
 - `http/server.fi` (facade; parts `http/hs_*.fi`: types, app, conn, reply, ws, http, loop, read, h2*) | HTTP/1.1 + HTTP/2 (ALPN h2, h2c) server + WebSocket + SSE + TLS 1.3 | `http.app(port)`, `http.reply(r, 200, "text/plain", "hi")`
-- `net/h2.fi`, `net/hpack.fi`, `net/h2frame.fi` | HTTP/2 client (multiplexing, flow control, ALPN h2; docs/HTTP2.md) | `h2.h2_request(&c, "GET", "https", host, "/", "", 0, 0)`
+- `net/transport.fi` | shared socket/TLS transport for h2/pg/mysql/ws (tp_connect, tp_start_tls, tp_write, tp_fill, tp_need) | `tr.tp_connect(&c.tp, addr, port)`, `tr.tp_write(&c.tp, p, n)`
+- `net/h2.fi`, `net/h2conn.fi`, `net/hpack.fi`, `net/h2frame.fi` | HTTP/2 client (multiplexing, flow control, ALPN h2; docs/HTTP2.md) | `h2.h2_request(&c, "GET", "https", host, "/", "", 0, 0)`
 - `webfw/wf_web.fi` + `wf_*.fi` | web framework on http/server: router, middleware, JSON/query/form/cookies, sessions, static (ETag/Range), gzip/zstd, CORS, rate limit, auth, templates | docs/WEBFRAMEWORK.md, `examples/webfw/app.fi`, `wf_web.get(&w, "/u/:id", h)`
 - `ws/ws.fi` | WebSocket codec + client (ws://, wss://)
 - `tls/tls.fi` (client 1.3/1.2), `tls/tls_server.fi`, `tls/x509.fi`, `tls/trust.fi` | TLS, certs, system roots
@@ -34,7 +35,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 ## Data (lib/db, lib/parquet)
 - `db/sqlite.fi` | embedded SQL DB, real SQLite 3 file format (SQL subset, docs/DB.md) | `sqlite.db_open("x.db", sqlite.OPEN_CREATE)`, `db_exec`, `db_prepare`, `stmt_step`
 - `pg/pg.fi` | PostgreSQL client (SCRAM-SHA-256/md5, TLS, simple+extended+prepared; docs/PG.md) | `pg.pg_connect(&c, addr, 5432, user, pw, db, pg.TLS_OFF, host, 0, 0, 0)`, `pg.pg_query(&c, sql, &r)`
-- `mysql/mysql.fi` | MySQL/MariaDB client (native + caching_sha2 auth, TLS 1.2, text + prepared; docs/MYSQL.md) | `mysql.my_connect(&c, addr, 3306, user, pw, db, mysql.TLS_OFF, host, 0, 0, 0)`, `mysql.my_query(&c, sql, &r)`
+- `mysql/mysql.fi` | MySQL/MariaDB client (native + caching_sha2 auth, TLS 1.2/1.3, text + prepared; docs/MYSQL.md) | `mysql.my_connect(&c, addr, 3306, user, pw, db, mysql.TLS_OFF, host, 0, 0, 0)`, `mysql.my_query(&c, sql, &r)`
 - `parquet/` | Parquet reader
 
 ## Compression (lib/compress, lib/zip) — docs/COMPRESSION.md

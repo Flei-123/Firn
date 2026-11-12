@@ -28,7 +28,7 @@ myrows.result_value(&r, row, col, &p, &n)
 ## Auth
 - `mysql_native_password`, `caching_sha2_password` fast path, AuthSwitchRequest between them.
 - `caching_sha2_password` full authentication works over TLS only (cleartext password inside TLS); without TLS it fails with a clear error (no RSA public key exchange).
-- TLS: SSLRequest, certificate checked against the given roots and host. TLS is capped at 1.2: MariaDB (OpenSSL 3) aborts the TLS 1.3 handshake of `tls.fi`, cause not yet found (roadmap).
+- TLS: SSLRequest, certificate checked against the given roots and host. TLS 1.3 works against MariaDB (OpenSSL 3): the client answers the CertificateRequest with an empty Certificate and derives the application keys from the transcript up to the server Finished. A failed TLS read reports the error number and the received alert code in `my_error`.
 
 ## Not included
 - FLOAT/DOUBLE/TIME columns in prepared results (error "malformed row", cast to text in SQL), LOCAL INFILE, multi-statement/multi-result, compression, `sha256_password`, `ed25519`, DNS (pass an IPv4 address).

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.rt
-import std.net
-import tls.tls
-import tls.x509
+import net.transport as tr
 import mysql.mywire as w
 import mysql.myrows as rows
 import mysql.mybin as bin
+import mysql.mylink as lk
+import mysql.myauth as au
 
 export {
     My, my_new, my_free, my_connect, my_is_open, my_close, my_error, my_error_code,
@@ -13,343 +13,28 @@ export {
     TLS_OFF, TLS_REQUIRE,
 }
 
+type My = lk.My
+
 const TLS_OFF: u32 = 0
 const TLS_REQUIRE: u32 = 1
-const READ_CHUNK: usize = 16384
-const MAX_PAYLOAD: usize = 268435456
-const CHARSET_UTF8MB4: u8 = 45
-const SALT_LEN: usize = 20
-const PLUGIN_NATIVE: str = "mysql_native_password"
-const PLUGIN_SHA2: str = "caching_sha2_password"
 
-struct My {
-    conn: net.Conn,
-    secure: bool,
-    t: tls.Tls,
-    store: x509.Store,
-    inb: rt.Buf,
-    inpos: usize,
-    out: rt.Buf,
-    pkt: rt.Buf,
-    seq: u8,
-    open: bool,
-    err: rt.Buf,
-    err_code: u32,
-    caps: u32,
-    salt: [u8; 20],
-    plugin: [u8; 32],
-    plugin_len: usize,
-}
-
-fn my_new() -> My {
-    return My { conn: net.conn_from_fd(0 - 1), secure: false, t: tls.tls_new(),
-        store: x509.store_new(), inb: rt.buf_new(), inpos: 0, out: rt.buf_new(),
-        pkt: rt.buf_new(), seq: 0, open: false, err: rt.buf_new(), err_code: 0, caps: 0,
-        salt: [0; 20], plugin: [0; 32], plugin_len: 0 }
-}
-
-fn my_free(c: *mut My) {
-    if (*c).secure { tls.tls_free(&(*c).t) }
-    x509.store_free(&(*c).store)
-    rt.buf_free(&(*c).inb)
-    rt.buf_free(&(*c).out)
-    rt.buf_free(&(*c).pkt)
-    rt.buf_free(&(*c).err)
-    if net.conn_is_open(&(*c).conn) { net.close(&(*c).conn) }
-}
-
-fn my_is_open(c: *mut My) -> bool { return (*c).open }
-fn my_error(c: *mut My) -> str { return rt.buf_str(&(*c).err) }
-fn my_error_code(c: *mut My) -> u32 { return (*c).err_code }
-
-fn set_error(c: *mut My, msg: str) {
-    rt.buf_clear(&(*c).err)
-    rt.buf_push_bytes(&(*c).err, msg.p as u64, msg.n)
-}
-
-fn raw_write(c: *mut My, p: u64, n: usize) -> bool {
-    if (*c).secure {
-        let ok: bool = tls.tls_write(&(*c).t, p, n) catch false
-        return ok
-    }
-    let k: usize = net.write_all(&(*c).conn, p, n) catch 0
-    return k == n
-}
-
-fn read_fail(c: *mut My, num: u32) -> usize {
-    set_error(c, "tls read failed")
-    rt.buf_push_dec_u64(&(*c).err, num as u64)
-    rt.buf_push_bytes(&(*c).err, " alert ".p as u64, 7)
-    rt.buf_push_dec_u64(&(*c).err, tls.tls_alert_desc(&(*c).t) as u64)
-    return 0
-}
-
-fn fill(c: *mut My) -> bool {
-    if (*c).inpos > 0 && (*c).inpos == (*c).inb.len {
-        rt.buf_clear(&(*c).inb)
-        (*c).inpos = 0
-    }
-    let have: usize = (*c).inb.len
-    rt.buf_reserve(&(*c).inb, have + READ_CHUNK)
-    var k: usize = 0
-    if (*c).secure {
-        k = tls.tls_read(&(*c).t, (*c).inb.ptr + have as u64, READ_CHUNK)
-        catch | e | read_fail(c, tls.tls_err_num(e))
-    } else {
-        k = net.read(&(*c).conn, (*c).inb.ptr + have as u64, READ_CHUNK) catch 0
-    }
-    if k == 0 { return false }
-    rt.buf_set_len(&(*c).inb, have + k)
-    return true
-}
-
-fn need(c: *mut My, n: usize) -> bool {
-    while (*c).inb.len - (*c).inpos < n {
-        if !fill(c) { return false }
-    }
-    return true
-}
-
-fn send_packet(c: *mut My, p: u64, n: usize) -> bool {
-    var pos: usize = 0
-    var first: bool = true
-    while pos < n || first {
-        var k: usize = n - pos
-        if k > w.MAX_PACKET { k = w.MAX_PACKET }
-        rt.buf_push(&(*c).out, (k & 255) as u8)
-        rt.buf_push(&(*c).out, ((k >> 8) & 255) as u8)
-        rt.buf_push(&(*c).out, ((k >> 16) & 255) as u8)
-        rt.buf_push(&(*c).out, (*c).seq)
-        (*c).seq = (*c).seq +% 1 as u8
-        rt.buf_push_bytes(&(*c).out, p + pos as u64, k)
-        pos = pos + k
-        first = false
-        if k == w.MAX_PACKET && pos == n {
-            rt.buf_push_bytes(&(*c).out, "\u0000\u0000\u0000".p as u64, 3)
-            rt.buf_push(&(*c).out, (*c).seq)
-            (*c).seq = (*c).seq +% 1 as u8
-        }
-    }
-    let ok: bool = raw_write(c, (*c).out.ptr, (*c).out.len)
-    rt.buf_clear(&(*c).out)
-    if !ok { (*c).open = false }
-    return ok
-}
-
-fn read_packet(c: *mut My) -> bool {
-    rt.buf_clear(&(*c).pkt)
-    var more: bool = true
-    while more {
-        if !need(c, 4) {
-            (*c).open = false
-            return false
-        }
-        let base: u64 = (*c).inb.ptr + (*c).inpos as u64
-        let len: usize = w.ld16le(base, 0) as usize | ((rt.ld8(base, 2) as usize) << 16)
-        let seq: u8 = rt.ld8(base, 3)
-        if seq != (*c).seq || (*c).pkt.len + len > MAX_PAYLOAD || !need(c, 4 + len) {
-            (*c).open = false
-            return false
-        }
-        (*c).seq = (*c).seq +% 1 as u8
-        rt.buf_push_bytes(&(*c).pkt, (*c).inb.ptr + (*c).inpos as u64 + 4, len)
-        (*c).inpos = (*c).inpos + 4 + len
-        more = len == w.MAX_PACKET
-    }
-    return true
-}
-
-fn parse_err(c: *mut My) {
-    let p: u64 = (*c).pkt.ptr
-    let n: usize = (*c).pkt.len
-    rt.buf_clear(&(*c).err)
-    if n < 3 { return }
-    (*c).err_code = w.ld16le(p, 1)
-    var at: usize = 3
-    if n > 9 && rt.ld8(p, 3) == 35 as u8 { at = 9 }
-    rt.buf_push_bytes(&(*c).err, p + at as u64, n - at)
-}
-
-fn parse_ok(c: *mut My, r: *mut rows.MyResult) -> bool {
-    var pos: usize = 1
-    var aff: u64 = 0
-    var id: u64 = 0
-    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &aff) { return false }
-    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &id) { return false }
-    (*r).affected = aff
-    (*r).insert_id = id
-    return true
-}
-
-fn is_eof(c: *mut My) -> bool {
-    return (*c).pkt.len < 9 && (*c).pkt.len > 0 && rt.ld8((*c).pkt.ptr, 0) == 254 as u8
-}
-
-fn start_tls(c: *mut My, host: str, roots: u64, rn: usize, now: u64) -> bool {
-    var b: rt.Buf = rt.buf_new()
-    w.put_u32le(&b, (*c).caps)
-    w.put_u32le(&b, w.MAX_PACKET as u32)
-    rt.buf_push(&b, CHARSET_UTF8MB4)
-    var i: usize = 0
-    while i < 23 {
-        rt.buf_push(&b, 0 as u8)
-        i = i + 1
-    }
-    let ok: bool = send_packet(c, b.ptr, b.len)
-    rt.buf_free(&b)
-    if !ok { return false }
-    x509.store_load_pem(&(*c).store, roots, rn)
-    if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) {
-        set_error(c, "tls init failed")
-        return false
-    }
-    (*c).secure = true
-    let hs: bool = tls.tls_handshake(&(*c).t) catch false
-    if !hs { set_error(c, "tls handshake failed") }
-    return hs
-}
-
-fn parse_handshake(c: *mut My) -> bool {
-    let p: u64 = (*c).pkt.ptr
-    let n: usize = (*c).pkt.len
-    if n < 1 || rt.ld8(p, 0) != 10 as u8 { return false }
-    var at: usize = 1
-    while at < n && rt.ld8(p, at) != 0 as u8 { at = at + 1 }
-    at = at + 1 + 4
-    if at + 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10 > n { return false }
-    rt.mem_copy((&(*c).salt[0]) as u64, p + at as u64, 8)
-    at = at + 9
-    var caps: u32 = w.ld16le(p, at)
-    at = at + 2 + 1 + 2
-    caps = caps | (w.ld16le(p, at) << 16)
-    at = at + 2 + 1 + 10
-    if at + 12 > n { return false }
-    rt.mem_copy((&(*c).salt[8]) as u64, p + at as u64, 12)
-    at = at + 13
-    (*c).plugin_len = 0
-    while at + (*c).plugin_len < n && rt.ld8(p, at + (*c).plugin_len) != 0 as u8 && (*c).plugin_len < 32 {
-        (*c).plugin[(*c).plugin_len] = rt.ld8(p, at + (*c).plugin_len)
-        (*c).plugin_len = (*c).plugin_len + 1
-    }
-    (*c).caps = caps
-    return true
-}
-
-fn plugin_is(c: *mut My, name: str) -> bool {
-    return (*c).plugin_len == name.n && rt.mem_eq((&(*c).plugin[0]) as u64, name.p as u64, name.n)
-}
-
-fn auth_token(c: *mut My, password: str, out: *mut rt.Buf) -> bool {
-    if password.n == 0 { return true }
-    var tok: [u8; 32] = [0; 32]
-    if plugin_is(c, PLUGIN_NATIVE) {
-        w.native_scramble(password, (&(*c).salt[0]) as u64, (&tok[0]) as u64)
-        rt.buf_push_bytes(out, (&tok[0]) as u64, 20)
-        return true
-    }
-    if plugin_is(c, PLUGIN_SHA2) {
-        w.sha2_scramble(password, (&(*c).salt[0]) as u64, (&tok[0]) as u64)
-        rt.buf_push_bytes(out, (&tok[0]) as u64, 32)
-        return true
-    }
-    return false
-}
-
-fn send_response(c: *mut My, user: str, password: str, database: str, tls_on: bool) -> bool {
-    var b: rt.Buf = rt.buf_new()
-    w.put_u32le(&b, (*c).caps)
-    w.put_u32le(&b, w.MAX_PACKET as u32)
-    rt.buf_push(&b, CHARSET_UTF8MB4)
-    var i: usize = 0
-    while i < 23 {
-        rt.buf_push(&b, 0 as u8)
-        i = i + 1
-    }
-    w.put_cstr(&b, user)
-    var tok: rt.Buf = rt.buf_new()
-    if !auth_token(c, password, &tok) {
-        rt.buf_free(&b)
-        rt.buf_free(&tok)
-        set_error(c, "unsupported authentication plugin")
-        return false
-    }
-    w.put_lenstr(&b, tok.ptr, tok.len)
-    rt.buf_free(&tok)
-    if database.n > 0 { w.put_cstr(&b, database) }
-    rt.buf_push_bytes(&b, (&(*c).plugin[0]) as u64, (*c).plugin_len)
-    rt.buf_push(&b, 0 as u8)
-    let ok: bool = send_packet(c, b.ptr, b.len)
-    rt.buf_free(&b)
-    return ok
-}
-
-fn auth_loop(c: *mut My, password: str) -> bool {
-    while true {
-        if !read_packet(c) {
-            if (*c).err.len == 0 { set_error(c, "connection closed during authentication") }
-            return false
-        }
-        let kind: u8 = rt.ld8((*c).pkt.ptr, 0)
-        if kind == 0 as u8 { return true }
-        if kind == 255 as u8 {
-            parse_err(c)
-            return false
-        }
-        if kind == 254 as u8 {
-            var e: usize = 1
-            while e < (*c).pkt.len && rt.ld8((*c).pkt.ptr, e) != 0 as u8 { e = e + 1 }
-            (*c).plugin_len = 0
-            while (*c).plugin_len < e - 1 && (*c).plugin_len < 32 {
-                (*c).plugin[(*c).plugin_len] = rt.ld8((*c).pkt.ptr, 1 + (*c).plugin_len)
-                (*c).plugin_len = (*c).plugin_len + 1
-            }
-            if (*c).pkt.len - e - 1 < SALT_LEN { return fail_auth(c) }
-            rt.mem_copy((&(*c).salt[0]) as u64, (*c).pkt.ptr + (e + 1) as u64, SALT_LEN)
-            var tok: rt.Buf = rt.buf_new()
-            let have: bool = auth_token(c, password, &tok)
-            let sent: bool = have && send_packet(c, tok.ptr, tok.len)
-            rt.buf_free(&tok)
-            if !sent { return fail_auth(c) }
-        } else if kind == 1 as u8 {
-            if (*c).pkt.len < 2 { return fail_auth(c) }
-            let more: u8 = rt.ld8((*c).pkt.ptr, 1)
-            if more == 4 as u8 {
-                if !(*c).secure {
-                    set_error(c, "caching_sha2_password full authentication needs TLS")
-                    return false
-                }
-                var pw: rt.Buf = rt.buf_new()
-                w.put_cstr(&pw, password)
-                let sent: bool = send_packet(c, pw.ptr, pw.len)
-                rt.buf_free(&pw)
-                if !sent { return false }
-            }
-        } else {
-            return fail_auth(c)
-        }
-    }
-    return false
-}
-
-fn fail_auth(c: *mut My) -> bool {
-    set_error(c, "authentication failed")
-    return false
-}
+fn my_new() -> My { return lk.my_new() }
+fn my_free(c: *mut My) { lk.my_free(c) }
+fn my_is_open(c: *mut My) -> bool { return lk.my_is_open(c) }
+fn my_error(c: *mut My) -> str { return lk.my_error(c) }
+fn my_error_code(c: *mut My) -> u32 { return lk.my_error_code(c) }
 
 fn my_connect(c: *mut My, addr: u32, port: u16, user: str, password: str, database: str,
     tls_mode: u32, host: str, roots: u64, rn: usize, now: u64) -> bool {
     rt.buf_clear(&(*c).err)
     (*c).err_code = 0
-    var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) {
-        set_error(c, "tcp connect failed")
+    if !tr.tp_connect(&(*c).tp, addr, port) {
+        lk.set_error(c, "tcp connect failed")
         return false
     }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
     (*c).seq = 0
-    if !read_packet(c) || !parse_handshake(c) {
-        set_error(c, "bad server handshake")
+    if !lk.read_packet(c) || !au.parse_handshake(c) {
+        lk.set_error(c, "bad server handshake")
         return false
     }
     var want: u32 = w.CAP_LONG_PASSWORD | w.CAP_PROTOCOL_41 | w.CAP_TRANSACTIONS | w.CAP_SECURE_CONNECTION
@@ -357,50 +42,33 @@ fn my_connect(c: *mut My, addr: u32, port: u16, user: str, password: str, databa
     if database.n > 0 { want = want | w.CAP_CONNECT_WITH_DB }
     if tls_mode == TLS_REQUIRE { want = want | w.CAP_SSL }
     if (want & w.CAP_SSL) != 0 && ((*c).caps & w.CAP_SSL) == 0 {
-        set_error(c, "server does not offer TLS")
+        lk.set_error(c, "server does not offer TLS")
         return false
     }
     (*c).caps = want
-    if tls_mode == TLS_REQUIRE && !start_tls(c, host, roots, rn, now) { return false }
-    if !send_response(c, user, password, database, tls_mode == TLS_REQUIRE) { return false }
-    if !auth_loop(c, password) { return false }
+    if tls_mode == TLS_REQUIRE && !au.start_tls(c, host, roots, rn, now) { return false }
+    if !au.send_response(c, user, password, database, tls_mode == TLS_REQUIRE) { return false }
+    if !au.auth_loop(c, password) { return false }
     (*c).open = true
     return true
 }
 
-fn command(c: *mut My, cmd: u8, p: u64, n: usize) -> bool {
-    if !(*c).open { return false }
-    (*c).seq = 0
-    var b: rt.Buf = rt.buf_new()
-    rt.buf_push(&b, cmd)
-    rt.buf_push_bytes(&b, p, n)
-    let ok: bool = send_packet(c, b.ptr, b.len)
-    rt.buf_free(&b)
-    return ok
-}
-
 fn my_close(c: *mut My) {
     if (*c).open {
-        command(c, 1 as u8, 0, 0)
+        lk.command(c, 1 as u8, 0, 0)
         (*c).open = false
     }
 }
 
 fn my_ping(c: *mut My) -> bool {
-    if !command(c, 14 as u8, 0, 0) || !read_packet(c) { return false }
+    if !lk.command(c, 14 as u8, 0, 0) || !lk.read_packet(c) { return false }
     return rt.ld8((*c).pkt.ptr, 0) == 0 as u8
-}
-
-fn protocol_error(c: *mut My) -> bool {
-    set_error(c, "protocol error")
-    (*c).open = false
-    return false
 }
 
 fn read_columns(c: *mut My, r: *mut rows.MyResult, count: usize) -> bool {
     var i: usize = 0
     while i < count {
-        if !read_packet(c) { return false }
+        if !lk.read_packet(c) { return false }
         let p: u64 = (*c).pkt.ptr
         let n: usize = (*c).pkt.len
         var pos: usize = 0
@@ -409,7 +77,7 @@ fn read_columns(c: *mut My, r: *mut rows.MyResult, count: usize) -> bool {
         var name_at: usize = 0
         var name_len: usize = 0
         while k < 6 {
-            if !w.read_lenenc(p, n, &pos, &len) || len > (n - pos) as u64 { return protocol_error(c) }
+            if !w.read_lenenc(p, n, &pos, &len) || len > (n - pos) as u64 { return lk.protocol_error(c) }
             if k == 4 {
                 name_at = pos
                 name_len = len as usize
@@ -417,7 +85,7 @@ fn read_columns(c: *mut My, r: *mut rows.MyResult, count: usize) -> bool {
             pos = pos + len as usize
             k = k + 1
         }
-        if pos + 13 > n { return protocol_error(c) }
+        if pos + 13 > n { return lk.protocol_error(c) }
         rows.add_column(r, p + name_at as u64, name_len, rt.ld8(p, pos + 7) as u32, w.ld16le(p, pos + 8))
         i = i + 1
     }
@@ -426,12 +94,12 @@ fn read_columns(c: *mut My, r: *mut rows.MyResult, count: usize) -> bool {
 
 fn read_result_set(c: *mut My, r: *mut rows.MyResult, ncols: usize, binary: bool) -> bool {
     if !read_columns(c, r, ncols) { return false }
-    if ncols > 0 && (!read_packet(c) || !is_eof(c)) { return protocol_error(c) }
+    if ncols > 0 && (!lk.read_packet(c) || !lk.is_eof(c)) { return lk.protocol_error(c) }
     while true {
-        if !read_packet(c) { return false }
-        if is_eof(c) { return true }
+        if !lk.read_packet(c) { return false }
+        if lk.is_eof(c) { return true }
         if rt.ld8((*c).pkt.ptr, 0) == 255 as u8 {
-            parse_err(c)
+            lk.parse_err(c)
             return false
         }
         var ok: bool = false
@@ -441,7 +109,7 @@ fn read_result_set(c: *mut My, r: *mut rows.MyResult, ncols: usize, binary: bool
             ok = bin.decode_text_row(r, (*c).pkt.ptr, (*c).pkt.len)
         }
         if !ok {
-            set_error(c, "malformed row")
+            lk.set_error(c, "malformed row")
             (*c).open = false
             return false
         }
@@ -453,25 +121,25 @@ fn read_response(c: *mut My, r: *mut rows.MyResult, binary: bool) -> bool {
     rows.result_clear(r)
     rt.buf_clear(&(*c).err)
     (*c).err_code = 0
-    if !read_packet(c) {
-        set_error(c, "connection lost")
+    if !lk.read_packet(c) {
+        lk.set_error(c, "connection lost")
         return false
     }
     let kind: u8 = rt.ld8((*c).pkt.ptr, 0)
     if kind == 255 as u8 {
-        parse_err(c)
+        lk.parse_err(c)
         return false
     }
-    if kind == 0 as u8 { return parse_ok(c, r) || protocol_error(c) }
-    if kind == 251 as u8 { return protocol_error(c) }
+    if kind == 0 as u8 { return lk.parse_ok(c, r) || lk.protocol_error(c) }
+    if kind == 251 as u8 { return lk.protocol_error(c) }
     var pos: usize = 0
     var ncols: u64 = 0
-    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &ncols) || ncols > 4096 { return protocol_error(c) }
+    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &ncols) || ncols > 4096 { return lk.protocol_error(c) }
     return read_result_set(c, r, ncols as usize, binary)
 }
 
 fn my_query(c: *mut My, sql: str, r: *mut rows.MyResult) -> bool {
-    if !command(c, 3 as u8, sql.p as u64, sql.n) { return false }
+    if !lk.command(c, 3 as u8, sql.p as u64, sql.n) { return false }
     return read_response(c, r, false)
 }
 
@@ -479,21 +147,21 @@ fn skip_defs(c: *mut My, count: usize) -> bool {
     if count == 0 { return true }
     var i: usize = 0
     while i < count + 1 {
-        if !read_packet(c) { return false }
+        if !lk.read_packet(c) { return false }
         i = i + 1
     }
     return true
 }
 
 fn my_prepare(c: *mut My, sql: str, nparams: *mut usize) -> i64 {
-    if !command(c, 22 as u8, sql.p as u64, sql.n) || !read_packet(c) { return 0 - 1 }
+    if !lk.command(c, 22 as u8, sql.p as u64, sql.n) || !lk.read_packet(c) { return 0 - 1 }
     let p: u64 = (*c).pkt.ptr
     if rt.ld8(p, 0) == 255 as u8 {
-        parse_err(c)
+        lk.parse_err(c)
         return 0 - 1
     }
     if (*c).pkt.len < 12 || rt.ld8(p, 0) != 0 as u8 {
-        protocol_error(c)
+        lk.protocol_error(c)
         return 0 - 1
     }
     let id: u32 = w.ld32le(p, 1)
@@ -539,7 +207,7 @@ fn my_exec_stmt(c: *mut My, id: u32, q: *mut rows.MyParams, r: *mut rows.MyResul
             i = i + 1
         }
     }
-    let sent: bool = command(c, 23 as u8, b.ptr, b.len)
+    let sent: bool = lk.command(c, 23 as u8, b.ptr, b.len)
     rt.buf_free(&b)
     if !sent { return false }
     return read_response(c, r, true)
@@ -548,7 +216,7 @@ fn my_exec_stmt(c: *mut My, id: u32, q: *mut rows.MyParams, r: *mut rows.MyResul
 fn my_close_stmt(c: *mut My, id: u32) -> bool {
     var b: rt.Buf = rt.buf_new()
     w.put_u32le(&b, id)
-    let ok: bool = command(c, 25 as u8, b.ptr, b.len)
+    let ok: bool = lk.command(c, 25 as u8, b.ptr, b.len)
     rt.buf_free(&b)
     return ok
 }

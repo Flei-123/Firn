@@ -2,34 +2,25 @@
 import std.rt
 import std.net
 import std.md5
-import tls.tls
-import tls.x509
+import net.transport as tr
 import pg.pgscram
 import pg.pgwire as w
+import pg.pgrows as rows
 
 export {
-    Pg, PgResult, PgParams,
+    Pg,
     pg_new, pg_free, pg_connect, pg_is_open, pg_close,
     pg_query, pg_query_params, pg_prepare, pg_exec_prepared, pg_deallocate,
     pg_error, pg_error_code, pg_txn_status,
-    result_new, result_free, result_nrows, result_ncols, result_col_name, result_col_oid,
-    result_value, result_tag,
-    params_new, params_free, params_clear, params_text, params_null,
     TLS_OFF, TLS_REQUIRE,
 }
 
 const TLS_OFF: u32 = 0
 const TLS_REQUIRE: u32 = 1
-const READ_CHUNK: usize = 16384
 const MAX_MESSAGE: usize = 268435456
 
 struct Pg {
-    conn: net.Conn,
-    secure: bool,
-    t: tls.Tls,
-    store: x509.Store,
-    inb: rt.Buf,
-    inpos: usize,
+    tp: tr.Transport,
     out: rt.Buf,
     open: bool,
     txn: u8,
@@ -38,36 +29,17 @@ struct Pg {
     scram: pgscram.Scram,
 }
 
-struct PgResult {
-    ncols: usize,
-    nrows: usize,
-    names: rt.Buf,
-    oids: rt.Buf,
-    data: rt.Buf,
-    rows: rt.Buf,
-    tag: rt.Buf,
-}
-
-struct PgParams {
-    count: usize,
-    data: rt.Buf,
-}
-
 fn pg_new() -> Pg {
-    return Pg { conn: net.conn_from_fd(0 - 1), secure: false, t: tls.tls_new(),
-        store: x509.store_new(), inb: rt.buf_new(), inpos: 0, out: rt.buf_new(),
+    return Pg { tp: tr.tp_new(), out: rt.buf_new(),
         open: false, txn: 73 as u8, err: rt.buf_new(), code: [48; 5],
         scram: pgscram.scram_new() }
 }
 
 fn pg_free(c: *mut Pg) {
-    if (*c).secure { tls.tls_free(&(*c).t) }
-    x509.store_free(&(*c).store)
+    tr.tp_free(&(*c).tp)
     pgscram.scram_free(&(*c).scram)
-    rt.buf_free(&(*c).inb)
     rt.buf_free(&(*c).out)
     rt.buf_free(&(*c).err)
-    if net.conn_is_open(&(*c).conn) { net.close(&(*c).conn) }
 }
 
 fn pg_is_open(c: *mut Pg) -> bool { return (*c).open }
@@ -75,120 +47,11 @@ fn pg_txn_status(c: *mut Pg) -> u8 { return (*c).txn }
 fn pg_error(c: *mut Pg) -> str { return rt.buf_str(&(*c).err) }
 fn pg_error_code(c: *mut Pg) -> u64 { return (&(*c).code[0]) as u64 }
 
-fn result_new() -> PgResult {
-    return PgResult { ncols: 0, nrows: 0, names: rt.buf_new(), oids: rt.buf_new(),
-        data: rt.buf_new(), rows: rt.buf_new(), tag: rt.buf_new() }
-}
-
-fn result_clear(r: *mut PgResult) {
-    (*r).ncols = 0
-    (*r).nrows = 0
-    rt.buf_clear(&(*r).names)
-    rt.buf_clear(&(*r).oids)
-    rt.buf_clear(&(*r).data)
-    rt.buf_clear(&(*r).rows)
-}
-
-fn result_free(r: *mut PgResult) {
-    rt.buf_free(&(*r).names)
-    rt.buf_free(&(*r).oids)
-    rt.buf_free(&(*r).data)
-    rt.buf_free(&(*r).rows)
-    rt.buf_free(&(*r).tag)
-}
-
-fn result_nrows(r: *mut PgResult) -> usize { return (*r).nrows }
-fn result_ncols(r: *mut PgResult) -> usize { return (*r).ncols }
-fn result_tag(r: *mut PgResult) -> str { return rt.buf_str(&(*r).tag) }
-
-fn result_col_oid(r: *mut PgResult, col: usize) -> u32 {
-    return rt.ld32((*r).oids.ptr, col)
-}
-
-fn result_col_name(r: *mut PgResult, col: usize) -> str {
-    var at: usize = 0
-    var i: usize = 0
-    while i < col {
-        while rt.ld8((*r).names.ptr, at) != 0 as u8 { at = at + 1 }
-        at = at + 1
-        i = i + 1
-    }
-    var e: usize = at
-    while rt.ld8((*r).names.ptr, e) != 0 as u8 { e = e + 1 }
-    return str { p: ((*r).names.ptr + at as u64) as *mut u8, n: e - at }
-}
-
-fn result_value(r: *mut PgResult, row: usize, col: usize, p: *mut u64, n: *mut usize) -> bool {
-    if row >= (*r).nrows || col >= (*r).ncols { return false }
-    let at: usize = rt.ld32((*r).rows.ptr, row * (*r).ncols + col) as usize
-    let len: u32 = rt.ld32((*r).data.ptr + at as u64, 0)
-    if len == 4294967295 as u32 { return false }
-    *p = (*r).data.ptr + (at + 4) as u64
-    *n = len as usize
-    return true
-}
-
-fn params_new() -> PgParams {
-    return PgParams { count: 0, data: rt.buf_new() }
-}
-
-fn params_free(q: *mut PgParams) { rt.buf_free(&(*q).data) }
-
-fn params_clear(q: *mut PgParams) {
-    (*q).count = 0
-    rt.buf_clear(&(*q).data)
-}
-
-fn params_text(q: *mut PgParams, p: u64, n: usize) {
-    w.put_i32(&(*q).data, n as u32)
-    rt.buf_push_bytes(&(*q).data, p, n)
-    (*q).count = (*q).count + 1
-}
-
-fn params_null(q: *mut PgParams) {
-    w.put_i32(&(*q).data, 4294967295 as u32)
-    (*q).count = (*q).count + 1
-}
-
-fn raw_write(c: *mut Pg, p: u64, n: usize) -> bool {
-    if (*c).secure {
-        let ok: bool = tls.tls_write(&(*c).t, p, n) catch false
-        return ok
-    }
-    let k: usize = net.write_all(&(*c).conn, p, n) catch 0
-    return k == n
-}
-
 fn flush_out(c: *mut Pg) -> bool {
-    let ok: bool = raw_write(c, (*c).out.ptr, (*c).out.len)
+    let ok: bool = tr.tp_write(&(*c).tp, (*c).out.ptr, (*c).out.len)
     rt.buf_clear(&(*c).out)
     if !ok { (*c).open = false }
     return ok
-}
-
-fn fill(c: *mut Pg) -> bool {
-    if (*c).inpos > 0 && (*c).inpos == (*c).inb.len {
-        rt.buf_clear(&(*c).inb)
-        (*c).inpos = 0
-    }
-    let have: usize = (*c).inb.len
-    rt.buf_reserve(&(*c).inb, have + READ_CHUNK)
-    var k: usize = 0
-    if (*c).secure {
-        k = tls.tls_read(&(*c).t, (*c).inb.ptr + have as u64, READ_CHUNK) catch 0
-    } else {
-        k = net.read(&(*c).conn, (*c).inb.ptr + have as u64, READ_CHUNK) catch 0
-    }
-    if k == 0 { return false }
-    rt.buf_set_len(&(*c).inb, have + k)
-    return true
-}
-
-fn need(c: *mut Pg, n: usize) -> bool {
-    while (*c).inb.len - (*c).inpos < n {
-        if !fill(c) { return false }
-    }
-    return true
 }
 
 fn set_error(c: *mut Pg, msg: str) {
@@ -197,29 +60,29 @@ fn set_error(c: *mut Pg, msg: str) {
 }
 
 fn read_message(c: *mut Pg, kind: *mut u8, p: *mut u64, n: *mut usize) -> bool {
-    if (*c).inpos > 0 && (*c).inpos == (*c).inb.len {
-        rt.buf_clear(&(*c).inb)
-        (*c).inpos = 0
+    if (*c).tp.inpos > 0 && (*c).tp.inpos == (*c).tp.inb.len {
+        rt.buf_clear(&(*c).tp.inb)
+        (*c).tp.inpos = 0
     }
-    if !need(c, 5) {
+    if !tr.tp_need(&(*c).tp, 5) {
         (*c).open = false
         return false
     }
-    let base: u64 = (*c).inb.ptr + (*c).inpos as u64
+    let base: u64 = (*c).tp.inb.ptr + (*c).tp.inpos as u64
     let len: usize = w.be32(base, 1) as usize
     if len < 4 || len > MAX_MESSAGE {
         (*c).open = false
         return false
     }
-    if !need(c, 1 + len) {
+    if !tr.tp_need(&(*c).tp, 1 + len) {
         (*c).open = false
         return false
     }
-    let at: u64 = (*c).inb.ptr + (*c).inpos as u64
+    let at: u64 = (*c).tp.inb.ptr + (*c).tp.inpos as u64
     *kind = rt.ld8(at, 0)
     *p = at + 5
     *n = len - 4
-    (*c).inpos = (*c).inpos + 1 + len
+    (*c).tp.inpos = (*c).tp.inpos + 1 + len
     return true
 }
 
@@ -358,14 +221,9 @@ fn startup_loop(c: *mut Pg, user: str, password: str) -> bool {
 }
 
 fn open_tcp(c: *mut Pg, addr: u32, port: u16) -> bool {
-    var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) {
-        set_error(c, "tcp connect failed")
-        return false
-    }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
-    return true
+    if tr.tp_connect(&(*c).tp, addr, port) { return true }
+    set_error(c, "tcp connect failed")
+    return false
 }
 
 fn start_tls(c: *mut Pg, host: str, roots: u64, rn: usize, now: u64) -> bool {
@@ -373,20 +231,15 @@ fn start_tls(c: *mut Pg, host: str, roots: u64, rn: usize, now: u64) -> bool {
     w.put_i32(&(*c).out, 80877103)
     if !flush_out(c) { return false }
     var b: [u8; 1] = [0; 1]
-    let k: usize = net.read(&(*c).conn, (&b[0]) as u64, 1) catch 0
+    let k: usize = net.read(&(*c).tp.conn, (&b[0]) as u64, 1) catch 0
     if k != 1 || b[0] != 83 as u8 {
         set_error(c, "server refused TLS")
         return false
     }
-    x509.store_load_pem(&(*c).store, roots, rn)
-    if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) {
-        set_error(c, "tls init failed")
-        return false
-    }
-    (*c).secure = true
-    let ok: bool = tls.tls_handshake(&(*c).t) catch false
-    if !ok { set_error(c, "tls handshake failed") }
-    return ok
+    let r: u32 = tr.tp_start_tls(&(*c).tp, host, roots, rn, now, false)
+    if r == tr.TP_TLS_INIT_FAILED { set_error(c, "tls init failed") }
+    if r == tr.TP_TLS_HANDSHAKE_FAILED { set_error(c, "tls handshake failed") }
+    return r == tr.TP_TLS_OK
 }
 
 fn pg_connect(c: *mut Pg, addr: u32, port: u16, user: str, password: str, database: str,
@@ -411,50 +264,9 @@ fn pg_close(c: *mut Pg) {
     (*c).open = false
 }
 
-fn on_row_description(r: *mut PgResult, p: u64, n: usize) -> bool {
-    result_clear(r)
-    if n < 2 { return false }
-    let cols: usize = w.be16(p, 0) as usize
-    var at: usize = 2
-    var i: usize = 0
-    while i < cols {
-        var e: usize = at
-        while e < n && rt.ld8(p, e) != 0 as u8 { e = e + 1 }
-        if e + 19 > n { return false }
-        rt.buf_push_bytes(&(*r).names, p + at as u64, e - at)
-        rt.buf_push(&(*r).names, 0 as u8)
-        w.put_u32le(&(*r).oids, w.be32(p, e + 7))
-        at = e + 19
-        i = i + 1
-    }
-    (*r).ncols = cols
-    return true
-}
-
-fn on_data_row(r: *mut PgResult, p: u64, n: usize) -> bool {
-    if n < 2 || w.be16(p, 0) as usize != (*r).ncols { return false }
-    var at: usize = 2
-    var i: usize = 0
-    while i < (*r).ncols {
-        if at + 4 > n { return false }
-        let len: u32 = w.be32(p, at)
-        w.put_u32le(&(*r).rows, (*r).data.len as u32)
-        w.put_u32le(&(*r).data, len)
-        at = at + 4
-        if len != 4294967295 as u32 {
-            if at + len as usize > n { return false }
-            rt.buf_push_bytes(&(*r).data, p + at as u64, len as usize)
-            at = at + len as usize
-        }
-        i = i + 1
-    }
-    (*r).nrows = (*r).nrows + 1
-    return true
-}
-
-fn collect(c: *mut Pg, r: *mut PgResult) -> bool {
+fn collect(c: *mut Pg, r: *mut rows.PgResult) -> bool {
     var failed: bool = false
-    result_clear(r)
+    rows.result_clear(r)
     rt.buf_clear(&(*r).tag)
     rt.buf_clear(&(*c).err)
     while true {
@@ -473,9 +285,9 @@ fn collect(c: *mut Pg, r: *mut PgResult) -> bool {
             parse_error(c, p, n)
             failed = true
         } else if kind == 84 as u8 {
-            if !on_row_description(r, p, n) { return protocol_error(c) }
+            if !rows.on_row_description(r, p, n) { return protocol_error(c) }
         } else if kind == 68 as u8 {
-            if !on_data_row(r, p, n) { return protocol_error(c) }
+            if !rows.on_data_row(r, p, n) { return protocol_error(c) }
         } else if kind == 67 as u8 {
             rt.buf_clear(&(*r).tag)
             var e: usize = 0
@@ -494,7 +306,7 @@ fn protocol_error(c: *mut Pg) -> bool {
     return false
 }
 
-fn pg_query(c: *mut Pg, sql: str, r: *mut PgResult) -> bool {
+fn pg_query(c: *mut Pg, sql: str, r: *mut rows.PgResult) -> bool {
     if !(*c).open { return false }
     let m: usize = w.begin(&(*c).out, 81 as u8)
     w.put_cstr(&(*c).out, sql)
@@ -503,7 +315,7 @@ fn pg_query(c: *mut Pg, sql: str, r: *mut PgResult) -> bool {
     return collect(c, r)
 }
 
-fn send_extended(c: *mut Pg, name: str, sql: str, parse: bool, q: *mut PgParams) -> bool {
+fn send_extended(c: *mut Pg, name: str, sql: str, parse: bool, q: *mut rows.PgParams) -> bool {
     if parse { w.parse(&(*c).out, name, sql) }
     w.bind(&(*c).out, name, (*q).count, &(*q).data)
     w.describe_portal(&(*c).out)
@@ -512,7 +324,7 @@ fn send_extended(c: *mut Pg, name: str, sql: str, parse: bool, q: *mut PgParams)
     return flush_out(c)
 }
 
-fn pg_query_params(c: *mut Pg, sql: str, q: *mut PgParams, r: *mut PgResult) -> bool {
+fn pg_query_params(c: *mut Pg, sql: str, q: *mut rows.PgParams, r: *mut rows.PgResult) -> bool {
     if !(*c).open { return false }
     if !send_extended(c, "", sql, true, q) { return false }
     return collect(c, r)
@@ -523,13 +335,13 @@ fn pg_prepare(c: *mut Pg, name: str, sql: str) -> bool {
     w.parse(&(*c).out, name, sql)
     w.sync(&(*c).out)
     if !flush_out(c) { return false }
-    var r: PgResult = result_new()
+    var r: rows.PgResult = rows.result_new()
     let ok: bool = collect(c, &r)
-    result_free(&r)
+    rows.result_free(&r)
     return ok
 }
 
-fn pg_exec_prepared(c: *mut Pg, name: str, q: *mut PgParams, r: *mut PgResult) -> bool {
+fn pg_exec_prepared(c: *mut Pg, name: str, q: *mut rows.PgParams, r: *mut rows.PgResult) -> bool {
     if !(*c).open { return false }
     if !send_extended(c, name, "", false, q) { return false }
     return collect(c, r)
@@ -540,8 +352,8 @@ fn pg_deallocate(c: *mut Pg, name: str) -> bool {
     w.close_statement(&(*c).out, name)
     w.sync(&(*c).out)
     if !flush_out(c) { return false }
-    var r: PgResult = result_new()
+    var r: rows.PgResult = rows.result_new()
     let ok: bool = collect(c, &r)
-    result_free(&r)
+    rows.result_free(&r)
     return ok
 }

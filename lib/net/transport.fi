@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.net
+import tls.tls
+import tls.x509
+
+export {
+    Transport, tp_new, tp_free, tp_connect, tp_start_tls, tp_write, tp_fill, tp_need,
+    tp_fail_num, tp_fail_alert,
+    TP_READ_CHUNK, TP_TLS_OK, TP_TLS_INIT_FAILED, TP_TLS_HANDSHAKE_FAILED,
+}
+
+const TP_READ_CHUNK: usize = 16384
+const TP_TLS_OK: u32 = 0
+const TP_TLS_INIT_FAILED: u32 = 1
+const TP_TLS_HANDSHAKE_FAILED: u32 = 2
+
+struct Transport {
+    conn: net.Conn,
+    secure: bool,
+    t: tls.Tls,
+    store: x509.Store,
+    inb: rt.Buf,
+    inpos: usize,
+    compact_at: usize,
+    fail_num: u32,
+}
+
+fn tp_new() -> Transport {
+    return Transport { conn: net.conn_from_fd(0 - 1), secure: false, t: tls.tls_new(),
+        store: x509.store_new(), inb: rt.buf_new(), inpos: 0, compact_at: 0, fail_num: 0 }
+}
+
+fn tp_free(p: *mut Transport) {
+    if (*p).secure { tls.tls_free(&(*p).t) }
+    x509.store_free(&(*p).store)
+    rt.buf_free(&(*p).inb)
+    if net.conn_is_open(&(*p).conn) { net.close(&(*p).conn) }
+}
+
+fn tp_connect(p: *mut Transport, addr: u32, port: u16) -> bool {
+    var err: i64 = 0
+    (*p).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&(*p).conn) { return false }
+    let nd: bool = net.set_no_delay(&(*p).conn, true) catch false
+    return true
+}
+
+fn tp_start_tls(p: *mut Transport, host: str, roots: u64, rn: usize, now: u64, offer_h2: bool) -> u32 {
+    x509.store_load_pem(&(*p).store, roots, rn)
+    if !tls.tls_init(&(*p).t, &(*p).conn, &(*p).store, host.p as u64, host.n, now) {
+        return TP_TLS_INIT_FAILED
+    }
+    if offer_h2 { tls.tls_offer_h2(&(*p).t, true) }
+    (*p).secure = true
+    let ok: bool = tls.tls_handshake(&(*p).t) catch false
+    if !ok { return TP_TLS_HANDSHAKE_FAILED }
+    return TP_TLS_OK
+}
+
+fn tp_write(p: *mut Transport, data: u64, n: usize) -> bool {
+    if (*p).secure {
+        let ok: bool = tls.tls_write(&(*p).t, data, n) catch false
+        return ok
+    }
+    let k: usize = net.write_all(&(*p).conn, data, n) catch 0
+    return k == n
+}
+
+fn note_fail(p: *mut Transport, num: u32) -> usize {
+    (*p).fail_num = num
+    return 0
+}
+
+fn tp_fail_num(p: *mut Transport) -> u32 { return (*p).fail_num }
+fn tp_fail_alert(p: *mut Transport) -> u32 { return tls.tls_alert_desc(&(*p).t) }
+
+fn compact(p: *mut Transport) {
+    if (*p).inpos > 0 && (*p).inpos == (*p).inb.len {
+        rt.buf_clear(&(*p).inb)
+        (*p).inpos = 0
+    } else if (*p).compact_at > 0 && (*p).inpos > (*p).compact_at {
+        let left: usize = (*p).inb.len - (*p).inpos
+        rt.mem_copy((*p).inb.ptr, (*p).inb.ptr + (*p).inpos as u64, left)
+        rt.buf_set_len(&(*p).inb, left)
+        (*p).inpos = 0
+    }
+}
+
+fn tp_fill(p: *mut Transport) -> bool {
+    compact(p)
+    let have: usize = (*p).inb.len
+    rt.buf_reserve(&(*p).inb, have + TP_READ_CHUNK)
+    var k: usize = 0
+    if (*p).secure {
+        k = tls.tls_read(&(*p).t, (*p).inb.ptr + have as u64, TP_READ_CHUNK)
+        catch | e | note_fail(p, tls.tls_err_num(e))
+    } else {
+        k = net.read(&(*p).conn, (*p).inb.ptr + have as u64, TP_READ_CHUNK) catch 0
+    }
+    if k == 0 { return false }
+    rt.buf_set_len(&(*p).inb, have + k)
+    return true
+}
+
+fn tp_need(p: *mut Transport, n: usize) -> bool {
+    while (*p).inb.len - (*p).inpos < n {
+        if !tp_fill(p) { return false }
+    }
+    return true
+}

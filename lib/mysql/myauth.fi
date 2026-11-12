@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.transport as tr
+import mysql.mywire as w
+import mysql.mylink as lk
+
+export { start_tls, parse_handshake, auth_loop, send_response }
+
+fn start_tls(c: *mut lk.My, host: str, roots: u64, rn: usize, now: u64) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    w.put_u32le(&b, (*c).caps)
+    w.put_u32le(&b, w.MAX_PACKET as u32)
+    rt.buf_push(&b, lk.CHARSET_UTF8MB4)
+    var i: usize = 0
+    while i < 23 {
+        rt.buf_push(&b, 0 as u8)
+        i = i + 1
+    }
+    let ok: bool = lk.send_packet(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    if !ok { return false }
+    let r: u32 = tr.tp_start_tls(&(*c).tp, host, roots, rn, now, false)
+    if r == tr.TP_TLS_INIT_FAILED { lk.set_error(c, "tls init failed") }
+    if r == tr.TP_TLS_HANDSHAKE_FAILED { lk.set_error(c, "tls handshake failed") }
+    return r == tr.TP_TLS_OK
+}
+
+fn parse_handshake(c: *mut lk.My) -> bool {
+    let p: u64 = (*c).pkt.ptr
+    let n: usize = (*c).pkt.len
+    if n < 1 || rt.ld8(p, 0) != 10 as u8 { return false }
+    var at: usize = 1
+    while at < n && rt.ld8(p, at) != 0 as u8 { at = at + 1 }
+    at = at + 1 + 4
+    if at + 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10 > n { return false }
+    rt.mem_copy((&(*c).salt[0]) as u64, p + at as u64, 8)
+    at = at + 9
+    var caps: u32 = w.ld16le(p, at)
+    at = at + 2 + 1 + 2
+    caps = caps | (w.ld16le(p, at) << 16)
+    at = at + 2 + 1 + 10
+    if at + 12 > n { return false }
+    rt.mem_copy((&(*c).salt[8]) as u64, p + at as u64, 12)
+    at = at + 13
+    (*c).plugin_len = 0
+    while at + (*c).plugin_len < n && rt.ld8(p, at + (*c).plugin_len) != 0 as u8 && (*c).plugin_len < 32 {
+        (*c).plugin[(*c).plugin_len] = rt.ld8(p, at + (*c).plugin_len)
+        (*c).plugin_len = (*c).plugin_len + 1
+    }
+    (*c).caps = caps
+    return true
+}
+
+fn plugin_is(c: *mut lk.My, name: str) -> bool {
+    return (*c).plugin_len == name.n && rt.mem_eq((&(*c).plugin[0]) as u64, name.p as u64, name.n)
+}
+
+fn auth_token(c: *mut lk.My, password: str, out: *mut rt.Buf) -> bool {
+    if password.n == 0 { return true }
+    var tok: [u8; 32] = [0; 32]
+    if plugin_is(c, lk.PLUGIN_NATIVE) {
+        w.native_scramble(password, (&(*c).salt[0]) as u64, (&tok[0]) as u64)
+        rt.buf_push_bytes(out, (&tok[0]) as u64, 20)
+        return true
+    }
+    if plugin_is(c, lk.PLUGIN_SHA2) {
+        w.sha2_scramble(password, (&(*c).salt[0]) as u64, (&tok[0]) as u64)
+        rt.buf_push_bytes(out, (&tok[0]) as u64, 32)
+        return true
+    }
+    return false
+}
+
+fn send_response(c: *mut lk.My, user: str, password: str, database: str, tls_on: bool) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    w.put_u32le(&b, (*c).caps)
+    w.put_u32le(&b, w.MAX_PACKET as u32)
+    rt.buf_push(&b, lk.CHARSET_UTF8MB4)
+    var i: usize = 0
+    while i < 23 {
+        rt.buf_push(&b, 0 as u8)
+        i = i + 1
+    }
+    w.put_cstr(&b, user)
+    var tok: rt.Buf = rt.buf_new()
+    if !auth_token(c, password, &tok) {
+        rt.buf_free(&b)
+        rt.buf_free(&tok)
+        lk.set_error(c, "unsupported authentication plugin")
+        return false
+    }
+    w.put_lenstr(&b, tok.ptr, tok.len)
+    rt.buf_free(&tok)
+    if database.n > 0 { w.put_cstr(&b, database) }
+    rt.buf_push_bytes(&b, (&(*c).plugin[0]) as u64, (*c).plugin_len)
+    rt.buf_push(&b, 0 as u8)
+    let ok: bool = lk.send_packet(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn auth_loop(c: *mut lk.My, password: str) -> bool {
+    while true {
+        if !lk.read_packet(c) {
+            if (*c).err.len == 0 { lk.set_error(c, "connection closed during authentication") }
+            return false
+        }
+        let kind: u8 = rt.ld8((*c).pkt.ptr, 0)
+        if kind == 0 as u8 { return true }
+        if kind == 255 as u8 {
+            lk.parse_err(c)
+            return false
+        }
+        if kind == 254 as u8 {
+            var e: usize = 1
+            while e < (*c).pkt.len && rt.ld8((*c).pkt.ptr, e) != 0 as u8 { e = e + 1 }
+            (*c).plugin_len = 0
+            while (*c).plugin_len < e - 1 && (*c).plugin_len < 32 {
+                (*c).plugin[(*c).plugin_len] = rt.ld8((*c).pkt.ptr, 1 + (*c).plugin_len)
+                (*c).plugin_len = (*c).plugin_len + 1
+            }
+            if (*c).pkt.len - e - 1 < lk.SALT_LEN { return fail_auth(c) }
+            rt.mem_copy((&(*c).salt[0]) as u64, (*c).pkt.ptr + (e + 1) as u64, lk.SALT_LEN)
+            var tok: rt.Buf = rt.buf_new()
+            let have: bool = auth_token(c, password, &tok)
+            let sent: bool = have && lk.send_packet(c, tok.ptr, tok.len)
+            rt.buf_free(&tok)
+            if !sent { return fail_auth(c) }
+        } else if kind == 1 as u8 {
+            if (*c).pkt.len < 2 { return fail_auth(c) }
+            let more: u8 = rt.ld8((*c).pkt.ptr, 1)
+            if more == 4 as u8 {
+                if !(*c).tp.secure {
+                    lk.set_error(c, "caching_sha2_password full authentication needs TLS")
+                    return false
+                }
+                var pw: rt.Buf = rt.buf_new()
+                w.put_cstr(&pw, password)
+                let sent: bool = lk.send_packet(c, pw.ptr, pw.len)
+                rt.buf_free(&pw)
+                if !sent { return false }
+            }
+        } else {
+            return fail_auth(c)
+        }
+    }
+    return false
+}
+
+fn fail_auth(c: *mut lk.My) -> bool {
+    lk.set_error(c, "authentication failed")
+    return false
+}

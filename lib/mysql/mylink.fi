@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.transport as tr
+import mysql.mywire as w
+import mysql.myrows as rows
+
+export {
+    My, my_new, my_free, my_is_open, my_error, my_error_code, set_error, link_down,
+    send_packet, read_packet, parse_err, parse_ok, is_eof, protocol_error, command,
+    MAX_PAYLOAD, CHARSET_UTF8MB4, SALT_LEN, PLUGIN_NATIVE, PLUGIN_SHA2,
+}
+
+const MAX_PAYLOAD: usize = 268435456
+const CHARSET_UTF8MB4: u8 = 45
+const SALT_LEN: usize = 20
+const PLUGIN_NATIVE: str = "mysql_native_password"
+const PLUGIN_SHA2: str = "caching_sha2_password"
+
+struct My {
+    tp: tr.Transport,
+    out: rt.Buf,
+    pkt: rt.Buf,
+    seq: u8,
+    open: bool,
+    err: rt.Buf,
+    err_code: u32,
+    caps: u32,
+    salt: [u8; 20],
+    plugin: [u8; 32],
+    plugin_len: usize,
+}
+
+fn my_new() -> My {
+    return My { tp: tr.tp_new(), out: rt.buf_new(),
+        pkt: rt.buf_new(), seq: 0, open: false, err: rt.buf_new(), err_code: 0, caps: 0,
+        salt: [0; 20], plugin: [0; 32], plugin_len: 0 }
+}
+
+fn my_free(c: *mut My) {
+    tr.tp_free(&(*c).tp)
+    rt.buf_free(&(*c).out)
+    rt.buf_free(&(*c).pkt)
+    rt.buf_free(&(*c).err)
+}
+
+fn my_is_open(c: *mut My) -> bool { return (*c).open }
+
+fn my_error(c: *mut My) -> str { return rt.buf_str(&(*c).err) }
+
+fn my_error_code(c: *mut My) -> u32 { return (*c).err_code }
+
+fn set_error(c: *mut My, msg: str) {
+    rt.buf_clear(&(*c).err)
+    rt.buf_push_bytes(&(*c).err, msg.p as u64, msg.n)
+}
+
+fn link_down(c: *mut My) -> bool {
+    (*c).open = false
+    let num: u32 = tr.tp_fail_num(&(*c).tp)
+    if num == 0 as u32 { return false }
+    set_error(c, "tls read failed")
+    rt.buf_push_dec_u64(&(*c).err, num as u64)
+    rt.buf_push_bytes(&(*c).err, " alert ".p as u64, 7)
+    rt.buf_push_dec_u64(&(*c).err, tr.tp_fail_alert(&(*c).tp) as u64)
+    return false
+}
+
+fn send_packet(c: *mut My, p: u64, n: usize) -> bool {
+    var pos: usize = 0
+    var first: bool = true
+    while pos < n || first {
+        var k: usize = n - pos
+        if k > w.MAX_PACKET { k = w.MAX_PACKET }
+        rt.buf_push(&(*c).out, (k & 255) as u8)
+        rt.buf_push(&(*c).out, ((k >> 8) & 255) as u8)
+        rt.buf_push(&(*c).out, ((k >> 16) & 255) as u8)
+        rt.buf_push(&(*c).out, (*c).seq)
+        (*c).seq = (*c).seq +% 1 as u8
+        rt.buf_push_bytes(&(*c).out, p + pos as u64, k)
+        pos = pos + k
+        first = false
+        if k == w.MAX_PACKET && pos == n {
+            rt.buf_push_bytes(&(*c).out, "\u0000\u0000\u0000".p as u64, 3)
+            rt.buf_push(&(*c).out, (*c).seq)
+            (*c).seq = (*c).seq +% 1 as u8
+        }
+    }
+    let ok: bool = tr.tp_write(&(*c).tp, (*c).out.ptr, (*c).out.len)
+    rt.buf_clear(&(*c).out)
+    if !ok { (*c).open = false }
+    return ok
+}
+
+fn read_packet(c: *mut My) -> bool {
+    rt.buf_clear(&(*c).pkt)
+    var more: bool = true
+    while more {
+        if !tr.tp_need(&(*c).tp, 4) { return link_down(c) }
+        let base: u64 = (*c).tp.inb.ptr + (*c).tp.inpos as u64
+        let len: usize = w.ld16le(base, 0) as usize | ((rt.ld8(base, 2) as usize) << 16)
+        let seq: u8 = rt.ld8(base, 3)
+        if seq != (*c).seq || (*c).pkt.len + len > MAX_PAYLOAD || !tr.tp_need(&(*c).tp, 4 + len) {
+            return link_down(c)
+        }
+        (*c).seq = (*c).seq +% 1 as u8
+        rt.buf_push_bytes(&(*c).pkt, (*c).tp.inb.ptr + (*c).tp.inpos as u64 + 4, len)
+        (*c).tp.inpos = (*c).tp.inpos + 4 + len
+        more = len == w.MAX_PACKET
+    }
+    return true
+}
+
+fn parse_err(c: *mut My) {
+    let p: u64 = (*c).pkt.ptr
+    let n: usize = (*c).pkt.len
+    rt.buf_clear(&(*c).err)
+    if n < 3 { return }
+    (*c).err_code = w.ld16le(p, 1)
+    var at: usize = 3
+    if n > 9 && rt.ld8(p, 3) == 35 as u8 { at = 9 }
+    rt.buf_push_bytes(&(*c).err, p + at as u64, n - at)
+}
+
+fn parse_ok(c: *mut My, r: *mut rows.MyResult) -> bool {
+    var pos: usize = 1
+    var aff: u64 = 0
+    var id: u64 = 0
+    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &aff) { return false }
+    if !w.read_lenenc((*c).pkt.ptr, (*c).pkt.len, &pos, &id) { return false }
+    (*r).affected = aff
+    (*r).insert_id = id
+    return true
+}
+
+fn is_eof(c: *mut My) -> bool {
+    return (*c).pkt.len < 9 && (*c).pkt.len > 0 && rt.ld8((*c).pkt.ptr, 0) == 254 as u8
+}
+
+fn protocol_error(c: *mut My) -> bool {
+    set_error(c, "protocol error")
+    (*c).open = false
+    return false
+}
+
+fn command(c: *mut My, cmd: u8, p: u64, n: usize) -> bool {
+    if !(*c).open { return false }
+    (*c).seq = 0
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push(&b, cmd)
+    rt.buf_push_bytes(&b, p, n)
+    let ok: bool = send_packet(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    return ok
+}

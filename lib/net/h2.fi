@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 import std.rt
-import std.net
 import tls.tls
-import tls.x509
+import net.transport as tr
 import net.hpack
 import net.h2frame as fr
+import net.h2conn as hc
 
 export {
     H2, H2Stream, h2_new, h2_free, h2_connect_plain, h2_connect_tls, h2_is_open,
@@ -13,415 +13,19 @@ export {
     MAX_STREAMS,
 }
 
-const MAX_STREAMS: usize = 16
-const RECV_WINDOW: i64 = 1048576
-const MAX_BODY: usize = 268435456
-const READ_CHUNK: usize = 16384
-const COMPACT_AT: usize = 1048576
+type H2 = hc.H2
+type H2Stream = hc.H2Stream
 
-struct H2Stream {
-    id: u32,
-    live: bool,
-    done: bool,
-    got_headers: bool,
-    status: i32,
-    err: u32,
-    send_win: i64,
-    recv_win: i64,
-    hdrs: rt.Buf,
-    body: rt.Buf,
-}
+const MAX_STREAMS: usize = hc.MAX_STREAMS
 
-fn stream_new() -> H2Stream {
-    return H2Stream { id: 0, live: false, done: false, got_headers: false, status: 0, err: 0,
-        send_win: 0, recv_win: 0, hdrs: rt.buf_new(), body: rt.buf_new() }
-}
-
-struct H2 {
-    conn: net.Conn,
-    secure: bool,
-    t: tls.Tls,
-    store: x509.Store,
-    inb: rt.Buf,
-    inpos: usize,
-    out: rt.Buf,
-    enc: hpack.Hpack,
-    dec: hpack.Hpack,
-    hblock: rt.Buf,
-    hblock_stream: u32,
-    hblock_end: bool,
-    open: bool,
-    goaway_code: u32,
-    peer_frame: usize,
-    peer_init_win: i64,
-    send_win: i64,
-    recv_win: i64,
-    ping_acked: bool,
-    next_id: u32,
-    streams: [H2Stream; 16],
-}
-
-fn h2_new() -> H2 {
-    return H2 { conn: net.conn_from_fd(0 - 1), secure: false, t: tls.tls_new(),
-        store: x509.store_new(), inb: rt.buf_new(), inpos: 0, out: rt.buf_new(),
-        enc: hpack.hp_new(), dec: hpack.hp_new(), hblock: rt.buf_new(),
-        hblock_stream: 0, hblock_end: false, open: false, goaway_code: 0,
-        peer_frame: fr.DEFAULT_FRAME_SIZE, peer_init_win: fr.DEFAULT_WINDOW,
-        send_win: fr.DEFAULT_WINDOW, recv_win: RECV_WINDOW, ping_acked: false,
-        next_id: 1, streams: [stream_new(); 16] }
-}
-
-fn h2_free(c: *mut H2) {
-    var i: usize = 0
-    while i < MAX_STREAMS {
-        rt.buf_free(&(*c).streams[i].hdrs)
-        rt.buf_free(&(*c).streams[i].body)
-        i = i + 1
-    }
-    if (*c).secure { tls.tls_free(&(*c).t) }
-    x509.store_free(&(*c).store)
-    hpack.hp_free(&(*c).enc)
-    hpack.hp_free(&(*c).dec)
-    rt.buf_free(&(*c).inb)
-    rt.buf_free(&(*c).out)
-    rt.buf_free(&(*c).hblock)
-    if net.conn_is_open(&(*c).conn) { net.close(&(*c).conn) }
-}
-
-fn h2_is_open(c: *mut H2) -> bool { return (*c).open }
-fn h2_goaway_code(c: *mut H2) -> u32 { return (*c).goaway_code }
-
-fn raw_write(c: *mut H2, p: u64, n: usize) -> bool {
-    if (*c).secure {
-        let ok: bool = tls.tls_write(&(*c).t, p, n) catch false
-        return ok
-    }
-    let k: usize = net.write_all(&(*c).conn, p, n) catch 0
-    return k == n
-}
-
-fn flush_out(c: *mut H2) -> bool {
-    if (*c).out.len == 0 { return true }
-    let ok: bool = raw_write(c, (*c).out.ptr, (*c).out.len)
-    rt.buf_clear(&(*c).out)
-    if !ok { (*c).open = false }
-    return ok
-}
-
-fn fill(c: *mut H2) -> bool {
-    if (*c).inpos > 0 && (*c).inpos == (*c).inb.len {
-        rt.buf_clear(&(*c).inb)
-        (*c).inpos = 0
-    } else if (*c).inpos > COMPACT_AT {
-        let left: usize = (*c).inb.len - (*c).inpos
-        rt.mem_copy((*c).inb.ptr, (*c).inb.ptr + (*c).inpos as u64, left)
-        rt.buf_set_len(&(*c).inb, left)
-        (*c).inpos = 0
-    }
-    let have: usize = (*c).inb.len
-    rt.buf_reserve(&(*c).inb, have + READ_CHUNK)
-    var k: usize = 0
-    if (*c).secure {
-        k = tls.tls_read(&(*c).t, (*c).inb.ptr + have as u64, READ_CHUNK) catch 0
-    } else {
-        k = net.read(&(*c).conn, (*c).inb.ptr + have as u64, READ_CHUNK) catch 0
-    }
-    if k == 0 { return false }
-    rt.buf_set_len(&(*c).inb, have + k)
-    return true
-}
-
-fn need(c: *mut H2, n: usize) -> bool {
-    while (*c).inb.len - (*c).inpos < n {
-        if !fill(c) { return false }
-    }
-    return true
-}
-
-fn find_stream(c: *mut H2, id: u32) -> *mut H2Stream {
-    var i: usize = 0
-    while i < MAX_STREAMS {
-        if (*c).streams[i].live && (*c).streams[i].id == id { return &(*c).streams[i] }
-        i = i + 1
-    }
-    return 0 as *mut H2Stream
-}
-
-fn fail_conn(c: *mut H2, code: u32) -> bool {
-    fr.put_frame_header(&(*c).out, 8, fr.T_GOAWAY, 0, 0)
-    fr.put_u32(&(*c).out, 0)
-    fr.put_u32(&(*c).out, code)
-    flush_out(c)
-    (*c).open = false
-    return false
-}
-
-fn send_window_update(c: *mut H2, stream: u32, inc: i64) {
-    fr.put_frame_header(&(*c).out, 4, fr.T_WINDOW_UPDATE, 0, stream)
-    fr.put_u32(&(*c).out, inc as u32)
-}
-
-fn apply_settings(c: *mut H2, p: u64, n: usize) -> bool {
-    var i: usize = 0
-    while i + 6 <= n {
-        let id: u32 = fr.be16(p, i)
-        let v: u32 = fr.be32(p, i + 2)
-        if id == fr.S_HEADER_TABLE_SIZE {
-            hpack.hp_set_limit(&(*c).enc, v as usize)
-        } else if id == fr.S_INITIAL_WINDOW_SIZE {
-            if v as i64 > fr.MAX_WINDOW { return fail_conn(c, fr.E_FLOW_CONTROL) }
-            let delta: i64 = v as i64 - (*c).peer_init_win
-            (*c).peer_init_win = v as i64
-            var s: usize = 0
-            while s < MAX_STREAMS {
-                if (*c).streams[s].live { (*c).streams[s].send_win = (*c).streams[s].send_win + delta }
-                s = s + 1
-            }
-        } else if id == fr.S_MAX_FRAME_SIZE {
-            if (v as usize) < fr.DEFAULT_FRAME_SIZE || (v as usize) > fr.MAX_FRAME_SIZE_LIMIT {
-                return fail_conn(c, fr.E_PROTOCOL)
-            }
-            (*c).peer_frame = v as usize
-        } else if id == fr.S_ENABLE_PUSH {
-            if v > 1 { return fail_conn(c, fr.E_PROTOCOL) }
-        }
-        i = i + 6
-    }
-    fr.put_frame_header(&(*c).out, 0, fr.T_SETTINGS, fr.F_ACK, 0)
-    return true
-}
-
-fn finish_stream(s: *mut H2Stream) {
-    (*s).done = true
-}
-
-fn on_header_block(c: *mut H2, stream: u32, end_stream: bool) -> bool {
-    var decoded: rt.Buf = rt.buf_new()
-    let r: i32 = hpack.hp_decode(&(*c).dec, (*c).hblock.ptr, (*c).hblock.len, &decoded)
-    rt.buf_clear(&(*c).hblock)
-    if r != hpack.HP_OK {
-        rt.buf_free(&decoded)
-        return fail_conn(c, fr.E_COMPRESSION)
-    }
-    let s: *mut H2Stream = find_stream(c, stream)
-    if s as u64 != 0 && !(*s).done {
-        var vp: u64 = 0
-        var vn: usize = 0
-        if !(*s).got_headers {
-            var code: i32 = 0
-            if hpack.hdr_find(decoded.ptr, decoded.len, ":status", &vp, &vn) && vn == 3 {
-                code = ((rt.ld8(vp, 0) as i32) - 48) * 100 + ((rt.ld8(vp, 1) as i32) - 48) * 10 + ((rt.ld8(vp, 2) as i32) - 48)
-            }
-            if code >= 100 && code < 200 {
-                rt.buf_free(&decoded)
-                return true
-            }
-            (*s).status = code
-            (*s).got_headers = true
-            rt.buf_push_bytes(&(*s).hdrs, decoded.ptr, decoded.len)
-        }
-        if end_stream { finish_stream(s) }
-    }
-    rt.buf_free(&decoded)
-    return true
-}
-
-fn on_headers(c: *mut H2, stream: u32, flags: u8, p: u64, n: usize) -> bool {
-    if stream == 0 { return fail_conn(c, fr.E_PROTOCOL) }
-    var off: usize = 0
-    var len: usize = 0
-    if !fr.strip_padding(p, n, flags, 5, &off, &len) { return fail_conn(c, fr.E_PROTOCOL) }
-    rt.buf_push_bytes(&(*c).hblock, p + off as u64, len)
-    (*c).hblock_stream = stream
-    (*c).hblock_end = (flags & fr.F_END_STREAM) != 0
-    if (flags & fr.F_END_HEADERS) != 0 { return on_header_block(c, stream, (*c).hblock_end) }
-    return true
-}
-
-fn on_data(c: *mut H2, stream: u32, flags: u8, p: u64, n: usize) -> bool {
-    if stream == 0 { return fail_conn(c, fr.E_PROTOCOL) }
-    var off: usize = 0
-    var len: usize = 0
-    if !fr.strip_padding(p, n, flags, 0, &off, &len) { return fail_conn(c, fr.E_PROTOCOL) }
-    if n as i64 > (*c).recv_win { return fail_conn(c, fr.E_FLOW_CONTROL) }
-    (*c).recv_win = (*c).recv_win - n as i64
-    let s: *mut H2Stream = find_stream(c, stream)
-    if s as u64 != 0 && !(*s).done {
-        if n as i64 > (*s).recv_win { return fail_conn(c, fr.E_FLOW_CONTROL) }
-        (*s).recv_win = (*s).recv_win - n as i64
-        if (*s).body.len + len > MAX_BODY {
-            (*s).err = fr.E_CANCEL
-            finish_stream(s)
-        } else {
-            rt.buf_push_bytes(&(*s).body, p + off as u64, len)
-            if (flags & fr.F_END_STREAM) != 0 { finish_stream(s) }
-        }
-        if !(*s).done && (*s).recv_win < RECV_WINDOW / 2 {
-            send_window_update(c, stream, RECV_WINDOW - (*s).recv_win)
-            (*s).recv_win = RECV_WINDOW
-        }
-    }
-    if (*c).recv_win < RECV_WINDOW / 2 {
-        send_window_update(c, 0, RECV_WINDOW - (*c).recv_win)
-        (*c).recv_win = RECV_WINDOW
-    }
-    return true
-}
-
-fn on_window_update(c: *mut H2, stream: u32, p: u64, n: usize) -> bool {
-    if n != 4 { return fail_conn(c, fr.E_FRAME_SIZE) }
-    let inc: i64 = (fr.be32(p, 0) & 2147483647) as i64
-    if inc == 0 { return fail_conn(c, fr.E_PROTOCOL) }
-    if stream == 0 {
-        (*c).send_win = (*c).send_win + inc
-        if (*c).send_win > fr.MAX_WINDOW { return fail_conn(c, fr.E_FLOW_CONTROL) }
-        return true
-    }
-    let s: *mut H2Stream = find_stream(c, stream)
-    if s as u64 != 0 {
-        (*s).send_win = (*s).send_win + inc
-        if (*s).send_win > fr.MAX_WINDOW {
-            (*s).err = fr.E_FLOW_CONTROL
-            finish_stream(s)
-        }
-    }
-    return true
-}
-
-fn on_goaway(c: *mut H2, p: u64, n: usize) -> bool {
-    if n < 8 { return fail_conn(c, fr.E_FRAME_SIZE) }
-    let last: u32 = fr.be32(p, 0) & 2147483647
-    (*c).goaway_code = fr.be32(p, 4)
-    var i: usize = 0
-    while i < MAX_STREAMS {
-        if (*c).streams[i].live && (*c).streams[i].id > last && !(*c).streams[i].done {
-            (*c).streams[i].err = (*c).goaway_code + 1000
-            (*c).streams[i].done = true
-        }
-        i = i + 1
-    }
-    (*c).open = false
-    return true
-}
-
-fn dispatch(c: *mut H2, ftype: u8, flags: u8, stream: u32, p: u64, n: usize) -> bool {
-    if (*c).hblock.len > 0 && ftype != fr.T_CONTINUATION { return fail_conn(c, fr.E_PROTOCOL) }
-    if ftype == fr.T_DATA { return on_data(c, stream, flags, p, n) }
-    if ftype == fr.T_HEADERS { return on_headers(c, stream, flags, p, n) }
-    if ftype == fr.T_CONTINUATION {
-        if (*c).hblock.len == 0 || stream != (*c).hblock_stream { return fail_conn(c, fr.E_PROTOCOL) }
-        rt.buf_push_bytes(&(*c).hblock, p, n)
-        if (flags & fr.F_END_HEADERS) != 0 { return on_header_block(c, stream, (*c).hblock_end) }
-        return true
-    }
-    if ftype == fr.T_SETTINGS {
-        if stream != 0 { return fail_conn(c, fr.E_PROTOCOL) }
-        if (flags & fr.F_ACK) != 0 { return n == 0 || fail_conn(c, fr.E_FRAME_SIZE) }
-        if n % 6 != 0 { return fail_conn(c, fr.E_FRAME_SIZE) }
-        return apply_settings(c, p, n)
-    }
-    if ftype == fr.T_PING {
-        if stream != 0 { return fail_conn(c, fr.E_PROTOCOL) }
-        if n != 8 { return fail_conn(c, fr.E_FRAME_SIZE) }
-        if (flags & fr.F_ACK) != 0 {
-            (*c).ping_acked = true
-        } else {
-            fr.put_frame(&(*c).out, fr.T_PING, fr.F_ACK, 0, p, 8)
-        }
-        return true
-    }
-    if ftype == fr.T_RST_STREAM {
-        if n != 4 || stream == 0 { return fail_conn(c, fr.E_FRAME_SIZE) }
-        let s: *mut H2Stream = find_stream(c, stream)
-        if s as u64 != 0 {
-            (*s).err = fr.be32(p, 0) + 1
-            finish_stream(s)
-        }
-        return true
-    }
-    if ftype == fr.T_WINDOW_UPDATE { return on_window_update(c, stream, p, n) }
-    if ftype == fr.T_GOAWAY { return on_goaway(c, p, n) }
-    if ftype == fr.T_PUSH_PROMISE { return fail_conn(c, fr.E_PROTOCOL) }
-    if ftype == fr.T_PRIORITY { return n == 5 || fail_conn(c, fr.E_FRAME_SIZE) }
-    return true
-}
-
-fn pump(c: *mut H2) -> bool {
-    if !(*c).open { return false }
-    if !need(c, fr.FRAME_HEADER_LEN) {
-        (*c).open = false
-        return false
-    }
-    let base: u64 = (*c).inb.ptr + (*c).inpos as u64
-    var len: usize = 0
-    var ftype: u8 = 0
-    var flags: u8 = 0
-    var stream: u32 = 0
-    fr.read_frame_header(base, fr.FRAME_HEADER_LEN, &len, &ftype, &flags, &stream)
-    if len > fr.DEFAULT_FRAME_SIZE { return fail_conn(c, fr.E_FRAME_SIZE) }
-    if !need(c, fr.FRAME_HEADER_LEN + len) {
-        (*c).open = false
-        return false
-    }
-    let pl: u64 = (*c).inb.ptr + (*c).inpos as u64 + fr.FRAME_HEADER_LEN as u64
-    let ok: bool = dispatch(c, ftype, flags, stream, pl, len)
-    (*c).inpos = (*c).inpos + fr.FRAME_HEADER_LEN + len
-    if !ok { return false }
-    return flush_out(c)
-}
-
-fn start(c: *mut H2) -> bool {
-    fr.put_preface(&(*c).out)
-    fr.put_frame_header(&(*c).out, 18, fr.T_SETTINGS, 0, 0)
-    fr.put_setting(&(*c).out, fr.S_ENABLE_PUSH, 0)
-    fr.put_setting(&(*c).out, fr.S_INITIAL_WINDOW_SIZE, RECV_WINDOW as u32)
-    fr.put_setting(&(*c).out, fr.S_MAX_CONCURRENT_STREAMS, 100)
-    send_window_update(c, 0, RECV_WINDOW - fr.DEFAULT_WINDOW)
-    (*c).open = true
-    return flush_out(c)
-}
-
-fn h2_connect_plain(c: *mut H2, addr: u32, port: u16) -> bool {
-    var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) { return false }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
-    return start(c)
-}
-
-fn h2_connect_tls(c: *mut H2, addr: u32, port: u16, host: str, roots: u64, rn: usize, now: u64) -> bool {
-    var err: i64 = 0
-    (*c).conn = net.connect_tcp_err(addr, port, &err) catch net.conn_from_fd(0 - 1)
-    if !net.conn_is_open(&(*c).conn) { return false }
-    let nd: bool = net.set_no_delay(&(*c).conn, true) catch false
-    x509.store_load_pem(&(*c).store, roots, rn)
-    if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) { return false }
-    tls.tls_offer_h2(&(*c).t, true)
-    (*c).secure = true
-    let ok: bool = tls.tls_handshake(&(*c).t) catch false
-    if !ok { return false }
-    if !tls.tls_alpn_is_h2(&(*c).t) { return false }
-    return start(c)
-}
-
-fn h2_ping(c: *mut H2) -> bool {
-    var data: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
-    (*c).ping_acked = false
-    fr.put_frame(&(*c).out, fr.T_PING, 0, 0, (&data[0]) as u64, 8)
-    if !flush_out(c) { return false }
-    while !(*c).ping_acked {
-        if !pump(c) { return false }
-    }
-    return true
-}
-
-fn h2_close(c: *mut H2) {
-    if (*c).open { fail_conn(c, fr.E_NO_ERROR) }
-}
+fn h2_new() -> H2 { return hc.h2_new() }
+fn h2_free(c: *mut H2) { hc.h2_free(c) }
+fn h2_is_open(c: *mut H2) -> bool { return hc.h2_is_open(c) }
+fn h2_goaway_code(c: *mut H2) -> u32 { return hc.h2_goaway_code(c) }
 
 fn free_slot(c: *mut H2) -> *mut H2Stream {
     var i: usize = 0
-    while i < MAX_STREAMS {
+    while i < hc.MAX_STREAMS {
         if !(*c).streams[i].live { return &(*c).streams[i] }
         i = i + 1
     }
@@ -484,7 +88,7 @@ fn send_header_block(c: *mut H2, id: u32, blk: *mut rt.Buf, end_stream: bool) ->
         pos = pos + n
         first = false
     }
-    return flush_out(c)
+    return hc.flush_out(c)
 }
 
 fn send_body(c: *mut H2, s: *mut H2Stream, p: u64, n: usize) -> bool {
@@ -493,7 +97,7 @@ fn send_body(c: *mut H2, s: *mut H2Stream, p: u64, n: usize) -> bool {
         var room: i64 = (*c).send_win
         if (*s).send_win < room { room = (*s).send_win }
         if room <= 0 {
-            if !pump(c) || (*s).done { return false }
+            if !hc.pump(c) || (*s).done { return false }
         } else {
             var k: usize = n - pos
             if k > (*c).peer_frame { k = (*c).peer_frame }
@@ -504,7 +108,7 @@ fn send_body(c: *mut H2, s: *mut H2Stream, p: u64, n: usize) -> bool {
             (*c).send_win = (*c).send_win - k as i64
             (*s).send_win = (*s).send_win - k as i64
             pos = pos + k
-            if !flush_out(c) { return false }
+            if !hc.flush_out(c) { return false }
         }
     }
     return true
@@ -515,7 +119,7 @@ fn h2_request(c: *mut H2, method: str, scheme: str, authority: str, path: str, e
     if !(*c).open { return 0 - 1 }
     var s: *mut H2Stream = free_slot(c)
     while s as u64 == 0 {
-        if !pump(c) { return 0 - 1 }
+        if !hc.pump(c) { return 0 - 1 }
         s = free_slot(c)
     }
     (*s).id = (*c).next_id
@@ -526,7 +130,7 @@ fn h2_request(c: *mut H2, method: str, scheme: str, authority: str, path: str, e
     (*s).status = 0
     (*s).err = 0
     (*s).send_win = (*c).peer_init_win
-    (*s).recv_win = RECV_WINDOW
+    (*s).recv_win = hc.RECV_WINDOW
     rt.buf_clear(&(*s).hdrs)
     rt.buf_clear(&(*s).body)
     var blk: rt.Buf = rt.buf_new()
@@ -551,45 +155,83 @@ fn h2_request(c: *mut H2, method: str, scheme: str, authority: str, path: str, e
 }
 
 fn h2_wait(c: *mut H2, id: u32) -> bool {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return false }
     while !(*s).done {
-        if !pump(c) && !(*s).done { return false }
+        if !hc.pump(c) && !(*s).done { return false }
     }
     return (*s).err == 0
 }
 
 fn h2_status(c: *mut H2, id: u32) -> i32 {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return 0 }
     return (*s).status
 }
 
 fn h2_error_code(c: *mut H2, id: u32) -> u32 {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return 0 }
     return (*s).err
 }
 
 fn h2_headers(c: *mut H2, id: u32) -> *mut rt.Buf {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return 0 as *mut rt.Buf }
     return &(*s).hdrs
 }
 
 fn h2_body(c: *mut H2, id: u32) -> *mut rt.Buf {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return 0 as *mut rt.Buf }
     return &(*s).body
 }
 
 fn h2_release(c: *mut H2, id: u32) {
-    let s: *mut H2Stream = find_stream(c, id)
+    let s: *mut H2Stream = hc.find_stream(c, id)
     if s as u64 == 0 { return }
     if !(*s).done {
         fr.put_frame_header(&(*c).out, 4, fr.T_RST_STREAM, 0, id)
         fr.put_u32(&(*c).out, fr.E_CANCEL)
-        flush_out(c)
+        hc.flush_out(c)
     }
     (*s).live = false
+}
+
+fn start(c: *mut H2) -> bool {
+    fr.put_preface(&(*c).out)
+    fr.put_frame_header(&(*c).out, 18, fr.T_SETTINGS, 0, 0)
+    fr.put_setting(&(*c).out, fr.S_ENABLE_PUSH, 0)
+    fr.put_setting(&(*c).out, fr.S_INITIAL_WINDOW_SIZE, hc.RECV_WINDOW as u32)
+    fr.put_setting(&(*c).out, fr.S_MAX_CONCURRENT_STREAMS, 100)
+    hc.send_window_update(c, 0, hc.RECV_WINDOW - fr.DEFAULT_WINDOW)
+    (*c).open = true
+    return hc.flush_out(c)
+}
+
+fn h2_connect_plain(c: *mut H2, addr: u32, port: u16) -> bool {
+    if !tr.tp_connect(&(*c).tp, addr, port) { return false }
+    return start(c)
+}
+
+fn h2_connect_tls(c: *mut H2, addr: u32, port: u16, host: str, roots: u64, rn: usize, now: u64) -> bool {
+    if !tr.tp_connect(&(*c).tp, addr, port) { return false }
+    if tr.tp_start_tls(&(*c).tp, host, roots, rn, now, true) != tr.TP_TLS_OK { return false }
+    if !tls.tls_alpn_is_h2(&(*c).tp.t) { return false }
+    return start(c)
+}
+
+fn h2_ping(c: *mut H2) -> bool {
+    var data: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    (*c).ping_acked = false
+    fr.put_frame(&(*c).out, fr.T_PING, 0, 0, (&data[0]) as u64, 8)
+    if !hc.flush_out(c) { return false }
+    while !(*c).ping_acked {
+        if !hc.pump(c) { return false }
+    }
+    return true
+}
+
+fn h2_close(c: *mut H2) {
+    if (*c).open { hc.fail_conn(c, fr.E_NO_ERROR) }
 }
