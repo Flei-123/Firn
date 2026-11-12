@@ -1344,6 +1344,30 @@ fn emit_epilogue(e: &mut Emitter, fr: &Frame, interrupt: bool) {
     e.line("ret");
 }
 
+const MEM_COPY_BLOCK_BYTES: u64 = 32;
+
+fn emit_mem_copy_blocks(e: &mut Emitter, esz: u8) {
+    let elems = MEM_COPY_BLOCK_BYTES / esz as u64;
+    let block = uniq(e, "mc_block");
+    let rest = uniq(e, "mc_rest");
+    let scalar = uniq(e, "mc_scalar");
+    e.line(&format!("sub {}, {}, {}", T1, A, B));
+    e.line(&format!("cmp {}, #{}", T1, MEM_COPY_BLOCK_BYTES));
+    e.line(&format!("b.lo {}", scalar));
+    e.line(&format!("subs {}, {}, #{}", C, C, elems));
+    e.line(&format!("b.lo {}", rest));
+    e.raw(&format!("{}:", block));
+    e.line(&format!("ldr q16, [{}], #16", B));
+    e.line(&format!("ldr q17, [{}], #16", B));
+    e.line(&format!("str q16, [{}], #16", A));
+    e.line(&format!("str q17, [{}], #16", A));
+    e.line(&format!("subs {}, {}, #{}", C, C, elems));
+    e.line(&format!("b.hs {}", block));
+    e.raw(&format!("{}:", rest));
+    e.line(&format!("add {}, {}, #{}", C, C, elems));
+    e.raw(&format!("{}:", scalar));
+}
+
 fn emit_mem_copy(e: &mut Emitter, esz: u8) {
     let done = uniq(e, "mc_done");
     let wide = uniq(e, "mc_wide");
@@ -1354,6 +1378,7 @@ fn emit_mem_copy(e: &mut Emitter, esz: u8) {
         4 => ("ldr", "str", w(T1), w(T2)),
         _ => ("ldr", "str", T1.to_string(), T2.to_string()),
     };
+    emit_mem_copy_blocks(e, esz);
     e.line(&format!("subs {}, {}, #4", C, C));
     e.line(&format!("b.lo {}", tail));
     e.raw(&format!("{}:", wide));
