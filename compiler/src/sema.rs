@@ -2461,6 +2461,17 @@ constants declared before it, and '+ - * /'"
                     );
                     return Type::Error;
                 }
+                if crate::gc::is_gc_ptr(&src) && dst.is_concrete_int() {
+                    self.dg.error(
+                        e.span,
+                        format!(
+                            "conversion from {} to {} is not allowed: an integer is not a collector root, cast to a raw pointer first ('as *mut u8') to hold the address on purpose",
+                            self.tcx.name_of(&src),
+                            self.tcx.name_of(&dst)
+                        ),
+                    );
+                    return Type::Error;
+                }
                 let ok = cast_kind(&src) && cast_kind(&dst);
                 if !ok {
                     self.dg.error(

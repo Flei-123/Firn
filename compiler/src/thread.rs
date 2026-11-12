@@ -345,6 +345,9 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("test rax, rax");
     e.line("jnz 1f");
     // ---- child: own stack, `rbp` fresh, fetch the argument back ---------
+    if crate::stackguard::enabled() {
+        crate::stackguard::emit_thread_alt_stack(e);
+    }
     e.line("mov rdi, qword ptr [rsp]");
     e.line("add rsp, 16");
     e.line("xor ebp, ebp");

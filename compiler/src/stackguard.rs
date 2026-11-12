@@ -40,6 +40,19 @@ pub(crate) const START: &[&str] = &[
     "add rsp, 64",
 ];
 
+pub(crate) const THREAD_ALT: &[&str] = &[
+    "lea rax, [rsi+16]",
+    "sub rsp, 32",
+    "mov qword ptr [rsp], rax",
+    "mov qword ptr [rsp+8], 0",
+    "mov qword ptr [rsp+16], 32768",
+    "mov eax, 131",
+    "mov rdi, rsp",
+    "xor esi, esi",
+    "syscall",
+    "add rsp, 32",
+];
+
 pub(crate) const TAIL: &[&str] = &[
     ".L__firn_segv:",
     "mov rax, qword ptr [rsi+16]",
@@ -98,5 +111,11 @@ pub(crate) fn emit_tail(e: &mut crate::codegen_x86::Emitter) {
         } else {
             e.line(l);
         }
+    }
+}
+
+pub(crate) fn emit_thread_alt_stack(e: &mut crate::codegen_x86::Emitter) {
+    for l in THREAD_ALT {
+        e.line(l);
     }
 }
