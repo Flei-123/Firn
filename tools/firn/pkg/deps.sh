@@ -70,7 +70,8 @@ dep_pin() {
 }
 
 cmd_add() {
-    [ $# -ge 2 ] || die "usage: firn add NAME PATH|GITURL [REF]"
+    [ $# -ge 1 ] || die "usage: firn add NAME[@REQ] | NAME PATH|GITURL [REF]"
+    [ $# -ge 2 ] || { cmd_add_registry "$1"; return; }
     local name=$1 src=$2 ref=${3:-} path ver
     [ -f firn.package ] || die "no ./firn.package here (run inside a project; firn new NAME)"
     case $name in [A-Za-z_]*) ;; *) die "dependency name must start with a letter or _" ;; esac
@@ -92,6 +93,20 @@ cmd_add() {
     return 0
 }
 
+cmd_add_registry() {
+    local name=${1%%@*} req=*
+    case $1 in *@*) req=${1#*@} ;; esac
+    [ -f firn.package ] || die "no ./firn.package here (run inside a project; firn new NAME)"
+    case $name in [A-Za-z_]*) ;; *) die "dependency name must start with a letter or _" ;; esac
+    grep -q "^needs[[:space:]]\{1,\}$name[[:space:]]" firn.package && die "'$name' is already a dependency (edit firn.package to change it)"
+    registry_pin "$name" "$req"
+    grep -qx '/.firn/' .gitignore 2>/dev/null || printf '/.firn/\n' >> .gitignore
+    printf 'needs    %s %s %s\n' "$name" "$DEPS_DIR/$name" "$REGISTRY_VERSION" >> firn.package
+    echo "added needs $name $REGISTRY_VERSION from registry (requirement $req)"
+    [ -f "$DEPS_DIR/$name/$DEPS_FILE" ] && cmd_fetch --quiet
+    return 0
+}
+
 cmd_remove() {
     [ $# -eq 1 ] || die "usage: firn remove NAME"
     local name=$1 tmp=firn.package.tmp.$$
@@ -109,7 +124,7 @@ cmd_update() {
     [ -z "$only" ] || [ -n "$(deps_row "$only")" ] || die "'$only' is not a git dependency"
     while read -r name url ref rev hash; do
         [ -n "$only" ] && [ "$only" != "$name" ] && continue
-        dep_pin "$name" "$url" "$ref"
+        case $ref in @*) registry_pin "$name" "${ref#@}" ;; *) dep_pin "$name" "$url" "$ref" ;; esac
         if [ "$PINNED_REV" = "$rev" ]; then echo "unchanged $name ${rev:0:12}"
         else echo "updated   $name ${rev:0:12} -> ${PINNED_REV:0:12}"; fi
     done < <(deps_rows)

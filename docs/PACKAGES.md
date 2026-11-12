@@ -1,6 +1,6 @@
 # Packages: manifest, dependencies, pins, lock
 
-One flow for Firn projects, built from three parts. The manifest format and the compiler side already existed (`docs/ROUND48.md`, `docs/ROUND93.md`); `tools/firn/firn` adds fetching and pinning of git dependencies on top. No registry yet.
+One flow for Firn projects, built from three parts. The manifest format and the compiler side already existed (`docs/ROUND48.md`, `docs/ROUND93.md`); `tools/firn/firn` adds fetching and pinning of git dependencies on top. Registry: an index file (below), no hosting.
 
 | file | written by | says |
 |---|---|---|
@@ -76,4 +76,29 @@ firn test                                                          # passed 1, f
 
 ## Not there yet
 
-Registry/index and semver ranges, publishing, docs generator, LSP, vendoring, patch overrides. See the ecosystem items in the roadmap.
+Docs generator, vendoring, patch overrides, authenticated/remote publishing. See the ecosystem items in the roadmap.
+
+## Registry index and SemVer requirements
+
+`FIRN_REGISTRY` points to one text file (a path, `file://` or `http(s)://` URL; an HTTP index is cached in `$FIRN_PKG_CACHE/registry.index` for `FIRN_OFFLINE=1`). One line per release, sorted by name:
+
+```
+NAME VERSION GITURL COMMIT TREE-SHA256 [yanked]
+```
+
+The index only points at git commits; nothing is hosted. The tree hash is the same one `firn.deps` uses, so `firn add` refuses a checkout that differs from what the publisher indexed (`checksum mismatch for NAME VERSION`).
+
+```
+firn search TEXT                  # names containing TEXT, latest version, release count
+firn add geo@^1.2                 # highest non-yanked release matching the requirement
+firn add geo                      # same as geo@*
+firn publish [DIR]                # clean git package -> index line (appended when FIRN_REGISTRY is a local file; a duplicate version is refused)
+firn yank geo 2.0.0               # resolution skips it; existing pins keep working
+firn update geo                   # re-resolves the stored requirement (firn.deps keeps `@^1.2` in the REF column)
+```
+
+Requirements follow Cargo: `1.2.3` and `^1.2.3` (caret; `^0.2.3` = `<0.3.0`, `^0.0.3` = `<0.0.4`), `~1.2` (`<1.3.0`), `=1.2.3`, `>=1.2, <2` (comma or space), `1.*`, `*`. A pre-release is only chosen when the requirement names a pre-release of the same `x.y.z`. Precedence follows semver.org (`tools/firn/pkg/semver.py`, 59 checks in `test_semver.py`).
+
+The compiler still resolves diamonds as described above (highest wins, same first number). The registry picks the version once, at `firn add` / `firn update`; the result is an ordinary pinned git dependency in `firn.deps`, and `firn.lock` stays as it is.
+
+Tests: `bash tools/firn/test_registry.sh` (23 checks: resolve, yank, tampered hash, build against the pinned version, offline).

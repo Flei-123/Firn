@@ -68,7 +68,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/pool.fi` | IO worker pool; `chan/` channels; `async/` event loop
 
 ## Toolchain and quality
-- `tools/firn/firn` (new/add/fetch/update/build; docs/PACKAGES.md), `lib/toolchain/` (installer), `tools/pin/` (PIN-POLICY.md)
+- `tools/firn/firn` (new/add/fetch/update/build/search/publish/yank, SemVer registry index; docs/PACKAGES.md), `lib/toolchain/` (installer), `tools/pin/` (PIN-POLICY.md)
 - Test: `firnc --test`, `lib/test/runner.fi`, `tools/testrunner/`; gate `bash test.sh --stage N` (tools/teststages/README.md)
 - Coverage `tools/coverage/firncov` (docs/COVERAGE.md); lint `tools/lint/run.sh`; format `tools/fmt/premerge.sh`; LSP `firnc --lsp` (tools/lsp); debugger docs/DEBUGGER.md, VS Code debug adapter `tools/dap/dap_server.py` (`bash tools/dap/run.sh`)
 - Language: `docs/FIR.md`, interfaces `docs/ROUND46.md`, tuples `docs/TUPLES.md`, aliases `docs/TYPE_ALIASES.md`, errors `docs/ERROR_UNIONS.md`, closures `docs/CLOSURES.md`
