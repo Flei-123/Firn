@@ -873,6 +873,297 @@ fn read_seq_table(mode: u32, t: *mut FseTab, kind: usize, maxsym: usize, maxlog:
     return used
 }
 
+const SEQ_DONE: u32 = 0
+const SEQ_READ: u32 = 1
+const SEQ_UPDATE: u32 = 2
+const SEQ_DICT: u32 = 3
+const SEQ_ERR_DATA: u32 = 4
+const SEQ_ERR_ROOM: u32 = 5
+
+struct SeqState {
+    i: usize,
+    op: usize,
+    litpos: usize,
+    bpos: usize,
+    ll: usize,
+    of: usize,
+    ml: usize,
+    rep1: u64,
+    rep2: u64,
+    rep3: u64,
+    pend: bool,
+    pov: u64,
+    pml: usize,
+    pll: usize,
+    poff: u64,
+    pcur: u64,
+}
+
+#[no_inline]
+fn seq_read_slow(br: *mut BitR, st: *mut SeqState, ofc: usize, mlc: usize, llc: usize) {
+    (*br).pos = (*st).bpos
+    (*st).pov = ((1 as u64) << (ofc as u64)) + br_get(br, ofc)
+    (*st).pml = (ML_BASE[mlc] as usize) + (br_get(br, ML_BITS[mlc] as usize) as usize)
+    (*st).pll = (LL_BASE[llc] as usize) + (br_get(br, LL_BITS[llc] as usize) as usize)
+    (*st).bpos = (*br).pos
+    (*st).pend = true
+}
+
+#[no_inline]
+fn seq_update_slow(d: *mut ZstdDec, br: *mut BitR, st: *mut SeqState) {
+    (*br).pos = (*st).bpos
+    (*st).ll = ((*d).ll.base[(*st).ll] as usize) + (br_get(br, (*d).ll.nb[(*st).ll] as usize) as usize)
+    (*st).ml = ((*d).ml.base[(*st).ml] as usize) + (br_get(br, (*d).ml.nb[(*st).ml] as usize) as usize)
+    (*st).of = ((*d).of.base[(*st).of] as usize) + (br_get(br, (*d).of.nb[(*st).of] as usize) as usize)
+    (*st).bpos = (*br).pos
+}
+
+#[no_inline]
+fn seq_copy_from_dict(d: *mut ZstdDec, dst: u64, st: *mut SeqState) -> bool {
+    let need: u64 = (*st).poff - (*st).pcur
+    let dictn: usize = (*d).dict_clen
+    if need > (dictn as u64) {
+        return false
+    }
+    let op: usize = (*st).op
+    let ml: usize = (*st).pml
+    let o: usize = (*st).poff as usize
+    var dp: usize = dictn - (need as usize)
+    var k: usize = 0
+    while k < ml && dp < dictn {
+        rt.st8(dst, op + k, rt.ld8((*d).dict_content, dp))
+        dp = dp + 1
+        k = k + 1
+    }
+    while k < ml {
+        rt.st8(dst, op + k, rt.ld8(dst, op + k - o))
+        k = k + 1
+    }
+    return true
+}
+
+#[no_inline]
+fn seq_fast(d: *mut ZstdDec, dst: u64, blk0: usize, room: usize, nseq: usize, bp0: u64, bspan: usize,
+    st: *mut SeqState) -> u32 {
+    let cur_base: u64 = (*d).ftotal -% (blk0 as u64) -% dst
+    let lits: u64 = (*d).litp
+    let litend: u64 = lits + ((*d).litn as u64)
+    let dend: u64 = dst + ((room + blk0) as u64)
+    let wsize: u64 = (*d).wsize
+    var left: usize = nseq - (*st).i
+    var dp: u64 = dst + ((*st).op as u64)
+    var lp: u64 = lits + ((*st).litpos as u64)
+    var bpos: usize = (*st).bpos
+    var lls: usize = (*st).ll
+    var ofs: usize = (*st).of
+    var mls: usize = (*st).ml
+    var rep1: u64 = (*st).rep1
+    var rep2: u64 = (*st).rep2
+    var rep3: u64 = (*st).rep3
+    var pending: bool = (*st).pend
+    (*st).pend = false
+    var status: u32 = SEQ_DONE
+    while left > 0 {
+        let llc: usize = (*d).ll.sym[lls] as usize
+        let ofc: usize = (*d).of.sym[ofs] as usize
+        let mlc: usize = (*d).ml.sym[mls] as usize
+        var fast: bool = (bpos -% SEQ_FAST_BITS) < bspan
+        var ov: u64 = 0
+        var ml: usize = 0
+        var ll: usize = 0
+        if pending {
+            ov = (*st).pov
+            ml = (*st).pml
+            ll = (*st).pll
+            pending = false
+            fast = (bpos -% SEQ_FAST_BITS) < bspan
+        } else if fast {
+            let mb: usize = ML_BITS[mlc] as usize
+            let lb: usize = LL_BITS[llc] as usize
+            let q0: usize = bpos - ofc
+            let q1: usize = q0 - mb
+            let q2: usize = q1 - lb
+            ov = ((1 as u64) << (ofc as u64)) + bits_at(bp0, q0, ofc)
+            ml = (ML_BASE[mlc] as usize) + (bits_at(bp0, q1, mb) as usize)
+            ll = (LL_BASE[llc] as usize) + (bits_at(bp0, q2, lb) as usize)
+            bpos = q2
+        } else {
+            status = SEQ_READ
+            break
+        }
+        var off: u64 = 0
+        if ov > 3 {
+            off = ov - 3
+            rep3 = rep2
+            rep2 = rep1
+            rep1 = off
+        } else {
+            var idx: u64 = ov
+            if ll == 0 {
+                idx = idx + 1
+            }
+            if idx == 1 {
+                off = rep1
+            } else if idx == 2 {
+                off = rep2
+                rep2 = rep1
+                rep1 = off
+            } else if idx == 3 {
+                off = rep3
+                rep3 = rep2
+                rep2 = rep1
+                rep1 = off
+            } else {
+                off = rep1 - 1
+                if off == 0 {
+                    status = SEQ_ERR_DATA
+                    break
+                }
+                rep3 = rep2
+                rep2 = rep1
+                rep1 = off
+            }
+        }
+        let rem: usize = (litend - lp) as usize
+        if ll > rem {
+            status = SEQ_ERR_DATA
+            break
+        }
+        if ll + ml > ((dend - dp) as usize) {
+            status = SEQ_ERR_ROOM
+            break
+        }
+        if ll <= 16 && rem >= 16 {
+            common.st64le(dp, 0, common.ld64le(lp, 0))
+            common.st64le(dp, 8, common.ld64le(lp, 8))
+        } else if rem >= ll + 8 {
+            var k: usize = 0
+            while k < ll {
+                common.st64le(dp, k, common.ld64le(lp, k))
+                k = k + 8
+            }
+        } else {
+            var k: usize = 0
+            while k < ll {
+                rt.st8(dp, k, rt.ld8(lp, k))
+                k = k + 1
+            }
+        }
+        lp = lp + (ll as u64)
+        dp = dp + (ll as u64)
+        let cur: u64 = cur_base +% dp
+        if off > wsize {
+            status = SEQ_ERR_DATA
+            break
+        }
+        if off > cur {
+            (*st).pml = ml
+            (*st).poff = off
+            (*st).pcur = cur
+            status = SEQ_DICT
+            break
+        }
+        let src: u64 = dp - off
+        if off >= 8 {
+            var k: usize = 0
+            while k < ml {
+                common.st64le(dp, k, common.ld64le(src, k))
+                k = k + 8
+            }
+        } else {
+            var k: usize = 0
+            while k < ml {
+                rt.st8(dp, k, rt.ld8(src, k))
+                k = k + 1
+            }
+        }
+        dp = dp + (ml as u64)
+        left = left - 1
+        if left > 0 {
+            if fast {
+                let n0: usize = (*d).ll.nb[lls] as usize
+                let n1: usize = (*d).ml.nb[mls] as usize
+                let n2: usize = (*d).of.nb[ofs] as usize
+                let q0: usize = bpos - n0
+                let q1: usize = q0 - n1
+                let q2: usize = q1 - n2
+                lls = ((*d).ll.base[lls] as usize) + (bits_at(bp0, q0, n0) as usize)
+                mls = ((*d).ml.base[mls] as usize) + (bits_at(bp0, q1, n1) as usize)
+                ofs = ((*d).of.base[ofs] as usize) + (bits_at(bp0, q2, n2) as usize)
+                bpos = q2
+            } else {
+                status = SEQ_UPDATE
+                break
+            }
+        }
+    }
+    (*st).i = nseq - left
+    (*st).op = (dp - dst) as usize
+    (*st).litpos = (lp - lits) as usize
+    (*st).bpos = bpos
+    (*st).ll = lls
+    (*st).of = ofs
+    (*st).ml = mls
+    (*st).rep1 = rep1
+    (*st).rep2 = rep2
+    (*st).rep3 = rep3
+    return status
+}
+
+fn run_sequences(d: *mut ZstdDec, dst: u64, blk0: usize, room: usize, limited: bool, nseq: usize,
+    br: *mut BitR, st: *mut SeqState) -> CompressError!bool {
+    var bspan: usize = 0
+    if (*br).hi > SEQ_FAST_BITS {
+        bspan = (*br).hi - SEQ_FAST_BITS
+    }
+    while true {
+        let status: u32 = seq_fast(d, dst, blk0, room, nseq, (*br).p, bspan, st)
+        if status == SEQ_DONE {
+            break
+        }
+        if status == SEQ_ERR_ROOM {
+            if limited && room < (*d).bmax {
+                return CompressError::TooLarge
+            }
+            return CompressError::Data
+        }
+        if status == SEQ_ERR_DATA {
+            return CompressError::Data
+        }
+        if status == SEQ_READ {
+            seq_read_slow(br, st, (*d).of.sym[(*st).of] as usize, (*d).ml.sym[(*st).ml] as usize,
+                (*d).ll.sym[(*st).ll] as usize)
+            if (*br).over {
+                return CompressError::Data
+            }
+        } else if status == SEQ_UPDATE {
+            seq_update_slow(d, br, st)
+            if (*br).over {
+                return CompressError::Data
+            }
+        } else {
+            if !seq_copy_from_dict(d, dst, st) {
+                return CompressError::Data
+            }
+            (*st).op = (*st).op + (*st).pml
+            (*st).i = (*st).i + 1
+            if (*st).i < nseq {
+                seq_update_slow(d, br, st)
+                if (*br).over {
+                    return CompressError::Data
+                }
+            }
+        }
+    }
+    if (*st).bpos != 0 {
+        return CompressError::Data
+    }
+    (*d).rep1 = (*st).rep1
+    (*d).rep2 = (*st).rep2
+    (*d).rep3 = (*st).rep3
+    return true
+}
+
 // Decodes a compressed block of `bn` octets at `bp` and appends its output
 // to `out`. `room` is the most it may write (`limited`: that bound is the
 // caller's limit and not the block size).
@@ -905,8 +1196,8 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
         return CompressError::OutOfMemory
     }
     let dst: u64 = (*out).ptr
-    var op: usize = blk0
     if nseq == 0 {
+        let op: usize = blk0
         if (*d).litn > room {
             if limited {
                 return CompressError::TooLarge
@@ -938,178 +1229,19 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
     if !br_init(&br, bp + at as u64, bn - at) {
         return CompressError::Data
     }
-    var lls: usize = br_get(&br, (*d).ll.log as usize) as usize
-    var ofs: usize = br_get(&br, (*d).of.log as usize) as usize
-    var mls: usize = br_get(&br, (*d).ml.log as usize) as usize
+    let lls0: usize = br_get(&br, (*d).ll.log as usize) as usize
+    let ofs0: usize = br_get(&br, (*d).of.log as usize) as usize
+    let mls0: usize = br_get(&br, (*d).ml.log as usize) as usize
     if br.over {
         return CompressError::Data
     }
-    let cur0: u64 = (*d).ftotal
-    let wsize: u64 = (*d).wsize
+    var st: SeqState = SeqState { i: 0, op: blk0, litpos: 0, bpos: br.pos, ll: lls0, of: ofs0, ml: mls0,
+        rep1: (*d).rep1, rep2: (*d).rep2, rep3: (*d).rep3, pend: false, pov: 0, pml: 0, pll: 0, poff: 0, pcur: 0 }
+    try run_sequences(d, dst, blk0, room, limited, nseq, &br, &st)
+    var op: usize = st.op
+    let litpos: usize = st.litpos
     let lits: u64 = (*d).litp
     let litn: usize = (*d).litn
-    let dictp: u64 = (*d).dict_content
-    let dictn: usize = (*d).dict_clen
-    var litpos: usize = 0
-    var rep1: u64 = (*d).rep1
-    var rep2: u64 = (*d).rep2
-    var rep3: u64 = (*d).rep3
-    var bpos: usize = br.pos
-    var bspan: usize = 0
-    if br.hi > SEQ_FAST_BITS {
-        bspan = br.hi - SEQ_FAST_BITS
-    }
-    let bp0: u64 = br.p
-    var i: usize = 0
-    while i < nseq {
-        let llc: usize = (*d).ll.sym[lls] as usize
-        let ofc: usize = (*d).of.sym[ofs] as usize
-        let mlc: usize = (*d).ml.sym[mls] as usize
-        let fast: bool = (bpos -% SEQ_FAST_BITS) < bspan
-        var ov: u64 = 0
-        var ml: usize = 0
-        var ll: usize = 0
-        if fast {
-            let mb: usize = ML_BITS[mlc] as usize
-            let lb: usize = LL_BITS[llc] as usize
-            let q0: usize = bpos - ofc
-            let q1: usize = q0 - mb
-            let q2: usize = q1 - lb
-            ov = ((1 as u64) << (ofc as u64)) + bits_at(bp0, q0, ofc)
-            ml = (ML_BASE[mlc] as usize) + (bits_at(bp0, q1, mb) as usize)
-            ll = (LL_BASE[llc] as usize) + (bits_at(bp0, q2, lb) as usize)
-            bpos = q2
-        } else {
-            br.pos = bpos
-            ov = ((1 as u64) << (ofc as u64)) + br_get(&br, ofc)
-            ml = (ML_BASE[mlc] as usize) + (br_get(&br, ML_BITS[mlc] as usize) as usize)
-            ll = (LL_BASE[llc] as usize) + (br_get(&br, LL_BITS[llc] as usize) as usize)
-            if br.over {
-                return CompressError::Data
-            }
-            bpos = br.pos
-        }
-        var off: u64 = 0
-        if ov > 3 {
-            off = ov - 3
-            rep3 = rep2
-            rep2 = rep1
-            rep1 = off
-        } else {
-            var idx: u64 = ov
-            if ll == 0 {
-                idx = idx + 1
-            }
-            if idx == 1 {
-                off = rep1
-            } else if idx == 2 {
-                off = rep2
-                rep2 = rep1
-                rep1 = off
-            } else if idx == 3 {
-                off = rep3
-                rep3 = rep2
-                rep2 = rep1
-                rep1 = off
-            } else {
-                off = rep1 - 1
-                if off == 0 {
-                    return CompressError::Data
-                }
-                rep3 = rep2
-                rep2 = rep1
-                rep1 = off
-            }
-        }
-        // the literals
-        if ll > litn - litpos {
-            return CompressError::Data
-        }
-        if ll + ml > room - (op - blk0) {
-            if limited && (room < (*d).bmax) {
-                return CompressError::TooLarge
-            }
-            return CompressError::Data
-        }
-        if ll <= 16 && litn - litpos >= 16 {
-            // two word moves; the output has 32 octets of slack and 16 octets are readable
-            common.st64le(dst, op, common.ld64le(lits, litpos))
-            common.st64le(dst, op + 8, common.ld64le(lits, litpos + 8))
-        } else {
-            rt.mem_copy(dst + op as u64, lits + litpos as u64, ll)
-        }
-        litpos = litpos + ll
-        op = op + ll
-        // the match
-        let cur: u64 = cur0 + ((op - blk0) as u64)
-        if off > wsize {
-            return CompressError::Data
-        }
-        if off <= cur {
-            let o: usize = off as usize
-            if o >= 8 {
-                // word moves, one after the other (an overlap with the bytes just written
-                // is right); up to 7 octets past the end land in the slack
-                var k: usize = 0
-                while k < ml {
-                    common.st64le(dst, op + k, common.ld64le(dst, op - o + k))
-                    k = k + 8
-                }
-            } else {
-                var k: usize = 0
-                while k < ml {
-                    rt.st8(dst, op + k, rt.ld8(dst, op + k - o))
-                    k = k + 1
-                }
-            }
-        } else {
-            let need: u64 = off - cur
-            if need > (dictn as u64) {
-                return CompressError::Data
-            }
-            let o: usize = off as usize
-            var dp: usize = dictn - (need as usize)
-            var k: usize = 0
-            while k < ml && dp < dictn {
-                rt.st8(dst, op + k, rt.ld8(dictp, dp))
-                dp = dp + 1
-                k = k + 1
-            }
-            while k < ml {
-                rt.st8(dst, op + k, rt.ld8(dst, op + k - o))
-                k = k + 1
-            }
-        }
-        op = op + ml
-        i = i + 1
-        if i < nseq {
-            // update LL, ML, OF
-            if fast {
-                let n0: usize = (*d).ll.nb[lls] as usize
-                let n1: usize = (*d).ml.nb[mls] as usize
-                let n2: usize = (*d).of.nb[ofs] as usize
-                let q0: usize = bpos - n0
-                let q1: usize = q0 - n1
-                let q2: usize = q1 - n2
-                lls = ((*d).ll.base[lls] as usize) + (bits_at(bp0, q0, n0) as usize)
-                mls = ((*d).ml.base[mls] as usize) + (bits_at(bp0, q1, n1) as usize)
-                ofs = ((*d).of.base[ofs] as usize) + (bits_at(bp0, q2, n2) as usize)
-                bpos = q2
-            } else {
-                br.pos = bpos
-                lls = ((*d).ll.base[lls] as usize) + (br_get(&br, (*d).ll.nb[lls] as usize) as usize)
-                mls = ((*d).ml.base[mls] as usize) + (br_get(&br, (*d).ml.nb[mls] as usize) as usize)
-                ofs = ((*d).of.base[ofs] as usize) + (br_get(&br, (*d).of.nb[ofs] as usize) as usize)
-                if br.over {
-                    return CompressError::Data
-                }
-                bpos = br.pos
-            }
-        }
-    }
-    if bpos != 0 {
-        return CompressError::Data // the stream was not used to its last bit
-    }
     // the literals after the last sequence
     let tail: usize = litn - litpos
     if tail > room - (op - blk0) {
@@ -1120,9 +1252,6 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
     }
     rt.mem_copy(dst + op as u64, lits + litpos as u64, tail)
     op = op + tail
-    (*d).rep1 = rep1
-    (*d).rep2 = rep2
-    (*d).rep3 = rep3
     (*out).len = op
     return true
 }
