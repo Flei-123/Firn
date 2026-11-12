@@ -2591,6 +2591,9 @@ constants declared before it, and '+ - * /'"
     }
 
     fn unary(&mut self, e: &Expr, op: UnOp, inner: &Expr, hint: Option<&Type>) -> Type {
+        if let Some(t) = crate::operators::hook_unary(self, e, op, inner) {
+            return t;
+        }
         match op {
             UnOp::Neg => {
                 // ROUND 68: `f64` counts as well. SPEC §14.1.f64 named "the
@@ -2700,6 +2703,9 @@ constants declared before it, and '+ - * /'"
     fn binary(&mut self, e: &Expr, op: BinOp, l: &Expr, r: &Expr, hint: Option<&Type>) -> Type {
         // HOOK fehlerunionen: comparison of two error values (errors.rs)
         if let Some(t) = crate::errors::hook_binary(self, op, l, r, e.span) {
+            return t;
+        }
+        if let Some(t) = crate::operators::hook_binary(self, e, op, l, r) {
             return t;
         }
         // HOOK ptrarith: `p + n`, `p - n`, `p - q` on typed pointers (ptrarith.rs, round GAPS)
@@ -3292,6 +3298,8 @@ constants declared before it, and '+ - * /'"
                     Some(Type::Bool)
                 } else if matches!(op, BinOp::Shl | BinOp::Shr) {
                     left_probe
+                } else if let Some(t) = crate::operators::probe_binary(self, *op, &left_probe) {
+                    Some(t)
                 } else if let Some(lp) = left_probe.clone().filter(|t| t.is_ptr() && !crate::gc::is_gc_ptr(t)) {
                     // Round GAPS (ptrarith.rs): `p +/- n` is the pointer,
                     // `p - q` the distance in i64.

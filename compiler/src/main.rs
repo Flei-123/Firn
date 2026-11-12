@@ -21,6 +21,7 @@ mod fsqrt;
 mod fbits;
 mod fnaddr;
 mod constcheck;
+mod operators;
 mod ptrarith;
 mod wrapcast;
 mod include;

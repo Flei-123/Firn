@@ -503,6 +503,9 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_addr_inner(&mut self, e: &Expr) -> Option<Val> {
+        if let Some(call) = crate::operators::desugar(self, e) {
+            return self.lower_addr(&call);
+        }
         // HOOK fehlerunionen: `try`/`catch`/error value as aggregate (lower_errors.rs)
         if let Some(r) = crate::lower_errors::hook_addr(self, e) {
             return r;
@@ -686,6 +689,9 @@ impl<'a> Lower<'a> {
     }
 
     fn write_into_inner(&mut self, addr: Val, e: &Expr) -> Option<()> {
+        if let Some(call) = crate::operators::desugar(self, e) {
+            return self.write_into(addr, &call);
+        }
         // HOOK fehlerunionen: implicit conversion / `try` / `catch` (lower_errors.rs)
         if let Some(r) = crate::lower_errors::hook_write_into(self, addr, e) {
             return r;
@@ -872,6 +878,9 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_expr_inner(&mut self, e: &Expr) -> Option<Val> {
+        if let Some(call) = crate::operators::desugar(self, e) {
+            return self.lower_expr(&call);
+        }
         // HOOK fehlerunionen: scalar result of `try`/`catch` (lower_errors.rs)
         if let Some(r) = crate::lower_errors::hook_value(self, e) {
             return r;
@@ -1104,6 +1113,9 @@ impl<'a> Lower<'a> {
         use ast::BinOp as B;
         // HOOK fehlerunionen: comparison of two error values (lower_errors.rs)
         if let Some(r) = crate::lower_errors::hook_binary(self, op, a, b) {
+            return r;
+        }
+        if let Some(r) = crate::operators::lower_compare(self, e, op, a, b) {
             return r;
         }
         // HOOK ptrarith: arithmetic on typed pointers (ptrarith.rs, round GAPS)
