@@ -1,6 +1,6 @@
 # Firn memory safety -- what is guaranteed and what is not
 
-State: 08.11.2026, `firnc` at main `ea7180d43` + the null guard round (G21). Every claim below points to a test.
+State: 12.11.2026, `firnc` at main `abe6d3aef` (guarantees G1-G24 unchanged, effort review of the open N items below). Every claim below points to a test.
 Green tests: `tests/47xx_safety_*.fi`, `tests/neg/47xx_safety_*.fi` (4730-4746: r904/r905/r907, null guard 4733/4736-4739, constant zero divisor neg 4740/4741/4744, positive 4745, constant overflow neg 4746). Counts: 24 guarantees, 14 open non-guarantees, 32 green safety tests, 25 UB probes.
 Documented undefined behaviour (not green tests): `tools/safety/ub/*.fi`, recorded per build level in
 `tools/safety/expected.txt`, checked with `bash tools/safety/run.sh` (exit 1 on any difference). `test.sh` section 149 runs it (plus `tools/safety/pe.sh`), so a change of behaviour shows up in the suite.
@@ -91,6 +91,7 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 ## Tools that watch the front-end and the unchecked corners (08.11.2026)
 
 - `python3 -I tools/safety/fuzz_frontend.py --runs N --seed S [--keep DIR]`: mutates `tests/*.fi` (byte cut, line copy / swap, token insert, truncation) and compiles every mutant with firnc0 (`--emit=asm`) and firnc1. A signal, a timeout or a Rust `panicked at` is a **crash** (exit 1). Different accept / reject between the two compilers is counted as `disagree` (not a failure, only listed). `test.sh` section 149 runs 80 mutants.
+- Measured 12.11.2026 (seed 2, 1200 mutants, firnc0 and firnc1 both built from main `abe6d3aef`): 0 crashes, 0 accept / reject disagreements. The 3 disagreements of 08.11. came from a stale `.firnc1` (built before G22): always rebuild it (`bin/firnc1.fi`) before fuzzing.
 - `bash tools/safety/rawptr_audit.sh`: counts raw pointer casts and `(*p)` sites per `lib/*` directory. An approximate size of the N16 job (`unsafe { }` has to mark all of it first), not a proof.
 
 ## Segment rights (r898)
@@ -118,3 +119,18 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 - Add `unsafe { }` and enforce it for raw pointer dereference (N16); the whole library has to be marked first (`rawptr_audit.sh` measures the size).
 - Null guard on aarch64 and Windows (the SIGSEGV handler is x86-64 Linux only; same gap as N3).
 - Roots for `Gc[T]` stored in raw memory: documented only (N13).
+
+## Open items by effort (review 12.11.2026)
+
+Cheapest first. None of the remaining N items can be closed by a one-line compiler fix: each needs a language rule, a runtime mechanism or a whole-library migration.
+
+| order | items | what closing needs | size | why not done in a drive-by |
+|---|---|---|---|---|
+| 1 | N3 (threads, aarch64, Windows) | child sequence of `Op::ThreadSpawn` maps a 64 KiB alternate stack and calls `sigaltstack` (x86-64 first), munmap on exit; same text in `lib/firnc1/codegen.fi`; the aarch64 and Windows startups get their own handler | medium | changes the asm of every checked program that starts a thread: firnc0 and firnc1 must stay identical (fixpoint, `tests/diff`), plus a full cargo test run |
+| 2 | N13 | reject `Gc[T] as <int>` outside `lib/gc` and add an explicit opt-in cast for identity use (hashing, printing) | medium | breaks existing library code that uses the address as an identity; needs a migration of every use first |
+| 3 | N5, N6, N8, N9 | debug allocator mode: quarantine of freed blocks with `mprotect(PROT_NONE)`, generation tags on `Vec` / `Buf` views | medium to large | costs memory and speed, must be opt-in; the safe fix is ownership of `Vec` / `Buf` (item 4) |
+| 4 | N7, N11 | `Vec[T]` and `Buf` as move types with a checked `drop` | large | every library signature and ~all tests that copy a `Vec` change |
+| 5 | N10, N18 | exclusivity analysis across statements and through callees (SPEC 1560, ROADMAP r193) | large | a borrow checker; "where the analysis cannot decide, it allows" (N19) stays until then |
+| 6 | N4, N16 | `unsafe { }` block, enforced for raw pointer deref and pointer casts | large | `rawptr_audit.sh`: 1928 files / 7505 casts in `lib/` have to be marked first |
+| 7 | N17 | `Send` / `Sync` style check for values handed to threads | large | needs item 4 and 5 first (what may cross a thread boundary) |
+| - | N19 | inherent: the lifetime analysis is not a proof | - | a stronger analysis only shrinks it |
