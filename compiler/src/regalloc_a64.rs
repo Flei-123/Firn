@@ -382,15 +382,64 @@ pub(crate) fn compute_silent(m: &crate::fir::Module) {
 /// returned. NOTE: `block_start` is the position of the FIRST instruction of the block, so "starts at a call" alone
 /// would also match a value that is live into a block whose first instruction is a call (found by the gate:
 /// tests/1003_js_gc_cycle.fi).
-fn spans(bars: &[usize], calls: &HashMap<usize, Val>, s: usize, e: usize, val: Val) -> bool {
-    let mut k = bars.partition_point(|&p| p < s);
-    while k < bars.len() && bars[k] <= e {
-        if !(bars[k] == s && calls.get(&s) == Some(&val)) {
+fn spans(
+    bars: &[(usize, usize, usize)],
+    calls: &HashMap<usize, Val>,
+    s: usize,
+    e: usize,
+    val: Val,
+    later: &LaterUses,
+    live: &crate::regalloc::Live,
+) -> bool {
+    let mut k = bars.partition_point(|&(p, _, _)| p < s);
+    while k < bars.len() && bars[k].0 <= e {
+        let (p, bi, ii) = bars[k];
+        let defined_here = p == s && calls.get(&s) == Some(&val);
+        if !defined_here && (!live.converged || live.live_out[bi][val as usize] || later.used_from(bi, ii, val)) {
             return true;
         }
         k += 1;
     }
     false
+}
+
+struct LaterUses {
+    last: Vec<HashMap<Val, usize>>,
+}
+
+impl LaterUses {
+    fn new(f: &Func) -> LaterUses {
+        let mut buf: Vec<Val> = Vec::new();
+        let last = f
+            .blocks
+            .iter()
+            .map(|b| {
+                let mut m: HashMap<Val, usize> = HashMap::default();
+                for (ii, i) in b.insts.iter().enumerate() {
+                    buf.clear();
+                    i.op.uses(&mut buf);
+                    for u in buf.iter() {
+                        m.insert(*u, ii);
+                    }
+                }
+                let tv = match &b.term {
+                    Term::BrCond { cond, .. } => Some(*cond),
+                    Term::Switch { val, .. } => Some(*val),
+                    Term::Ret(Some(v)) => Some(*v),
+                    _ => None,
+                };
+                if let Some(v) = tv {
+                    m.insert(v, usize::MAX);
+                }
+                m
+            })
+            .collect();
+        LaterUses { last }
+    }
+
+    fn used_from(&self, bi: usize, ii: usize, v: Val) -> bool {
+        self.last[bi].get(&v).map_or(false, |&l| l >= ii)
+    }
 }
 
 /// The Poletto/Sarkar scan, once for each register class. Returns the register
@@ -748,8 +797,8 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         pool.extend(caller.iter().copied());
     }
     if !leaf {
-        let mut bar_all: Vec<usize> = Vec::new();
-        let mut bar_gc: Vec<usize> = Vec::new();
+        let mut bar_all: Vec<(usize, usize, usize)> = Vec::new();
+        let mut bar_gc: Vec<(usize, usize, usize)> = Vec::new();
         let mut bar_call: HashMap<usize, Val> = HashMap::default();
         SILENT.with(|sl| {
             let sl = sl.borrow();
@@ -759,7 +808,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                         continue;
                     }
                     let p = live.pos[bi][ii];
-                    bar_all.push(p);
+                    bar_all.push((p, bi, ii));
                     match &i.op {
                         Op::Call { name, .. } => {
                             if let Some(d) = i.dst {
@@ -768,7 +817,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                                 }
                             }
                             if !sl.contains(name.as_str()) {
-                                bar_gc.push(p);
+                                bar_gc.push((p, bi, ii));
                             }
                         }
                         Op::CallIndirect { .. } => {
@@ -777,18 +826,19 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                                     bar_call.insert(p, d);
                                 }
                             }
-                            bar_gc.push(p);
+                            bar_gc.push((p, bi, ii));
                         }
-                        _ => bar_gc.push(p),
+                        _ => bar_gc.push((p, bi, ii)),
                     }
                 }
             }
         });
         bar_all.sort_unstable();
         bar_gc.sort_unstable();
+        let later = LaterUses::new(f);
         for iv in ivs.iter_mut() {
-            iv.cross = spans(&bar_all, &bar_call, iv.start, iv.end, iv.val);
-            iv.gc = spans(&bar_gc, &bar_call, iv.start, iv.end, iv.val);
+            iv.cross = spans(&bar_all, &bar_call, iv.start, iv.end, iv.val, &later, &live);
+            iv.gc = spans(&bar_gc, &bar_call, iv.start, iv.end, iv.val, &later, &live);
         }
     }
     let unscanned: &[&'static str] = if xpool_on { &A64_XPOOL } else { &[] };
