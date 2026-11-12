@@ -98,9 +98,9 @@ fn open_requests() -> usize             // async requests still waiting for the 
 Ops: `OP_FILE_ITEM` (1) one opened file, `OP_FILE_END` (2) end of a file open, `OP_CLIP_TEXT` (3) clipboard text.
 
 Host events (browser): the page loop hands every `web.WE_DIALOG` / `web.WE_CLIP` to
-`svcos.from_web_event(e: *mut web.WebEvent) -> bool` (true = consumed). The portable form, present in every backend,
+`svcos.from_web_event(e: *mut hostev.HostEvent) -> bool` (true = consumed). The portable form, present in every backend,
 is `svc.host_event(kind, status, id, q: str, p: u64, n: usize) -> bool` (kind `svc.HOST_DIALOG` / `svc.HOST_CLIP`,
-fields as in `plat.web.WebEvent`); native backends never need it and it answers `false` there when nothing is open.
+fields as in `plat.hostev.HostEvent`); native backends never need it and it answers `false` there when nothing is open.
 A file item is any WE_DIALOG while a file open is waiting, except `"color"`, `"notify-click"`, `"notify-close"`.
 
 ## Capabilities
