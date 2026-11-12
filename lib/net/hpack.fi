@@ -1,0 +1,436 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.hpacktab
+
+export {
+    Hpack, hp_new, hp_free, hp_set_limit, hp_set_max_list,
+    hp_encode_begin, hp_encode, hp_decode,
+    hdr_next, hdr_find,
+    HP_OK, HP_BAD_INDEX, HP_BAD_INT, HP_BAD_STRING, HP_BAD_HUFFMAN,
+    HP_BAD_UPDATE, HP_TOO_BIG, HP_TRUNCATED,
+}
+
+const HP_OK: i32 = 0
+const HP_BAD_INDEX: i32 = 1
+const HP_BAD_INT: i32 = 2
+const HP_BAD_STRING: i32 = 3
+const HP_BAD_HUFFMAN: i32 = 4
+const HP_BAD_UPDATE: i32 = 5
+const HP_TOO_BIG: i32 = 6
+const HP_TRUNCATED: i32 = 7
+
+const DYN_ENTRIES: usize = 256
+const ENTRY_OVERHEAD: usize = 32
+const DEFAULT_TABLE: usize = 4096
+const DEFAULT_MAX_LIST: usize = 262144
+const MAX_INT_SHIFT: u32 = 28
+const STATIC_LAST: usize = 61
+
+struct Hpack {
+    blob: rt.Buf,
+    nlen: [u32; 256],
+    vlen: [u32; 256],
+    count: usize,
+    size: usize,
+    max_size: usize,
+    limit: usize,
+    max_list: usize,
+    pending_update: bool,
+    name: rt.Buf,
+    value: rt.Buf,
+    spare: rt.Buf,
+}
+
+fn hp_new() -> Hpack {
+    return Hpack { blob: rt.buf_new(), nlen: [0; 256], vlen: [0; 256], count: 0,
+        size: 0, max_size: DEFAULT_TABLE, limit: DEFAULT_TABLE,
+        max_list: DEFAULT_MAX_LIST, pending_update: false,
+        name: rt.buf_new(), value: rt.buf_new(), spare: rt.buf_new() }
+}
+
+fn hp_free(h: *mut Hpack) {
+    rt.buf_free(&(*h).blob)
+    rt.buf_free(&(*h).name)
+    rt.buf_free(&(*h).value)
+    rt.buf_free(&(*h).spare)
+}
+
+fn hp_set_max_list(h: *mut Hpack, n: usize) {
+    (*h).max_list = n
+}
+
+fn evict_oldest(h: *mut Hpack) {
+    let last: usize = (*h).count - 1
+    let n: usize = (*h).nlen[last] as usize
+    let v: usize = (*h).vlen[last] as usize
+    rt.buf_set_len(&(*h).blob, (*h).blob.len - n - v)
+    (*h).size = (*h).size - n - v - ENTRY_OVERHEAD
+    (*h).count = last
+}
+
+fn shrink_to(h: *mut Hpack, limit: usize) {
+    while (*h).count > 0 && (*h).size > limit {
+        evict_oldest(h)
+    }
+}
+
+fn hp_set_limit(h: *mut Hpack, limit: usize) {
+    (*h).limit = limit
+    if (*h).max_size > limit {
+        (*h).max_size = limit
+        shrink_to(h, limit)
+        (*h).pending_update = true
+    }
+}
+
+fn set_max_size(h: *mut Hpack, size: usize) {
+    (*h).max_size = size
+    shrink_to(h, size)
+}
+
+fn dyn_offset(h: *mut Hpack, i: usize) -> usize {
+    var off: usize = 0
+    var j: usize = 0
+    while j < i {
+        off = off + ((*h).nlen[j] + (*h).vlen[j]) as usize
+        j = j + 1
+    }
+    return off
+}
+
+fn dyn_insert(h: *mut Hpack, np: u64, nn: usize, vp: u64, vn: usize) {
+    let esize: usize = nn + vn + ENTRY_OVERHEAD
+    if esize > (*h).max_size {
+        shrink_to(h, 0)
+        return
+    }
+    shrink_to(h, (*h).max_size - esize)
+    if (*h).count == DYN_ENTRIES { evict_oldest(h) }
+    rt.buf_clear(&(*h).spare)
+    rt.buf_push_bytes(&(*h).spare, np, nn)
+    rt.buf_push_bytes(&(*h).spare, vp, vn)
+    rt.buf_push_bytes(&(*h).spare, (*h).blob.ptr, (*h).blob.len)
+    let tmp: rt.Buf = (*h).blob
+    (*h).blob = (*h).spare
+    (*h).spare = tmp
+    var i: usize = (*h).count
+    while i > 0 {
+        (*h).nlen[i] = (*h).nlen[i - 1]
+        (*h).vlen[i] = (*h).vlen[i - 1]
+        i = i - 1
+    }
+    (*h).nlen[0] = nn as u32
+    (*h).vlen[0] = vn as u32
+    (*h).count = (*h).count + 1
+    (*h).size = (*h).size + esize
+}
+
+fn static_name_ptr(i: usize) -> u64 {
+    return (&hpacktab.STATIC_BLOB[0]) as u64 + hpacktab.STATIC_OFF[i - 1] as u64
+}
+
+fn static_name_len(i: usize) -> usize {
+    return hpacktab.STATIC_NAME_LEN[i - 1] as usize
+}
+
+fn static_value_ptr(i: usize) -> u64 {
+    return static_name_ptr(i) + static_name_len(i) as u64
+}
+
+fn static_value_len(i: usize) -> usize {
+    return (hpacktab.STATIC_OFF[i] - hpacktab.STATIC_OFF[i - 1]) as usize - static_name_len(i)
+}
+
+fn lookup(h: *mut Hpack, idx: usize, np: *mut u64, nn: *mut usize, vp: *mut u64, vn: *mut usize) -> bool {
+    if idx == 0 { return false }
+    if idx <= STATIC_LAST {
+        *np = static_name_ptr(idx)
+        *nn = static_name_len(idx)
+        *vp = static_value_ptr(idx)
+        *vn = static_value_len(idx)
+        return true
+    }
+    let d: usize = idx - STATIC_LAST - 1
+    if d >= (*h).count { return false }
+    let off: usize = dyn_offset(h, d)
+    *np = (*h).blob.ptr + off as u64
+    *nn = (*h).nlen[d] as usize
+    *vp = *np + (*nn) as u64
+    *vn = (*h).vlen[d] as usize
+    return true
+}
+
+fn read_int(p: u64, n: usize, pos: *mut usize, prefix: u32, out: *mut u64) -> bool {
+    if *pos >= n { return false }
+    let maxp: u64 = (1 << prefix) - 1
+    var v: u64 = (rt.ld8(p, *pos) as u64) & maxp
+    *pos = *pos + 1
+    if v < maxp {
+        *out = v
+        return true
+    }
+    var shift: u32 = 0
+    while true {
+        if *pos >= n || shift > MAX_INT_SHIFT { return false }
+        let b: u64 = rt.ld8(p, *pos) as u64
+        *pos = *pos + 1
+        v = v + ((b & 127) << shift)
+        shift = shift + 7
+        if (b & 128) == 0 {
+            *out = v
+            return true
+        }
+    }
+    return false
+}
+
+fn huff_decode(p: u64, n: usize, out: *mut rt.Buf) -> i32 {
+    var code: i64 = 0
+    var len: usize = 0
+    var i: usize = 0
+    while i < n {
+        let byte: u32 = rt.ld8(p, i) as u32
+        var b: i32 = 7
+        while b >= 0 {
+            code = (code << 1) | (((byte >> (b as u32)) & 1) as i64)
+            len = len + 1
+            if len > 30 { return HP_BAD_HUFFMAN }
+            let c: i64 = hpacktab.HUFF_COUNT[len] as i64
+            if c > 0 {
+                let d: i64 = code - (hpacktab.HUFF_FIRST[len] as i64)
+                if d >= 0 && d < c {
+                    let sym: usize = hpacktab.HUFF_SORTED[(hpacktab.HUFF_INDEX[len] as usize) + d as usize] as usize
+                    if sym == 256 { return HP_BAD_HUFFMAN }
+                    rt.buf_push(out, sym as u8)
+                    code = 0
+                    len = 0
+                }
+            }
+            b = b - 1
+        }
+        i = i + 1
+    }
+    if len > 7 { return HP_BAD_HUFFMAN }
+    if code != (1 << len) - 1 { return HP_BAD_HUFFMAN }
+    return HP_OK
+}
+
+fn read_string(h: *mut Hpack, p: u64, n: usize, pos: *mut usize, out: *mut rt.Buf) -> i32 {
+    if *pos >= n { return HP_TRUNCATED }
+    let huff: bool = (rt.ld8(p, *pos) & 128) != 0
+    var len: u64 = 0
+    if !read_int(p, n, pos, 7, &len) { return HP_BAD_INT }
+    if len > (n - *pos) as u64 { return HP_TRUNCATED }
+    if len > (*h).max_list as u64 { return HP_TOO_BIG }
+    rt.buf_clear(out)
+    let at: u64 = p + (*pos) as u64
+    *pos = *pos + len as usize
+    if huff { return huff_decode(at, len as usize, out) }
+    rt.buf_push_bytes(out, at, len as usize)
+    return HP_OK
+}
+
+fn emit(out: *mut rt.Buf, np: u64, nn: usize, vp: u64, vn: usize) {
+    push_u32(out, nn as u32)
+    push_u32(out, vn as u32)
+    rt.buf_push_bytes(out, np, nn)
+    rt.buf_push_bytes(out, vp, vn)
+}
+
+fn push_u32(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, ((v >> 24) & 255) as u8)
+    rt.buf_push(out, ((v >> 16) & 255) as u8)
+    rt.buf_push(out, ((v >> 8) & 255) as u8)
+    rt.buf_push(out, (v & 255) as u8)
+}
+
+fn decode_literal(h: *mut Hpack, p: u64, n: usize, pos: *mut usize, prefix: u32, indexed: bool,
+    out: *mut rt.Buf) -> i32 {
+    var idx: u64 = 0
+    if !read_int(p, n, pos, prefix, &idx) { return HP_BAD_INT }
+    if idx == 0 {
+        let r: i32 = read_string(h, p, n, pos, &(*h).name)
+        if r != HP_OK { return r }
+    } else {
+        var np: u64 = 0
+        var nn: usize = 0
+        var vp: u64 = 0
+        var vn: usize = 0
+        if !lookup(h, idx as usize, &np, &nn, &vp, &vn) { return HP_BAD_INDEX }
+        rt.buf_clear(&(*h).name)
+        rt.buf_push_bytes(&(*h).name, np, nn)
+    }
+    let r2: i32 = read_string(h, p, n, pos, &(*h).value)
+    if r2 != HP_OK { return r2 }
+    emit(out, (*h).name.ptr, (*h).name.len, (*h).value.ptr, (*h).value.len)
+    if indexed {
+        dyn_insert(h, (*h).name.ptr, (*h).name.len, (*h).value.ptr, (*h).value.len)
+    }
+    return HP_OK
+}
+
+fn decode_one(h: *mut Hpack, p: u64, n: usize, pos: *mut usize, first: bool, out: *mut rt.Buf) -> i32 {
+    let b: u32 = rt.ld8(p, *pos) as u32
+    if (b & 128) != 0 {
+        var idx: u64 = 0
+        if !read_int(p, n, pos, 7, &idx) { return HP_BAD_INT }
+        var np: u64 = 0
+        var nn: usize = 0
+        var vp: u64 = 0
+        var vn: usize = 0
+        if !lookup(h, idx as usize, &np, &nn, &vp, &vn) { return HP_BAD_INDEX }
+        emit(out, np, nn, vp, vn)
+        return HP_OK
+    }
+    if (b & 64) != 0 { return decode_literal(h, p, n, pos, 6, true, out) }
+    if (b & 32) != 0 {
+        if !first { return HP_BAD_UPDATE }
+        var size: u64 = 0
+        if !read_int(p, n, pos, 5, &size) { return HP_BAD_INT }
+        if size > (*h).limit as u64 { return HP_BAD_UPDATE }
+        set_max_size(h, size as usize)
+        return HP_OK
+    }
+    return decode_literal(h, p, n, pos, 4, false, out)
+}
+
+fn hp_decode(h: *mut Hpack, p: u64, n: usize, out: *mut rt.Buf) -> i32 {
+    var pos: usize = 0
+    var first: bool = true
+    while pos < n {
+        let before: usize = (*out).len
+        let r: i32 = decode_one(h, p, n, &pos, first, out)
+        if r != HP_OK { return r }
+        if (*out).len != before { first = false }
+        if (*out).len > (*h).max_list { return HP_TOO_BIG }
+    }
+    return HP_OK
+}
+
+fn put_int(out: *mut rt.Buf, flags: u32, prefix: u32, v: u64) {
+    let maxp: u64 = (1 << prefix) - 1
+    if v < maxp {
+        rt.buf_push(out, (flags | v as u32) as u8)
+        return
+    }
+    rt.buf_push(out, (flags | maxp as u32) as u8)
+    var rest: u64 = v - maxp
+    while rest >= 128 {
+        rt.buf_push(out, ((rest & 127) | 128) as u8)
+        rest = rest >> 7
+    }
+    rt.buf_push(out, rest as u8)
+}
+
+fn huff_len(p: u64, n: usize) -> usize {
+    var bits: usize = 0
+    var i: usize = 0
+    while i < n {
+        bits = bits + hpacktab.HUFF_LEN[rt.ld8(p, i) as usize] as usize
+        i = i + 1
+    }
+    return (bits + 7) / 8
+}
+
+fn huff_encode(p: u64, n: usize, out: *mut rt.Buf) {
+    var acc: u64 = 0
+    var nbits: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let s: usize = rt.ld8(p, i) as usize
+        let l: u32 = hpacktab.HUFF_LEN[s] as u32
+        acc = (acc << l) | (hpacktab.HUFF_CODE[s] as u64)
+        nbits = nbits + l
+        while nbits >= 8 {
+            rt.buf_push(out, ((acc >> (nbits - 8)) & 255) as u8)
+            nbits = nbits - 8
+        }
+        i = i + 1
+    }
+    if nbits > 0 {
+        let pad: u64 = (1 << (8 - nbits)) - 1
+        rt.buf_push(out, (((acc << (8 - nbits)) | pad) & 255) as u8)
+    }
+}
+
+fn put_string(out: *mut rt.Buf, p: u64, n: usize) {
+    let hl: usize = huff_len(p, n)
+    if hl < n {
+        put_int(out, 128, 7, hl as u64)
+        huff_encode(p, n, out)
+        return
+    }
+    put_int(out, 0, 7, n as u64)
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn hp_encode_begin(h: *mut Hpack, out: *mut rt.Buf) {
+    if !(*h).pending_update { return }
+    put_int(out, 32, 5, (*h).max_size as u64)
+    (*h).pending_update = false
+}
+
+fn find_entry(h: *mut Hpack, np: u64, nn: usize, vp: u64, vn: usize, name_idx: *mut usize) -> usize {
+    var found: usize = 0
+    var i: usize = 1
+    let total: usize = STATIC_LAST + (*h).count
+    while i <= total {
+        var enp: u64 = 0
+        var enn: usize = 0
+        var evp: u64 = 0
+        var evn: usize = 0
+        if lookup(h, i, &enp, &enn, &evp, &evn) && enn == nn && rt.mem_eq(enp, np, nn) {
+            if *name_idx == 0 { *name_idx = i }
+            if evn == vn && rt.mem_eq(evp, vp, vn) { return i }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn hp_encode(h: *mut Hpack, out: *mut rt.Buf, np: u64, nn: usize, vp: u64, vn: usize, secret: bool) {
+    var name_idx: usize = 0
+    let full: usize = find_entry(h, np, nn, vp, vn, &name_idx)
+    if full > 0 {
+        put_int(out, 128, 7, full as u64)
+        return
+    }
+    var flags: u32 = 64
+    var prefix: u32 = 6
+    if secret {
+        flags = 16
+        prefix = 4
+    }
+    put_int(out, flags, prefix, name_idx as u64)
+    if name_idx == 0 { put_string(out, np, nn) }
+    put_string(out, vp, vn)
+    if !secret { dyn_insert(h, np, nn, vp, vn) }
+}
+
+fn be32(p: u64, at: usize) -> usize {
+    return ((rt.ld8(p, at) as usize) << 24) | ((rt.ld8(p, at + 1) as usize) << 16)
+    | ((rt.ld8(p, at + 2) as usize) << 8) | (rt.ld8(p, at + 3) as usize)
+}
+
+fn hdr_next(p: u64, n: usize, pos: *mut usize, np: *mut u64, nn: *mut usize, vp: *mut u64, vn: *mut usize) -> bool {
+    if *pos + 8 > n { return false }
+    let a: usize = be32(p, *pos)
+    let b: usize = be32(p, *pos + 4)
+    if *pos + 8 + a + b > n { return false }
+    *np = p + (*pos + 8) as u64
+    *nn = a
+    *vp = *np + a as u64
+    *vn = b
+    *pos = *pos + 8 + a + b
+    return true
+}
+
+fn hdr_find(p: u64, n: usize, name: str, vp: *mut u64, vn: *mut usize) -> bool {
+    var pos: usize = 0
+    var np: u64 = 0
+    var nn: usize = 0
+    while hdr_next(p, n, &pos, &np, &nn, vp, vn) {
+        if nn == name.n && rt.mem_eq(np, name.p as u64, nn) { return true }
+    }
+    return false
+}

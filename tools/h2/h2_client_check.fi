@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.io
+import std.time
+import net.h2
+import net.hpack
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        io.print("FAIL ")
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, code as u64)
+        rt.buf_push(&b, 10 as u8)
+        io.print_bytes(b.ptr, b.len)
+        rt.buf_free(&b)
+    }
+}
+
+fn body_is_pattern(b: *mut rt.Buf, n: usize) -> bool {
+    if (*b).len != n { return false }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8((*b).ptr, i) != ((i * 7) & 255) as u8 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    var port: u16 = 0
+    var pbuf: rt.Buf = rt.buf_new()
+    if !io.read_stdin(&pbuf) { return 2 }
+    var i: usize = 0
+    while i < pbuf.len && rt.ld8(pbuf.ptr, i) != 10 as u8 {
+        let d: u8 = rt.ld8(pbuf.ptr, i)
+        if d >= 48 as u8 && d <= 57 as u8 { port = port * 10 + ((d - 48 as u8) as u16) }
+        i = i + 1
+    }
+    var c: h2.H2 = h2.h2_new()
+    var scheme: str = "http"
+    if i + 1 < pbuf.len {
+        var path: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&path, pbuf.ptr + (i + 1) as u64, pbuf.len - i - 1)
+        rt.buf_push(&path, 0 as u8)
+        var roots: rt.Buf = rt.buf_new()
+        check(io.read_file(path.ptr, &roots), 30)
+        let now: u64 = (time.now_unix_ms() / 1000) as u64
+        check(h2.h2_connect_tls(&c, 2130706433 as u32, port, "localhost", roots.ptr, roots.len, now), 1)
+        scheme = "https"
+    } else {
+        check(h2.h2_connect_plain(&c, 2130706433 as u32, port), 1)
+    }
+
+    let a: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/hello", "", 0, 0)
+    check(a > 0, 2)
+    check(h2.h2_wait(&c, a as u32), 3)
+    check(h2.h2_status(&c, a as u32) == 200, 4)
+    var hb: *mut rt.Buf = h2.h2_body(&c, a as u32)
+    check((*hb).len == 5 && rt.mem_eq((*hb).ptr, "hello".p as u64, 5), 5)
+    var vp: u64 = 0
+    var vn: usize = 0
+    let hh: *mut rt.Buf = h2.h2_headers(&c, a as u32)
+    check(hpack.hdr_find((*hh).ptr, (*hh).len, "content-length", &vp, &vn) && vn == 1, 6)
+    h2.h2_release(&c, a as u32)
+
+    let m: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/missing", "", 0, 0)
+    check(h2.h2_wait(&c, m as u32) && h2.h2_status(&c, m as u32) == 404, 7)
+    h2.h2_release(&c, m as u32)
+
+    let u: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/ua", "X-Test: Value1\r\n", 0, 0)
+    check(h2.h2_wait(&c, u as u32), 8)
+    let ub: *mut rt.Buf = h2.h2_body(&c, u as u32)
+    check((*ub).len == 6 && rt.mem_eq((*ub).ptr, "Value1".p as u64, 6), 9)
+    h2.h2_release(&c, u as u32)
+
+    var up: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 300000 {
+        rt.buf_push(&up, ((k * 7) & 255) as u8)
+        k = k + 1
+    }
+    let e: i32 = h2.h2_request(&c, "POST", scheme, "localhost", "/echo", "", up.ptr, up.len)
+    check(e > 0, 10)
+    let big: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/big", "", 0, 0)
+    let hd: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/headers", "", 0, 0)
+    check(big > 0 && hd > 0, 11)
+    check(h2.h2_wait(&c, hd as u32) && h2.h2_status(&c, hd as u32) == 200, 12)
+    let hdh: *mut rt.Buf = h2.h2_headers(&c, hd as u32)
+    check(hpack.hdr_find((*hdh).ptr, (*hdh).len, "x-h59", &vp, &vn) && vn == 600, 13)
+    check(h2.h2_wait(&c, big as u32), 14)
+    check(body_is_pattern(h2.h2_body(&c, big as u32), 3145728), 15)
+    check(h2.h2_wait(&c, e as u32), 16)
+    check(body_is_pattern(h2.h2_body(&c, e as u32), 300000), 17)
+    h2.h2_release(&c, e as u32)
+    h2.h2_release(&c, big as u32)
+    h2.h2_release(&c, hd as u32)
+
+    check(h2.h2_ping(&c), 18)
+    var n: u32 = 0
+    while n < 40 {
+        let r: i32 = h2.h2_request(&c, "GET", scheme, "localhost", "/hello", "", 0, 0)
+        check(r > 0 && h2.h2_wait(&c, r as u32) && h2.h2_status(&c, r as u32) == 200, 19)
+        h2.h2_release(&c, r as u32)
+        n = n + 1
+    }
+    h2.h2_close(&c)
+    h2.h2_free(&c)
+    if fails == 0 { io.print_line("h2 client ok") }
+    return fails as i32
+}
