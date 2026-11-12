@@ -439,7 +439,7 @@ fn add_imm(e: &mut Emitter, dst: &str, src: &str, imm: u64) {
 /// fits the scaled immediate field it becomes `[base, #off]`; otherwise the
 /// address is built in `x12` — which is why nothing but an address ever
 /// lives there.
-fn at_base(e: &mut Emitter, base: &str, off: u64, scale: u64) -> String {
+pub(crate) fn at_base(e: &mut Emitter, base: &str, off: u64, scale: u64) -> String {
     if off % scale == 0 && off / scale <= 4095 {
         if off == 0 {
             format!("[{}]", base)
@@ -915,7 +915,7 @@ pub(crate) fn uniq(e: &Emitter, tag: &str) -> String {
 /// left travels on the stack, in the order of writing. That is the same
 /// shape System V has on x86 — with eight integer registers instead of six,
 /// which is the only thing that actually differs here.
-fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
+pub(crate) fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
     let mut int_i = 0usize;
     let mut fp_i = 0usize;
     let mut spot: Vec<Option<&'static str>> = Vec::with_capacity(args.len());
@@ -1096,7 +1096,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::so_thunk::runtime_asm()?);
     }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
-    Ok(cold_checks(&spill_peephole(&e.out)))
+    Ok(crate::a64leaf::strip_leaf_frames(&cold_checks(&spill_peephole(&e.out))))
 }
 
 /// **ROUND ARM-FREESTANDING — the A64 exception entry.**
@@ -1163,11 +1163,7 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // and `sp` never moves again) and BEFORE the parameters are placed —
     // a parameter may itself land in one of these registers.
     if !fr.ra.saved.is_empty() {
-        e.raw("    // ROUND BILLIG: the registers the allocation hands out");
-        for (k, r) in fr.ra.saved.iter().enumerate() {
-            let m = at_base(e, "sp", fr.saved_at + 8 * k as u64, 8);
-            e.line(&format!("str {}, {}", r, m));
-        }
+        crate::a64saves::emit_saved_registers(e, &fr.ra.saved, fr.saved_at, true);
     }
     // ROUND FREG: the low halves of the callee-saved float registers in use,
     // behind the integer ones.
@@ -1318,12 +1314,7 @@ fn cond_branch(e: &mut Emitter, f: &Func, cc: &str, then_bb: u32, else_bb: u32, 
 fn emit_epilogue(e: &mut Emitter, fr: &Frame, interrupt: bool) {
     // Round BILLIG: back out of the frame before `sp` moves. The return
     // value is already in x0/d0/v0, and `at_base` only ever uses x12.
-    if !fr.ra.saved.is_empty() {
-        for (k, r) in fr.ra.saved.iter().enumerate() {
-            let m = at_base(e, "sp", fr.saved_at + 8 * k as u64, 8);
-            e.line(&format!("ldr {}, {}", r, m));
-        }
-    }
+    crate::a64saves::emit_saved_registers(e, &fr.ra.saved, fr.saved_at, false);
     for (k, r) in fr.ra.fsaved.iter().enumerate() {
         let m = at_base(e, "sp", fr.saved_at + 8 * (fr.ra.saved.len() + k) as u64, 8);
         e.line(&format!("ldr {}, {}", r, m));
@@ -2832,7 +2823,7 @@ mod tests {
     fn start_block_prologue_and_exit() {
         let s = build(&simple_module());
         assert!(s.contains("_start:"), "{}", s);
-        assert!(s.contains("stp x29, x30, [sp, #-16]!"), "{}", s);
+        assert!(!s.contains("stp x29, x30, [sp, #-16]!"), "{}", s);
         // ROUND BILLIG: until this round the constant went `movz x9, #42`
         // / `str x9, [sp]` / `ldr x0, [sp]` -- three instructions and two
         // memory accesses to hand a literal to `ret`. A constant that

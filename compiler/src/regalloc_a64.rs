@@ -84,6 +84,8 @@ pub(crate) const A64_XPOOL: [&str; 4] = ["x25", "x26", "x27", "x28"];
 /// big frames). The panic blocks read `x9`/`x10` (and write x0-x3 for the runtime call, which never returns).
 /// Consequences: no value of a PARAMETER may live in one of them (the prologue moves the arguments one by one), and
 /// x0/x1 stay out (return value / possible second result). Nothing here needs a save: the caller treats them as clobbered.
+const ENTRY_ONLY_REGISTERS: [&str; 2] = ["x0", "x1"];
+
 pub(crate) const A64_XCALLER: [&str; 8] = ["x2", "x3", "x4", "x5", "x6", "x7", "x8", "x17"];
 
 /// ROUND FREG -- the floating point registers handed out: `d8`-`d15`. AAPCS64
@@ -303,6 +305,19 @@ fn plain_op(op: &Op) -> bool {
 }
 
 /// A function that never calls anything and never reaches a safepoint -- see `A64_XPOOL`.
+fn entry_register_pins(f: &Func, ivs: &[Iv]) -> Vec<Option<&'static str>> {
+    let pvals: Vec<Val> = (0..f.params.len() as Val).collect();
+    let (spot, _) = crate::codegen_a64::place_args(f, &pvals);
+    ivs.iter()
+        .map(|iv| {
+            if iv.is_cell || (iv.val as usize) >= spot.len() || iv.cross {
+                return None;
+            }
+            spot[iv.val as usize].filter(|r| r.starts_with('x'))
+        })
+        .collect()
+}
+
 fn is_leaf(f: &Func) -> bool {
     f.blocks.iter().all(|b| b.insts.iter().all(|i| plain_op(&i.op)))
 }
@@ -386,11 +401,20 @@ fn linear_scan(
     param_n: usize,
     caller_saved: &[&'static str],
     unscanned: &[&'static str],
+    pins: &[Option<&'static str>],
 ) -> (Vec<Option<&'static str>>, Vec<&'static str>) {
     let mut free: Vec<&'static str> = pool.to_vec();
     let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
     let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
     let mut used: Vec<&'static str> = Vec::new();
+    for (k, pin) in pins.iter().enumerate() {
+        if let Some(r) = *pin {
+            free.retain(|x| *x != r);
+            got[k] = Some(r);
+            active.push((ivs[k].end, r, k));
+        }
+    }
+    active.sort_by_key(|&(e, _, _)| e);
     // May interval `k` live in register `r`?
     //  * r841: a parameter must not get a caller-saved register -- the prologue moves the incoming arguments (x0-x7)
     //    one by one and would overwrite a neighbour;
@@ -409,10 +433,15 @@ fn linear_scan(
 
     let density = std::env::var_os("FIRN_A64_SPILL_OLD").is_none();
     for k in 0..ivs.len() {
+        if pins.get(k).copied().flatten().is_some() {
+            continue;
+        }
         // expire
         active.retain(|&(e, r, _)| {
             if e < ivs[k].start {
-                free.push(r);
+                if !ENTRY_ONLY_REGISTERS.contains(&r) {
+                    free.push(r);
+                }
                 false
             } else {
                 true
@@ -763,8 +792,9 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         }
     }
     let unscanned: &[&'static str] = if xpool_on { &A64_XPOOL } else { &[] };
-    let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller, unscanned);
-    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL, 0, &[], &[]);
+    let pins = if leaf && xcaller_on { entry_register_pins(f, &ivs) } else { vec![None; ivs.len()] };
+    let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller, unscanned, &pins);
+    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL, 0, &[], &[], &[]);
 
     for (k, iv) in ivs.iter().enumerate() {
         if let Some(r) = got[k] {
