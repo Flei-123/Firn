@@ -32,6 +32,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 
 ## Data (lib/db, lib/parquet)
 - `db/sqlite.fi` | embedded SQL DB, real SQLite 3 file format (SQL subset, docs/DB.md) | `sqlite.db_open("x.db", sqlite.OPEN_CREATE)`, `db_exec`, `db_prepare`, `stmt_step`
+- `pg/pg.fi` | PostgreSQL client (SCRAM-SHA-256/md5, TLS, simple+extended+prepared; docs/PG.md) | `pg.pg_connect(&c, addr, 5432, user, pw, db, pg.TLS_OFF, host, 0, 0, 0)`, `pg.pg_query(&c, sql, &r)`
 - `parquet/` | Parquet reader
 
 ## Compression (lib/compress, lib/zip) — docs/COMPRESSION.md

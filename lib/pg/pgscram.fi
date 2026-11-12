@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.base64
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+
+export {
+    Scram, scram_new, scram_free, scram_first, scram_final, scram_verify, pbkdf2_sha256,
+}
+
+const NONCE_BYTES: usize = 18
+const MAX_ITERATIONS: u64 = 10000000
+const DIGEST: usize = 32
+
+struct Scram {
+    nonce: rt.Buf,
+    first_bare: rt.Buf,
+    server_sig: [u8; 32],
+}
+
+fn scram_new() -> Scram {
+    return Scram { nonce: rt.buf_new(), first_bare: rt.buf_new(), server_sig: [0; 32] }
+}
+
+fn scram_free(s: *mut Scram) {
+    rt.buf_free(&(*s).nonce)
+    rt.buf_free(&(*s).first_bare)
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn scram_first(s: *mut Scram, out: *mut rt.Buf) -> bool {
+    var raw: [u8; 18] = [0; 18]
+    if !random.random_bytes((&raw[0]) as u64, NONCE_BYTES) { return false }
+    rt.buf_clear(&(*s).nonce)
+    base64.encode((&raw[0]) as u64, NONCE_BYTES, &(*s).nonce)
+    rt.buf_clear(&(*s).first_bare)
+    push_str(&(*s).first_bare, "n=,r=")
+    rt.buf_push_bytes(&(*s).first_bare, (*s).nonce.ptr, (*s).nonce.len)
+    push_str(out, "n,,")
+    rt.buf_push_bytes(out, (*s).first_bare.ptr, (*s).first_bare.len)
+    return true
+}
+
+fn pbkdf2_sha256(pw: u64, pn: usize, salt: u64, sn: usize, iters: u64, out: u64) {
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&msg, salt, sn)
+    rt.buf_push(&msg, 0 as u8)
+    rt.buf_push(&msg, 0 as u8)
+    rt.buf_push(&msg, 0 as u8)
+    rt.buf_push(&msg, 1 as u8)
+    var u: [u8; 32] = [0; 32]
+    hmac.hmac_sha256(pw, pn, msg.ptr, msg.len, (&u[0]) as u64)
+    rt.buf_free(&msg)
+    var acc: [u8; 32] = u
+    var i: u64 = 1
+    while i < iters {
+        var next: [u8; 32] = [0; 32]
+        hmac.hmac_sha256(pw, pn, (&u[0]) as u64, DIGEST, (&next[0]) as u64)
+        u = next
+        var k: usize = 0
+        while k < DIGEST {
+            acc[k] = acc[k] ^ u[k]
+            k = k + 1
+        }
+        i = i + 1
+    }
+    rt.mem_copy(out, (&acc[0]) as u64, DIGEST)
+}
+
+fn field(p: u64, n: usize, key: u8, at: *mut usize, len: *mut usize) -> bool {
+    var i: usize = 0
+    while i + 2 <= n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 44 as u8 { e = e + 1 }
+        if rt.ld8(p, i) == key && rt.ld8(p, i + 1) == 61 as u8 {
+            *at = i + 2
+            *len = e - i - 2
+            return true
+        }
+        i = e + 1
+    }
+    return false
+}
+
+fn parse_iterations(p: u64, at: usize, n: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let d: u8 = rt.ld8(p, at + i)
+        if d < 48 as u8 || d > 57 as u8 { return 0 }
+        v = v * 10 + ((d - 48 as u8) as u64)
+        if v > MAX_ITERATIONS { return 0 }
+        i = i + 1
+    }
+    return v
+}
+
+fn scram_final(s: *mut Scram, pw: u64, pn: usize, sfirst: u64, sn: usize, out: *mut rt.Buf) -> bool {
+    var rat: usize = 0
+    var rlen: usize = 0
+    var sat: usize = 0
+    var slen: usize = 0
+    var iat: usize = 0
+    var ilen: usize = 0
+    if !field(sfirst, sn, 114 as u8, &rat, &rlen) { return false }
+    if !field(sfirst, sn, 115 as u8, &sat, &slen) { return false }
+    if !field(sfirst, sn, 105 as u8, &iat, &ilen) { return false }
+    if rlen <= (*s).nonce.len || !rt.mem_eq(sfirst + rat as u64, (*s).nonce.ptr, (*s).nonce.len) { return false }
+    let iters: u64 = parse_iterations(sfirst, iat, ilen)
+    if iters == 0 { return false }
+    var salt: rt.Buf = rt.buf_new()
+    if !base64.decode(sfirst + sat as u64, slen, &salt) {
+        rt.buf_free(&salt)
+        return false
+    }
+    var salted: [u8; 32] = [0; 32]
+    pbkdf2_sha256(pw, pn, salt.ptr, salt.len, iters, (&salted[0]) as u64)
+    rt.buf_free(&salt)
+    var without: rt.Buf = rt.buf_new()
+    push_str(&without, "c=biws,r=")
+    rt.buf_push_bytes(&without, sfirst + rat as u64, rlen)
+    var auth: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&auth, (*s).first_bare.ptr, (*s).first_bare.len)
+    rt.buf_push(&auth, 44 as u8)
+    rt.buf_push_bytes(&auth, sfirst, sn)
+    rt.buf_push(&auth, 44 as u8)
+    rt.buf_push_bytes(&auth, without.ptr, without.len)
+    var ckey: [u8; 32] = [0; 32]
+    let ck: str = "Client Key"
+    hmac.hmac_sha256((&salted[0]) as u64, DIGEST, ck.p as u64, ck.n, (&ckey[0]) as u64)
+    var stored: [u8; 32] = [0; 32]
+    sha256.sha256((&ckey[0]) as u64, DIGEST, (&stored[0]) as u64)
+    var sig: [u8; 32] = [0; 32]
+    hmac.hmac_sha256((&stored[0]) as u64, DIGEST, auth.ptr, auth.len, (&sig[0]) as u64)
+    var k: usize = 0
+    while k < DIGEST {
+        sig[k] = sig[k] ^ ckey[k]
+        k = k + 1
+    }
+    var skey: [u8; 32] = [0; 32]
+    let sk: str = "Server Key"
+    hmac.hmac_sha256((&salted[0]) as u64, DIGEST, sk.p as u64, sk.n, (&skey[0]) as u64)
+    hmac.hmac_sha256((&skey[0]) as u64, DIGEST, auth.ptr, auth.len, (&(*s).server_sig[0]) as u64)
+    rt.buf_push_bytes(out, without.ptr, without.len)
+    push_str(out, ",p=")
+    base64.encode((&sig[0]) as u64, DIGEST, out)
+    rt.buf_free(&without)
+    rt.buf_free(&auth)
+    return true
+}
+
+fn scram_verify(s: *mut Scram, sfinal: u64, sn: usize) -> bool {
+    var at: usize = 0
+    var len: usize = 0
+    if !field(sfinal, sn, 118 as u8, &at, &len) { return false }
+    var sig: rt.Buf = rt.buf_new()
+    let ok: bool = base64.decode(sfinal + at as u64, len, &sig)
+    let same: bool = ok && sig.len == DIGEST && hmac.hmac_equal(sig.ptr, (&(*s).server_sig[0]) as u64, DIGEST)
+    rt.buf_free(&sig)
+    return same
+}
