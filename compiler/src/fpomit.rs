@@ -73,8 +73,23 @@ fn own_label(lines: &[&str]) -> Option<String> {
         .map(|t| t.trim_end_matches(':').to_string())
 }
 
+fn next_real(lines: &[&str], from: usize) -> Option<usize> {
+    (from..lines.len()).find(|&j| is_real(lines[j]))
+}
+
+fn unused_frame_reserve(lines: &[&str], second: usize, pushes: usize) -> Option<usize> {
+    if pushes != 0 {
+        return None;
+    }
+    let idx = next_real(lines, second + 1)?;
+    let amount = lines[idx].trim().strip_prefix("sub rsp, ")?;
+    let bytes: u64 = amount.parse().ok()?;
+    (bytes % 16 == 0).then_some(idx)
+}
+
 fn rewrite_function(lines: &[&str]) -> Option<Vec<String>> {
     let (first, second, pushes) = prologue(lines)?;
+    let reserve = unused_frame_reserve(lines, second, pushes);
     let own = own_label(lines);
     let no_pad_ok = std::env::var_os("FIRN_NO_SELFPAD").is_none();
     let mut has_call = false;
@@ -87,6 +102,12 @@ fn rewrite_function(lines: &[&str]) -> Option<Vec<String>> {
         let t = line.trim();
         if t == "pop rbp" {
             pop_rbp.push(i);
+            continue;
+        }
+        if reserve == Some(i) {
+            continue;
+        }
+        if reserve.is_some() && t == "mov rsp, rbp" && next_real(lines, i + 1).is_some_and(|j| lines[j].trim() == "pop rbp") {
             continue;
         }
         if mentions_frame(t) {
@@ -110,7 +131,9 @@ fn rewrite_function(lines: &[&str]) -> Option<Vec<String>> {
             if pad {
                 out.push(line.replace("push rbp", "push rax"));
             }
-        } else if i == second {
+        } else if i == second || reserve == Some(i) {
+            continue;
+        } else if reserve.is_some() && line.trim() == "mov rsp, rbp" {
             continue;
         } else if pop_rbp.binary_search(&i).is_ok() {
             if pad {
