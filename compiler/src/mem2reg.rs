@@ -653,7 +653,7 @@ pub(crate) fn dom_frontiers(dt: &DomTree) -> Vec<Vec<u32>> {
 /// deliberately does not rewrite those operands -- so a value one of them
 /// reads must never be deleted, and a cell whose `load` feeds one is not
 /// promotable.
-fn untouchable_uses(f: &Func) -> crate::fx::HashSet<Val> {
+pub(crate) fn untouchable_uses(f: &Func) -> crate::fx::HashSet<Val> {
     let mut out = crate::fx::HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {

@@ -1399,6 +1399,7 @@ fn cse(f: &mut Func) -> usize {
     let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::default();
     let mut map: HashMap<Val, Val> = HashMap::default();
     let mut kill: Vec<(usize, usize)> = Vec::new();
+    let mut held: Option<crate::fx::HashSet<Val>> = None;
     for bi in 0..n {
         for ii in 0..f.blocks[bi].insts.len() {
             let inst = &f.blocks[bi].insts[ii];
@@ -1413,6 +1414,14 @@ fn cse(f: &mut Func) -> usize {
                 Some(k) => k,
                 None => continue,
             };
+            let checked = matches!(
+                inst.op,
+                Op::CheckedBin { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
+                    | Op::CheckedIdxV { .. }
+                    | Op::CheckedDiv { .. }
+            );
             let e = avail.entry(k).or_default();
             let mut hit = None;
             for &(ob, ov) in e.iter() {
@@ -1422,18 +1431,17 @@ fn cse(f: &mut Func) -> usize {
                     break;
                 }
             }
+            if hit.is_some()
+                && checked
+                && held.get_or_insert_with(|| crate::mem2reg::untouchable_uses(f)).contains(&d)
+            {
+                continue;
+            }
             match hit {
                 Some(ov) => {
                     map.insert(d, ov);
                     // r797: DCE keeps checked ops (they may trap), so the dominated duplicate is deleted here
-                    if matches!(
-                        f.blocks[bi].insts[ii].op,
-                        Op::CheckedBin { .. }
-                            | Op::CheckedCast { .. }
-                            | Op::CheckedIdx { .. }
-                            | Op::CheckedIdxV { .. }
-                            | Op::CheckedDiv { .. }
-                    ) {
+                    if checked {
                         kill.push((bi, ii));
                     }
                 }
@@ -2441,6 +2449,35 @@ mod tests {
         assert_eq!(f.inst_count(), 1);
         assert_eq!(consts_in(f), vec![42]);
         assert!(matches!(f.blocks[0].term, Term::Ret(Some(_))));
+    }
+
+    fn checked_add_pair(f: &mut Func) -> (Val, Val) {
+        let base = f.param_val(0);
+        let step = f.push(0, FTy::U64, Op::Const(4096));
+        let op = |msg: &str| Op::CheckedBin { op: BinOp::Add, a: base, b: step, msg: msg.to_string() };
+        let held = f.push(0, FTy::U64, op("first"));
+        let dup = f.push(0, FTy::U64, op("second"));
+        (held, dup)
+    }
+
+    #[test]
+    fn cse_keeps_checked_duplicate_read_by_mmio() {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let (held, dup) = checked_add_pair(&mut f);
+        f.push_void(0, FTy::U64, Op::MmioStore { addr: f.param_val(0), val: dup });
+        f.set_term(0, Term::Ret(Some(held)));
+        assert_eq!(cse(&mut f), 0);
+        assert!(f.blocks[0].insts.iter().any(|i| i.dst == Some(dup)));
+    }
+
+    #[test]
+    fn cse_removes_checked_duplicate_without_untouchable_reader() {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let (held, dup) = checked_add_pair(&mut f);
+        let sum = f.push(0, FTy::U64, Op::Bin(BinOp::Add, held, dup));
+        f.set_term(0, Term::Ret(Some(sum)));
+        assert_eq!(cse(&mut f), 1);
+        assert!(f.blocks[0].insts.iter().all(|i| i.dst != Some(dup)));
     }
 
     #[test]
