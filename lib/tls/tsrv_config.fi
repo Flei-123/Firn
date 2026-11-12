@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+import tls.tsrv_types as tys
+
+fn config_free(c: *mut tys.TlsConfig) {
+    rt.mem_set((&(*c).key[0]) as u64, 0 as u8, 32)
+    rt.buf_free(&(*c).blob)
+    (*c).n = 0
+    (*c).ok = false
+}
+
+fn find(p: u64, n: usize, from: usize, lit: str) -> usize {
+    var i: usize = from
+    while i + lit.n <= n {
+        if rt.mem_eq(p + i as u64, lit.p as u64, lit.n) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn cert_p256_point(p: u64, n: usize) -> u64 {
+    var d: der.Der = der.der_open(p, 0, n)
+    var cert: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &cert) { return 0 }
+    var tbs: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&cert, der.T_SEQ, &tbs) { return 0 }
+    // [0] version (optional), serial, signature, issuer, validity, subject
+    if der.der_peek(&tbs) == 160 as u32 {
+        der.der_skip(&tbs)
+    }
+    var k: usize = 0
+    while k < 5 {
+        if !der.der_skip(&tbs) { return 0 }
+        k = k + 1
+    }
+    var spki: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&tbs, der.T_SEQ, &spki) { return 0 }
+    var alg: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&spki, der.T_SEQ, &alg) { return 0 }
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if !der.der_read(&alg, &tag, &off, &len) { return 0 }
+    // id-ecPublicKey 1.2.840.10045.2.1
+    var ec: [u8; 7] = [42, 134, 72, 206, 61, 2, 1]
+    if tag != der.T_OID || len != 7 || !rt.mem_eq(p + off as u64, (&ec[0]) as u64, 7) {
+        return 0
+    }
+    if !der.der_read(&alg, &tag, &off, &len) { return 0 }
+    // prime256v1 1.2.840.10045.3.1.7
+    var curve: [u8; 8] = [42, 134, 72, 206, 61, 3, 1, 7]
+    if tag != der.T_OID || len != 8 || !rt.mem_eq(p + off as u64, (&curve[0]) as u64, 8) {
+        return 0
+    }
+    if !der.der_read(&spki, &tag, &off, &len) { return 0 }
+    if tag != der.T_BITSTRING || len != 66 || rt.ld8(p, off) != 0 as u8
+    || rt.ld8(p, off + 1) != 4 as u8 {
+        return 0
+    }
+    return p + (off + 1) as u64
+}
+
+fn key_from_der(p: u64, n: usize, out: u64) -> bool {
+    var d: der.Der = der.der_open(p, 0, n)
+    var top: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &top) { return false }
+    var ver: u64 = 99
+    if !der.der_uint(&top, &ver) { return false }
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if ver == 0 {
+        // PKCS #8: AlgorithmIdentifier, then an OCTET STRING with SEC 1
+        if !der.der_skip(&top) { return false }
+        if !der.der_read(&top, &tag, &off, &len) || tag != der.T_OCTETSTRING {
+            return false
+        }
+        return key_from_der(p + off as u64, len, out)
+    }
+    if ver != 1 { return false }
+    if !der.der_read(&top, &tag, &off, &len) || tag != der.T_OCTETSTRING
+    || len == 0 || len > 32 {
+        return false
+    }
+    rt.mem_set(out, 0 as u8, 32)
+    rt.mem_copy(out + (32 - len) as u64, p + off as u64, len)
+    return true
+}
+
+fn config_load_pem(c: *mut tys.TlsConfig, cert: u64, cn: usize, key: u64,
+    kn: usize) -> bool {
+    (*c).ok = false
+    (*c).n = 0
+    rt.buf_clear(&(*c).blob)
+    var at: usize = 0
+    while (*c).n < tys.MAX_CHAIN {
+        let b: usize = find(cert, cn, at, "-----BEGIN CERTIFICATE-----")
+        if b >= cn { break }
+        let body: usize = b + 27
+        let e: usize = find(cert, cn, body, "-----END CERTIFICATE-----")
+        if e >= cn { return false }
+        let before: usize = (*c).blob.len
+        if !base64.decode(cert + body as u64, e - body, &(*c).blob) { return false }
+        (*c).off[(*c).n] = before
+        (*c).len[(*c).n] = (*c).blob.len - before
+        (*c).n = (*c).n + 1
+        at = e + 25
+    }
+    if (*c).n == 0 { return false }
+    var kb: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var b: usize = find(key, kn, 0, "-----BEGIN EC PRIVATE KEY-----")
+    if b < kn {
+        let e: usize = find(key, kn, b + 30, "-----END EC PRIVATE KEY-----")
+        got = e < kn && base64.decode(key + (b + 30) as u64, e - b - 30, &kb)
+    } else {
+        b = find(key, kn, 0, "-----BEGIN PRIVATE KEY-----")
+        if b < kn {
+            let e: usize = find(key, kn, b + 27, "-----END PRIVATE KEY-----")
+            got = e < kn && base64.decode(key + (b + 27) as u64, e - b - 27, &kb)
+        }
+    }
+    if got {
+        got = key_from_der(kb.ptr, kb.len, (&(*c).key[0]) as u64)
+    }
+    rt.mem_set(kb.ptr, 0 as u8, kb.len)
+    rt.buf_free(&kb)
+    if !got { return false }
+    return config_check(c)
+}
+
+fn config_set(c: *mut tys.TlsConfig, cert: u64, cn: usize, key32: u64) -> bool {
+    rt.buf_clear(&(*c).blob)
+    rt.buf_push_bytes(&(*c).blob, cert, cn)
+    (*c).off[0] = 0
+    (*c).len[0] = cn
+    (*c).n = 1
+    rt.mem_copy((&(*c).key[0]) as u64, key32, 32)
+    return config_check(c)
+}
+
+fn config_check(c: *mut tys.TlsConfig) -> bool {
+    let pt: u64 = cert_p256_point(tys.config_cert_ptr(c, 0), tys.config_cert_len(c, 0))
+    if pt == 0 { return false }
+    var mine: [u8; 65] = [0; 65]
+    if !p256.p256_public((&(*c).key[0]) as u64, (&mine[0]) as u64) { return false }
+    (*c).ok = rt.mem_eq(pt, (&mine[0]) as u64, 65)
+    return (*c).ok
+}

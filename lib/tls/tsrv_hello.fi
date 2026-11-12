@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+import tls.tsrv_types as tys
+import tls.tsrv_core as core
+import tls.tsrv_flight as fl
+
+export {
+    handshake_messages,
+}
+
+fn handshake_messages(t: *mut tys.TlsServer) -> bool {
+    while true {
+        let have: usize = (*t).hsin.len - (*t).hspos
+        if have < 4 { break }
+        let base: u64 = (*t).hsin.ptr + (*t).hspos as u64
+        let blen: usize = core.be24(base, 1)
+        if blen > tys.MAX_HANDSHAKE { return core.fail(t, tys.A_DECODE) }
+        if have < 4 + blen { break }
+        let ht: u32 = rt.ld8(base, 0) as u32
+        // copy the message out: acting on it may grow `hsin`
+        var msg: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&msg, base, 4 + blen)
+        (*t).hspos = (*t).hspos + 4 + blen
+        let r: bool = handshake(t, ht, &msg)
+        rt.buf_free(&msg)
+        if !r { return false }
+    }
+    if (*t).hspos > 0 {
+        let rest: usize = (*t).hsin.len - (*t).hspos
+        if rest > 0 {
+            rt.mem_copy((*t).hsin.ptr, (*t).hsin.ptr + (*t).hspos as u64, rest)
+        }
+        rt.buf_set_len(&(*t).hsin, rest)
+        (*t).hspos = 0
+    }
+    return true
+}
+
+fn handshake(t: *mut tys.TlsServer, ht: u32, msg: *mut rt.Buf) -> bool {
+    let st: u32 = (*t).state
+    if st == tys.ST_HELLO || st == tys.ST_HELLO2 {
+        if ht != tys.HS_CLIENT_HELLO { return core.fail(t, tys.A_UNEXPECTED) }
+        // A handshake message must not straddle a key change (RFC 8446
+        // 5.1): nothing may follow the ClientHello in the same flight.
+        if (*t).hsin.len - (*t).hspos != 0 { return core.fail(t, tys.A_UNEXPECTED) }
+        return client_hello(t, msg)
+    }
+    if st == tys.ST_WAIT_FIN {
+        if ht != tys.HS_FINISHED { return core.fail(t, tys.A_UNEXPECTED) }
+        return fl.client_finished(t, msg)
+    }
+    if st == tys.ST_OPEN {
+        if ht != tys.HS_KEY_UPDATE { return core.fail(t, tys.A_UNEXPECTED) }
+        if (*msg).len != 5 { return core.fail(t, tys.A_DECODE) }
+        let req: u8 = rt.ld8((*msg).ptr, 4)
+        if req > 1 as u8 { return core.fail(t, tys.A_ILLEGAL) }
+        if !core.next_secret((&(*t).c_ap[0]) as u64) { return core.fail(t, tys.A_INTERNAL) }
+        if !core.set_read_keys(t, (&(*t).c_ap[0]) as u64) { return core.fail(t, tys.A_INTERNAL) }
+        if req == 1 as u8 {
+            var ku: [u8; 5] = [24, 0, 0, 1, 0]
+            core.write_record(t, tys.REC_HANDSHAKE, (&ku[0]) as u64, 5)
+            if !core.next_secret((&(*t).s_ap[0]) as u64) { return core.fail(t, tys.A_INTERNAL) }
+            if !core.set_write_keys(t, (&(*t).s_ap[0]) as u64) { return core.fail(t, tys.A_INTERNAL) }
+        }
+        return true
+    }
+    return core.fail(t, tys.A_UNEXPECTED)
+}
+
+fn client_hello(t: *mut tys.TlsServer, msg: *mut rt.Buf) -> bool {
+    let p: u64 = (*msg).ptr
+    let end: usize = (*msg).len
+    var at: usize = 4
+    if at + 35 > end { return core.fail(t, tys.A_DECODE) }
+    at = at + 2 + 32 // legacy_version, random
+    let sl: usize = rt.ld8(p, at) as usize
+    at = at + 1
+    if sl > 32 || at + sl > end { return core.fail(t, tys.A_DECODE) }
+    (*t).sidlen = sl
+    rt.mem_copy((&(*t).sid[0]) as u64, p + at as u64, sl)
+    at = at + sl
+    if at + 2 > end { return core.fail(t, tys.A_DECODE) }
+    let csl: usize = core.be16(p, at)
+    at = at + 2
+    if csl % 2 != 0 || at + csl > end { return core.fail(t, tys.A_DECODE) }
+    var chosen: u32 = 0
+    var k: usize = 0
+    while k < csl {
+        let cs: u32 = core.be16(p, at + k) as u32
+        if chosen == 0 && (cs == tys.SUITE_AES128GCM || cs == tys.SUITE_CHACHA20) {
+            chosen = cs
+        }
+        k = k + 2
+    }
+    at = at + csl
+    if at + 1 > end { return core.fail(t, tys.A_DECODE) }
+    let cml: usize = rt.ld8(p, at) as usize
+    at = at + 1
+    if at + cml > end { return core.fail(t, tys.A_DECODE) }
+    at = at + cml
+    // extensions
+    (*t).have_share = false
+    (*t).v13 = false
+    (*t).ecdsa_ok = false
+    (*t).alpn_offered = false
+    (*t).alpn_h11 = false
+    (*t).alpn_h2 = false
+    if at + 2 > end { return core.fail(t, tys.A_MISSING_EXT) }
+    let el: usize = core.be16(p, at)
+    at = at + 2
+    if at + el != end { return core.fail(t, tys.A_DECODE) }
+    while at < end {
+        if at + 4 > end { return core.fail(t, tys.A_DECODE) }
+        let et: usize = core.be16(p, at)
+        let elen: usize = core.be16(p, at + 2)
+        at = at + 4
+        if at + elen > end { return core.fail(t, tys.A_DECODE) }
+        if !extension(t, et, p, at, elen) { return false }
+        at = at + elen
+    }
+    if !(*t).v13 { return core.fail(t, tys.A_PROTOCOL_VERSION) }
+    if chosen == 0 || !(*t).ecdsa_ok { return core.fail(t, tys.A_HANDSHAKE_FAILURE) }
+    if (*t).alpn_offered && !(*t).alpn_h11 && !((*t).alpn_h2 && (*(*t).cfg).h2) { return core.fail(t, tys.A_NO_APP_PROTOCOL) }
+    if (*t).state == tys.ST_HELLO2 && chosen != (*t).suite {
+        return core.fail(t, tys.A_ILLEGAL)
+    }
+    (*t).suite = chosen
+    (*t).keylen = 16
+    if chosen == tys.SUITE_CHACHA20 { (*t).keylen = 32 }
+    if !(*t).have_share {
+        if (*t).offers_x25519 && (*t).state == tys.ST_HELLO {
+            return fl.hello_retry(t, msg)
+        }
+        return core.fail(t, tys.A_HANDSHAKE_FAILURE)
+    }
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    return fl.server_flight(t)
+}
+
+fn extension(t: *mut tys.TlsServer, et: usize, p: u64, at: usize, len: usize) -> bool {
+    if et == 43 { // supported_versions
+        if len < 1 { return core.fail(t, tys.A_DECODE) }
+        let l: usize = rt.ld8(p, at) as usize
+        if l + 1 != len || l % 2 != 0 { return core.fail(t, tys.A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if core.be16(p, at + 1 + k) == 772 { (*t).v13 = true }
+            k = k + 2
+        }
+        return true
+    }
+    if et == 10 { // supported_groups
+        if len < 2 { return core.fail(t, tys.A_DECODE) }
+        let l: usize = core.be16(p, at)
+        if l + 2 != len || l % 2 != 0 { return core.fail(t, tys.A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if core.be16(p, at + 2 + k) == 29 { (*t).offers_x25519 = true }
+            k = k + 2
+        }
+        return true
+    }
+    if et == 51 { // key_share
+        if len < 2 { return core.fail(t, tys.A_DECODE) }
+        let l: usize = core.be16(p, at)
+        if l + 2 != len { return core.fail(t, tys.A_DECODE) }
+        var k: usize = at + 2
+        while k < at + len {
+            if k + 4 > at + len { return core.fail(t, tys.A_DECODE) }
+            let g: usize = core.be16(p, k)
+            let kl: usize = core.be16(p, k + 2)
+            if k + 4 + kl > at + len { return core.fail(t, tys.A_DECODE) }
+            if g == 29 && kl == 32 && !(*t).have_share {
+                rt.mem_copy((&(*t).cshare[0]) as u64, p + (k + 4) as u64, 32)
+                (*t).have_share = true
+            }
+            k = k + 4 + kl
+        }
+        return true
+    }
+    if et == 13 { // signature_algorithms
+        if len < 2 { return core.fail(t, tys.A_DECODE) }
+        let l: usize = core.be16(p, at)
+        if l + 2 != len || l % 2 != 0 { return core.fail(t, tys.A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if core.be16(p, at + 2 + k) == 1027 { (*t).ecdsa_ok = true } // 0x0403
+            k = k + 2
+        }
+        return true
+    }
+    if et == 16 { // ALPN
+        if len < 2 { return core.fail(t, tys.A_DECODE) }
+        let l: usize = core.be16(p, at)
+        if l + 2 != len { return core.fail(t, tys.A_DECODE) }
+        (*t).alpn_offered = true
+        var k: usize = at + 2
+        while k < at + len {
+            let pl: usize = rt.ld8(p, k) as usize
+            if pl == 0 || k + 1 + pl > at + len { return core.fail(t, tys.A_DECODE) }
+            if pl == 8 && rt.mem_eq(p + (k + 1) as u64, "http/1.1".p as u64, 8) {
+                (*t).alpn_h11 = true
+            }
+            if pl == 2 && rt.mem_eq(p + (k + 1) as u64, "h2".p as u64, 2) {
+                (*t).alpn_h2 = true
+            }
+            k = k + 1 + pl
+        }
+        return true
+    }
+    if et == 0 { // server_name
+        if len >= 5 && rt.ld8(p, at + 2) == 0 as u8 {
+            let hl: usize = core.be16(p, at + 3)
+            if hl <= 255 && at + 5 + hl <= at + len {
+                rt.mem_copy((&(*t).sni[0]) as u64, p + (at + 5) as u64, hl)
+                (*t).snilen = hl
+            }
+        }
+        return true
+    }
+    return true
+}

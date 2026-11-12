@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+import tls.tsrv_types as tys
+import tls.tsrv_core as core
+import tls.tsrv_hello as hl
+
+fn feed(t: *mut tys.TlsServer, p: u64, n: usize) -> bool {
+    if (*t).state == tys.ST_FAILED || (*t).state == tys.ST_CLOSED { return false }
+    rt.buf_push_bytes(&(*t).rbuf, p, n)
+    while (*t).state != tys.ST_FAILED && (*t).state != tys.ST_CLOSED {
+        let have: usize = (*t).rbuf.len - (*t).rpos
+        if have < 5 { break }
+        let base: u64 = (*t).rbuf.ptr + (*t).rpos as u64
+        let kind0: u32 = rt.ld8(base, 0) as u32
+        // Anything but the four record types, or a version octet other
+        // than 3, is not TLS at all -- plain HTTP sent to the TLS port
+        // lands here -- and is refused before its "length" is believed.
+        if kind0 < tys.REC_CCS || kind0 > tys.REC_APPDATA || rt.ld8(base, 1) != 3 as u8 {
+            return core.fail(t, tys.A_DECODE)
+        }
+        let len: usize = core.be16(base, 3)
+        if len > tys.MAX_CIPHER { return core.fail(t, tys.A_OVERFLOW) }
+        if have < 5 + len { break }
+        let kind: u32 = rt.ld8(base, 0) as u32
+        (*t).rpos = (*t).rpos + 5 + len
+        if !record(t, kind, base, len) { break }
+    }
+    // compact
+    if (*t).rpos > 0 {
+        let rest: usize = (*t).rbuf.len - (*t).rpos
+        if rest > 0 {
+            rt.mem_copy((*t).rbuf.ptr, (*t).rbuf.ptr + (*t).rpos as u64, rest)
+        }
+        rt.buf_set_len(&(*t).rbuf, rest)
+        (*t).rpos = 0
+    }
+    return (*t).state != tys.ST_FAILED && (*t).state != tys.ST_CLOSED
+}
+
+fn record(t: *mut tys.TlsServer, kind: u32, head: u64, len: usize) -> bool {
+    let body: u64 = head + 5
+    if kind == tys.REC_CCS {
+        // allowed (and meaningless) only during the handshake, value 1
+        if (*t).state == tys.ST_OPEN || len != 1 || rt.ld8(body, 0) != 1 as u8 {
+            return core.fail(t, tys.A_UNEXPECTED)
+        }
+        return true
+    }
+    if !(*t).rkeys {
+        if kind == tys.REC_ALERT {
+            return got_alert(t, body, len)
+        }
+        if kind != tys.REC_HANDSHAKE { return core.fail(t, tys.A_UNEXPECTED) }
+        if len > tys.MAX_PLAIN { return core.fail(t, tys.A_OVERFLOW) }
+        rt.buf_push_bytes(&(*t).hsin, body, len)
+        return hl.handshake_messages(t)
+    }
+    if kind != tys.REC_APPDATA { return core.fail(t, tys.A_UNEXPECTED) }
+    if len < 17 { return core.fail(t, tys.A_DECODE) }
+    var plain: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&plain, len)
+    var nonce: [u8; 12] = [0; 12]
+    core.make_nonce((&(*t).riv[0]) as u64, (*t).rseq, (&nonce[0]) as u64)
+    var ok: bool = false
+    if (*t).suite == tys.SUITE_CHACHA20 {
+        ok = chacha.aead_open((&(*t).rkey[0]) as u64, (&nonce[0]) as u64, head, 5,
+            body, len, plain.ptr)
+    } else {
+        ok = gcm.gcm_open((&(*t).rkey[0]) as u64, (*t).keylen, (&nonce[0]) as u64,
+            head, 5, body, len, plain.ptr)
+    }
+    if !ok {
+        rt.buf_free(&plain)
+        return core.fail(t, tys.A_BAD_MAC)
+    }
+    (*t).rseq = (*t).rseq + 1
+    var pn: usize = len - 16
+    while pn > 0 && rt.ld8(plain.ptr, pn - 1) == 0 as u8 {
+        pn = pn - 1
+    }
+    if pn == 0 {
+        rt.buf_free(&plain)
+        return core.fail(t, tys.A_UNEXPECTED)
+    }
+    let inner: u32 = rt.ld8(plain.ptr, pn - 1) as u32
+    pn = pn - 1
+    if pn > tys.MAX_PLAIN {
+        rt.buf_free(&plain)
+        return core.fail(t, tys.A_OVERFLOW)
+    }
+    var r: bool = true
+    if inner == tys.REC_APPDATA {
+        if (*t).state != tys.ST_OPEN {
+            r = core.fail(t, tys.A_UNEXPECTED)
+        } else {
+            rt.buf_push_bytes(&(*t).app, plain.ptr, pn)
+        }
+    } else if inner == tys.REC_HANDSHAKE {
+        rt.buf_push_bytes(&(*t).hsin, plain.ptr, pn)
+        r = hl.handshake_messages(t)
+    } else if inner == tys.REC_ALERT {
+        r = got_alert(t, plain.ptr, pn)
+    } else {
+        r = core.fail(t, tys.A_UNEXPECTED)
+    }
+    rt.buf_free(&plain)
+    return r
+}
+
+fn got_alert(t: *mut tys.TlsServer, p: u64, n: usize) -> bool {
+    if n != 2 { return core.fail(t, tys.A_DECODE) }
+    (*t).alert_in = rt.ld8(p, 1) as u32
+    if (*t).alert_in == tys.A_CLOSE_NOTIFY {
+        // answer in kind, then the connection is over
+        if (*t).state == tys.ST_OPEN {
+            var a: [u8; 2] = [1, 0]
+            core.write_record(t, tys.REC_ALERT, (&a[0]) as u64, 2)
+        }
+        (*t).state = tys.ST_CLOSED
+        return false
+    }
+    (*t).state = tys.ST_FAILED
+    return false
+}
+
+fn send(t: *mut tys.TlsServer, p: u64, n: usize) -> bool {
+    if (*t).state != tys.ST_OPEN { return false }
+    var at: usize = 0
+    while at < n {
+        var k: usize = n - at
+        if k > tys.MAX_PLAIN { k = tys.MAX_PLAIN }
+        if !core.write_record(t, tys.REC_APPDATA, p + at as u64, k) { return false }
+        at = at + k
+    }
+    return true
+}
+
+fn close(t: *mut tys.TlsServer) {
+    if (*t).state == tys.ST_OPEN || (*t).state == tys.ST_WAIT_FIN {
+        var a: [u8; 2] = [1, 0]
+        core.write_record(t, tys.REC_ALERT, (&a[0]) as u64, 2)
+        (*t).state = tys.ST_CLOSED
+    }
+}

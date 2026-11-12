@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+import tls.tsrv_types as tys
+import tls.tsrv_core as core
+
+export {
+    client_finished, hello_retry, server_flight,
+}
+
+fn hello_retry(t: *mut tys.TlsServer, ch1: *mut rt.Buf) -> bool {
+    var h: [u8; 32] = [0; 32]
+    sha256.sha256((*ch1).ptr, (*ch1).len, (&h[0]) as u64)
+    rt.buf_clear(&(*t).tr)
+    rt.buf_push(&(*t).tr, tys.HS_MESSAGE_HASH as u8)
+    core.push24(&(*t).tr, 32)
+    rt.buf_push_bytes(&(*t).tr, (&h[0]) as u64, 32)
+    var hrr_random: [u8; 32] = [207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140,
+        2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226,
+        200, 168, 51, 156]
+    var body: rt.Buf = rt.buf_new()
+    core.push16(&body, 771)
+    rt.buf_push_bytes(&body, (&hrr_random[0]) as u64, 32)
+    rt.buf_push(&body, (*t).sidlen as u8)
+    rt.buf_push_bytes(&body, (&(*t).sid[0]) as u64, (*t).sidlen)
+    core.push16(&body, (*t).suite as usize)
+    rt.buf_push(&body, 0 as u8)
+    core.push16(&body, 12)
+    core.push16(&body, 43) // supported_versions: 0x0304
+    core.push16(&body, 2)
+    core.push16(&body, 772)
+    core.push16(&body, 51) // key_share: selected_group x25519
+    core.push16(&body, 2)
+    core.push16(&body, 29)
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push(&msg, tys.HS_SERVER_HELLO as u8)
+    core.push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    let ok: bool = core.write_handshake(t, &msg)
+    rt.buf_free(&body)
+    rt.buf_free(&msg)
+    if (*t).sidlen > 0 {
+        var ccs: [u8; 1] = [1]
+        core.write_record(t, tys.REC_CCS, (&ccs[0]) as u64, 1)
+    }
+    (*t).state = tys.ST_HELLO2
+    (*t).retried = true
+    return ok
+}
+
+fn server_flight(t: *mut tys.TlsServer) -> bool {
+    // our half of the X25519 exchange
+    var priv: [u8; 32] = [0; 32]
+    var pubk: [u8; 32] = [0; 32]
+    var srnd: [u8; 32] = [0; 32]
+    if !random.random_bytes((&priv[0]) as u64, 32) { return core.fail(t, tys.A_INTERNAL) }
+    if !random.random_bytes((&srnd[0]) as u64, 32) { return core.fail(t, tys.A_INTERNAL) }
+    if !x25519.x25519_keypair((&priv[0]) as u64, (&pubk[0]) as u64) {
+        return core.fail(t, tys.A_INTERNAL)
+    }
+    var shared: [u8; 32] = [0; 32]
+    if !x25519.x25519((&priv[0]) as u64, (&(*t).cshare[0]) as u64,
+        (&shared[0]) as u64) {
+        return core.fail(t, tys.A_ILLEGAL) // the all-zero result: a low order point
+    }
+    rt.mem_set((&priv[0]) as u64, 0 as u8, 32)
+    // ServerHello
+    var body: rt.Buf = rt.buf_new()
+    core.push16(&body, 771)
+    rt.buf_push_bytes(&body, (&srnd[0]) as u64, 32)
+    rt.buf_push(&body, (*t).sidlen as u8)
+    rt.buf_push_bytes(&body, (&(*t).sid[0]) as u64, (*t).sidlen)
+    core.push16(&body, (*t).suite as usize)
+    rt.buf_push(&body, 0 as u8)
+    core.push16(&body, 46)
+    core.push16(&body, 43)
+    core.push16(&body, 2)
+    core.push16(&body, 772)
+    core.push16(&body, 51)
+    core.push16(&body, 36)
+    core.push16(&body, 29)
+    core.push16(&body, 32)
+    rt.buf_push_bytes(&body, (&pubk[0]) as u64, 32)
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push(&msg, tys.HS_SERVER_HELLO as u8)
+    core.push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    core.write_handshake(t, &msg)
+    if (*t).sidlen > 0 && !(*t).retried {
+        var ccs: [u8; 1] = [1]
+        core.write_record(t, tys.REC_CCS, (&ccs[0]) as u64, 1)
+    }
+    // handshake keys
+    var early: [u8; 32] = [0; 32]
+    keys.key_schedule_early((&early[0]) as u64)
+    if !keys.key_schedule_handshake((&early[0]) as u64, (&shared[0]) as u64, 32,
+        (&(*t).hs_secret[0]) as u64) {
+        return core.fail(t, tys.A_INTERNAL)
+    }
+    rt.mem_set((&shared[0]) as u64, 0 as u8, 32)
+    var lc: [u8; 12] = "c hs traffic"
+    var ls: [u8; 12] = "s hs traffic"
+    keys.derive_secret((&(*t).hs_secret[0]) as u64, (&lc[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).c_hs[0]) as u64)
+    keys.derive_secret((&(*t).hs_secret[0]) as u64, (&ls[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).s_hs[0]) as u64)
+    core.set_write_keys(t, (&(*t).s_hs[0]) as u64)
+    core.set_read_keys(t, (&(*t).c_hs[0]) as u64)
+    // EncryptedExtensions
+    rt.buf_clear(&body)
+    if tys.alpn_is_h2(t) {
+        core.push16(&body, 9)
+        core.push16(&body, 16)
+        core.push16(&body, 5)
+        core.push16(&body, 3)
+        rt.buf_push(&body, 2 as u8)
+        rt.buf_push_bytes(&body, "h2".p as u64, 2)
+    } else if (*t).alpn_h11 {
+        core.push16(&body, 15)
+        core.push16(&body, 16)
+        core.push16(&body, 11)
+        core.push16(&body, 9)
+        rt.buf_push(&body, 8 as u8)
+        rt.buf_push_bytes(&body, "http/1.1".p as u64, 8)
+    } else {
+        core.push16(&body, 0)
+    }
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, tys.HS_ENCRYPTED_EXT as u8)
+    core.push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    core.write_handshake(t, &msg)
+    // Certificate
+    let cfg: *mut tys.TlsConfig = (*t).cfg
+    rt.buf_clear(&body)
+    rt.buf_push(&body, 0 as u8) // certificate_request_context
+    var total: usize = 0
+    var i: usize = 0
+    while i < (*cfg).n {
+        total = total + 3 + (*cfg).len[i] + 2
+        i = i + 1
+    }
+    core.push24(&body, total)
+    i = 0
+    while i < (*cfg).n {
+        core.push24(&body, (*cfg).len[i])
+        rt.buf_push_bytes(&body, tys.config_cert_ptr(cfg, i), (*cfg).len[i])
+        core.push16(&body, 0)
+        i = i + 1
+    }
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, tys.HS_CERTIFICATE as u8)
+    core.push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    core.write_handshake(t, &msg)
+    // CertificateVerify (RFC 8446 4.4.3)
+    var content: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 64 {
+        rt.buf_push(&content, 32 as u8)
+        i = i + 1
+    }
+    let label: str = "TLS 1.3, server CertificateVerify"
+    rt.buf_push_bytes(&content, label.p as u64, label.n)
+    rt.buf_push(&content, 0 as u8)
+    var th: [u8; 32] = [0; 32]
+    keys.transcript((*t).tr.ptr, (*t).tr.len, (&th[0]) as u64)
+    rt.buf_push_bytes(&content, (&th[0]) as u64, 32)
+    var digest: [u8; 32] = [0; 32]
+    sha256.sha256(content.ptr, content.len, (&digest[0]) as u64)
+    rt.buf_free(&content)
+    var extra: [u8; 32] = [0; 32]
+    random.random_bytes((&extra[0]) as u64, 32)
+    var r: [u8; 32] = [0; 32]
+    var s: [u8; 32] = [0; 32]
+    if !p256.p256_sign(tys.config_key_ptr(cfg), (&digest[0]) as u64, (&extra[0]) as u64, 32,
+        (&r[0]) as u64, (&s[0]) as u64) {
+        return core.fail(t, tys.A_INTERNAL)
+    }
+    var sig: rt.Buf = rt.buf_new()
+    p256.p256_sig_der((&r[0]) as u64, (&s[0]) as u64, &sig)
+    rt.buf_clear(&body)
+    core.push16(&body, 1027)
+    core.push16(&body, sig.len)
+    rt.buf_push_bytes(&body, sig.ptr, sig.len)
+    rt.buf_free(&sig)
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, tys.HS_CERT_VERIFY as u8)
+    core.push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    core.write_handshake(t, &msg)
+    // Finished
+    var fkey: [u8; 32] = [0; 32]
+    keys.finished_key((&(*t).s_hs[0]) as u64, (&fkey[0]) as u64)
+    var mac: [u8; 32] = [0; 32]
+    keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, (*t).tr.len, (&mac[0]) as u64)
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, tys.HS_FINISHED as u8)
+    core.push24(&msg, 32)
+    rt.buf_push_bytes(&msg, (&mac[0]) as u64, 32)
+    core.write_handshake(t, &msg)
+    rt.buf_free(&body)
+    rt.buf_free(&msg)
+    // application secrets over ClientHello..server Finished
+    var ms: [u8; 32] = [0; 32]
+    if !keys.key_schedule_master((&(*t).hs_secret[0]) as u64, (&ms[0]) as u64) {
+        return core.fail(t, tys.A_INTERNAL)
+    }
+    var lca: [u8; 12] = "c ap traffic"
+    var lsa: [u8; 12] = "s ap traffic"
+    keys.derive_secret((&ms[0]) as u64, (&lca[0]) as u64, 12, (*t).tr.ptr,
+        (*t).tr.len, (&(*t).c_ap[0]) as u64)
+    keys.derive_secret((&ms[0]) as u64, (&lsa[0]) as u64, 12, (*t).tr.ptr,
+        (*t).tr.len, (&(*t).s_ap[0]) as u64)
+    rt.mem_set((&ms[0]) as u64, 0 as u8, 32)
+    core.set_write_keys(t, (&(*t).s_ap[0]) as u64)
+    (*t).state = tys.ST_WAIT_FIN
+    return true
+}
+
+fn client_finished(t: *mut tys.TlsServer, msg: *mut rt.Buf) -> bool {
+    if (*msg).len != 36 { return core.fail(t, tys.A_DECODE) }
+    var fkey: [u8; 32] = [0; 32]
+    keys.finished_key((&(*t).c_hs[0]) as u64, (&fkey[0]) as u64)
+    var mac: [u8; 32] = [0; 32]
+    keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, (*t).tr.len, (&mac[0]) as u64)
+    if !hmac.hmac_equal((&mac[0]) as u64, (*msg).ptr + 4, 32) {
+        return core.fail(t, tys.A_DECRYPT)
+    }
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    core.set_read_keys(t, (&(*t).c_ap[0]) as u64)
+    rt.mem_set((&(*t).hs_secret[0]) as u64, 0 as u8, 32)
+    (*t).state = tys.ST_OPEN
+    return true
+}

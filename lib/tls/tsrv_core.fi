@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+import tls.tsrv_types as tys
+
+export {
+    be16, be24, fail, make_nonce, next_secret, push16, push24, set_read_keys, set_write_keys, write_handshake, write_record,
+}
+
+fn be16(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 8) | (rt.ld8(p, off + 1) as usize)
+}
+
+fn be24(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 16) | ((rt.ld8(p, off + 1) as usize) << 8)
+    | (rt.ld8(p, off + 2) as usize)
+}
+
+fn push16(b: *mut rt.Buf, v: usize) {
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+fn push24(b: *mut rt.Buf, v: usize) {
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+fn make_nonce(iv: u64, seq: u64, out: u64) {
+    rt.mem_copy(out, iv, 12)
+    var i: usize = 0
+    while i < 8 {
+        let sh: u64 = ((7 - i) as u64) * 8
+        rt.st8(out, 4 + i, rt.ld8(out, 4 + i) ^ ((seq >> sh) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn fail(t: *mut tys.TlsServer, desc: u32) -> bool {
+    if (*t).state == tys.ST_FAILED || (*t).state == tys.ST_CLOSED {
+        return false
+    }
+    var a: [u8; 2] = [2, 0]
+    a[1] = desc as u8
+    write_record(t, tys.REC_ALERT, (&a[0]) as u64, 2)
+    (*t).alert_out = desc
+    (*t).state = tys.ST_FAILED
+    return false
+}
+
+fn write_record(t: *mut tys.TlsServer, kind: u32, p: u64, n: usize) -> bool {
+    if !(*t).wkeys {
+        rt.buf_push(&(*t).out, kind as u8)
+        push16(&(*t).out, 771)
+        push16(&(*t).out, n)
+        rt.buf_push_bytes(&(*t).out, p, n)
+        return true
+    }
+    var inner: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&inner, p, n)
+    rt.buf_push(&inner, kind as u8)
+    let clen: usize = inner.len + 16
+    var head: [u8; 5] = [23, 3, 3, 0, 0]
+    head[3] = ((clen >> 8) & 255) as u8
+    head[4] = (clen & 255) as u8
+    var nonce: [u8; 12] = [0; 12]
+    make_nonce((&(*t).wiv[0]) as u64, (*t).wseq, (&nonce[0]) as u64)
+    rt.buf_push_bytes(&(*t).out, (&head[0]) as u64, 5)
+    let at: usize = (*t).out.len
+    rt.buf_reserve(&(*t).out, at + clen)
+    rt.buf_set_len(&(*t).out, at + clen)
+    var ok: bool = true
+    if (*t).suite == tys.SUITE_CHACHA20 {
+        chacha.aead_seal((&(*t).wkey[0]) as u64, (&nonce[0]) as u64,
+            (&head[0]) as u64, 5, inner.ptr, inner.len, (*t).out.ptr + at as u64)
+    } else {
+        ok = gcm.gcm_seal((&(*t).wkey[0]) as u64, (*t).keylen, (&nonce[0]) as u64,
+            (&head[0]) as u64, 5, inner.ptr, inner.len, (*t).out.ptr + at as u64)
+    }
+    rt.buf_free(&inner)
+    (*t).wseq = (*t).wseq + 1
+    return ok
+}
+
+fn write_handshake(t: *mut tys.TlsServer, msg: *mut rt.Buf) -> bool {
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    var at: usize = 0
+    while at < (*msg).len {
+        var k: usize = (*msg).len - at
+        if k > tys.MAX_PLAIN { k = tys.MAX_PLAIN }
+        if !write_record(t, tys.REC_HANDSHAKE, (*msg).ptr + at as u64, k) { return false }
+        at = at + k
+    }
+    return true
+}
+
+fn set_read_keys(t: *mut tys.TlsServer, secret: u64) -> bool {
+    (*t).rseq = 0
+    (*t).rkeys = true
+    return keys.traffic_keys(secret, (*t).keylen, (&(*t).rkey[0]) as u64,
+        (&(*t).riv[0]) as u64)
+}
+
+fn set_write_keys(t: *mut tys.TlsServer, secret: u64) -> bool {
+    (*t).wseq = 0
+    (*t).wkeys = true
+    return keys.traffic_keys(secret, (*t).keylen, (&(*t).wkey[0]) as u64,
+        (&(*t).wiv[0]) as u64)
+}
+
+fn next_secret(secret: u64) -> bool {
+    var lit: [u8; 11] = "traffic upd"
+    var empty: [u8; 1] = [0; 1]
+    var nx: [u8; 32] = [0; 32]
+    if !keys.expand_label(secret, (&lit[0]) as u64, 11, (&empty[0]) as u64, 0,
+        (&nx[0]) as u64, 32) {
+        return false
+    }
+    rt.mem_copy(secret, (&nx[0]) as u64, 32)
+    return true
+}
