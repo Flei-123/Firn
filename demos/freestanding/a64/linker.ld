@@ -34,6 +34,8 @@ SECTIONS
     .bss    : ALIGN(16) { *(COMMON) *(.bss .bss.*) }
     . = ALIGN(16);
     __bss_end = .;
+    . += 0x4000;
+    __stack_top = .;
 
     /DISCARD/ : { *(.note.GNU-stack) *(.comment) *(.eh_frame) }
 }
