@@ -64,6 +64,7 @@ mod ifexpr;
 mod gc_lower;
 mod gc_ext;
 mod iface;
+mod impl_generic;
 mod impls;
 mod core;
 mod inline;

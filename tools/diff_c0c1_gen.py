@@ -915,6 +915,26 @@ NEG = [
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)
 
+IMPL_GENERIC_RUN = [
+    ("get_set", "struct Box[T] { value: T, count: i32 }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n    fn set(*mut self, v: T) {\n        (*self).value = v\n        (*self).count = (*self).count + 1\n    }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 7, count: 0 }\n    a.set(a.get() + 2)\n    put(a.get() as i64)\n    put(a.count as i64)\n    var b: Box[u8] = Box[u8] { value: 200 as u8, count: 0 }\n    b.set(b.get() + 5 as u8)\n    put(b.get() as i64)\n    return 0\n}\n"),
+    ("two_params", "struct Pair[A, B] { first: A, second: B }\nimpl Pair[A, B] {\n    fn swapped(*self) -> Pair[B, A] {\n        return Pair[B, A] { first: (*self).second, second: (*self).first }\n    }\n    fn second_of(*self) -> B { return (*self).second }\n}\nfn main() -> i32 {\n    var p: Pair[i32, i64] = Pair[i32, i64] { first: 5, second: 90 }\n    let q: Pair[i64, i32] = p.swapped()\n    put(q.first)\n    put(q.second_of() as i64)\n    put(p.second_of())\n    return 0\n}\n"),
+    ("nested_calls", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n    fn same(*self) -> T { return self.get() }\n}\nfn main() -> i32 {\n    var inner: Box[i32] = Box[i32] { value: 21 }\n    var outer: Box[Box[i32]] = Box[Box[i32]] { value: inner }\n    let got: Box[i32] = outer.same()\n    put(got.get() as i64)\n    put(inner.same() as i64)\n    return 0\n}\n"),
+    ("value_receiver_and_blocks", "struct Cell[T] { v: T }\nimpl Cell[T] {\n    fn take(self) -> T { return self.v }\n}\nimpl Cell[X] {\n    fn peek(*self) -> X { return (*self).v }\n}\nfn main() -> i32 {\n    var c: Cell[i16] = Cell[i16] { v: 12 as i16 }\n    put(c.peek() as i64)\n    put(c.take() as i64)\n    return 0\n}\n"),
+]
+for nm, src in IMPL_GENERIC_RUN:
+    emit("impl_generic_" + nm, "run", "same", src)
+
+IMPL_GENERIC_NEG = [
+    ("no_method", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    return a.missing()\n}\n"),
+    ("arg_type", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn set(*mut self, v: T) { (*self).value = v }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    a.set(true)\n    return 0\n}\n"),
+    ("arg_count", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn set(*mut self, v: T) { (*self).value = v }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    a.set(1, 2)\n    return 0\n}\n"),
+    ("duplicate", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n}\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+    ("no_receiver", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn make(v: T) -> i32 { return 0 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+    ("body_type", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return true }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    return a.get()\n}\n"),
+]
+for nm, src in IMPL_GENERIC_NEG:
+    emit("neg_impl_generic_" + nm, "neg", "", src, prelude=False)
+
 # sanity programs that MUST be accepted by both (guard against both-reject hiding in neg)
 emit("ok_struct_no_comma", "run", "same", "struct S { a: i32 b: i32 }\nfn main() -> i32 {\n    let s: S = S { a: 1, b: 2 }\n    put((s.a + s.b) as i64)\n    return 0\n}\n")
 emit("ok_empty_main", "run", "same", "fn main() -> i32 {\n    return 0\n}\n", prelude=False)

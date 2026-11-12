@@ -145,6 +145,9 @@ pub(crate) fn hook_item(p: &mut Parser, prog: &mut Program) -> bool {
             impl_decl(p, prog, false);
             true
         }
+        Some(TokKind::LBracket) => {
+            crate::impl_generic::hook_item(p)
+        }
         Some(TokKind::KwFor) => {
             if !matches!(p.toks.get(p.pos + 3).map(|t| &t.kind), Some(TokKind::Ident(_))) {
                 return false;
@@ -249,10 +252,13 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         // One broken method aborts the WHOLE block. Otherwise the actual
         // message is followed by a cascade of consequential errors, and the
         // first one — the only one that explains anything — drowns in it.
-        if !method(p, prog, &ty, tsp, is_for) {
-            p.recovering = false;
-            p.sync_item();
-            return;
+        match method(p, &ty, &ty, tsp, is_for) {
+            Some(decl) => prog.funcs.push(decl),
+            None => {
+                p.recovering = false;
+                p.sync_item();
+                return;
+            }
         }
         if p.pos == before {
             p.bump();
@@ -264,34 +270,40 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
 }
 
 /// One method: `fn name(<receiver>[, param…]) [-> T] { … }`.
-/// `false` = aborted, the surrounding `impl` block is discarded.
-fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool) -> bool {
+/// `None` = aborted, the surrounding `impl` block is discarded.
+pub(crate) fn method(
+    p: &mut Parser,
+    ty: &str,
+    self_ty: &str,
+    tsp: Span,
+    is_for: bool,
+) -> Option<FnDecl> {
     let start = p.bump(); // 'fn'
     let name = match p.ident("after 'fn' in an impl block") {
         Some((n, _)) => n,
         None => {
             p.recovering = false;
             p.sync_item();
-            return false;
+            return None;
         }
     };
     if p.at(&TokKind::LBracket) {
         p.error_here("a method cannot be generic in this stage");
         p.recovering = false;
         p.sync_item();
-        return false;
+        return None;
     }
     if !p.expect(TokKind::LParen, "after the method name") {
         p.recovering = false;
         p.sync_item();
-        return false;
+        return None;
     }
-    let slf = match self_param(p, ty, tsp) {
+    let slf = match self_param(p, self_ty, tsp) {
         Some(x) => x,
         None => {
             p.recovering = false;
             p.sync_item();
-            return false;
+            return None;
         }
     };
     let mut params = vec![slf];
@@ -313,7 +325,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool)
             None => {
                 p.recovering = false;
                 p.sync_item();
-                return false;
+                return None;
             }
         }
     } else {
@@ -326,7 +338,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool)
         ));
         p.recovering = false;
         p.sync_item();
-        return false;
+        return None;
     }
     let saved_ret = std::mem::replace(&mut p.cur_ret, ret.clone());
     let mut body = p.block("at the start of the method body");
@@ -334,7 +346,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool)
     p.recovering = false;
     p.finish_body(&ref_params, &mut body);
     let attrs = std::mem::take(&mut p.pending_attrs);
-    prog.funcs.push(FnDecl {
+    Some(FnDecl {
         name: fn_name(ty, &name),
         params,
         ret,
@@ -342,8 +354,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool)
         span: start,
         attrs,
         extern_info: None,
-    });
-    true
+    })
 }
 
 /// The receiver: `self`, `*self` or `*mut self`.

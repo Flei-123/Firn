@@ -56,7 +56,7 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
         if inst.is_fn {
             expand_fn(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
         } else {
-            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue);
+            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
         }
     }
     prog.expr_count = next_id;
@@ -91,7 +91,7 @@ pub fn expand_late(prog: &mut Program, dg: &mut Diags) {
         if inst.is_fn {
             expand_fn(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
         } else {
-            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue);
+            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
         }
     }
     prog.expr_count = next_id;
@@ -196,26 +196,54 @@ fn expand_fn(
         Some(m) => m,
         None => return,
     };
-    let mut decl: FnDecl = tpl.decl.clone();
-    decl.name = mangled.to_string();
+    let decl = instantiate_fn(&tpl.decl, mangled, &map, queue, next_id);
+    prog.funcs.push(decl);
+}
+
+fn instantiate_fn(
+    template: &FnDecl,
+    name: &str,
+    map: &HashMap<String, TypeExpr>,
+    queue: &mut Vec<(String, Instantiation)>,
+    next_id: &mut u32,
+) -> FnDecl {
+    let mut decl: FnDecl = template.clone();
+    decl.name = name.to_string();
     for p in decl.params.iter_mut() {
-        p.ty = subst_ty(&p.ty, &map, queue);
-        // r704: a default may name the type parameter (`b: T = 3 as T`)
+        p.ty = subst_ty(&p.ty, map, queue);
         if let Some(d) = p.default.as_mut() {
-            subst_expr(d, &map, queue);
+            subst_expr(d, map, queue);
             renumber_expr(d, next_id);
         }
     }
     if let Some(r) = decl.ret.as_mut() {
-        *r = subst_ty(r, &map, queue);
+        *r = subst_ty(r, map, queue);
     }
-    subst_block(&mut decl.body, &map, queue);
-    // r716: a closure literal inside a template: every instance gets fresh
-    // closure ids (one generated function + capture class per copy).
+    subst_block(&mut decl.body, map, queue);
     FRESH_LAMBDA.with(|f| f.set(true));
     renumber_block(&mut decl.body, next_id);
     FRESH_LAMBDA.with(|f| f.set(false));
-    prog.funcs.push(decl);
+    decl
+}
+
+fn expand_methods(
+    prog: &mut Program,
+    dg: &mut Diags,
+    fnames: &HashSet<String>,
+    mangled: &str,
+    inst: &Instantiation,
+    queue: &mut Vec<(String, Instantiation)>,
+    next_id: &mut u32,
+) {
+    for (method, tpl) in sema_generic::method_templates(&inst.base) {
+        let map = match bind_params(dg, fnames, &tpl.params, inst, "generic impl") {
+            Some(m) => m,
+            None => continue,
+        };
+        let name = format!("{}__{}", mangled, method);
+        let decl = instantiate_fn(&tpl.decl, &name, &map, queue, next_id);
+        prog.funcs.push(decl);
+    }
 }
 
 fn expand_struct(
@@ -225,6 +253,7 @@ fn expand_struct(
     mangled: &str,
     inst: &Instantiation,
     queue: &mut Vec<(String, Instantiation)>,
+    next_id: &mut u32,
 ) {
     let tpl = match sema_generic::struct_template(&inst.base) {
         Some(t) => t,
@@ -246,6 +275,7 @@ fn expand_struct(
         *te = subst_ty(te, &map, queue);
     }
     prog.structs.push(decl);
+    expand_methods(prog, dg, fnames, mangled, inst, queue, next_id);
 }
 
 fn satisfies(te: &TypeExpr, b: &Bound) -> bool {

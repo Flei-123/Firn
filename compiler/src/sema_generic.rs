@@ -115,6 +115,7 @@ struct Registry {
     /// still uses is not instantiated: its argument names a type that exists
     /// only under the qualified name.
     kept: crate::fx::HashSet<String>,
+    methods: HashMap<String, Vec<String>>,
     insts: HashMap<String, Instantiation>,
     order: Vec<String>,
     /// nesting depth while parsing a template
@@ -228,6 +229,47 @@ pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name:
             r.borrow_mut().structs.insert(name.to_string(), t);
         });
     }
+}
+
+pub(crate) fn enter_template() {
+    REG.with(|r| r.borrow_mut().in_template += 1);
+}
+
+pub(crate) fn leave_template() {
+    REG.with(|r| r.borrow_mut().in_template -= 1);
+}
+
+pub(crate) fn add_method_template(base: &str, method: &str, key: String, tpl: FnTemplate) -> bool {
+    REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        if reg.fns.contains_key(&key) {
+            return false;
+        }
+        reg.fns.insert(key.clone(), tpl);
+        reg.methods
+            .entry(base.to_string())
+            .or_default()
+            .push(method.to_string());
+        true
+    })
+}
+
+pub(crate) fn method_templates(base: &str) -> Vec<(String, FnTemplate)> {
+    REG.with(|r| {
+        let reg = r.borrow();
+        reg.methods
+            .get(base)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|m| {
+                        let key = format!("{}__{}", base, m);
+                        reg.fns.get(&key).map(|t| (m.clone(), t.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 pub(crate) fn struct_template(name: &str) -> Option<StructTemplate> {
@@ -351,7 +393,7 @@ pub(crate) fn mangle(base: &str, args: &[TypeExpr]) -> String {
 
 impl<'a> Parser<'a> {
     /// `[T, U: Int]` — type parameter list of a template.
-    fn generic_params(&mut self) -> Option<Vec<TyParam>> {
+    pub(crate) fn generic_params(&mut self) -> Option<Vec<TyParam>> {
         if !self.expect(TokKind::LBracket, "at the start of the type parameter list") {
             return None;
         }
@@ -628,7 +670,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
+    pub(crate) fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
         let mangled = mangle(base, &args);
         let is_abstract = REG.with(|r| r.borrow().in_template > 0);
         record_inst(
