@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import tls.tls_server
+import http.hs_types
+import http.hs_conn
+import http.hs_http
+import http.hs_ws
+import http.hs_h2
+
+export {
+    read_all,
+}
+
+fn route_http(a: *mut hs_types.App, ci: usize) {
+    let c: *mut hs_types.Conn = hs_conn.conn(a, ci)
+    if (*a).h2 {
+        let st: i32 = hs_h2.preface_state(c)
+        if st == 2 {
+            hs_h2.h2_start(c)
+            return
+        }
+        if st == 1 && (*c).inb.len > (*c).inpos { return }
+    }
+    hs_http.http_input(a, ci)
+}
+
+fn read_all(a: *mut hs_types.App, ci: usize, now: i64) {
+    let c: *mut hs_types.Conn = hs_conn.conn(a, ci)
+    var buf: [u8; 16384] = [0; 16384]
+    var got: bool = false
+    while !(*c).dead {
+        let n: i64 = syscall(hs_types.SYS_READ_FROM, (*c).fd as i64, (&buf[0]) as i64, 16384, 0, 0, 0)
+        if n == hs_types.EINTR { continue }
+        if n == hs_types.EAGAIN { break }
+        if n <= 0 {
+            // the peer is gone (or reset); what is queued cannot arrive
+            (*c).close_after = true
+            if (*c).outb.len == (*c).outpos { (*c).dead = true }
+            break
+        }
+        got = true
+        (*c).last_ms = now
+        if (*c).secure {
+            let alive: bool = tls_server.feed(&(*c).t, (&buf[0]) as u64, n as usize)
+            let an: usize = tls_server.app_len(&(*c).t)
+            if an > 0 {
+                rt.buf_push_bytes(&(*c).inb, tls_server.app_ptr(&(*c).t), an)
+                tls_server.app_consume(&(*c).t, an)
+            }
+            hs_conn.move_tls_out(c)
+            if (*c).kind == hs_types.K_HTTP && tls_server.established(&(*c).t) && tls_server.alpn_is_h2(&(*c).t) {
+                hs_h2.h2_start(c)
+            }
+            if !alive {
+                (*c).close_after = true
+            }
+        } else {
+            rt.buf_push_bytes(&(*c).inb, (&buf[0]) as u64, n as usize)
+        }
+        if (*c).inb.len - (*c).inpos > hs_types.MAX_HEAD + (*a).max_body + (*a).max_msg + 65536 {
+            break // enough to work on; poll comes back for the rest
+        }
+    }
+    if got && !(*c).dead {
+        if (*c).kind == hs_types.K_HTTP { route_http(a, ci) }
+        if (*c).kind == hs_types.K_H2 { hs_h2.h2_input(a, ci, hs_http.dispatch) }
+        if (*c).kind == hs_types.K_WS { hs_ws.ws_input(a, ci) }
+        if (*c).kind == hs_types.K_SSE { (*c).inpos = (*c).inb.len }
+        hs_conn.compact(c)
+    }
+    hs_conn.flush(c)
+}

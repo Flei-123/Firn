@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.hpack
+import net.h2frame as fr
+import http.hs_types
+import http.hs_conn
+import http.hs_h2state
+
+export {
+    send_settings, send_goaway, send_rst, send_window_update, send_ping_ack, send_settings_ack,
+    reply, pump, finish_if_done, sse_open, sse_push, sse_keepalive,
+}
+
+fn flush_frames(c: *mut hs_types.Conn, out: *mut rt.Buf) {
+    if (*out).len > 0 { hs_conn.conn_send(c, (*out).ptr, (*out).len) }
+    rt.buf_free(out)
+}
+
+fn send_settings(c: *mut hs_types.Conn) {
+    var out: rt.Buf = rt.buf_new()
+    fr.put_frame_header(&out, 24, fr.T_SETTINGS, 0, 0)
+    fr.put_setting(&out, fr.S_MAX_CONCURRENT_STREAMS, hs_h2state.MAX_STREAMS as u32)
+    fr.put_setting(&out, fr.S_INITIAL_WINDOW_SIZE, hs_h2state.RECV_WINDOW as u32)
+    fr.put_setting(&out, fr.S_MAX_HEADER_LIST_SIZE, hs_h2state.MAX_LIST as u32)
+    fr.put_setting(&out, fr.S_MAX_FRAME_SIZE, hs_h2state.OUR_FRAME as u32)
+    send_window_update_into(&out, 0, hs_h2state.RECV_WINDOW)
+    flush_frames(c, &out)
+}
+
+fn send_window_update_into(out: *mut rt.Buf, stream: u32, inc: i64) {
+    fr.put_frame_header(out, 4, fr.T_WINDOW_UPDATE, 0, stream)
+    fr.put_u32(out, inc as u32)
+}
+
+fn send_window_update(c: *mut hs_types.Conn, stream: u32, inc: i64) {
+    var out: rt.Buf = rt.buf_new()
+    send_window_update_into(&out, stream, inc)
+    flush_frames(c, &out)
+}
+
+fn send_settings_ack(c: *mut hs_types.Conn) {
+    var out: rt.Buf = rt.buf_new()
+    fr.put_frame_header(&out, 0, fr.T_SETTINGS, fr.F_ACK, 0)
+    flush_frames(c, &out)
+}
+
+fn send_ping_ack(c: *mut hs_types.Conn, p: u64) {
+    var out: rt.Buf = rt.buf_new()
+    fr.put_frame(&out, fr.T_PING, fr.F_ACK, 0, p, 8)
+    flush_frames(c, &out)
+}
+
+fn send_goaway(c: *mut hs_types.Conn, last_id: u32, code: u32) {
+    var out: rt.Buf = rt.buf_new()
+    fr.put_frame_header(&out, 8, fr.T_GOAWAY, 0, 0)
+    fr.put_u32(&out, last_id)
+    fr.put_u32(&out, code)
+    flush_frames(c, &out)
+    (*c).close_after = true
+}
+
+fn send_rst(c: *mut hs_types.Conn, stream: u32, code: u32) {
+    var out: rt.Buf = rt.buf_new()
+    fr.put_frame_header(&out, 4, fr.T_RST_STREAM, 0, stream)
+    fr.put_u32(&out, code)
+    flush_frames(c, &out)
+}
+
+fn lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 { return b + 32 as u8 }
+    return b
+}
+
+fn skip_extra(name: *mut rt.Buf) -> bool {
+    let n: str = rt.buf_str(name)
+    return n == "connection" || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade"
+    || n == "content-length" || n == "proxy-connection" || n == "te"
+}
+
+fn encode_extra(h: *mut hpack.Hpack, blk: *mut rt.Buf, extra: str) {
+    var pos: usize = 0
+    let base: u64 = extra.p as u64
+    var name: rt.Buf = rt.buf_new()
+    while pos < extra.n {
+        var e: usize = pos
+        while e < extra.n && rt.ld8(base, e) != 10 as u8 { e = e + 1 }
+        var colon: usize = pos
+        while colon < e && rt.ld8(base, colon) != 58 as u8 { colon = colon + 1 }
+        if colon < e && colon > pos {
+            rt.buf_clear(&name)
+            var i: usize = pos
+            while i < colon {
+                rt.buf_push(&name, lower(rt.ld8(base, i)))
+                i = i + 1
+            }
+            var v: usize = colon + 1
+            while v < e && rt.ld8(base, v) == 32 as u8 { v = v + 1 }
+            var ve: usize = e
+            if ve > v && rt.ld8(base, ve - 1) == 13 as u8 { ve = ve - 1 }
+            if !skip_extra(&name) {
+                hpack.hp_encode(h, blk, name.ptr, name.len, base + v as u64, ve - v, name.len == 10 && rt.buf_str(&name) == "set-cookie")
+            }
+        }
+        pos = e + 1
+    }
+    rt.buf_free(&name)
+}
+
+fn put_header(h: *mut hpack.Hpack, blk: *mut rt.Buf, name: str, value: str) {
+    hpack.hp_encode(h, blk, name.p as u64, name.n, value.p as u64, value.n, false)
+}
+
+fn put_block(out: *mut rt.Buf, blk: *mut rt.Buf, id: u32, end_stream: bool, max: usize) {
+    var pos: usize = 0
+    var first: bool = true
+    while pos < (*blk).len || first {
+        var n: usize = (*blk).len - pos
+        if n > max { n = max }
+        var flags: u8 = 0
+        if pos + n >= (*blk).len { flags = fr.F_END_HEADERS }
+        var ftype: u8 = fr.T_CONTINUATION
+        if first {
+            ftype = fr.T_HEADERS
+            if end_stream { flags = flags | fr.F_END_STREAM }
+        }
+        fr.put_frame(out, ftype, flags, id, (*blk).ptr + pos as u64, n)
+        pos = pos + n
+        first = false
+    }
+}
+
+fn no_body(status: u32, head_only: bool) -> bool {
+    return head_only || status == 204 || status == 304 || (status >= 100 && status < 200)
+}
+
+fn reply(r: *mut hs_types.Req, status: u32, ctype: str, extra: str, body: str, cookie: str) {
+    let c: *mut hs_types.Conn = hs_conn.conn((*r).app, (*r).ci)
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_find(&(*c).h2, (*r).h2sid)
+    if s as u64 == 0 { return }
+    let h: *mut hpack.Hpack = &(*c).h2.enc
+    var blk: rt.Buf = rt.buf_new()
+    hpack.hp_encode_begin(h, &blk)
+    var st: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&st, status as u64)
+    put_header(h, &blk, ":status", rt.buf_str(&st))
+    rt.buf_free(&st)
+    if ctype.n > 0 { put_header(h, &blk, "content-type", ctype) }
+    var cl: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&cl, body.n as u64)
+    put_header(h, &blk, "content-length", rt.buf_str(&cl))
+    rt.buf_free(&cl)
+    put_header(h, &blk, "x-content-type-options", "nosniff")
+    if cookie.n > 0 {
+        var sc: rt.Buf = rt.buf_new()
+        hs_types.push_str(&sc, "firn_pair=")
+        hs_types.push_str(&sc, cookie)
+        hs_types.push_str(&sc, "; Path=/; HttpOnly; SameSite=Strict")
+        hpack.hp_encode(h, &blk, "set-cookie".p as u64, 10, sc.ptr, sc.len, true)
+        rt.buf_free(&sc)
+    }
+    encode_extra(h, &blk, extra)
+    let has_body: bool = !no_body(status, (*r).head_only) && body.n > 0
+    var out: rt.Buf = rt.buf_new()
+    put_block(&out, &blk, (*s).id, !has_body, (*c).h2.peer_frame)
+    rt.buf_free(&blk)
+    (*s).replied = true
+    if has_body { hs_types.push_str(&(*s).out, body) }
+    flush_frames(c, &out)
+    pump(c)
+    finish_if_done(c, s)
+}
+
+fn finish_if_done(c: *mut hs_types.Conn, s: *mut hs_h2state.H2Stream) {
+    if !(*s).live || !(*s).replied { return }
+    if (*s).outpos < (*s).out.len || (*s).sse > 0 { return }
+    if !(*s).req_done { send_rst(c, (*s).id, fr.E_NO_ERROR) }
+    hs_h2state.stream_release(s)
+}
+
+fn pump(c: *mut hs_types.Conn) {
+    var out: rt.Buf = rt.buf_new()
+    let hc: *mut hs_h2state.H2Conn = &(*c).h2
+    var i: usize = 0
+    while i < hs_h2state.MAX_STREAMS {
+        let s: *mut hs_h2state.H2Stream = &(*hc).streams[i]
+        while (*s).live && (*s).replied && (*s).outpos < (*s).out.len {
+            var room: i64 = (*hc).send_win
+            if (*s).send_win < room { room = (*s).send_win }
+            if room <= 0 { break }
+            var k: usize = (*s).out.len - (*s).outpos
+            if k > (*hc).peer_frame { k = (*hc).peer_frame }
+            if k as i64 > room { k = room as usize }
+            var flags: u8 = 0
+            if (*s).outpos + k == (*s).out.len && (*s).sse == 0 { flags = fr.F_END_STREAM }
+            fr.put_frame(&out, fr.T_DATA, flags, (*s).id, (*s).out.ptr + (*s).outpos as u64, k)
+            (*hc).send_win = (*hc).send_win - k as i64
+            (*s).send_win = (*s).send_win - k as i64
+            (*s).outpos = (*s).outpos + k
+        }
+        i = i + 1
+    }
+    flush_frames(c, &out)
+    i = 0
+    while i < hs_h2state.MAX_STREAMS {
+        finish_if_done(c, &(*hc).streams[i])
+        i = i + 1
+    }
+}
+
+const SSE_QUEUE_LIMIT: usize = 1048576
+
+fn sse_open(r: *mut hs_types.Req, route: usize, cookie: str) {
+    let c: *mut hs_types.Conn = hs_conn.conn((*r).app, (*r).ci)
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_find(&(*c).h2, (*r).h2sid)
+    if s as u64 == 0 { return }
+    let h: *mut hpack.Hpack = &(*c).h2.enc
+    var blk: rt.Buf = rt.buf_new()
+    hpack.hp_encode_begin(h, &blk)
+    put_header(h, &blk, ":status", "200")
+    put_header(h, &blk, "content-type", "text/event-stream")
+    put_header(h, &blk, "cache-control", "no-store")
+    put_header(h, &blk, "x-accel-buffering", "no")
+    if cookie.n > 0 {
+        var sc: rt.Buf = rt.buf_new()
+        hs_types.push_str(&sc, "firn_pair=")
+        hs_types.push_str(&sc, cookie)
+        hs_types.push_str(&sc, "; Path=/; HttpOnly; SameSite=Strict")
+        hpack.hp_encode(h, &blk, "set-cookie".p as u64, 10, sc.ptr, sc.len, true)
+        rt.buf_free(&sc)
+    }
+    var out: rt.Buf = rt.buf_new()
+    put_block(&out, &blk, (*s).id, false, (*c).h2.peer_frame)
+    rt.buf_free(&blk)
+    (*s).replied = true
+    (*s).sse = route + 1
+    hs_types.push_str(&(*s).out, ": stream open\n\n")
+    flush_frames(c, &out)
+    pump(c)
+}
+
+fn sse_push(c: *mut hs_types.Conn, s: *mut hs_h2state.H2Stream, p: u64, n: usize) -> bool {
+    if (*s).out.len - (*s).outpos + n > SSE_QUEUE_LIMIT {
+        send_rst(c, (*s).id, fr.E_CANCEL)
+        hs_h2state.stream_release(s)
+        return false
+    }
+    rt.buf_push_bytes(&(*s).out, p, n)
+    return true
+}
+
+fn sse_keepalive(c: *mut hs_types.Conn) {
+    var i: usize = 0
+    while i < hs_h2state.MAX_STREAMS {
+        let s: *mut hs_h2state.H2Stream = &(*c).h2.streams[i]
+        if (*s).live && (*s).sse > 0 { sse_push(c, s, ": keep-alive\n\n".p as u64, 14) }
+        i = i + 1
+    }
+    pump(c)
+}

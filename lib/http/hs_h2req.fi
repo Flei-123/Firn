@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.hpack
+import http.hs_types
+import http.hs_h2state
+
+export {
+    validate, build_head, pseudo, run_request,
+}
+
+fn pseudo(h: *mut rt.Buf, name: str) -> str {
+    var vp: u64 = 0
+    var vn: usize = 0
+    if hpack.hdr_find((*h).ptr, (*h).len, name, &vp, &vn) { return hs_types.as_str(vp, vn) }
+    return ""
+}
+
+fn name_ok(np: u64, nn: usize) -> bool {
+    var i: usize = 0
+    while i < nn {
+        let b: u8 = rt.ld8(np, i)
+        if b <= 32 as u8 || b >= 127 as u8 || (b >= 65 as u8 && b <= 90 as u8) { return false }
+        if b == 58 as u8 && i > 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn value_ok(vp: u64, vn: usize) -> bool {
+    var i: usize = 0
+    while i < vn {
+        let b: u8 = rt.ld8(vp, i)
+        if b == 0 as u8 || b == 10 as u8 || b == 13 as u8 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn forbidden(name: str) -> bool {
+    return name == "connection" || name == "transfer-encoding" || name == "keep-alive"
+    || name == "upgrade" || name == "proxy-connection"
+}
+
+fn parse_len(v: str) -> i64 {
+    if v.n == 0 || v.n > 18 { return 0 - 1 }
+    var n: i64 = 0
+    var i: usize = 0
+    while i < v.n {
+        let b: u8 = *(v.p + i)
+        if b < 48 as u8 || b > 57 as u8 { return 0 - 1 }
+        n = n * 10 + (b - 48 as u8) as i64
+        i = i + 1
+    }
+    return n
+}
+
+fn pseudo_slot(name: str) -> i32 {
+    if name == ":method" { return 0 }
+    if name == ":scheme" { return 1 }
+    if name == ":path" { return 2 }
+    if name == ":authority" { return 3 }
+    return 0 - 1
+}
+
+fn validate(h: *mut rt.Buf, clen: *mut i64) -> bool {
+    var pos: usize = 0
+    var np: u64 = 0
+    var nn: usize = 0
+    var vp: u64 = 0
+    var vn: usize = 0
+    var seen: [u32; 4] = [0; 4]
+    var regular: bool = false
+    *clen = 0 - 1
+    while hpack.hdr_next((*h).ptr, (*h).len, &pos, &np, &nn, &vp, &vn) {
+        if nn == 0 || !name_ok(np, nn) || !value_ok(vp, vn) { return false }
+        let name: str = hs_types.as_str(np, nn)
+        if rt.ld8(np, 0) == 58 as u8 {
+            let slot: i32 = pseudo_slot(name)
+            if regular || slot < 0 { return false }
+            seen[slot as usize] = seen[slot as usize] + 1
+            if seen[slot as usize] > 1 { return false }
+        } else {
+            regular = true
+            if forbidden(name) { return false }
+            if name == "te" && hs_types.as_str(vp, vn) != "trailers" { return false }
+            if name == "content-length" {
+                let v: i64 = parse_len(hs_types.as_str(vp, vn))
+                if v < 0 || (*clen >= 0 && *clen != v) { return false }
+                *clen = v
+            }
+        }
+    }
+    if seen[0] != 1 || seen[1] != 1 || seen[2] != 1 { return false }
+    let path: str = pseudo(h, ":path")
+    if path.n == 0 { return false }
+    if *path.p != 47 as u8 && path != "*" { return false }
+    return true
+}
+
+fn build_head(h: *mut rt.Buf, out: *mut rt.Buf) {
+    var pos: usize = 0
+    var np: u64 = 0
+    var nn: usize = 0
+    var vp: u64 = 0
+    var vn: usize = 0
+    var has_host: bool = false
+    var cookies: rt.Buf = rt.buf_new()
+    let auth: str = pseudo(h, ":authority")
+    while hpack.hdr_next((*h).ptr, (*h).len, &pos, &np, &nn, &vp, &vn) {
+        if hs_types.as_str(np, nn) == "host" { has_host = true }
+    }
+    if !has_host && auth.n > 0 {
+        hs_types.push_str(out, "host: ")
+        hs_types.push_str(out, auth)
+        hs_types.push_str(out, "\r\n")
+    }
+    pos = 0
+    while hpack.hdr_next((*h).ptr, (*h).len, &pos, &np, &nn, &vp, &vn) {
+        if rt.ld8(np, 0) == 58 as u8 { continue }
+        if hs_types.as_str(np, nn) == "cookie" {
+            if cookies.len > 0 { hs_types.push_str(&cookies, "; ") }
+            rt.buf_push_bytes(&cookies, vp, vn)
+            continue
+        }
+        rt.buf_push_bytes(out, np, nn)
+        hs_types.push_str(out, ": ")
+        rt.buf_push_bytes(out, vp, vn)
+        hs_types.push_str(out, "\r\n")
+    }
+    if cookies.len > 0 {
+        hs_types.push_str(out, "cookie: ")
+        rt.buf_push_bytes(out, cookies.ptr, cookies.len)
+        hs_types.push_str(out, "\r\n")
+    }
+    rt.buf_free(&cookies)
+}
+
+fn run_request(a: *mut hs_types.App, ci: usize, s: *mut hs_h2state.H2Stream,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) {
+    var head: rt.Buf = rt.buf_new()
+    build_head(&(*s).hdrs, &head)
+    let target: str = pseudo(&(*s).hdrs, ":path")
+    var r: hs_types.Req = hs_types.Req { app: a, ci: ci, method: pseudo(&(*s).hdrs, ":method"),
+        path: target, query: "", head: rt.buf_str(&head), body: rt.buf_str(&(*s).body),
+        v11: true, keep: true, head_only: false, replied: false, set_cookie: false, h2sid: (*s).id }
+    let qm: usize = target.find_char(63 as u8)
+    if qm < target.n {
+        r.path = target.to(qm)
+        r.query = target.ab(qm + 1)
+    }
+    r.head_only = r.method == "HEAD"
+    disp(a, &r)
+    rt.buf_free(&head)
+}

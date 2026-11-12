@@ -21,8 +21,19 @@ h2.h2_release(&c, id as u32)
 ```
 `h2_connect_plain` speaks h2c with prior knowledge. Up to 16 streams in flight (`MAX_STREAMS`); start several requests, then wait for each. Response headers are length-prefixed records read with `hpack.hdr_next` / `hpack.hdr_find`.
 
+## Server (lib/http/server.fi)
+The poll-loop server speaks HTTP/2 next to HTTP/1.1 on the same port; handlers and `lib/webfw` run unchanged.
+- TLS: ALPN `h2` is chosen when the client offers it (`tls_server.config_offer_h2`, on by default in `http.app`); without ALPN or with `http/1.1` the connection stays HTTP/1.1. `http.set_h2(&app, false)` turns it off.
+- h2c: a plain connection that starts with the HTTP/2 preface (prior knowledge) switches to h2. No `Upgrade: h2c`.
+- Modules: `http/hs_h2.fi` (frame loop, SETTINGS/PING/RST/WINDOW_UPDATE, request assembly), `hs_h2req.fi` (header validation, `Req` build), `hs_h2out.fi` (frames out, response, DATA flow control), `hs_h2state.fi` (per connection state, 100 streams).
+- Limits advertised: 100 concurrent streams, 1 MiB stream/connection receive windows, 64 KiB header list, 16 KiB frames; header block up to 256 KiB (else GOAWAY ENHANCE_YOUR_CALM); body up to `max_body` (then 413).
+- Checks: lowercase names, pseudo headers first and unique, `:method/:scheme/:path` present, no connection-specific headers, `te: trailers` only, no CR/LF/NUL in values, `content-length` equals the DATA received; violations reset the stream with PROTOCOL_ERROR. Several `cookie` headers are joined for the handler.
+- Flood guard: more than 1000 SETTINGS/PING/PRIORITY/RST_STREAM frames without a completed request -> GOAWAY ENHANCE_YOUR_CALM (rapid reset).
+- Responses: the handler's body is copied and sent as DATA as the peer windows allow; WebSocket and SSE routes answer 501 over h2 (use HTTP/1.1 for them).
+- Test: `heavy bash tools/h2/run.sh` also runs `tools/h2/server_check.py` (Python h2 client over TLS+ALPN and h2c: GET/HEAD/404/501, 300 KB upload, 3 MB and 1 MB-with-1000-octet-window downloads, 413, 40 KB header (CONTINUATION), cookie join, 40 multiplexed streams, PING, malformed requests, bad preface, rapid-reset flood, HTTP/1.1 on the same port, 1500 mutated-stream fuzz runs).
+
 ## Not included
-- Server side (`lib/http/server.fi` still answers HTTP/1.1 only).
+- Server: no push, priorities ignored, trailers dropped, no WebSocket over h2 (RFC 8441), no SSE over h2.
 - Server push (disabled via SETTINGS_ENABLE_PUSH=0, PUSH_PROMISE is a protocol error).
 - Stream priorities (ignored), trailers (decoded, dropped), request header size limits beyond `max_list` 256 KiB.
 

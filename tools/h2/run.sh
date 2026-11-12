@@ -26,5 +26,8 @@ rm -f "$D/port"
 python3 -I "$ROOT/tools/h2/h2_server.py" "$D/py" "$D/port" "$D/cert.pem" & SP=$!
 for i in $(seq 50); do [ -s "$D/port" ] && break; sleep 0.1; done
 (cat "$D/port"; echo; printf '%s' "$D/cert.pem") | timeout 120 "$D/h2_client_check" || fail=1
+mkdir -p "$D/sc"
+"$FIRNC" "$ROOT/tools/http/test_main.fi" -o "$D/h2srv" || { echo "compile h2srv failed"; exit 1; }
+timeout 600 python3 -I "$ROOT/tools/h2/server_check.py" "$D/py" "$D/h2srv" "$D/sc" "${H2_FUZZ_RUNS:-1500}" || fail=1
 [ $fail = 0 ] && echo "h2 all ok" || echo "h2 FAILED"
 exit $fail

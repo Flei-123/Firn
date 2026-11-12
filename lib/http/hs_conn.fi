@@ -9,12 +9,13 @@ import std.base64
 import ws.ws
 import tls.tls_server
 import http.hs_types
+import http.hs_h2state
 import http.hs_ws
 import http.hs_http
 
 export {
     conn, conn_init, accept_all, flush, move_tls_out, conn_send,
-    conn_send_max, read_all, compact, reap,
+    conn_send_max, compact, reap,
 }
 
 fn conn(a: *mut hs_types.App, ci: usize) -> *mut hs_types.Conn {
@@ -29,7 +30,7 @@ fn conn_init(a: *mut hs_types.App) {
                 t: tls_server.server_new(&(*a).cfg), last_ms: 0, ping_ms: 0,
                 close_after: false, dead: false, route: 0, msg: rt.buf_new(), msg_op: 0,
                 in_msg: false, utf: ws.utf8_new(), close_sent: false, cont_sent: false,
-                chunked: rt.buf_new(), fr_done: 0, fr_started: false, peer: 0 })
+                chunked: rt.buf_new(), fr_done: 0, fr_started: false, peer: 0, h2: hs_h2state.h2c_new() })
         i = i + 1
     }
 }
@@ -127,49 +128,6 @@ fn conn_send_max(c: *mut hs_types.Conn, p: u64, n: usize, limit: usize) {
     flush(c)
 }
 
-fn read_all(a: *mut hs_types.App, ci: usize, now: i64) {
-    let c: *mut hs_types.Conn = conn(a, ci)
-    var buf: [u8; 16384] = [0; 16384]
-    var got: bool = false
-    while !(*c).dead {
-        let n: i64 = syscall(hs_types.SYS_READ_FROM, (*c).fd as i64, (&buf[0]) as i64, 16384, 0, 0, 0)
-        if n == hs_types.EINTR { continue }
-        if n == hs_types.EAGAIN { break }
-        if n <= 0 {
-            // the peer is gone (or reset); what is queued cannot arrive
-            (*c).close_after = true
-            if (*c).outb.len == (*c).outpos { (*c).dead = true }
-            break
-        }
-        got = true
-        (*c).last_ms = now
-        if (*c).secure {
-            let alive: bool = tls_server.feed(&(*c).t, (&buf[0]) as u64, n as usize)
-            let an: usize = tls_server.app_len(&(*c).t)
-            if an > 0 {
-                rt.buf_push_bytes(&(*c).inb, tls_server.app_ptr(&(*c).t), an)
-                tls_server.app_consume(&(*c).t, an)
-            }
-            move_tls_out(c)
-            if !alive {
-                (*c).close_after = true
-            }
-        } else {
-            rt.buf_push_bytes(&(*c).inb, (&buf[0]) as u64, n as usize)
-        }
-        if (*c).inb.len - (*c).inpos > hs_types.MAX_HEAD + (*a).max_body + (*a).max_msg + 65536 {
-            break // enough to work on; poll comes back for the rest
-        }
-    }
-    if got && !(*c).dead {
-        if (*c).kind == hs_types.K_HTTP { hs_http.http_input(a, ci) }
-        if (*c).kind == hs_types.K_WS { hs_ws.ws_input(a, ci) }
-        if (*c).kind == hs_types.K_SSE { (*c).inpos = (*c).inb.len }
-        compact(c)
-    }
-    flush(c)
-}
-
 fn compact(c: *mut hs_types.Conn) {
     if (*c).inpos == 0 { return }
     let rest: usize = (*c).inb.len - (*c).inpos
@@ -189,6 +147,7 @@ fn reap(a: *mut hs_types.App, ci: usize) {
         (*c).kind = hs_types.K_FREE // no sends to a closing connection from the callback
         f(&w)
     }
+    if (*c).kind == hs_types.K_H2 { hs_h2state.h2c_free(&(*c).h2) }
     syscall(hs_types.SYS_CLOSE_FD, (*c).fd as i64, 0, 0, 0, 0, 0)
     (*c).fd = 0 - 1
     (*c).kind = hs_types.K_FREE

@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import net.hpack
+import net.h2frame as fr
+import http.hs_types
+import http.hs_conn
+import http.hs_h2state
+import http.hs_h2out
+import http.hs_h2req
+
+export {
+    h2_start, h2_input, preface_state,
+}
+
+const E_ENHANCE_YOUR_CALM: u32 = 11
+const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+fn preface_state(c: *mut hs_types.Conn) -> i32 {
+    var n: usize = (*c).inb.len - (*c).inpos
+    if n == 0 { return 1 }
+    if n > fr.PREFACE_LEN { n = fr.PREFACE_LEN }
+    if !rt.mem_eq((*c).inb.ptr + (*c).inpos as u64, PREFACE.p as u64, n) { return 0 }
+    if n < fr.PREFACE_LEN { return 1 }
+    return 2
+}
+
+fn h2_start(c: *mut hs_types.Conn) {
+    (*c).kind = hs_types.K_H2
+    (*c).h2 = hs_h2state.h2c_new()
+    hs_h2out.send_settings(c)
+}
+
+fn conn_err(c: *mut hs_types.Conn, code: u32) -> bool {
+    hs_h2out.send_goaway(c, (*c).h2.last_id, code)
+    return false
+}
+
+fn too_chatty(c: *mut hs_types.Conn) -> bool {
+    (*c).h2.ctrl = (*c).h2.ctrl + 1
+    return (*c).h2.ctrl > hs_h2state.CTRL_LIMIT
+}
+
+fn credit(c: *mut hs_types.Conn, s: *mut hs_h2state.H2Stream, n: usize, more: bool) {
+    if n == 0 { return }
+    (*c).h2.recv_win = (*c).h2.recv_win + n as i64
+    hs_h2out.send_window_update(c, 0, n as i64)
+    if s as u64 != 0 && more {
+        (*s).recv_win = (*s).recv_win + n as i64
+        hs_h2out.send_window_update(c, (*s).id, n as i64)
+    }
+}
+
+fn complete_request(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn, s: *mut hs_h2state.H2Stream,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) {
+    (*c).h2.ctrl = 0
+    if (*s).clen >= 0 && (*s).got != (*s).clen as u64 && !(*s).too_big {
+        hs_h2out.send_rst(c, (*s).id, fr.E_PROTOCOL)
+        hs_h2state.stream_release(s)
+        return
+    }
+    if (*s).too_big {
+        var r: hs_types.Req = hs_types.Req { app: a, ci: ci, method: "", path: "", query: "", head: "",
+            body: "", v11: true, keep: true, head_only: false, replied: false, set_cookie: false,
+            h2sid: (*s).id }
+        hs_h2out.reply(&r, 413, "text/plain; charset=utf-8", "", "body too large\n", "")
+        (*a).requests = (*a).requests + 1
+        return
+    }
+    hs_h2req.run_request(a, ci, s, disp)
+}
+
+fn on_data(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn, flags: u8, stream: u32, p: u64, n: usize,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) -> bool {
+    if stream == 0 { return conn_err(c, fr.E_PROTOCOL) }
+    var off: usize = 0
+    var dl: usize = 0
+    if !fr.strip_padding(p, n, flags, 0, &off, &dl) { return conn_err(c, fr.E_PROTOCOL) }
+    (*c).h2.recv_win = (*c).h2.recv_win - n as i64
+    if (*c).h2.recv_win < 0 { return conn_err(c, fr.E_FLOW_CONTROL) }
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_find(&(*c).h2, stream)
+    let last: bool = (flags & fr.F_END_STREAM) != 0
+    if s as u64 == 0 {
+        if stream > (*c).h2.last_id { return conn_err(c, fr.E_PROTOCOL) }
+        credit(c, s, n, false)
+        return true
+    }
+    if (*s).req_done {
+        hs_h2out.send_rst(c, stream, fr.E_STREAM_CLOSED)
+        credit(c, s, n, false)
+        hs_h2state.stream_release(s)
+        return true
+    }
+    (*s).recv_win = (*s).recv_win - n as i64
+    if (*s).recv_win < 0 {
+        hs_h2out.send_rst(c, stream, fr.E_FLOW_CONTROL)
+        credit(c, s, n, false)
+        hs_h2state.stream_release(s)
+        return true
+    }
+    (*s).got = (*s).got + dl as u64
+    if !(*s).too_big {
+        if (*s).body.len + dl > (*a).max_body {
+            (*s).too_big = true
+            rt.buf_clear(&(*s).body)
+        } else {
+            rt.buf_push_bytes(&(*s).body, p + off as u64, dl)
+        }
+    }
+    credit(c, s, n, !last)
+    if last {
+        (*s).req_done = true
+        complete_request(a, ci, c, s, disp)
+    }
+    return true
+}
+
+fn append_block(c: *mut hs_types.Conn, p: u64, n: usize) -> bool {
+    if (*c).h2.hblock.len + n > hs_h2state.MAX_HEADER_BLOCK { return false }
+    rt.buf_push_bytes(&(*c).h2.hblock, p, n)
+    return true
+}
+
+fn finish_headers(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) -> bool {
+    let hc: *mut hs_h2state.H2Conn = &(*c).h2
+    let stream: u32 = (*hc).hblock_stream
+    let end_stream: bool = (*hc).hblock_end
+    (*hc).hblock_stream = 0
+    var dec: rt.Buf = rt.buf_new()
+    let r: i32 = hpack.hp_decode(&(*hc).dec, (*hc).hblock.ptr, (*hc).hblock.len, &dec)
+    rt.buf_clear(&(*hc).hblock)
+    if r != hpack.HP_OK {
+        rt.buf_free(&dec)
+        return conn_err(c, fr.E_COMPRESSION)
+    }
+    let existing: *mut hs_h2state.H2Stream = hs_h2state.stream_find(hc, stream)
+    if existing as u64 != 0 {
+        rt.buf_free(&dec)
+        if !end_stream || (*existing).req_done { return conn_err(c, fr.E_PROTOCOL) }
+        (*existing).req_done = true
+        complete_request(a, ci, c, existing, disp)
+        return true
+    }
+    (*hc).last_id = stream
+    var clen: i64 = 0 - 1
+    if hs_h2state.live_count(hc) >= hs_h2state.MAX_STREAMS {
+        rt.buf_free(&dec)
+        hs_h2out.send_rst(c, stream, fr.E_REFUSED_STREAM)
+        return true
+    }
+    if !hs_h2req.validate(&dec, &clen) {
+        rt.buf_free(&dec)
+        hs_h2out.send_rst(c, stream, fr.E_PROTOCOL)
+        return true
+    }
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_open(hc, stream)
+    rt.buf_push_bytes(&(*s).hdrs, dec.ptr, dec.len)
+    rt.buf_free(&dec)
+    (*s).clen = clen
+    if end_stream {
+        (*s).req_done = true
+        complete_request(a, ci, c, s, disp)
+    }
+    return true
+}
+
+fn on_headers(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn, flags: u8, stream: u32, p: u64, n: usize,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) -> bool {
+    let hc: *mut hs_h2state.H2Conn = &(*c).h2
+    if stream == 0 || (stream & 1) == 0 { return conn_err(c, fr.E_PROTOCOL) }
+    var off: usize = 0
+    var len: usize = 0
+    if !fr.strip_padding(p, n, flags, 5, &off, &len) { return conn_err(c, fr.E_PROTOCOL) }
+    if hs_h2state.stream_find(hc, stream) as u64 == 0 && stream <= (*hc).last_id {
+        return conn_err(c, fr.E_STREAM_CLOSED)
+    }
+    rt.buf_clear(&(*hc).hblock)
+    if !append_block(c, p + off as u64, len) { return conn_err(c, E_ENHANCE_YOUR_CALM) }
+    (*hc).hblock_stream = stream
+    (*hc).hblock_end = (flags & fr.F_END_STREAM) != 0
+    if (flags & fr.F_END_HEADERS) != 0 { return finish_headers(a, ci, c, disp) }
+    return true
+}
+
+fn on_continuation(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn, flags: u8, stream: u32, p: u64, n: usize,
+    disp: fn(*mut hs_types.App, *mut hs_types.Req)) -> bool {
+    if (*c).h2.hblock_stream == 0 || stream != (*c).h2.hblock_stream { return conn_err(c, fr.E_PROTOCOL) }
+    if !append_block(c, p, n) { return conn_err(c, E_ENHANCE_YOUR_CALM) }
+    if (flags & fr.F_END_HEADERS) != 0 { return finish_headers(a, ci, c, disp) }
+    return true
+}
+
+fn apply_setting(c: *mut hs_types.Conn, id: u32, v: u32) -> bool {
+    let hc: *mut hs_h2state.H2Conn = &(*c).h2
+    if id == fr.S_HEADER_TABLE_SIZE {
+        hpack.hp_set_limit(&(*hc).enc, v as usize)
+    } else if id == fr.S_INITIAL_WINDOW_SIZE {
+        if v as i64 > fr.MAX_WINDOW { return conn_err(c, fr.E_FLOW_CONTROL) }
+        let delta: i64 = v as i64 - (*hc).peer_init_win
+        (*hc).peer_init_win = v as i64
+        var i: usize = 0
+        while i < hs_h2state.MAX_STREAMS {
+            if (*hc).streams[i].live {
+                (*hc).streams[i].send_win = (*hc).streams[i].send_win + delta
+                if (*hc).streams[i].send_win > fr.MAX_WINDOW { return conn_err(c, fr.E_FLOW_CONTROL) }
+            }
+            i = i + 1
+        }
+    } else if id == fr.S_MAX_FRAME_SIZE {
+        if (v as usize) < fr.DEFAULT_FRAME_SIZE || (v as usize) > fr.MAX_FRAME_SIZE_LIMIT {
+            return conn_err(c, fr.E_PROTOCOL)
+        }
+        (*hc).peer_frame = v as usize
+    } else if id == fr.S_ENABLE_PUSH {
+        if v > 1 { return conn_err(c, fr.E_PROTOCOL) }
+    }
+    return true
+}
+
+fn on_settings(c: *mut hs_types.Conn, flags: u8, stream: u32, p: u64, n: usize) -> bool {
+    if stream != 0 { return conn_err(c, fr.E_PROTOCOL) }
+    if (flags & fr.F_ACK) != 0 {
+        if n != 0 { return conn_err(c, fr.E_FRAME_SIZE) }
+        return true
+    }
+    if n % 6 != 0 { return conn_err(c, fr.E_FRAME_SIZE) }
+    if too_chatty(c) { return conn_err(c, E_ENHANCE_YOUR_CALM) }
+    var i: usize = 0
+    while i + 6 <= n {
+        if !apply_setting(c, fr.be16(p, i), fr.be32(p, i + 2)) { return false }
+        i = i + 6
+    }
+    hs_h2out.send_settings_ack(c)
+    hs_h2out.pump(c)
+    return true
+}
+
+fn on_window_update(c: *mut hs_types.Conn, stream: u32, p: u64, n: usize) -> bool {
+    let hc: *mut hs_h2state.H2Conn = &(*c).h2
+    if n != 4 { return conn_err(c, fr.E_FRAME_SIZE) }
+    let inc: i64 = (fr.be32(p, 0) & 2147483647) as i64
+    if stream == 0 {
+        if inc == 0 { return conn_err(c, fr.E_PROTOCOL) }
+        (*hc).send_win = (*hc).send_win + inc
+        if (*hc).send_win > fr.MAX_WINDOW { return conn_err(c, fr.E_FLOW_CONTROL) }
+        hs_h2out.pump(c)
+        return true
+    }
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_find(hc, stream)
+    if s as u64 == 0 {
+        if stream > (*hc).last_id { return conn_err(c, fr.E_PROTOCOL) }
+        return true
+    }
+    if inc == 0 {
+        hs_h2out.send_rst(c, stream, fr.E_PROTOCOL)
+        hs_h2state.stream_release(s)
+        return true
+    }
+    (*s).send_win = (*s).send_win + inc
+    if (*s).send_win > fr.MAX_WINDOW {
+        hs_h2out.send_rst(c, stream, fr.E_FLOW_CONTROL)
+        hs_h2state.stream_release(s)
+        return true
+    }
+    hs_h2out.pump(c)
+    return true
+}
+
+fn on_rst(c: *mut hs_types.Conn, stream: u32, n: usize) -> bool {
+    if n != 4 { return conn_err(c, fr.E_FRAME_SIZE) }
+    if stream == 0 { return conn_err(c, fr.E_PROTOCOL) }
+    if too_chatty(c) { return conn_err(c, E_ENHANCE_YOUR_CALM) }
+    let s: *mut hs_h2state.H2Stream = hs_h2state.stream_find(&(*c).h2, stream)
+    if s as u64 != 0 {
+        hs_h2state.stream_release(s)
+        return true
+    }
+    if stream > (*c).h2.last_id { return conn_err(c, fr.E_PROTOCOL) }
+    return true
+}
+
+fn on_frame(a: *mut hs_types.App, ci: usize, c: *mut hs_types.Conn, ftype: u8, flags: u8, stream: u32,
+    p: u64, n: usize, disp: fn(*mut hs_types.App, *mut hs_types.Req)) -> bool {
+    if (*c).h2.hblock_stream != 0 && (ftype != fr.T_CONTINUATION || stream != (*c).h2.hblock_stream) {
+        return conn_err(c, fr.E_PROTOCOL)
+    }
+    if ftype == fr.T_DATA { return on_data(a, ci, c, flags, stream, p, n, disp) }
+    if ftype == fr.T_HEADERS { return on_headers(a, ci, c, flags, stream, p, n, disp) }
+    if ftype == fr.T_CONTINUATION { return on_continuation(a, ci, c, flags, stream, p, n, disp) }
+    if ftype == fr.T_SETTINGS { return on_settings(c, flags, stream, p, n) }
+    if ftype == fr.T_WINDOW_UPDATE { return on_window_update(c, stream, p, n) }
+    if ftype == fr.T_RST_STREAM { return on_rst(c, stream, n) }
+    if ftype == fr.T_PING {
+        if stream != 0 { return conn_err(c, fr.E_PROTOCOL) }
+        if n != 8 { return conn_err(c, fr.E_FRAME_SIZE) }
+        if too_chatty(c) { return conn_err(c, E_ENHANCE_YOUR_CALM) }
+        if (flags & fr.F_ACK) == 0 { hs_h2out.send_ping_ack(c, p) }
+        return true
+    }
+    if ftype == fr.T_PRIORITY {
+        if stream == 0 { return conn_err(c, fr.E_PROTOCOL) }
+        if n != 5 { return conn_err(c, fr.E_FRAME_SIZE) }
+        return !too_chatty(c) || conn_err(c, E_ENHANCE_YOUR_CALM)
+    }
+    if ftype == fr.T_GOAWAY {
+        if stream != 0 { return conn_err(c, fr.E_PROTOCOL) }
+        (*c).close_after = true
+        return false
+    }
+    if ftype == fr.T_PUSH_PROMISE { return conn_err(c, fr.E_PROTOCOL) }
+    return true
+}
+
+fn h2_input(a: *mut hs_types.App, ci: usize, disp: fn(*mut hs_types.App, *mut hs_types.Req)) {
+    let c: *mut hs_types.Conn = hs_conn.conn(a, ci)
+    while !(*c).dead && !(*c).close_after {
+        let p: u64 = (*c).inb.ptr + (*c).inpos as u64
+        let avail: usize = (*c).inb.len - (*c).inpos
+        if !(*c).h2.preface {
+            let st: i32 = preface_state(c)
+            if st == 0 {
+                conn_err(c, fr.E_PROTOCOL)
+                return
+            }
+            if st == 1 { return }
+            (*c).h2.preface = true
+            (*c).inpos = (*c).inpos + fr.PREFACE_LEN
+            continue
+        }
+        var len: usize = 0
+        var ftype: u8 = 0
+        var flags: u8 = 0
+        var stream: u32 = 0
+        if !fr.read_frame_header(p, avail, &len, &ftype, &flags, &stream) { return }
+        if len > hs_h2state.OUR_FRAME {
+            conn_err(c, fr.E_FRAME_SIZE)
+            return
+        }
+        if avail < fr.FRAME_HEADER_LEN + len { return }
+        let ok: bool = on_frame(a, ci, c, ftype, flags, stream, p + fr.FRAME_HEADER_LEN as u64, len, disp)
+        (*c).inpos = (*c).inpos + fr.FRAME_HEADER_LEN + len
+        if !ok { return }
+    }
+}
