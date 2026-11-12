@@ -110,6 +110,7 @@ struct Method {
 struct Interface {
     name: String,
     methods: Vec<Method>,
+    parents: Vec<String>,
     /// index of the struct `"dyn I"` in `TypeCtx`, `usize::MAX` until registered
     struct_idx: usize,
 }
@@ -131,6 +132,7 @@ struct Impl {
     ok: bool,
     /// already checked (addenda from `comptime` would else report twice)
     checked: bool,
+    parents_checked: bool,
 }
 
 #[derive(Default)]
@@ -467,7 +469,10 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     if !matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::Ident(_))) {
         return false;
     }
-    if !matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::LBrace)) {
+    if !matches!(
+        p.toks.get(p.pos + 2).map(|t| &t.kind),
+        Some(TokKind::LBrace | TokKind::Colon)
+    ) {
         return false;
     }
     interface_decl(p);
@@ -493,12 +498,31 @@ fn interface_decl(p: &mut Parser) {
             return;
         }
     };
+    let mut parents: Vec<(String, Span)> = Vec::new();
+    if p.eat(&TokKind::Colon) {
+        loop {
+            match p.ident("after ':' in an interface") {
+                Some(x) => parents.push(x),
+                None => {
+                    p.recovering = false;
+                    p.sync_item();
+                    return;
+                }
+            }
+            if !p.eat(&TokKind::Plus) {
+                break;
+            }
+        }
+    }
     if !p.expect(TokKind::LBrace, "after the name of the interface") {
         p.recovering = false;
         p.sync_item();
         return;
     }
     let mut methods: Vec<Method> = Vec::new();
+    for (parent, psp) in &parents {
+        inherit_methods(p, &name, parent, *psp, &mut methods);
+    }
     loop {
         while p.eat(&TokKind::Semi) {}
         if p.at(&TokKind::RBrace) || p.at_eof() {
@@ -568,9 +592,43 @@ fn interface_decl(p: &mut Parser) {
         r.borrow_mut().ifaces.push(Interface {
             name,
             methods,
+            parents: parents.into_iter().map(|x| x.0).collect(),
             struct_idx: usize::MAX,
         })
     });
+}
+
+fn inherit_methods(p: &mut Parser, name: &str, parent: &str, span: Span, methods: &mut Vec<Method>) {
+    let inherited = REG.with(|r| {
+        r.borrow()
+            .ifaces
+            .iter()
+            .find(|i| i.name == parent)
+            .map(|i| i.methods.clone())
+    });
+    let Some(inherited) = inherited else {
+        p.dg.error_note(
+            span,
+            format!("unknown interface '{}' in the parents of '{}'", parent, name),
+            "a parent interface must be declared before the interface that extends it".to_string(),
+        );
+        return;
+    };
+    for mut m in inherited {
+        if methods.iter().any(|x| x.name == m.name) {
+            p.dg.error(
+                span,
+                format!(
+                    "the interface '{}' inherits the method '{}' more than once",
+                    name, m.name
+                ),
+            );
+            continue;
+        }
+        m.default = None;
+        m.resolved = false;
+        methods.push(m);
+    }
 }
 
 /// One method of the interface: `fn m(<receiver>[, param…]) [-> T]`
@@ -670,6 +728,7 @@ pub(crate) fn remember_impl(iface: String, ty: String, span: Span) {
             prefix: String::new(),
             ok: false,
             checked: false,
+            parents_checked: false,
         })
     });
 }
@@ -867,9 +926,41 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
         REG.with(|r| r.borrow_mut().impls[u].checked = true);
         check_impl(ck, u, &iface, &ty, span);
     }
+    check_parent_impls(ck);
     // 3. No interface value in the heap: the collector traces PRECISELY
     //    there (SPEC §3.5.3) and does not know the data pointer in a `dyn I`.
     check_gc_fields(ck);
+}
+
+fn check_parent_impls(ck: &mut Checker) {
+    let cnt = REG.with(|r| r.borrow().impls.len());
+    for u in 0..cnt {
+        let missing = REG.with(|r| {
+            let mut reg = r.borrow_mut();
+            let x = reg.impls[u].clone();
+            if !x.checked || x.parents_checked || x.prefix.is_empty() {
+                return None;
+            }
+            reg.impls[u].parents_checked = true;
+            let parents = reg
+                .ifaces
+                .iter()
+                .find(|i| i.name == x.iface)
+                .map(|i| i.parents.clone())
+                .unwrap_or_default();
+            parents
+                .into_iter()
+                .find(|pa| !reg.impls.iter().any(|y| &y.iface == pa && y.prefix == x.prefix))
+                .map(|pa| (x.iface, x.ty, x.span, pa))
+        });
+        if let Some((iface, ty, span, parent)) = missing {
+            ck.dg.error_note(
+                span,
+                format!("'{}' implements '{}' but not its parent interface '{}'", ty, iface, parent),
+                format!("add 'impl {} for {}'", parent, ty),
+            );
+        }
+    }
 }
 
 fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {

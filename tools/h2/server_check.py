@@ -109,6 +109,10 @@ def request(method, path, extra=(), body=None, tls=True, settings=None):
     return r
 
 
+def frame(t, flags, sid, payload=b""):
+    return len(payload).to_bytes(3, "big") + bytes([t, flags]) + sid.to_bytes(4, "big") + payload
+
+
 def pat(n):
     return bytes(97 + i % 26 for i in range(n))
 
@@ -158,6 +162,65 @@ s.sendall(c.data_to_send())
 evs = pump(s, c, lambda e: sum(1 for v in collect(e).values() if v["end"]) >= 40)
 res = collect(evs)
 check("40 multiplexed streams", all(res.get(sid, {}).get("b") == b"s%d" % i for i, sid in enumerate(ids)))
+
+
+def curl(args, data=None):
+    base = ["curl", "-sS", "--max-time", "60", "--cacert", CERT, "--resolve", "localhost:%d:127.0.0.1" % TLS_PORT]
+    r = subprocess.run(base + args, capture_output=True, input=data)
+    return r.stdout
+
+
+TLS_URL = "https://localhost:%d" % TLS_PORT
+PLAIN_URL = "http://127.0.0.1:%d" % PLAIN_PORT
+out = curl(["--http2", "-w", "|%{http_version}|%{http_code}", TLS_URL + "/q?a=hi"])
+check("curl --http2 GET over TLS+ALPN uses h2", out == b"hi|2|200")
+out = curl(["--http2-prior-knowledge", "-w", "|%{http_version}|%{http_code}", PLAIN_URL + "/q?a=plain"])
+check("curl --http2-prior-knowledge GET over h2c", out == b"plain|2|200")
+out = curl(["--http2", "-H", "x-probe: up", "--data-binary", "@-", TLS_URL + "/echo"], body)
+check("curl 300 KB upload over h2", out == b"POST 300000 up\n" + body)
+out = curl(["--http2", TLS_URL + "/big?n=3000000"])
+check("curl 3 MB download over h2", out == pat(3000000))
+urls = [TLS_URL + "/q?a=c%d" % i for i in range(20)]
+args = ["--http2", "--parallel", "--parallel-immediate", "-w", "%{http_version}\n"]
+for u in urls:
+    args += ["-o", os.path.join(WORK, "c%d.out" % urls.index(u)), u]
+out = curl(args)
+bodies = [open(os.path.join(WORK, "c%d.out" % i), "rb").read() for i in range(20)]
+check("curl --parallel 20 transfers all over h2", out.split() == [b"2"] * 20 and bodies == [b"c%d" % i for i in range(20)])
+out = curl(["--http2", "-I", "-w", "%{http_version}", TLS_URL + "/q?a=xyz"])
+check("curl HEAD over h2", out.startswith(b"HTTP/2 200") and out.endswith(b"2"))
+
+from hpack import Encoder
+lim_sock = socket.create_connection(("127.0.0.1", PLAIN_PORT), timeout=10)
+enc = Encoder()
+extra = 30
+sids = [1 + 2 * i for i in range(100 + extra)]
+wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0)
+for sid in sids:
+    block = enc.encode([(":method", "GET"), (":scheme", "http"), (":authority", "localhost"), (":path", "/events")])
+    wire += frame(1, 0x5, sid, block)
+lim_sock.sendall(wire)
+lim_raw, lim_end = b"", time.time() + 4
+lim_sock.settimeout(0.5)
+while time.time() < lim_end:
+    try:
+        d = lim_sock.recv(65536)
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    if not d:
+        break
+    lim_raw += d
+lim_sock.close()
+refused, pos = set(), 0
+while pos + 9 <= len(lim_raw):
+    n = int.from_bytes(lim_raw[pos:pos + 3], "big")
+    ftype, fsid = lim_raw[pos + 3], int.from_bytes(lim_raw[pos + 5:pos + 9], "big") & 0x7FFFFFFF
+    if ftype == 3 and n == 4 and pos + 9 + 4 <= len(lim_raw) and int.from_bytes(lim_raw[pos + 9:pos + 13], "big") == 7:
+        refused.add(fsid)
+    pos += 9 + n
+check("streams above MAX_CONCURRENT_STREAMS (100) are refused: %d of %d" % (len(refused), extra), len(refused) == extra and refused == set(sids[100:]))
 c.ping(b"12345678")
 s.sendall(c.data_to_send())
 evs = pump(s, c, lambda e: any(isinstance(x, h2.events.PingAckReceived) for x in e), 5)
@@ -209,10 +272,6 @@ for i in range(3000):
 evs = pump(s, c, lambda e: False, 1.5)
 check("rapid reset flood is cut off (GOAWAY or close)", any(isinstance(x, h2.events.ConnectionTerminated) for x in evs) or "closed" in evs)
 s.close()
-
-
-def frame(t, flags, sid, payload=b""):
-    return len(payload).to_bytes(3, "big") + bytes([t, flags]) + sid.to_bytes(4, "big") + payload
 
 
 def valid_stream():

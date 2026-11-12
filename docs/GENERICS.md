@@ -15,9 +15,9 @@ Every row below was run against `firnc`; the test column names a file in `tests/
 | Methods (`impl Typ { fn m(*self) }`) on a non-generic struct | works | `docs/ROUND45.md` |
 | Dynamic dispatch `dyn Interface` | works | `docs/ROUND46.md` |
 | Methods on a generic type `impl Box[T] { .. }` | works in `firnc0` and `firnc1` (2026-11-12) | `tests/6720_impl_generic_core.fi`, `tests/neg/impl_generic_*.fi`, `tests/diff/impl_generic_*.fi` |
-| Operator overloading (`impl Add for V2`, `a + b`) | **missing**: `unknown interface 'Add'` | `docs/ROUND45.md` section 10 |
+| Operator overloading (`impl V2 { fn add(*self, o: V2) -> V2 }`, `a + b`) | works: `a + b` calls `add` on a struct operand (`add sub mul div neg eq cmp`) | `docs/OPERATORS.md` |
 | Default methods in an interface | works: `fn m(*self) -> T { body }` inside `interface`; copied as `X__m` at the end of every `impl I for X` that does not define it | `tests/6730_iface_default_core.fi` |
-| Interface inheritance (`interface A: B`) | missing | `docs/ROUND46.md` section 9 |
+| Interface inheritance (`interface A: B + C`) | works: the methods of the parents come first in `A` (and its method table), `impl A for T` needs `impl B for T` too, `dyn A` and bounds `[T: A]` call the parent methods | `tests/diff/iface_inherit_basic.fi` |
 | Associated functions `Typ::new()` | missing (`::` is no token) | `docs/ROUND45.md` section 10 |
 | Type parameters on aliases `type V[T] = ..` | refused | `SPEC.md` (type aliases section) |
 
