@@ -145,7 +145,9 @@ fn hoist(rw: &mut Rw, s: &mut Stmt) -> Vec<Stmt> {
 
 fn drop_stmt(rw: &mut Rw, var: &str, span: crate::diag::Span) -> Stmt {
     let ident = Expr { id: fresh_id(rw), span, kind: ExprKind::Ident(var.to_string()) };
-    let cast = Expr { id: fresh_id(rw), span, kind: ExprKind::Cast(Box::new(ident), TypeExpr::Named("u64".to_string(), span)) };
+    let raw_ty = TypeExpr::Ptr { mutable: true, inner: Box::new(TypeExpr::Named("u8".to_string(), span)), span };
+    let raw = Expr { id: fresh_id(rw), span, kind: ExprKind::Cast(Box::new(ident), raw_ty) };
+    let cast = Expr { id: fresh_id(rw), span, kind: ExprKind::Cast(Box::new(raw), TypeExpr::Named("u64".to_string(), span)) };
     let call = Expr { id: fresh_id(rw), span, kind: ExprKind::Call(rw.drop_name.to_string(), vec![cast], span) };
     Stmt::Expr(call)
 }
