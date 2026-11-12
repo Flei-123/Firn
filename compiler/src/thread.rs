@@ -391,6 +391,9 @@ pub(crate) fn spawn_sequence_a64(e: &mut crate::codegen_x86::Emitter) {
     crate::codegen_a64::imm_into(e, "x8", 220);
     e.line("svc #0");
     e.line(&format!("cbnz x0, {}", back));
+    if crate::stackguard::enabled_a64() {
+        crate::stackguard::emit_thread_alt_stack_a64(e);
+    }
     // ---- child: own stack, fetch the argument back ----------------------
     e.line("ldr x0, [sp]");
     e.line("add sp, sp, #16");

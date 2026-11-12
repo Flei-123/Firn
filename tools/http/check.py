@@ -211,7 +211,7 @@ out, _ = curl("-s", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1:%
 refusal("no token -> 403", out == "403", out)
 out, _ = curl("-s", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1:%d/?t=%s" % (P, "0" * 32))
 refusal("wrong token -> 403", out == "403", out)
-out, _ = curl("-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "Cookie: firn_pair=" + tok[:31] + "0",
+out, _ = curl("-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "Cookie: firn_pair=" + tok[:31] + ("1" if tok[-1] == "0" else "0"),
               "http://127.0.0.1:%d/" % P)
 refusal("wrong cookie -> 403", out == "403", out)
 jar = os.path.join(WORK, "jar.txt")

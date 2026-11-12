@@ -90,6 +90,8 @@ pub const PAGE: u64 = 4096;
 const KNOWN: &[(&str, &str, u32)] = &[
     // --- kernel32: process, memory, files, time -----------------------
     ("ExitProcess", "KERNEL32.dll", 1),
+    ("AddVectoredExceptionHandler", "KERNEL32.dll", 2),
+    ("SetThreadStackGuarantee", "KERNEL32.dll", 1),
     // --- kernel32: THREADS (round WIN-THREADS) -------------------------
     // `CreateThread` for `Op::ThreadSpawn`; `TlsAlloc`/`TlsSetValue` keep the
     // thread block pointer (the Windows twin of `fs:0`, see
@@ -566,6 +568,9 @@ pub const THREAD_MAIN: &str = "_Fwin.thread_main";
 pub fn note_thread_main() {
     THREADMAIN_USED.with(|p| *p.borrow_mut() = true);
     let _ = note("WakeByAddressAll");
+    if crate::stackguard::enabled_windows() {
+        let _ = note("SetThreadStackGuarantee");
+    }
 }
 
 /// Is the thread entry thunk needed?
@@ -1044,6 +1049,9 @@ fn thread_main_asm() -> String {
     s.push_str("    mov rbx, rcx\n");
     s.push_str("    mov rax, qword ptr gs:[8]\n");
     s.push_str(&format!("    mov qword ptr [rbx+{}], rax\n", crate::thread::WIN_TCB_BOTTOM));
+    if crate::stackguard::enabled_windows() {
+        s.push_str(&crate::stackguard::windows_thread_asm(&thunk("SetThreadStackGuarantee")));
+    }
     s.push_str("    mov rdi, rbx\n");
     s.push_str(&format!("    call {}\n", crate::codegen_x86::label(crate::thread::ENTRY)));
     s.push_str(&format!("    mov dword ptr [rbx+{}], 0\n", crate::thread::WIN_TCB_TID));
@@ -1192,6 +1200,14 @@ pub fn start_asm(gc_init: Option<&str>, seam_init: &str, argv_sym: &str, main_sy
     // The seam first: it opens the standard handles, and everything after
     // it — the collector included — may want to report an error.
     s.push_str(&format!("    call {}\n", seam_init));
+    let stack_guard = crate::stackguard::enabled_windows();
+    if stack_guard {
+        let _ = note("TerminateProcess");
+        s.push_str(&crate::stackguard::windows_start_asm(
+            &note("AddVectoredExceptionHandler").expect("known import"),
+            &note("SetThreadStackGuarantee").expect("known import"),
+        ));
+    }
     if let Some(g) = gc_init {
         s.push_str(&format!("    call {}\n", g));
     }
@@ -1201,6 +1217,9 @@ pub fn start_asm(gc_init: Option<&str>, seam_init: &str, argv_sym: &str, main_sy
     s.push_str("    mov ecx, eax\n");
     s.push_str(&format!("    call [rip + {}]\n", imp("ExitProcess")));
     s.push_str("    hlt\n");
+    if stack_guard {
+        s.push_str(&crate::stackguard::windows_handler_asm(&imp("GetStdHandle"), &imp("WriteFile"), &imp("TerminateProcess")));
+    }
     s
 }
 

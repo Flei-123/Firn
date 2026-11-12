@@ -987,6 +987,7 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
 // ------------------------------------------------------------------ the module
 
 pub fn emit(m: &Module) -> Result<String, String> {
+    crate::stackguard::prepare(m);
     // ROUND ARM-FREESTANDING: round 80 refused the kernel profile here. It
     // does not any more -- see `emit_start` below and `emit_func`'s
     // `#[interrupt]` arm. What a freestanding object file must NOT have is
@@ -1031,6 +1032,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if auxv {
         crate::simd_a64::emit_auxv_save(&mut e);
     }
+    let stack_guard = crate::stackguard::enabled_a64();
+    if stack_guard {
+        crate::stackguard::emit_start_a64(&mut e);
+    }
     if crate::gc::runtime_active() {
         e.line(&format!("bl {}", label(crate::gc::FN_INIT)));
     }
@@ -1044,6 +1049,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov x8, #93"); // exit(2) — 60 on x86-64, 93 here
     e.line("svc #0");
     e.line("brk #0");
+    if stack_guard {
+        crate::stackguard::emit_tail_a64(&mut e);
+    }
     }
 
     if !no_start && !m.funcs.iter().any(|f| f.name == "main") {
@@ -2897,8 +2905,9 @@ mod tests {
         assert!(fr.size >= 12);
         let s = build(&Module { funcs: vec![f] });
         // exactly one `sub sp` (the prologue) and one `add sp` (the epilogue)
-        assert_eq!(s.matches("sub sp, sp,").count(), 1, "{}", s);
-        assert_eq!(s.matches("add sp, sp,").count(), 1, "{}", s);
+        let body = &s[s.find(&format!("{}:", label("main"))).expect("main is emitted")..];
+        assert_eq!(body.matches("sub sp, sp,").count(), 1, "{}", s);
+        assert_eq!(body.matches("add sp, sp,").count(), 1, "{}", s);
     }
 
     /// More than eight arguments: from the ninth word on they travel on the

@@ -3,7 +3,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FIRNC="${FIRNC:-/root/firn/compiler/target/release/firnc}"
 export FIRNLIB="$ROOT/lib"
-D="$(mktemp -d)"
+D="$(TMPDIR=/var/tmp mktemp -d)"
 PIDFILE="$D/my.pid"
 cleanup() {
   [ -s "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null && sleep 2

@@ -51,7 +51,7 @@ skipped in release-fast by `// not_mode: opt`). Measured behaviour in release-fa
 | G12 | `vec_free` zeroes ptr/len/cap: freeing the same variable twice is a no-op | by design | `4708` |
 | G13 | Drop runs once per owned value, in reverse order, moved values are dropped by the new owner only | C + codegen | `2005` |
 | G14 | `rt.heap_free` of a block that is already free (cached block): message `firn: double free (heap_free)`, exit 101, in every build level. Detection is a mark word at offset 8 (`p ^ FREE_MARK`) set when the block is cached and cleared when it is handed out again: one load and one store per call | P | `4730`, `4731`, `4734` (reuse stays clean), ub16, ub18 |
-| G15 | Stack overflow by unbounded recursion: `firn: stack overflow`, exit 101 (SIGSEGV handler on an alternate stack; it only claims faults within 1 MiB of the faulting `rsp`, any other SIGSEGV stays 139). Levels dev, dev-fast, release-safe; Linux x86-64 user programs, main thread AND every thread started with `thread_start` (each thread child calls `sigaltstack` on a 32 KiB area above its own stack, `THREAD_ALT_BYTES` in `lib/gc/gc.fi`, `stackguard::THREAD_ALT`; firnc1 emits the same text in `emit_spawn`). firnc1 installs the guard in the checked levels only, like firnc0 (before, it also did in release-fast: differential test `tests/diff/safety_null_deref.fi`) | P | `4732`, `4733` (null deref still 139), `4862` (thread), ub05, ub26 |
+| G15 | Stack overflow by unbounded recursion: `firn: stack overflow`, exit 101. Linux x86-64 and aarch64: SIGSEGV handler on an alternate stack that only claims faults within 1 MiB of the faulting stack pointer, any other SIGSEGV stays 139; every `thread_start` child calls `sigaltstack` on a 32 KiB area above its own stack (`THREAD_ALT_BYTES` in `lib/gc/gc.fi`, `stackguard::THREAD_ALT` / `THREAD_ALT_A64`; firnc1 emits the same x86 text in `emit_spawn`). Windows x86-64: a vectored exception handler (`AddVectoredExceptionHandler`) claims `STATUS_STACK_OVERFLOW`, writes the message and ends with `TerminateProcess(-1, 101)`; main thread and every thread get `SetThreadStackGuarantee(32 KiB)` (`stackguard::windows_*`). Levels dev, dev-fast, release-safe always; release-fast only in a program that contains the thread spawn (`thread_start` is linked into every program with a `Gc` heap, so in practice every release-fast program that links the GC runtime (about 60 % of bench/examples); the guard costs a few start-up system calls, a release-fast program without the runtime stays unguarded, see N3). firnc1 (x86-64 Linux) follows the same rule (`guard_on` in `lib/firnc1/codegen.fi`) | P | `4732`, `4733` (null deref still 139), `4862` (thread, all levels), ub05, ub26, `tools/safety/guard_targets.sh` (aarch64 under qemu, Windows under Wine) |
 | G16 | An explicit `x.drop()` on a local with a `drop` is a move: no second drop at scope end, reading `x` afterwards is rejected | C + codegen | `4711`, neg `4735` |
 | G17 | `-MIN` (`-i32::MIN`, `-i64::MIN`, any signed width) | P (release-fast wraps to `MIN`) | `4810`, `4811`, ub13, ub14 |
 | G18 | Shift count outside `0 .. bits-1` (also negative, also `<<=`) | P (release-fast: count modulo the width) | `4812`, `4813`, `4814`, ub15 |
@@ -72,7 +72,7 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 |---|---|---|---|
 | N1 | (closed by G21, 08.11.2026) | | ub01, ub02 |
 | N2 | (closed by G21, 08.11.2026) | | ub03, ub04 |
-| N3 | Stack overflow by unbounded recursion in release-fast (main thread and threads: no guard is installed), on aarch64 and on Windows (checked x86-64 Linux: main thread and threads are guarded, G15) | T (SIGSEGV 139), no message | ub05, ub26 |
+| N3 | Stack overflow by unbounded recursion in a release-fast program that does not link the thread runtime (no `Gc`, no threads: no guard installed), and in a Windows thread not started by `thread_start` | T (SIGSEGV 139 / Windows STATUS_STACK_OVERFLOW), no message | ub05 |
 | N4 | Raw pointer arithmetic past an object | reads / writes whatever is there | ub22 |
 | N5 | `rt.heap_free` twice, when the first free already gave the block back to the kernel (more than 16 pages, or the size cache was full) | accepted (a second `munmap`); a later access faults. A free of a CACHED block is caught, see G14. A free of a block that was handed out again in between is a free of a live block and not detectable. Opt-in: after `rt.heap_debug_enable()` every free is caught while its address is among the last 4096 frees (`4863`) | ub16 |
 | N6 | Read after `rt.heap_free` | returns 0 today for small blocks (wiped and cached); T for blocks that were `munmap`ed. Opt-in debug heap: always T (`4864`) | ub17 |
@@ -114,11 +114,11 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 ## Gaps (roadmap)
 
 - Kernel W^X (page tables + PHDRS + `noexecstack`).
-- Stack overflow guard for release-fast, aarch64 (`panic_rt_a64`/startup, fUi owns it) and Windows (N3; threads on x86-64 Linux done, 4862).
+- Stack overflow guard for release-fast programs without threads (N3; x86-64 Linux, aarch64 and Windows threads done, `guard_targets.sh`).
 - Use after `heap_free` (reads of cached blocks return 0, no detection) and double free of uncached blocks (N5, N6, N8, N9).
 - Make `Vec` / `Buf` non-trivial (move semantics) or add a `drop` that is checked (N7, N11).
 - Add `unsafe { }` and enforce it for raw pointer dereference (N16); the whole library has to be marked first (`rawptr_audit.sh` measures the size).
-- Null guard on aarch64 and Windows (the SIGSEGV handler is x86-64 Linux only; same gap as N3).
+- Null guard on aarch64 and Windows (the null branch of the SIGSEGV handler is x86-64 Linux only; the stack overflow guard G15 now runs on all three).
 - Roots for `Gc[T]` stored in raw memory or behind `as *mut u8 as u64`: documented only (N13).
 - Debug heap (`rt.heap_debug_enable()`) is opt-in and x86-64 Linux; making the checks the default for N5/N6/N8/N9 costs one `mmap` per free and 1 page per block, so it stays a switch.
 

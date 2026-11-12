@@ -30,6 +30,17 @@ fn header(o: &Options, rel: &str) -> String {
     src.lines().next().unwrap_or("").to_string()
 }
 
+fn run_timeout(o: &Options, rel: &str) -> Duration {
+    let src = std::fs::read_to_string(o.root.join(rel)).unwrap_or_default();
+    let requested = src
+        .lines()
+        .take(5)
+        .find_map(|l| l.strip_prefix("// timeout: "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Duration::from_secs(o.timeout_secs.max(requested))
+}
+
 fn after(hdr: &str, key: &str) -> String {
     hdr.split_once(key).map(|x| x.1.to_string()).unwrap_or_else(|| hdr.to_string())
 }
@@ -65,7 +76,8 @@ pub fn run_program(o: &Options, work: &Path, rel: &str, level: &str) -> Case {
     };
     let mut cmd = Command::new(&bin);
     cmd.current_dir(&o.root);
-    let result = exec::run(&mut cmd, Duration::from_secs(o.timeout_secs));
+    let limit = run_timeout(o, rel);
+    let result = exec::run(&mut cmd, limit);
     let _ = std::fs::remove_file(&bin);
     let run = match result {
         Ok(r) => r,
@@ -73,7 +85,7 @@ pub fn run_program(o: &Options, work: &Path, rel: &str, level: &str) -> Case {
     };
     let micros = t0.elapsed().as_micros();
     if run.timed_out {
-        return case.failed(format!("program timed out after {} s", o.timeout_secs), micros);
+        return case.failed(format!("program timed out after {} s", limit.as_secs()), micros);
     }
     let hdr = header(o, rel);
     let stderr = run.stderr_text();
