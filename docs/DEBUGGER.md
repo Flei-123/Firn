@@ -158,6 +158,22 @@ and compares the output line by line against these expectations; the
 addresses may change with the code generator, the file, the lines and the
 values may not.
 
+## VS Code / DAP adapter (`tools/dap/`)
+
+`tools/dap/dap_server.py` is a Debug Adapter Protocol server over stdio that drives `gdb --interpreter=mi3`. It is the same DWARF information as above, so variables need a `--no-opt` build.
+
+| Request | Behaviour |
+|---|---|
+| `launch` | `program`, `args`, `cwd`, `stopOnEntry`; inferior output arrives as `output` events |
+| `setBreakpoints`, `setFunctionBreakpoints` | `--source/--line` and `--function`; `verified` from gdb |
+| `continue`, `next`, `stepIn`, `stepOut`, `pause` | `stopped` events with reason `breakpoint`, `step`, `entry`, `exception` |
+| `stackTrace`, `scopes`, `variables` | one `Locals` scope per frame, values as gdb prints them (structs flat) |
+| `evaluate` | any gdb expression in the selected frame |
+
+`exited` + `terminated` carry the real exit code. Test: `bash tools/dap/run.sh` (builds `docs/gdb_example.fi`, drives the adapter through a full session, 23 checks). Editor wiring: `editors/vscode-firn` contributes the `firn` debug type; a manual `launch.json` is `{"type":"firn","request":"launch","name":"Debug","program":"${workspaceFolder}/out/app"}`.
+
+Not done: variable expansion of structs/arrays into children, watch points, attach, conditional breakpoints.
+
 ## Limits (honestly)
 
 * **No variables in the optimized build.** Lines are there since round 94,
