@@ -217,7 +217,7 @@ here, because both read the same registration at the same point in time.
 | the interface exists | the same | `iface_unknown.fi` |
 | `dyn I` with an unknown `I` | `iface::hook_resolve_ty` | `iface_dyn_unknown.fi` |
 | receiver of an interface method is `*self`/`*mut self` | parser | `iface_receiver_value.fi` |
-| interface method has no body | parser | `iface_body.fi` |
+| default method calls a method the interface does not declare | type checker | `iface_default_no_method.fi` |
 | only methods of the interface are reachable via `dyn` | `iface::hook_methode` | `iface_no_method.fi` |
 | conversion only from a pointer to a struct | `iface::hook_cast` | `iface_no_ptr.fi` |
 | the type really implements the interface | the same | `iface_does_not_impl.fi` |

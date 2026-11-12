@@ -16,19 +16,21 @@ Every row below was run against `firnc`; the test column names a file in `tests/
 | Dynamic dispatch `dyn Interface` | works | `docs/ROUND46.md` |
 | Methods on a generic type `impl Box[T] { .. }` | works in `firnc0` and `firnc1` (2026-11-12) | `tests/6720_impl_generic_core.fi`, `tests/neg/impl_generic_*.fi`, `tests/diff/impl_generic_*.fi` |
 | Operator overloading (`impl Add for V2`, `a + b`) | **missing**: `unknown interface 'Add'` | `docs/ROUND45.md` section 10 |
-| Default methods in an interface | missing | `docs/ROUND46.md` section 9 |
+| Default methods in an interface | works: `fn m(*self) -> T { body }` inside `interface`; copied as `X__m` at the end of every `impl I for X` that does not define it | `tests/6730_iface_default_core.fi` |
 | Interface inheritance (`interface A: B`) | missing | `docs/ROUND46.md` section 9 |
 | Associated functions `Typ::new()` | missing (`::` is no token) | `docs/ROUND45.md` section 10 |
 | Type parameters on aliases `type V[T] = ..` | refused | `SPEC.md` (type aliases section) |
 
 Methods on generic types, how it works: `impl Box[T] { fn m(*self) .. }` is parsed as a template per method, stored under `Box__m` next to the function templates (the type parameters of the `impl` header are the template parameters, their names are free: `impl Box[U]` is fine). When the struct instance `Box[i32]` (`Box__i32`) is expanded, every method template of `Box` is expanded with it as `Box__i32__m`. After that the ordinary method resolution of round 45 finds `Box__i32__m` by the receiver type; nothing downstream changed.
 
+Default methods: the body is parsed once with `Self` as the receiver type and copied per implementing type (type parameter `Self` in firnc1, `replace_self` in firnc0); `Self` is usable in the signature only, the body may call methods the interface declares and free functions visible in the implementing module; a `gc class` receiver works in firnc0 only (firnc1 cannot call a class method from another method of the same class, tracked separately).
+
 Limits: a method cannot be generic itself; `impl Iface for Box[T]` is not supported; `impl Box[i32]` (a specialised block) is not supported, the header lists type parameters only; every method of every used instance is type-checked even when never called.
 
 ## Plan for the missing parts (each needs both compilers and tests/diff)
 
 1. **Methods on generic types.** Done, see above (`compiler/src/impl_generic.rs`, `mono.rs::expand_methods`, `lib/firnc1/mono.fi::methods_instantiate`).
-2. **Default methods in interfaces** (r1472, design). `interface I { fn m(*self) -> T { body } }`: the parser keeps the body (`iface.rs` and `lib/firnc1/iface.fi` store signatures only today, so both registries need a body slot, a template like the method templates above). At the end of every `impl I for X` block each default method that the block does not define is copied as `X__m` with `self` typed `*X`, through the same expansion used for generic methods. Dynamic dispatch through `dyn I` needs no change: the method table is filled from the `X__m` names. Error to add: a default body that calls a method the interface does not declare.
+2. **Default methods in interfaces** (r1472, done in firnc0 `iface_default.rs` and firnc1 `parser.fi interface_default_body/impl_defaults_add` + `mono.fi gen_defaults_instantiate`). `interface I { fn m(*self) -> T { body } }`: the parser keeps the body (`iface.rs` and `lib/firnc1/iface.fi` store signatures only today, so both registries need a body slot, a template like the method templates above). At the end of every `impl I for X` block each default method that the block does not define is copied as `X__m` with `self` typed `*X`, through the same expansion used for generic methods. Dynamic dispatch through `dyn I` needs no change: the method table is filled from the `X__m` names. Error to add: a default body that calls a method the interface does not declare.
 3. **Operator overloading** (r1473, design). `a + b` on a struct operand becomes the method call `a.add(b)` when `Add` is implemented for the type (`impl Add for V2 { fn add(self, o: V2) -> V2 }`). Fixed set: `Add Sub Mul Div Neg Eq Ord Index`. Hook: the type checker, where binary operators currently report "operator on struct"; the lowering reuses the method resolution (`impls::target_of`). Generic operands work now that `impl Box[T]` exists.
 4. **Interface inheritance** (`interface A: B`): method-table prefix rule, after 2.
 

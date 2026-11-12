@@ -225,13 +225,14 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     };
     let ty = crate::types::canon_name(&ty).to_string();
     if is_for {
-        crate::iface::remember_impl(first, ty.clone(), esp);
+        crate::iface::remember_impl(first.clone(), ty.clone(), esp);
     }
     if !p.expect(TokKind::LBrace, "after the type name in 'impl'") {
         p.recovering = false;
         p.sync_item();
         return;
     }
+    let mut defined: crate::fx::HashSet<String> = Default::default();
     loop {
         while p.eat(&TokKind::Semi) {}
         if p.at(&TokKind::RBrace) || p.at_eof() {
@@ -253,7 +254,10 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         // message is followed by a cascade of consequential errors, and the
         // first one — the only one that explains anything — drowns in it.
         match method(p, &ty, &ty, tsp, is_for) {
-            Some(decl) => prog.funcs.push(decl),
+            Some(decl) => {
+                defined.insert(decl.name.clone());
+                prog.funcs.push(decl)
+            }
             None => {
                 p.recovering = false;
                 p.sync_item();
@@ -266,6 +270,9 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     }
     p.close(TokKind::RBrace, "at the end of the impl block");
     p.recovering = false;
+    if is_for {
+        crate::iface_default::add_defaults(p, prog, &first, &ty, &defined);
+    }
     let _ = start;
 }
 

@@ -66,7 +66,7 @@
 use std::cell::RefCell;
 use crate::fx::HashSet;
 
-use crate::ast::{Expr, TypeExpr};
+use crate::ast::{Expr, FnDecl, TypeExpr};
 use crate::diag::{Diags, Span};
 use crate::lexer::TokKind;
 use crate::parser::Parser;
@@ -103,6 +103,7 @@ struct Method {
     /// the implementing type and are resolved ONLY PER IMPLEMENTATION; globally
     /// they stay empty, and through `dyn I` the method is not callable.
     has_self: bool,
+    default: Option<FnDecl>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +146,24 @@ thread_local! {
 /// Resets the registry (one per compilation, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
+}
+
+pub(crate) const SELF_TYPE: &str = "Self";
+
+pub(crate) fn default_methods(iface: &str) -> Vec<(String, FnDecl)> {
+    REG.with(|r| {
+        let reg = r.borrow();
+        reg.ifaces
+            .iter()
+            .find(|i| i.name == iface)
+            .map(|i| {
+                i.methods
+                    .iter()
+                    .filter_map(|m| m.default.clone().map(|d| (m.name.clone(), d)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 fn iface_index(name: &str) -> Option<usize> {
@@ -501,8 +520,20 @@ fn interface_decl(p: &mut Parser) {
         // One broken method aborts the WHOLE interface — the same rule as in
         // the `impl` block (impls.rs): the first message is the only one that
         // explains anything.
+        let head_pos = p.pos;
         match method_head(p, &name) {
-            Some(m) => {
+            Some(mut m) => {
+                if p.at(&TokKind::LBrace) {
+                    p.pos = head_pos;
+                    match crate::impls::method(p, &name, SELF_TYPE, m.span, false) {
+                        Some(decl) => m.default = Some(decl),
+                        None => {
+                            p.recovering = false;
+                            p.sync_item();
+                            return;
+                        }
+                    }
+                }
                 if methods.iter().any(|x| x.name == m.name) {
                     p.dg.error(
                         m.span,
@@ -592,13 +623,6 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     } else {
         None
     };
-    if p.at(&TokKind::LBrace) {
-        p.error_here(format!(
-            "an interface method has no body ('{}.{}')",
-            iface, name
-        ));
-        return None;
-    }
     // `Self` (round 50): the type that implements the interface. Only with it
     // can an ordering be written down — `fn less(*self, b: *Self)`.
     // Without `Self` a CONCRETE type would have to stand in the interface, and
@@ -615,6 +639,7 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
         rtyp: Type::Void,
         resolved: false,
         has_self,
+        default: None,
     })
 }
 

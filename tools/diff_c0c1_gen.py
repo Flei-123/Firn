@@ -935,6 +935,23 @@ IMPL_GENERIC_NEG = [
 for nm, src in IMPL_GENERIC_NEG:
     emit("neg_impl_generic_" + nm, "neg", "", src, prelude=False)
 
+IFACE_DEFAULT_RUN = [
+    ("basic", "interface Shape {\n    fn area(*self) -> i64\n    fn double_area(*self) -> i64 {\n        return self.area() * 2\n    }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nfn main() -> i32 {\n    let a: Sq = Sq { s: 4 }\n    put(a.double_area())\n    return 0\n}\n"),
+    ("override", "interface Shape {\n    fn area(*self) -> i64\n    fn describe(*self, k: i64) -> i64 {\n        return self.area() + k\n    }\n}\nstruct Sq { s: i64 }\nstruct Rect { w: i64, h: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nimpl Shape for Rect {\n    fn area(*self) -> i64 { return (*self).w * (*self).h }\n    fn describe(*self, k: i64) -> i64 { return 1000 + k }\n}\nfn main() -> i32 {\n    let a: Sq = Sq { s: 3 }\n    let b: Rect = Rect { w: 2, h: 5 }\n    put(a.describe(1))\n    put(b.describe(1))\n    return 0\n}\n"),
+    ("chain_and_self", "interface Shape {\n    fn area(*self) -> i64\n    fn double_area(*self) -> i64 { return self.area() * 2 }\n    fn quad_area(*self) -> i64 { return self.double_area() * 2 }\n    fn bigger_than(*self, o: *Self) -> bool { return self.area() > o.area() }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nfn main() -> i32 {\n    let a: Sq = Sq { s: 3 }\n    let b: Sq = Sq { s: 2 }\n    put(a.quad_area())\n    if a.bigger_than(&b) { put(1) }\n    if b.bigger_than(&a) { put(2) }\n    return 0\n}\n"),
+    ("through_dyn", "interface Shape {\n    fn area(*self) -> i64\n    fn double_area(*self) -> i64 { return self.area() * 2 }\n}\nstruct Sq { s: i64 }\nstruct Dot { x: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nimpl Shape for Dot {\n    fn area(*self) -> i64 { return (*self).x }\n}\nfn twice(x: dyn Shape) -> i64 { return x.double_area() }\nfn main() -> i32 {\n    let a: Sq = Sq { s: 3 }\n    let d: Dot = Dot { x: 7 }\n    put(twice((&a) as dyn Shape))\n    put(twice((&d) as dyn Shape))\n    return 0\n}\n"),
+]
+for nm, src in IFACE_DEFAULT_RUN:
+    emit("iface_default_" + nm, "run", "same", src)
+
+IFACE_DEFAULT_NEG = [
+    ("no_method", "interface Shape {\n    fn area(*self) -> i64\n    fn bad(*self) -> i64 {\n        return self.nothing()\n    }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+    ("required_missing", "interface Shape {\n    fn area(*self) -> i64\n    fn twice(*self) -> i64 { return self.area() * 2 }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn twice(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+    ("body_type", "interface Shape {\n    fn area(*self) -> i64\n    fn bad(*self) -> i64 {\n        return true\n    }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+]
+for nm, src in IFACE_DEFAULT_NEG:
+    emit("neg_iface_default_" + nm, "neg", "", src, prelude=False)
+
 # sanity programs that MUST be accepted by both (guard against both-reject hiding in neg)
 emit("ok_struct_no_comma", "run", "same", "struct S { a: i32 b: i32 }\nfn main() -> i32 {\n    let s: S = S { a: 1, b: 2 }\n    put((s.a + s.b) as i64)\n    return 0\n}\n")
 emit("ok_empty_main", "run", "same", "fn main() -> i32 {\n    return 0\n}\n", prelude=False)
