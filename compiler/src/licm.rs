@@ -107,6 +107,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     loops.sort_by_key(|(_, body)| body.len());
     // addresses in `.rodata`: they do not change when code moves
     let mut ro: Option<HashMap<Val, u64>> = None;
+    let mut facts: Option<crate::loadcse::Facts> = None;
 
     for (head, body) in loops {
         let preheader = match preheader_of(f, head, &body, &preds) {
@@ -116,7 +117,11 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
         if ro.is_none() {
             ro = Some(rodata_addrs(f));
         }
-        moved += hoist_out(f, head, &body, preheader, ro.as_ref().unwrap());
+        if facts.is_none() && loop_is_read_only(f, &body) {
+            facts = Some(crate::loadcse::analyse(f));
+        }
+        let stack = if loop_is_read_only(f, &body) { facts.as_ref() } else { None };
+        moved += hoist_out(f, head, &body, preheader, ro.as_ref().unwrap(), stack);
     }
     moved
 }
@@ -237,6 +242,20 @@ fn rodata_load(op: &Op, ty: crate::fir::FTy, ro: &HashMap<Val, u64>) -> bool {
     }
 }
 
+fn loop_is_read_only(f: &Func, body: &HashSet<usize>) -> bool {
+    body.iter().all(|&b| {
+        f.blocks[b].insts.iter().all(|i| matches!(i.op, Op::Load { .. }) || !crate::loadcse::has_memory_effect(&i.op))
+    })
+}
+
+fn stack_load(op: &Op, facts: Option<&crate::loadcse::Facts>) -> bool {
+    let (Op::Load { addr }, Some(facts)) = (op, facts) else {
+        return false;
+    };
+    let loc = facts.locate(*addr);
+    matches!(loc.root, crate::loadcse::Root::Alloca(_)) && loc.off.is_some()
+}
+
 /// May this instruction be moved at all? (purity + trap freedom)
 fn hoistable_op(op: &Op) -> bool {
     if crate::mem2reg::is_untouchable(op) {
@@ -286,6 +305,7 @@ fn hoist_out(
     body: &HashSet<usize>,
     preheader: usize,
     ro: &HashMap<Val, u64>,
+    stack: Option<&crate::loadcse::Facts>,
 ) -> usize {
     let mut moved = 0;
     let mut buf: Vec<Val> = Vec::new();
@@ -304,7 +324,7 @@ fn hoist_out(
         let mut hit: Option<(usize, usize)> = None;
         'search: for &b in &order {
             for (ix, i) in f.blocks[b].insts.iter().enumerate() {
-                if !hoistable_op(&i.op) && !rodata_load(&i.op, i.ty, ro) {
+                if !hoistable_op(&i.op) && !rodata_load(&i.op, i.ty, ro) && !stack_load(&i.op, stack) {
                     continue;
                 }
                 let d = match i.dst {

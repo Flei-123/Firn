@@ -70,7 +70,7 @@ fn size_of(ty: FTy) -> u64 {
     (ty.bits() / 8).max(1) as u64
 }
 
-fn analyse(f: &Func) -> Facts {
+pub(crate) fn analyse(f: &Func) -> Facts {
     let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
