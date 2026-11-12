@@ -987,7 +987,6 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
 // ------------------------------------------------------------------ the module
 
 pub fn emit(m: &Module) -> Result<String, String> {
-    crate::stackguard::prepare(m);
     // ROUND ARM-FREESTANDING: round 80 refused the kernel profile here. It
     // does not any more -- see `emit_start` below and `emit_func`'s
     // `#[interrupt]` arm. What a freestanding object file must NOT have is

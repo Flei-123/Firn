@@ -328,7 +328,6 @@ pub fn function_sections() -> bool {
 pub fn emit(m: &Module) -> Result<String, String> {
     let mut clk = crate::opt::StageClock::new();
     crate::fpool::reset();
-    crate::stackguard::prepare(m);
     let mut e = Emitter {
         out: String::new(),
         cold: String::new(),

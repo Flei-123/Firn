@@ -7,6 +7,10 @@
 //! x86-64 Linux user programs only.
 
 
+const STACK_MESSAGE_ASM: &str = ".byte 102,105,114,110,58,32,115,116,97,99,107,32,111,118,101,114,102,108,111,119,10";
+const NULL_MESSAGE_ASM: &str = ".byte 102,105,114,110,58,32,110,117,108,108,32,112,111,105,110,116,101,114,32,100,101,114,101,102,101,114,101,110,99,101,10";
+const NULL_ADDRESS_LIMIT: u32 = 4096;
+
 pub(crate) const START: &[&str] = &[
     "sub rsp, 64",
     "mov eax, 9",
@@ -86,29 +90,13 @@ pub(crate) const TAIL: &[&str] = &[
     "mov eax, 15",
     "syscall",
     ".L__firn_so_msg:",
-    ".byte 102,105,114,110,58,32,115,116,97,99,107,32,111,118,101,114,102,108,111,119,10",
+    STACK_MESSAGE_ASM,
     ".L__firn_null_msg:",
-    ".byte 102,105,114,110,58,32,110,117,108,108,32,112,111,105,110,116,101,114,32,100,101,114,101,102,101,114,101,110,99,101,10",
+    NULL_MESSAGE_ASM,
 ];
 
-static SPAWNS_THREADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn spawns_threads() -> bool {
-    SPAWNS_THREADS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub(crate) fn prepare(m: &crate::fir::Module) {
-    let spawns = m.funcs.iter().any(|f| {
-        f.blocks
-            .iter()
-            .any(|b| b.insts.iter().any(|i| matches!(i.op, crate::fir::Op::ThreadSpawn { .. })))
-    });
-    SPAWNS_THREADS.store(spawns, std::sync::atomic::Ordering::Relaxed);
-}
-
 pub(crate) fn enabled() -> bool {
-    (crate::checkmode::is_checked() || spawns_threads())
-        && !crate::target::windows()
+    !crate::target::windows()
         && !crate::target::shared()
         && !crate::prof::is_kernel()
 }
@@ -186,6 +174,9 @@ pub(crate) const THREAD_ALT_A64: &[&str] = &[
 pub(crate) const TAIL_A64: &[&str] = &[
     ".L__firn_segv:",
     "ldr x3, [x1, #16]",
+    "mov x5, #4096",
+    "cmp x3, x5",
+    "b.lo .L__firn_segv_null",
     "ldr x4, [x2, #432]",
     "sub x3, x3, x4",
     "mov x5, #1048576",
@@ -201,16 +192,26 @@ pub(crate) const TAIL_A64: &[&str] = &[
     "mov x0, #101",
     "mov x8, #94",
     "svc #0",
+    ".L__firn_segv_null:",
+    "mov x0, #2",
+    "adr x1, .L__firn_null_msg",
+    "mov x2, #31",
+    "mov x8, #64",
+    "svc #0",
+    "mov x0, #101",
+    "mov x8, #94",
+    "svc #0",
     ".L__firn_segv_other:",
     "ret",
     ".L__firn_so_msg:",
-    ".byte 102,105,114,110,58,32,115,116,97,99,107,32,111,118,101,114,102,108,111,119,10",
+    STACK_MESSAGE_ASM,
+    ".L__firn_null_msg:",
+    NULL_MESSAGE_ASM,
     ".balign 4",
 ];
 
 pub(crate) fn enabled_a64() -> bool {
-    (crate::checkmode::is_checked() || spawns_threads())
-        && !crate::target::shared()
+    !crate::target::shared()
         && !crate::prof::is_kernel()
 }
 
@@ -238,11 +239,13 @@ pub(crate) fn emit_tail_a64(e: &mut crate::codegen_x86::Emitter) {
 
 const WINDOWS_STACK_GUARANTEE: u32 = 0x8000;
 const WINDOWS_STACK_OVERFLOW_CODE: i32 = -1073741571;
+const WINDOWS_ACCESS_VIOLATION_CODE: i32 = -1073741819;
+const STACK_MESSAGE_LENGTH: usize = 21;
+const NULL_MESSAGE_LENGTH: usize = 31;
 const WINDOWS_HANDLER: &str = "__firn_win_guard";
 
 pub(crate) fn enabled_windows() -> bool {
-    (crate::checkmode::is_checked() || spawns_threads())
-        && crate::target::windows()
+    crate::target::windows()
         && !crate::target::shared()
         && !crate::prof::is_kernel()
 }
@@ -265,13 +268,26 @@ pub(crate) fn windows_thread_asm(set_guarantee: &str) -> String {
     )
 }
 
-pub(crate) fn windows_handler_asm(get_std_handle: &str, write_file: &str, terminate_process: &str) -> String {
+fn windows_report_asm(get_std_handle: &str, write_file: &str, terminate_process: &str, label: &str, length: usize) -> String {
     format!(
-        "{handler}:\n    mov rax, qword ptr [rcx]\n    cmp dword ptr [rax], {code}\n    jne .L__firn_win_other\n    sub rsp, 56\n    mov ecx, -12\n    call [rip + {get}]\n    mov rcx, rax\n    lea rdx, [rip + .L__firn_win_msg]\n    mov r8d, 21\n    lea r9, [rsp + 48]\n    mov qword ptr [rsp + 32], 0\n    call [rip + {write}]\n    mov rcx, -1\n    mov edx, 101\n    call [rip + {exit}]\n.L__firn_win_other:\n    xor eax, eax\n    ret\n.L__firn_win_msg:\n    .byte 102,105,114,110,58,32,115,116,97,99,107,32,111,118,101,114,102,108,111,119,10\n",
-        handler = WINDOWS_HANDLER,
-        code = WINDOWS_STACK_OVERFLOW_CODE,
+        "    sub rsp, 56\n    mov ecx, -12\n    call [rip + {get}]\n    mov rcx, rax\n    lea rdx, [rip + {label}]\n    mov r8d, {length}\n    lea r9, [rsp + 48]\n    mov qword ptr [rsp + 32], 0\n    call [rip + {write}]\n    mov rcx, -1\n    mov edx, 101\n    call [rip + {exit}]\n",
         get = get_std_handle,
         write = write_file,
         exit = terminate_process,
+    )
+}
+
+pub(crate) fn windows_handler_asm(get_std_handle: &str, write_file: &str, terminate_process: &str) -> String {
+    let report = |label: &str, length: usize| windows_report_asm(get_std_handle, write_file, terminate_process, label, length);
+    format!(
+        "{handler}:\n    mov rax, qword ptr [rcx]\n    mov ecx, dword ptr [rax]\n    cmp ecx, {overflow}\n    je .L__firn_win_stack\n    cmp ecx, {violation}\n    jne .L__firn_win_other\n    cmp qword ptr [rax + 40], {limit}\n    jae .L__firn_win_other\n{null_report}.L__firn_win_stack:\n{stack_report}.L__firn_win_other:\n    xor eax, eax\n    ret\n.L__firn_win_stack_msg:\n    {stack_msg}\n.L__firn_win_null_msg:\n    {null_msg}\n",
+        handler = WINDOWS_HANDLER,
+        overflow = WINDOWS_STACK_OVERFLOW_CODE,
+        violation = WINDOWS_ACCESS_VIOLATION_CODE,
+        limit = NULL_ADDRESS_LIMIT,
+        null_report = report(".L__firn_win_null_msg", NULL_MESSAGE_LENGTH),
+        stack_report = report(".L__firn_win_stack_msg", STACK_MESSAGE_LENGTH),
+        stack_msg = STACK_MESSAGE_ASM,
+        null_msg = NULL_MESSAGE_ASM,
     )
 }
