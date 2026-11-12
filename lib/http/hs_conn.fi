@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+import http.hs_types
+import http.hs_ws
+import http.hs_http
+
+export {
+    conn, conn_init, accept_all, flush, move_tls_out, conn_send,
+    conn_send_max, read_all, compact, reap,
+}
+
+fn conn(a: *mut hs_types.App, ci: usize) -> *mut hs_types.Conn {
+    return vec_elem_ptr[hs_types.Conn](&(*a).conns, ci)
+}
+
+fn conn_init(a: *mut hs_types.App) {
+    var i: usize = vec_len[hs_types.Conn](&(*a).conns)
+    while i < (*a).max_conn {
+        vec_push[hs_types.Conn](&(*a).conns, hs_types.Conn { fd: 0 - 1, kind: hs_types.K_FREE, inb: rt.buf_new(),
+                inpos: 0, outb: rt.buf_new(), outpos: 0, secure: false,
+                t: tls_server.server_new(&(*a).cfg), last_ms: 0, ping_ms: 0,
+                close_after: false, dead: false, route: 0, msg: rt.buf_new(), msg_op: 0,
+                in_msg: false, utf: ws.utf8_new(), close_sent: false, cont_sent: false,
+                chunked: rt.buf_new(), fr_done: 0, fr_started: false, peer: 0 })
+        i = i + 1
+    }
+}
+
+fn accept_all(a: *mut hs_types.App, now: i64) {
+    while true {
+        var sa: [u8; 16] = [0; 16]
+        var sl: [i32; 1] = [16]
+        let fd: i64 = syscall(hs_types.SYS_ACCEPT4, (*a).fd as i64, (&sa[0]) as i64, (&sl[0]) as i64, 2048 | 524288, 0, 0)
+        if fd < 0 { return }
+        var slot: usize = (*a).max_conn
+        var i: usize = 0
+        while i < (*a).max_conn {
+            if (*conn(a, i)).kind == hs_types.K_FREE {
+                slot = i
+                break
+            }
+            i = i + 1
+        }
+        if slot == (*a).max_conn {
+            syscall(hs_types.SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+            continue
+        }
+        var one: [i32; 1] = [1]
+        syscall(hs_types.SYS_SETSOCKOPT, fd, 6, 1, (&one[0]) as i64, 4, 0) // TCP_NODELAY
+        let c: *mut hs_types.Conn = conn(a, slot)
+        (*c).fd = fd as i32
+        (*c).kind = hs_types.K_HTTP
+        (*c).peer = (sa[4] as u32) << 24 | (sa[5] as u32) << 16 | (sa[6] as u32) << 8 | (sa[7] as u32)
+        rt.buf_clear(&(*c).inb)
+        (*c).inpos = 0
+        rt.buf_clear(&(*c).outb)
+        (*c).outpos = 0
+        (*c).secure = (*a).tls_on
+        if (*c).secure {
+            (*c).t = tls_server.server_new(&(*a).cfg)
+        }
+        (*c).last_ms = now
+        (*c).ping_ms = 0
+        (*c).close_after = false
+        (*c).dead = false
+        (*c).in_msg = false
+        (*c).close_sent = false
+        (*c).cont_sent = false
+        rt.buf_clear(&(*c).msg)
+    }
+}
+
+// Sends what stands in `outb` until the kernel would block.
+fn flush(c: *mut hs_types.Conn) {
+    while (*c).outpos < (*c).outb.len && !(*c).dead {
+        let n: i64 = syscall(hs_types.SYS_SEND_TO, (*c).fd as i64,
+            ((*c).outb.ptr + (*c).outpos as u64) as i64,
+            ((*c).outb.len - (*c).outpos) as i64, 16384 | 64, 0, 0) // MSG_NOSIGNAL|MSG_DONTWAIT
+        if n == hs_types.EINTR { continue }
+        if n == hs_types.EAGAIN { return }
+        if n <= 0 {
+            (*c).dead = true
+            return
+        }
+        (*c).outpos = (*c).outpos + n as usize
+    }
+    if (*c).outpos >= (*c).outb.len {
+        rt.buf_clear(&(*c).outb)
+        (*c).outpos = 0
+    }
+}
+
+fn move_tls_out(c: *mut hs_types.Conn) {
+    let n: usize = tls_server.out_len(&(*c).t)
+    if n > 0 {
+        rt.buf_push_bytes(&(*c).outb, tls_server.out_ptr(&(*c).t), n)
+        tls_server.out_consume(&(*c).t, n)
+    }
+}
+
+// Plaintext for the peer: through TLS when the connection has it. A peer
+// that does not read gets no more than `limit` octets queued.
+fn conn_send(c: *mut hs_types.Conn, p: u64, n: usize) {
+    conn_send_max(c, p, n, 16777216)
+}
+
+fn conn_send_max(c: *mut hs_types.Conn, p: u64, n: usize, limit: usize) {
+    if (*c).dead { return }
+    if (*c).secure {
+        tls_server.send(&(*c).t, p, n)
+        move_tls_out(c)
+    } else {
+        rt.buf_push_bytes(&(*c).outb, p, n)
+    }
+    if (*c).outb.len - (*c).outpos > limit + n {
+        (*c).dead = true
+        return
+    }
+    flush(c)
+}
+
+fn read_all(a: *mut hs_types.App, ci: usize, now: i64) {
+    let c: *mut hs_types.Conn = conn(a, ci)
+    var buf: [u8; 16384] = [0; 16384]
+    var got: bool = false
+    while !(*c).dead {
+        let n: i64 = syscall(hs_types.SYS_READ_FROM, (*c).fd as i64, (&buf[0]) as i64, 16384, 0, 0, 0)
+        if n == hs_types.EINTR { continue }
+        if n == hs_types.EAGAIN { break }
+        if n <= 0 {
+            // the peer is gone (or reset); what is queued cannot arrive
+            (*c).close_after = true
+            if (*c).outb.len == (*c).outpos { (*c).dead = true }
+            break
+        }
+        got = true
+        (*c).last_ms = now
+        if (*c).secure {
+            let alive: bool = tls_server.feed(&(*c).t, (&buf[0]) as u64, n as usize)
+            let an: usize = tls_server.app_len(&(*c).t)
+            if an > 0 {
+                rt.buf_push_bytes(&(*c).inb, tls_server.app_ptr(&(*c).t), an)
+                tls_server.app_consume(&(*c).t, an)
+            }
+            move_tls_out(c)
+            if !alive {
+                (*c).close_after = true
+            }
+        } else {
+            rt.buf_push_bytes(&(*c).inb, (&buf[0]) as u64, n as usize)
+        }
+        if (*c).inb.len - (*c).inpos > hs_types.MAX_HEAD + (*a).max_body + (*a).max_msg + 65536 {
+            break // enough to work on; poll comes back for the rest
+        }
+    }
+    if got && !(*c).dead {
+        if (*c).kind == hs_types.K_HTTP { hs_http.http_input(a, ci) }
+        if (*c).kind == hs_types.K_WS { hs_ws.ws_input(a, ci) }
+        if (*c).kind == hs_types.K_SSE { (*c).inpos = (*c).inb.len }
+        compact(c)
+    }
+    flush(c)
+}
+
+fn compact(c: *mut hs_types.Conn) {
+    if (*c).inpos == 0 { return }
+    let rest: usize = (*c).inb.len - (*c).inpos
+    if rest > 0 {
+        rt.mem_copy((*c).inb.ptr, (*c).inb.ptr + (*c).inpos as u64, rest)
+    }
+    rt.buf_set_len(&(*c).inb, rest)
+    (*c).inpos = 0
+}
+
+fn reap(a: *mut hs_types.App, ci: usize) {
+    let c: *mut hs_types.Conn = conn(a, ci)
+    if (*c).kind == hs_types.K_WS {
+        var w: hs_types.Ws = hs_types.Ws { app: a, ci: ci, binary: false }
+        let r: *mut hs_types.Route = vec_elem_ptr[hs_types.Route](&(*a).routes, (*c).route)
+        let f: fn(*mut hs_types.Ws) = (*r).on_close
+        (*c).kind = hs_types.K_FREE // no sends to a closing connection from the callback
+        f(&w)
+    }
+    syscall(hs_types.SYS_CLOSE_FD, (*c).fd as i64, 0, 0, 0, 0, 0)
+    (*c).fd = 0 - 1
+    (*c).kind = hs_types.K_FREE
+    if (*c).secure {
+        tls_server.server_free(&(*c).t)
+        (*c).secure = false
+    }
+    // big buffers go back, small ones are kept for the next connection
+    if (*c).inb.cap > 262144 { rt.buf_free(&(*c).inb) }
+    if (*c).outb.cap > 262144 { rt.buf_free(&(*c).outb) }
+    if (*c).msg.cap > 262144 { rt.buf_free(&(*c).msg) }
+    if (*c).chunked.cap > 262144 { rt.buf_free(&(*c).chunked) }
+}

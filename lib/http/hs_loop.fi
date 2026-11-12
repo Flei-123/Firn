@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+import http.hs_types
+import http.hs_app
+import http.hs_conn
+import http.hs_ws
+
+export {
+    step, push_poll, listen, port, serve, serve_main,
+    serve_background, stop_wait, close_server, run_for,
+}
+
+// ------------------------------------------------------------ The loop
+
+// One round: wait up to `timeout_ms` for anything, act on it. False when
+// the server could not be started.
+// The App owns its connections, and a connection keeps a pointer back to
+// the App's TLS config and hands `a` to the callbacks: a pointer into the
+// App stored inside the App, never outliving it. The escape check cannot
+// see that ownership, so it is vouched for here (compiler/src/escape.rs).
+#[allow_escape]
+fn step(a: *mut hs_types.App, timeout_ms: i64) -> bool {
+    if (*a).fd < 0 {
+        if !hs_app.bind_port(a) { return false }
+        hs_conn.conn_init(a)
+        (*a).running = true
+    }
+    rt.buf_clear(&(*a).polls)
+    rt.buf_clear(&(*a).pmap)
+    var n: usize = 0
+    push_poll(a, (*a).fd, hs_types.POLLIN, 0)
+    n = 1
+    if (*a).wake_fd >= 0 {
+        push_poll(a, (*a).wake_fd, hs_types.POLLIN, hs_types.WAKE_CI)
+        n = 2
+    }
+    var i: usize = 0
+    while i < (*a).max_conn {
+        let c: *mut hs_types.Conn = hs_conn.conn(a, i)
+        if (*c).kind != hs_types.K_FREE {
+            var ev: u32 = hs_types.POLLIN
+            if (*c).outb.len > (*c).outpos { ev = ev | hs_types.POLLOUT }
+            push_poll(a, (*c).fd, ev, i)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    var wait: i64 = timeout_ms
+    if (*a).tick_ms > 0 {
+        let until: i64 = (*a).next_tick - hs_types.now_ms()
+        if until < wait { wait = until }
+        if wait < 0 { wait = 0 }
+    }
+    let r: i64 = syscall(hs_types.SYS_POLL_FDS, (*a).polls.ptr as i64, n as i64, wait, 0, 0, 0)
+    let now: i64 = hs_types.now_ms()
+    if r > 0 {
+        var k: usize = 0
+        while k < n {
+            let rev: u32 = (rt.ld8((*a).polls.ptr, k * 8 + 6) as u32)
+            | ((rt.ld8((*a).polls.ptr, k * 8 + 7) as u32) << 8)
+            if rev != 0 {
+                if k == 0 {
+                    hs_conn.accept_all(a, now)
+                } else {
+                    let ci: usize = rt.ld64((*a).pmap.ptr, k) as usize
+                    if ci == hs_types.WAKE_CI {
+                        var sink: [u64; 1] = [0; 1]
+                        syscall(hs_types.SYS_READ_FD, (*a).wake_fd as i64, (&sink[0]) as i64, 8, 0, 0, 0)
+                    } else {
+                        let c: *mut hs_types.Conn = hs_conn.conn(a, ci)
+                        if (rev & (hs_types.POLLIN | hs_types.POLLHUP | hs_types.POLLERR)) != 0 {
+                            hs_conn.read_all(a, ci, now)
+                        }
+                        if (rev & hs_types.POLLOUT) != 0 { hs_conn.flush(c) }
+                    }
+                }
+            }
+            k = k + 1
+        }
+    }
+    // timers
+    if (*a).tick_ms > 0 && now >= (*a).next_tick {
+        (*a).next_tick = now + (*a).tick_ms
+        let f: fn(*mut hs_types.App) = (*a).tick
+        f(a)
+    }
+    i = 0
+    while i < (*a).max_conn {
+        let c: *mut hs_types.Conn = hs_conn.conn(a, i)
+        if (*c).kind != hs_types.K_FREE {
+            let quiet: i64 = now - (*c).last_ms
+            if (*c).kind == hs_types.K_HTTP && quiet > (*a).idle_ms {
+                (*c).dead = true
+            }
+            if (*c).kind == hs_types.K_WS && !(*c).close_sent {
+                if quiet > 25000 && now - (*c).ping_ms > 25000 {
+                    (*c).ping_ms = now
+                    hs_ws.ws_frame(c, ws.OP_PING, 0, 0)
+                }
+                if quiet > 90000 { (*c).dead = true }
+            }
+            if (*c).kind == hs_types.K_SSE && now - (*c).ping_ms > 25000 {
+                (*c).ping_ms = now
+                hs_conn.conn_send(c, ": keep-alive\n\n".p as u64, 14)
+            }
+            if (*c).close_after && (*c).outb.len == (*c).outpos { (*c).dead = true }
+            if (*c).dead { hs_conn.reap(a, i) }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn push_poll(a: *mut hs_types.App, fd: i32, ev: u32, ci: usize) {
+    var e: [u8; 8] = [0; 8]
+    let u: u32 = fd as u32
+    e[0] = (u & 255) as u8
+    e[1] = ((u >> 8) & 255) as u8
+    e[2] = ((u >> 16) & 255) as u8
+    e[3] = ((u >> 24) & 255) as u8
+    e[4] = (ev & 255) as u8
+    rt.buf_push_bytes(&(*a).polls, (&e[0]) as u64, 8)
+    var m: [u64; 1] = [0]
+    m[0] = ci as u64
+    rt.buf_push_bytes(&(*a).pmap, (&m[0]) as u64, 8)
+}
+
+// Binds and starts listening now (instead of in the first `step`), so that the caller knows the
+// port: `app(0)` + `listen` + `port` = "any free port", like Python's HTTPServer(("127.0.0.1", 0), H).
+// False when the port is taken. Idempotent.
+#[allow_escape]
+fn listen(a: *mut hs_types.App) -> bool {
+    return step(a, 0)
+}
+
+// The port the App listens on (the real one after `listen`/`step` when it was created with 0).
+fn port(a: *mut hs_types.App) -> u16 { return (*a).port }
+
+// Serves until `stop` (or forever). Returns 1 when the port is not free.
+#[allow_escape]
+fn serve(a: *mut hs_types.App) -> i32 {
+    if !step(a, 0) {
+        io.eprint_line("http: cannot listen on that port (in use?)")
+        return 1
+    }
+    while (*a).running {
+        step(a, 1000)
+    }
+    return 0
+}
+
+// The thread body for `SERVE_KIND`: steps the App until `stop`.
+#[allow_escape]
+fn serve_main(arg: u64) -> u64 {
+    let a: *mut hs_types.App = arg as *mut hs_types.App
+    while (*a).running {
+        step(a, 1000)
+    }
+    return 0
+}
+
+// Binds (when not yet done) and serves on a new thread. Returns the thread handle for `stop_wait`,
+// 0 when the port is taken or no thread could be started.
+#[allow_escape]
+fn serve_background(a: *mut hs_types.App) -> u64 {
+    if (*a).wake_fd < 0 {
+        let fd: i64 = syscall(hs_types.SYS_EVENTFD2, 0, 2048 + 524288, 0, 0, 0, 0)
+        if fd >= 0 {
+            (*a).wake_fd = fd as i32
+        }
+    }
+    if !step(a, 0) { return 0 }
+    return thread_start(hs_types.SERVE_KIND, a as u64)
+}
+
+// Stops a background server and waits for its thread; the wake-up makes this take microseconds,
+// not up to one poll interval.
+fn stop_wait(a: *mut hs_types.App, th: u64) {
+    hs_app.stop(a)
+    thread_wait(th)
+}
+
+// Closes the listening socket and every connection, and gives the connection
+// buffers back: after this the port is free again and the App must not be
+// stepped any more. (A program that serves until it exits never needs this; a
+// program that serves for a while -- the loopback redirect of an OAuth login --
+// does.)
+#[allow_escape]
+fn close_server(a: *mut hs_types.App) {
+    var i: usize = 0
+    let n: usize = vec_len[hs_types.Conn](&(*a).conns)
+    while i < n {
+        let c: *mut hs_types.Conn = hs_conn.conn(a, i)
+        if (*c).fd >= 0 && (*c).kind != hs_types.K_FREE {
+            hs_conn.reap(a, i)
+        }
+        rt.buf_free(&(*c).inb)
+        rt.buf_free(&(*c).outb)
+        rt.buf_free(&(*c).msg)
+        rt.buf_free(&(*c).chunked)
+        i = i + 1
+    }
+    if (*a).fd >= 0 {
+        syscall(hs_types.SYS_CLOSE_FD, (*a).fd as i64, 0, 0, 0, 0, 0)
+        (*a).fd = 0 - 1
+    }
+    if (*a).wake_fd >= 0 {
+        syscall(hs_types.SYS_CLOSE_FD, (*a).wake_fd as i64, 0, 0, 0, 0, 0)
+        (*a).wake_fd = 0 - 1
+    }
+    (*a).running = false
+}
+
+// Serves for `ms` milliseconds (tests, tools).
+#[allow_escape]
+fn run_for(a: *mut hs_types.App, ms: i64) -> i32 {
+    let end: i64 = hs_types.now_ms() + ms
+    if !step(a, 0) { return 1 }
+    while (*a).running && hs_types.now_ms() < end {
+        step(a, end - hs_types.now_ms())
+    }
+    return 0
+}

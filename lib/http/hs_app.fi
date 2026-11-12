@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+import http.hs_types
+
+export {
+    app, add_route, route_text, route, route_fallback, route_ws,
+    route_ws_full, route_sse, every, set_quiet, set_limits, requests_served,
+    stop, set_userdata, app_userdata, userdata, pair, token,
+    tls_pem, tls_files, tls_enabled, url, bind_port,
+}
+
+// ------------------------------------------------------------ Building
+
+fn app(port: u16) -> hs_types.App {
+    return hs_types.App { port: port, addr: net.ADDR_ANY, fd: 0 - 1,
+        routes: vec_new[hs_types.Route](), conns: vec_new[hs_types.Conn](), max_conn: 64,
+        token: [0; 32], paired: false, tls_on: false, cfg: tls_server.config_new(),
+        tick: hs_types.no_tick, tick_ms: 0, next_tick: 0, max_body: 1048576,
+        max_msg: 1048576, idle_ms: 60000, quiet: false, running: false,
+        requests: 0, urlbuf: rt.buf_new(), polls: rt.buf_new(), pmap: rt.buf_new(),
+        scratch: rt.buf_new(), ud: 0, wake_fd: 0 - 1, fallback: hs_types.no_req, has_fallback: false }
+}
+
+fn add_route(a: *mut hs_types.App, path: str, kind: u32) -> *mut hs_types.Route {
+    vec_push[hs_types.Route](&(*a).routes, hs_types.Route { path: path, kind: kind, ctype: "", body: "",
+            handler: hs_types.no_req, on_msg: hs_types.no_msg, on_open: hs_types.no_ws, on_close: hs_types.no_ws })
+    return vec_elem_ptr[hs_types.Route](&(*a).routes, vec_len[hs_types.Route](&(*a).routes) - 1)
+}
+
+// GET/HEAD on `path` answers with a fixed body (a page, a script).
+fn route_text(a: *mut hs_types.App, path: str, ctype: str, body: str) {
+    let r: *mut hs_types.Route = add_route(a, path, hs_types.R_TEXT)
+    (*r).ctype = ctype
+    (*r).body = body
+}
+
+// Any method on `path` calls `handler`.
+fn route(a: *mut hs_types.App, path: str, handler: fn(*mut hs_types.Req)) {
+    let r: *mut hs_types.Route = add_route(a, path, hs_types.R_FN)
+    (*r).handler = handler
+}
+
+fn route_fallback(a: *mut hs_types.App, handler: fn(*mut hs_types.Req)) {
+    (*a).fallback = handler
+    (*a).has_fallback = true
+}
+
+// A WebSocket on `path`; every text or binary message goes to `on_msg`.
+fn route_ws(a: *mut hs_types.App, path: str, on_msg: fn(*mut hs_types.Ws, str)) {
+    let r: *mut hs_types.Route = add_route(a, path, hs_types.R_WS)
+    (*r).on_msg = on_msg
+}
+
+fn route_ws_full(a: *mut hs_types.App, path: str, on_open: fn(*mut hs_types.Ws),
+    on_msg: fn(*mut hs_types.Ws, str), on_close: fn(*mut hs_types.Ws)) {
+    let r: *mut hs_types.Route = add_route(a, path, hs_types.R_WS)
+    (*r).on_msg = on_msg
+    (*r).on_open = on_open
+    (*r).on_close = on_close
+}
+
+// A stream of Server-Sent Events on `path`; fill it with `sse_send`.
+fn route_sse(a: *mut hs_types.App, path: str) {
+    add_route(a, path, hs_types.R_SSE)
+}
+
+// `f` every `ms` milliseconds, on the poll thread.
+fn every(a: *mut hs_types.App, ms: i64, f: fn(*mut hs_types.App)) {
+    (*a).tick = f
+    (*a).tick_ms = ms
+    (*a).next_tick = hs_types.now_ms() + ms
+}
+
+fn set_quiet(a: *mut hs_types.App, q: bool) { (*a).quiet = q }
+
+fn set_limits(a: *mut hs_types.App, max_body: usize, max_msg: usize, max_conn: usize) {
+    (*a).max_body = max_body
+    (*a).max_msg = max_msg
+    (*a).max_conn = max_conn
+}
+
+fn requests_served(a: *mut hs_types.App) -> u64 { return (*a).requests }
+
+// Ends `serve`/`run_for`. Callable from another thread; with `serve_background` the poll ends at once.
+fn stop(a: *mut hs_types.App) {
+    (*a).running = false
+    if (*a).wake_fd >= 0 {
+        var one: [u64; 1] = [1; 1]
+        syscall(hs_types.SYS_WRITE_FD, (*a).wake_fd as i64, (&one[0]) as i64, 8, 0, 0, 0)
+    }
+}
+
+// Per-app user data: any number or pointer, handed to the handlers: `http.userdata(r)`.
+fn set_userdata(a: *mut hs_types.App, ud: u64) { (*a).ud = ud }
+fn app_userdata(a: *mut hs_types.App) -> u64 { return (*a).ud }
+fn userdata(r: *mut hs_types.Req) -> u64 { return (*(*r).app).ud }
+
+// The pairing token: 16 random octets as 32 hex digits. Returns it.
+fn pair(a: *mut hs_types.App) -> str {
+    var raw: [u8; 16] = [0; 16]
+    if !random.random_bytes((&raw[0]) as u64, 16) {
+        io.eprint_line("http: no randomness for the pairing token -- refusing to serve")
+        rt.finish(1)
+    }
+    var d: [u8; 16] = "0123456789abcdef"
+    var i: usize = 0
+    while i < 16 {
+        (*a).token[2 * i] = d[(raw[i] >> 4) as usize]
+        (*a).token[2 * i + 1] = d[(raw[i] & 15 as u8) as usize]
+        i = i + 1
+    }
+    (*a).paired = true
+    return token(a)
+}
+
+fn token(a: *mut hs_types.App) -> str {
+    if !(*a).paired { return "" }
+    return hs_types.as_str((&(*a).token[0]) as u64, 32)
+}
+
+// TLS from PEM text (chain + P-256 key). False: refused, see tls_server.
+fn tls_pem(a: *mut hs_types.App, cert: u64, cn: usize, key: u64, kn: usize) -> bool {
+    (*a).tls_on = tls_server.config_load_pem(&(*a).cfg, cert, cn, key, kn)
+    return (*a).tls_on
+}
+
+fn tls_files(a: *mut hs_types.App, cert_path: str, key_path: str) -> bool {
+    var cp: rt.Buf = rt.buf_new()
+    var kp: rt.Buf = rt.buf_new()
+    hs_types.push_str(&cp, cert_path)
+    rt.buf_push(&cp, 0 as u8)
+    hs_types.push_str(&kp, key_path)
+    rt.buf_push(&kp, 0 as u8)
+    var cert: rt.Buf = rt.buf_new()
+    var key: rt.Buf = rt.buf_new()
+    var ok: bool = io.read_file(cp.ptr, &cert) && io.read_file(kp.ptr, &key)
+    if ok {
+        ok = tls_pem(a, cert.ptr, cert.len, key.ptr, key.len)
+    }
+    rt.mem_set(key.ptr, 0 as u8, key.len)
+    rt.buf_free(&cert)
+    rt.buf_free(&key)
+    rt.buf_free(&cp)
+    rt.buf_free(&kp)
+    return ok
+}
+
+fn tls_enabled(a: *mut hs_types.App) -> bool { return (*a).tls_on }
+
+// "http://192.168.1.23:8080/?t=<token>" -- what to open on the phone.
+fn url(a: *mut hs_types.App) -> str {
+    rt.buf_clear(&(*a).urlbuf)
+    if (*a).tls_on {
+        hs_types.push_str(&(*a).urlbuf, "https://")
+    } else {
+        hs_types.push_str(&(*a).urlbuf, "http://")
+    }
+    var ip: u32 = (*a).addr
+    if ip == net.ADDR_ANY { ip = net.local_ipv4() }
+    net.ipv4_text(ip, &(*a).urlbuf)
+    rt.buf_push(&(*a).urlbuf, 58 as u8)
+    rt.buf_push_dec_u64(&(*a).urlbuf, (*a).port as u64)
+    rt.buf_push(&(*a).urlbuf, 47 as u8)
+    if (*a).paired {
+        hs_types.push_str(&(*a).urlbuf, "?t=")
+        hs_types.push_str(&(*a).urlbuf, token(a))
+    }
+    return hs_types.as_str((*a).urlbuf.ptr, (*a).urlbuf.len)
+}
+
+// ------------------------------------------------------------ Sockets
+
+fn bind_port(a: *mut hs_types.App) -> bool {
+    let fd: i64 = syscall(hs_types.SYS_SOCKET_NEW, 2, 1 | 2048 | 524288, 0, 0, 0, 0)
+    if fd < 0 { return false }
+    var one: [i32; 1] = [1]
+    syscall(hs_types.SYS_SETSOCKOPT, fd, 1, 2, (&one[0]) as i64, 4, 0) // SO_REUSEADDR
+    var sa: [u8; 16] = [0; 16]
+    sa[0] = 2 as u8
+    sa[2] = (((*a).port as u32 >> 8) & 255) as u8
+    sa[3] = ((*a).port as u32 & 255) as u8
+    sa[4] = (((*a).addr >> 24) & 255) as u8
+    sa[5] = (((*a).addr >> 16) & 255) as u8
+    sa[6] = (((*a).addr >> 8) & 255) as u8
+    sa[7] = ((*a).addr & 255) as u8
+    if syscall(hs_types.SYS_BIND_ADDR, fd, (&sa[0]) as i64, 16, 0, 0, 0) < 0 {
+        syscall(hs_types.SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    if syscall(hs_types.SYS_BACKLOG, fd, 128, 0, 0, 0, 0) < 0 {
+        syscall(hs_types.SYS_CLOSE_FD, fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    var got: [u8; 16] = [0; 16]
+    var glen: [u32; 1] = [16]
+    if syscall(hs_types.SYS_GETSOCKNAME, fd, (&got[0]) as i64, (&glen[0]) as i64, 0, 0, 0) >= 0 {
+        (*a).port = (((got[2] as u32) << 8) | (got[3] as u32)) as u16 // the port the kernel chose for port 0
+    }
+    (*a).fd = fd as i32
+    return true
+}

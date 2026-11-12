@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+import http.hs_types
+import http.hs_app
+import http.hs_conn
+import http.hs_reply
+import http.hs_ws
+
+export {
+    dechunk, find_head_end, http_input, continue_if_expected, find_route, dispatch,
+}
+
+// A chunked body starting at p[0..n). Returns the octets consumed
+// (0 = incomplete, -1 = malformed, -2 = too large); the data goes to `out`.
+fn dechunk(p: u64, n: usize, out: *mut rt.Buf, max: usize) -> i64 {
+    rt.buf_clear(out)
+    var at: usize = 0
+    while true {
+        // chunk-size [; ext] CRLF
+        var e: usize = at
+        while e + 1 < n && !(rt.ld8(p, e) == 13 as u8 && rt.ld8(p, e + 1) == 10 as u8) { e = e + 1 }
+        if e + 1 >= n { return 0 }
+        var size: u64 = 0
+        var k: usize = at
+        var digits: usize = 0
+        while k < e && hs_types.hexv(rt.ld8(p, k)) >= 0 {
+            size = size * 16 + hs_types.hexv(rt.ld8(p, k)) as u64
+            digits = digits + 1
+            if digits > 15 { return -1 }
+            k = k + 1
+        }
+        if digits == 0 { return -1 }
+        if k < e && rt.ld8(p, k) != 59 as u8 && rt.ld8(p, k) != 32 as u8 && rt.ld8(p, k) != 9 as u8 {
+            return -1
+        }
+        at = e + 2
+        if size == 0 {
+            // trailers until an empty line
+            while true {
+                var t: usize = at
+                while t + 1 < n && !(rt.ld8(p, t) == 13 as u8 && rt.ld8(p, t + 1) == 10 as u8) { t = t + 1 }
+                if t + 1 >= n { return 0 }
+                if t == at { return (t + 2) as i64 }
+                at = t + 2
+            }
+        }
+        if (*out).len as u64 + size > max as u64 { return -2 }
+        if (at as u64) + size + 2 > n as u64 { return 0 }
+        rt.buf_push_bytes(out, p + at as u64, size as usize)
+        at = at + size as usize
+        if rt.ld8(p, at) != 13 as u8 || rt.ld8(p, at + 1) != 10 as u8 { return -1 }
+        at = at + 2
+    }
+    return -1
+}
+
+fn find_head_end(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i + 4 <= n {
+        if rt.ld8(p, i) == 13 as u8 && rt.ld8(p, i + 1) == 10 as u8
+        && rt.ld8(p, i + 2) == 13 as u8 && rt.ld8(p, i + 3) == 10 as u8 {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Works through every complete request in the connection's buffer.
+fn http_input(a: *mut hs_types.App, ci: usize) {
+    let c: *mut hs_types.Conn = hs_conn.conn(a, ci)
+    while (*c).kind == hs_types.K_HTTP && !(*c).dead && !(*c).close_after {
+        let p: u64 = (*c).inb.ptr + (*c).inpos as u64
+        let n: usize = (*c).inb.len - (*c).inpos
+        if n == 0 { return }
+        // blank lines before a request are allowed (RFC 9112 2.2)
+        if rt.ld8(p, 0) == 13 as u8 || rt.ld8(p, 0) == 10 as u8 {
+            (*c).inpos = (*c).inpos + 1
+            continue
+        }
+        let hend: usize = find_head_end(p, n)
+        if hend == 0 {
+            if n > hs_types.MAX_HEAD { hs_reply.raw_reply(c, 431, "header block too large\n", true) }
+            return
+        }
+        if hend > hs_types.MAX_HEAD {
+            hs_reply.raw_reply(c, 431, "header block too large\n", true)
+            return
+        }
+        // the request line
+        var e: usize = 0
+        while e + 1 < hend && !(rt.ld8(p, e) == 13 as u8 && rt.ld8(p, e + 1) == 10 as u8) { e = e + 1 }
+        let line: str = hs_types.as_str(p, e)
+        let s1: usize = line.find_char(32 as u8)
+        if s1 >= line.n || s1 == 0 {
+            hs_reply.raw_reply(c, 400, "bad request line\n", true)
+            return
+        }
+        let rest: str = line.ab(s1 + 1)
+        let s2: usize = rest.find_char(32 as u8)
+        if s2 >= rest.n || s2 == 0 {
+            hs_reply.raw_reply(c, 400, "bad request line\n", true)
+            return
+        }
+        let target: str = rest.to(s2)
+        let version: str = rest.ab(s2 + 1)
+        var v11: bool = false
+        if version == "HTTP/1.1" {
+            v11 = true
+        } else if version != "HTTP/1.0" {
+            hs_reply.raw_reply(c, 505, "HTTP/1.1 only\n", true)
+            return
+        }
+        var r: hs_types.Req = hs_types.Req { app: a, ci: ci, method: line.to(s1), path: target, query: "",
+            head: hs_types.as_str(p + (e + 2) as u64, hend - e - 4), body: "", v11: v11,
+            keep: v11, head_only: false, replied: false, set_cookie: false }
+        let qm: usize = target.find_char(63 as u8)
+        if qm < target.n {
+            r.path = target.to(qm)
+            r.query = target.ab(qm + 1)
+        }
+        r.head_only = r.method == "HEAD"
+        // header block checks: folding, white space before the colon
+        let h: str = r.head
+        var i: usize = 0
+        var bad: bool = false
+        while i < h.n && !bad {
+            if *(h.p + i) == 32 as u8 || *(h.p + i) == 9 as u8 { bad = true }
+            var le: usize = i
+            while le + 1 < h.n && !(*(h.p + le) == 13 as u8 && *(h.p + le + 1) == 10 as u8) { le = le + 1 }
+            var colon: usize = i
+            while colon < le && *(h.p + colon) != 58 as u8 { colon = colon + 1 }
+            if colon >= le || colon == i { bad = true }
+            if colon > i && (*(h.p + colon - 1) == 32 as u8 || *(h.p + colon - 1) == 9 as u8) { bad = true }
+            if !bad && hs_types.same_ci(hs_types.as_str((h.p + i) as u64, colon - i), "Content-Length") {
+                // two different Content-Lengths are a smuggling attempt
+                let v: str = hs_types.trim(hs_types.as_str((h.p + colon + 1) as u64, le - colon - 1))
+                if v != hs_reply.header(&r, "Content-Length") { bad = true }
+            }
+            i = le + 2
+        }
+        if bad {
+            hs_reply.raw_reply(c, 400, "malformed header block\n", true)
+            return
+        }
+        if v11 && hs_reply.header(&r, "Host").n == 0 {
+            hs_reply.raw_reply(c, 400, "Host header missing\n", true)
+            return
+        }
+        let conn_h: str = hs_reply.header(&r, "Connection")
+        if hs_types.has_token(conn_h, "close") { r.keep = false }
+        if !v11 && hs_types.has_token(conn_h, "keep-alive") { r.keep = true }
+        // the body
+        let te: str = hs_reply.header(&r, "Transfer-Encoding")
+        let cl: str = hs_reply.header(&r, "Content-Length")
+        var blen: usize = 0
+        var used: usize = hend
+        if te.n > 0 {
+            if cl.n > 0 {
+                hs_reply.raw_reply(c, 400, "Content-Length together with Transfer-Encoding\n", true)
+                return
+            }
+            if !hs_types.same_ci(hs_types.trim(te), "chunked") {
+                hs_reply.raw_reply(c, 501, "only chunked transfer coding\n", true)
+                return
+            }
+            let got: i64 = dechunk(p + hend as u64, n - hend, &(*c).chunked, (*a).max_body)
+            if got == -1 {
+                hs_reply.raw_reply(c, 400, "malformed chunked body\n", true)
+                return
+            }
+            if got == -2 {
+                hs_reply.raw_reply(c, 413, "body too large\n", true)
+                return
+            }
+            if got == 0 {
+                continue_if_expected(c, &r)
+                return
+            }
+            r.body = hs_types.as_str((*c).chunked.ptr, (*c).chunked.len)
+            used = hend + got as usize
+        } else if cl.n > 0 {
+            var v: u64 = 0
+            if !hs_types.parse_dec(cl, &v) {
+                hs_reply.raw_reply(c, 400, "bad Content-Length\n", true)
+                return
+            }
+            if v > (*a).max_body as u64 {
+                hs_reply.raw_reply(c, 413, "body too large\n", true)
+                return
+            }
+            blen = v as usize
+            if n - hend < blen {
+                continue_if_expected(c, &r)
+                return
+            }
+            r.body = hs_types.as_str(p + hend as u64, blen)
+            used = hend + blen
+        }
+        (*c).cont_sent = false
+        dispatch(a, &r)
+        if !r.keep { (*c).close_after = true }
+        // the request is done: its octets go (dispatch may have turned the
+        // connection into a WebSocket; what follows are frames then)
+        (*c).inpos = (*c).inpos + used
+    }
+}
+
+fn continue_if_expected(c: *mut hs_types.Conn, r: *mut hs_types.Req) {
+    if (*r).v11 && !(*c).cont_sent && hs_types.same_ci(hs_reply.header(r, "Expect"), "100-continue") {
+        (*c).cont_sent = true
+        let s: str = "HTTP/1.1 100 Continue\r\n\r\n"
+        hs_conn.conn_send(c, s.p as u64, s.n)
+    }
+}
+
+fn find_route(a: *mut hs_types.App, path: str) -> usize {
+    var i: usize = 0
+    while i < vec_len[hs_types.Route](&(*a).routes) {
+        if (*vec_elem_ptr[hs_types.Route](&(*a).routes, i)).path == path { return i }
+        i = i + 1
+    }
+    return vec_len[hs_types.Route](&(*a).routes)
+}
+
+fn dispatch(a: *mut hs_types.App, r: *mut hs_types.Req) {
+    // pairing
+    if (*a).paired {
+        let t: str = hs_reply.query_param(r, "t")
+        if t.n > 0 && hs_reply.token_ok(a, t) {
+            if (*r).method == "GET" && hs_reply.header(r, "Upgrade").n == 0 {
+                // the token leaves the address bar: redirect to the path
+                (*r).set_cookie = true
+                var loc: rt.Buf = rt.buf_new()
+                hs_types.push_str(&loc, "Location: ")
+                hs_types.push_str(&loc, (*r).path)
+                hs_types.push_str(&loc, "\r\nCache-Control: no-store\r\n")
+                hs_reply.reply_ex(r, 303, "text/plain", hs_types.as_str(loc.ptr, loc.len), "paired\n")
+                rt.buf_free(&loc)
+                return
+            }
+        } else if !hs_reply.token_ok(a, hs_reply.cookie(r, "firn_pair")) {
+            hs_reply.reply(r, 403, "text/plain; charset=utf-8",
+                "not paired: open the address the server printed (it carries the token)\n")
+            return
+        }
+    }
+    let ri: usize = find_route(a, (*r).path)
+    if ri >= vec_len[hs_types.Route](&(*a).routes) {
+        if (*a).has_fallback {
+            let fb: fn(*mut hs_types.Req) = (*a).fallback
+            fb(r)
+            if !(*r).replied { hs_reply.reply(r, 500, "text/plain", "the handler did not reply\n") }
+            return
+        }
+        hs_reply.reply(r, 404, "text/plain", "not found\n")
+        return
+    }
+    let rt0: *mut hs_types.Route = vec_elem_ptr[hs_types.Route](&(*a).routes, ri)
+    let kind: u32 = (*rt0).kind
+    if kind == hs_types.R_TEXT {
+        if (*r).method != "GET" && (*r).method != "HEAD" {
+            hs_reply.reply_ex(r, 405, "text/plain", "Allow: GET, HEAD\r\n", "method not allowed\n")
+            return
+        }
+        hs_reply.reply_ex(r, 200, (*rt0).ctype, "Cache-Control: no-cache\r\n", (*rt0).body)
+        return
+    }
+    if kind == hs_types.R_FN {
+        let f: fn(*mut hs_types.Req) = (*rt0).handler
+        f(r)
+        if !(*r).replied { hs_reply.reply(r, 500, "text/plain", "the handler did not reply\n") }
+        return
+    }
+    if kind == hs_types.R_WS {
+        hs_ws.ws_upgrade(a, r, ri)
+        return
+    }
+    if kind == hs_types.R_SSE {
+        if (*r).method != "GET" {
+            hs_reply.reply_ex(r, 405, "text/plain", "Allow: GET\r\n", "method not allowed\n")
+            return
+        }
+        (*r).replied = true
+        let c: *mut hs_types.Conn = hs_conn.conn(a, (*r).ci)
+        var b: rt.Buf = rt.buf_new()
+        hs_types.push_str(&b, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\n")
+        if (*r).set_cookie {
+            hs_types.push_str(&b, "Set-Cookie: firn_pair=")
+            hs_types.push_str(&b, hs_app.token(a))
+            hs_types.push_str(&b, "; Path=/; HttpOnly; SameSite=Strict\r\n")
+        }
+        hs_types.push_str(&b, "\r\n: stream open\n\n")
+        hs_conn.conn_send(c, b.ptr, b.len)
+        rt.buf_free(&b)
+        (*c).kind = hs_types.K_SSE
+        (*c).route = ri
+        (*c).ping_ms = hs_types.now_ms()
+        (*r).keep = true
+        (*a).requests = (*a).requests + 1
+        return
+    }
+}

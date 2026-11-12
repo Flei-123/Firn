@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+import http.hs_types
+import http.hs_app
+import http.hs_conn
+
+export {
+    reason, raw_reply, reply_ex, reply, peer_ip, peer_text,
+    method, path, query, body, header, pair_value,
+    query_param, cookie, token_ok,
+}
+
+// ------------------------------------------------------------ HTTP
+
+fn reason(status: u32) -> str {
+    if status == 100 { return "Continue" }
+    if status == 101 { return "Switching Protocols" }
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 204 { return "No Content" }
+    if status == 206 { return "Partial Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 303 { return "See Other" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 401 { return "Unauthorized" }
+    if status == 403 { return "Forbidden" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 409 { return "Conflict" }
+    if status == 411 { return "Length Required" }
+    if status == 413 { return "Content Too Large" }
+    if status == 415 { return "Unsupported Media Type" }
+    if status == 416 { return "Range Not Satisfiable" }
+    if status == 422 { return "Unprocessable Content" }
+    if status == 426 { return "Upgrade Required" }
+    if status == 429 { return "Too Many Requests" }
+    if status == 431 { return "Request Header Fields Too Large" }
+    if status == 500 { return "Internal Server Error" }
+    if status == 501 { return "Not Implemented" }
+    if status == 505 { return "HTTP Version Not Supported" }
+    return "Status"
+}
+
+// A response written straight to a connection (errors outside a handler).
+fn raw_reply(c: *mut hs_types.Conn, status: u32, text: str, close: bool) {
+    var b: rt.Buf = rt.buf_new()
+    hs_types.push_str(&b, "HTTP/1.1 ")
+    rt.buf_push_dec_u64(&b, status as u64)
+    rt.buf_push(&b, 32 as u8)
+    hs_types.push_str(&b, reason(status))
+    hs_types.push_str(&b, "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ")
+    rt.buf_push_dec_u64(&b, text.n as u64)
+    if close { hs_types.push_str(&b, "\r\nConnection: close") }
+    hs_types.push_str(&b, "\r\n\r\n")
+    hs_types.push_str(&b, text)
+    hs_conn.conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    if close { (*c).close_after = true }
+}
+
+fn reply_ex(r: *mut hs_types.Req, status: u32, ctype: str, extra: str, body: str) {
+    if (*r).replied { return }
+    (*r).replied = true
+    let c: *mut hs_types.Conn = hs_conn.conn((*r).app, (*r).ci)
+    var b: rt.Buf = rt.buf_new()
+    hs_types.push_str(&b, "HTTP/1.1 ")
+    rt.buf_push_dec_u64(&b, status as u64)
+    rt.buf_push(&b, 32 as u8)
+    hs_types.push_str(&b, reason(status))
+    hs_types.push_str(&b, "\r\n")
+    if ctype.n > 0 {
+        hs_types.push_str(&b, "Content-Type: ")
+        hs_types.push_str(&b, ctype)
+        hs_types.push_str(&b, "\r\n")
+    }
+    hs_types.push_str(&b, "Content-Length: ")
+    rt.buf_push_dec_u64(&b, body.n as u64)
+    hs_types.push_str(&b, "\r\nX-Content-Type-Options: nosniff\r\n")
+    if (*r).set_cookie {
+        hs_types.push_str(&b, "Set-Cookie: firn_pair=")
+        hs_types.push_str(&b, hs_app.token((*r).app))
+        hs_types.push_str(&b, "; Path=/; HttpOnly; SameSite=Strict\r\n")
+    }
+    if !(*r).keep {
+        hs_types.push_str(&b, "Connection: close\r\n")
+    } else if !(*r).v11 {
+        hs_types.push_str(&b, "Connection: keep-alive\r\n")
+    }
+    hs_types.push_str(&b, extra)
+    hs_types.push_str(&b, "\r\n")
+    if !(*r).head_only { hs_types.push_str(&b, body) }
+    hs_conn.conn_send(c, b.ptr, b.len)
+    rt.buf_free(&b)
+    (*(*r).app).requests = (*(*r).app).requests + 1
+}
+
+fn reply(r: *mut hs_types.Req, status: u32, ctype: str, body: str) {
+    reply_ex(r, status, ctype, "", body)
+}
+
+fn peer_ip(r: *mut hs_types.Req) -> u32 { return (*hs_conn.conn((*r).app, (*r).ci)).peer }
+
+fn peer_text(r: *mut hs_types.Req) -> str {
+    let ip: u32 = peer_ip(r)
+    return io.fmt_string(f"{(ip >> 24) & 255}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}")
+}
+
+fn method(r: *mut hs_types.Req) -> str { return (*r).method }
+fn path(r: *mut hs_types.Req) -> str { return (*r).path }
+fn query(r: *mut hs_types.Req) -> str { return (*r).query }
+fn body(r: *mut hs_types.Req) -> str { return (*r).body }
+
+// The value of the first header `name` (any case), "" when absent.
+fn header(r: *mut hs_types.Req, name: str) -> str {
+    let h: str = (*r).head
+    var i: usize = 0
+    while i < h.n {
+        var e: usize = i
+        while e + 1 < h.n && !(*(h.p + e) == 13 as u8 && *(h.p + e + 1) == 10 as u8) { e = e + 1 }
+        var colon: usize = i
+        while colon < e && *(h.p + colon) != 58 as u8 { colon = colon + 1 }
+        if colon < e && hs_types.same_ci(hs_types.as_str((h.p + i) as u64, colon - i), name) {
+            return hs_types.trim(hs_types.as_str((h.p + colon + 1) as u64, e - colon - 1))
+        }
+        i = e + 2
+    }
+    return ""
+}
+
+// `name=value` pairs separated by `sep` (& for queries, ; for cookies).
+fn pair_value(s: str, name: str, sep: u8) -> str {
+    var i: usize = 0
+    while i < s.n {
+        while i < s.n && (*(s.p + i) == 32 as u8) { i = i + 1 }
+        var e: usize = i
+        while e < s.n && *(s.p + e) != sep { e = e + 1 }
+        var eq: usize = i
+        while eq < e && *(s.p + eq) != 61 as u8 { eq = eq + 1 }
+        if eq < e && hs_types.as_str((s.p + i) as u64, eq - i) == name {
+            return hs_types.as_str((s.p + eq + 1) as u64, e - eq - 1)
+        }
+        i = e + 1
+    }
+    return ""
+}
+
+fn query_param(r: *mut hs_types.Req, name: str) -> str {
+    return pair_value((*r).query, name, 38 as u8)
+}
+
+fn cookie(r: *mut hs_types.Req, name: str) -> str {
+    return pair_value(header(r, "Cookie"), name, 59 as u8)
+}
+
+fn token_ok(a: *mut hs_types.App, s: str) -> bool {
+    if s.n != 32 { return false }
+    return hmac.hmac_equal(s.p as u64, (&(*a).token[0]) as u64, 32)
+}

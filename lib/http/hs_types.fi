@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.net
+import std.io
+import std.crypto.random
+import std.crypto.hmac
+import std.base64
+import ws.ws
+import tls.tls_server
+
+export {
+    K_FREE, K_HTTP, K_WS, K_SSE, R_TEXT, R_FN,
+    R_WS, R_SSE, SYS_READ_FROM, SYS_SEND_TO, SYS_CLOSE_FD, SYS_WRITE_FD,
+    SYS_READ_FD, SYS_EVENTFD2, WAKE_CI, SYS_POLL_FDS, SYS_SOCKET_NEW, SYS_BIND_ADDR,
+    SYS_BACKLOG, SYS_ACCEPT4, SYS_SETSOCKOPT, SYS_CLOCK, SYS_GETSOCKNAME, POLLIN,
+    POLLOUT, POLLERR, POLLHUP, EAGAIN, EINTR, MAX_HEAD,
+    Route, Conn, App, Req, Ws, no_req,
+    no_msg, no_ws, no_tick, now_ms, push_str, as_str,
+    lower, same_ci, has_token, SERVE_KIND, trim, parse_dec,
+    hexv,
+}
+
+const K_FREE: u32 = 0
+const K_HTTP: u32 = 1
+const K_WS: u32 = 2
+const K_SSE: u32 = 3
+
+const R_TEXT: u32 = 1
+const R_FN: u32 = 2
+const R_WS: u32 = 3
+const R_SSE: u32 = 4
+
+const SYS_READ_FROM: i64 = 45 // recvfrom
+const SYS_SEND_TO: i64 = 44 // sendto
+const SYS_CLOSE_FD: i64 = 3
+const SYS_WRITE_FD: i64 = 1
+const SYS_READ_FD: i64 = 0
+const SYS_EVENTFD2: i64 = 290
+const WAKE_CI: usize = 18446744073709551615
+const SYS_POLL_FDS: i64 = 7
+const SYS_SOCKET_NEW: i64 = 41
+const SYS_BIND_ADDR: i64 = 49
+const SYS_BACKLOG: i64 = 50
+const SYS_ACCEPT4: i64 = 288
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_CLOCK: i64 = 228
+const SYS_GETSOCKNAME: i64 = 51
+
+const POLLIN: u32 = 1
+const POLLOUT: u32 = 4
+const POLLERR: u32 = 8
+const POLLHUP: u32 = 16
+
+const EAGAIN: i64 = -11
+const EINTR: i64 = -4
+
+const MAX_HEAD: usize = 16384
+
+// ------------------------------------------------------------ The types
+
+struct Route {
+    path: str,
+    kind: u32,
+    ctype: str,
+    body: str,
+    handler: fn(*mut Req),
+    on_msg: fn(*mut Ws, str),
+    on_open: fn(*mut Ws),
+    on_close: fn(*mut Ws),
+}
+
+struct Conn {
+    fd: i32,
+    kind: u32,
+    inb: rt.Buf,
+    inpos: usize,
+    outb: rt.Buf,
+    outpos: usize,
+    secure: bool,
+    t: tls_server.TlsServer,
+    last_ms: i64,
+    ping_ms: i64,
+    close_after: bool,
+    dead: bool,
+    route: usize,
+    msg: rt.Buf,
+    msg_op: u32,
+    in_msg: bool,
+    utf: ws.Utf8,
+    close_sent: bool,
+    cont_sent: bool,
+    chunked: rt.Buf,
+    fr_done: usize, // payload octets of the current, incomplete frame already checked
+    fr_started: bool,
+    peer: u32,
+}
+
+struct App {
+    port: u16,
+    addr: u32,
+    fd: i32,
+    routes: Vec[Route],
+    conns: Vec[Conn],
+    max_conn: usize,
+    token: [u8; 32],
+    paired: bool,
+    tls_on: bool,
+    cfg: tls_server.TlsConfig,
+    tick: fn(*mut App),
+    tick_ms: i64,
+    next_tick: i64,
+    max_body: usize,
+    max_msg: usize,
+    idle_ms: i64,
+    quiet: bool,
+    running: bool,
+    requests: u64,
+    urlbuf: rt.Buf,
+    polls: rt.Buf,
+    pmap: rt.Buf,
+    scratch: rt.Buf,
+    ud: u64, // the program's own pointer/number, see `set_userdata`
+    wake_fd: i32, // eventfd that makes `stop` end a poll at once (-1 = none)
+    fallback: fn(*mut Req),
+    has_fallback: bool,
+}
+
+// What a handler sees of one request.
+struct Req {
+    app: *mut App,
+    ci: usize,
+    method: str,
+    path: str,
+    query: str,
+    head: str, // the header lines, each ending in CRLF
+    body: str,
+    v11: bool,
+    keep: bool,
+    head_only: bool,
+    replied: bool,
+    set_cookie: bool,
+}
+
+// What a WebSocket callback sees of its connection.
+struct Ws {
+    app: *mut App,
+    ci: usize,
+    binary: bool,
+}
+
+fn no_req(r: *mut Req) {}
+fn no_msg(w: *mut Ws, m: str) {}
+fn no_ws(w: *mut Ws) {}
+fn no_tick(a: *mut App) {}
+
+fn now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn as_str(p: u64, n: usize) -> str {
+    return str { p: p as *mut u8, n: n }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+fn same_ci(a: str, b: str) -> bool {
+    if a.n != b.n { return false }
+    var i: usize = 0
+    while i < a.n {
+        if lower(*(a.p + i)) != lower(*(b.p + i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Does the comma separated header value contain `tok` (case-insensitive)?
+fn has_token(v: str, tok: str) -> bool {
+    var i: usize = 0
+    while i < v.n {
+        while i < v.n && (*(v.p + i) == 32 as u8 || *(v.p + i) == 44 as u8 || *(v.p + i) == 9 as u8) {
+            i = i + 1
+        }
+        var j: usize = i
+        while j < v.n && *(v.p + j) != 44 as u8 { j = j + 1 }
+        var e: usize = j
+        while e > i && (*(v.p + e - 1) == 32 as u8 || *(v.p + e - 1) == 9 as u8) { e = e - 1 }
+        if same_ci(as_str((v.p + i) as u64, e - i), tok) { return true }
+        i = j + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ in the background
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {       // ONE line to wire it (a library cannot define it)
+//         if kind == http.SERVE_KIND { return http.serve_main(arg) }
+//         return 0
+//     }
+//     var app: http.App = http.app(0)
+//     http.listen(&app)                      // port known
+//     let th: u64 = http.serve_background(&app)
+//     ...                                    // talk to it
+//     http.stop_wait(&app, th)               // returns at once: stop() wakes the poll
+//
+// The App must stay alive (a local of `main` is fine) until `stop_wait` has returned.
+const SERVE_KIND: u64 = 1213420118
+
+fn trim(s: str) -> str {
+    var i: usize = 0
+    var e: usize = s.n
+    while i < e && (*(s.p + i) == 32 as u8 || *(s.p + i) == 9 as u8) { i = i + 1 }
+    while e > i && (*(s.p + e - 1) == 32 as u8 || *(s.p + e - 1) == 9 as u8) { e = e - 1 }
+    return as_str((s.p + i) as u64, e - i)
+}
+
+fn parse_dec(s: str, out: *mut u64) -> bool {
+    if s.n == 0 || s.n > 18 { return false }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n {
+        let ch: u8 = *(s.p + i)
+        if ch < 48 as u8 || ch > 57 as u8 { return false }
+        v = v * 10 + (ch - 48 as u8) as u64
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn hexv(ch: u8) -> i64 {
+    if ch >= 48 as u8 && ch <= 57 as u8 { return (ch - 48 as u8) as i64 }
+    if ch >= 97 as u8 && ch <= 102 as u8 { return (ch - 87 as u8) as i64 }
+    if ch >= 65 as u8 && ch <= 70 as u8 { return (ch - 55 as u8) as i64 }
+    return -1
+}
