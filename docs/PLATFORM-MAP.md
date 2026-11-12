@@ -15,6 +15,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/pool.fi`, `std/scope.fi`, `std/rc.fi`, `std/mem.fi` | worker pool, scopes, refcount, memory
 - `std/dialog.fi`, `std/clipboard.fi`, `std/toast.fi` | native dialogs, clipboard, notifications (use via `services` in apps)
 - `std/testkit.fi` | assertions for `#[test]`
+- `std/mock.fi` | spies with scripted returns, argument asserts, ordered call log | `mock.spy_call2(mock.spy_from_ctx(ctx), a, b)`, `mock.assert_calls(&spy, 2)`, `mock.assert_log(&log, "a,b")`
 
 ## Crypto (lib/std/crypto)
 - `sha256.fi sha512.fi sha1.fi blake2b.fi hmac.fi hkdf.fi argon2.fi aes.fi gcm.fi chacha.fi x25519.fi ed25519.fi p256.fi ecdsa.fi rsa.fi random.fi keyring.fi` | primitives | `sha256.sha256(ptr, len, out_ptr)`; secrets: `std/secret.fi`
@@ -71,7 +72,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `tools/firn/firn` (new/add/fetch/update/build/search/publish/yank, SemVer registry index; docs/PACKAGES.md), `lib/toolchain/` (installer), `tools/pin/` (PIN-POLICY.md)
 - Test: `firnc --test`, `lib/test/runner.fi`, `tools/testrunner/`; gate `bash test.sh --stage N` (tools/teststages/README.md)
 - Coverage `tools/coverage/firncov` (docs/COVERAGE.md); lint `tools/lint/run.sh`; format `tools/fmt/premerge.sh`; LSP `firnc --lsp` (tools/lsp); debugger docs/DEBUGGER.md, VS Code debug adapter `tools/dap/dap_server.py` (`bash tools/dap/run.sh`)
-- Language: `docs/FIR.md`, interfaces `docs/ROUND46.md`, tuples `docs/TUPLES.md`, aliases `docs/TYPE_ALIASES.md`, errors `docs/ERROR_UNIONS.md`, closures `docs/CLOSURES.md`
+- Language: generics state `docs/GENERICS.md`, async plan `docs/design/async-await.md`, `docs/FIR.md`, interfaces `docs/ROUND46.md`, tuples `docs/TUPLES.md`, aliases `docs/TYPE_ALIASES.md`, errors `docs/ERROR_UNIONS.md`, closures `docs/CLOSURES.md`
 
 ## Domain libs
 - `mc/` (610 Minecraft modules; docs/MC-LIBS.md), `brigadier/`, `rvemu/`, `hf/`, `bpe/`, `cuda/`, `rc/`, `compile: firnc1/`
