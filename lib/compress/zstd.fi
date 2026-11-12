@@ -66,6 +66,7 @@ export {
 const ZSTD_MAGIC: u32 = 0xFD2FB528
 const ZSTD_SKIP_LO: u32 = 0x184D2A50
 const ZSTD_SKIP_HI: u32 = 0x184D2A5F
+const SEQ_FAST_BITS: usize = 96
 const ZSTD_DICT_MAGIC: u32 = 0xEC30A437
 const ZSTD_BLOCK_MAX: usize = 131072
 const WMAX_DEFAULT: u64 = 134217728 // windowLog 27, libzstd's default cap
@@ -87,6 +88,8 @@ static ML_BASE: [u32; 53] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
     259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539]
 static ML_BITS: [u8; 53] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+static LOW_MASK: [u32; 32] = [0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535, 131071, 262143, 524287, 1048575, 2097151, 4194303, 8388607, 16777215, 33554431, 67108863, 134217727, 268435455, 536870911, 1073741823, 2147483647]
 
 // the predefined distributions (RFC 8878 3.1.1.3.2.2.1); -1 = "less than one"
 static LL_NORM: [i32; 36] = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -144,6 +147,7 @@ struct BitR {
     p: u64,
     n: usize,
     pos: usize,
+    hi: usize,
     over: bool, // more bits were asked for than the stream had
 }
 
@@ -166,6 +170,11 @@ fn load_bits(p: u64, n: usize, start: usize, k: usize) -> u64 {
     return (w >> sh) & (((1 as u64) << (k as u64)) - 1)
 }
 
+#[inline]
+fn bits_at(p: u64, start: usize, k: usize) -> u64 {
+    return (common.ld64le(p, start >> 3) >> ((start & 7) as u64)) & (LOW_MASK[k] as u64)
+}
+
 // false when the stream is empty or its last octet is 0 (no sentinel)
 fn br_init(b: *mut BitR, p: u64, n: usize) -> bool {
     if n == 0 {
@@ -178,6 +187,10 @@ fn br_init(b: *mut BitR, p: u64, n: usize) -> bool {
     (*b).p = p
     (*b).n = n
     (*b).pos = (n - 1) * 8 + (highbit32(last) as usize)
+    (*b).hi = 0
+    if n >= 8 {
+        (*b).hi = (n - 7) * 8
+    }
     (*b).over = false
     return true
 }
@@ -553,7 +566,7 @@ fn huf_read_table(d: *mut ZstdDec, p: u64, n: usize) -> CompressError!usize {
         if used_nc >= csize {
             return CompressError::Data
         }
-        var br: BitR = BitR { p: 0, n: 0, pos: 0, over: false }
+        var br: BitR = BitR { p: 0, n: 0, pos: 0, hi: 0, over: false }
         if !br_init(&br, p + 1 + used_nc as u64, csize - used_nc) {
             return CompressError::Data
         }
@@ -658,7 +671,7 @@ fn huf_read_table(d: *mut ZstdDec, p: u64, n: usize) -> CompressError!usize {
 
 // One Huffman stream of `count` symbols; false on any inconsistency.
 fn huf_stream(d: *mut ZstdDec, p: u64, n: usize, dst: u64, count: usize) -> bool {
-    var br: BitR = BitR { p: 0, n: 0, pos: 0, over: false }
+    var br: BitR = BitR { p: 0, n: 0, pos: 0, hi: 0, over: false }
     if !br_init(&br, p, n) {
         return false
     }
@@ -921,7 +934,7 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
     if at >= bn {
         return CompressError::Truncated
     }
-    var br: BitR = BitR { p: 0, n: 0, pos: 0, over: false }
+    var br: BitR = BitR { p: 0, n: 0, pos: 0, hi: 0, over: false }
     if !br_init(&br, bp + at as u64, bn - at) {
         return CompressError::Data
     }
@@ -941,16 +954,40 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
     var rep1: u64 = (*d).rep1
     var rep2: u64 = (*d).rep2
     var rep3: u64 = (*d).rep3
+    var bpos: usize = br.pos
+    var bspan: usize = 0
+    if br.hi > SEQ_FAST_BITS {
+        bspan = br.hi - SEQ_FAST_BITS
+    }
+    let bp0: u64 = br.p
     var i: usize = 0
     while i < nseq {
         let llc: usize = (*d).ll.sym[lls] as usize
         let ofc: usize = (*d).of.sym[ofs] as usize
         let mlc: usize = (*d).ml.sym[mls] as usize
-        let ov: u64 = ((1 as u64) << (ofc as u64)) + br_get(&br, ofc)
-        let ml: usize = (ML_BASE[mlc] as usize) + (br_get(&br, ML_BITS[mlc] as usize) as usize)
-        let ll: usize = (LL_BASE[llc] as usize) + (br_get(&br, LL_BITS[llc] as usize) as usize)
-        if br.over {
-            return CompressError::Data
+        let fast: bool = (bpos -% SEQ_FAST_BITS) < bspan
+        var ov: u64 = 0
+        var ml: usize = 0
+        var ll: usize = 0
+        if fast {
+            let mb: usize = ML_BITS[mlc] as usize
+            let lb: usize = LL_BITS[llc] as usize
+            let q0: usize = bpos - ofc
+            let q1: usize = q0 - mb
+            let q2: usize = q1 - lb
+            ov = ((1 as u64) << (ofc as u64)) + bits_at(bp0, q0, ofc)
+            ml = (ML_BASE[mlc] as usize) + (bits_at(bp0, q1, mb) as usize)
+            ll = (LL_BASE[llc] as usize) + (bits_at(bp0, q2, lb) as usize)
+            bpos = q2
+        } else {
+            br.pos = bpos
+            ov = ((1 as u64) << (ofc as u64)) + br_get(&br, ofc)
+            ml = (ML_BASE[mlc] as usize) + (br_get(&br, ML_BITS[mlc] as usize) as usize)
+            ll = (LL_BASE[llc] as usize) + (br_get(&br, LL_BITS[llc] as usize) as usize)
+            if br.over {
+                return CompressError::Data
+            }
+            bpos = br.pos
         }
         var off: u64 = 0
         if ov > 3 {
@@ -1047,15 +1084,30 @@ fn block_compressed(d: *mut ZstdDec, out: *mut rt.Buf, bp: u64, bn: usize, room:
         i = i + 1
         if i < nseq {
             // update LL, ML, OF
-            lls = ((*d).ll.base[lls] as usize) + (br_get(&br, (*d).ll.nb[lls] as usize) as usize)
-            mls = ((*d).ml.base[mls] as usize) + (br_get(&br, (*d).ml.nb[mls] as usize) as usize)
-            ofs = ((*d).of.base[ofs] as usize) + (br_get(&br, (*d).of.nb[ofs] as usize) as usize)
-            if br.over {
-                return CompressError::Data
+            if fast {
+                let n0: usize = (*d).ll.nb[lls] as usize
+                let n1: usize = (*d).ml.nb[mls] as usize
+                let n2: usize = (*d).of.nb[ofs] as usize
+                let q0: usize = bpos - n0
+                let q1: usize = q0 - n1
+                let q2: usize = q1 - n2
+                lls = ((*d).ll.base[lls] as usize) + (bits_at(bp0, q0, n0) as usize)
+                mls = ((*d).ml.base[mls] as usize) + (bits_at(bp0, q1, n1) as usize)
+                ofs = ((*d).of.base[ofs] as usize) + (bits_at(bp0, q2, n2) as usize)
+                bpos = q2
+            } else {
+                br.pos = bpos
+                lls = ((*d).ll.base[lls] as usize) + (br_get(&br, (*d).ll.nb[lls] as usize) as usize)
+                mls = ((*d).ml.base[mls] as usize) + (br_get(&br, (*d).ml.nb[mls] as usize) as usize)
+                ofs = ((*d).of.base[ofs] as usize) + (br_get(&br, (*d).of.nb[ofs] as usize) as usize)
+                if br.over {
+                    return CompressError::Data
+                }
+                bpos = br.pos
             }
         }
     }
-    if br.pos != 0 {
+    if bpos != 0 {
         return CompressError::Data // the stream was not used to its last bit
     }
     // the literals after the last sequence
