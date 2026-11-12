@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import mysql.mywire as w
+import mysql.myrows as rows
+
+export { decode_binary_row, decode_text_row }
+
+fn push_num(tmp: *mut rt.Buf, v: u64, signed_bits: u32, unsigned: bool) {
+    if unsigned || signed_bits == 0 {
+        rt.buf_push_dec_u64(tmp, v)
+        return
+    }
+    let shift: u64 = (64 - signed_bits) as u64
+    let sv: i64 = ((v << shift) as i64) >> shift
+    rt.buf_push_dec_i64(tmp, sv)
+}
+
+fn push_pad(tmp: *mut rt.Buf, v: u32, width: u32) {
+    var div: u32 = 1
+    var i: u32 = 1
+    while i < width {
+        div = div * 10
+        i = i + 1
+    }
+    while div > 0 {
+        rt.buf_push(tmp, (48 + (v / div) % 10) as u8)
+        div = div / 10
+    }
+}
+
+fn decode_datetime(tmp: *mut rt.Buf, p: u64, len: usize) {
+    if len == 0 {
+        rt.buf_push_bytes(tmp, "0000-00-00".p as u64, 10)
+        return
+    }
+    push_pad(tmp, w.ld16le(p, 0), 4)
+    rt.buf_push(tmp, 45 as u8)
+    push_pad(tmp, rt.ld8(p, 2) as u32, 2)
+    rt.buf_push(tmp, 45 as u8)
+    push_pad(tmp, rt.ld8(p, 3) as u32, 2)
+    if len < 7 { return }
+    rt.buf_push(tmp, 32 as u8)
+    push_pad(tmp, rt.ld8(p, 4) as u32, 2)
+    rt.buf_push(tmp, 58 as u8)
+    push_pad(tmp, rt.ld8(p, 5) as u32, 2)
+    rt.buf_push(tmp, 58 as u8)
+    push_pad(tmp, rt.ld8(p, 6) as u32, 2)
+    if len < 11 { return }
+    rt.buf_push(tmp, 46 as u8)
+    push_pad(tmp, w.ld32le(p, 7), 6)
+}
+
+fn int_width(t: u32) -> usize {
+    if t == rows.TYPE_TINY { return 1 }
+    if t == rows.TYPE_SHORT || t == rows.TYPE_YEAR { return 2 }
+    if t == rows.TYPE_LONG || t == rows.TYPE_INT24 { return 4 }
+    if t == rows.TYPE_LONGLONG { return 8 }
+    return 0
+}
+
+fn decode_binary_row(r: *mut rows.MyResult, p: u64, n: usize) -> bool {
+    let nc: usize = (*r).ncols
+    let bitmap: usize = (nc + 9) / 8
+    if n < 1 + bitmap || rt.ld8(p, 0) != 0 as u8 { return false }
+    var pos: usize = 1 + bitmap
+    var tmp: rt.Buf = rt.buf_new()
+    var col: usize = 0
+    while col < nc {
+        let bit: usize = col + 2
+        if (rt.ld8(p, 1 + bit / 8) & (1 << (bit % 8) as u8)) != 0 as u8 {
+            rows.add_null_cell(r)
+            col = col + 1
+        } else {
+            rt.buf_clear(&tmp)
+            let t: u32 = rows.result_col_type(r, col)
+            let fl: u32 = rows.result_col_flags(r, col)
+            let iw: usize = int_width(t)
+            if iw > 0 {
+                if pos + iw > n {
+                    rt.buf_free(&tmp)
+                    return false
+                }
+                var v: u64 = 0
+                var i: usize = 0
+                while i < iw {
+                    v = v | ((rt.ld8(p, pos + i) as u64) << ((i * 8) as u64))
+                    i = i + 1
+                }
+                push_num(&tmp, v, (iw * 8) as u32, (fl & rows.FLAG_UNSIGNED) != 0)
+                pos = pos + iw
+            } else if t == rows.TYPE_DATE || t == rows.TYPE_DATETIME || t == rows.TYPE_TIMESTAMP {
+                if pos >= n || pos + 1 + rt.ld8(p, pos) as usize > n {
+                    rt.buf_free(&tmp)
+                    return false
+                }
+                let len: usize = rt.ld8(p, pos) as usize
+                decode_datetime(&tmp, p + (pos + 1) as u64, len)
+                pos = pos + 1 + len
+            } else if t == rows.TYPE_FLOAT || t == rows.TYPE_DOUBLE || t == rows.TYPE_TIME {
+                rt.buf_free(&tmp)
+                return false
+            } else {
+                var len: u64 = 0
+                if !w.read_lenenc(p, n, &pos, &len) || len > (n - pos) as u64 {
+                    rt.buf_free(&tmp)
+                    return false
+                }
+                rt.buf_push_bytes(&tmp, p + pos as u64, len as usize)
+                pos = pos + len as usize
+            }
+            rows.add_cell(r, tmp.ptr, tmp.len)
+            col = col + 1
+        }
+    }
+    rt.buf_free(&tmp)
+    rows.finish_row(r)
+    return true
+}
+
+fn decode_text_row(r: *mut rows.MyResult, p: u64, n: usize) -> bool {
+    var pos: usize = 0
+    var col: usize = 0
+    while col < (*r).ncols {
+        if pos >= n { return false }
+        if rt.ld8(p, pos) == 251 as u8 {
+            rows.add_null_cell(r)
+            pos = pos + 1
+        } else {
+            var len: u64 = 0
+            if !w.read_lenenc(p, n, &pos, &len) || len > (n - pos) as u64 { return false }
+            rows.add_cell(r, p + pos as u64, len as usize)
+            pos = pos + len as usize
+        }
+        col = col + 1
+    }
+    rows.finish_row(r)
+    return true
+}

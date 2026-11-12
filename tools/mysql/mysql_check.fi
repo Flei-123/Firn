@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.io
+import std.time
+import mysql.mysql
+import mysql.myrows
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, "FAIL ".p as u64, 5)
+        rt.buf_push_dec_u64(&b, code as u64)
+        rt.buf_push(&b, 10 as u8)
+        io.print_bytes(b.ptr, b.len)
+        rt.buf_free(&b)
+    }
+}
+
+fn value_is(r: *mut myrows.MyResult, row: usize, col: usize, s: str) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    if !myrows.result_value(r, row, col, &p, &n) { return false }
+    return n == s.n && rt.mem_eq(p, s.p as u64, n)
+}
+
+fn is_null(r: *mut myrows.MyResult, row: usize, col: usize) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    return !myrows.result_value(r, row, col, &p, &n)
+}
+
+fn field(buf: *mut rt.Buf, idx: usize, out: *mut rt.Buf) {
+    var line: usize = 0
+    var i: usize = 0
+    rt.buf_clear(out)
+    while i < (*buf).len {
+        let b: u8 = rt.ld8((*buf).ptr, i)
+        if b == 10 as u8 {
+            line = line + 1
+        } else if line == idx {
+            rt.buf_push(out, b)
+        }
+        i = i + 1
+    }
+}
+
+fn to_u16(b: *mut rt.Buf) -> u16 {
+    var v: u16 = 0
+    var i: usize = 0
+    while i < (*b).len {
+        v = v * 10 + ((rt.ld8((*b).ptr, i) - 48 as u8) as u16)
+        i = i + 1
+    }
+    return v
+}
+
+fn run_session(c: *mut mysql.My) {
+    var r: myrows.MyResult = myrows.result_new()
+    check(mysql.my_ping(c), 9)
+    check(mysql.my_query(c, "SELECT 1+1 AS two, 'héllo' AS word, NULL AS nothing", &r), 10)
+    check(myrows.result_nrows(&r) == 1 && myrows.result_ncols(&r) == 3, 11)
+    check(value_is(&r, 0, 0, "2") && value_is(&r, 0, 1, "héllo") && is_null(&r, 0, 2), 12)
+    let nm: str = myrows.result_col_name(&r, 1)
+    check(nm.n == 4 && rt.mem_eq(nm.p as u64, "word".p as u64, 4), 13)
+    check(mysql.my_query(c, "CREATE TEMPORARY TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, n BIGINT, u INT UNSIGNED, s VARCHAR(40), d DATETIME, m DECIMAL(10,2), tn TINYINT)", &r), 14)
+    check(mysql.my_query(c, "INSERT INTO t (n, u, s, d, m, tn) VALUES (-5, 4000000000, 'a', '2026-11-12 20:30:40', 12.50, -3), (6, 1, 'b', NULL, NULL, NULL)", &r), 15)
+    check(myrows.result_affected(&r) == 2 && myrows.result_insert_id(&r) == 1, 16)
+    check(mysql.my_query(c, "SELECT id, n, u, s, d, m, tn FROM t ORDER BY id", &r), 17)
+    check(myrows.result_nrows(&r) == 2 && value_is(&r, 0, 1, "-5") && value_is(&r, 0, 2, "4000000000"), 18)
+    check(!mysql.my_query(c, "SELEC nonsense", &r), 19)
+    check(mysql.my_error_code(c) == 1064, 20)
+    check(mysql.my_is_open(c) && mysql.my_query(c, "SELECT 5", &r) && value_is(&r, 0, 0, "5"), 21)
+    var np: usize = 0
+    let sid: i64 = mysql.my_prepare(c, "SELECT id, n, u, s, d, m, tn FROM t WHERE id >= ? ORDER BY id", &np)
+    check(sid > 0 && np == 1, 22)
+    var q: myrows.MyParams = myrows.params_new()
+    myrows.params_text(&q, "1".p as u64, 1)
+    check(mysql.my_exec_stmt(c, sid as u32, &q, &r), 23)
+    check(myrows.result_nrows(&r) == 2 && value_is(&r, 0, 1, "-5") && value_is(&r, 0, 2, "4000000000"), 24)
+    check(value_is(&r, 0, 3, "a") && value_is(&r, 0, 4, "2026-11-12 20:30:40") && value_is(&r, 0, 5, "12.50") && value_is(&r, 0, 6, "-3"), 25)
+    check(value_is(&r, 1, 0, "2") && is_null(&r, 1, 4) && is_null(&r, 1, 5) && is_null(&r, 1, 6), 26)
+    check(mysql.my_close_stmt(c, sid as u32), 27)
+    var np2: usize = 0
+    let ins: i64 = mysql.my_prepare(c, "INSERT INTO t (n, s) VALUES (?, ?)", &np2)
+    check(ins > 0 && np2 == 2, 28)
+    var k: u32 = 0
+    while k < 100 {
+        myrows.params_clear(&q)
+        var num: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&num, (100 + k) as u64)
+        myrows.params_text(&q, num.ptr, num.len)
+        if k % 2 == 0 {
+            myrows.params_text(&q, "Zoë".p as u64, 4)
+        } else {
+            myrows.params_null(&q)
+        }
+        check(mysql.my_exec_stmt(c, ins as u32, &q, &r) && myrows.result_affected(&r) == 1, 29)
+        rt.buf_free(&num)
+        k = k + 1
+    }
+    check(mysql.my_query(c, "SELECT count(*), sum(n), count(s) FROM t", &r), 30)
+    check(value_is(&r, 0, 0, "102") && value_is(&r, 0, 1, "14951") && value_is(&r, 0, 2, "52"), 31)
+    check(mysql.my_query(c, "SELECT seq, md5(seq) FROM seq_1_to_100000", &r), 32)
+    check(myrows.result_nrows(&r) == 100000 && value_is(&r, 99999, 0, "100000") && value_is(&r, 0, 1, "c4ca4238a0b923820dcc509a6f75849b"), 33)
+    var big: rt.Buf = rt.buf_new()
+    var b: usize = 0
+    while b < 1000000 {
+        rt.buf_push(&big, (97 + b % 26) as u8)
+        b = b + 1
+    }
+    myrows.params_clear(&q)
+    myrows.params_text(&q, big.ptr, big.len)
+    let echo: i64 = mysql.my_prepare(c, "SELECT ?, LENGTH(?)", &np)
+    myrows.params_text(&q, big.ptr, big.len)
+    check(echo > 0 && np == 2, 34)
+    check(mysql.my_exec_stmt(c, echo as u32, &q, &r), 35)
+    var vp: u64 = 0
+    var vn: usize = 0
+    check(myrows.result_value(&r, 0, 0, &vp, &vn) && vn == 1000000 && rt.mem_eq(vp, big.ptr, vn), 36)
+    check(value_is(&r, 0, 1, "1000000"), 37)
+    check(mysql.my_query(c, "SELECT REPEAT('x', 20000000)", &r), 38)
+    check(myrows.result_value(&r, 0, 0, &vp, &vn) && vn == 20000000 && rt.ld8(vp, 19999999) == 120 as u8, 39)
+    myrows.params_free(&q)
+    myrows.result_free(&r)
+    rt.buf_free(&big)
+}
+
+fn main() -> i32 {
+    var inb: rt.Buf = rt.buf_new()
+    if !io.read_stdin(&inb) { return 2 }
+    var f0: rt.Buf = rt.buf_new()
+    var f1: rt.Buf = rt.buf_new()
+    var f2: rt.Buf = rt.buf_new()
+    var f3: rt.Buf = rt.buf_new()
+    var f4: rt.Buf = rt.buf_new()
+    field(&inb, 0, &f0)
+    field(&inb, 1, &f1)
+    field(&inb, 2, &f2)
+    field(&inb, 3, &f3)
+    field(&inb, 4, &f4)
+    let port: u16 = to_u16(&f0)
+    var roots: rt.Buf = rt.buf_new()
+    var mode: u32 = mysql.TLS_OFF
+    if f4.len > 0 {
+        rt.buf_push(&f4, 0 as u8)
+        check(io.read_file(f4.ptr, &roots), 1)
+        mode = mysql.TLS_REQUIRE
+    }
+    let now: u64 = (time.now_unix_ms() / 1000) as u64
+    var bad: mysql.My = mysql.my_new()
+    check(!mysql.my_connect(&bad, 2130706433 as u32, port, rt.buf_str(&f1), "wrong-password", rt.buf_str(&f3), mode, "localhost", roots.ptr, roots.len, now), 2)
+    check(mysql.my_error_code(&bad) == 1045, 3)
+    mysql.my_free(&bad)
+    var c: mysql.My = mysql.my_new()
+    if mysql.my_connect(&c, 2130706433 as u32, port, rt.buf_str(&f1), rt.buf_str(&f2), rt.buf_str(&f3), mode, "localhost", roots.ptr, roots.len, now) {
+        run_session(&c)
+        mysql.my_close(&c)
+    } else {
+        check(false, 4)
+        io.print_line(mysql.my_error(&c))
+    }
+    mysql.my_free(&c)
+    if fails == 0 { io.print_line("mysql ok") }
+    return fails as i32
+}
