@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.dict
+import std.time
+import std.pystr
+import std.crypto.random
+import std.crypto.hmac
+import webfw.wf_types
+import webfw.wf_ctx
+import webfw.wf_web
+import webfw.wf_text
+
+export { enable_sessions, session_get, session_set, session_destroy }
+
+const SID_COOKIE: str = "wf_sid"
+
+fn sign(w: *mut wf_types.Web, id: str) -> str {
+    var mac: [u8; 32] = [0; 32]
+    hmac.hmac_sha256((*w).session_secret.p as u64, (*w).session_secret.n, id.p as u64, id.n, (&mac[0]) as u64)
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 32 {
+        rt.buf_push_hex_u64(&b, mac[i] as u64, 2)
+        i = i + 1
+    }
+    let out: str = __str_copy(rt.buf_str(&b))
+    rt.buf_free(&b)
+    return out
+}
+
+fn new_id() -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_hex_u64(&b, random.random_u64(), 16)
+    rt.buf_push_hex_u64(&b, random.random_u64(), 16)
+    let out: str = __str_copy(rt.buf_str(&b))
+    rt.buf_free(&b)
+    return out
+}
+
+fn verified_id(c: *mut wf_types.Ctx) -> str {
+    let w: *mut wf_types.Web = (*c).web
+    let v: str = wf_ctx.cookie(c, SID_COOKIE)
+    let dot: i64 = pystr.find(v, ".")
+    if dot != 32 { return "" }
+    let id: str = wf_text.slice(v, 0, 32)
+    let sig: str = wf_text.slice(v, 33, v.n)
+    let want: str = sign(w, id)
+    if sig.n != want.n { return "" }
+    if !hmac.hmac_equal(sig.p as u64, want.p as u64, want.n) { return "" }
+    let expiry: i64 = dict_get_or[i64](&(*w).session_ids, id, 0)
+    if expiry <= time.now_unix_ms() { return "" }
+    return __str_copy(id)
+}
+
+fn start(c: *mut wf_types.Ctx) {
+    if (*c).sid.n > 0 { return }
+    let w: *mut wf_types.Web = (*c).web
+    var id: str = verified_id(c)
+    if id.n == 0 {
+        id = new_id()
+        (*c).sid_new = true
+        dict_set[i64](&(*w).session_ids, id, time.now_unix_ms() + (*w).session_ttl_ms)
+    }
+    (*c).sid = id
+}
+
+fn key_of(c: *mut wf_types.Ctx, key: str) -> str { return (*c).sid + "|" + key }
+
+fn session_get(c: *mut wf_types.Ctx, key: str) -> str {
+    start(c)
+    return dict_get_or[str](&(*(*c).web).session_vals, key_of(c, key), "")
+}
+
+fn session_set(c: *mut wf_types.Ctx, key: str, value: str) {
+    start(c)
+    let w: *mut wf_types.Web = (*c).web
+    let index: str = (*c).sid + "#keys"
+    let known: str = dict_get_or[str](&(*w).session_vals, index, "")
+    if !pystr.contains("\n" + known, "\n" + key + "\n") {
+        dict_set[str](&(*w).session_vals, index, known + key + "\n")
+    }
+    dict_set[str](&(*w).session_vals, key_of(c, key), value)
+}
+
+fn session_destroy(c: *mut wf_types.Ctx) {
+    start(c)
+    let w: *mut wf_types.Web = (*c).web
+    let index: str = (*c).sid + "#keys"
+    var keys: Vec[str] = vec_new[str]()
+    pystr.split(dict_get_or[str](&(*w).session_vals, index, ""), "\n", &keys)
+    var i: usize = 0
+    while i < vec_len[str](&keys) {
+        dict_remove[str](&(*w).session_vals, key_of(c, *vec_elem_ptr[str](&keys, i)))
+        i = i + 1
+    }
+    dict_remove[str](&(*w).session_vals, index)
+    dict_remove[i64](&(*w).session_ids, (*c).sid)
+    vec_free[str](&keys)
+    (*c).sid = ""
+    (*c).sid_new = false
+    wf_ctx.set_cookie(c, SID_COOKIE, "", 0, true)
+}
+
+fn session_after(c: *mut wf_types.Ctx) {
+    if !(*c).sid_new || (*c).sid.n == 0 { return }
+    let w: *mut wf_types.Web = (*c).web
+    wf_ctx.set_cookie(c, SID_COOKIE, (*c).sid + "." + sign(w, (*c).sid), (*w).session_ttl_ms / 1000, true)
+}
+
+fn enable_sessions(w: *mut wf_types.Web, secret: str, ttl_s: i64) {
+    (*w).session_secret = secret
+    (*w).session_ttl_ms = ttl_s * 1000
+    wf_web.use_after(w, session_after)
+}

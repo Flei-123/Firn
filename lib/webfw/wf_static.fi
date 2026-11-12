@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.fs
+import std.pystr
+import webfw.wf_types
+import webfw.wf_ctx
+import webfw.wf_text
+import webfw.wf_mime
+
+export { try_serve, serve_file, safe_rel }
+
+const STATIC_MAX: u64 = 67108864
+
+fn safe_rel(rel: str) -> bool {
+    var i: usize = 0
+    var seg: usize = 0
+    while i <= rel.n {
+        if i == rel.n || *(rel.p + i) == 47 as u8 {
+            let s: str = wf_text.slice(rel, seg, i)
+            if s == ".." { return false }
+            seg = i + 1
+        } else {
+            let c: u8 = *(rel.p + i)
+            if c == 0 as u8 || c == 92 as u8 { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn make_etag(size: u64, mtime_ns: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    wf_text.push(&b, "W/\"")
+    rt.buf_push_hex_u64(&b, size, 1)
+    rt.buf_push(&b, 45 as u8)
+    rt.buf_push_hex_u64(&b, (mtime_ns / 1000000) as u64, 1)
+    rt.buf_push(&b, 34 as u8)
+    let out: str = __str_copy(rt.buf_str(&b))
+    rt.buf_free(&b)
+    return out
+}
+
+fn parse_range(h: str, size: u64, start: *mut u64, end: *mut u64) -> bool {
+    if !pystr.startswith(h, "bytes=") { return false }
+    let spec: str = wf_text.slice(h, 6, h.n)
+    var dash: usize = 0
+    while dash < spec.n && *(spec.p + dash) != 45 as u8 { dash = dash + 1 }
+    if dash >= spec.n { return false }
+    let a: str = wf_text.slice(spec, 0, dash)
+    let b: str = wf_text.slice(spec, dash + 1, spec.n)
+    var av: u64 = 0
+    var bv: u64 = 0
+    if a.n == 0 {
+        if !wf_text.parse_u64(b, &bv) || bv == 0 || size == 0 { return false }
+        if bv > size { bv = size }
+        *start = size - bv
+        *end = size - 1
+        return true
+    }
+    if !wf_text.parse_u64(a, &av) { return false }
+    if b.n == 0 {
+        bv = size - 1
+    } else if !wf_text.parse_u64(b, &bv) {
+        return false
+    }
+    if bv >= size { bv = size - 1 }
+    if av > bv || av >= size { return false }
+    *start = av
+    *end = bv
+    return true
+}
+
+fn range_unsatisfiable(c: *mut wf_types.Ctx, size: u64) {
+    var b: rt.Buf = rt.buf_new()
+    wf_text.push(&b, "bytes */")
+    rt.buf_push_dec_u64(&b, size)
+    wf_ctx.set_header(c, "Content-Range", rt.buf_str(&b))
+    rt.buf_free(&b)
+    wf_ctx.status_error(c, 416, "range not satisfiable")
+}
+
+fn content_range(c: *mut wf_types.Ctx, start: u64, end: u64, size: u64) {
+    var b: rt.Buf = rt.buf_new()
+    wf_text.push(&b, "bytes ")
+    rt.buf_push_dec_u64(&b, start)
+    rt.buf_push(&b, 45 as u8)
+    rt.buf_push_dec_u64(&b, end)
+    rt.buf_push(&b, 47 as u8)
+    rt.buf_push_dec_u64(&b, size)
+    wf_ctx.set_header(c, "Content-Range", rt.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn serve_file(c: *mut wf_types.Ctx, full: str) -> bool {
+    let info: fs.FileInfo = fs.stat(full) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if info.kind != fs.KIND_FILE { return false }
+    if info.size > STATIC_MAX {
+        wf_ctx.status_error(c, 413, "file too large")
+        return true
+    }
+    let etag: str = make_etag(info.size, info.mtime_ns)
+    wf_ctx.set_header(c, "ETag", etag)
+    wf_ctx.set_header(c, "Accept-Ranges", "bytes")
+    wf_ctx.set_header(c, "Cache-Control", "no-cache")
+    if pystr.contains(wf_ctx.header(c, "If-None-Match"), etag) {
+        wf_ctx.send_bytes(c, 304, wf_mime.mime_for(full), "".p as u64, 0)
+        return true
+    }
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(full, &data) catch 0
+    var start: u64 = 0
+    var end: u64 = 0
+    let ctype: str = wf_mime.mime_for(full)
+    let rh: str = wf_ctx.header(c, "Range")
+    if rh.n > 0 && n > 0 {
+        if parse_range(rh, n as u64, &start, &end) {
+            content_range(c, start, end, n as u64)
+            wf_ctx.send_bytes(c, 206, ctype, rt.buf_ptr(&data) + start, (end - start + 1) as usize)
+        } else {
+            range_unsatisfiable(c, n as u64)
+        }
+    } else {
+        wf_ctx.send_bytes(c, 200, ctype, rt.buf_ptr(&data), n)
+    }
+    rt.buf_free(&data)
+    return true
+}
+
+fn mount_matches(m: *mut wf_types.StaticMount, path: str) -> bool {
+    if !pystr.startswith(path, (*m).prefix) { return false }
+    if path.n == (*m).prefix.n { return true }
+    return *(path.p + (*m).prefix.n) == 47 as u8
+}
+
+fn strip_leading_slashes(rel: str) -> str {
+    var i: usize = 0
+    while i < rel.n && *(rel.p + i) == 47 as u8 { i = i + 1 }
+    return wf_text.slice(rel, i, rel.n)
+}
+
+fn try_serve(c: *mut wf_types.Ctx) -> bool {
+    let method: str = wf_ctx.method(c)
+    if method != "GET" && method != "HEAD" { return false }
+    let path: str = wf_ctx.path(c)
+    var i: usize = 0
+    while i < vec_len[wf_types.StaticMount](&(*(*c).web).statics) {
+        let m: *mut wf_types.StaticMount = vec_elem_ptr[wf_types.StaticMount](&(*(*c).web).statics, i)
+        if mount_matches(m, path) {
+            var rel: str = wf_text.url_decode(wf_text.slice(path, (*m).prefix.n, path.n), false)
+            rel = strip_leading_slashes(rel)
+            if !safe_rel(rel) { return false }
+            if rel.n == 0 || *(rel.p + rel.n - 1) == 47 as u8 { rel = rel + "index.html" }
+            if serve_file(c, fs.path_join((*m).dir, rel)) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}

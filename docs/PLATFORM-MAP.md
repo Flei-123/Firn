@@ -23,6 +23,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `net/http.fi` | blocking HTTP(S) client, redirects, gzip/br/zstd bodies
 - `http/server.fi` | HTTP/1.1 server + WebSocket + SSE + TLS 1.3 | `http.app(port)`, `http.reply(r, 200, "text/plain", "hi")`
 - `net/h2.fi`, `net/hpack.fi`, `net/h2frame.fi` | HTTP/2 client (multiplexing, flow control, ALPN h2; docs/HTTP2.md) | `h2.h2_request(&c, "GET", "https", host, "/", "", 0, 0)`
+- `webfw/wf_web.fi` + `wf_*.fi` | web framework on http/server: router, middleware, JSON/query/form/cookies, sessions, static (ETag/Range), gzip/zstd, CORS, rate limit, auth, templates | docs/WEBFRAMEWORK.md, `examples/webfw/app.fi`, `wf_web.get(&w, "/u/:id", h)`
 - `ws/ws.fi` | WebSocket codec + client (ws://, wss://)
 - `tls/tls.fi` (client 1.3/1.2), `tls/tls_server.fi`, `tls/x509.fi`, `tls/trust.fi` | TLS, certs, system roots
 - `net/dns.fi`, `net/dnsd.fi`, `net/addrinfo.fi`, `net/tcp.fi`, `net/udp.fi`, `net/idn.fi`, `net/ip6.fi` | DNS, sockets

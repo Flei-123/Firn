@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.vec
+import std.dict
+import std.net
+import http.server as http
+import webfw.wf_types
+import webfw.wf_ctx
+import webfw.wf_router
+import webfw.wf_static
+import webfw.wf_text
+
+export {
+    web_new, web_app, listen, serve, serve_background, serve_main, stop_wait, port, url,
+    add, get, post, put, patch, del, any,
+    group, sub, group_use, group_add, g_get, g_post, g_put, g_patch, g_del, g_any,
+    use_before, use_after, set_not_found, mount_static, set_quiet, set_limits, stop_now,
+}
+
+fn default_not_found(c: *mut wf_types.Ctx) {
+    wf_ctx.status_error(c, 404, "not found")
+}
+
+fn no_auth(c: *mut wf_types.Ctx) -> bool { return true }
+
+fn web_new(port: u16) -> wf_types.Web {
+    return wf_types.Web { app: http.app(port), routes: vec_new[wf_types.Route](),
+        before: vec_new[wf_types.Mw](), after: vec_new[wf_types.After](),
+        statics: vec_new[wf_types.StaticMount](), not_found: default_not_found,
+        cors_origin: "", cors_methods: "", cors_headers: "", cors_max_age: 0 as u32,
+        rate_max: 0 as u32, rate_window_ms: 0, rate_count: dict_new[i64](), rate_start: dict_new[i64](),
+        auth_hook: no_auth, auth_realm: "app", session_secret: "", session_ttl_ms: 0,
+        session_ids: dict_new[i64](), session_vals: dict_new[str](),
+        compress_min: 0, compress_level: 0 as u32 }
+}
+
+fn web_app(w: *mut wf_types.Web) -> *mut http.App { return &(*w).app }
+
+fn run_before(c: *mut wf_types.Ctx) -> bool {
+    let w: *mut wf_types.Web = (*c).web
+    var i: usize = 0
+    while i < vec_len[wf_types.Mw](&(*w).before) {
+        let f: fn(*mut wf_types.Ctx) -> bool = (*vec_elem_ptr[wf_types.Mw](&(*w).before, i)).f
+        if !f(c) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_mws(c: *mut wf_types.Ctx, mws: *mut Vec[wf_types.Mw]) -> bool {
+    var i: usize = 0
+    while i < vec_len[wf_types.Mw](mws) {
+        let f: fn(*mut wf_types.Ctx) -> bool = (*vec_elem_ptr[wf_types.Mw](mws, i)).f
+        if !f(c) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn reject(c: *mut wf_types.Ctx, allow: *mut rt.Buf) {
+    if (*allow).len == 0 {
+        let nf: fn(*mut wf_types.Ctx) = (*(*c).web).not_found
+        nf(c)
+        return
+    }
+    wf_ctx.set_header(c, "Allow", rt.buf_str(allow))
+    if wf_ctx.method(c) == "OPTIONS" {
+        wf_ctx.send_bytes(c, 204, "", "".p as u64, 0)
+    } else {
+        wf_ctx.status_error(c, 405, "method not allowed")
+    }
+}
+
+fn route_request(c: *mut wf_types.Ctx) {
+    let w: *mut wf_types.Web = (*c).web
+    var allow: rt.Buf = rt.buf_new()
+    let ri: usize = wf_router.find_route(w, wf_ctx.method(c), wf_ctx.path(c), &(*c).pkeys, &(*c).pvals, &allow)
+    if ri != wf_types.NO_ROUTE {
+        let r: *mut wf_types.Route = vec_elem_ptr[wf_types.Route](&(*w).routes, ri)
+        if run_mws(c, &(*r).mws) {
+            let h: fn(*mut wf_types.Ctx) = (*r).handler
+            h(c)
+        }
+    } else if !wf_static.try_serve(c) {
+        reject(c, &allow)
+    }
+    rt.buf_free(&allow)
+}
+
+fn finish(c: *mut wf_types.Ctx) {
+    let w: *mut wf_types.Web = (*c).web
+    var i: usize = 0
+    while i < vec_len[wf_types.After](&(*w).after) {
+        let f: fn(*mut wf_types.Ctx) = (*vec_elem_ptr[wf_types.After](&(*w).after, i)).f
+        f(c)
+        i = i + 1
+    }
+    http.reply_ex((*c).req, (*c).status, (*c).ctype, wf_ctx.header_block(c), rt.buf_str(&(*c).body))
+}
+
+fn entry(r: *mut http.Req) {
+    let w: *mut wf_types.Web = http.userdata(r) as *mut wf_types.Web
+    var c: wf_types.Ctx = wf_ctx.ctx_new(r, w)
+    if run_before(&c) { route_request(&c) }
+    finish(&c)
+    wf_ctx.ctx_free(&c)
+}
+
+fn attach(w: *mut wf_types.Web) {
+    http.set_userdata(&(*w).app, w as u64)
+    http.route_fallback(&(*w).app, entry)
+}
+
+fn listen(w: *mut wf_types.Web) -> bool {
+    attach(w)
+    return http.listen(&(*w).app)
+}
+
+fn serve(w: *mut wf_types.Web) -> i32 {
+    attach(w)
+    return http.serve(&(*w).app)
+}
+
+fn serve_background(w: *mut wf_types.Web) -> u64 {
+    attach(w)
+    return http.serve_background(&(*w).app)
+}
+
+fn serve_main(arg: u64) -> u64 { return http.serve_main(arg) }
+fn stop_wait(w: *mut wf_types.Web, th: u64) { http.stop_wait(&(*w).app, th) }
+fn port(w: *mut wf_types.Web) -> u16 { return http.port(&(*w).app) }
+fn url(w: *mut wf_types.Web) -> str { return http.url(&(*w).app) }
+
+fn add(w: *mut wf_types.Web, method: str, pattern: str, h: fn(*mut wf_types.Ctx)) {
+    var none: Vec[wf_types.Mw] = vec_new[wf_types.Mw]()
+    wf_router.add_route(w, method, pattern, h, &none)
+    vec_free[wf_types.Mw](&none)
+}
+
+fn get(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "GET", p, h) }
+fn post(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "POST", p, h) }
+fn put(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "PUT", p, h) }
+fn patch(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "PATCH", p, h) }
+fn del(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "DELETE", p, h) }
+fn any(w: *mut wf_types.Web, p: str, h: fn(*mut wf_types.Ctx)) { add(w, "", p, h) }
+
+fn group(w: *mut wf_types.Web, prefix: str) -> wf_types.Group {
+    return wf_types.Group { web: w, prefix: prefix, mws: vec_new[wf_types.Mw]() }
+}
+
+fn sub(g: *mut wf_types.Group, prefix: str) -> wf_types.Group {
+    var n: wf_types.Group = group((*g).web, (*g).prefix + prefix)
+    var i: usize = 0
+    while i < vec_len[wf_types.Mw](&(*g).mws) {
+        vec_push[wf_types.Mw](&n.mws, *vec_elem_ptr[wf_types.Mw](&(*g).mws, i))
+        i = i + 1
+    }
+    return n
+}
+
+fn group_use(g: *mut wf_types.Group, f: fn(*mut wf_types.Ctx) -> bool) {
+    vec_push[wf_types.Mw](&(*g).mws, wf_types.Mw { f: f })
+}
+
+fn group_add(g: *mut wf_types.Group, method: str, p: str, h: fn(*mut wf_types.Ctx)) {
+    wf_router.add_route((*g).web, method, wf_router.join_path((*g).prefix, p), h, &(*g).mws)
+}
+
+fn g_get(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "GET", p, h) }
+fn g_post(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "POST", p, h) }
+fn g_put(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "PUT", p, h) }
+fn g_patch(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "PATCH", p, h) }
+fn g_del(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "DELETE", p, h) }
+fn g_any(g: *mut wf_types.Group, p: str, h: fn(*mut wf_types.Ctx)) { group_add(g, "", p, h) }
+
+fn use_before(w: *mut wf_types.Web, f: fn(*mut wf_types.Ctx) -> bool) {
+    vec_push[wf_types.Mw](&(*w).before, wf_types.Mw { f: f })
+}
+
+fn use_after(w: *mut wf_types.Web, f: fn(*mut wf_types.Ctx)) {
+    vec_push[wf_types.After](&(*w).after, wf_types.After { f: f })
+}
+
+fn set_not_found(w: *mut wf_types.Web, h: fn(*mut wf_types.Ctx)) { (*w).not_found = h }
+
+fn mount_static(w: *mut wf_types.Web, prefix: str, dir: str) {
+    vec_push[wf_types.StaticMount](&(*w).statics, wf_types.StaticMount { prefix: wf_text.trim_slash(prefix), dir: dir })
+}
+
+fn set_quiet(w: *mut wf_types.Web, q: bool) { http.set_quiet(&(*w).app, q) }
+
+fn set_limits(w: *mut wf_types.Web, max_body: usize, max_conn: usize) {
+    http.set_limits(&(*w).app, max_body, max_body, max_conn)
+}
+
+fn stop_now(c: *mut wf_types.Ctx) { http.stop(&(*(*c).web).app) }
