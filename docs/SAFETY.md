@@ -1,6 +1,6 @@
 # Firn memory safety -- what is guaranteed and what is not
 
-State: 12.11.2026, `firnc` at main `abe6d3aef` (guarantees G1-G24 unchanged, effort review of the open N items below). Every claim below points to a test.
+State: 12.11.2026, `firnc` at main `abe6d3aef` + safety2 (G15 covers threads, G25 new; N3/N5/N6/N8/N9/N13 narrowed). Every claim below points to a test.
 Green tests: `tests/47xx_safety_*.fi`, `tests/neg/47xx_safety_*.fi` (4730-4747, 4862-4866: r904/r905/r907, null guard 4733/4736-4739, constant zero divisor neg 4740/4741/4744, positive 4745, constant overflow neg 4746). Counts: 25 guarantees, 14 non-guarantee rows (12 open, none fully closed: N3, N5, N6, N8, N9, N13 narrowed), 38 green safety tests, 27 UB probes.
 Documented undefined behaviour (not green tests): `tools/safety/ub/*.fi`, recorded per build level in
 `tools/safety/expected.txt`, checked with `bash tools/safety/run.sh` (exit 1 on any difference). `test.sh` section 149 runs it (plus `tools/safety/pe.sh`), so a change of behaviour shows up in the suite.
