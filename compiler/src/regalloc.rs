@@ -332,6 +332,8 @@ const POOL: [&str; 12] = [
     "rbx", "r12", "r13", "r14", "r15", "r11", "r10", "r9", "r8", "rsi", "rdi", "rdx",
 ];
 
+const INDIRECT_CALL_HOMES: [&str; 7] = ["rbx", "r12", "r13", "r14", "r15", "r10", "r11"];
+
 /// A set of [`POOL`] registers.
 type RegMask = u16;
 
@@ -8141,8 +8143,13 @@ fn emit_inst(
             }
             // the target LAST, into `rax`: never the home of a value and no
             // argument register
-            ra.load_full(e, "rax", *target);
-            e.line("call rax");
+            let target_home = ra.opnd(*target);
+            if INDIRECT_CALL_HOMES.contains(&target_home.as_str()) {
+                e.line(&format!("call {}", target_home));
+            } else {
+                ra.load_full(e, "rax", *target);
+                e.line("call rax");
+            }
             if space > 0 {
                 e.line(&format!("add rsp, {}", space));
             }
