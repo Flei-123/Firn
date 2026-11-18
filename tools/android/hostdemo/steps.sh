@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MPL-2.0
 step_net() {
     echo "== fetch and SSE (server on 10.0.2.2:$PORT) =="
+    check "the emulator network reaches the test server" wait_network
+    echo "   (network ready after ${NET_WAITED}s)"
     $ADB logcat -c
     send origin "http://10.0.2.2:$PORT"
     send fetch /json
@@ -35,8 +37,7 @@ step_state() {
 step_typing() {
     echo "== typing: adb input text and imeinject =="
     $ADB logcat -c
-    send kbd on
-    check "keyboard: the system input method is shown" "wait_ime 1"
+    check "keyboard: the system input method is shown" show_keyboard
     $ADB shell input text hello
     sleep 2
     check "adb shell input text arrives as text events (\"hello\")" '[ "$(typed)" = hello ]'
@@ -122,11 +123,11 @@ step_back_route() {
     expect "location returns the current route" 'hostdemo where path="/a"'
     $ADB shell input keyevent KEYCODE_BACK
     expect "Back pops to the start route" 'hostdemo route path="/"'
-    send kbd on
-    wait_ime 1
+    $ADB logcat -c
+    show_keyboard
     send insets
     check "insets returns true with four numbers" '[ "$LAST_OK" = 1 ] && [ -n "$(inset_bottom)" ]'
-    check "the keyboard changes the layout (bottom inset or window resize)" '[ "$(inset_bottom)" -gt 0 ] 2>/dev/null || [ "$(resizes)" -ge 2 ]'
+    check "the keyboard changes the layout (bottom inset or window resize)" keyboard_changes_layout
     send kbd off
     wait_ime 0
     sleep 1
