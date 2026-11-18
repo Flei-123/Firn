@@ -50,17 +50,18 @@ Two interfaces carry everything an app needs from its platform. Browser twin = `
 | `store_get/set` | done: file in the app directory (`services.svcosstore`) |
 | `tz_offset`, `dark`, `wake_in` | done (JNI `TimeZone`, theme event, timer) |
 | `clip_write/read` | done (`plat.android.share`, text only, 64 KB) |
-| `navigate` | external URLs only (`fileio.fio_open_url`); in-app routes (`#/...`) not handled |
-| `location` | STUB (returns 0): needs an in-app route string plus the back key |
-| `keyboard`, `edit_mode`, `edit_wrap`, `edit_set` | STUB. The pieces exist: `window.text_input/text_sync` + `fui.textbuf` + `lib/android/inputmethod.fi` (InputConnection as in-memory dex). Missing: `lib/plat/android/hostedit.fi` that maps one `TextBuf` to `WE_EDIT` (text, caret, anchor, composing range) and to `WE_TEXT`/Backspace when only `keyboard()` is on |
+| `navigate`, `location` | in-app routes (`/...`, `#...`): route stack in `plat/android/hostroute.fi`, start route = intent extra `route` (default `/`), every change arrives as `WE_ROUTE` (p/n = route); external URLs open through `fileio.fio_open_url`. Compiled, not run on a device |
+| `keyboard`, `edit_mode`, `edit_wrap`, `edit_set` | `plat/android/hostedit.fi`: one `TextBuf` behind `window.text_input/text_sync`. Edit mode on: every change arrives as `WE_EDIT` (whole text, caret, anchor, composing range), Enter as `WE_KEY`. Edit mode off: the text diff arrives as `WE_TEXT` / `WE_KEY Backspace`. `edit_wrap` is a no-op. Compiled, not run on a device |
 | `font_extra` | STUB (0): emoji font as APK asset |
 | `tz_reset` | no-op (correct on Android) |
 
 `plat.hostwin` (`lib/plat/hostwin.fi`, Android: `lib/@android/plat/hostwin.fi`): window, frame loop (on demand), touch, keys (web names), text, wheel, resize, theme change: done (demo app `tools/android/hostwin_demo.fi` builds for both ABIs and starts). `cursor`, `damage`, `use_gpu`, `gpu_enable`, `font_apply` are no-ops (software present, faces through `fui.face`).
 
-Existing Firn Android libs that are NOT behind `plat.host` yet (needed by Orbit, today `firnchat_*` externs): file pick/save (`plat/android/pickfile.fi`), photo pick (`pick.fi`), share and open (`share.fi`), notification and badge (`push.fi`, `window.notify`), back key (`plat/backkey.fi`), insets (`kbd.fi`, `window.android_set_insets`). Each becomes one call in `plat.host` with a stub, a web twin and an Android twin.
+Added to `plat.host` (generic stub, web twin, Android twin; Android modules in `lib/plat/android/`): `notify(key, title, text)` (`hostshare`, needs the POST_NOTIFICATIONS grant and `--push`), `pick(kind)` (`hostpick`, kind 0 photo, 1 any file; answer as `WE_DIALOG` exactly like the browser: q = name, p/n = content, status 1, then status 2; status 0 = cancelled; build with `--pick`), `save(name, mime, p, n)` and `share(title, text)` (`hostshare`, MediaStore Downloads / ACTION_SEND), `back_hold(on)` (`hostroute`: `WE_BACK` when held, otherwise the route stack pops with `WE_ROUTE`, otherwise the system leaves), `insets(out)` (`hostinsets`, 4 f64 CSS px: left, top, right, bottom incl. keyboard), `origin(url)` (base for relative `fetch`/`stream_open`). Web twin: `notify`, `pick`, `save` through `webdialog`/`webdownload`; `share`, `back_hold`, `insets`, `origin` are stubs.
 
-Not tested on a device or emulator (only compiled): fetch/stream against a server, store across restarts, clipboard, every `edit_*` call. Tested on the emulator: window + frame loop through the fUi path (section 1) and the `firn new` app (`dist/android` apk: greeting from the asset, counter, Count button).
+`hostwin` (Android) is split into `winstate`, `winsurface`, `winpointer`, `wininput`, `winframe`; `hostbus` has the shared window pointer, scale and the turn hooks (`bus_on_turn`) that `hostedit`, `hostroute` and `hostpick` use once per loop turn.
+
+Compiled for Android x86_64, wasm32-browser and native (hostwin_demo). NOT run yet: every call above on the emulator, fetch/stream against a server, store across restarts, clipboard, IME on a real device, push in the background.
 
 Next in this order: (1) `hostedit.fi` + route string for `location/navigate`, with a login-free emulator demo that logs `store`, `fetch` (local server on 10.0.2.2), `clip`, typed text (`adb shell input text`); (2) `notify/pick/save/share/back` calls; (3) emoji and Inter as assets for `hostwin`.
 

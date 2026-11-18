@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import fui.textbuf
+import window.window
+import android.inputmethod
+import plat.hostev
+import plat.android.hostbus
+
+export { keyboard, edit_mode, edit_wrap, edit_set }
+
+const TEXT_CAP: usize = 16384
+const KEEP_CAP: usize = 4096
+const MARKER: u8 = 32
+const CONTINUATION_MASK: u8 = 192
+const CONTINUATION_BITS: u8 = 128
+const KEY_BACKSPACE: str = "Backspace"
+const KEY_ENTER: str = "Enter"
+const MARKER_TEXT: str = " "
+
+static mut G_FIELD: u64 = 0
+static mut G_SNAP: u64 = 0
+static mut G_SNAP_N: usize = 0
+static mut G_SHOWN: bool = false
+static mut G_EDIT: bool = false
+
+fn field_bytes() -> usize {
+    var probe: [textbuf.TextBuf; 2] = [textbuf.tb_new(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn field() -> *mut textbuf.TextBuf {
+    if G_FIELD == 0 {
+        let p: u64 = rt.heap_alloc(field_bytes())
+        let text: u64 = rt.heap_alloc(TEXT_CAP)
+        let snap: u64 = rt.heap_alloc(TEXT_CAP)
+        if p == 0 || text == 0 || snap == 0 { return 0 as *mut textbuf.TextBuf }
+        *(p as *mut textbuf.TextBuf) = textbuf.tb_new()
+        textbuf.tb_init(p as *mut textbuf.TextBuf, text, TEXT_CAP)
+        G_FIELD = p
+        G_SNAP = snap
+    }
+    return G_FIELD as *mut textbuf.TextBuf
+}
+
+fn remember(t: *mut textbuf.TextBuf) {
+    G_SNAP_N = textbuf.tb_len(t)
+    rt.mem_copy(G_SNAP, textbuf.tb_ptr(t), G_SNAP_N)
+}
+
+fn restart_input() {
+    if G_SHOWN { inputmethod.ime_restart() }
+}
+
+fn reset_content(t: *mut textbuf.TextBuf) {
+    if G_EDIT {
+        textbuf.tb_set_text(t, 0 as u64, 0)
+    } else {
+        textbuf.tb_set_text(t, MARKER_TEXT.p as u64, MARKER_TEXT.n)
+    }
+    remember(t)
+    restart_input()
+}
+
+fn emit_key(name: str) {
+    var e: hostev.HostEvent = hostev.blank(hostev.WE_KEY)
+    e.p = name.p as u64
+    e.n = name.n
+    e.status = 1 as u32
+    let used: bool = hostbus.bus_emit(&e)
+}
+
+fn emit_text(p: u64, n: usize) {
+    var e: hostev.HostEvent = hostev.blank(hostev.WE_TEXT)
+    e.p = p
+    e.n = n
+    let used: bool = hostbus.bus_emit(&e)
+}
+
+fn emit_edit(t: *mut textbuf.TextBuf) {
+    var e: hostev.HostEvent = hostev.blank(hostev.WE_EDIT)
+    e.p = textbuf.tb_ptr(t)
+    e.n = textbuf.tb_len(t)
+    e.cur = textbuf.tb_caret(t)
+    e.anc = textbuf.tb_anchor(t)
+    e.ca = textbuf.tb_comp_a(t)
+    e.cb = textbuf.tb_comp_b(t)
+    let used: bool = hostbus.bus_emit(&e)
+}
+
+fn is_continuation(b: u8) -> bool {
+    return (b & CONTINUATION_MASK) == CONTINUATION_BITS
+}
+
+fn common_prefix(t: *mut textbuf.TextBuf) -> usize {
+    let n: usize = textbuf.tb_len(t)
+    let p: u64 = textbuf.tb_ptr(t)
+    var k: usize = 0
+    while k < n && k < G_SNAP_N && rt.ld8(p, k) == rt.ld8(G_SNAP, k) { k = k + 1 }
+    while k > 0 && ((k < n && is_continuation(rt.ld8(p, k))) || (k < G_SNAP_N && is_continuation(rt.ld8(G_SNAP, k)))) {
+        k = k - 1
+    }
+    return k
+}
+
+fn snapshot_chars_from(k: usize) -> usize {
+    var count: usize = 0
+    var i: usize = k
+    while i < G_SNAP_N {
+        if !is_continuation(rt.ld8(G_SNAP, i)) { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+fn flush_keys(t: *mut textbuf.TextBuf) {
+    let k: usize = common_prefix(t)
+    var deletes: usize = snapshot_chars_from(k)
+    while deletes > 0 {
+        emit_key(KEY_BACKSPACE)
+        deletes = deletes - 1
+    }
+    let n: usize = textbuf.tb_len(t)
+    if n > k { emit_text(textbuf.tb_ptr(t) + (k as u64), n - k) }
+    let kept: bool = n > 0 && n <= KEEP_CAP && rt.ld8(textbuf.tb_ptr(t), 0) == MARKER
+    if kept {
+        remember(t)
+    } else {
+        reset_content(t)
+    }
+}
+
+fn edit_turn() {
+    if !G_SHOWN { return }
+    let t: *mut textbuf.TextBuf = field()
+    let w: *mut window.Window = hostbus.bus_window()
+    if t as u64 == 0 || w as u64 == 0 { return }
+    let got: u32 = window.text_sync(w, t as u64)
+    if (got & window.TI_CHANGED) != 0 as u32 {
+        if G_EDIT { emit_edit(t) } else { flush_keys(t) }
+    }
+    if (got & window.TI_ENTER) != 0 as u32 { emit_key(KEY_ENTER) }
+}
+
+fn same_text(t: *mut textbuf.TextBuf, p: u64, n: usize) -> bool {
+    return textbuf.tb_len(t) == n && rt.mem_eq(textbuf.tb_ptr(t), p, n)
+}
+
+fn keyboard(show: bool, x: f64, y: f64, fw: f64, fh: f64) {
+    let t: *mut textbuf.TextBuf = field()
+    let w: *mut window.Window = hostbus.bus_window()
+    if t as u64 == 0 || w as u64 == 0 { return }
+    if !show {
+        if !G_SHOWN { return }
+        G_SHOWN = false
+        let down: bool = window.text_input(w, false, false, 0 as u64)
+        return
+    }
+    let hooked: bool = hostbus.bus_on_turn(edit_turn)
+    if G_SHOWN { return }
+    if !G_EDIT { reset_content(t) }
+    G_SHOWN = true
+    let up: bool = window.text_input(w, true, false, t as u64)
+}
+
+fn edit_mode(on: bool, font: f64, line: f64, left: f64, top: f64, right: f64) {
+    if G_EDIT == on { return }
+    G_EDIT = on
+    let t: *mut textbuf.TextBuf = field()
+    if t as u64 != 0 { reset_content(t) }
+}
+
+fn edit_wrap(wrap: bool) {}
+
+fn edit_set(p: u64, n: usize, cur: usize, anc: usize, scroll: f64) {
+    let t: *mut textbuf.TextBuf = field()
+    if t as u64 == 0 { return }
+    if same_text(t, p, n) {
+        if textbuf.tb_caret(t) != cur || textbuf.tb_anchor(t) != anc { textbuf.tb_set_range(t, cur, anc) }
+        return
+    }
+    textbuf.tb_set_text(t, p, n)
+    textbuf.tb_set_range(t, cur, anc)
+    restart_input()
+}
