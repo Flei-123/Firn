@@ -30,7 +30,7 @@ cd "$W"
 check "registry has four releases" bash -c "[ \$(grep -c '^geo ' $W/registry.index) -eq 4 ]"
 check "index sorted, one line per release" bash -c "awk 'NF == 5' $W/registry.index | wc -l | grep -qx 4"
 check "search lists the package" bash -c "$FI search ge | grep -q '^geo .*2.0.0 (4 versions)'"
-"$FI" new app > /dev/null
+"$FI" new app --console > /dev/null
 cd app
 check "add geo@^1.2 picks 1.3.0" bash -c "$FI add geo@^1.2 | grep -q 'needs geo 1.3.0'"
 check "needs line carries the version" bash -c "grep -q 'needs *geo .firn/deps/geo 1.3.0' firn.package"

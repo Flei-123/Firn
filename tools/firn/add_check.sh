@@ -17,7 +17,7 @@ ensure_identity() { git config user.name > /dev/null || git config user.name fir
 commit_repo() { ( cd "$1" && git init -q -b main && ensure_identity && git add -A && git commit -q -m "$2" && git tag "$3" ) > /dev/null; }
 
 cd "$T"
-"$FIRN" new app > /dev/null && "$FIRN" new --lib geo > /dev/null && "$FIRN" new --lib txt > /dev/null && "$FIRN" new --lib util > /dev/null || { echo "FAIL new"; exit 1; }
+"$FIRN" new app --console > /dev/null && "$FIRN" new --lib geo > /dev/null && "$FIRN" new --lib txt > /dev/null && "$FIRN" new --lib util > /dev/null || { echo "FAIL new"; exit 1; }
 commit_repo txt init v1
 ( cd txt && printf 'fn add(a: i32, b: i32) -> i32 {\n    return a + b + 100\n}\n' > src/txt.fi && git commit -qam second && git tag v2 ) > /dev/null
 ( cd util && "$FIRN" add txt "file://$T/txt" v1 > /dev/null && printf 'import txt\n\nfn twice(a: i32) -> i32 {\n    return txt.add(a, a)\n}\n' > src/util.fi ) && commit_repo util init v1
@@ -63,7 +63,7 @@ ck "remove of an unknown name fails" '! "$FIRN" remove txt >/dev/null 2>&1'
 ck "build works after remove" '"$FIRN" build . -o ./appbin4 >/dev/null 2>&1 && [ "$(./appbin4)" = "5 8" ]'
 
 mk_user() { ( cd "$T" && "$FIRN" new --lib "$1" > /dev/null && cd "$1" && "$FIRN" add txt "file://$T/txt" "$2" > /dev/null && printf 'import txt\n\nfn f(a: i32) -> i32 {\n    return txt.add(a, a)\n}\n' > "src/$1.fi" ) && commit_repo "$T/$1" init v1; }
-mk_consumer() { ( cd "$T" && "$FIRN" new "$1" > /dev/null && cd "$1" && shift && for u in "$@"; do "$FIRN" add "$u" "file://$T/$u" v1 > /dev/null 2>&1 || true; done && printf 'import std.io\nimport %s\nimport %s\n\nfn main() -> i32 {\n    io.fmt_print_line(f"{%s.f(3)} {%s.f(4)}")\n    return 0\n}\n' "$1" "$2" "$1" "$2" > src/main.fi ); }
+mk_consumer() { ( cd "$T" && "$FIRN" new "$1" --console > /dev/null && cd "$1" && shift && for u in "$@"; do "$FIRN" add "$u" "file://$T/$u" v1 > /dev/null 2>&1 || true; done && printf 'import std.io\nimport %s\nimport %s\n\nfn main() -> i32 {\n    io.fmt_print_line(f"{%s.f(3)} {%s.f(4)}")\n    return 0\n}\n' "$1" "$2" "$1" "$2" > src/main.fi ); }
 
 cd "$T"
 mk_user ua v1; mk_user ub v1

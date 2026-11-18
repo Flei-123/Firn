@@ -27,7 +27,7 @@ build_parse_args() {
 build_select_targets() {
     local t
     if [ -n "$TARGETS" ]; then
-        APP_TARGETS=${TARGETS//,/ }
+        APP_TARGETS=$(fui_canonical_targets "${TARGETS//,/ }")
         for t in $APP_TARGETS; do
             fui_is_target "$t" || fui_die 2 "unknown target '$t' (known: $(fui_registered_targets | tr '\n' ' '))"
         done

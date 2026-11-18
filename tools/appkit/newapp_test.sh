@@ -10,6 +10,7 @@
 #      verifies it -- and the catalog it made names bin:probe-app with the right version
 #   4b. build-android.sh: the APK with both ABIs and the receiver class (when the Android build tools are there)
 #   5. the same for a project generated with another id/vendor (substitutions are not hard coded)
+#   6. `firn new` + `firn build --target linux|web|windows|android`: one source, every target (tools/firn/firn)
 #
 # Needs fui.kit (lib/fui/kit.fi) and an X server (Xvfb) for step 3; without them
 # the steps that cannot run are SKIPped and the rest still runs.
@@ -107,6 +108,50 @@ echo "== 5. another project, same generator"
 out=$(bash tools/newapp.sh "Second" second-app --dir "$W/p2" --store-key $KEY --version 0.2.0-beta.1 2>&1) && ok "newapp.sh with --version" || bad "second project" "$out"
 [ "$(tr -d ' \n' < "$W/p2/VERSION")" = "0.2.0-beta.1" ] && ok "VERSION is the one given" || bad "VERSION"
 
+
+echo "== 6. one source, every target (firn new, firn build --target)"
+FIRN=$ROOT/tools/firn/firn
+export FIRN_CACHE=$W/firn-cache FIRNC FIRNLIB=${FIRNLIB:-$ROOT/lib}
+mkdir -p "$W/p6"
+if (cd "$W/p6" && "$FIRN" new oneapp >"$W/new6.log" 2>&1); then ok "firn new makes an app"; else bad "firn new" "$(tail -3 "$W/new6.log")"; fi
+for f in firn.package fui.app main.fi data/greeting.json .gitignore; do
+    [ -f "$W/p6/oneapp/$f" ] && ok "app file $f" || bad "app file $f is missing"
+done
+out=$(cd "$W/p6" && "$FIRN" new oneapp 2>&1); [ $? -ne 0 ] && ok "firn new refuses an existing directory" || bad "firn new overwrote a project"
+(cd "$W/p6" && "$FIRN" new oneconsole --console >/dev/null 2>&1) && [ -f "$W/p6/oneconsole/src/main.fi" ] && ok "firn new --console keeps the print program" || bad "firn new --console"
+out=$(cd "$W/p6/oneapp" && "$FIRN" build --target nowhere 2>&1); [ $? -ne 0 ] && ok "an unknown target is refused" || bad "unknown target accepted"
+
+(cd "$W/p6/oneapp" && "$FIRN" build --target linux >"$W/t_linux.log" 2>&1) && ok "firn build --target linux" || bad "target linux" "$(tail -3 "$W/t_linux.log")"
+if [ -x "$W/p6/oneapp/dist/native/oneapp" ]; then
+    out=$(cd "$W/p6/oneapp" && FUI_DATA_DIR=dist/native/data dist/native/oneapp --theme light --size 480x320 --shot "$W/linux.png" 2>&1)
+    [ -s "$W/linux.png" ] && ok "the linux binary starts and paints (--shot)" || bad "linux --shot" "$out"
+fi
+
+(cd "$W/p6/oneapp" && "$FIRN" build --target web >"$W/t_web.log" 2>&1) && ok "firn build --target web" || bad "target web" "$(tail -3 "$W/t_web.log")"
+for f in index.html oneapp.wasm firn.js greeting.json; do
+    [ -s "$W/p6/oneapp/dist/web/$f" ] && ok "web/$f" || bad "web/$f is missing"
+done
+[ "$(head -c 4 "$W/p6/oneapp/dist/web/oneapp.wasm" | od -An -c | tr -d ' ')" = '\0asm' ] && ok "oneapp.wasm is a WebAssembly module" || bad "oneapp.wasm has no wasm header"
+
+if command -v x86_64-w64-mingw32-ld >/dev/null 2>&1; then
+    (cd "$W/p6/oneapp" && "$FIRN" build --target windows >"$W/t_win.log" 2>&1) && ok "firn build --target windows" || bad "target windows" "$(tail -3 "$W/t_win.log")"
+    [ "$(head -c 2 "$W/p6/oneapp/dist/windows/oneapp.exe" 2>/dev/null)" = MZ ] && ok "oneapp.exe is a PE image" || bad "oneapp.exe has no MZ header"
+    [ -s "$W/p6/oneapp/dist/windows/data/greeting.json" ] && ok "the data folder travels next to the exe" || bad "windows data missing"
+else
+    echo "  --    no mingw ld: the windows target is not built"
+fi
+
+if [ -d "${NDK:-/root/android-ndk-min}" ] && [ -n "$AAPT2" ] && command -v keytool >/dev/null 2>&1; then
+    (cd "$W/p6/oneapp" && KEYSTORE=$W/test.jks "$FIRN" build --target android --abi x86_64 >"$W/t_and.log" 2>&1) && ok "firn build --target android" || bad "target android" "$(tail -3 "$W/t_and.log")"
+    APK6=$W/p6/oneapp/dist/android/oneapp-x86_64.apk
+    if [ -s "$APK6" ]; then
+        "$AAPT2" dump badging "$APK6" 2>/dev/null | grep -q "package: name='com.fleitec.fui.oneapp'" && ok "the apk carries the app id" || bad "apk package name"
+        unzip -l "$APK6" 2>/dev/null | grep -q 'lib/x86_64/libfirnapp.so' && ok "the apk has the native library" || bad "apk native library"
+        unzip -l "$APK6" 2>/dev/null | grep -q 'assets/greeting.json' && ok "the data file is an apk asset" || bad "apk asset"
+    fi
+else
+    echo "  --    no Android NDK / SDK build tools / keytool: the android target is not built"
+fi
 echo
 echo "newapp: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

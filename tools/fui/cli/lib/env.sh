@@ -25,3 +25,13 @@ fui_registered_targets() {
 fui_is_target() {
     [ -f "$FUI_CLI/targets/$1.sh" ]
 }
+
+fui_canonical_targets() {
+    local t
+    for t in $1; do
+        case "$t" in
+            linux) t=native ;;
+        esac
+        echo "$t"
+    done | awk '!seen[$0]++' | paste -sd' '
+}

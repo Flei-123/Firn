@@ -17,9 +17,12 @@ echo "== firn driver =="
 t "help lists sub-commands"        bash -c "$FI help | grep -q 'firn repl'"
 t "doctor names compiler and lib"  bash -c "$FI doctor | grep -q '^lib'"
 cd "$W"
-t "new makes a program"            "$FI" new demo
-t "new refuses an existing dir"    bash -c "! $FI new demo"
+t "new --console makes a program"  "$FI" new demo --console
+t "new refuses an existing dir"    bash -c "! $FI new demo --console"
 t "new --lib"                      "$FI" new tool --lib
+t "new makes an app"               bash -c "$FI new gui && test -f gui/fui.app && test -f gui/main.fi"
+t "build --target rejects unknown" bash -c "cd gui && ! $FI build --target nowhere 2> err.txt && grep -q 'unknown target' err.txt"
+t "targets lists the targets"      bash -c "$FI targets | grep -q '^web'"
 ( cd demo
   t "build DIR (--package)"        "$FI" build . 
   t "built program runs"           bash -c "./demo | grep -q 'hello from demo'"

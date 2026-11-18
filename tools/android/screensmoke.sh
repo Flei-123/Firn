@@ -7,6 +7,7 @@
 # Needs the AVD template a31e (as examples/bench_android/smoke.sh). Prints SMOKE <package> PASS|FAIL.
 set -uo pipefail
 APK=${1:?apk}; PKG=${2:?package}; SHOTS=${3:?outdir}
+. "$(dirname "$0")/dismiss_anr.sh"
 SDK=/root/android-sdk
 AVD=${AVD:-screenf}
 EMU_PORT=${EMU_PORT:-5588}
@@ -39,6 +40,7 @@ $ADB install -r "$APK" >/dev/null || { echo "SMOKE $PKG FAIL install"; exit 1; }
 $ADB logcat -c
 $ADB shell am start -W -n "$PKG/android.app.NativeActivity" | grep -E "TotalTime|WaitTime" | tr '\n' ' '; echo
 sleep "${WAIT:-12}"
+dismiss_anr && sleep 3
 $ADB exec-out screencap -p >"$SHOTS/$PKG.png"
 $ADB logcat -d >"$SHOTS/$PKG.log"
 PID=$($ADB shell pidof "$PKG" | tr -d '\r')
