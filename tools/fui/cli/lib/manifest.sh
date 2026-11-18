@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MPL-2.0
 MANIFEST_OPT_LEVELS="dev dev-fast release-safe release-fast"
+MANIFEST_ENTRIES="app host"
+MANIFEST_HOST_FLAGS="--push --pick"
+MANIFEST_HOST_PERMISSIONS="android.permission.INTERNET"
 
 manifest_defaults() {
     APP_TITLE=$APP_PACKAGE
@@ -9,6 +12,9 @@ manifest_defaults() {
     APP_ANDROID_ID=com.fleitec.fui.$APP_PACKAGE
     APP_OPT=release-safe
     APP_LIMIT=0.5
+    APP_ENTRY=app
+    APP_ANDROID_FLAGS=""
+    APP_PERMISSIONS=""
 }
 
 manifest_read_package() {
@@ -31,6 +37,9 @@ manifest_set() {
         android_id) APP_ANDROID_ID=$value ;;
         opt) APP_OPT=$value ;;
         limit) APP_LIMIT=$value ;;
+        entry) APP_ENTRY=$value ;;
+        android_flags) APP_ANDROID_FLAGS=$value ;;
+        permissions) APP_PERMISSIONS=$value ;;
         *) fui_die 5 "$APP_DIR/fui.app: unknown key '$key'" ;;
     esac
 }
@@ -51,9 +60,16 @@ manifest_validate() {
     [[ "$APP_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || fui_die 5 "fui.app: size must look like 1100x700, got '$APP_SIZE'"
     [[ " $MANIFEST_OPT_LEVELS " == *" $APP_OPT "* ]] || fui_die 5 "fui.app: opt must be one of: $MANIFEST_OPT_LEVELS"
     [[ "$APP_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fui_die 5 "fui.app: limit must be a percentage like 0.5, got '$APP_LIMIT'"
+    [[ " $MANIFEST_ENTRIES " == *" $APP_ENTRY "* ]] || fui_die 5 "fui.app: entry must be one of: $MANIFEST_ENTRIES"
     for t in $APP_TARGETS; do
         fui_is_target "$t" || fui_die 5 "fui.app: unknown target '$t' (known: $(fui_registered_targets | tr '\n' ' '))"
     done
+}
+
+manifest_apply_entry() {
+    [ "$APP_ENTRY" = host ] || return 0
+    [ -n "$APP_ANDROID_FLAGS" ] || APP_ANDROID_FLAGS=$MANIFEST_HOST_FLAGS
+    [ -n "$APP_PERMISSIONS" ] || APP_PERMISSIONS=$MANIFEST_HOST_PERMISSIONS
 }
 
 manifest_load() {
@@ -62,6 +78,7 @@ manifest_load() {
     manifest_defaults
     manifest_read_app "$APP_DIR/fui.app"
     manifest_validate
+    manifest_apply_entry
     APP_DATA_DIR=$(realpath -m "$APP_DIR/$APP_DATA_REL")
     case "$APP_START" in
         /*) ;;

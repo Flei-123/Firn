@@ -53,6 +53,14 @@ expect_exit 2 "build unknown option" $FUI build probe --bogus
 expect_exit 2 "build unknown target" $FUI build probe --targets bogus
 expect_exit 2 "verify needs native and web" $FUI build probe --targets native --verify
 expect_exit 4 "android without SDK" env NDK=/nonexistent $FUI build probe --targets android --out "$D/noandroid"
+cp -r probe hostprobe && printf 'entry host\n' >> hostprobe/fui.app
+for t in native windows; do
+    expect_exit 4 "entry host is refused for $t" $FUI build hostprobe --targets $t --out "$D/out-host-$t"
+    grep -q "needs the $t host backend (roadmap r622)" "$D/last.log" && echo "ok   entry host message for $t" || { echo "FAIL entry host message for $t"; fail=1; }
+done
+printf 'entry bogus\n' >> probe/fui.app
+expect_exit 5 "unknown entry" $FUI build probe --targets native --out "$D/out-bogus"
+sed -i '/^entry bogus$/d' probe/fui.app
 
 if ! command -v chromium >/dev/null 2>&1; then
     echo "chromium missing -- web verify skipped"

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MPL-2.0
 native_available() {
-    return 0
+    fui_reject_host_entry native
 }
 
 native_build() {

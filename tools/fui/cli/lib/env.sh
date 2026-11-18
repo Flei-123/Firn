@@ -35,3 +35,9 @@ fui_canonical_targets() {
         echo "$t"
     done | awk '!seen[$0]++' | paste -sd' '
 }
+
+fui_reject_host_entry() {
+    [ "${APP_ENTRY:-app}" = host ] || return 0
+    echo "target $1: 'entry host' needs the $1 host backend (roadmap r622), not available yet" >&2
+    return 1
+}

@@ -7,8 +7,10 @@ android_build() {
     local dir=$OUT/android
     local abi_args=()
     [ -z "$ANDROID_ABI" ] || abi_args=(--abi "$ANDROID_ABI")
+    local perm
+    for perm in $APP_PERMISSIONS; do abi_args+=(--permission "$perm"); done
     mkdir -p "$dir"
     FIRNC="$FIRNC" APP_MAIN="$APP_START" ASSETS_DIR="$APP_DATA_DIR" APP_ID="$APP_ANDROID_ID" APP_TITLE="$APP_TITLE" OUTDIR="$dir" \
-        bash "$FUI_ROOT/tools/android/screenapp.sh" "$APP_PACKAGE" ${abi_args[@]+"${abi_args[@]}"} || return 1
+        bash "$FUI_ROOT/tools/android/screenapp.sh" "$APP_PACKAGE" ${abi_args[@]+"${abi_args[@]}"} $APP_ANDROID_FLAGS || return 1
     fui_info "android: $dir"
 }

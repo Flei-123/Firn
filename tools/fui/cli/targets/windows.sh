@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MPL-2.0
 windows_available() {
+    fui_reject_host_entry windows || return 1
     command -v x86_64-w64-mingw32-ld >/dev/null || { echo "x86_64-w64-mingw32-ld not found (binutils-mingw-w64-x86-64)" >&2; return 1; }
 }
 

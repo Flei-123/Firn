@@ -61,9 +61,30 @@ Added to `plat.host` (generic stub, web twin, Android twin; Android modules in `
 
 `hostwin` (Android) is split into `winstate`, `winsurface`, `winpointer`, `wininput`, `winframe`; `hostbus` has the shared window pointer, scale and the turn hooks (`bus_on_turn`) that `hostedit`, `hostroute` and `hostpick` use once per loop turn.
 
-Compiled for Android x86_64, wasm32-browser and native (hostwin_demo). NOT run yet: every call above on the emulator, fetch/stream against a server, store across restarts, clipboard, IME on a real device, push in the background.
+### Verification state per call (18.11.2026)
 
-Next in this order: (1) `hostedit.fi` + route string for `location/navigate`, with a login-free emulator demo that logs `store`, `fetch` (local server on 10.0.2.2), `clip`, typed text (`adb shell input text`); (2) `notify/pick/save/share/back` calls; (3) emoji and Inter as assets for `hostwin`.
+Emulator checks: `bash tools/android/hostdemo/check.sh` (login-free demo `tools/android/hostdemo/`, local server `server.py` on 0.0.0.0, the emulator reaches it as 10.0.2.2, commands through the property `debug.firn.hostdemo`, answers as logcat lines `hostdemo ...`). Exit code 0 = all green; run it through `/root/jarvis/bin/heavy`.
+
+| call | state |
+|---|---|
+| `fetch` GET/POST, `origin` | checked on emulator (status, JSON body, server log) |
+| `stream_open/close` | checked on emulator (open/closed state, named + default event) |
+| `store_get/set` | checked on emulator, also across an app restart |
+| `clip_write/read` | checked on emulator (round trip) |
+| `keyboard`, `edit_mode`, `edit_set` | checked on emulator: `adb shell input text`, imeinject commit/composing/Backspace as `WE_TEXT`/`WE_KEY`, edit mode as `WE_EDIT` with caret and composing range; IME fine points (suggestions, autocorrect, gestures) need a real device |
+| `notify` | checked on emulator: asks for POST_NOTIFICATIONS itself and returns false until it is granted, then `dumpsys notification` shows the text; tap on the notification and push in the background need a real device |
+| `save` | checked on emulator (`/sdcard/Download/<name>` has the content) |
+| `share` | checked on emulator (the chooser opens); the target app's receipt needs a real device |
+| `pick` | checked on emulator: the document picker opens, cancel answers `WE_DIALOG` status 0; picking a file by hand is not automated |
+| `back_hold`, `navigate`, `location` | checked on emulator (`WE_BACK`, `WE_ROUTE`, route stack, Back at the start route hands over to the system) |
+| `insets` | checked on emulator (four numbers; the keyboard changes inset or window size); `window.insets` now asks Android live |
+| `tz_offset`, `dark`, `wake_in` | compiled, logged by `info`, not asserted |
+| `font_extra` | stub |
+| Windows backend | missing (r622): `entry host` is refused for `windows` and `native` with a clear message |
+
+Manifest (`fui.app`): `entry app|host` (default `app`). `entry host` marks an app that opens its window through `plat.hostwin`; for Android the build then gets `--push --pick` and the permission `android.permission.INTERNET` unless the manifest sets `android_flags` / `permissions` itself. `windows` and `native` refuse it until the host backends exist (r622).
+
+Next: emoji and Inter as assets for `hostwin`; Orbit's Android entry (r621).
 
 ## 4. Orbit on the same road (E4, concept only, no Orbit change)
 
