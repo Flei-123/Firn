@@ -70,6 +70,38 @@ pub(crate) fn sites_set(n: usize) {
 /// scratch (never the home of a value). `rep movs` has a start-up cost of a
 /// few dozen cycles, so a short copy (under 64 bytes) runs a plain loop with
 /// the same forward, element by element order instead.
+pub(crate) const SMALL_COPY_MAX: u64 = 64;
+
+pub(crate) fn emit_copy_mem(e: &mut crate::codegen_x86::Emitter, size: u64) {
+    if size == 0 {
+        return;
+    }
+    if size > SMALL_COPY_MAX {
+        e.line(&format!("mov rcx, {}", size));
+        e.line("cld");
+        e.line("rep movsb");
+        return;
+    }
+    let mut off: u64 = 0;
+    while off < size {
+        let left = size - off;
+        let (load, store) = if left >= 16 {
+            (format!("movdqu xmm0, xmmword ptr [rsi+{}]", off), format!("movdqu xmmword ptr [rdi+{}], xmm0", off))
+        } else if left >= 8 {
+            (format!("mov rax, qword ptr [rsi+{}]", off), format!("mov qword ptr [rdi+{}], rax", off))
+        } else if left >= 4 {
+            (format!("mov eax, dword ptr [rsi+{}]", off), format!("mov dword ptr [rdi+{}], eax", off))
+        } else if left >= 2 {
+            (format!("mov ax, word ptr [rsi+{}]", off), format!("mov word ptr [rdi+{}], ax", off))
+        } else {
+            (format!("mov al, byte ptr [rsi+{}]", off), format!("mov byte ptr [rdi+{}], al", off))
+        };
+        e.line(&load);
+        e.line(&store);
+        off += if left >= 16 { 16 } else if left >= 8 { 8 } else if left >= 4 { 4 } else if left >= 2 { 2 } else { 1 };
+    }
+}
+
 pub(crate) fn emit_rep(e: &mut crate::codegen_x86::Emitter, esz: u8) {
     let id = SITES.with(|c| c.replace(c.get() + 1));
     let small = format!(".Lmcpy_small{}", id);

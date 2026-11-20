@@ -1958,9 +1958,7 @@ fn emit_inst(
         Op::CopyMem { dst, src, size } => {
             load_full(e, fr, "rdi", *dst);
             load_full(e, fr, "rsi", *src);
-            e.line(&format!("mov rcx, {}", size));
-            e.line("cld");
-            e.line("rep movsb");
+            crate::memcpy_idiom::emit_copy_mem(e, *size as u64);
         }
         // ROUND 52 (core.rs, SPEC §2): inline assembler. ALWAYS volatile —
         // the lines stand exactly once and exactly here.

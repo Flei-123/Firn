@@ -8373,9 +8373,7 @@ fn emit_inst(
         Op::CopyMem { dst, src, size } => {
             ra.load_full(e, "rdi", *dst);
             ra.load_full(e, "rsi", *src);
-            e.line(&format!("mov rcx, {}", size));
-            e.line("cld");
-            e.line("rep movsb");
+            crate::memcpy_idiom::emit_copy_mem(e, *size as u64);
         }
         Op::MemCopy { dst, src, n, esz } => {
             ra.load_full(e, "rdi", *dst);
