@@ -248,7 +248,8 @@ let r: i32 = fut.block_on[i32](&l, total(&l))
   A local used after an `.await` needs a type (`let x: T`).
 * Errors: `.await` outside an `async fn`; `.await` inside `if`/`while`/`for`/a sub-expression ("not supported in
   this position"); async fn without result type, with `&`/`inout`/default parameters.
-* HONEST limits: no `.await` inside control flow or nested expressions yet; no `defer`/`?` across an await; pointers to
+* Sub-expressions (20.11.2026): an `.await` inside a call argument, operator operand, struct/array element, cast, index, the condition of a top-level `if` or nested in another `.await` is hoisted into a temporary `let __awN = e.await` before the statement (`compiler/src/asyncfn_hoist.rs`); all awaits of one statement run first, in source order, BEFORE its other operands. Not hoisted: the right side of `&&` / `||`, `if` expression branches, lambdas.
+* HONEST limits: no `.await` inside the BODY of `if`/`while`/`for` yet (r1592, control-flow state machine open); no `defer`/`?` across an await; pointers to
   locals must not live across an await; one waiter per future (no `select`/`race`/`join_all` yet); a future that is
   never awaited or taken leaks its cell; passing `&local` into an async fn trips the escape check on purpose
   (the frame outlives the caller: `#[allow_escape]` on the caller); firnc1 does not know `async` (parse error,

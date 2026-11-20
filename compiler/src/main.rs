@@ -8,6 +8,7 @@
 mod abi;
 mod assoc;
 mod asyncfn;
+mod asyncfn_hoist;
 mod match_cover;
 mod layout_attrs;
 mod fx;

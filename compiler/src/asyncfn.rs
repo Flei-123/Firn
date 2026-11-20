@@ -8,12 +8,13 @@
 //! text (frame struct, entry function, driver, one function per segment);
 //! the user statements are moved into the segment functions as syntax trees.
 
+use crate::asyncfn_hoist::Hoist;
 use crate::ast::*;
 use crate::diag::{Diags, Span};
 use crate::fx::HashMap;
 
 pub const MARKER: &str = "__async";
-const AWAIT: &str = "await";
+pub(crate) const AWAIT: &str = "await";
 
 enum Bind {
     Let { name: String, mutable: bool },
@@ -231,6 +232,7 @@ fn split(
     f: &mut FnDecl,
     sigs: &Sigs,
     ret: &str,
+    hoist: &mut Hoist,
     dg: &mut Diags,
 ) -> Result<Vec<Seg>, ()> {
     let mut declared: HashMap<String, String> = HashMap::default();
@@ -239,7 +241,8 @@ fn split(
     }
     let mut segs = vec![Seg { stmts: Vec::new(), wait: None }];
     let mut ok = true;
-    for s in std::mem::take(&mut f.body.stmts) {
+    let stmts: Vec<Stmt> = std::mem::take(&mut f.body.stmts).into_iter().flat_map(|s| hoist.stmt(s)).collect();
+    for s in stmts {
         if let Stmt::Let { name, ty: Some(t), .. } = &s {
             declared.insert(name.clone(), ty_text(t));
         }
@@ -409,7 +412,10 @@ fn lower_one(prog: &mut Program, mut f: FnDecl, sigs: &Sigs, dg: &mut Diags) {
         return;
     }
     let ret = ty_text(&ret_ty);
-    let Ok(mut segs) = split(&mut f, sigs, &ret, dg) else { return };
+    let mut hoist = Hoist::new(prog.expr_count);
+    let split_result = split(&mut f, sigs, &ret, &mut hoist, dg);
+    prog.expr_count = hoist.next_id();
+    let Ok(mut segs) = split_result else { return };
     let Ok(locals) = collect_locals(&f, &segs, dg) else { return };
     let mut text = String::new();
     for imp in &prog.imports {
