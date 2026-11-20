@@ -12,9 +12,15 @@ const SEND_SINKS: &[(&str, &[usize])] = &[
     ("jobs__parallel_for", &[5]),
     ("pool__submit", &[2]),
     ("chan__chan_send1", &[1]),
+    ("chan__chan_send", &[1]),
+    ("chan__chan_try_send", &[1]),
+    ("jobs__parallel_each", &[3]),
+    ("jobs__group_go", &[6]),
+    ("pool__run_all", &[2]),
 ];
 
 const MAX_DEPTH: u32 = 32;
+const MAX_POINTER_HOPS: u32 = 2;
 
 pub(crate) const ALLOWED: &str = "off, on";
 
@@ -43,7 +49,7 @@ fn strip_casts(e: &Expr) -> &Expr {
     }
 }
 
-fn holds_gc(tcx: &TypeCtx, t: &Type, depth: u32) -> bool {
+fn holds_gc(tcx: &TypeCtx, t: &Type, depth: u32, hops: u32) -> bool {
     if depth > MAX_DEPTH {
         return false;
     }
@@ -54,8 +60,9 @@ fn holds_gc(tcx: &TypeCtx, t: &Type, depth: u32) -> bool {
         Type::Struct(i) => tcx
             .structs
             .get(*i)
-            .is_some_and(|s| s.fields.iter().any(|f| holds_gc(tcx, &f.ty, depth + 1))),
-        Type::Array(inner, _) => holds_gc(tcx, inner, depth + 1),
+            .is_some_and(|s| s.fields.iter().any(|f| holds_gc(tcx, &f.ty, depth + 1, hops))),
+        Type::Array(inner, _) => holds_gc(tcx, inner, depth + 1, hops),
+        Type::Ptr { inner, .. } => hops < MAX_POINTER_HOPS && holds_gc(tcx, inner, depth + 1, hops + 1),
         _ => false,
     }
 }
@@ -76,7 +83,7 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
                 let Some(arg) = args.get(*i) else { continue };
                 let source = strip_casts(arg);
                 let Some(t) = ck.expr_types.get(source.id as usize) else { continue };
-                if !holds_gc(&ck.tcx, t, 0) {
+                if !holds_gc(&ck.tcx, t, 0, 0) {
                     continue;
                 }
                 errors.push((
