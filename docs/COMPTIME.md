@@ -48,7 +48,7 @@ Errors carry source position: index out of range, division by zero, endless loop
 - arrays as `const` (only `static`)
 - array length expressions in types: `[u8; N]` needs a literal; `[v; N]` repeat counts may use consts and `const fn` calls
 - const generics `[const N: usize]`
-- firnc1: parses `const fn` but marks the file "not core" (exit 3, same as other unported features); calls in const contexts are not evaluated there (`ct_needed`)
+- firnc1: parses `const fn`, runs the same three checks (`lib/firnc1/constfn.fi`: calls of non-const fn, pointers, floating point) and compiles runtime-only use; a call in a const context (`const`, `static`, array count) is not evaluated there and the file answers exit 4 (`ct_needed`). Interpreter port with arrays/statics is open (r1596)
 
 ## Tests
 
