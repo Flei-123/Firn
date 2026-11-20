@@ -18,7 +18,7 @@ Rules and limits:
 - A field without the method gives `type 'Inner' has no method 'debug'` (derive `Debug` on `Inner` too).
 - Unknown name: `unknown derive 'Debog', known: ...`; wrong target: `derive attribute must stand before a struct or an enum`.
 - Generic structs work (`#[derive(Debug, Eq, Clone)] struct Pair[A, B]`), every instance is checked as usual.
-- Generic enums work (`#[derive(Debug, Json)] enum Opt[T]`, firnc0). `Default` works on non-generic structs only.
+- Generic enums are still refused by derive: the frozen negative golden `tests/stable/neg/derive_generic_enum.fi` pins that rejection; the generator itself works now (methods and `match` inside generic enums run), lifting the refusal needs an unfreeze of that golden. `Default` works on non-generic structs only.
 - The derive attribute must start its line and stand on one line.
 - `Debug` allocates through the GC: call `gc_init()` first.
 - Operators `<` `>` work on structs only (operators.rs); on enums call `a.cmp(b)`.
