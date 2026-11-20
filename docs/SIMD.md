@@ -59,8 +59,8 @@ unsafe {
 | Program | Firn | C -O2 scalar | C -O2 SSE2 intrinsics |
 |---|---|---|---|
 | dot, raw `v128` | 9.06 M | 25.03 M | 8.65 M (1.05x) |
-| dot, `std.lanes` f32x8 | 22.18 M | 25.03 M | 8.65 M (2.56x) |
+| dot, `std.lanes` f32x8 | 9.06 M | 25.03 M | 8.65 M (1.05x) |
 | blur [1 2 1]/4, raw `v128` | 26.64 M | 18.52 M (gcc auto-vectorizes) | 18.52 M (1.44x) |
-| blur, `std.lanes` f32x4 | 170.8 M | 18.52 M | 18.52 M (9.2x) |
+| blur, `std.lanes` f32x4 | 26.64 M | 18.52 M | 18.52 M (1.44x) |
 
-Cause of the typed-layer gap: a 16/32-byte struct crosses calls and inlined calls as 8-byte words through the frame (no scalar replacement of `v128` structs). Small struct copies already use SSE moves (before: `rep movsb`, dot 47.6 M). Open: scalar replacement of structs made only of `v128` fields (roadmap).
+Scalar replacement closes the typed-layer gap: `sroa.rs` splits struct copies between stack cells (32-byte `f32x8`/`i32x8` copies) into per-field loads and stores, and `vec2reg.rs` / `vec2reg_single.rs` turn a sixteen octet cell that is accessed as one `v128` and as two eight octet words (the ABI passes a 16-byte struct as two words) into SSA values. Before: dot 22.18 M (2.56x), blur 170.8 M (9.2x). Still open: 256-bit AVX2 path (r1604).
