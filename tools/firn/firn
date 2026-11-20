@@ -9,6 +9,10 @@
 #   firn check x.fi                       parse + type check only (no as/ld, ~0.2 s)
 #   firn test  [x.fi...]                  firnc --test (TAP); default: tests/*.fi or test_*.fi
 #   firn fmt   [-c|-w] x.fi...            firnfmt (built once into the cache from tools/fmt)
+#   firn bindgen HEADER.h [opts]          C header -> Firn bindings (opts: -I d, -D N[=V], --system, --lib L, --wrap SPEC,
+#                                         --emit firn|layout|check-c|check-fi|glue, -o F.fi); with --wrap and -o F.fi the
+#                                         C glue is written to F.glue.c, and `firn build x.fi` links every *.glue.c next
+#                                         to x.fi (or given by --glue FILE.c) -- no manual cc step (docs/CBIND.md)
 #   firn new   NAME [--template T]        fUi app (builds for every target, `firn build --target`); T: counter|blank|settings|files
 #   firn new   NAME --console|--lib       print program, or library without start (src/, tests/)
 #   firn add   NAME[@REQ]                 registry dependency: highest version matching the SemVer requirement
@@ -68,6 +72,70 @@ firnfmt_bin() {
             && mv "$bin.tmp.$$" "$bin" || { rm -f "$bin.tmp.$$"; die "cannot build firnfmt"; }
     fi
     echo "$bin"
+}
+
+bindgen_bin() {
+    local bin="$CACHE/bindgen-bin" src="$FIRN_ROOT/tools/cbind/firn_bindgen.fi"
+    [ -f "$src" ] || die "no bindgen source: $src"
+    if [ ! -x "$bin" ] || [ "$FIRNC" -nt "$bin" ] || [ -n "$(find "$FIRN_ROOT/lib/cbind" "$src" -newer "$bin" -print -quit)" ]; then
+        mkdir -p "$CACHE"
+        "$FIRNC" "$src" -o "$bin.tmp.$$" > "$bin.log" 2>&1 \
+            && mv "$bin.tmp.$$" "$bin" || { rm -f "$bin.tmp.$$"; cat "$bin.log" >&2; die "cannot build bindgen"; }
+    fi
+    echo "$bin"
+}
+
+cmd_bindgen() {
+    local bin header="" out="" wrapped=0 emit=firn args=() a
+    bin=$(bindgen_bin) || exit 125
+    while [ $# -gt 0 ]; do
+        a=$1; shift
+        case $a in
+        -I|-D|--lib|--wrap|--glue-prefix|--emit|-o)
+            [ $# -ge 1 ] || die "bindgen: $a needs a value"
+            [ "$a" = -o ] && out=$1
+            [ "$a" = --wrap ] && wrapped=1
+            [ "$a" = --emit ] && emit=$1
+            args+=("$a" "$1"); shift ;;
+        -*) args+=("$a") ;;
+        *) header=$(readlink -f "$a"); args+=("$header") ;;
+        esac
+    done
+    [ -n "$header" ] || die "usage: firn bindgen HEADER.h [-I dir] [-D N[=V]] [--system] [--lib L] [--wrap SPEC] [--emit E] [-o F.fi]"
+    "$bin" "${args[@]}" || exit $?
+    if [ "$wrapped" = 1 ] && [ "$emit" = firn ] && [ "${out%.fi}" != "$out" ]; then
+        local glue_args=() i=0 skip=0
+        for a in "${args[@]}"; do
+            if [ $skip = 1 ]; then skip=0; continue; fi
+            case $a in --emit|-o) skip=1 ;; *) glue_args+=("$a") ;; esac
+        done
+        "$bin" "${glue_args[@]}" --emit glue -o "${out%.fi}.glue.c" 2> /dev/null || die "bindgen: cannot write glue"
+        echo "firn: glue ${out%.fi}.glue.c (linked automatically by 'firn build')" >&2
+    fi
+}
+
+glue_link_build() { # $1 = source.fi, rest = firnc options (may contain --glue FILE and -o OUT)
+    local src=$1 out="" glue=() fargs=() a prev="" objs=() tmp g o
+    shift
+    for a in "$@"; do
+        if [ "$prev" = --glue ]; then glue+=("$a"); prev=""; continue; fi
+        if [ "$prev" = -o ]; then out=$a; prev=""; continue; fi
+        case $a in --glue|-o) prev=$a; continue ;; esac
+        fargs+=("$a")
+    done
+    for g in "$(dirname "$src")"/*.glue.c; do [ -f "$g" ] && glue+=("$g"); done
+    [ ${#glue[@]} -gt 0 ] || return 1
+    [ -n "$out" ] || out=${src%.fi}
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/firn-glue.XXXXXX"); trap "rm -rf '$tmp'" EXIT
+    "$FIRNC" -c "$src" "${fargs[@]}" -o "$tmp/prog.o" > /dev/null 2> "$tmp/err" || { cat "$tmp/err" >&2; exit 125; }
+    objs+=("$tmp/prog.o")
+    for g in "${glue[@]}"; do
+        o="$tmp/$(basename "$g").o"
+        cc -c -fPIC -o "$o" "$g" || die "cannot compile glue $g"
+        objs+=("$o")
+    done
+    ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -e _start -o "$out" "${objs[@]}" -l:libc.so.6 || die "link failed"
+    exit 0
 }
 
 usage() { sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$SELF"; }
@@ -205,6 +273,7 @@ build)
     case " $* " in *" --target "*) cmd_build_target "$@" ;; esac
     [ $# -ge 1 ] || die "usage: firn build x.fi|DIR [-o out] [firnc options] | firn build [DIR] --target T"
     t=$1; shift
+    [ -f "$t" ] && glue_link_build "$t" "$@"
     if [ -d "$t" ]; then
         pkg_ensure "$t"
         case " $* " in *" --lock "*|*" --locked "*) ;; *) set -- --lock "$@" ;; esac
@@ -217,6 +286,7 @@ test)
     [ $# -ge 1 ] || die "no test files (tests/*.fi or test_*.fi)"
     rc=0; for f in "$@"; do "$FIRNC" --test --format=tap "$f" || rc=1; done; exit $rc ;;
 fmt)    exec "$(firnfmt_bin)" "$@" ;;
+bindgen) cmd_bindgen "$@" ;;
 new)    cmd_new "$@" ;;
 targets) cmd_targets ;;
 add)    cmd_add "$@" ;;

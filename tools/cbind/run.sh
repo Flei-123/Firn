@@ -73,6 +73,47 @@ if [ -f "$W/prog.o" ] && [ -f "$W/glue.o" ]; then
     gcc -o "$W/glue.bin" tools/cbind/cases/glue_host.c "$W/prog.o" "$W/glue.o" 2> "$W/glue.link.log" && "$W/glue.bin" && ok "glue: static inline + macros callable from Firn" || { bad "glue: link/run"; head -5 "$W/glue.link.log"; }
 fi
 
+FD=$W/driver
+mkdir -p "$FD"
+DRV=(env FIRNC="$FIRNC" FIRN_ROOT="$ROOT" FIRN_CACHE="$W/cache" bash tools/firn/firn)
+"${DRV[@]}" bindgen "$G" --wrap twice --wrap "ADD3:int(int,int,int)" -o "$FD/glue_decl.fi" 2> "$FD/bindgen.log"
+printf 'fn main() -> i32 {\n    return twice(21) + ADD3(1, 2, 3) - 48\n}\n' > "$FD/main_tail.fi"
+cat "$FD/glue_decl.fi" "$FD/main_tail.fi" > "$FD/app.fi"
+[ -f "$FD/glue_decl.glue.c" ] && ok "driver: firn bindgen writes the glue file" || bad "driver: firn bindgen writes the glue file"
+"${DRV[@]}" build "$FD/app.fi" -o "$FD/app" > "$FD/build.log" 2>&1 && "$FD/app"
+[ $? -eq 0 ] && ok "driver: firn build links the glue automatically (exit 0)" || { bad "driver: firn build links the glue automatically"; head -5 "$FD/build.log"; }
+"${DRV[@]}" bindgen tools/cbind/cases/kernel_like.h --lib kl > "$FD/kl_stdout.fi" 2> /dev/null
+grep -q "^extern fn kl_insert" "$FD/kl_stdout.fi" && ok "driver: firn bindgen prints bindings" || bad "driver: firn bindgen prints bindings"
+
+F=tools/cbind/cases/ffi_features.h
+FW=(--wrap "vsum3=vsum:int(int,int,int,int)" --wrap "vsum1=vsum:int(int,int)" --wrap "dmix_ii=dmix:double(const char*,int,int,int,double)")
+"$BG" "$F" "${FW[@]}" --emit glue -o "$W/feat_glue.c" 2> /dev/null
+"$BG" "$F" "${FW[@]}" --emit firn -o "$W/feat_decl.fi" 2> "$W/feat.warn"
+cat "$W/feat_decl.fi" tools/cbind/cases/ffi_features_prog.fi > "$W/feat_full.fi"
+grep -q "^const NAME_STR: str = \"fire.tfly\"$" "$W/feat_decl.fi" && ok "consts: string macro" || bad "consts: string macro"
+grep -q "^const VERSION_STR: str = \"1.2\"$" "$W/feat_decl.fi" && ok "consts: concatenated string macro" || bad "consts: concatenated string macro"
+grep -q "^const NEG_E: f64 = 0.0 - 2.5e-3$" "$W/feat_decl.fi" && ok "consts: float macro" || bad "consts: float macro"
+grep -q "^const HDR_SIZE: i32 = 12$" "$W/feat_decl.fi" && ok "consts: sizeof(typedef) in enum" || bad "consts: sizeof(typedef) in enum"
+grep -q "^fn bits_get_b(" "$W/feat_decl.fi" && ok "bit-fields: accessors generated" || bad "bit-fields: accessors generated"
+gcc -c -I "$ROOT" -o "$W/feat_glue.o" "$W/feat_glue.c" 2> "$W/feat.gcc.log" || { bad "features: C glue compiles"; head -5 "$W/feat.gcc.log"; }
+"$FIRNC" -c "$W/feat_full.fi" -o "$W/feat_prog.o" > "$W/feat.firn.log" 2>&1 || { bad "features: Firn object"; head -8 "$W/feat.firn.log"; }
+if [ -f "$W/feat_prog.o" ] && [ -f "$W/feat_glue.o" ]; then
+    objcopy --localize-symbol=_start --localize-symbol=main "$W/feat_prog.o"
+    gcc -I tools/cbind/cases -o "$W/feat.bin" tools/cbind/cases/ffi_features_host.c "$W/feat_prog.o" "$W/feat_glue.o" 2> "$W/feat.link.log" && "$W/feat.bin" && ok "features: bit-field accessors, sizeof consts, string/float consts, variadics == gcc" || { bad "features: link/run"; head -5 "$W/feat.link.log"; }
+fi
+
+if command -v aarch64-linux-gnu-gcc > /dev/null 2>&1 && command -v qemu-aarch64 > /dev/null 2>&1; then
+    for name in kernel_like ffi_features; do
+        "$BG" --emit layout "tools/cbind/cases/$name.h" > "$W/$name.a64.pred" 2> /dev/null
+        "$BG" --emit check-c "tools/cbind/cases/$name.h" -o "$W/$name.a64.c" 2> /dev/null
+        if aarch64-linux-gnu-gcc -static -I "$ROOT" -o "$W/$name.a64" "$W/$name.a64.c" 2> /dev/null && qemu-aarch64 "$W/$name.a64" > "$W/$name.a64.out" && diff -q "$W/$name.a64.pred" "$W/$name.a64.out" > /dev/null; then
+            ok "$name: aarch64 LP64 layout (gcc + qemu) == x86-64 prediction"
+        else
+            bad "$name: aarch64 layout differs"
+        fi
+    done
+fi
+
 if command -v apt-get > /dev/null 2>&1 && command -v dpkg > /dev/null 2>&1; then
     (cd "$W" && mkdir -p sq && cd sq && timeout 60 apt-get download libsqlite3-dev > /dev/null 2>&1 && dpkg -x libsqlite3-dev*.deb x 2> /dev/null)
     SQ="$W/sq/x/usr/include/sqlite3.h"

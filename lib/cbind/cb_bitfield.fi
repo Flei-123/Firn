@@ -1,0 +1,116 @@
+import std.vec
+import cbind.cb_util
+import cbind.cb_types
+import cbind.cb_names
+
+export { bit_run_end, run_span, accessors }
+
+const MAX_WIDTH: i32 = 32
+
+fn field_at(db: *mut cb_types.Db, r: *mut cb_types.Rec, k: u32) -> *mut cb_types.Field {
+    return vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + k) as usize)
+}
+
+fn bit_run_end(db: *mut cb_types.Db, r: *mut cb_types.Rec, from: u32) -> u32 {
+    var k: u32 = from
+    while k < (*r).fcount {
+        if (*field_at(db, r, k)).bits < 0 {
+            break
+        }
+        k = k + 1
+    }
+    return k
+}
+
+fn run_span(db: *mut cb_types.Db, r: *mut cb_types.Rec, from: u32, to: u32, lo: *mut u64, hi: *mut u64) {
+    *lo = 1000000000
+    *hi = 0
+    for q in from..to {
+        let g: *mut cb_types.Field = field_at(db, r, q)
+        if (*g).bits > 0 {
+            if (*g).bitoff / 8 < *lo { *lo = (*g).bitoff / 8 }
+            let e: u64 = ((*g).bitoff + ((*g).bits as u64) + 7) / 8
+            if e > *hi { *hi = e }
+        }
+    }
+}
+
+fn byte_expr(run: str, j: u64) -> str {
+    return "((*p)." + run + "[" + cb_util.istr(j as i64) + "] as u64)"
+}
+
+fn gather(run: str, first: u64, last: u64) -> str {
+    var out: str = "    var v: u64 = 0\n"
+    for j in first..(last + 1) {
+        out = out + "    v = v | (" + byte_expr(run, j) + " << " + cb_util.istr(((j - first) * 8) as i64) + ")\n"
+    }
+    return out
+}
+
+fn getter(label: str, name: str, run: str, first: u64, last: u64, shift: u64, width: u64, sgn: bool) -> str {
+    let mask: i64 = (1 << (width as i64)) - 1
+    var out: str = "fn " + label + "_get_" + name + "(p: *mut " + label + ") -> "
+    if sgn { out = out + "i32" } else { out = out + "u32" }
+    out = out + " {\n" + gather(run, first, last)
+    out = out + "    let x: u64 = (v >> " + cb_util.istr(shift as i64) + ") & " + cb_util.istr(mask) + "\n"
+    if sgn {
+        let sign: i64 = 1 << (width as i64 - 1)
+        return out + "    return (((x as i64) ^ " + cb_util.istr(sign) + ") - " + cb_util.istr(sign) + ") as i32\n}\n"
+    }
+    return out + "    return x as u32\n}\n"
+}
+
+fn setter(label: str, name: str, run: str, first: u64, last: u64, shift: u64, width: u64, sgn: bool) -> str {
+    let mask: i64 = (1 << (width as i64)) - 1
+    let span: i64 = (1 << (((last - first + 1) * 8) as i64)) - 1
+    let clear: i64 = span ^ (mask << shift as i64)
+    var out: str = "fn " + label + "_set_" + name + "(p: *mut " + label + ", x: "
+    if sgn { out = out + "i32" } else { out = out + "u32" }
+    out = out + ") {\n" + gather(run, first, last)
+    out = out + "    v = (v & " + cb_util.istr(clear) + ") | (((x as u64) & " + cb_util.istr(mask) + ") << " + cb_util.istr(shift as i64) + ")\n"
+    for j in first..(last + 1) {
+        out = out + "    (*p)." + run + "[" + cb_util.istr(j as i64) + "] = ((v >> " + cb_util.istr(((j - first) * 8) as i64) + ") & 255) as u8\n"
+    }
+    return out + "}\n"
+}
+
+fn field_accessors(db: *mut cb_types.Db, label: str, g: *mut cb_types.Field, lo: u64) -> str {
+    let rel: u64 = (*g).bitoff - lo * 8
+    let first: u64 = rel / 8
+    let last: u64 = (rel + ((*g).bits as u64) - 1) / 8
+    let run: str = "_bits" + cb_util.istr(lo as i64)
+    let sgn: bool = (*cb_types.ty_ref(db, cb_types.strip(db, (*g).ty))).sgn
+    let name: str = cb_names.fi_name((*g).name)
+    return getter(label, name, run, first, last, rel % 8, (*g).bits as u64, sgn) + setter(label, name, run, first, last, rel % 8, (*g).bits as u64, sgn)
+}
+
+fn accessors(db: *mut cb_types.Db, r: *mut cb_types.Rec, label: str) -> str {
+    var out: str = ""
+    if (*r).is_union {
+        return out
+    }
+    var k: u32 = 0
+    while k < (*r).fcount {
+        if (*field_at(db, r, k)).bits < 0 {
+            k = k + 1
+            continue
+        }
+        let end_k: u32 = bit_run_end(db, r, k)
+        var lo: u64 = 0
+        var hi: u64 = 0
+        run_span(db, r, k, end_k, &lo, &hi)
+        for q in k..end_k {
+            let g: *mut cb_types.Field = field_at(db, r, q)
+            if (*g).bits <= 0 || (*g).name.n == 0 {
+                continue
+            }
+            if (*g).bits > MAX_WIDTH {
+                cb_types.db_warn(db, "bit-field " + label + "." + (*g).name + " wider than 32 bits has no accessors")
+                continue
+            }
+            out = out + "\n" + field_accessors(db, label, g, lo)
+        }
+        k = end_k
+    }
+    return out
+}
