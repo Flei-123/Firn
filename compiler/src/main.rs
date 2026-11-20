@@ -1500,6 +1500,7 @@ fn cache_hit(opts: &Options, path: &Path, target_out_manifest: &Option<PathBuf>,
 fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
     let cacheable = matches!(opts.emit, Emit::Exe | Emit::Asm)
         && !opts.no_cache
+        && crate::unsafety::mode() != crate::unsafety::Mode::Warn
         && !buildcache::disabled_by_env()
         && !opts.stats
         && !pgo::active()

@@ -694,6 +694,9 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
+            if crate::unsafety::is_marked(f.body.span) {
+                crate::unsafety::register_fn(&f.name);
+            }
             self.fns.insert(f.name.clone(), FnSig { params, ret });
         }
     }
@@ -3153,6 +3156,9 @@ constants declared before it, and '+ - * /'"
                 return Type::Error;
             }
         };
+        if crate::unsafety::is_unsafe_fn(name) {
+            self.require_unsafe(espan, crate::unsafety::CALL_SITE);
+        }
         if args.len() != sig.params.len() {
             self.dg.error(
                 espan,

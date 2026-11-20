@@ -2450,6 +2450,11 @@ compute it",
         out
     }
 
+    pub(crate) fn at_unsafe_fn(&self) -> bool {
+        matches!(self.kind(), TokKind::Ident(w) if w == "unsafe")
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn))
+    }
+
     fn fn_decl(&mut self, prog: &mut Program) {
         let is_unsafe = matches!(self.kind(), TokKind::Ident(w) if w == "unsafe");
         if is_unsafe {
@@ -2932,7 +2937,7 @@ compute it",
                     prog.comptime_blocks.push((b, sp));
                 }
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
-                TokKind::Ident(w) if w == "unsafe" && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn)) => self.fn_decl(&mut prog),
+                _ if self.at_unsafe_fn() => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
                 TokKind::KwStatic => self.static_decl(&mut prog),

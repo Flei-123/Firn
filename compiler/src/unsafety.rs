@@ -16,6 +16,8 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 
 static SCOPE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+static UNSAFE_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
 static MARKED: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
 
 pub(crate) fn parse(v: &str) -> Option<Mode> {
@@ -57,6 +59,18 @@ pub(crate) fn is_marked(block_span: Span) -> bool {
     let g = MARKED.lock().unwrap_or_else(|e| e.into_inner());
     g.as_ref().is_some_and(|s| s.contains(&key(block_span)))
 }
+
+pub(crate) fn register_fn(name: &str) {
+    let mut g = UNSAFE_FNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(name.to_string());
+}
+
+pub(crate) fn is_unsafe_fn(name: &str) -> bool {
+    let g = UNSAFE_FNS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|s| s.contains(name))
+}
+
+pub(crate) const CALL_SITE: &str = "a call of an unsafe fn";
 
 pub(crate) fn site_message(what: &str) -> String {
     format!("{} is only allowed inside an 'unsafe' block or 'unsafe fn'", what)

@@ -18,6 +18,7 @@ for dir in "$@"; do
     done
 done
 sort -u "$WORK/all" >"$WORK/uniq"
+[ -n "${AUDIT_SITES:-}" ] && cp "$WORK/uniq" "$AUDIT_SITES"
 printf '%-40s %6s\n' file sites
 sed -E 's/:[0-9]+:[0-9]+:$//' "$WORK/uniq" | sed "s#^$ROOT/##" | sort | uniq -c | sort -k1,1n | awk '{printf "%-40s %6d\n", $2, $1}'
 printf '%-40s %6d\n' total "$(wc -l <"$WORK/uniq")"

@@ -94,51 +94,53 @@ fn block_new(size: u64) -> u64 {
 // `bytes` with alignment `align` (a power of two, at most 4096); 0 when the
 // memory could not be had.
 fn arena_alloc(a: *mut Arena, bytes: u64, align: u64) -> u64 {
-    var al: u64 = align
-    if al < 1 {
-        al = 1
-    }
-    if (*a).cur != 0 {
-        let start: u64 = ((*a).cur + (*a).off + al - 1) / al * al
-        let end: u64 = start + bytes
-        if end <= (*a).cur + rt.ld64((*a).cur, AB_SIZE) {
-            (*a).off = end - (*a).cur
-            (*a).used = (*a).used + bytes
-            return start
-        }
-    }
-    // next block: the one after `cur` if a reset kept it, else a new one
-    var nb: u64 = 0
-    if (*a).cur != 0 {
-        nb = rt.ld64((*a).cur, AB_NEXT)
-    }
-    var need: u64 = AB_HDR + bytes + al
-    if need < (*a).block_bytes {
-        need = (*a).block_bytes
-    }
-    if nb != 0 && rt.ld64(nb, AB_SIZE) < AB_HDR + bytes + al {
-        nb = 0 // a kept block that is too small for this request: new block in front of it
-    }
-    if nb == 0 {
-        nb = block_new(need)
-        if nb == 0 {
-            return 0
+    unsafe {
+        var al: u64 = align
+        if al < 1 {
+            al = 1
         }
         if (*a).cur != 0 {
-            rt.st64(nb, AB_NEXT, rt.ld64((*a).cur, AB_NEXT))
-            rt.st64((*a).cur, AB_NEXT, nb)
-        } else {
-            rt.st64(nb, AB_NEXT, (*a).first)
-            (*a).first = nb
+            let start: u64 = ((*a).cur + (*a).off + al - 1) / al * al
+            let end: u64 = start + bytes
+            if end <= (*a).cur + rt.ld64((*a).cur, AB_SIZE) {
+                (*a).off = end - (*a).cur
+                (*a).used = (*a).used + bytes
+                return start
+            }
         }
-        (*a).blocks = (*a).blocks + 1
+        // next block: the one after `cur` if a reset kept it, else a new one
+        var nb: u64 = 0
+        if (*a).cur != 0 {
+            nb = rt.ld64((*a).cur, AB_NEXT)
+        }
+        var need: u64 = AB_HDR + bytes + al
+        if need < (*a).block_bytes {
+            need = (*a).block_bytes
+        }
+        if nb != 0 && rt.ld64(nb, AB_SIZE) < AB_HDR + bytes + al {
+            nb = 0 // a kept block that is too small for this request: new block in front of it
+        }
+        if nb == 0 {
+            nb = block_new(need)
+            if nb == 0 {
+                return 0
+            }
+            if (*a).cur != 0 {
+                rt.st64(nb, AB_NEXT, rt.ld64((*a).cur, AB_NEXT))
+                rt.st64((*a).cur, AB_NEXT, nb)
+            } else {
+                rt.st64(nb, AB_NEXT, (*a).first)
+                (*a).first = nb
+            }
+            (*a).blocks = (*a).blocks + 1
+        }
+        (*a).cur = nb
+        (*a).off = AB_HDR
+        let start2: u64 = (nb + AB_HDR + al - 1) / al * al
+        (*a).off = start2 + bytes - nb
+        (*a).used = (*a).used + bytes
+        return start2
     }
-    (*a).cur = nb
-    (*a).off = AB_HDR
-    let start2: u64 = (nb + AB_HDR + al - 1) / al * al
-    (*a).off = start2 + bytes - nb
-    (*a).used = (*a).used + bytes
-    return start2
 }
 
 fn arena_alloc_zero(a: *mut Arena, bytes: u64, align: u64) -> u64 {
@@ -151,29 +153,37 @@ fn arena_alloc_zero(a: *mut Arena, bytes: u64, align: u64) -> u64 {
 
 // Forgets everything handed out; keeps the blocks for the next round.
 fn arena_reset(a: *mut Arena) {
-    (*a).cur = (*a).first
-    (*a).off = AB_HDR
-    (*a).used = 0
+    unsafe {
+        (*a).cur = (*a).first
+        (*a).off = AB_HDR
+        (*a).used = 0
+    }
 }
 
 fn arena_used(a: *mut Arena) -> u64 {
-    return (*a).used
+    unsafe {
+        return (*a).used
+    }
 }
 
 fn arena_blocks(a: *mut Arena) -> u64 {
-    return (*a).blocks
+    unsafe {
+        return (*a).blocks
+    }
 }
 
 impl Arena {
     fn drop(inout self) {
-        var b: u64 = self.first
-        while b != 0 {
-            let nx: u64 = rt.ld64(b, AB_NEXT)
-            rt.heap_free(b, rt.ld64(b, AB_SIZE) as usize)
-            b = nx
+        unsafe {
+            var b: u64 = self.first
+            while b != 0 {
+                let nx: u64 = rt.ld64(b, AB_NEXT)
+                rt.heap_free(b, rt.ld64(b, AB_SIZE) as usize)
+                b = nx
+            }
+            self.first = 0
+            self.cur = 0
         }
-        self.first = 0
-        self.cur = 0
     }
 }
 
@@ -190,66 +200,74 @@ fn scope_new() -> Scope {
 // Registers `release(handle)` to run when the scope closes. False: out of
 // memory (the caller must release the handle itself then).
 fn scope_add(s: *mut Scope, release: fn(u64), handle: u64) -> bool {
-    var blk: u64 = (*s).blk
-    var n: u64 = 0
-    var cap: u64 = 0
-    if blk != 0 {
-        n = rt.ld64(blk, 0)
-        cap = rt.ld64(blk, 1)
-    }
-    if blk == 0 || n == cap {
-        var ncap: u64 = cap * 2
-        if ncap < 8 {
-            ncap = 8
-        }
-        let nb: u64 = rt.heap_alloc((2 + ncap * 2) as usize * 8)
-        if nb == 0 {
-            return false
-        }
+    unsafe {
+        var blk: u64 = (*s).blk
+        var n: u64 = 0
+        var cap: u64 = 0
         if blk != 0 {
-            rt.mem_copy(nb + 16, blk + 16, (n * 2) as usize * 8)
-            rt.heap_free(blk, (2 + cap * 2) as usize * 8)
+            n = rt.ld64(blk, 0)
+            cap = rt.ld64(blk, 1)
         }
-        rt.st64(nb, 0, n)
-        rt.st64(nb, 1, ncap)
-        blk = nb
-        (*s).blk = nb
+        if blk == 0 || n == cap {
+            var ncap: u64 = cap * 2
+            if ncap < 8 {
+                ncap = 8
+            }
+            let nb: u64 = rt.heap_alloc((2 + ncap * 2) as usize * 8)
+            if nb == 0 {
+                return false
+            }
+            if blk != 0 {
+                rt.mem_copy(nb + 16, blk + 16, (n * 2) as usize * 8)
+                rt.heap_free(blk, (2 + cap * 2) as usize * 8)
+            }
+            rt.st64(nb, 0, n)
+            rt.st64(nb, 1, ncap)
+            blk = nb
+            (*s).blk = nb
+        }
+        rt.st64(blk, (2 + n * 2) as usize, release as u64)
+        rt.st64(blk, (3 + n * 2) as usize, handle)
+        rt.st64(blk, 0, n + 1)
+        return true
     }
-    rt.st64(blk, (2 + n * 2) as usize, release as u64)
-    rt.st64(blk, (3 + n * 2) as usize, handle)
-    rt.st64(blk, 0, n + 1)
-    return true
 }
 
 fn scope_len(s: *mut Scope) -> u64 {
-    if (*s).blk == 0 {
-        return 0
+    unsafe {
+        if (*s).blk == 0 {
+            return 0
+        }
+        return rt.ld64((*s).blk, 0)
     }
-    return rt.ld64((*s).blk, 0)
 }
 
 // Forgets the registration of `handle` WITHOUT releasing it (ownership went
 // elsewhere). True if it was registered.
 fn scope_cancel(s: *mut Scope, handle: u64) -> bool {
-    let blk: u64 = (*s).blk
-    if blk == 0 {
+    unsafe {
+        let blk: u64 = (*s).blk
+        if blk == 0 {
+            return false
+        }
+        var i: u64 = rt.ld64(blk, 0)
+        while i > 0 {
+            i = i - 1
+            if rt.ld64(blk, (3 + i * 2) as usize) == handle {
+                rt.st64(blk, (2 + i * 2) as usize, 0)
+                return true
+            }
+        }
         return false
     }
-    var i: u64 = rt.ld64(blk, 0)
-    while i > 0 {
-        i = i - 1
-        if rt.ld64(blk, (3 + i * 2) as usize) == handle {
-            rt.st64(blk, (2 + i * 2) as usize, 0)
-            return true
-        }
-    }
-    return false
 }
 
 // Releases everything in reverse order of registration; the scope can be
 // used again afterwards.
 fn scope_close(s: *mut Scope) {
-    scope_run((*s).blk)
+    unsafe {
+        scope_run((*s).blk)
+    }
 }
 
 fn scope_run(blk: u64) {
@@ -272,10 +290,12 @@ fn scope_run(blk: u64) {
 
 impl Scope {
     fn drop(inout self) {
-        scope_run(self.blk)
-        if self.blk != 0 {
-            rt.heap_free(self.blk, (2 + rt.ld64(self.blk, 1) * 2) as usize * 8)
-            self.blk = 0
+        unsafe {
+            scope_run(self.blk)
+            if self.blk != 0 {
+                rt.heap_free(self.blk, (2 + rt.ld64(self.blk, 1) * 2) as usize * 8)
+                self.blk = 0
+            }
         }
     }
 }
@@ -284,14 +304,18 @@ impl Scope {
 static mut TRACK: [u64; 16] = [0; 16]
 
 fn track_acquire(kind: u64) {
-    if kind < 16 {
-        __atomic_add((&TRACK[kind as usize]) as *mut u64, 1)
+    unsafe {
+        if kind < 16 {
+            __atomic_add((&TRACK[kind as usize]) as *mut u64, 1)
+        }
     }
 }
 
 fn track_release(kind: u64) {
-    if kind < 16 {
-        __atomic_add((&TRACK[kind as usize]) as *mut u64, 18446744073709551615)
+    unsafe {
+        if kind < 16 {
+            __atomic_add((&TRACK[kind as usize]) as *mut u64, 18446744073709551615)
+        }
     }
 }
 

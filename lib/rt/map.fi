@@ -120,34 +120,38 @@ fn map_new[K: Scalar, V: Scalar]() -> Map[K, V] {
 }
 
 fn map_free[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
-    if (*m).cap > 0 {
-        // r497: the arrays were collector roots if K / V hold GC pointers
-        gc_untrack[K]((*m).key)
-        gc_untrack[V]((*m).values)
-        rt.heap_free((*m).key, (*m).cap * size_of[K]())
-        rt.heap_free((*m).values, (*m).cap * size_of[V]())
-        rt.heap_free((*m).state, (*m).cap)
+    unsafe {
+        if (*m).cap > 0 {
+            // r497: the arrays were collector roots if K / V hold GC pointers
+            gc_untrack[K]((*m).key)
+            gc_untrack[V]((*m).values)
+            rt.heap_free((*m).key, (*m).cap * size_of[K]())
+            rt.heap_free((*m).values, (*m).cap * size_of[V]())
+            rt.heap_free((*m).state, (*m).cap)
+        }
+        (*m).key = 0
+        (*m).values = 0
+        (*m).state = 0
+        (*m).cap = 0
+        (*m).len = 0
+        (*m).dead = 0
     }
-    (*m).key = 0
-    (*m).values = 0
-    (*m).state = 0
-    (*m).cap = 0
-    (*m).len = 0
-    (*m).dead = 0
 }
 
 // Keeps the memory, only sets every slot to `empty`. For a scope table that
 // is filled anew per function this is the right way -- no mmap per
 // function.
 fn map_clear[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
-    if (*m).cap > 0 {
-        rt.mem_set((*m).state, 0 as u8, (*m).cap)
-        // r497: do not keep dead closures alive through stale slots
-        if has_gc[K]() { rt.mem_set((*m).key, 0 as u8, (*m).cap * size_of[K]()) }
-        if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
+    unsafe {
+        if (*m).cap > 0 {
+            rt.mem_set((*m).state, 0 as u8, (*m).cap)
+            // r497: do not keep dead closures alive through stale slots
+            if has_gc[K]() { rt.mem_set((*m).key, 0 as u8, (*m).cap * size_of[K]()) }
+            if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
+        }
+        (*m).len = 0
+        (*m).dead = 0
     }
-    (*m).len = 0
-    (*m).dead = 0
 }
 
 fn map_len[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
@@ -184,122 +188,132 @@ fn map_slot_value[K: Scalar, V: Scalar](m: *mut Map[K, V], i: usize) -> V {
 // Looks for the slot of a key. Return value `cap` = not present.
 // It stops at state 0 and runs across state 2.
 fn map_find[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> usize {
-    // Hot path of every lookup: the fields are read once, and the address
-    // arithmetic wraps (`+%`/`*%`) -- an index below `cap` cannot overflow, so
-    // the overflow checks of `+`/`*` only cost instructions here.
-    let cap: usize = (*m).cap
-    if cap == 0 {
-        return 0
-    }
-    let mask: u64 = (cap as u64) -% 1
-    let states: u64 = (*m).state
-    let keys: u64 = (*m).key
-    var i: u64 = map_hash[K](k) & mask
-    var steps: usize = 0
-    while steps < cap {
-        let z: u8 = *((states +% i) as *mut u8)
-        if z == 0 as u8 {
-            return cap
+    unsafe {
+        // Hot path of every lookup: the fields are read once, and the address
+        // arithmetic wraps (`+%`/`*%`) -- an index below `cap` cannot overflow, so
+        // the overflow checks of `+`/`*` only cost instructions here.
+        let cap: usize = (*m).cap
+        if cap == 0 {
+            return 0
         }
-        if z == 1 as u8 {
-            if *((keys +% i *% size_of[K]() as u64) as *mut K) == k {
-                return i as usize
+        let mask: u64 = (cap as u64) -% 1
+        let states: u64 = (*m).state
+        let keys: u64 = (*m).key
+        var i: u64 = map_hash[K](k) & mask
+        var steps: usize = 0
+        while steps < cap {
+            let z: u8 = *((states +% i) as *mut u8)
+            if z == 0 as u8 {
+                return cap
             }
+            if z == 1 as u8 {
+                if *((keys +% i *% size_of[K]() as u64) as *mut K) == k {
+                    return i as usize
+                }
+            }
+            i = (i +% 1) & mask
+            steps = steps +% 1
         }
-        i = (i +% 1) & mask
-        steps = steps +% 1
+        return cap
     }
-    return cap
 }
 
 fn map_has[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> bool {
-    return map_find[K, V](m, k) < (*m).cap
+    unsafe {
+        return map_find[K, V](m, k) < (*m).cap
+    }
 }
 
 fn map_get[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> V {
-    let i: usize = map_find[K, V](m, k)
-    if i >= (*m).cap {
-        return 0 as V
+    unsafe {
+        let i: usize = map_find[K, V](m, k)
+        if i >= (*m).cap {
+            return 0 as V
+        }
+        let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
+        return *(addr as *mut V)
     }
-    let addr: u64 = (*m).values + i as u64 * size_of[V]() as u64
-    return *(addr as *mut V)
 }
 
 // Stores a pair without any check. Only for `map_grow`, where it is known
 // that the key is new and that there is room.
 fn map_raw_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) {
-    let mask: u64 = ((*m).cap as u64) -% 1
-    let states: u64 = (*m).state
-    var i: u64 = map_hash[K](k) & mask
-    while *((states +% i) as *mut u8) == 1 as u8 {
-        i = (i +% 1) & mask
+    unsafe {
+        let mask: u64 = ((*m).cap as u64) -% 1
+        let states: u64 = (*m).state
+        var i: u64 = map_hash[K](k) & mask
+        while *((states +% i) as *mut u8) == 1 as u8 {
+            i = (i +% 1) & mask
+        }
+        *(((*m).key +% i *% size_of[K]() as u64) as *mut K) = k
+        *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
+        *((states +% i) as *mut u8) = 1 as u8
     }
-    *(((*m).key +% i *% size_of[K]() as u64) as *mut K) = k
-    *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
-    *((states +% i) as *mut u8) = 1 as u8
 }
 
 // Rebuilds the table with `new_cap` slots. In doing so it clears away every
 // tombstone -- which is why it rebuilds even when the capacity stays the
 // same and only `dead` has grown too large.
 fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
-    var cap: usize = 8
-    while cap < new_cap {
-        cap = cap * 2
-    }
-    let sk: u64 = rt.heap_alloc(cap * size_of[K]())
-    if sk == 0 {
-        return false
-    }
-    let sw: u64 = rt.heap_alloc(cap * size_of[V]())
-    if sw == 0 {
-        rt.heap_free(sk, cap * size_of[K]())
-        return false
-    }
-    let sz: u64 = rt.heap_alloc(cap)
-    if sz == 0 {
-        rt.heap_free(sk, cap * size_of[K]())
-        rt.heap_free(sw, cap * size_of[V]())
-        return false
-    }
-    rt.mem_set(sz, 0 as u8, cap)
-    // r497: with GC pointers in K / V the new arrays are collector roots,
-    // registered BEFORE the old ones are dropped (same as vec_grow)
-    gc_track[K](sk, cap * size_of[K]())
-    gc_track[V](sw, cap * size_of[V]())
-
-    // Remember the old table, hang in the new one, then rehash.
-    let old_k: u64 = (*m).key
-    let old_v: u64 = (*m).values
-    let old_z: u64 = (*m).state
-    let old_cap: usize = (*m).cap
-
-    (*m).key = sk
-    (*m).values = sw
-    (*m).state = sz
-    (*m).cap = cap
-    (*m).len = 0
-    (*m).dead = 0
-
-    var i: usize = 0
-    while i < old_cap {
-        if rt.ld8(old_z, i) == 1 as u8 {
-            let ka: u64 = old_k + i as u64 * size_of[K]() as u64
-            let va: u64 = old_v + i as u64 * size_of[V]() as u64
-            map_raw_set[K, V](m, *(ka as *mut K), *(va as *mut V))
-            (*m).len = (*m).len + 1
+    unsafe {
+        var cap: usize = 8
+        while cap < new_cap {
+            cap = cap * 2
         }
-        i = i + 1
-    }
+        let sk: u64 = rt.heap_alloc(cap * size_of[K]())
+        if sk == 0 {
+            return false
+        }
+        let sw: u64 = rt.heap_alloc(cap * size_of[V]())
+        if sw == 0 {
+            rt.heap_free(sk, cap * size_of[K]())
+            return false
+        }
+        let sz: u64 = rt.heap_alloc(cap)
+        if sz == 0 {
+            rt.heap_free(sk, cap * size_of[K]())
+            rt.heap_free(sw, cap * size_of[V]())
+            return false
+        }
+        rt.mem_set(sz, 0 as u8, cap)
+        // r497: with GC pointers in K / V the new arrays are collector roots,
+        // registered BEFORE the old ones are dropped (same as vec_grow)
+        gc_track[K](sk, cap * size_of[K]())
+        gc_track[V](sw, cap * size_of[V]())
 
-    if old_cap > 0 {
-        gc_untrack[K](old_k)
-        gc_untrack[V](old_v)
-        rt.heap_free(old_k, old_cap * size_of[K]())
-        rt.heap_free(old_v, old_cap * size_of[V]())
-        rt.heap_free(old_z, old_cap)
+        // Remember the old table, hang in the new one, then rehash.
+        let old_k: u64 = (*m).key
+        let old_v: u64 = (*m).values
+        let old_z: u64 = (*m).state
+        let old_cap: usize = (*m).cap
+
+        (*m).key = sk
+        (*m).values = sw
+        (*m).state = sz
+        (*m).cap = cap
+        (*m).len = 0
+        (*m).dead = 0
+
+        var i: usize = 0
+        while i < old_cap {
+            if rt.ld8(old_z, i) == 1 as u8 {
+                let ka: u64 = old_k + i as u64 * size_of[K]() as u64
+                let va: u64 = old_v + i as u64 * size_of[V]() as u64
+                map_raw_set[K, V](m, *(ka as *mut K), *(va as *mut V))
+                (*m).len = (*m).len + 1
+            }
+            i = i + 1
+        }
+
+        if old_cap > 0 {
+            gc_untrack[K](old_k)
+            gc_untrack[V](old_v)
+            rt.heap_free(old_k, old_cap * size_of[K]())
+            rt.heap_free(old_v, old_cap * size_of[V]())
+            rt.heap_free(old_z, old_cap)
+        }
+        return true
     }
-    return true
 }
 
 fn map_reserve[K: Scalar, V: Scalar](m: *mut Map[K, V], n: usize) -> bool {
@@ -312,36 +326,38 @@ fn map_reserve[K: Scalar, V: Scalar](m: *mut Map[K, V], n: usize) -> bool {
 
 // Stores or overwrites. `false` means: out of memory.
 fn map_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) -> bool {
-    // An existing key first -- then nothing grows.
-    let da: usize = map_find[K, V](m, k)
-    if da < (*m).cap {
-        let va: u64 = (*m).values + da as u64 * size_of[V]() as u64
-        *(va as *mut V) = v
+    unsafe {
+        // An existing key first -- then nothing grows.
+        let da: usize = map_find[K, V](m, k)
+        if da < (*m).cap {
+            let va: u64 = (*m).values + da as u64 * size_of[V]() as u64
+            *(va as *mut V) = v
+            return true
+        }
+        // Load limit 3/4, tombstones count too: they occupy a slot the probe loop
+        // has to walk through. Without that, a table that is constantly inserted
+        // into and deleted from degenerates into a linear scan.
+        if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
+            if !map_grow[K, V](m, (*m).len * 2 + 8) {
+                return false
+            }
+        }
+        let mask: u64 = ((*m).cap as u64) -% 1
+        let states: u64 = (*m).state
+        var i: u64 = map_hash[K](k) & mask
+        while *((states +% i) as *mut u8) == 1 as u8 {
+            i = (i +% 1) & mask
+        }
+        // A tombstone gets overwritten -- afterwards it no longer counts as dead.
+        if *((states +% i) as *mut u8) == 2 as u8 {
+            (*m).dead = (*m).dead - 1
+        }
+        *(((*m).key +% i *% size_of[K]() as u64) as *mut K) = k
+        *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
+        *((states +% i) as *mut u8) = 1 as u8
+        (*m).len = (*m).len + 1
         return true
     }
-    // Load limit 3/4, tombstones count too: they occupy a slot the probe loop
-    // has to walk through. Without that, a table that is constantly inserted
-    // into and deleted from degenerates into a linear scan.
-    if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
-        if !map_grow[K, V](m, (*m).len * 2 + 8) {
-            return false
-        }
-    }
-    let mask: u64 = ((*m).cap as u64) -% 1
-    let states: u64 = (*m).state
-    var i: u64 = map_hash[K](k) & mask
-    while *((states +% i) as *mut u8) == 1 as u8 {
-        i = (i +% 1) & mask
-    }
-    // A tombstone gets overwritten -- afterwards it no longer counts as dead.
-    if *((states +% i) as *mut u8) == 2 as u8 {
-        (*m).dead = (*m).dead - 1
-    }
-    *(((*m).key +% i *% size_of[K]() as u64) as *mut K) = k
-    *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
-    *((states +% i) as *mut u8) = 1 as u8
-    (*m).len = (*m).len + 1
-    return true
 }
 
 // `true` if something really was removed.
@@ -699,48 +715,52 @@ fn bmap_new[V: Scalar]() -> BMap[V] {
 }
 
 fn bmap_free[V: Scalar](m: *mut BMap[V]) {
-    if (*m).cap > 0 {
-        gc_untrack[V]((*m).values) // r497
-        rt.heap_free((*m).hashes, (*m).cap * 8)
-        rt.heap_free((*m).koff, (*m).cap * 8)
-        rt.heap_free((*m).klen, (*m).cap * 4)
-        rt.heap_free((*m).values, (*m).cap * size_of[V]())
-        rt.heap_free((*m).state, (*m).cap)
+    unsafe {
+        if (*m).cap > 0 {
+            gc_untrack[V]((*m).values) // r497
+            rt.heap_free((*m).hashes, (*m).cap * 8)
+            rt.heap_free((*m).koff, (*m).cap * 8)
+            rt.heap_free((*m).klen, (*m).cap * 4)
+            rt.heap_free((*m).values, (*m).cap * size_of[V]())
+            rt.heap_free((*m).state, (*m).cap)
+        }
+        if (*m).blob_cap > 0 {
+            rt.heap_free((*m).blob, (*m).blob_cap)
+        }
+        (*m).hashes = 0
+        (*m).koff = 0
+        (*m).klen = 0
+        (*m).values = 0
+        (*m).state = 0
+        (*m).blob = 0
+        (*m).blob_len = 0
+        (*m).blob_cap = 0
+        (*m).cap = 0
+        (*m).len = 0
+        (*m).dead = 0
     }
-    if (*m).blob_cap > 0 {
-        rt.heap_free((*m).blob, (*m).blob_cap)
-    }
-    (*m).hashes = 0
-    (*m).koff = 0
-    (*m).klen = 0
-    (*m).values = 0
-    (*m).state = 0
-    (*m).blob = 0
-    (*m).blob_len = 0
-    (*m).blob_cap = 0
-    (*m).cap = 0
-    (*m).len = 0
-    (*m).dead = 0
 }
 
 // Keeps every allocation, throws away the content -- including the key
 // octets, which is the difference to `map_clear`: the blob starts at 0
 // again.
 fn bmap_clear[V: Scalar](m: *mut BMap[V]) {
-    if (*m).cap > 0 {
-        rt.mem_set((*m).state, 0 as u8, (*m).cap)
-        // r497: do not keep dead closures alive through stale slots
-        if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
+    unsafe {
+        if (*m).cap > 0 {
+            rt.mem_set((*m).state, 0 as u8, (*m).cap)
+            // r497: do not keep dead closures alive through stale slots
+            if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
+        }
+        (*m).len = 0
+        (*m).dead = 0
+        (*m).blob_len = 0
     }
-    (*m).len = 0
-    (*m).dead = 0
-    (*m).blob_len = 0
 }
 
-fn bmap_len[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).len }
-fn bmap_cap[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).cap }
+fn bmap_len[V: Scalar](m: *mut BMap[V]) -> usize { unsafe { return (*m).len } }
+fn bmap_cap[V: Scalar](m: *mut BMap[V]) -> usize { unsafe { return (*m).cap } }
 fn bmap_dead[V: Scalar](m: *mut BMap[V]) -> usize { return (*m).dead }
-fn bmap_is_empty[V: Scalar](m: *mut BMap[V]) -> bool { return (*m).len == 0 }
+fn bmap_is_empty[V: Scalar](m: *mut BMap[V]) -> bool { unsafe { return (*m).len == 0 } }
 
 // Every octet this map holds: the five slot arrays plus the key blob. For
 // the soak measurement -- a table that grows where it should not shows up
@@ -757,21 +777,27 @@ fn bmap_slot_used[V: Scalar](m: *mut BMap[V], i: usize) -> bool {
 }
 
 fn bmap_key_ptr[V: Scalar](m: *mut BMap[V], i: usize) -> u64 {
-    if i >= (*m).cap {
-        return 0
+    unsafe {
+        if i >= (*m).cap {
+            return 0
+        }
+        return (*m).blob + rt.ld64((*m).koff, i)
     }
-    return (*m).blob + rt.ld64((*m).koff, i)
 }
 
 fn bmap_key_len[V: Scalar](m: *mut BMap[V], i: usize) -> usize {
-    if i >= (*m).cap {
-        return 0
+    unsafe {
+        if i >= (*m).cap {
+            return 0
+        }
+        return rt.ld32((*m).klen, i) as usize
     }
-    return rt.ld32((*m).klen, i) as usize
 }
 
 fn bmap_key_span[V: Scalar](m: *mut BMap[V], i: usize) -> str.Span {
-    return str.span(bmap_key_ptr[V](m, i) as *mut u8, bmap_key_len[V](m, i))
+    unsafe {
+        return str.span(bmap_key_ptr[V](m, i) as *mut u8, bmap_key_len[V](m, i))
+    }
 }
 
 fn bmap_slot_value[V: Scalar](m: *mut BMap[V], i: usize) -> V {
@@ -789,14 +815,16 @@ fn bmap_slot_set_value[V: Scalar](m: *mut BMap[V], i: usize, v: V) {
 }
 
 fn bmap_next[V: Scalar](m: *mut BMap[V], ab: usize) -> usize {
-    var i: usize = ab
-    while i < (*m).cap {
-        if rt.ld8((*m).state, i) == 1 as u8 {
-            return i
+    unsafe {
+        var i: usize = ab
+        while i < (*m).cap {
+            if rt.ld8((*m).state, i) == 1 as u8 {
+                return i
+            }
+            i = i + 1
         }
-        i = i + 1
+        return (*m).cap
     }
-    return (*m).cap
 }
 
 fn bmap_first[V: Scalar](m: *mut BMap[V]) -> usize {
@@ -805,195 +833,203 @@ fn bmap_first[V: Scalar](m: *mut BMap[V]) -> usize {
 
 // Room for `n` more octets of key material.
 fn bmap_blob_reserve[V: Scalar](m: *mut BMap[V], n: usize) -> bool {
-    let need: usize = (*m).blob_len + n
-    if need <= (*m).blob_cap {
+    unsafe {
+        let need: usize = (*m).blob_len + n
+        if need <= (*m).blob_cap {
+            return true
+        }
+        var want: usize = (*m).blob_cap
+        if want == 0 {
+            want = 256
+        }
+        while want < need {
+            want = want * 2
+        }
+        let p: u64 = rt.heap_alloc(want)
+        if p == 0 {
+            return false
+        }
+        if (*m).blob_len > 0 {
+            rt.mem_copy(p, (*m).blob, (*m).blob_len)
+        }
+        if (*m).blob_cap > 0 {
+            rt.heap_free((*m).blob, (*m).blob_cap)
+        }
+        (*m).blob = p
+        (*m).blob_cap = want
         return true
     }
-    var want: usize = (*m).blob_cap
-    if want == 0 {
-        want = 256
-    }
-    while want < need {
-        want = want * 2
-    }
-    let p: u64 = rt.heap_alloc(want)
-    if p == 0 {
-        return false
-    }
-    if (*m).blob_len > 0 {
-        rt.mem_copy(p, (*m).blob, (*m).blob_len)
-    }
-    if (*m).blob_cap > 0 {
-        rt.heap_free((*m).blob, (*m).blob_cap)
-    }
-    (*m).blob = p
-    (*m).blob_cap = want
-    return true
 }
 
 // The slot of a key, `cap` if it is not there. Stops at state 0, runs
 // across state 2 -- the same rule as `map_find`, for the same reason.
 // THE HASH IS COMPARED FIRST: only a full 64 bit match reaches the octets.
 fn bmap_find[V: Scalar](m: *mut BMap[V], p: u64, n: usize, h: u64) -> usize {
-    if (*m).cap == 0 {
-        return 0
-    }
-    // rt.ld8/ld32/ld64 spelled out: no inliner at dev-fast
-    let cap: usize = (*m).cap
-    let mask: u64 = cap as u64 - 1
-    let st: u64 = (*m).state
-    let hs: u64 = (*m).hashes
-    let kl: u64 = (*m).klen
-    var i: u64 = h & mask
-    var steps: usize = 0
-    while steps < cap {
-        let z: u8 = *((st +% i) as *mut u8)
-        if z == 0 as u8 {
-            return cap
+    unsafe {
+        if (*m).cap == 0 {
+            return 0
         }
-        if z == 1 as u8 && *((hs +% i *% 8) as *mut u64) == h {
-            let kn: usize = (*((kl +% i *% 4) as *mut u32)) as usize
-            if kn == n {
-                if n == 0 {
-                    return i as usize
-                }
-                if rt.mem_eq((*m).blob +% *(((*m).koff +% i *% 8) as *mut u64), p, n) {
-                    return i as usize
+        // rt.ld8/ld32/ld64 spelled out: no inliner at dev-fast
+        let cap: usize = (*m).cap
+        let mask: u64 = cap as u64 - 1
+        let st: u64 = (*m).state
+        let hs: u64 = (*m).hashes
+        let kl: u64 = (*m).klen
+        var i: u64 = h & mask
+        var steps: usize = 0
+        while steps < cap {
+            let z: u8 = *((st +% i) as *mut u8)
+            if z == 0 as u8 {
+                return cap
+            }
+            if z == 1 as u8 && *((hs +% i *% 8) as *mut u64) == h {
+                let kn: usize = (*((kl +% i *% 4) as *mut u32)) as usize
+                if kn == n {
+                    if n == 0 {
+                        return i as usize
+                    }
+                    if rt.mem_eq((*m).blob +% *(((*m).koff +% i *% 8) as *mut u64), p, n) {
+                        return i as usize
+                    }
                 }
             }
+            i = (i +% 1) & mask
+            steps = steps + 1
         }
-        i = (i +% 1) & mask
-        steps = steps + 1
+        return cap
     }
-    return cap
 }
 
 // Writes a pair into a table that is known to have room and not to hold the
 // key. Only for `bmap_grow` and `bmap_set`; it appends the key octets to
 // the blob.
 fn bmap_raw_set[V: Scalar](m: *mut BMap[V], p: u64, n: usize, h: u64, v: V) -> bool {
-    if !bmap_blob_reserve[V](m, n) {
-        return false
-    }
-    let off: usize = (*m).blob_len
-    if n > 0 {
-        rt.mem_copy((*m).blob + off as u64, p, n)
-    }
-    (*m).blob_len = off + n
+    unsafe {
+        if !bmap_blob_reserve[V](m, n) {
+            return false
+        }
+        let off: usize = (*m).blob_len
+        if n > 0 {
+            rt.mem_copy((*m).blob + off as u64, p, n)
+        }
+        (*m).blob_len = off + n
 
-    let mask: u64 = (*m).cap as u64 - 1
-    let st: u64 = (*m).state
-    var i: u64 = h & mask
-    while *((st +% i) as *mut u8) == 1 as u8 {
-        i = (i +% 1) & mask
+        let mask: u64 = (*m).cap as u64 - 1
+        let st: u64 = (*m).state
+        var i: u64 = h & mask
+        while *((st +% i) as *mut u8) == 1 as u8 {
+            i = (i +% 1) & mask
+        }
+        if *((st +% i) as *mut u8) == 2 as u8 {
+            (*m).dead = (*m).dead - 1
+        }
+        *(((*m).hashes +% i *% 8) as *mut u64) = h
+        *(((*m).koff +% i *% 8) as *mut u64) = off as u64
+        *(((*m).klen +% i *% 4) as *mut u32) = n as u32
+        *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
+        *((st +% i) as *mut u8) = 1 as u8
+        (*m).len = (*m).len + 1
+        return true
     }
-    if *((st +% i) as *mut u8) == 2 as u8 {
-        (*m).dead = (*m).dead - 1
-    }
-    *(((*m).hashes +% i *% 8) as *mut u64) = h
-    *(((*m).koff +% i *% 8) as *mut u64) = off as u64
-    *(((*m).klen +% i *% 4) as *mut u32) = n as u32
-    *(((*m).values +% i *% size_of[V]() as u64) as *mut V) = v
-    *((st +% i) as *mut u8) = 1 as u8
-    (*m).len = (*m).len + 1
-    return true
 }
 
 // Rebuilds the table AND the blob: the new blob holds the live keys only,
 // which is what bounds the growth of a table that is deleted from (M1).
 fn bmap_grow[V: Scalar](m: *mut BMap[V], new_cap: usize) -> bool {
-    var cap: usize = 8
-    while cap < new_cap {
-        cap = cap * 2
-    }
-    let a_h: u64 = rt.heap_alloc(cap * 8)
-    let a_o: u64 = rt.heap_alloc(cap * 8)
-    let a_l: u64 = rt.heap_alloc(cap * 4)
-    let a_v: u64 = rt.heap_alloc(cap * size_of[V]())
-    let a_s: u64 = rt.heap_alloc(cap)
-    if a_h == 0 || a_o == 0 || a_l == 0 || a_v == 0 || a_s == 0 {
-        if a_h != 0 { rt.heap_free(a_h, cap * 8) }
-        if a_o != 0 { rt.heap_free(a_o, cap * 8) }
-        if a_l != 0 { rt.heap_free(a_l, cap * 4) }
-        if a_v != 0 { rt.heap_free(a_v, cap * size_of[V]()) }
-        if a_s != 0 { rt.heap_free(a_s, cap) }
-        return false
-    }
-    rt.mem_set(a_s, 0 as u8, cap)
-    gc_track[V](a_v, cap * size_of[V]()) // r497: root if V holds GC pointers
-
-    // How many octets the live keys really need.
-    var live: usize = 0
-    var i: usize = 0
-    let live_cap: usize = (*m).cap
-    let live_st: u64 = (*m).state
-    let live_kl: u64 = (*m).klen
-    while i < live_cap {
-        if *((live_st +% i as u64) as *mut u8) == 1 as u8 {
-            live = live + (*((live_kl +% i as u64 *% 4) as *mut u32)) as usize
+    unsafe {
+        var cap: usize = 8
+        while cap < new_cap {
+            cap = cap * 2
         }
-        i = i + 1
-    }
-    var bcap: usize = 256
-    while bcap < live + 1 {
-        bcap = bcap * 2
-    }
-    let a_b: u64 = rt.heap_alloc(bcap)
-    if a_b == 0 {
-        gc_untrack[V](a_v)
-        rt.heap_free(a_h, cap * 8)
-        rt.heap_free(a_o, cap * 8)
-        rt.heap_free(a_l, cap * 4)
-        rt.heap_free(a_v, cap * size_of[V]())
-        rt.heap_free(a_s, cap)
-        return false
-    }
-
-    let old_h: u64 = (*m).hashes
-    let old_o: u64 = (*m).koff
-    let old_l: u64 = (*m).klen
-    let old_v: u64 = (*m).values
-    let old_s: u64 = (*m).state
-    let old_b: u64 = (*m).blob
-    let old_cap: usize = (*m).cap
-    let old_bcap: usize = (*m).blob_cap
-
-    (*m).hashes = a_h
-    (*m).koff = a_o
-    (*m).klen = a_l
-    (*m).values = a_v
-    (*m).state = a_s
-    (*m).blob = a_b
-    (*m).blob_cap = bcap
-    (*m).blob_len = 0
-    (*m).cap = cap
-    (*m).len = 0
-    (*m).dead = 0
-
-    i = 0
-    while i < old_cap {
-        if *((old_s +% i as u64) as *mut u8) == 1 as u8 {
-            let kp: u64 = old_b +% *((old_o +% i as u64 *% 8) as *mut u64)
-            let kn: usize = (*((old_l +% i as u64 *% 4) as *mut u32)) as usize
-            let hv: u64 = *((old_h +% i as u64 *% 8) as *mut u64)
-            let vv: V = *((old_v +% i as u64 *% size_of[V]() as u64) as *mut V)
-            bmap_raw_set[V](m, kp, kn, hv, vv)
+        let a_h: u64 = rt.heap_alloc(cap * 8)
+        let a_o: u64 = rt.heap_alloc(cap * 8)
+        let a_l: u64 = rt.heap_alloc(cap * 4)
+        let a_v: u64 = rt.heap_alloc(cap * size_of[V]())
+        let a_s: u64 = rt.heap_alloc(cap)
+        if a_h == 0 || a_o == 0 || a_l == 0 || a_v == 0 || a_s == 0 {
+            if a_h != 0 { rt.heap_free(a_h, cap * 8) }
+            if a_o != 0 { rt.heap_free(a_o, cap * 8) }
+            if a_l != 0 { rt.heap_free(a_l, cap * 4) }
+            if a_v != 0 { rt.heap_free(a_v, cap * size_of[V]()) }
+            if a_s != 0 { rt.heap_free(a_s, cap) }
+            return false
         }
-        i = i + 1
-    }
+        rt.mem_set(a_s, 0 as u8, cap)
+        gc_track[V](a_v, cap * size_of[V]()) // r497: root if V holds GC pointers
 
-    if old_cap > 0 {
-        gc_untrack[V](old_v) // r497
-        rt.heap_free(old_h, old_cap * 8)
-        rt.heap_free(old_o, old_cap * 8)
-        rt.heap_free(old_l, old_cap * 4)
-        rt.heap_free(old_v, old_cap * size_of[V]())
-        rt.heap_free(old_s, old_cap)
+        // How many octets the live keys really need.
+        var live: usize = 0
+        var i: usize = 0
+        let live_cap: usize = (*m).cap
+        let live_st: u64 = (*m).state
+        let live_kl: u64 = (*m).klen
+        while i < live_cap {
+            if *((live_st +% i as u64) as *mut u8) == 1 as u8 {
+                live = live + (*((live_kl +% i as u64 *% 4) as *mut u32)) as usize
+            }
+            i = i + 1
+        }
+        var bcap: usize = 256
+        while bcap < live + 1 {
+            bcap = bcap * 2
+        }
+        let a_b: u64 = rt.heap_alloc(bcap)
+        if a_b == 0 {
+            gc_untrack[V](a_v)
+            rt.heap_free(a_h, cap * 8)
+            rt.heap_free(a_o, cap * 8)
+            rt.heap_free(a_l, cap * 4)
+            rt.heap_free(a_v, cap * size_of[V]())
+            rt.heap_free(a_s, cap)
+            return false
+        }
+
+        let old_h: u64 = (*m).hashes
+        let old_o: u64 = (*m).koff
+        let old_l: u64 = (*m).klen
+        let old_v: u64 = (*m).values
+        let old_s: u64 = (*m).state
+        let old_b: u64 = (*m).blob
+        let old_cap: usize = (*m).cap
+        let old_bcap: usize = (*m).blob_cap
+
+        (*m).hashes = a_h
+        (*m).koff = a_o
+        (*m).klen = a_l
+        (*m).values = a_v
+        (*m).state = a_s
+        (*m).blob = a_b
+        (*m).blob_cap = bcap
+        (*m).blob_len = 0
+        (*m).cap = cap
+        (*m).len = 0
+        (*m).dead = 0
+
+        i = 0
+        while i < old_cap {
+            if *((old_s +% i as u64) as *mut u8) == 1 as u8 {
+                let kp: u64 = old_b +% *((old_o +% i as u64 *% 8) as *mut u64)
+                let kn: usize = (*((old_l +% i as u64 *% 4) as *mut u32)) as usize
+                let hv: u64 = *((old_h +% i as u64 *% 8) as *mut u64)
+                let vv: V = *((old_v +% i as u64 *% size_of[V]() as u64) as *mut V)
+                bmap_raw_set[V](m, kp, kn, hv, vv)
+            }
+            i = i + 1
+        }
+
+        if old_cap > 0 {
+            gc_untrack[V](old_v) // r497
+            rt.heap_free(old_h, old_cap * 8)
+            rt.heap_free(old_o, old_cap * 8)
+            rt.heap_free(old_l, old_cap * 4)
+            rt.heap_free(old_v, old_cap * size_of[V]())
+            rt.heap_free(old_s, old_cap)
+        }
+        if old_bcap > 0 {
+            rt.heap_free(old_b, old_bcap)
+        }
+        return true
     }
-    if old_bcap > 0 {
-        rt.heap_free(old_b, old_bcap)
-    }
-    return true
 }
 
 fn bmap_reserve[V: Scalar](m: *mut BMap[V], n: usize) -> bool {
@@ -1004,19 +1040,21 @@ fn bmap_reserve[V: Scalar](m: *mut BMap[V], n: usize) -> bool {
 }
 
 fn bmap_set[V: Scalar](m: *mut BMap[V], p: u64, n: usize, v: V) -> bool {
-    let h: u64 = hash.hash_bytes(p, n)
-    let at: usize = bmap_find[V](m, p, n, h)
-    if at < (*m).cap {
-        *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V) = v
-        return true
-    }
-    // Load limit 3/4, tombstones included -- they cost probe steps.
-    if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
-        if !bmap_grow[V](m, (*m).len * 2 + 8) {
-            return false
+    unsafe {
+        let h: u64 = hash.hash_bytes(p, n)
+        let at: usize = bmap_find[V](m, p, n, h)
+        if at < (*m).cap {
+            *(((*m).values + at as u64 * size_of[V]() as u64) as *mut V) = v
+            return true
         }
+        // Load limit 3/4, tombstones included -- they cost probe steps.
+        if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
+            if !bmap_grow[V](m, (*m).len * 2 + 8) {
+                return false
+            }
+        }
+        return bmap_raw_set[V](m, p, n, h, v)
     }
-    return bmap_raw_set[V](m, p, n, h, v)
 }
 
 fn bmap_get[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> V {
@@ -1045,7 +1083,9 @@ fn bmap_get_if[V: Scalar](m: *mut BMap[V], p: u64, n: usize, out: *mut V) -> boo
 }
 
 fn bmap_has[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> bool {
-    return bmap_find[V](m, p, n, hash.hash_bytes(p, n)) < (*m).cap
+    unsafe {
+        return bmap_find[V](m, p, n, hash.hash_bytes(p, n)) < (*m).cap
+    }
 }
 
 // VALID ONLY until the table grows the next time -- same contract as
@@ -1059,14 +1099,16 @@ fn bmap_value_address[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> u64 {
 }
 
 fn bmap_delete[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> bool {
-    let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
-    if at >= (*m).cap {
-        return false
+    unsafe {
+        let at: usize = bmap_find[V](m, p, n, hash.hash_bytes(p, n))
+        if at >= (*m).cap {
+            return false
+        }
+        rt.st8((*m).state, at, 2 as u8)
+        (*m).len = (*m).len - 1
+        (*m).dead = (*m).dead + 1
+        return true
     }
-    rt.st8((*m).state, at, 2 as u8)
-    (*m).len = (*m).len - 1
-    (*m).dead = (*m).dead + 1
-    return true
 }
 
 fn bmap_take[V: Scalar](m: *mut BMap[V], p: u64, n: usize, out: *mut V) -> bool {
@@ -1078,15 +1120,17 @@ fn bmap_take[V: Scalar](m: *mut BMap[V], p: u64, n: usize, out: *mut V) -> bool 
 
 fn bmap_set_if_new[V: Scalar](m: *mut BMap[V], p: u64, n: usize, v: V,
     inserted: *mut bool) -> bool {
-    *inserted = false
-    if bmap_has[V](m, p, n) {
+    unsafe {
+        *inserted = false
+        if bmap_has[V](m, p, n) {
+            return true
+        }
+        if !bmap_set[V](m, p, n, v) {
+            return false
+        }
+        *inserted = true
         return true
     }
-    if !bmap_set[V](m, p, n, v) {
-        return false
-    }
-    *inserted = true
-    return true
 }
 
 // The counting pattern -- what a word frequency count is made of.
@@ -1113,45 +1157,49 @@ fn bmap_cleanup[V: Scalar](m: *mut BMap[V]) -> bool {
 // ------------------------------------------- the measurement, for BMap
 
 fn bmap_probe_of[V: Scalar](m: *mut BMap[V], p: u64, n: usize) -> usize {
-    if (*m).cap == 0 {
-        return 0
-    }
-    let h: u64 = hash.hash_bytes(p, n)
-    let mask: u64 = (*m).cap as u64 - 1
-    var i: u64 = h & mask
-    var steps: usize = 0
-    while steps < (*m).cap {
-        let z: u8 = rt.ld8((*m).state, i as usize)
-        if z == 0 as u8 {
-            return (*m).cap
+    unsafe {
+        if (*m).cap == 0 {
+            return 0
         }
-        if z == 1 as u8 && rt.ld64((*m).hashes, i as usize) == h {
-            let kn: usize = rt.ld32((*m).klen, i as usize) as usize
-            if kn == n && (n == 0
-                || rt.mem_eq((*m).blob + rt.ld64((*m).koff, i as usize), p, n)) {
-                return steps
+        let h: u64 = hash.hash_bytes(p, n)
+        let mask: u64 = (*m).cap as u64 - 1
+        var i: u64 = h & mask
+        var steps: usize = 0
+        while steps < (*m).cap {
+            let z: u8 = rt.ld8((*m).state, i as usize)
+            if z == 0 as u8 {
+                return (*m).cap
             }
+            if z == 1 as u8 && rt.ld64((*m).hashes, i as usize) == h {
+                let kn: usize = rt.ld32((*m).klen, i as usize) as usize
+                if kn == n && (n == 0
+                    || rt.mem_eq((*m).blob + rt.ld64((*m).koff, i as usize), p, n)) {
+                    return steps
+                }
+            }
+            i = (i + 1) & mask
+            steps = steps + 1
         }
-        i = (i + 1) & mask
-        steps = steps + 1
+        return (*m).cap
     }
-    return (*m).cap
 }
 
 fn bmap_probe_max[V: Scalar](m: *mut BMap[V]) -> usize {
-    var worst: usize = 0
-    var i: usize = 0
-    while i < (*m).cap {
-        if rt.ld8((*m).state, i) == 1 as u8 {
-            let s: usize = bmap_probe_of[V](m, bmap_key_ptr[V](m, i),
-                bmap_key_len[V](m, i))
-            if s < (*m).cap && s > worst {
-                worst = s
+    unsafe {
+        var worst: usize = 0
+        var i: usize = 0
+        while i < (*m).cap {
+            if rt.ld8((*m).state, i) == 1 as u8 {
+                let s: usize = bmap_probe_of[V](m, bmap_key_ptr[V](m, i),
+                    bmap_key_len[V](m, i))
+                if s < (*m).cap && s > worst {
+                    worst = s
+                }
             }
+            i = i + 1
         }
-        i = i + 1
+        return worst
     }
-    return worst
 }
 
 fn bmap_probe_total[V: Scalar](m: *mut BMap[V]) -> u64 {
@@ -1226,39 +1274,51 @@ fn bset_new() -> BSet {
     return BSet { m: bmap_new[u8]() }
 }
 
-fn bset_free(s: *mut BSet) { bmap_free[u8](&(*s).m) }
-fn bset_clear(s: *mut BSet) { bmap_clear[u8](&(*s).m) }
+fn bset_free(s: *mut BSet) { unsafe { bmap_free[u8](&(*s).m) } }
+fn bset_clear(s: *mut BSet) { unsafe { bmap_clear[u8](&(*s).m) } }
 
 fn bset_add(s: *mut BSet, p: u64, n: usize, added: *mut bool) -> bool {
-    return bmap_set_if_new[u8](&(*s).m, p, n, 1 as u8, added)
+    unsafe {
+        return bmap_set_if_new[u8](&(*s).m, p, n, 1 as u8, added)
+    }
 }
 
 fn bset_has(s: *mut BSet, p: u64, n: usize) -> bool {
-    return bmap_has[u8](&(*s).m, p, n)
+    unsafe {
+        return bmap_has[u8](&(*s).m, p, n)
+    }
 }
 
 fn bset_remove(s: *mut BSet, p: u64, n: usize) -> bool {
-    return bmap_delete[u8](&(*s).m, p, n)
+    unsafe {
+        return bmap_delete[u8](&(*s).m, p, n)
+    }
 }
 
 fn bset_add_span(s: *mut BSet, t: str.Span, added: *mut bool) -> bool {
-    return bset_add(s, t.p as u64, t.n, added)
+    unsafe {
+        return bset_add(s, t.p as u64, t.n, added)
+    }
 }
 
 fn bset_has_span(s: *mut BSet, t: str.Span) -> bool {
-    return bset_has(s, t.p as u64, t.n)
+    unsafe {
+        return bset_has(s, t.p as u64, t.n)
+    }
 }
 
 fn bset_remove_span(s: *mut BSet, t: str.Span) -> bool {
-    return bset_remove(s, t.p as u64, t.n)
+    unsafe {
+        return bset_remove(s, t.p as u64, t.n)
+    }
 }
 
-fn bset_len(s: *mut BSet) -> usize { return bmap_len[u8](&(*s).m) }
-fn bset_cap(s: *mut BSet) -> usize { return bmap_cap[u8](&(*s).m) }
-fn bset_is_empty(s: *mut BSet) -> bool { return bmap_is_empty[u8](&(*s).m) }
-fn bset_next(s: *mut BSet, ab: usize) -> usize { return bmap_next[u8](&(*s).m, ab) }
-fn bset_first(s: *mut BSet) -> usize { return bmap_first[u8](&(*s).m) }
-fn bset_key_ptr(s: *mut BSet, i: usize) -> u64 { return bmap_key_ptr[u8](&(*s).m, i) }
-fn bset_key_len(s: *mut BSet, i: usize) -> usize { return bmap_key_len[u8](&(*s).m, i) }
-fn bset_key_span(s: *mut BSet, i: usize) -> str.Span { return bmap_key_span[u8](&(*s).m, i) }
-fn bset_probe_max(s: *mut BSet) -> usize { return bmap_probe_max[u8](&(*s).m) }
+fn bset_len(s: *mut BSet) -> usize { unsafe { return bmap_len[u8](&(*s).m) } }
+fn bset_cap(s: *mut BSet) -> usize { unsafe { return bmap_cap[u8](&(*s).m) } }
+fn bset_is_empty(s: *mut BSet) -> bool { unsafe { return bmap_is_empty[u8](&(*s).m) } }
+fn bset_next(s: *mut BSet, ab: usize) -> usize { unsafe { return bmap_next[u8](&(*s).m, ab) } }
+fn bset_first(s: *mut BSet) -> usize { unsafe { return bmap_first[u8](&(*s).m) } }
+fn bset_key_ptr(s: *mut BSet, i: usize) -> u64 { unsafe { return bmap_key_ptr[u8](&(*s).m, i) } }
+fn bset_key_len(s: *mut BSet, i: usize) -> usize { unsafe { return bmap_key_len[u8](&(*s).m, i) } }
+fn bset_key_span(s: *mut BSet, i: usize) -> str.Span { unsafe { return bmap_key_span[u8](&(*s).m, i) } }
+fn bset_probe_max(s: *mut BSet) -> usize { unsafe { return bmap_probe_max[u8](&(*s).m) } }

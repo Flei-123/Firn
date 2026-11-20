@@ -242,7 +242,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             break;
         }
         let before = p.pos;
-        if !p.at(&TokKind::KwFn) {
+        if !p.at(&TokKind::KwFn) && !p.at_unsafe_fn() {
             p.error_here(format!(
                 "expected 'fn' in an impl block, found '{}'",
                 p.kind().text()
@@ -285,6 +285,10 @@ pub(crate) fn method(
     tsp: Span,
     is_for: bool,
 ) -> Option<FnDecl> {
+    let is_unsafe = p.at_unsafe_fn();
+    if is_unsafe {
+        p.bump();
+    }
     let start = p.bump(); // 'fn'
     let name = match p.ident("after 'fn' in an impl block") {
         Some((n, _)) => n,
@@ -349,6 +353,9 @@ pub(crate) fn method(
     }
     let saved_ret = std::mem::replace(&mut p.cur_ret, ret.clone());
     let mut body = p.block("at the start of the method body");
+    if is_unsafe {
+        crate::unsafety::mark(body.span);
+    }
     p.cur_ret = saved_ret;
     p.recovering = false;
     p.finish_body(&ref_params, &mut body);
@@ -837,6 +844,9 @@ pub(crate) fn hook_call(
         hit = Some(STEP_FLAGS_FN.to_string());
     }
     let full = hit.clone().unwrap_or_else(|| fn_name(&prefix, &method));
+    if crate::unsafety::is_unsafe_fn(&full) {
+        ck.require_unsafe(espan, crate::unsafety::CALL_SITE);
+    }
     let sig = match hit.and_then(|f| ck.fns.get(&f)) {
         Some(s) => s.clone(),
         None => {

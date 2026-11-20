@@ -145,20 +145,22 @@ fn fs_error(r: i64) -> FsError {
 // `path` with a terminating zero, in `c`. false = empty path or a zero
 // octet inside it.
 fn cpath(path: str, c: *mut rt.Buf) -> bool {
-    let n: usize = path.length()
-    if n == 0 {
-        return false
-    }
-    var i: usize = 0
-    while i < n {
-        if path.chars(i) == 0 as u8 {
+    unsafe {
+        let n: usize = path.length()
+        if n == 0 {
             return false
         }
-        i = i + 1
+        var i: usize = 0
+        while i < n {
+            if path.chars(i) == 0 as u8 {
+                return false
+            }
+            i = i + 1
+        }
+        rt.buf_push_bytes(c, path.p as u64, n)
+        rt.buf_push(c, 0 as u8)
+        return true
     }
-    rt.buf_push_bytes(c, path.p as u64, n)
-    rt.buf_push(c, 0 as u8)
-    return true
 }
 
 // ------------------------------------------------------------ Directories
@@ -309,68 +311,72 @@ fn remove(path: str) -> FsError!bool {
 // empty -- so no address of the frame is kept.
 #[allow_escape]
 fn remove_tree(path: str) -> FsError!bool {
-    let info: FileInfo = try lstat(path)
-    if info.kind != KIND_DIR {
+    unsafe {
+        let info: FileInfo = try lstat(path)
+        if info.kind != KIND_DIR {
+            return try remove(path)
+        }
+        // collect first, remove afterwards: removing entries while getdents64
+        // walks the same directory may skip some
+        var names: Vec[str] = vec_new[str]()
+        var d: dir.Dir = dir.open(path)
+        if !dir.is_open(&d) {
+            vec_free[str](&names)
+            return FsError::Permission
+        }
+        while dir.next(&d) {
+            vec_push[str](&names, path + "/" + d.name)
+        }
+        dir.close(&d)
+        var i: usize = 0
+        let n: usize = names.len
+        var failed: bool = false
+        while i < n && !failed {
+            let child: str = *vec_elem_ptr[str](&names, i)
+            // an entry that vanished meanwhile is what we wanted anyway
+            let ok: bool = remove_tree(child) catch | e | (e == FsError::NotFound)
+            if !ok {
+                failed = true
+            }
+            i = i + 1
+        }
+        vec_free[str](&names)
+        if failed {
+            return fs_error(0 - fs_errno)
+        }
         return try remove(path)
     }
-    // collect first, remove afterwards: removing entries while getdents64
-    // walks the same directory may skip some
-    var names: Vec[str] = vec_new[str]()
-    var d: dir.Dir = dir.open(path)
-    if !dir.is_open(&d) {
-        vec_free[str](&names)
-        return FsError::Permission
-    }
-    while dir.next(&d) {
-        vec_push[str](&names, path + "/" + d.name)
-    }
-    dir.close(&d)
-    var i: usize = 0
-    let n: usize = names.len
-    var failed: bool = false
-    while i < n && !failed {
-        let child: str = *vec_elem_ptr[str](&names, i)
-        // an entry that vanished meanwhile is what we wanted anyway
-        let ok: bool = remove_tree(child) catch | e | (e == FsError::NotFound)
-        if !ok {
-            failed = true
-        }
-        i = i + 1
-    }
-    vec_free[str](&names)
-    if failed {
-        return fs_error(0 - fs_errno)
-    }
-    return try remove(path)
 }
 
 // ------------------------------------------------------------ Inspection
 
 fn stat_with(path: str, flags: i64) -> FsError!FileInfo {
-    var c: rt.Buf = rt.buf_new()
-    if !cpath(path, &c) {
+    unsafe {
+        var c: rt.Buf = rt.buf_new()
+        if !cpath(path, &c) {
+            rt.buf_free(&c)
+            return FsError::Invalid
+        }
+        // struct statx is 256 octets: stx_mode u16 @28, stx_size u64 @40,
+        // stx_mtime {tv_sec i64, tv_nsec u32} @112
+        var sx: [u64; 32] = [0 as u64; 32]
+        let base: u64 = (&sx[0]) as u64
+        let r: i64 = syscall(FS_SYS_STATX, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, flags, FS_STATX_BASIC, base as i64, 0)
         rt.buf_free(&c)
-        return FsError::Invalid
+        if r < 0 {
+            return fs_error(r)
+        }
+        let mode: u32 = rt.ld16(base, 14) as u32 // octet 28
+        let fmt: u32 = mode & 61440 as u32 // S_IFMT 0o170000
+        var kind: u8 = KIND_OTHER
+        if fmt == 32768 as u32 { kind = KIND_FILE } // S_IFREG
+        if fmt == 16384 as u32 { kind = KIND_DIR } // S_IFDIR
+        if fmt == 40960 as u32 { kind = KIND_LINK } // S_IFLNK
+        let size: u64 = rt.ld64(base, 5) // octet 40
+        let sec: i64 = rt.ld64(base, 14) as i64 // octet 112
+        let nsec: i64 = rt.ld32(base, 30) as i64 // octet 120
+        return FileInfo { kind: kind, mode: mode & 4095 as u32, size: size, mtime_ns: sec * 1000000000 + nsec }
     }
-    // struct statx is 256 octets: stx_mode u16 @28, stx_size u64 @40,
-    // stx_mtime {tv_sec i64, tv_nsec u32} @112
-    var sx: [u64; 32] = [0 as u64; 32]
-    let base: u64 = (&sx[0]) as u64
-    let r: i64 = syscall(FS_SYS_STATX, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, flags, FS_STATX_BASIC, base as i64, 0)
-    rt.buf_free(&c)
-    if r < 0 {
-        return fs_error(r)
-    }
-    let mode: u32 = rt.ld16(base, 14) as u32 // octet 28
-    let fmt: u32 = mode & 61440 as u32 // S_IFMT 0o170000
-    var kind: u8 = KIND_OTHER
-    if fmt == 32768 as u32 { kind = KIND_FILE } // S_IFREG
-    if fmt == 16384 as u32 { kind = KIND_DIR } // S_IFDIR
-    if fmt == 40960 as u32 { kind = KIND_LINK } // S_IFLNK
-    let size: u64 = rt.ld64(base, 5) // octet 40
-    let sec: i64 = rt.ld64(base, 14) as i64 // octet 112
-    let nsec: i64 = rt.ld32(base, 30) as i64 // octet 120
-    return FileInfo { kind: kind, mode: mode & 4095 as u32, size: size, mtime_ns: sec * 1000000000 + nsec }
 }
 
 // Kind, size and modification time; symbolic links are followed.
@@ -466,27 +472,29 @@ fn fsync_dir(path: str) -> FsError!bool {
 
 // Appends the whole file to `out`; the answer is the number of octets read.
 fn read_file(path: str, out: *mut rt.Buf) -> FsError!usize {
-    let fd: i64 = try open_c(path, FS_O_READ, 0)
-    var total: usize = 0
-    while true {
-        rt.buf_reserve(out, (*out).len + 65536)
-        if (*out).cap < (*out).len + 65536 {
-            syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
-            return FsError::NoSpace
+    unsafe {
+        let fd: i64 = try open_c(path, FS_O_READ, 0)
+        var total: usize = 0
+        while true {
+            rt.buf_reserve(out, (*out).len + 65536)
+            if (*out).cap < (*out).len + 65536 {
+                syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+                return FsError::NoSpace
+            }
+            let r: i64 = syscall(FS_SYS_READ, fd, (rt.buf_ptr(out) + (*out).len as u64) as i64, 65536, 0, 0, 0)
+            if r < 0 {
+                syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+                return fs_error(r)
+            }
+            if r == 0 {
+                break
+            }
+            rt.buf_set_len(out, (*out).len + r as usize)
+            total = total + r as usize
         }
-        let r: i64 = syscall(FS_SYS_READ, fd, (rt.buf_ptr(out) + (*out).len as u64) as i64, 65536, 0, 0, 0)
-        if r < 0 {
-            syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
-            return fs_error(r)
-        }
-        if r == 0 {
-            break
-        }
-        rt.buf_set_len(out, (*out).len + r as usize)
-        total = total + r as usize
+        syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return total
     }
-    syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
-    return total
 }
 
 fn write_fd(fd: i64, p: u64, n: usize) -> i64 {
@@ -531,18 +539,20 @@ fn append_file(path: str, p: u64, n: usize) -> FsError!usize {
 // A name for a temporary file NEXT TO `path` ("<path>.tmp-<pid>-<n>"): same
 // directory = same volume, so renaming it over `path` stays atomic.
 fn temp_name_for(path: str) -> str {
-    let pid: i64 = syscall(FS_SYS_GETPID, 0, 0, 0, 0, 0, 0)
-    fs_counter = fs_counter + 1
-    var t: rt.Buf = rt.buf_new()
-    rt.buf_push_bytes(&t, path.p as u64, path.length())
-    let tail: str = ".tmp-"
-    rt.buf_push_bytes(&t, tail.p as u64, tail.length())
-    rt.buf_push_dec_i64(&t, pid)
-    rt.buf_push(&t, 45 as u8) // '-'
-    rt.buf_push_dec_u64(&t, fs_counter)
-    let tmp: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
-    rt.buf_free(&t)
-    return tmp
+    unsafe {
+        let pid: i64 = syscall(FS_SYS_GETPID, 0, 0, 0, 0, 0, 0)
+        fs_counter = fs_counter + 1
+        var t: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&t, path.p as u64, path.length())
+        let tail: str = ".tmp-"
+        rt.buf_push_bytes(&t, tail.p as u64, tail.length())
+        rt.buf_push_dec_i64(&t, pid)
+        rt.buf_push(&t, 45 as u8) // '-'
+        rt.buf_push_dec_u64(&t, fs_counter)
+        let tmp: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+        rt.buf_free(&t)
+        return tmp
+    }
 }
 
 // Creates a NEW file (never follows a link, never reuses a file) opened for
@@ -638,26 +648,28 @@ fn write_file_mode(path: str, p: u64, n: usize, mode: u32, exclusive: bool) -> F
 // access time stays as it is (UTIME_OMIT). `follow` false = the symbolic
 // link itself. On Windows the seam answers utimensat with SetFileTime.
 fn set_mtime(path: str, secs: i64, follow: bool) -> FsError!bool {
-    var c: rt.Buf = rt.buf_new()
-    if !cpath(path, &c) {
+    unsafe {
+        var c: rt.Buf = rt.buf_new()
+        if !cpath(path, &c) {
+            rt.buf_free(&c)
+            return FsError::Invalid
+        }
+        var ts: [i64; 4] = [0; 4]
+        ts[0] = 0
+        ts[1] = 1073741822 // UTIME_OMIT: leave the access time alone
+        ts[2] = secs
+        ts[3] = 0
+        var flags: i64 = 0
+        if !follow {
+            flags = 256 // AT_SYMLINK_NOFOLLOW
+        }
+        let r: i64 = syscall(FS_SYS_UTIMENSAT, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, (&ts[0]) as i64, flags, 0, 0)
         rt.buf_free(&c)
-        return FsError::Invalid
+        if r < 0 {
+            return fs_error(r)
+        }
+        return true
     }
-    var ts: [i64; 4] = [0; 4]
-    ts[0] = 0
-    ts[1] = 1073741822 // UTIME_OMIT: leave the access time alone
-    ts[2] = secs
-    ts[3] = 0
-    var flags: i64 = 0
-    if !follow {
-        flags = 256 // AT_SYMLINK_NOFOLLOW
-    }
-    let r: i64 = syscall(FS_SYS_UTIMENSAT, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, (&ts[0]) as i64, flags, 0, 0)
-    rt.buf_free(&c)
-    if r < 0 {
-        return fs_error(r)
-    }
-    return true
 }
 
 // Sets the permission bits of a file or directory (the lower 12 bits of

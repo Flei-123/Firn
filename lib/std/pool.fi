@@ -119,8 +119,10 @@ struct Pool {
 }
 
 fn nap_ms(ms: u64) {
-    var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
-    syscall(SYS_NANOSLEEP, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+    unsafe {
+        var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
+        syscall(SYS_NANOSLEEP, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+    }
 }
 
 // Starts `workers` threads (1 to 32) and a queue that holds `queue` jobs
@@ -168,62 +170,68 @@ fn pool_new(workers: u64, queue: u64) -> Pool {
 }
 
 fn worker_count(p: *mut Pool) -> u64 {
-    if (*p).blk == 0 {
-        return 0
+    unsafe {
+        if (*p).blk == 0 {
+            return 0
+        }
+        return rt.ld64((*p).blk, P_WORKERS)
     }
-    return rt.ld64((*p).blk, P_WORKERS)
 }
 
 // Takes a job record from the free list or from a new slab.
 fn job_alloc(blk: u64) -> u64 {
-    let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
-    thread_lock(lock)
-    var j: u64 = rt.ld64(blk, P_FREE)
-    if j != 0 {
-        rt.st64(blk, P_FREE, rt.ld64(j, J_NEXT_STATE) >> 8)
-    } else {
-        let n: u64 = rt.ld64(blk, P_SLABS)
-        if n < SLAB_MAX as u64 {
-            let slab: u64 = rt.heap_alloc(SLAB_JOBS * JOB_WORDS * 8)
-            if slab != 0 {
-                rt.mem_set(slab, 0 as u8, SLAB_JOBS * JOB_WORDS * 8)
-                rt.st64(blk, P_SLAB_LIST + n as usize, slab)
-                rt.st64(blk, P_SLABS, n + 1)
-                // record 0 is returned, 1.. go onto the free list
-                var k: usize = SLAB_JOBS - 1
-                while k >= 1 {
-                    let rec: u64 = slab + (k * JOB_WORDS * 8) as u64
-                    rt.st64(rec, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
-                    rt.st64(blk, P_FREE, rec)
-                    k = k - 1
+    unsafe {
+        let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
+        thread_lock(lock)
+        var j: u64 = rt.ld64(blk, P_FREE)
+        if j != 0 {
+            rt.st64(blk, P_FREE, rt.ld64(j, J_NEXT_STATE) >> 8)
+        } else {
+            let n: u64 = rt.ld64(blk, P_SLABS)
+            if n < SLAB_MAX as u64 {
+                let slab: u64 = rt.heap_alloc(SLAB_JOBS * JOB_WORDS * 8)
+                if slab != 0 {
+                    rt.mem_set(slab, 0 as u8, SLAB_JOBS * JOB_WORDS * 8)
+                    rt.st64(blk, P_SLAB_LIST + n as usize, slab)
+                    rt.st64(blk, P_SLABS, n + 1)
+                    // record 0 is returned, 1.. go onto the free list
+                    var k: usize = SLAB_JOBS - 1
+                    while k >= 1 {
+                        let rec: u64 = slab + (k * JOB_WORDS * 8) as u64
+                        rt.st64(rec, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
+                        rt.st64(blk, P_FREE, rec)
+                        k = k - 1
+                    }
+                    j = slab
                 }
-                j = slab
             }
         }
+        thread_unlock(lock)
+        return j
     }
-    thread_unlock(lock)
-    return j
 }
 
 // Queues `f(arg)`. The result is the job handle (for `job_done`,
 // `job_result`, `job_free`), or 0 when the pool is stopped or out of memory.
 // Blocks while the queue is full (Q2).
 fn submit(p: *mut Pool, f: fn(u64) -> u64, arg: u64) -> u64 {
-    let blk: u64 = (*p).blk
-    if blk == 0 || rt.ld64(blk, P_STOPPED) != 0 {
-        return 0
+    unsafe {
+        let blk: u64 = (*p).blk
+        if blk == 0 || rt.ld64(blk, P_STOPPED) != 0 {
+            return 0
+        }
+        let j: u64 = job_alloc(blk)
+        if j == 0 {
+            return 0
+        }
+        rt.st64(j, J_FN, f as u64)
+        rt.st64(j, J_ARG, arg)
+        rt.st64(j, J_RES, 0)
+        rt.st64(j, J_NEXT_STATE, 0)
+        __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, 1)
+        thread_channel_send(rt.ld64(blk, P_CHAN), j)
+        return j
     }
-    let j: u64 = job_alloc(blk)
-    if j == 0 {
-        return 0
-    }
-    rt.st64(j, J_FN, f as u64)
-    rt.st64(j, J_ARG, arg)
-    rt.st64(j, J_RES, 0)
-    rt.st64(j, J_NEXT_STATE, 0)
-    __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, 1)
-    thread_channel_send(rt.ld64(blk, P_CHAN), j)
-    return j
 }
 
 fn job_done(j: u64) -> bool {
@@ -240,91 +248,103 @@ fn job_result(j: u64) -> u64 {
 
 // Gives the record back for reuse. The handle is invalid afterwards.
 fn job_free(p: *mut Pool, j: u64) {
-    let blk: u64 = (*p).blk
-    if blk == 0 || j == 0 {
-        return
+    unsafe {
+        let blk: u64 = (*p).blk
+        if blk == 0 || j == 0 {
+            return
+        }
+        let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
+        thread_lock(lock)
+        rt.st64(j, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
+        rt.st64(blk, P_FREE, j)
+        thread_unlock(lock)
     }
-    let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
-    thread_lock(lock)
-    rt.st64(j, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
-    rt.st64(blk, P_FREE, j)
-    thread_unlock(lock)
 }
 
 fn pending(p: *mut Pool) -> u64 {
-    if (*p).blk == 0 {
-        return 0
+    unsafe {
+        if (*p).blk == 0 {
+            return 0
+        }
+        return rt.ld64((*p).blk, P_PENDING)
     }
-    return rt.ld64((*p).blk, P_PENDING)
 }
 
 fn completed(p: *mut Pool) -> u64 {
-    if (*p).blk == 0 {
-        return 0
+    unsafe {
+        if (*p).blk == 0 {
+            return 0
+        }
+        return rt.ld64((*p).blk, P_COMPLETED)
     }
-    return rt.ld64((*p).blk, P_COMPLETED)
 }
 
 // Returns when every job submitted so far has finished.
 fn wait_idle(p: *mut Pool) {
-    if (*p).blk == 0 {
-        return
-    }
-    while rt.ld64((*p).blk, P_PENDING) != 0 {
-        nap_ms(1)
+    unsafe {
+        if (*p).blk == 0 {
+            return
+        }
+        while rt.ld64((*p).blk, P_PENDING) != 0 {
+            nap_ms(1)
+        }
     }
 }
 
 // What the dispatcher calls for WORKER_KIND (see the head of this file).
 fn worker_main(blk: u64) -> u64 {
-    let ch: u64 = rt.ld64(blk, P_CHAN)
-    while true {
-        let j: u64 = thread_channel_receive(ch)
-        if j == 0 {
-            break
+    unsafe {
+        let ch: u64 = rt.ld64(blk, P_CHAN)
+        while true {
+            let j: u64 = thread_channel_receive(ch)
+            if j == 0 {
+                break
+            }
+            rt.st64(j, J_NEXT_STATE, 1)
+            let f: fn(u64) -> u64 = rt.ld64(j, J_FN) as fn(u64) -> u64
+            let r: u64 = f(rt.ld64(j, J_ARG))
+            rt.st64(j, J_RES, r)
+            // the counter is a locked instruction: it orders the result before the state
+            __atomic_add((blk + (P_COMPLETED * 8) as u64) as *mut u64, 1)
+            rt.st64(j, J_NEXT_STATE, 2)
+            __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, MINUS1)
         }
-        rt.st64(j, J_NEXT_STATE, 1)
-        let f: fn(u64) -> u64 = rt.ld64(j, J_FN) as fn(u64) -> u64
-        let r: u64 = f(rt.ld64(j, J_ARG))
-        rt.st64(j, J_RES, r)
-        // the counter is a locked instruction: it orders the result before the state
-        __atomic_add((blk + (P_COMPLETED * 8) as u64) as *mut u64, 1)
-        rt.st64(j, J_NEXT_STATE, 2)
-        __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, MINUS1)
+        return 0
     }
-    return 0
 }
 
 // Waits for the queued jobs, ends the workers and frees everything. The
 // pool and every job handle are invalid afterwards.
 fn shutdown(p: *mut Pool) {
-    let blk: u64 = (*p).blk
-    if blk == 0 {
-        return
+    unsafe {
+        let blk: u64 = (*p).blk
+        if blk == 0 {
+            return
+        }
+        rt.st64(blk, P_STOPPED, 1)
+        wait_idle(p)
+        let ch: u64 = rt.ld64(blk, P_CHAN)
+        let n: u64 = rt.ld64(blk, P_WORKERS)
+        var i: u64 = 0
+        while i < n {
+            thread_channel_send(ch, 0)
+            i = i + 1
+        }
+        i = 0
+        while i < n {
+            thread_wait(rt.ld64(blk, P_HANDLES + i as usize))
+            i = i + 1
+        }
+        thread_channel_free(ch)
+        var s: u64 = 0
+        let slabs: u64 = rt.ld64(blk, P_SLABS)
+        while s < slabs {
+            rt.heap_free(rt.ld64(blk, P_SLAB_LIST + s as usize), SLAB_JOBS * JOB_WORDS * 8)
+            s = s + 1
+        }
+        rt.heap_free(blk, P_WORDS * 8)
+        (*p).blk = 0
     }
-    rt.st64(blk, P_STOPPED, 1)
-    wait_idle(p)
-    let ch: u64 = rt.ld64(blk, P_CHAN)
-    let n: u64 = rt.ld64(blk, P_WORKERS)
-    var i: u64 = 0
-    while i < n {
-        thread_channel_send(ch, 0)
-        i = i + 1
-    }
-    i = 0
-    while i < n {
-        thread_wait(rt.ld64(blk, P_HANDLES + i as usize))
-        i = i + 1
-    }
-    thread_channel_free(ch)
-    var s: u64 = 0
-    let slabs: u64 = rt.ld64(blk, P_SLABS)
-    while s < slabs {
-        rt.heap_free(rt.ld64(blk, P_SLAB_LIST + s as usize), SLAB_JOBS * JOB_WORDS * 8)
-        s = s + 1
-    }
-    rt.heap_free(blk, P_WORDS * 8)
-    (*p).blk = 0
 }
 
 // `f(args[0])` .. `f(args[n-1])` on the pool; the results land in

@@ -68,7 +68,7 @@ fn methods(p: &mut Parser, base: &str, self_ty: &str, tsp: Span, params: &[TyPar
             return true;
         }
         let before = p.pos;
-        if !p.at(&TokKind::KwFn) {
+        if !p.at(&TokKind::KwFn) && !p.at_unsafe_fn() {
             p.error_here(format!(
                 "expected 'fn' in an impl block, found '{}'",
                 p.kind().text()

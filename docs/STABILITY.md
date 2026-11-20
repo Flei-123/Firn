@@ -49,5 +49,6 @@ A program that compiles and passes under an edition keeps compiling and keeps it
 - `tests/stable/neg/*.fi`: programs that must stay rejected (no crash, no acceptance).
 - `tests/stable/levels/*.fi`: programs whose first line `// expect_levels: dev=101 dev-fast=101 release-safe=101 release-fast=7` lists the exit code per build level (overflow, shifts, narrowing, wrapping operators).
 - `tools/stability/api_check.sh`: extracts the exported API of the std core modules (and the `std.rt` allow-list `rt_stable.txt`) and diffs it against `tools/stability/api_std.txt`. Removed or changed entries are a **breaking change** and fail the gate; new entries are reported and frozen with `--update`.
+- 20.11.2026: `std.math` `frexp` / `ldexp` are plain `fn` again (they were `unsafe fn` only through a hand edit of the generated `lib/std/math.fi`; `std.core` always had them safe). The frozen list was updated; callers are not affected.
 - Adding a golden: `bash tools/stability/freeze.sh` (copies new qualifying tests, never overwrites). Changing or deleting a golden requires a new edition and an entry in this file.
 - Run: `bash tools/stability/run.sh` (or `bash test.sh --stage` of section 151).
