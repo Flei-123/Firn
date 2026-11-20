@@ -491,7 +491,7 @@ impl<'a> Walk<'a> {
             e.kind,
             ExprKind::Ident(_) | ExprKind::Field(..) | ExprKind::Index(..)
         ) && !matches!(e.kind, ExprKind::Unary(UnOp::Deref, _));
-        if temp && self.is_nt(e) {
+        if temp && self.has_drop(e) {
             self.err(
                 e.span,
                 "a temporary that owns a value with a 'drop' is looked into".to_string(),
@@ -619,6 +619,21 @@ impl<'a> Walk<'a> {
                     }
                     None => false,
                 };
+                let by_address_recv = by_address_recv
+                    || match args.first().and_then(|a| self.ty(a)) {
+                        Some(t) => {
+                            crate::foreach::is_vec_slice(self.tcx, self.fns, name, t, args.len())
+                                || crate::foreach::vec_sugar(self.tcx, self.fns, name, t, args.len()).is_some()
+                        }
+                        None => false,
+                    };
+                let slice_assign = match args.first().and_then(|a| self.ty(a)) {
+                    Some(t) => matches!(
+                        crate::foreach::vec_sugar(self.tcx, self.fns, name, t, args.len()),
+                        Some(crate::foreach::VecSugar::Assign | crate::foreach::VecSugar::AssignStep)
+                    ),
+                    None => false,
+                };
                 let explicit_drop = crate::impls::method_name(name) == Some("drop");
                 for (i, a) in args.iter().enumerate() {
                     if i == 0 && by_address_recv {
@@ -628,6 +643,8 @@ impl<'a> Walk<'a> {
                             self.temp_check(a);
                             self.read(a);
                         }
+                    } else if slice_assign {
+                        self.read(a);
                     } else {
                         self.consume(a);
                     }
