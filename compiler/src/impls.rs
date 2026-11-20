@@ -378,7 +378,7 @@ pub(crate) fn method(
         body,
         span: start,
         attrs,
-        extern_info: None,
+        extern_info: None, is_const: false,
     })
 }
 

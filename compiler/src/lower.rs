@@ -2861,7 +2861,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
             body: d.body.clone(),
             span: d.span,
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         match lower_fn(&fd, info, dg) {
             Some(f) => m.funcs.push(f),
@@ -2957,7 +2957,7 @@ pub fn lower_reach(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Mo
                 body: d.body.clone(),
                 span: d.span,
                 attrs: Vec::new(),
-                extern_info: None,
+                extern_info: None, is_const: false,
             };
             lower_fn(&fd, info, dg)
         };
@@ -3086,7 +3086,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(sum), span: Span::new(1, 1, 1) }]),
             span: Span::new(1, 1, 1),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -3125,7 +3125,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -3194,7 +3194,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
 
         // --- fn main() -> i32 ---
@@ -3244,7 +3244,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
 
         let prog = Program { funcs: vec![sum_decl, mainf], expr_count: b.next, ..Default::default() };
@@ -3317,7 +3317,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(

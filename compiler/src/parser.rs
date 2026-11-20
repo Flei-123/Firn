@@ -2458,7 +2458,16 @@ compute it",
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn))
     }
 
+    pub(crate) fn at_const_fn(&self) -> bool {
+        self.at(&TokKind::KwConst)
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn))
+    }
+
     fn fn_decl(&mut self, prog: &mut Program) {
+        let is_const = self.at_const_fn();
+        if is_const {
+            self.bump();
+        }
         let is_unsafe = matches!(self.kind(), TokKind::Ident(w) if w == "unsafe");
         if is_unsafe {
             self.bump();
@@ -2534,7 +2543,7 @@ compute it",
                 body,
                 span: start,
                 attrs,
-                extern_info: Some(ExternInfo { link_name }),
+                extern_info: Some(ExternInfo { link_name }), is_const: false,
             });
             return;
         }
@@ -2555,7 +2564,7 @@ compute it",
         self.cur_ret = saved_ret;
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
-        prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
+        prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None, is_const });
     }
 
     fn struct_decl(&mut self, prog: &mut Program) {
@@ -2942,6 +2951,7 @@ compute it",
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
                 _ if self.at_unsafe_fn() => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
+                TokKind::KwConst if self.at_const_fn() => self.fn_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
                 TokKind::KwStatic => self.static_decl(&mut prog),
                 TokKind::KwProfile => self.profile_decl(&mut prog),

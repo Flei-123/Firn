@@ -438,7 +438,7 @@ mod tests {
             } else {
                 Vec::new()
             },
-            extern_info: None,
+            extern_info: None, is_const: false,
         }
     }
 

@@ -420,6 +420,7 @@ pub struct FnDecl {
     /// **Round 75** — `Some` marks the declaration as `extern fn`
     /// (SPEC §14.5). `None` is an ordinary Firn function with a real body.
     pub extern_info: Option<ExternInfo>,
+    pub is_const: bool,
 }
 
 #[derive(Clone, Debug)]

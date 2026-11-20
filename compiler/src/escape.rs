@@ -1139,7 +1139,7 @@ mod tests {
             body: Block { stmts, span: sp(1, 1), end: sp(9, 1) },
             span: sp(1, 1),
             attrs,
-            extern_info: None,
+            extern_info: None, is_const: false,
         }
     }
 

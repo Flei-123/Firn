@@ -43,6 +43,7 @@ use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::Span;
 use crate::types::Type;
 use crate::fx::HashMap;
+use crate::comptime_value::{coerce, element_shape, follow, follow_mut, shape_of, to_int, Shape, Value, MAX_ARRAY_LEN};
 
 /// Upper bound of statements executed per `comptime` evaluation.
 const MAX_STEPS: u64 = 2_000_000;
@@ -51,12 +52,19 @@ const MAX_DEPTH: u32 = 64;
 
 type Error = (Span, String);
 
+struct Slot {
+    value: Value,
+    shape: Shape,
+}
+
+type Env = Vec<HashMap<String, Slot>>;
+
 /// Result of one executed statement.
 enum Flow {
     /// carry on with the next statement
     Next,
     /// `return` with value (or 0 for `return` without value)
-    Back(i128),
+    Back(Value),
     Abort,
     Resume,
 }
@@ -68,6 +76,7 @@ pub(crate) struct Execution<'a> {
     /// Type of every expression (for the width at conversions).
     expr_types: &'a [Type],
     steps: u64,
+    in_const_fn: bool,
     /// Source text built up by `emit_*`.
     pub(crate) output: String,
     /// Directory of the root source file — the ONLY place `file_*` is
@@ -88,13 +97,13 @@ impl<'a> Execution<'a> {
             consts,
             expr_types,
             steps: 0,
+            in_const_fn: false,
             output: String::new(),
             base: std::path::PathBuf::from("."),
             files: HashMap::default(),
         }
     }
 
-    /// Calls the given function with arguments that are already evaluated.
     pub(crate) fn call_on(
         &mut self,
         name: &str,
@@ -102,6 +111,17 @@ impl<'a> Execution<'a> {
         span: Span,
         depth: u32,
     ) -> Result<i128, Error> {
+        let values: Vec<Value> = args.iter().map(|a| Value::Int(*a)).collect();
+        to_int(self.call_value(name, &values, span, depth)?, span)
+    }
+
+    pub(crate) fn call_value(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        span: Span,
+        depth: u32,
+    ) -> Result<Value, Error> {
         if depth >= MAX_DEPTH {
             return Err((
                 span,
@@ -128,22 +148,31 @@ impl<'a> Execution<'a> {
                 ),
             ));
         }
-        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::default()];
-        for (p, v) in f.params.iter().zip(args.iter()) {
-            env[0].insert(p.name.clone(), *v);
+        if self.in_const_fn && !f.is_const {
+            return Err((
+                span,
+                format!("comptime: a 'const fn' can only call 'const fn', '{}' is not one", name),
+            ));
         }
-        match self.block(&f.body, &mut env, depth)? {
-            Flow::Back(v) => Ok(v),
-            // A function without `return` yields 0 — the type checker made
-            // sure beforehand that this happens with `-> void` only.
-            _ => Ok(0),
+        let mut env: Env = vec![HashMap::default()];
+        for (p, v) in f.params.iter().zip(args.iter()) {
+            let shape = shape_of(&p.ty);
+            env[0].insert(p.name.clone(), Slot { value: coerce(v.clone(), &shape), shape });
+        }
+        let saved = std::mem::replace(&mut self.in_const_fn, f.is_const);
+        let flow = self.block(&f.body, &mut env, depth);
+        self.in_const_fn = saved;
+        let ret = f.ret.as_ref().map(shape_of).unwrap_or(Shape::Any);
+        match flow? {
+            Flow::Back(v) => Ok(coerce(v, &ret)),
+            _ => Ok(Value::Int(0)),
         }
     }
 
     fn block(
         &mut self,
         b: &Block,
-        env: &mut Vec<HashMap<String, i128>>,
+        env: &mut Env,
         depth: u32,
     ) -> Result<Flow, Error> {
         env.push(HashMap::default());
@@ -161,7 +190,7 @@ impl<'a> Execution<'a> {
     fn stmt(
         &mut self,
         s: &Stmt,
-        env: &mut Vec<HashMap<String, i128>>,
+        env: &mut Env,
         depth: u32,
     ) -> Result<Flow, Error> {
         self.steps += 1;
@@ -176,39 +205,28 @@ impl<'a> Execution<'a> {
         }
         match s {
             Stmt::Error(_) => Ok(Flow::Next),
-            Stmt::Let { name, init, .. } => {
-                let v = self.expr(init, env, depth)?;
+            Stmt::Let { name, ty, init, .. } => {
+                let shape = ty.as_ref().map(shape_of).unwrap_or(Shape::Any);
+                let v = coerce(self.value(init, env, depth)?, &shape);
                 if let Some(top) = env.last_mut() {
-                    top.insert(name.clone(), v);
+                    top.insert(name.clone(), Slot { value: v, shape });
                 }
                 Ok(Flow::Next)
             }
-            // ROUND 70: the comptime interpreter knows no compound
-            // assignment. It refuses it with a message instead of
-            // computing something wrong.
-            Stmt::AssignOp { span, .. } | Stmt::Step { span, .. } => Err((
-                *span,
-                "comptime: '+=' and '++' are not available inside a comptime block".to_string(),
-            )),
+            Stmt::AssignOp { target, op, value, span } => {
+                let rhs = self.expr(value, env, depth)?;
+                self.update(target, env, depth, *span, |old| compute(*op, old, rhs, *span))?;
+                Ok(Flow::Next)
+            }
+            Stmt::Step { target, up, span } => {
+                let delta = if *up { 1 } else { -1 };
+                self.update(target, env, depth, *span, |old| Ok(old + delta))?;
+                Ok(Flow::Next)
+            }
             Stmt::Assign { target, value, span } => {
-                let v = self.expr(value, env, depth)?;
-                let name = match &target.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => {
-                        return Err((
-                            *span,
-                            "comptime: only assignments to a local variable (no field, no index, no pointer)"
-                                .to_string(),
-                        ))
-                    }
-                };
-                for level in env.iter_mut().rev() {
-                    if let Some(slot) = level.get_mut(&name) {
-                        *slot = v;
-                        return Ok(Flow::Next);
-                    }
-                }
-                Err((*span, format!("comptime: '{}' is not a local variable", name)))
+                let v = self.value(value, env, depth)?;
+                self.store(target, env, depth, *span, |_| Ok(v))?;
+                Ok(Flow::Next)
             }
             Stmt::Expr(e) => {
                 self.expr(e, env, depth)?;
@@ -217,8 +235,8 @@ impl<'a> Execution<'a> {
             Stmt::Block(b) => self.block(b, env, depth),
             Stmt::Return { value, .. } => {
                 let v = match value {
-                    Some(e) => self.expr(e, env, depth)?,
-                    None => 0,
+                    Some(e) => self.value(e, env, depth)?,
+                    None => Value::Int(0),
                 };
                 Ok(Flow::Back(v))
             }
@@ -271,7 +289,7 @@ impl<'a> Execution<'a> {
                     }
                     env.push(HashMap::default());
                     if let Some(top) = env.last_mut() {
-                        top.insert(name.clone(), i);
+                        top.insert(name.clone(), Slot { value: Value::Int(i), shape: Shape::Any });
                     }
                     let r = self.block(body, env, depth);
                     env.pop();
@@ -348,7 +366,7 @@ impl<'a> Execution<'a> {
     fn expr(
         &mut self,
         e: &Expr,
-        env: &mut Vec<HashMap<String, i128>>,
+        env: &mut Env,
         depth: u32,
     ) -> Result<i128, Error> {
         let no = |msg: &str| Err((e.span, format!("comptime: {}", msg)));
@@ -358,8 +376,8 @@ impl<'a> Execution<'a> {
             ExprKind::Float(..) => no("floating point is not yet possible at compile time"),
             ExprKind::Ident(n) => {
                 for level in env.iter().rev() {
-                    if let Some(v) = level.get(n) {
-                        return Ok(*v);
+                    if let Some(slot) = level.get(n) {
+                        return to_int(slot.value.clone(), e.span);
                     }
                 }
                 match self.consts.get(n) {
@@ -400,8 +418,14 @@ point is not yet possible at compile time",
                 let b = self.expr(r, env, depth)?;
                 compute(*op, a, b, e.span)
             }
-            ExprKind::Cast(inner, _) => {
+            ExprKind::Index(..) => to_int(self.read_index(e, env, depth)?, e.span),
+            ExprKind::Cast(inner, te) => {
                 let v = self.expr(inner, env, depth)?;
+                match shape_of(te) {
+                    Shape::Int(t) => return Ok(crate::sema::comptime_wrap(v, &t)),
+                    Shape::Bool => return Ok((v != 0) as i128),
+                    _ => {}
+                }
                 let target = self
                     .expr_types
                     .get(e.id as usize)
@@ -451,14 +475,125 @@ point is not yet possible at compile time",
                 }
                 let mut values = Vec::with_capacity(args.len());
                 for a in args {
-                    values.push(self.expr(a, env, depth)?);
+                    values.push(self.value(a, env, depth)?);
                 }
-                self.call_on(name, &values, e.span, depth + 1)
+                to_int(self.call_value(name, &values, e.span, depth + 1)?, e.span)
             }
             _ => no(
-                "only literals, names, operators, conversions and calls are allowed here",
+                "only literals, names, operators, conversions, array indexing and calls are allowed here",
             ),
         }
+    }
+
+    fn value(&mut self, e: &Expr, env: &mut Env, depth: u32) -> Result<Value, Error> {
+        match &e.kind {
+            ExprKind::ArrayLit(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.value(it, env, depth)?);
+                }
+                Ok(Value::Arr(out))
+            }
+            ExprKind::ArrayRepeat(item, count) => {
+                let n = self.expr(count, env, depth)?;
+                if !(0..=MAX_ARRAY_LEN).contains(&n) {
+                    return Err((count.span, format!("comptime: array length {} is not in 0..={}", n, MAX_ARRAY_LEN)));
+                }
+                let one = self.value(item, env, depth)?;
+                Ok(Value::Arr(vec![one; n as usize]))
+            }
+            ExprKind::Text(_, inner) => self.value(inner, env, depth),
+            ExprKind::Ident(n) => {
+                for level in env.iter().rev() {
+                    if let Some(slot) = level.get(n) {
+                        return Ok(slot.value.clone());
+                    }
+                }
+                Ok(Value::Int(self.expr(e, env, depth)?))
+            }
+            ExprKind::Index(..) => self.read_index(e, env, depth),
+            ExprKind::Call(name, args, _) if self.prog.funcs.iter().any(|f| f.name == *name) => {
+                let mut values = Vec::with_capacity(args.len());
+                for a in args {
+                    values.push(self.value(a, env, depth)?);
+                }
+                self.call_value(name, &values, e.span, depth + 1)
+            }
+            _ => Ok(Value::Int(self.expr(e, env, depth)?)),
+        }
+    }
+
+    fn index_path<'e>(
+        &mut self,
+        e: &'e Expr,
+        env: &mut Env,
+        depth: u32,
+    ) -> Result<(&'e Expr, Vec<i128>), Error> {
+        let mut exprs: Vec<&Expr> = Vec::new();
+        let mut cur = e;
+        while let ExprKind::Index(base, idx) = &cur.kind {
+            exprs.push(idx);
+            cur = base;
+        }
+        exprs.reverse();
+        let mut path = Vec::with_capacity(exprs.len());
+        for ie in exprs {
+            path.push(self.expr(ie, env, depth)?);
+        }
+        Ok((cur, path))
+    }
+
+    fn read_index(&mut self, e: &Expr, env: &mut Env, depth: u32) -> Result<Value, Error> {
+        let (root, path) = self.index_path(e, env, depth)?;
+        if let ExprKind::Ident(n) = &root.kind {
+            for level in env.iter().rev() {
+                if let Some(slot) = level.get(n) {
+                    return follow(&slot.value, &path, e.span).cloned();
+                }
+            }
+        }
+        let base = self.value(root, env, depth)?;
+        follow(&base, &path, e.span).cloned()
+    }
+
+    fn store(
+        &mut self,
+        target: &Expr,
+        env: &mut Env,
+        depth: u32,
+        span: Span,
+        make: impl FnOnce(&Value) -> Result<Value, Error>,
+    ) -> Result<(), Error> {
+        let (root, path) = self.index_path(target, env, depth)?;
+        let ExprKind::Ident(name) = &root.kind else {
+            return Err((
+                span,
+                "comptime: only assignments to a local variable or an element of one (no field, no pointer)".to_string(),
+            ));
+        };
+        for level in env.iter_mut().rev() {
+            if let Some(slot) = level.get_mut(name) {
+                let shape = element_shape(&slot.shape, path.len());
+                let cell = follow_mut(&mut slot.value, &path, span)?;
+                let new = make(cell)?;
+                *cell = coerce(new, &shape);
+                return Ok(());
+            }
+        }
+        Err((span, format!("comptime: '{}' is not a local variable", name)))
+    }
+
+    fn update(
+        &mut self,
+        target: &Expr,
+        env: &mut Env,
+        depth: u32,
+        span: Span,
+        change: impl FnOnce(i128) -> Result<i128, Error>,
+    ) -> Result<(), Error> {
+        self.store(target, env, depth, span, |old| {
+            Ok(Value::Int(change(to_int(old.clone(), span)?)?))
+        })
     }
 }
 
@@ -582,7 +717,7 @@ pub(crate) fn run_blocks_out(
     for (b, _span) in &prog.comptime_blocks {
         let mut run = Execution::new(prog, &empty_consts, &empty_types);
         run.base = base.to_path_buf();
-        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::default()];
+        let mut env: Env = vec![HashMap::default()];
         match run.block(b, &mut env, 0) {
             Ok(_) => total.push_str(&run.output),
             Err((span, msg)) => dg.error(span, msg),

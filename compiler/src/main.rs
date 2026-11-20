@@ -47,6 +47,8 @@ mod asm_a64;
 mod asm_dwarf;
 mod elfobj;
 mod comptime;
+mod comptime_value;
+mod constfn;
 mod env;
 mod brand;
 mod brand_compat;

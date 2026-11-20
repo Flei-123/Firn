@@ -302,6 +302,7 @@ impl<'a> Checker<'a> {
         crate::iface::hook_check_impls(self);
         // Check and apply the attributes (attrs.rs)
         self.check_attrs(prog);
+        crate::constfn::check(prog, &mut self.dg);
         self.check_consts(prog);
         // ROUND 89: after the constants, because a `static`'s initial value
         // may name a `const` (`static mut BUF: [u8; SIZE] = [0; SIZE]`),
@@ -1064,11 +1065,14 @@ so it has to be known while compiling -- there is no code that runs before \
                             out.extend_from_slice(&one);
                         }
                     }
+                    ExprKind::Call(name, args, _) => {
+                        self.static_from_call(name, args, e.span, ty, out)?;
+                    }
                     _ => {
                         return Err((
                             e.span,
                             "the initial value of an array 'static' must be an array literal \
-('[a, b, c]', '[0; n]' or a text literal)"
+('[a, b, c]', '[0; n]' a text literal or a call of a 'const fn')"
                                 .to_string(),
                         ))
                     }
@@ -1150,6 +1154,27 @@ compile time)"
             out.resize(start + want, 0);
         }
         Ok(())
+    }
+
+    fn static_from_call(
+        &self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        ty: &Type,
+        out: &mut Vec<u8>,
+    ) -> Result<(), (Span, String)> {
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            values.push(crate::comptime_value::Value::Int(self.eval_const(a)?));
+        }
+        let prog = match self.prog {
+            Some(p) => unsafe { &*p },
+            None => return Err((span, "comptime: the program is not available here".to_string())),
+        };
+        let mut run = crate::comptime::Execution::new(prog, &self.consts, &self.expr_types);
+        let value = run.call_value(name, &values, span, 0)?;
+        crate::comptime_value::encode(&value, ty, span, out)
     }
 
     /// The bit pattern of a floating point initial value of a `static`. The
@@ -3855,7 +3880,7 @@ pub(crate) fn fmt_spec_head(name: &str) -> Option<&str> {
     }
 }
 
-fn prim_type(name: &str) -> Option<Type> {
+pub(crate) fn prim_type(name: &str) -> Option<Type> {
     // ROUND 70: `int`/`long`/`byte`/... are only a second spelling; they
     // are folded onto the canonical name here and are therefore THE SAME
     // type (types.rs::canon_name).
@@ -4232,7 +4257,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(ret_base), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let ret_main = b.int(0);
         let first = Program {
@@ -4259,7 +4284,7 @@ mod tests {
                 body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
-                extern_info: None,
+                extern_info: None, is_const: false,
             }],
             expr_count: b.next,
             ..Default::default()
@@ -4297,7 +4322,7 @@ mod tests {
                 body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
-                extern_info: None,
+                extern_info: None, is_const: false,
             }],
             expr_count: b.next,
             ..Default::default()
@@ -4343,7 +4368,7 @@ mod tests {
             params: Vec::new(),
             ret: Some(named("i32")),
             body: blk(body),
-            span: sp(), attrs: Vec::new(), extern_info: None,
+            span: sp(), attrs: Vec::new(), extern_info: None, is_const: false,
         }
     }
 
@@ -4727,7 +4752,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(fret), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let prog = Program {
             profile: None,
@@ -4945,7 +4970,7 @@ mod tests {
             body: blk(Vec::new()),
             span: sp(),
             attrs: Vec::new(),
-            extern_info: None,
+            extern_info: None, is_const: false,
         };
         let prog = Program {
             profile: None,

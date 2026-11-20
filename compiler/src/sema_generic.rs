@@ -618,7 +618,7 @@ impl<'a> Parser<'a> {
         self.cur_ret = saved_ret;
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
-        Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new(), extern_info: None })
+        Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new(), extern_info: None, is_const: false })
     }
 
     fn generic_struct_template(&mut self) {
