@@ -3,7 +3,7 @@ import re
 import sys
 from pathlib import Path
 
-DECL = re.compile(r"^(?:gc\s+)?(fn|struct|enum|error|interface|const|type|static|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
+DECL = re.compile(r"^(?:unsafe\s+)?(?:gc\s+)?(fn|struct|enum|error|interface|const|type|static|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
 EXPORT_START = re.compile(r"^export\s*\{")
 
 

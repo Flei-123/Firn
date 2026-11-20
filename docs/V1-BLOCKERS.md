@@ -21,3 +21,4 @@ Found while writing `docs/STABILITY.md`. Each item is a roadmap point (group "v1
 | 15 | **Name**: rename Firn to Fission is not approved. Keep the manifest file and CLI names as they are (`brand_compat`). | Renaming after 1.0 breaks every project. | B |
 | 16 | **Diagnostics**: error text is unstable by design; tools (LSP, editors) need a machine-readable code per error. | Without error codes tools parse text. | C |
 | 17 | **Edition differences list** does not exist yet: only `2026` is defined. The first change that needs a second edition starts the list. | Mechanism is in place (`--edition`, manifest key), content is empty. | C |
+| 18 | **`unsafe fn` in the std core**: N16 marked `std.math.frexp/ldexp` as `unsafe fn`; the API gate flagged it as a signature change. Is `unsafe` part of the stable signature? Callers break under `--unsafe=error`. | Decide before the std core list is final; the frozen list was refreshed once for this (pre-1.0). | B |
