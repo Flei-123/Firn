@@ -140,6 +140,7 @@ mod simd_a64;
 mod sizeof;
 mod split;
 mod statics;
+mod generic_enum;
 mod sema_generic;
 mod sema_match;
 mod peephole;

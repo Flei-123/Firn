@@ -255,6 +255,10 @@ fn expand_struct(
     queue: &mut Vec<(String, Instantiation)>,
     next_id: &mut u32,
 ) {
+    if let Some(tpl) = crate::generic_enum::template(&inst.base) {
+        expand_enum(dg, fnames, mangled, inst, &tpl, queue);
+        return;
+    }
     let tpl = match sema_generic::struct_template(&inst.base) {
         Some(t) => t,
         None => {
@@ -276,6 +280,31 @@ fn expand_struct(
     }
     prog.structs.push(decl);
     expand_methods(prog, dg, fnames, mangled, inst, queue, next_id);
+}
+
+fn expand_enum(
+    dg: &mut Diags,
+    fnames: &HashSet<String>,
+    mangled: &str,
+    inst: &Instantiation,
+    tpl: &crate::generic_enum::EnumTemplate,
+    queue: &mut Vec<(String, Instantiation)>,
+) {
+    let map = match bind_params(dg, fnames, &tpl.params, inst, "generic enum") {
+        Some(m) => m,
+        None => return,
+    };
+    let mut def = tpl.def.clone();
+    def.name = mangled.to_string();
+    def.base = Some(inst.base.clone());
+    for v in def.variants.iter_mut() {
+        for te in v.field_tys.iter_mut() {
+            *te = subst_ty(te, &map, queue);
+        }
+    }
+    if !crate::sema_match::register_enum(def) {
+        dg.error(inst.span, format!("enum '{}' is already declared", mangled));
+    }
 }
 
 fn satisfies(te: &TypeExpr, b: &Bound) -> bool {

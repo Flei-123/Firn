@@ -60,6 +60,7 @@ pub(crate) struct VariantDef {
 #[derive(Clone, Debug)]
 pub(crate) struct EnumDef {
     pub(crate) name: String,
+    pub(crate) base: Option<String>,
     pub(crate) span: Span,
     pub(crate) variants: Vec<VariantDef>,
     /// Index into `TypeCtx::structs`
@@ -181,6 +182,20 @@ thread_local! {
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
     crate::sema_generic::reset();
+    crate::generic_enum::reset();
+}
+
+pub(crate) fn register_enum(def: EnumDef) -> bool {
+    REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        if reg.by_name.contains_key(&def.name) {
+            return false;
+        }
+        let i = reg.enums.len();
+        reg.by_name.insert(def.name.clone(), i);
+        reg.enums.push(def);
+        true
+    })
 }
 
 pub(crate) fn enum_count() -> usize {
@@ -290,10 +305,25 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
+        let tparams = if self.at(&TokKind::LBracket) {
+            match self.generic_params() {
+                Some(p) => Some(p),
+                None => {
+                    self.recovering = false;
+                    self.sync_item();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if !self.expect(TokKind::LBrace, "after the name of the enum") {
             self.recovering = false;
             self.sync_item();
             return;
+        }
+        if tparams.is_some() {
+            crate::sema_generic::enter_template();
         }
         let mut variants: Vec<VariantDef> = Vec::new();
         loop {
@@ -348,6 +378,9 @@ impl<'a> Parser<'a> {
         let end = self.span();
         self.close(TokKind::RBrace, "at the end of the enum");
         self.recovering = false;
+        if tparams.is_some() {
+            crate::sema_generic::leave_template();
+        }
         if variants.is_empty() {
             self.dg.error(
                 nspan,
@@ -357,22 +390,21 @@ impl<'a> Parser<'a> {
         }
         let def = EnumDef {
             name: name.clone(),
+            base: None,
             span: Parser::join(start, end),
             variants,
             struct_idx: usize::MAX,
             size: 0,
             align: 1,
         };
-        let duplicate = REG.with(|r| {
-            let mut reg = r.borrow_mut();
-            if reg.by_name.contains_key(&name) {
-                return true;
+        let duplicate = match tparams {
+            Some(params) => {
+                crate::sema_generic::register_struct_name(&name);
+                let tpl = crate::generic_enum::EnumTemplate { params, def };
+                !crate::generic_enum::add_template(&name, tpl)
             }
-            let i = reg.enums.len();
-            reg.enums.push(def);
-            reg.by_name.insert(name.clone(), i);
-            false
-        });
+            None => !register_enum(def),
+        };
         if duplicate {
             self.dg
                 .error(nspan, format!("enum '{}' is already declared", name));
@@ -609,22 +641,27 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if let TokKind::Ident(name) = p.kind().clone() {
         if p.types_at_colon2(1) && matches!(p.tk(3), TokKind::Ident(_)) {
             let sp = p.bump();
-            p.types_eat_colon2();
-            let (vname, vspan) = p.ident("after '::'")?;
-            let full = format!("{}::{}", name, vname);
-            let mut args = Vec::new();
-            let mut end = vspan;
-            if p.at(&TokKind::LParen) {
-                p.bump();
-                let (a, e) = p.call_args("after the payload of the variant");
-                args = a;
-                end = e;
-            }
-            let span = Parser::join(sp, end);
-            return Some(p.mk(span, ExprKind::Call(full, args, span)));
+            return ctor_tail(p, name, sp);
         }
     }
     crate::sema_generic::hook_primary(p)
+}
+
+/// `::Variant(args)` behind the enum name `ename` (cursor at the `::`).
+pub(crate) fn ctor_tail(p: &mut Parser, ename: String, sp: Span) -> Option<Expr> {
+    p.types_eat_colon2();
+    let (vname, vspan) = p.ident("after '::'")?;
+    let full = format!("{}::{}", ename, vname);
+    let mut args = Vec::new();
+    let mut end = vspan;
+    if p.at(&TokKind::LParen) {
+        p.bump();
+        let (a, e) = p.call_args("after the payload of the variant");
+        args = a;
+        end = e;
+    }
+    let span = Parser::join(sp, end);
+    Some(p.mk(span, ExprKind::Call(full, args, span)))
 }
 
 // ------------------------------------------- Registration at the type context
@@ -886,9 +923,22 @@ pub(crate) fn hook_call(
         return Some(Type::Void);
     }
     if let Some((ename, vname)) = name.split_once("::") {
-        return Some(check_ctor(ck, ename, vname, args, nspan, espan));
+        let hint = crate::generic_enum::take_hint();
+        return Some(check_ctor(ck, ename, vname, args, nspan, espan, hint));
     }
     None
+}
+
+fn instance_for_hint(ename: &str, hint: Option<Type>) -> Option<EnumDef> {
+    let idx = match hint {
+        Some(Type::Struct(i)) => i,
+        _ => return None,
+    };
+    enum_by_struct(idx).filter(|d| d.base.as_deref() == Some(ename))
+}
+
+fn enum_for_pattern(name: &str, ty: &Type) -> Option<EnumDef> {
+    enum_by_name(name).or_else(|| instance_for_hint(name, Some(ty.clone())))
 }
 
 fn check_ctor(
@@ -898,15 +948,23 @@ fn check_ctor(
     args: &[Expr],
     nspan: Span,
     espan: Span,
+    hint: Option<Type>,
 ) -> Type {
-    let def = match enum_by_name(ename) {
+    let def = match enum_by_name(ename).or_else(|| instance_for_hint(ename, hint)) {
         Some(d) => d,
         None => {
             for a in args {
                 ck.type_out_expr(a);
             }
-            ck.dg
-                .error(nspan, format!("unknown enum '{}'", ename));
+            if crate::generic_enum::template(ename).is_some() {
+                ck.dg.error_note(
+                    nspan,
+                    format!("cannot infer the type arguments of the generic enum '{}'", ename),
+                    format!("write '{}[T]::{}' or give the value a declared type", ename, vname),
+                );
+            } else {
+                ck.dg.error(nspan, format!("unknown enum '{}'", ename));
+            }
             return Type::Error;
         }
     };
@@ -1200,7 +1258,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
         Pattern::Variant { ename, vname, subs, span } => {
             // determine the enum of the pattern
             let def = match ename {
-                Some(n) => match enum_by_name(n) {
+                Some(n) => match enum_for_pattern(n, ty) {
                     Some(d) => Some(d),
                     None => {
                         ck.dg.error(*span, format!("unknown enum '{}'", n));

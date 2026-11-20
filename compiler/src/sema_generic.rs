@@ -231,6 +231,15 @@ pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name:
     }
 }
 
+pub(crate) fn register_struct_name(name: &str) {
+    REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        if !reg.struct_names.iter().any(|n| n == name) {
+            reg.struct_names.push(name.to_string());
+        }
+    });
+}
+
 pub(crate) fn enter_template() {
     REG.with(|r| r.borrow_mut().in_template += 1);
 }
@@ -689,7 +698,7 @@ pub(crate) fn hook_prescan(toks: &[Token]) {
     for i in 0..toks.len() {
         let k = &toks[i].kind;
         let is_fn = matches!(k, TokKind::KwFn);
-        let is_st = matches!(k, TokKind::KwStruct);
+        let is_st = matches!(k, TokKind::KwStruct | TokKind::KwEnum);
         if !is_fn && !is_st {
             continue;
         }
@@ -1005,6 +1014,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             if let Some((member, full)) = qual_struct_head(p, &m, sp0) {
                 let args = p.generic_args()?;
                 let mangled = p.note_inst(&member, args, full, false);
+                if p.types_at_colon2(0) {
+                    return crate::sema_match::ctor_tail(p, mangled, sp0);
+                }
                 if p.at(&TokKind::LBrace) && !p.no_struct_lit {
                     return Some(p.struct_lit(mangled, full));
                 }
@@ -1031,6 +1043,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     p.bump();
     let args = p.generic_args()?;
     let mangled = p.note_inst(&name, args, sp, false);
+    if p.types_at_colon2(0) {
+        return crate::sema_match::ctor_tail(p, mangled, sp);
+    }
     if p.at(&TokKind::LBrace) && !p.no_struct_lit {
         return Some(p.struct_lit(mangled, sp));
     }

@@ -2411,6 +2411,7 @@ constants declared before it, and '+ - * /'"
                 if let Some(t) = crate::errors::hook_call(self, e.id, name, args, *nspan, e.span) {
                     return t;
                 }
+                crate::generic_enum::set_hint(hint);
                 self.call(name, args, *nspan, e.span)
             }
             ExprKind::Syscall(args) => {
