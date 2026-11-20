@@ -7,9 +7,6 @@ pub fn generate(decl: &Decl, names: &[String]) -> Result<String, String> {
     if has("Default") && (!decl.generics.is_empty() || matches!(decl.body, Body::Enum(_))) {
         return Err("derive(Default) works on non-generic structs only".to_string());
     }
-    if !decl.generics.is_empty() && matches!(decl.body, Body::Enum(_)) {
-        return Err("derive on a generic enum needs 'match' inside generic templates (roadmap r1573)".to_string());
-    }
     let mut methods = String::new();
     let mut frees = String::new();
     for n in names {
@@ -55,6 +52,7 @@ fn struct_method(name: &str, decl: &Decl, fields: &[(String, String)]) -> String
             });
             format!("fn cmp(*self, o: {}) -> i64 {{ {} return 0 }} ", h, steps)
         }
+        "Json" => struct_json(fields),
         "Hash" => {
             let steps = joined(fields, "", " ", |f, t| {
                 let v = expr::hash(t, &format!("(*self).{}", f));
@@ -85,6 +83,17 @@ fn struct_debug(decl: &Decl, fields: &[(String, String)]) -> String {
         s.push_str("c = derive.dbg_text(c, \" }\"); ");
     }
     s.push_str("return derive.dbg_done(c) } ");
+    s
+}
+
+fn struct_json(fields: &[(String, String)]) -> String {
+    let mut s = String::from("fn to_json(*self) -> str { var c = derive.dbg_new(); c = derive.dbg_text(c, \"{\"); ");
+    for (i, (f, t)) in fields.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "," };
+        let v = expr::json(t, &format!("(*self).{}", f));
+        s.push_str(&format!("c = derive.json_field(c, \"{}\", \"{}\", {}); ", f, sep, v));
+    }
+    s.push_str("c = derive.dbg_text(c, \"}\"); return derive.dbg_done(c) } ");
     s
 }
 

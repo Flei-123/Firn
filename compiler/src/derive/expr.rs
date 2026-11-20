@@ -8,6 +8,13 @@ pub fn debug(ty: &str, value: &str) -> String {
     format!("{}.debug()", value)
 }
 
+pub fn json(ty: &str, value: &str) -> String {
+    if ty == STR {
+        return format!("derive.json_str({})", value);
+    }
+    format!("{}.to_json()", value)
+}
+
 pub fn clone(ty: &str, value: &str) -> String {
     if ty == STR {
         return value.to_string();

@@ -172,6 +172,7 @@ struct Registry {
     by_name: HashMap<String, usize>,
     by_struct: HashMap<usize, usize>,
     matches: Vec<MatchInfo>,
+    fresh: crate::fx::HashSet<usize>,
 }
 
 thread_local! {
@@ -246,6 +247,20 @@ pub(crate) fn put_match(idx: usize, m: MatchInfo) {
     })
 }
 
+pub(crate) fn push_fresh_match(info: MatchInfo) -> usize {
+    REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        reg.matches.push(info);
+        let idx = reg.matches.len() - 1;
+        reg.fresh.insert(idx);
+        idx
+    })
+}
+
+pub(crate) fn take_fresh(idx: usize) -> bool {
+    REG.with(|r| r.borrow_mut().fresh.remove(&idx))
+}
+
 pub(crate) fn match_index_of(name: &str) -> Option<usize> {
     name.strip_prefix(MATCH_PREFIX).and_then(|s| s.parse::<usize>().ok())
 }
@@ -307,7 +322,10 @@ impl<'a> Parser<'a> {
         };
         let tparams = if self.at(&TokKind::LBracket) {
             match self.generic_params() {
-                Some(p) => Some(p),
+                Some(mut p) => {
+                    self.where_params(&mut p, "enum");
+                    Some(p)
+                }
                 None => {
                     self.recovering = false;
                     self.sync_item();
@@ -414,15 +432,6 @@ impl<'a> Parser<'a> {
     /// `match subject { pattern => { .. } .. }` as a statement.
     fn types_match_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'match'
-        if crate::sema_generic::in_template() {
-            // The body blocks of the cases sit in the registry, not in the
-            // AST — a template could not replace them per instantiation.
-            self.dg.error_note(
-                start,
-                "'match' inside a generic template is not supported in this stage",
-                "move the pattern match into a non-generic function",
-            );
-        }
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
         let subject = self.expr();

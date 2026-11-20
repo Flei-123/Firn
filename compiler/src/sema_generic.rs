@@ -514,7 +514,7 @@ impl<'a> Parser<'a> {
             Some(d) => d,
             None => return,
         };
-        self.apply_where(&mut tparams, clauses);
+        self.apply_where(&mut tparams, clauses, "function");
         let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.fns.contains_key(&name) {
@@ -563,12 +563,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn apply_where(&mut self, tparams: &mut [TyParam], clauses: Vec<(String, Bound, Span)>) {
+    pub(crate) fn where_params(&mut self, tparams: &mut [TyParam], what: &str) {
+        self.where_clause();
+        let clauses = REG.with(|r| std::mem::take(&mut r.borrow_mut().where_clauses));
+        self.apply_where(tparams, clauses, what);
+    }
+
+    fn apply_where(&mut self, tparams: &mut [TyParam], clauses: Vec<(String, Bound, Span)>, what: &str) {
         for (pname, bound, span) in clauses {
             let param = match tparams.iter_mut().find(|p| p.name == pname) {
                 Some(p) => p,
                 None => {
-                    self.dg.error(span, format!("'where' clause names '{}', which is no type parameter of the function", pname));
+                    self.dg.error(span, format!("'where' clause names '{}', which is no type parameter of the {}", pname, what));
                     continue;
                 }
             };
@@ -632,7 +638,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        let tparams = match self.generic_params() {
+        let mut tparams = match self.generic_params() {
             Some(p) => p,
             None => {
                 self.recovering = false;
@@ -640,6 +646,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
+        self.where_params(&mut tparams, "struct");
         if !self.expect(TokKind::LBrace, "after the structure name") {
             self.recovering = false;
             self.sync_item();

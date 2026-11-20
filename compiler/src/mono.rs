@@ -257,6 +257,7 @@ fn expand_struct(
 ) {
     if let Some(tpl) = crate::generic_enum::template(&inst.base) {
         expand_enum(dg, fnames, mangled, inst, &tpl, queue);
+        expand_methods(prog, dg, fnames, mangled, inst, queue, next_id);
         return;
     }
     let tpl = match sema_generic::struct_template(&inst.base) {
@@ -478,7 +479,7 @@ fn subst_call_name(
     }
 }
 
-fn subst_block(b: &mut Block, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
+pub(crate) fn subst_block(b: &mut Block, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     for s in b.stmts.iter_mut() {
         subst_stmt(s, map, queue);
     }
@@ -526,7 +527,7 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
     }
 }
 
-fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
+pub(crate) fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     let sp = e.span;
     match &mut e.kind {
         ExprKind::Named(_, v, _) => subst_expr(v, map, queue),
@@ -568,6 +569,10 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
             subst_expr(i, map, queue);
         }
         ExprKind::Call(name, args, _) => {
+            if let Some(idx) = crate::sema_match::match_index_of(name) {
+                *name = crate::mono_match::clone_substituted(idx, map, queue);
+                return;
+            }
             *name = subst_call_name(name, sp, map, queue);
             for a in args.iter_mut() {
                 subst_expr(a, map, queue);
@@ -676,7 +681,15 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
             renumber_expr(b, next);
             renumber_expr(i, next);
         }
-        ExprKind::Call(_, args, _) | ExprKind::Syscall(args) => {
+        ExprKind::Call(name, args, _) => {
+            if let Some(idx) = crate::sema_match::match_index_of(name) {
+                crate::mono_match::renumber_fresh(idx, next);
+            }
+            for a in args.iter_mut() {
+                renumber_expr(a, next);
+            }
+        }
+        ExprKind::Syscall(args) => {
             for a in args.iter_mut() {
                 renumber_expr(a, next);
             }

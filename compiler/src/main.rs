@@ -99,6 +99,7 @@ mod lower_errors;
 mod lower_match;
 mod modules;
 mod mono;
+mod mono_match;
 mod mem2reg;
 mod heapstat;
 mod memcpy_idiom;

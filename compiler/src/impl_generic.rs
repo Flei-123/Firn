@@ -33,10 +33,11 @@ fn impl_decl(p: &mut Parser, base: &str) {
         Some(x) => x,
         None => return abort(p),
     };
-    let params = match p.generic_params() {
+    let mut params = match p.generic_params() {
         Some(x) => x,
         None => return abort(p),
     };
+    p.where_params(&mut params, "impl block");
     let args: Vec<TypeExpr> = params
         .iter()
         .map(|t| TypeExpr::Named(t.name.clone(), tsp))

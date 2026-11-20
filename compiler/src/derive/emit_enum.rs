@@ -28,8 +28,25 @@ pub fn method(name: &str, decl: &Decl, variants: &[Variant]) -> String {
         ),
         "Hash" => format!("fn hash(*self) -> u64 {{ match *self {{ {} }} }} ", arms(variants, |i, v| hash_arm(decl, i, v))),
         "Ord" => ord_methods(decl, variants),
+        "Json" => format!("fn to_json(*self) -> str {{ match *self {{ {} }} }} ", arms(variants, |_, v| json_arm(decl, v))),
         _ => format!("fn clone(*self) -> {} {{ match *self {{ {} }} }} ", h, arms(variants, |_, v| clone_arm(decl, v))),
     }
+}
+
+fn json_arm(decl: &Decl, v: &Variant) -> String {
+    let head = pattern(decl, v, "a");
+    if v.types.is_empty() {
+        return format!("{} => {{ return derive.json_str(\"{}\") }}", head, v.name);
+    }
+    let mut s = format!("{} => {{ var c = derive.dbg_new(); c = derive.dbg_text(c, \"{{\\\"{}\\\":[\"); ", head, v.name);
+    for (i, (b, t)) in binds(v, "a").iter().zip(&v.types).enumerate() {
+        if i > 0 {
+            s.push_str("c = derive.dbg_text(c, \",\"); ");
+        }
+        s.push_str(&format!("c = derive.dbg_text(c, {}); ", expr::json(t, b)));
+    }
+    s.push_str("c = derive.dbg_text(c, \"]}\"); return derive.dbg_done(c) }");
+    s
 }
 
 fn debug_arm(decl: &Decl, v: &Variant) -> String {

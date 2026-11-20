@@ -13,7 +13,7 @@ pub struct Fail {
 
 const ATTR_OPEN: &str = "#[derive(";
 const IMPORT_TEXT: &str = "import std.derive; ";
-const KNOWN: &[&str] = &["Debug", "Eq", "Ord", "Hash", "Clone", "Default"];
+const KNOWN: &[&str] = &["Debug", "Eq", "Ord", "Hash", "Clone", "Default", "Json"];
 
 fn position(src: &str, at: usize) -> (u32, u32) {
     let before = &src[..at];
