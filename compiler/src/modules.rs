@@ -376,20 +376,22 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
 
 fn nogc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     let mut needs = false;
+    let mut threads = false;
     let mut has_allocerror = false;
     for f in files {
         let mut dg = Diags::new("<gc-search>", &f.src);
         let toks = lexer::lex_file_cached(&f.src, f.id, &mut dg);
         needs |= crate::strtype::source_uses_str(&toks);
+        threads |= crate::gcfree::source_uses_threads(&toks);
         has_allocerror |= crate::gc::source_has_allocerror(&toks);
     }
-    if !needs {
+    if !needs && !threads {
         return None;
     }
     Some(SourceFile {
         id: files.len() as u32,
         path: PathBuf::from(crate::gcfree::RUNTIME_PATH),
-        src: crate::gcfree::runtime_source(!has_allocerror),
+        src: crate::gcfree::runtime_source(!has_allocerror, threads),
     })
 }
 

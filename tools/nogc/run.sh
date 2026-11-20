@@ -25,6 +25,9 @@ for src in tools/nogc/cases/*.fi; do
   [ "$got" = "$want" ] && check "$name out" ok || check "$name out" bad "got '$got' want '$want'"
   syms=$(nm "$D/$name" | grep -c 'gc_init\|__gc_')
   [ "$syms" = 0 ] && check "$name no-gc-symbols" ok || check "$name no-gc-symbols" bad "$syms gc symbols"
+  if grep -q '^// nogc_only' "$src"; then
+    continue
+  fi
   if "$FIRNC" --no-cache "$src" -o "$D/$name.gc" >/dev/null 2>&1; then
     gcgot=$("$D/$name.gc" | tr '\n' ' ' | sed 's/ $//')
     [ "$gcgot" = "$got" ] && check "$name same-as-gc" ok || check "$name same-as-gc" bad "gc '$gcgot'"

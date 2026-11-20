@@ -13,6 +13,10 @@ pub(crate) const RUNTIME_PATH: &str = "lib/gc/nogc.fi";
 
 const RUNTIME: &str = include_str!("../../lib/gc/nogc.fi");
 
+const THREAD_RUNTIME: &str = include_str!("../../lib/gc/nogc_thread.fi");
+
+const THREAD_PREFIXES: &[&str] = &["thread_", "__thread"];
+
 const GC_TYPES: &[&str] = &["Gc", "GcWeak"];
 
 const GC_PREFIXES: &[&str] = &["GcVec", "GcMap", "gcvec_", "gcmap_"];
@@ -25,13 +29,23 @@ pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-pub(crate) fn runtime_source(with_error_set: bool) -> String {
+pub(crate) fn runtime_source(with_error_set: bool, with_threads: bool) -> String {
     let mut s = String::new();
     if with_error_set {
         s.push_str("error AllocError { OutOfMemory }\n");
     }
     s.push_str(RUNTIME);
+    if with_threads {
+        s.push_str(THREAD_RUNTIME);
+    }
     s
+}
+
+pub(crate) fn source_uses_threads(toks: &[Token]) -> bool {
+    toks.iter().any(|t| match &t.kind {
+        TokKind::Ident(a) => THREAD_PREFIXES.iter().any(|p| a.starts_with(p)),
+        _ => false,
+    })
 }
 
 pub(crate) fn message(what: &str) -> String {
