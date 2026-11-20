@@ -42,13 +42,17 @@ Typing rules: values are `i128` internally; every store into a typed local, para
 
 Errors carry source position: index out of range, division by zero, endless loop, non-const call, pointer use.
 
+## firnc1
+
+firnc1 runs the same interpreter (`lib/firnc1/construn.fi`, values in `cvalue.fi`, operators in `cops.fi`, static encoding in `cencode.fi`) for `const`, `static` array initializers and `[v; N]` counts; messages and positions equal firnc0 (tests/diff/*const_fn*).
+
 ## Not supported (yet)
 
 - struct values, `str`, floats inside a `const fn`
 - arrays as `const` (only `static`)
 - array length expressions in types: `[u8; N]` needs a literal; `[v; N]` repeat counts may use consts and `const fn` calls
 - const generics `[const N: usize]`
-- firnc1: parses `const fn`, runs the same three checks (`lib/firnc1/constfn.fi`: calls of non-const fn, pointers, floating point) and compiles runtime-only use; a call in a const context (`const`, `static`, array count) is not evaluated there and the file answers exit 4 (`ct_needed`). Interpreter port with arrays/statics is open (r1596)
+- firnc1 values are `i64` (not `i128`): `u64` values at or above 2^63 compare and shift as signed; shifts of 64..127 give the wrapped result, outside 0..127 is an error. Statement errors in firnc1 underline one character, firnc0 the whole statement, and firnc1 omits the `= note:` that firnc0 adds to errors inside a `static` initializer
 
 ## Tests
 
