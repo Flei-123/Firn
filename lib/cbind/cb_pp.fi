@@ -1,0 +1,683 @@
+import std.rt
+import std.io
+import std.vec
+import std.dict
+import std.pystr
+import cbind.cb_util
+import cbind.cb_lex
+import cbind.cb_expr
+
+export { Pp, pp_new, pp_file, pp_text, pp_define, pp_eval_macros, pp_warn, pp_finish }
+
+const MAX_INCLUDE_DEPTH: u32 = 32
+const COND_ACTIVE: i32 = 1
+const COND_TAKEN: i32 = 2
+const COND_PARENT: i32 = 4
+
+struct Macro {
+    name: str,
+    func: bool,
+    variadic: bool,
+    params: Vec[str],
+    body: Vec[cb_lex.Tok],
+    live: bool,
+    file: u32,
+}
+
+struct Pp {
+    macros: Vec[Macro],
+    index: Dict[i32],
+    inc_dirs: Vec[str],
+    files: Vec[str],
+    foreign: Vec[bool],
+    out: Vec[cb_lex.Tok],
+    once: Dict[bool],
+    warns: Vec[str],
+    empty: Dict[i64],
+    depth: u32,
+}
+
+fn pp_new() -> Pp {
+    var pp: Pp = Pp {
+        macros: vec_new[Macro](), index: dict_new[i32](), inc_dirs: vec_new[str](), files: vec_new[str](),
+        foreign: vec_new[bool](), out: vec_new[cb_lex.Tok](), once: dict_new[bool](), warns: vec_new[str](),
+        empty: dict_new[i64](), depth: 0,
+    }
+    vec_push[str](&pp.files, "<cmdline>")
+    vec_push[bool](&pp.foreign, true)
+    return pp
+}
+
+fn pp_warn(pp: *mut Pp, msg: str) {
+    vec_push[str](&(*pp).warns, msg)
+}
+
+fn tok_at(v: *mut Vec[cb_lex.Tok], i: usize) -> *mut cb_lex.Tok {
+    return vec_elem_ptr[cb_lex.Tok](v, i)
+}
+
+fn find_macro(pp: *mut Pp, name: str) -> i32 {
+    var mi: i32 = 0
+    if dict_get_if[i32](&(*pp).index, name, &mi) {
+        return mi
+    }
+    return 0 - 1
+}
+
+fn is_hidden(hide: *mut Vec[str], name: str) -> bool {
+    for i in 0..vec_len[str](hide) {
+        if *vec_elem_ptr[str](hide, i) == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn param_index(m: *mut Macro, name: str) -> i32 {
+    for i in 0..vec_len[str](&(*m).params) {
+        if *vec_elem_ptr[str](&(*m).params, i) == name {
+            return i as i32
+        }
+    }
+    if (*m).variadic && name == "__VA_ARGS__" {
+        return vec_len[str](&(*m).params) as i32
+    }
+    return 0 - 1
+}
+
+fn collect_args(input: *mut Vec[cb_lex.Tok], open: usize, flat: *mut Vec[cb_lex.Tok], starts: *mut Vec[usize]) -> usize {
+    var depth: i32 = 1
+    var j: usize = open + 1
+    let n: usize = vec_len[cb_lex.Tok](input)
+    vec_push[usize](starts, 0)
+    while j < n {
+        let t: *mut cb_lex.Tok = tok_at(input, j)
+        if (*t).kind == cb_lex.T_EOF {
+            return 0
+        }
+        if (*t).kind == cb_lex.T_PUNCT {
+            if (*t).text == "(" { depth = depth + 1 }
+            if (*t).text == ")" {
+                depth = depth - 1
+                if depth == 0 {
+                    vec_push[usize](starts, vec_len[cb_lex.Tok](flat))
+                    return j + 1
+                }
+            }
+            if (*t).text == "," && depth == 1 {
+                vec_push[usize](starts, vec_len[cb_lex.Tok](flat))
+                j = j + 1
+                continue
+            }
+        }
+        vec_push[cb_lex.Tok](flat, *t)
+        j = j + 1
+    }
+    return 0
+}
+
+fn arg_count(starts: *mut Vec[usize]) -> usize {
+    return vec_len[usize](starts) - 1
+}
+
+fn arg_slice(flat: *mut Vec[cb_lex.Tok], starts: *mut Vec[usize], k: usize, out: *mut Vec[cb_lex.Tok]) {
+    if k >= arg_count(starts) {
+        return
+    }
+    let from: usize = *vec_elem_ptr[usize](starts, k)
+    let to: usize = *vec_elem_ptr[usize](starts, k + 1)
+    for i in from..to {
+        vec_push[cb_lex.Tok](out, *tok_at(flat, i))
+    }
+}
+
+fn variadic_slice(flat: *mut Vec[cb_lex.Tok], starts: *mut Vec[usize], fixed: usize, out: *mut Vec[cb_lex.Tok]) {
+    let nargs: usize = arg_count(starts)
+    var k: usize = fixed
+    while k < nargs {
+        if k > fixed {
+            vec_push[cb_lex.Tok](out, cb_lex.tok_new(cb_lex.T_PUNCT, ",", 0, 0))
+        }
+        arg_slice(flat, starts, k, out)
+        k = k + 1
+    }
+}
+
+fn pop_tok(v: *mut Vec[cb_lex.Tok]) -> cb_lex.Tok {
+    let n: usize = vec_len[cb_lex.Tok](v)
+    let t: cb_lex.Tok = *tok_at(v, n - 1)
+    vec_shorten[cb_lex.Tok](v, n - 1)
+    return t
+}
+
+fn raw_arg(pi: i32, nparams: usize, flat: *mut Vec[cb_lex.Tok], starts: *mut Vec[usize], out: *mut Vec[cb_lex.Tok]) {
+    if pi as usize == nparams {
+        variadic_slice(flat, starts, nparams, out)
+    } else {
+        arg_slice(flat, starts, pi as usize, out)
+    }
+}
+
+fn stringize(raw: *mut Vec[cb_lex.Tok], line: u32, file: u32) -> cb_lex.Tok {
+    var b: rt.Buf = rt.buf_new()
+    cb_util.put(&b, "\"")
+    for i in 0..vec_len[cb_lex.Tok](raw) {
+        let t: *mut cb_lex.Tok = tok_at(raw, i)
+        if i > 0 && (*t).spc {
+            cb_util.put(&b, " ")
+        }
+        cb_util.put(&b, (*t).text)
+    }
+    cb_util.put(&b, "\"")
+    let s: str = cb_util.gstr(&b)
+    rt.buf_free(&b)
+    return cb_lex.tok_new(cb_lex.T_STR, s, line, file)
+}
+
+fn paste(left: *mut cb_lex.Tok, right: *mut cb_lex.Tok, out: *mut Vec[cb_lex.Tok]) {
+    let joined: str = (*left).text + (*right).text
+    var tmp: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    cb_lex.lex(joined, (*left).file, &tmp)
+    let n: usize = vec_len[cb_lex.Tok](&tmp)
+    for i in 0..n - 1 {
+        var t: cb_lex.Tok = *tok_at(&tmp, i)
+        t.line = (*left).line
+        t.spc = (*left).spc
+        t.bol = false
+        vec_push[cb_lex.Tok](out, t)
+    }
+}
+
+fn substitute(pp: *mut Pp, m: *mut Macro, flat: *mut Vec[cb_lex.Tok], starts: *mut Vec[usize], hide: *mut Vec[str], site: *mut cb_lex.Tok, out: *mut Vec[cb_lex.Tok]) {
+    let nparams: usize = vec_len[str](&(*m).params)
+    let n: usize = vec_len[cb_lex.Tok](&(*m).body)
+    var k: usize = 0
+    var pending_paste: bool = false
+    while k < n {
+        let b: *mut cb_lex.Tok = tok_at(&(*m).body, k)
+        var next_paste: bool = false
+        if k + 1 < n {
+            let nx: *mut cb_lex.Tok = tok_at(&(*m).body, k + 1)
+            next_paste = (*nx).kind == cb_lex.T_PUNCT && (*nx).text == "##"
+        }
+        if (*b).kind == cb_lex.T_PUNCT && (*b).text == "##" {
+            pending_paste = true
+            k = k + 1
+            continue
+        }
+        if (*b).kind == cb_lex.T_PUNCT && (*b).text == "#" && k + 1 < n && (*m).func {
+            let pn: *mut cb_lex.Tok = tok_at(&(*m).body, k + 1)
+            let pi: i32 = param_index(m, (*pn).text)
+            if pi >= 0 {
+                var raw: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+                raw_arg(pi, nparams, flat, starts, &raw)
+                vec_push[cb_lex.Tok](out, stringize(&raw, (*site).line, (*site).file))
+                k = k + 2
+                continue
+            }
+        }
+        var pi: i32 = 0 - 1
+        if (*b).kind == cb_lex.T_ID && (*m).func {
+            pi = param_index(m, (*b).text)
+        }
+        if pi >= 0 {
+            var raw: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+            raw_arg(pi, nparams, flat, starts, &raw)
+            var piece: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+            if pending_paste || next_paste {
+                piece = raw
+            } else {
+                expand(pp, &raw, &piece, hide)
+            }
+            let pn: usize = vec_len[cb_lex.Tok](&piece)
+            if pending_paste {
+                let on: usize = vec_len[cb_lex.Tok](out)
+                if pn == 0 {
+                    if on > 0 && pi as usize == nparams && (*m).variadic && (*tok_at(out, on - 1)).text == "," {
+                        pop_tok(out)
+                    }
+                } else if on > 0 {
+                    let left: cb_lex.Tok = pop_tok(out)
+                    paste(&left, tok_at(&piece, 0), out)
+                    for q in 1..pn {
+                        vec_push[cb_lex.Tok](out, *tok_at(&piece, q))
+                    }
+                }
+            } else {
+                for q in 0..pn {
+                    vec_push[cb_lex.Tok](out, *tok_at(&piece, q))
+                }
+            }
+            pending_paste = false
+            k = k + 1
+            continue
+        }
+        if pending_paste && vec_len[cb_lex.Tok](out) > 0 {
+            let left: cb_lex.Tok = pop_tok(out)
+            paste(&left, b, out)
+        } else {
+            var t: cb_lex.Tok = *b
+            t.line = (*site).line
+            t.file = (*site).file
+            vec_push[cb_lex.Tok](out, t)
+        }
+        pending_paste = false
+        k = k + 1
+    }
+}
+
+fn expand(pp: *mut Pp, input: *mut Vec[cb_lex.Tok], out: *mut Vec[cb_lex.Tok], hide: *mut Vec[str]) {
+    let n: usize = vec_len[cb_lex.Tok](input)
+    var i: usize = 0
+    while i < n {
+        let t: *mut cb_lex.Tok = tok_at(input, i)
+        if (*t).kind != cb_lex.T_ID {
+            vec_push[cb_lex.Tok](out, *t)
+            i = i + 1
+            continue
+        }
+        let mi: i32 = find_macro(pp, (*t).text)
+        if mi < 0 || is_hidden(hide, (*t).text) {
+            vec_push[cb_lex.Tok](out, *t)
+            i = i + 1
+            continue
+        }
+        let m: *mut Macro = vec_elem_ptr[Macro](&(*pp).macros, mi as usize)
+        var result: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+        var next: usize = i + 1
+        if !(*m).func {
+            var flat0: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+            var starts0: Vec[usize] = vec_new[usize]()
+            substitute(pp, m, &flat0, &starts0, hide, t, &result)
+        } else {
+            var has_call: bool = false
+            if i + 1 < n {
+                let o: *mut cb_lex.Tok = tok_at(input, i + 1)
+                has_call = (*o).kind == cb_lex.T_PUNCT && (*o).text == "("
+            }
+            if !has_call {
+                vec_push[cb_lex.Tok](out, *t)
+                i = i + 1
+                continue
+            }
+            var flat: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+            var starts: Vec[usize] = vec_new[usize]()
+            let after: usize = collect_args(input, i + 1, &flat, &starts)
+            if after == 0 {
+                vec_push[cb_lex.Tok](out, *t)
+                i = i + 1
+                continue
+            }
+            next = after
+            substitute(pp, m, &flat, &starts, hide, t, &result)
+        }
+        vec_push[str](hide, (*t).text)
+        var rescanned: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+        expand(pp, &result, &rescanned, hide)
+        vec_shorten[str](hide, vec_len[str](hide) - 1)
+        let rn: usize = vec_len[cb_lex.Tok](&rescanned)
+        for q in 0..rn {
+            var piece: cb_lex.Tok = *tok_at(&rescanned, q)
+            if q == 0 {
+                piece.spc = (*t).spc
+            }
+            vec_push[cb_lex.Tok](out, piece)
+        }
+        i = next
+    }
+}
+
+fn push_macro(pp: *mut Pp, m: Macro) {
+    let idx: i32 = vec_len[Macro](&(*pp).macros) as i32
+    let old: i32 = find_macro(pp, m.name)
+    if old >= 0 {
+        let om: *mut Macro = vec_elem_ptr[Macro](&(*pp).macros, old as usize)
+        (*om).live = false
+    }
+    vec_push[Macro](&(*pp).macros, m)
+    dict_set[i32](&(*pp).index, m.name, idx)
+}
+
+fn define_from(pp: *mut Pp, toks: *mut Vec[cb_lex.Tok], from: usize, to: usize, file: u32) {
+    if from >= to {
+        return
+    }
+    let nt: *mut cb_lex.Tok = tok_at(toks, from)
+    var m: Macro = Macro {
+        name: (*nt).text, func: false, variadic: false, params: vec_new[str](),
+        body: vec_new[cb_lex.Tok](), live: true, file: file,
+    }
+    var k: usize = from + 1
+    if k < to {
+        let o: *mut cb_lex.Tok = tok_at(toks, k)
+        if (*o).kind == cb_lex.T_PUNCT && (*o).text == "(" && !(*o).spc {
+            m.func = true
+            k = k + 1
+            while k < to {
+                let p: *mut cb_lex.Tok = tok_at(toks, k)
+                k = k + 1
+                if (*p).text == ")" {
+                    break
+                }
+                if (*p).text == "..." {
+                    m.variadic = true
+                } else if (*p).kind == cb_lex.T_ID {
+                    vec_push[str](&m.params, (*p).text)
+                    if k < to {
+                        let nx: *mut cb_lex.Tok = tok_at(toks, k)
+                        if (*nx).text == "..." {
+                            m.variadic = true
+                            k = k + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    while k < to {
+        vec_push[cb_lex.Tok](&m.body, *tok_at(toks, k))
+        k = k + 1
+    }
+    push_macro(pp, m)
+}
+
+fn pp_define(pp: *mut Pp, spec: str) {
+    var text: str = "#define "
+    var eq: i64 = pystr.find(spec, "=")
+    if eq >= 0 {
+        text = text + cb_util.sub(spec, 0, eq as usize) + " " + cb_util.sub(spec, eq as usize + 1, spec.n) + "\n"
+    } else {
+        text = text + spec + " 1\n"
+    }
+    pp_text(pp, text, 0, false)
+}
+
+fn eval_cond(pp: *mut Pp, toks: *mut Vec[cb_lex.Tok], from: usize, to: usize) -> bool {
+    var tmp: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    var i: usize = from
+    while i < to {
+        let t: *mut cb_lex.Tok = tok_at(toks, i)
+        let nm: str = (*t).text
+        if (*t).kind == cb_lex.T_ID && nm == "defined" {
+            var j: usize = i + 1
+            var paren: bool = false
+            if j < to && (*tok_at(toks, j)).text == "(" {
+                paren = true
+                j = j + 1
+            }
+            var val: str = "0"
+            if j < to && find_macro(pp, (*tok_at(toks, j)).text) >= 0 {
+                val = "1"
+            }
+            j = j + 1
+            if paren {
+                j = j + 1
+            }
+            vec_push[cb_lex.Tok](&tmp, cb_lex.tok_new(cb_lex.T_NUM, val, (*t).line, (*t).file))
+            i = j
+            continue
+        }
+        if (*t).kind == cb_lex.T_ID && (nm == "__has_include" || nm == "__has_attribute" || nm == "__has_builtin" || nm == "__has_feature" || nm == "__has_extension" || nm == "__has_cpp_attribute") {
+            var depth: i32 = 0
+            var j: usize = i + 1
+            while j < to {
+                let x: *mut cb_lex.Tok = tok_at(toks, j)
+                if (*x).text == "(" { depth = depth + 1 }
+                if (*x).text == ")" { depth = depth - 1 }
+                j = j + 1
+                if depth == 0 {
+                    break
+                }
+            }
+            vec_push[cb_lex.Tok](&tmp, cb_lex.tok_new(cb_lex.T_NUM, "0", (*t).line, (*t).file))
+            i = j
+            continue
+        }
+        vec_push[cb_lex.Tok](&tmp, *t)
+        i = i + 1
+    }
+    var hide: Vec[str] = vec_new[str]()
+    var exp: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    expand(pp, &tmp, &exp, &hide)
+    var ok: bool = true
+    let v: i64 = cb_expr.eval_range(&exp, 0, vec_len[cb_lex.Tok](&exp), &(*pp).empty, true, &ok)
+    return ok && v != 0
+}
+
+fn cond_active(cond: *mut Vec[i32]) -> bool {
+    let n: usize = vec_len[i32](cond)
+    if n == 0 {
+        return true
+    }
+    return (*vec_elem_ptr[i32](cond, n - 1) & COND_ACTIVE) != 0
+}
+
+fn cond_open(cond: *mut Vec[i32], parent: bool, value: bool) {
+    var st: i32 = 0
+    if parent {
+        st = COND_PARENT
+        if value {
+            st = st | COND_ACTIVE | COND_TAKEN
+        }
+    }
+    vec_push[i32](cond, st)
+}
+
+fn cond_else(cond: *mut Vec[i32], value: bool) {
+    let n: usize = vec_len[i32](cond)
+    if n == 0 {
+        return
+    }
+    let top: *mut i32 = vec_elem_ptr[i32](cond, n - 1)
+    var st: i32 = *top
+    if (st & COND_PARENT) != 0 && (st & COND_TAKEN) == 0 && value {
+        st = st | COND_ACTIVE | COND_TAKEN
+    } else {
+        st = st & (0 - 1 - COND_ACTIVE)
+    }
+    *top = st
+}
+
+fn header_name(toks: *mut Vec[cb_lex.Tok], from: usize, to: usize, quoted: *mut bool) -> str {
+    let t: *mut cb_lex.Tok = tok_at(toks, from)
+    if (*t).kind == cb_lex.T_STR {
+        *quoted = true
+        return cb_util.sub((*t).text, 1, (*t).text.n - 1)
+    }
+    *quoted = false
+    var b: rt.Buf = rt.buf_new()
+    var k: usize = from + 1
+    while k < to && (*tok_at(toks, k)).text != ">" {
+        cb_util.put(&b, (*tok_at(toks, k)).text)
+        k = k + 1
+    }
+    let s: str = cb_util.gstr(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn path_exists(path: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    cb_util.str_buf(path, &b)
+    let ok: bool = io.file_exists(rt.buf_ptr(&b))
+    rt.buf_free(&b)
+    return ok
+}
+
+fn resolve(pp: *mut Pp, name: str, quoted: bool, file: u32, out: *mut str) -> bool {
+    if quoted {
+        let local: str = cb_util.dirname(*vec_elem_ptr[str](&(*pp).files, file as usize)) + "/" + name
+        if path_exists(local) {
+            *out = local
+            return true
+        }
+    }
+    for i in 0..vec_len[str](&(*pp).inc_dirs) {
+        let cand: str = *vec_elem_ptr[str](&(*pp).inc_dirs, i) + "/" + name
+        if path_exists(cand) {
+            *out = cand
+            return true
+        }
+    }
+    return false
+}
+
+fn do_include(pp: *mut Pp, toks: *mut Vec[cb_lex.Tok], from: usize, to: usize, file: u32) {
+    if from >= to || (*pp).depth >= MAX_INCLUDE_DEPTH {
+        return
+    }
+    var quoted: bool = false
+    let name: str = header_name(toks, from, to, &quoted)
+    var path: str = ""
+    if !resolve(pp, name, quoted, file, &path) {
+        if quoted {
+            pp_warn(pp, "include not found: " + name)
+        }
+        return
+    }
+    var already: bool = false
+    var seen: bool = false
+    if dict_get_if[bool](&(*pp).once, path, &seen) {
+        already = true
+    }
+    if already {
+        return
+    }
+    let foreign: bool = !quoted || *vec_elem_ptr[bool](&(*pp).foreign, file as usize)
+    pp_file(pp, path, foreign)
+}
+
+fn directive(pp: *mut Pp, toks: *mut Vec[cb_lex.Tok], from: usize, to: usize, file: u32, cond: *mut Vec[i32]) {
+    if from >= to {
+        return
+    }
+    let name: str = (*tok_at(toks, from)).text
+    let active: bool = cond_active(cond)
+    if name == "if" {
+        cond_open(cond, active, active && eval_cond(pp, toks, from + 1, to))
+    } else if name == "ifdef" || name == "ifndef" {
+        var defined: bool = false
+        if from + 1 < to {
+            defined = find_macro(pp, (*tok_at(toks, from + 1)).text) >= 0
+        }
+        if name == "ifndef" {
+            defined = !defined
+        }
+        cond_open(cond, active, active && defined)
+    } else if name == "elif" {
+        let n: usize = vec_len[i32](cond)
+        var take: bool = false
+        if n > 0 {
+            let st: i32 = *vec_elem_ptr[i32](cond, n - 1)
+            take = (st & COND_PARENT) != 0 && (st & COND_TAKEN) == 0 && eval_cond(pp, toks, from + 1, to)
+        }
+        cond_else(cond, take)
+    } else if name == "else" {
+        cond_else(cond, true)
+    } else if name == "endif" {
+        let n: usize = vec_len[i32](cond)
+        if n > 0 {
+            vec_shorten[i32](cond, n - 1)
+        }
+    } else if !active {
+        return
+    } else if name == "define" {
+        define_from(pp, toks, from + 1, to, file)
+    } else if name == "undef" {
+        if from + 1 < to {
+            let nm: str = (*tok_at(toks, from + 1)).text
+            let mi: i32 = find_macro(pp, nm)
+            if mi >= 0 {
+                let um: *mut Macro = vec_elem_ptr[Macro](&(*pp).macros, mi as usize)
+                (*um).live = false
+                dict_remove[i32](&(*pp).index, nm)
+            }
+        }
+    } else if name == "include" || name == "include_next" {
+        do_include(pp, toks, from + 1, to, file)
+    } else if name == "pragma" {
+        if from + 1 < to && (*tok_at(toks, from + 1)).text == "once" {
+            dict_set[bool](&(*pp).once, *vec_elem_ptr[str](&(*pp).files, file as usize), true)
+        }
+    }
+}
+
+fn run(pp: *mut Pp, toks: *mut Vec[cb_lex.Tok], file: u32) {
+    var cond: Vec[i32] = vec_new[i32]()
+    var region: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    var hide: Vec[str] = vec_new[str]()
+    let n: usize = vec_len[cb_lex.Tok](toks)
+    var i: usize = 0
+    while i < n {
+        let t: *mut cb_lex.Tok = tok_at(toks, i)
+        if (*t).kind == cb_lex.T_EOF {
+            break
+        }
+        if (*t).bol && (*t).kind == cb_lex.T_PUNCT && (*t).text == "#" {
+            expand(pp, &region, &(*pp).out, &hide)
+            vec_clear[cb_lex.Tok](&region)
+            var j: usize = i + 1
+            while j < n && !(*tok_at(toks, j)).bol {
+                j = j + 1
+            }
+            directive(pp, toks, i + 1, j, file, &cond)
+            i = j
+            continue
+        }
+        if cond_active(&cond) {
+            vec_push[cb_lex.Tok](&region, *t)
+        }
+        i = i + 1
+    }
+    expand(pp, &region, &(*pp).out, &hide)
+}
+
+fn pp_text(pp: *mut Pp, src: str, file: u32, foreign: bool) {
+    var toks: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    cb_lex.lex(src, file, &toks)
+    (*pp).depth = (*pp).depth + 1
+    run(pp, &toks, file)
+    (*pp).depth = (*pp).depth - 1
+}
+
+fn pp_file(pp: *mut Pp, path: str, foreign: bool) -> bool {
+    if !path_exists(path) {
+        return false
+    }
+    let id: u32 = vec_len[str](&(*pp).files) as u32
+    vec_push[str](&(*pp).files, path)
+    vec_push[bool](&(*pp).foreign, foreign)
+    pp_text(pp, pystr.read_text(path), id, foreign)
+    return true
+}
+
+fn pp_eval_macros(pp: *mut Pp, consts: *mut Dict[i64], names: *mut Vec[str], values: *mut Vec[i64], files: *mut Vec[u32]) {
+    for i in 0..vec_len[Macro](&(*pp).macros) {
+        let m: *mut Macro = vec_elem_ptr[Macro](&(*pp).macros, i)
+        let nb: usize = vec_len[cb_lex.Tok](&(*m).body)
+        if !(*m).live || (*m).func || nb == 0 || *vec_elem_ptr[bool](&(*pp).foreign, (*m).file as usize) {
+            continue
+        }
+        if cb_util.at((*m).name, 0) == 95 {
+            continue
+        }
+        var hide: Vec[str] = vec_new[str]()
+        vec_push[str](&hide, (*m).name)
+        var exp: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+        expand(pp, &(*m).body, &exp, &hide)
+        var ok: bool = true
+        let v: i64 = cb_expr.eval_range(&exp, 0, vec_len[cb_lex.Tok](&exp), consts, false, &ok)
+        if ok {
+            dict_set[i64](consts, (*m).name, v)
+            vec_push[str](names, (*m).name)
+            vec_push[i64](values, v)
+            vec_push[u32](files, (*m).file)
+        }
+    }
+}
+
+fn pp_finish(pp: *mut Pp) {
+    var e: cb_lex.Tok = cb_lex.tok_new(cb_lex.T_EOF, "", 0, 0)
+    e.bol = true
+    vec_push[cb_lex.Tok](&(*pp).out, e)
+}

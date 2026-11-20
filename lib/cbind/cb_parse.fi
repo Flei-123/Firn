@@ -1,0 +1,544 @@
+import std.vec
+import std.dict
+import cbind.cb_util
+import cbind.cb_lex
+import cbind.cb_types
+import cbind.cb_pscan
+
+export { parse_unit, parse_type_name }
+
+struct Spec {
+    is_typedef: bool,
+    is_static: bool,
+    is_inline: bool,
+    attrs: cb_pscan.Attrs,
+}
+
+struct Counts {
+    n_long: i32,
+    n_short: i32,
+    n_signed: i32,
+    n_unsigned: i32,
+    kw_char: bool,
+    kw_int: bool,
+    kw_float: bool,
+    kw_double: bool,
+    kw_void: bool,
+    kw_bool: bool,
+    kw_i128: bool,
+    base: i32,
+}
+
+fn tok_text(ps: *mut cb_pscan.Ps) -> str {
+    return (*cb_pscan.cur(ps)).text
+}
+
+fn advance(ps: *mut cb_pscan.Ps) {
+    (*ps).pos = (*ps).pos + 1
+}
+
+fn warn_at(ps: *mut cb_pscan.Ps, msg: str) {
+    cb_types.db_warn((*ps).db, "line " + cb_util.istr((*cb_pscan.cur(ps)).line as i64) + ": " + msg)
+}
+
+fn rec_ptr(ps: *mut cb_pscan.Ps, idx: i32) -> *mut cb_types.Rec {
+    return vec_elem_ptr[cb_types.Rec](&(*(*ps).db).recs, idx as usize)
+}
+
+fn va_list_type(ps: *mut cb_pscan.Ps) -> i32 {
+    return cb_types.ty_arr((*ps).db, cb_types.B_ULONG, 3)
+}
+
+fn int_from_counts(c: *mut Counts) -> i32 {
+    if (*c).kw_void { return cb_types.B_VOID }
+    if (*c).kw_bool { return cb_types.B_BOOL }
+    if (*c).kw_float { return cb_types.B_FLOAT }
+    if (*c).kw_double {
+        if (*c).n_long > 0 { return cb_types.B_LDOUBLE }
+        return cb_types.B_DOUBLE
+    }
+    if (*c).kw_i128 {
+        if (*c).n_unsigned > 0 { return cb_types.B_U128 }
+        return cb_types.B_I128
+    }
+    if (*c).kw_char {
+        if (*c).n_unsigned > 0 { return cb_types.B_UCHAR }
+        if (*c).n_signed > 0 { return cb_types.B_SCHAR }
+        return cb_types.B_CHAR
+    }
+    if (*c).n_short > 0 {
+        if (*c).n_unsigned > 0 { return cb_types.B_USHORT }
+        return cb_types.B_SHORT
+    }
+    if (*c).n_long >= 2 {
+        if (*c).n_unsigned > 0 { return cb_types.B_ULLONG }
+        return cb_types.B_LLONG
+    }
+    if (*c).n_long == 1 {
+        if (*c).n_unsigned > 0 { return cb_types.B_ULONG }
+        return cb_types.B_LONG
+    }
+    if (*c).n_unsigned > 0 { return cb_types.B_UINT }
+    return cb_types.B_INT
+}
+
+fn counts_seen(c: *mut Counts) -> bool {
+    return (*c).base >= 0 || (*c).n_long > 0 || (*c).n_short > 0 || (*c).n_signed > 0 || (*c).n_unsigned > 0
+    || (*c).kw_char || (*c).kw_int || (*c).kw_float || (*c).kw_double || (*c).kw_void || (*c).kw_bool || (*c).kw_i128
+}
+
+fn type_keyword(c: *mut Counts, s: str) -> bool {
+    if s == "void" { (*c).kw_void = true } else if s == "char" { (*c).kw_char = true }
+    else if s == "short" { (*c).n_short = (*c).n_short + 1 } else if s == "int" { (*c).kw_int = true }
+    else if s == "long" { (*c).n_long = (*c).n_long + 1 } else if s == "float" { (*c).kw_float = true }
+    else if s == "double" { (*c).kw_double = true } else if s == "signed" || s == "__signed__" { (*c).n_signed = (*c).n_signed + 1 }
+    else if s == "unsigned" { (*c).n_unsigned = (*c).n_unsigned + 1 } else if s == "_Bool" { (*c).kw_bool = true }
+    else if s == "__int128" || s == "__int128_t" { (*c).kw_i128 = true }
+    else if s == "__uint128_t" {
+        (*c).kw_i128 = true
+        (*c).n_unsigned = 1
+    } else {
+        return false
+    }
+    return true
+}
+
+fn unknown_type(ps: *mut cb_pscan.Ps, name: str, file: u32) -> i32 {
+    let ri: i32 = cb_types.rec_add((*ps).db, name, false, false, file)
+    cb_types.typedef_add((*ps).db, name, (*rec_ptr(ps, ri)).ty, file, false)
+    cb_types.db_warn((*ps).db, "unknown type " + name + " treated as opaque")
+    return (*vec_elem_ptr[cb_types.Typedef](&(*(*ps).db).tds, cb_types.typedef_find((*ps).db, name) as usize)).ty
+}
+
+fn parse_specifiers(ps: *mut cb_pscan.Ps, sp: *mut Spec) -> i32 {
+    var c: Counts = Counts {
+        n_long: 0, n_short: 0, n_signed: 0, n_unsigned: 0, kw_char: false, kw_int: false, kw_float: false,
+        kw_double: false, kw_void: false, kw_bool: false, kw_i128: false, base: 0 - 1,
+    }
+    while true {
+        cb_pscan.skip_attrs(ps, &(*sp).attrs)
+        let t: *mut cb_lex.Tok = cb_pscan.cur(ps)
+        if (*t).kind != cb_lex.T_ID {
+            break
+        }
+        let s: str = (*t).text
+        if s == "typedef" {
+            (*sp).is_typedef = true
+        } else if s == "static" {
+            (*sp).is_static = true
+        } else if s == "inline" || s == "__inline" || s == "__inline__" {
+            (*sp).is_inline = true
+        } else if s == "extern" || s == "register" || s == "auto" || s == "_Thread_local" || s == "__thread" {
+            advance(ps)
+            continue
+        } else if s == "const" || s == "volatile" || s == "restrict" || s == "__restrict" || s == "__restrict__" || s == "__const" || s == "__volatile__" {
+            advance(ps)
+            continue
+        } else if s == "_Atomic" {
+            advance(ps)
+            continue
+        } else if s == "_Complex" || s == "__complex__" {
+            warn_at(ps, "complex type is not supported")
+        } else if s == "struct" || s == "union" {
+            c.base = parse_rec(ps, s == "union")
+            continue
+        } else if s == "enum" {
+            c.base = parse_enum(ps)
+            continue
+        } else if s == "__builtin_va_list" || s == "__gnuc_va_list" {
+            c.base = va_list_type(ps)
+        } else if type_keyword(&c, s) {
+        } else {
+            if counts_seen(&c) {
+                break
+            }
+            let ti: i32 = cb_types.typedef_find((*ps).db, s)
+            if ti >= 0 {
+                let td: *mut cb_types.Typedef = vec_elem_ptr[cb_types.Typedef](&(*(*ps).db).tds, ti as usize)
+                (*td).used = true
+                c.base = (*td).ty
+            } else {
+                let nx: *mut cb_lex.Tok = cb_pscan.la(ps, 1)
+                if (*nx).kind == cb_lex.T_ID || ((*nx).kind == cb_lex.T_PUNCT && ((*nx).text == "*")) {
+                    c.base = unknown_type(ps, s, (*t).file)
+                } else {
+                    break
+                }
+            }
+        }
+        advance(ps)
+    }
+    if c.base >= 0 {
+        return c.base
+    }
+    if !counts_seen(&c) {
+        return 0 - 1
+    }
+    return int_from_counts(&c)
+}
+
+fn parse_enum(ps: *mut cb_pscan.Ps) -> i32 {
+    let file: u32 = (*cb_pscan.cur(ps)).file
+    advance(ps)
+    var a: cb_pscan.Attrs = cb_pscan.Attrs { packed: false, align: 0 }
+    cb_pscan.skip_attrs(ps, &a)
+    var name: str = ""
+    if (*cb_pscan.cur(ps)).kind == cb_lex.T_ID {
+        name = tok_text(ps)
+        advance(ps)
+    }
+    var ri: i32 = 0 - 1
+    if name.n > 0 {
+        ri = cb_types.rec_find((*ps).db, cb_types.tag_key(false, true, name))
+    }
+    if ri < 0 {
+        ri = cb_types.rec_add((*ps).db, name, false, true, file)
+    }
+    if cb_pscan.is_p(ps, "{") {
+        advance(ps)
+        var value: i64 = 0
+        while !cb_pscan.is_p(ps, "}") && !cb_pscan.at_eof(ps) {
+            cb_pscan.skip_attrs(ps, &a)
+            let nt: *mut cb_lex.Tok = cb_pscan.cur(ps)
+            let cname: str = (*nt).text
+            advance(ps)
+            if cb_pscan.accept(ps, "=") {
+                var ok: bool = true
+                value = cb_pscan.eval_here(ps, &ok)
+                if !ok {
+                    warn_at(ps, "enum value of " + cname + " is not constant")
+                }
+            }
+            let d: *mut cb_types.Db = (*ps).db
+            dict_set[i64](&(*d).consts, cname, value)
+            vec_push[str](&(*d).const_names, cname)
+            vec_push[i64](&(*d).const_vals, value)
+            vec_push[u32](&(*d).const_files, (*nt).file)
+            if value < 0 {
+                (*rec_ptr(ps, ri)).neg = true
+            }
+            value = value + 1
+            cb_pscan.accept(ps, ",")
+        }
+        cb_pscan.accept(ps, "}")
+        (*rec_ptr(ps, ri)).complete = true
+    }
+    return (*rec_ptr(ps, ri)).ty
+}
+
+fn parse_fields(ps: *mut cb_pscan.Ps, fields: *mut Vec[cb_types.Field]) {
+    while !cb_pscan.is_p(ps, "}") && !cb_pscan.at_eof(ps) {
+        if cb_pscan.accept(ps, ";") {
+            continue
+        }
+        if cb_pscan.is_id(ps, "_Static_assert") || cb_pscan.is_id(ps, "static_assert") {
+            cb_pscan.skip_to_semi(ps)
+            continue
+        }
+        var sp: Spec = Spec { is_typedef: false, is_static: false, is_inline: false, attrs: cb_pscan.Attrs { packed: false, align: 0 } }
+        let base: i32 = parse_specifiers(ps, &sp)
+        if base < 0 {
+            warn_at(ps, "cannot parse member declaration")
+            cb_pscan.skip_to_semi(ps)
+            continue
+        }
+        if cb_pscan.is_p(ps, ";") {
+            vec_push[cb_types.Field](fields, cb_types.Field { name: "", ty: base, bits: 0 - 1, off: 0, bitoff: 0, aalign: 0 })
+            advance(ps)
+            continue
+        }
+        while true {
+            var name: str = ""
+            var t: i32 = base
+            sp.attrs = cb_pscan.Attrs { packed: false, align: 0 }
+            if !cb_pscan.is_p(ps, ":") {
+                t = declarator(ps, base, &name, &sp.attrs)
+            }
+            var bits: i32 = 0 - 1
+            if cb_pscan.accept(ps, ":") {
+                var ok: bool = true
+                bits = cb_pscan.eval_here(ps, &ok) as i32
+                if !ok {
+                    warn_at(ps, "bit-field width is not constant")
+                    bits = 1
+                }
+                warn_at(ps, "bit-field " + name + " is stored as opaque bytes")
+            }
+            cb_pscan.skip_attrs(ps, &sp.attrs)
+            vec_push[cb_types.Field](fields, cb_types.Field { name: name, ty: t, bits: bits, off: 0, bitoff: 0, aalign: sp.attrs.align })
+            if cb_pscan.accept(ps, ",") {
+                continue
+            }
+            break
+        }
+        cb_pscan.accept(ps, ";")
+    }
+}
+
+fn parse_rec(ps: *mut cb_pscan.Ps, is_union: bool) -> i32 {
+    let file: u32 = (*cb_pscan.cur(ps)).file
+    advance(ps)
+    var a1: cb_pscan.Attrs = cb_pscan.Attrs { packed: false, align: 0 }
+    cb_pscan.skip_attrs(ps, &a1)
+    var name: str = ""
+    if (*cb_pscan.cur(ps)).kind == cb_lex.T_ID {
+        name = tok_text(ps)
+        advance(ps)
+    }
+    cb_pscan.skip_attrs(ps, &a1)
+    var ri: i32 = 0 - 1
+    if name.n > 0 {
+        ri = cb_types.rec_find((*ps).db, cb_types.tag_key(is_union, false, name))
+    }
+    if ri < 0 {
+        ri = cb_types.rec_add((*ps).db, name, is_union, false, file)
+    }
+    if cb_pscan.is_p(ps, "{") {
+        advance(ps)
+        var fields: Vec[cb_types.Field] = vec_new[cb_types.Field]()
+        parse_fields(ps, &fields)
+        cb_pscan.accept(ps, "}")
+        cb_pscan.skip_attrs(ps, &a1)
+        let r: *mut cb_types.Rec = rec_ptr(ps, ri)
+        if !(*r).complete {
+            (*r).fstart = vec_len[cb_types.Field](&(*(*ps).db).fields) as u32
+            (*r).fcount = vec_len[cb_types.Field](&fields) as u32
+            for i in 0..vec_len[cb_types.Field](&fields) {
+                vec_push[cb_types.Field](&(*(*ps).db).fields, *vec_elem_ptr[cb_types.Field](&fields, i))
+            }
+            (*r).complete = true
+            (*r).packed = a1.packed
+            (*r).aalign = a1.align
+            for k in 0..(*r).fcount {
+                let f: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*(*ps).db).fields, ((*r).fstart + k) as usize)
+                let ft: *mut cb_types.Ty = cb_types.ty_ref((*ps).db, cb_types.strip((*ps).db, (*f).ty))
+                if (*ft).kind == cb_types.K_REC {
+                    let child: *mut cb_types.Rec = rec_ptr(ps, (*ft).rec)
+                    if (*child).name.n == 0 && (*child).owner < 0 {
+                        (*child).owner = ri
+                        (*child).owner_field = (*f).name
+                    }
+                }
+            }
+        }
+    }
+    return (*rec_ptr(ps, ri)).ty
+}
+
+fn skip_quals(ps: *mut cb_pscan.Ps, a: *mut cb_pscan.Attrs) {
+    while true {
+        cb_pscan.skip_attrs(ps, a)
+        let s: str = tok_text(ps)
+        if (*cb_pscan.cur(ps)).kind == cb_lex.T_ID && (s == "const" || s == "volatile" || s == "restrict" || s == "__restrict" || s == "__restrict__" || s == "_Atomic" || s == "__const") {
+            advance(ps)
+            continue
+        }
+        break
+    }
+}
+
+fn nested_declarator(ps: *mut cb_pscan.Ps) -> bool {
+    let t: *mut cb_lex.Tok = cb_pscan.la(ps, 1)
+    if (*t).kind == cb_lex.T_PUNCT {
+        return (*t).text == "*" || (*t).text == "("
+    }
+    if (*t).kind == cb_lex.T_ID {
+        if (*t).text == "__attribute__" {
+            return true
+        }
+        return !cb_pscan.starts_type(ps, 1)
+    }
+    return false
+}
+
+fn decay(ps: *mut cb_pscan.Ps, t: i32) -> i32 {
+    let ty: *mut cb_types.Ty = cb_types.ty_ref((*ps).db, cb_types.strip((*ps).db, t))
+    if (*ty).kind == cb_types.K_ARR {
+        return cb_types.ty_ptr((*ps).db, (*ty).elem)
+    }
+    if (*ty).kind == cb_types.K_FUNC {
+        return cb_types.ty_ptr((*ps).db, t)
+    }
+    return t
+}
+
+fn parse_params(ps: *mut cb_pscan.Ps, params: *mut Vec[cb_types.Param], variadic: *mut bool) {
+    while !cb_pscan.is_p(ps, ")") && !cb_pscan.at_eof(ps) {
+        if cb_pscan.accept(ps, "...") {
+            *variadic = true
+            continue
+        }
+        var sp: Spec = Spec { is_typedef: false, is_static: false, is_inline: false, attrs: cb_pscan.Attrs { packed: false, align: 0 } }
+        let base: i32 = parse_specifiers(ps, &sp)
+        if base < 0 {
+            warn_at(ps, "cannot parse parameter")
+            while !cb_pscan.is_p(ps, ")") && !cb_pscan.at_eof(ps) {
+                advance(ps)
+            }
+            return
+        }
+        var name: str = ""
+        let t: i32 = declarator(ps, base, &name, &sp.attrs)
+        if !(base == cb_types.B_VOID && t == base && name.n == 0) {
+            vec_push[cb_types.Param](params, cb_types.Param { name: name, ty: decay(ps, t) })
+        }
+        cb_pscan.accept(ps, ",")
+    }
+}
+
+fn suffixes(ps: *mut cb_pscan.Ps, t: i32) -> i32 {
+    if cb_pscan.is_p(ps, "[") {
+        advance(ps)
+        var a: cb_pscan.Attrs = cb_pscan.Attrs { packed: false, align: 0 }
+        skip_quals(ps, &a)
+        if cb_pscan.is_id(ps, "static") {
+            advance(ps)
+        }
+        var count: i64 = 0 - 1
+        if !cb_pscan.is_p(ps, "]") {
+            var ok: bool = true
+            count = cb_pscan.eval_here(ps, &ok)
+            if !ok {
+                warn_at(ps, "array size is not constant")
+                count = 0 - 1
+            }
+        }
+        cb_pscan.accept(ps, "]")
+        let inner: i32 = suffixes(ps, t)
+        return cb_types.ty_arr((*ps).db, inner, count)
+    }
+    if cb_pscan.is_p(ps, "(") {
+        advance(ps)
+        var params: Vec[cb_types.Param] = vec_new[cb_types.Param]()
+        var variadic: bool = false
+        parse_params(ps, &params, &variadic)
+        cb_pscan.accept(ps, ")")
+        let id: i32 = cb_types.ty_new((*ps).db, cb_types.K_FUNC, 1, 1, false)
+        let ft: *mut cb_types.Ty = cb_types.ty_ref((*ps).db, id)
+        (*ft).elem = t
+        (*ft).variadic = variadic
+        (*ft).pstart = vec_len[cb_types.Param](&(*(*ps).db).params) as u32
+        (*ft).pcount = vec_len[cb_types.Param](&params) as u32
+        for i in 0..vec_len[cb_types.Param](&params) {
+            vec_push[cb_types.Param](&(*(*ps).db).params, *vec_elem_ptr[cb_types.Param](&params, i))
+        }
+        return id
+    }
+    return t
+}
+
+fn declarator(ps: *mut cb_pscan.Ps, base: i32, name: *mut str, attrs: *mut cb_pscan.Attrs) -> i32 {
+    var t: i32 = base
+    while cb_pscan.is_p(ps, "*") || cb_pscan.is_p(ps, "^") {
+        advance(ps)
+        t = cb_types.ty_ptr((*ps).db, t)
+        skip_quals(ps, attrs)
+    }
+    cb_pscan.skip_attrs(ps, attrs)
+    if cb_pscan.is_p(ps, "(") && nested_declarator(ps) {
+        let save: usize = (*ps).pos
+        cb_pscan.skip_group(ps)
+        let outer: i32 = suffixes(ps, t)
+        let end: usize = (*ps).pos
+        (*ps).pos = save + 1
+        let r: i32 = declarator(ps, outer, name, attrs)
+        (*ps).pos = end
+        return r
+    }
+    let c: *mut cb_lex.Tok = cb_pscan.cur(ps)
+    if (*c).kind == cb_lex.T_ID && !cb_pscan.is_type_kw((*c).text) {
+        *name = (*c).text
+        advance(ps)
+    }
+    cb_pscan.skip_attrs(ps, attrs)
+    return suffixes(ps, t)
+}
+
+fn parse_type_name(ps: *mut cb_pscan.Ps) -> i32 {
+    var sp: Spec = Spec { is_typedef: false, is_static: false, is_inline: false, attrs: cb_pscan.Attrs { packed: false, align: 0 } }
+    let base: i32 = parse_specifiers(ps, &sp)
+    if base < 0 {
+        return 0 - 1
+    }
+    var name: str = ""
+    return declarator(ps, base, &name, &sp.attrs)
+}
+
+fn skip_initializer(ps: *mut cb_pscan.Ps) {
+    while !cb_pscan.at_eof(ps) && !cb_pscan.is_p(ps, ",") && !cb_pscan.is_p(ps, ";") {
+        if cb_pscan.is_p(ps, "{") || cb_pscan.is_p(ps, "(") || cb_pscan.is_p(ps, "[") {
+            cb_pscan.skip_group(ps)
+        } else {
+            advance(ps)
+        }
+    }
+}
+
+fn register_typedef(ps: *mut cb_pscan.Ps, name: str, t: i32, file: u32) {
+    let ty: *mut cb_types.Ty = cb_types.ty_ref((*ps).db, t)
+    if (*ty).kind == cb_types.K_REC {
+        let r: *mut cb_types.Rec = rec_ptr(ps, (*ty).rec)
+        if (*r).name.n == 0 {
+            (*r).name = name
+            (*r).cname = name
+        }
+    }
+    cb_types.typedef_add((*ps).db, name, t, file, false)
+}
+
+fn declaration(ps: *mut cb_pscan.Ps) {
+    let file: u32 = (*cb_pscan.cur(ps)).file
+    var sp: Spec = Spec { is_typedef: false, is_static: false, is_inline: false, attrs: cb_pscan.Attrs { packed: false, align: 0 } }
+    let base: i32 = parse_specifiers(ps, &sp)
+    if base < 0 {
+        warn_at(ps, "cannot parse declaration near " + tok_text(ps))
+        cb_pscan.skip_to_semi(ps)
+        return
+    }
+    if cb_pscan.accept(ps, ";") {
+        return
+    }
+    while true {
+        var name: str = ""
+        let t: i32 = declarator(ps, base, &name, &sp.attrs)
+        cb_pscan.skip_attrs(ps, &sp.attrs)
+        let kind: u32 = (*cb_types.ty_ref((*ps).db, cb_types.strip((*ps).db, t))).kind
+        if sp.is_typedef {
+            register_typedef(ps, name, t, file)
+        } else if kind == cb_types.K_FUNC {
+            let body: bool = cb_pscan.is_p(ps, "{")
+            vec_push[cb_types.FnDecl](&(*(*ps).db).fns, cb_types.FnDecl { name: name, ty: t, file: file, has_body: body, is_static: sp.is_static })
+            if body {
+                cb_pscan.skip_group(ps)
+                return
+            }
+        } else if name.n > 0 {
+            warn_at(ps, "variable " + name + " skipped")
+        }
+        if cb_pscan.accept(ps, "=") {
+            skip_initializer(ps)
+        }
+        if cb_pscan.accept(ps, ",") {
+            continue
+        }
+        break
+    }
+    cb_pscan.accept(ps, ";")
+}
+
+fn parse_unit(ps: *mut cb_pscan.Ps) {
+    while !cb_pscan.at_eof(ps) {
+        let before: usize = (*ps).pos
+        if cb_pscan.accept(ps, ";") {
+            continue
+        }
+        if cb_pscan.is_id(ps, "_Static_assert") || cb_pscan.is_id(ps, "static_assert") {
+            cb_pscan.skip_to_semi(ps)
+            continue
+        }
+        declaration(ps)
+        if (*ps).pos == before {
+            advance(ps)
+        }
+    }
+}

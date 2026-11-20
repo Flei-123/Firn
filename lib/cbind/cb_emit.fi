@@ -1,0 +1,319 @@
+import std.rt
+import std.vec
+import std.dict
+import cbind.cb_util
+import cbind.cb_types
+import cbind.cb_layout
+import cbind.cb_names
+
+export { Em, em_new, emit_firn, emit_layout }
+
+struct Em {
+    db: *mut cb_types.Db,
+    foreign: *mut Vec[bool],
+    b: rt.Buf,
+    done: Vec[bool],
+    lib: str,
+    prefix: str,
+    wraps: Dict[bool],
+}
+
+fn em_new(db: *mut cb_types.Db, foreign: *mut Vec[bool]) -> Em {
+    var done: Vec[bool] = vec_new[bool]()
+    for i in 0..vec_len[cb_types.Rec](&(*db).recs) {
+        vec_push[bool](&done, false)
+    }
+    return Em { db: db, foreign: foreign, b: rt.buf_new(), done: done, lib: "", prefix: "fbg_", wraps: dict_new[bool]() }
+}
+
+fn is_foreign(em: *mut Em, file: u32) -> bool {
+    return *vec_elem_ptr[bool]((*em).foreign, file as usize)
+}
+
+fn line(em: *mut Em, s: str) {
+    cb_util.put(&(*em).b, s)
+    cb_util.put(&(*em).b, "\n")
+}
+
+fn emit_const(em: *mut Em, name: str, v: i64) {
+    var ty: str = "i32"
+    if v > 2147483647 || v < 0 - 2147483648 {
+        ty = "i64"
+    }
+    var lit: str = cb_util.istr(v)
+    if v < 0 {
+        lit = "0 - " + cb_util.istr(0 - v)
+    }
+    line(em, "const " + name + ": " + ty + " = " + lit)
+}
+
+fn emit_consts(em: *mut Em) {
+    let db: *mut cb_types.Db = (*em).db
+    var seen: Dict[bool] = dict_new[bool]()
+    for i in 0..vec_len[str](&(*db).const_names) {
+        let name: str = *vec_elem_ptr[str](&(*db).const_names, i)
+        if is_foreign(em, *vec_elem_ptr[u32](&(*db).const_files, i)) || dict_has[bool](&seen, name) {
+            continue
+        }
+        dict_set[bool](&seen, name, true)
+        emit_const(em, name, *vec_elem_ptr[i64](&(*db).const_vals, i))
+    }
+}
+
+fn ensure_rec(em: *mut Em, ri: i32) {
+    if *vec_elem_ptr[bool](&(*em).done, ri as usize) {
+        return
+    }
+    vec_set[bool](&(*em).done, ri as usize, true)
+    let db: *mut cb_types.Db = (*em).db
+    let r: *mut cb_types.Rec = cb_names.rec_ptr(db, ri)
+    let label: str = cb_names.rec_label(db, ri)
+    if (*r).is_enum {
+        if (*r).name.n > 0 {
+            line(em, "type " + label + " = " + cb_names.fi_type(db, (*r).ty))
+        }
+        return
+    }
+    if !(*r).complete {
+        line(em, "struct " + label + " { _opaque: u8 }")
+        return
+    }
+    cb_layout.layout_rec(db, ri)
+    deps(em, ri)
+    emit_struct(em, ri, label)
+}
+
+fn dep_of_type(em: *mut Em, t: i32) {
+    let db: *mut cb_types.Db = (*em).db
+    var s: i32 = cb_types.strip(db, t)
+    var ty: *mut cb_types.Ty = cb_types.ty_ref(db, s)
+    while (*ty).kind == cb_types.K_ARR {
+        s = cb_types.strip(db, (*ty).elem)
+        ty = cb_types.ty_ref(db, s)
+    }
+    if (*ty).kind == cb_types.K_REC {
+        ensure_rec(em, (*ty).rec)
+    }
+    if (*ty).kind == cb_types.K_PTR {
+        let e: *mut cb_types.Ty = cb_types.ty_ref(db, cb_types.strip(db, (*ty).elem))
+        if (*e).kind == cb_types.K_REC {
+            ensure_rec(em, (*e).rec)
+        }
+    }
+}
+
+fn deps(em: *mut Em, ri: i32) {
+    let db: *mut cb_types.Db = (*em).db
+    let r: *mut cb_types.Rec = cb_names.rec_ptr(db, ri)
+    for k in 0..(*r).fcount {
+        let f: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + k) as usize)
+        dep_of_type(em, (*f).ty)
+    }
+}
+
+fn emit_union(em: *mut Em, label: str, r: *mut cb_types.Rec) {
+    if (*r).align > 1 {
+        line(em, "#[align(" + cb_util.istr((*r).align as i64) + ")]")
+    }
+    line(em, "struct " + label + " { _data: [u8; " + cb_util.istr((*r).size as i64) + "] }")
+}
+
+fn bit_run_end(db: *mut cb_types.Db, r: *mut cb_types.Rec, from: u32) -> u32 {
+    var k: u32 = from
+    while k < (*r).fcount {
+        let f: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + k) as usize)
+        if (*f).bits < 0 {
+            break
+        }
+        k = k + 1
+    }
+    return k
+}
+
+fn emit_struct(em: *mut Em, ri: i32, label: str) {
+    let db: *mut cb_types.Db = (*em).db
+    let r: *mut cb_types.Rec = cb_names.rec_ptr(db, ri)
+    if (*r).is_union {
+        emit_union(em, label, r)
+        return
+    }
+    var body: rt.Buf = rt.buf_new()
+    var cur: u64 = 0
+    var max_align: u64 = 1
+    var k: u32 = 0
+    while k < (*r).fcount {
+        let f: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + k) as usize)
+        if (*f).bits >= 0 {
+            let end_k: u32 = bit_run_end(db, r, k)
+            var lo: u64 = 1000000000
+            var hi: u64 = 0
+            for q in k..end_k {
+                let g: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + q) as usize)
+                if (*g).bits > 0 {
+                    if (*g).bitoff / 8 < lo { lo = (*g).bitoff / 8 }
+                    let e: u64 = ((*g).bitoff + ((*g).bits as u64) + 7) / 8
+                    if e > hi { hi = e }
+                }
+            }
+            if hi > lo && lo >= cur {
+                if lo > cur {
+                    cb_util.put(&body, "    _pad" + cb_util.istr(cur as i64) + ": [u8; " + cb_util.istr((lo - cur) as i64) + "],\n")
+                }
+                cb_util.put(&body, "    _bits" + cb_util.istr(lo as i64) + ": [u8; " + cb_util.istr((hi - lo) as i64) + "],\n")
+                cur = hi
+            }
+            k = end_k
+            continue
+        }
+        let fs: u64 = cb_layout.size_of(db, (*f).ty)
+        var fa: u64 = cb_layout.align_of(db, (*f).ty)
+        if (*r).packed {
+            fa = 1
+        }
+        let ft: *mut cb_types.Ty = cb_types.ty_ref(db, cb_types.strip(db, (*f).ty))
+        if (*ft).kind == cb_types.K_ARR && (*ft).count < 0 {
+            cb_types.db_warn(db, "flexible array member in " + label + " skipped")
+            k = k + 1
+            continue
+        }
+        if (*f).off > cb_layout.round_up(cur, fa) {
+            cb_util.put(&body, "    _pad" + cb_util.istr(cur as i64) + ": [u8; " + cb_util.istr(((*f).off - cur) as i64) + "],\n")
+            cur = (*f).off
+        }
+        var fname: str = cb_names.fi_name((*f).name)
+        if fname.n == 0 {
+            fname = "_anon" + cb_util.istr((*f).off as i64)
+        }
+        cb_util.put(&body, "    " + fname + ": " + cb_names.fi_type(db, (*f).ty) + ",\n")
+        cur = (*f).off + fs
+        if fa > max_align {
+            max_align = fa
+        }
+        k = k + 1
+    }
+    if cb_layout.round_up(cur, max_align) != (*r).size {
+        cb_util.put(&body, "    _tail: [u8; " + cb_util.istr(((*r).size - cur) as i64) + "],\n")
+    }
+    if (*r).packed {
+        line(em, "#[packed]")
+    }
+    if (*r).align > max_align {
+        line(em, "#[align(" + cb_util.istr((*r).align as i64) + ")]")
+    }
+    if rt.buf_len(&body) == 0 {
+        cb_util.put(&body, "    _opaque: u8,\n")
+    }
+    line(em, "struct " + label + " {")
+    cb_util.put(&(*em).b, cb_util.gstr(&body))
+    line(em, "}")
+    rt.buf_free(&body)
+}
+
+fn emit_typedefs(em: *mut Em) {
+    let db: *mut cb_types.Db = (*em).db
+    for i in 0..vec_len[cb_types.Typedef](&(*db).tds) {
+        let td: *mut cb_types.Typedef = cb_names.td_ptr(db, i as i32)
+        if is_foreign(em, (*td).file) && !(*td).used {
+            continue
+        }
+        if (*td).builtin && !(*td).used {
+            continue
+        }
+        let ty: *mut cb_types.Ty = cb_types.ty_ref(db, (*td).ty)
+        let target: i32 = (*ty).elem
+        let ts: *mut cb_types.Ty = cb_types.ty_ref(db, cb_types.strip(db, target))
+        if (*ts).kind == cb_types.K_REC {
+            ensure_rec(em, (*ts).rec)
+            if cb_names.rec_label(db, (*ts).rec) == (*td).name {
+                continue
+            }
+        }
+        if cb_names.is_primitive_name((*td).name) {
+            continue
+        }
+        if (*ts).kind == cb_types.K_FUNC || (*ts).kind == cb_types.K_VOID {
+            continue
+        }
+        dep_of_type(em, target)
+        line(em, "type " + (*td).name + " = " + cb_names.fi_type(db, target))
+    }
+}
+
+fn emit_fn(em: *mut Em, fd: *mut cb_types.FnDecl) {
+    let db: *mut cb_types.Db = (*em).db
+    let ft: *mut cb_types.Ty = cb_types.ty_ref(db, cb_types.strip(db, (*fd).ty))
+    let wrapped: bool = dict_has[bool](&(*em).wraps, (*fd).name)
+    if ((*fd).has_body || (*ft).variadic) && !wrapped {
+        cb_types.db_warn(db, "function " + (*fd).name + " needs a C glue wrapper (--wrap)")
+        return
+    }
+    var sig: str = "extern fn " + cb_names.fi_name((*fd).name) + "("
+    for i in 0..(*ft).pcount {
+        let p: *mut cb_types.Param = vec_elem_ptr[cb_types.Param](&(*db).params, ((*ft).pstart + i) as usize)
+        var pn: str = cb_names.fi_name((*p).name)
+        if pn.n == 0 {
+            pn = "a" + cb_util.istr(i as i64)
+        }
+        if i > 0 {
+            sig = sig + ", "
+        }
+        dep_of_type(em, (*p).ty)
+        sig = sig + pn + ": " + cb_names.fi_type(db, (*p).ty)
+    }
+    sig = sig + ")"
+    let rt_ty: *mut cb_types.Ty = cb_types.ty_ref(db, cb_types.strip(db, (*ft).elem))
+    if (*rt_ty).kind != cb_types.K_VOID {
+        dep_of_type(em, (*ft).elem)
+        sig = sig + " -> " + cb_names.fi_type(db, (*ft).elem)
+    }
+    if wrapped {
+        line(em, "#[link_name(" + (*em).prefix + (*fd).name + ")]")
+    } else if (*em).lib.n > 0 {
+        line(em, "#[link_lib(" + (*em).lib + ")]")
+    }
+    line(em, sig + ";")
+}
+
+fn emit_firn(em: *mut Em) -> str {
+    let db: *mut cb_types.Db = (*em).db
+    emit_consts(em)
+    emit_typedefs(em)
+    for i in 0..vec_len[cb_types.Rec](&(*db).recs) {
+        let r: *mut cb_types.Rec = cb_names.rec_ptr(db, i as i32)
+        if !is_foreign(em, (*r).file) && ((*r).name.n > 0 || (*r).owner >= 0) {
+            ensure_rec(em, i as i32)
+        }
+    }
+    for i in 0..vec_len[cb_types.FnDecl](&(*db).fns) {
+        let fd: *mut cb_types.FnDecl = vec_elem_ptr[cb_types.FnDecl](&(*db).fns, i)
+        if !is_foreign(em, (*fd).file) {
+            emit_fn(em, fd)
+        }
+    }
+    return cb_util.gstr(&(*em).b)
+}
+
+fn emit_layout(em: *mut Em) -> str {
+    let db: *mut cb_types.Db = (*em).db
+    var b: rt.Buf = rt.buf_new()
+    for i in 0..vec_len[cb_types.Rec](&(*db).recs) {
+        let r: *mut cb_types.Rec = cb_names.rec_ptr(db, i as i32)
+        if is_foreign(em, (*r).file) || !(*r).complete || (*r).is_enum || (*r).cname.n == 0 {
+            continue
+        }
+        cb_layout.layout_rec(db, i as i32)
+        cb_util.put(&b, "S " + (*r).name + " " + cb_util.istr((*r).size as i64) + "\n")
+        if (*r).is_union {
+            continue
+        }
+        for k in 0..(*r).fcount {
+            let f: *mut cb_types.Field = vec_elem_ptr[cb_types.Field](&(*db).fields, ((*r).fstart + k) as usize)
+            if cb_names.has_offset(db, f) {
+                cb_util.put(&b, "O " + (*r).name + "." + (*f).name + " " + cb_util.istr((*f).off as i64) + "\n")
+            }
+        }
+    }
+    let s: str = cb_util.gstr(&b)
+    rt.buf_free(&b)
+    return s
+}

@@ -1,0 +1,169 @@
+import std.io
+import std.rt
+import std.vec
+import std.dict
+import std.pystr
+import cbind.cb_util
+import cbind.cb_lex
+import cbind.cb_pp
+import cbind.cb_types
+import cbind.cb_pscan
+import cbind.cb_parse
+import cbind.cb_emit
+import cbind.cb_check
+import cbind.cb_glue
+
+struct Opts {
+    header: str,
+    emit: str,
+    out: str,
+    lib: str,
+    prefix: str,
+    system: bool,
+    includes: Vec[str],
+    defines: Vec[str],
+    wraps: Vec[str],
+}
+
+fn arg_str(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return __str_copy(str { p: p as *mut u8, n: rt.c_length(p) })
+}
+
+fn usage() -> i32 {
+    io.eprint_line("usage: firn-bindgen [-I dir] [-D NAME[=V]] [--system] [--lib NAME] [--wrap SPEC] [--glue-prefix P]")
+    io.eprint_line("                    [--emit firn|layout|check-c|check-fi|glue] [-o FILE] header.h")
+    return 2
+}
+
+fn parse_opts(start: u64, o: *mut Opts) -> bool {
+    let argc: usize = rt.arg_count(start)
+    var i: usize = 1
+    while i < argc {
+        let a: str = arg_str(start, i)
+        if a == "--system" {
+            (*o).system = true
+        } else if i + 1 < argc && (a == "-I" || a == "-D" || a == "--lib" || a == "--wrap" || a == "--glue-prefix" || a == "--emit" || a == "-o") {
+            let v: str = arg_str(start, i + 1)
+            i = i + 1
+            if a == "-I" { vec_push[str](&(*o).includes, v) }
+            else if a == "-D" { vec_push[str](&(*o).defines, v) }
+            else if a == "--wrap" { vec_push[str](&(*o).wraps, v) }
+            else if a == "--lib" { (*o).lib = v }
+            else if a == "--glue-prefix" { (*o).prefix = v }
+            else if a == "--emit" { (*o).emit = v }
+            else { (*o).out = v }
+        } else if a.n > 2 && cb_util.at(a, 0) == 45 && cb_util.at(a, 1) == 73 {
+            vec_push[str](&(*o).includes, cb_util.sub(a, 2, a.n))
+        } else if a.n > 0 && cb_util.at(a, 0) != 45 {
+            (*o).header = a
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return (*o).header.n > 0
+}
+
+fn add_macro_wrap(db: *mut cb_types.Db, spec: str, wraps: *mut Dict[bool]) {
+    let colon: i64 = pystr.find(spec, ":")
+    if colon < 0 {
+        dict_set[bool](wraps, spec, true)
+        return
+    }
+    let name: str = cb_util.sub(spec, 0, colon as usize)
+    var toks: Vec[cb_lex.Tok] = vec_new[cb_lex.Tok]()
+    cb_lex.lex(cb_util.sub(spec, colon as usize + 1, spec.n), 1, &toks)
+    var ps: cb_pscan.Ps = cb_pscan.ps_new(&toks, db)
+    let t: i32 = cb_parse.parse_type_name(&ps)
+    if t < 0 || (*cb_types.ty_ref(db, t)).kind != cb_types.K_FUNC {
+        cb_types.db_warn(db, "bad wrap spec " + spec)
+        return
+    }
+    vec_push[cb_types.FnDecl](&(*db).fns, cb_types.FnDecl { name: name, ty: t, file: 1, has_body: true, is_static: true })
+    dict_set[bool](wraps, name, true)
+}
+
+fn predefine(pp: *mut cb_pp.Pp, o: *mut Opts) {
+    let defs: [str; 7] = ["__x86_64__", "__linux__", "__STDC__", "__STDC_VERSION__=201112L", "__LP64__", "_LP64", "__CHAR_BIT__=8"]
+    for d in defs {
+        cb_pp.pp_define(pp, d)
+    }
+    for i in 0..vec_len[str](&(*o).defines) {
+        cb_pp.pp_define(pp, *vec_elem_ptr[str](&(*o).defines, i))
+    }
+    for i in 0..vec_len[str](&(*o).includes) {
+        vec_push[str](&(*pp).inc_dirs, *vec_elem_ptr[str](&(*o).includes, i))
+    }
+    if (*o).system {
+        vec_push[str](&(*pp).inc_dirs, "/usr/include")
+        vec_push[str](&(*pp).inc_dirs, "/usr/include/x86_64-linux-gnu")
+    }
+}
+
+fn write_result(out: str, text: str) -> bool {
+    if out.n == 0 {
+        io.print(text)
+        return true
+    }
+    var b: rt.Buf = rt.buf_new()
+    cb_util.str_buf(out, &b)
+    let ok: bool = io.write_file(rt.buf_ptr(&b), text.p as u64, text.n)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn main(start: u64) -> i32 {
+    if !gc_init() {
+        return 1
+    }
+    var o: Opts = Opts {
+        header: "", emit: "firn", out: "", lib: "", prefix: "fbg_", system: false,
+        includes: vec_new[str](), defines: vec_new[str](), wraps: vec_new[str](),
+    }
+    if !parse_opts(start, &o) {
+        return usage()
+    }
+    var pp: cb_pp.Pp = cb_pp.pp_new()
+    predefine(&pp, &o)
+    if !cb_pp.pp_file(&pp, o.header, false) {
+        io.eprint_line("firn-bindgen: cannot read " + o.header)
+        return 2
+    }
+    cb_pp.pp_finish(&pp)
+    var db: cb_types.Db = cb_types.db_new()
+    var ps: cb_pscan.Ps = cb_pscan.ps_new(&pp.out, &db)
+    cb_parse.parse_unit(&ps)
+    cb_pp.pp_eval_macros(&pp, &db.consts, &db.const_names, &db.const_vals, &db.const_files)
+    var em: cb_emit.Em = cb_emit.em_new(&db, &pp.foreign)
+    em.lib = o.lib
+    em.prefix = o.prefix
+    for i in 0..vec_len[str](&o.wraps) {
+        add_macro_wrap(&db, *vec_elem_ptr[str](&o.wraps, i), &em.wraps)
+    }
+    var text: str = ""
+    if o.emit == "firn" {
+        text = cb_emit.emit_firn(&em)
+    } else if o.emit == "layout" {
+        text = cb_emit.emit_layout(&em)
+    } else if o.emit == "check-c" {
+        text = cb_check.emit_check_c(&db, &pp.foreign, o.header)
+    } else if o.emit == "check-fi" {
+        text = "import std.io\n" + cb_emit.emit_firn(&em) + "\n" + cb_check.emit_check_fi(&db, &pp.foreign)
+    } else if o.emit == "glue" {
+        text = cb_glue.emit_glue(&db, &pp.foreign, &em.wraps, o.prefix, o.header)
+    } else {
+        return usage()
+    }
+    for i in 0..vec_len[str](&pp.warns) {
+        io.eprint_line("warning: " + *vec_elem_ptr[str](&pp.warns, i))
+    }
+    for i in 0..vec_len[str](&db.warns) {
+        io.eprint_line("warning: " + *vec_elem_ptr[str](&db.warns, i))
+    }
+    if !write_result(o.out, text) {
+        io.eprint_line("firn-bindgen: cannot write " + o.out)
+        return 2
+    }
+    return 0
+}
