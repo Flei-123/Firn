@@ -9,6 +9,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/fs.fi`, `std/fsx.fi`, `std/dir.fi`, `std/glob.fi`, `std/safefs.fi` | files, dirs, atomic writes, globbing
 - `std/str.fi`, `std/text.fi`, `std/textfmt.fi`, `std/pystr.fi` | strings, formatting
 - `std/vec.fi`, `std/map.fi`, `std/deque.fi`, `std/heap.fi`, `std/dict.fi`, `std/pycoll.fi`, `std/itertools.fi` | collections
+- `std/simd.fi`, `std/cpu.fi`, `std/lanes/{vf4,vi4,vu16,vf8,vi8,vmask,vconv}.fi` | SIMD: raw `v128` wrappers, CPU features, typed lanes f32x4/i32x4/u8x16/f32x8/i32x8 (docs/SIMD.md) | `vf4.load(p).add(vf4.splat(1.0)).hsum()`
 - `std/json.fi`, `std/csv.fi`, `std/xml.fi`, `std/nbt.fi`, `std/base64.fi` | parse/emit formats
 - `std/time.fi`, `std/log.fi`, `std/args.fi`, `std/cmdline.fi`, `std/env.fi`, `std/process.fi`, `std/shell.fi` | clocks, logging, CLI, spawn
 - `std/hash.fi`, `std/md5.fi`, `std/tar.fi`, `std/extract.fi`, `std/stats.fi`, `std/mathx.fi`, `std/rng.fi` | hashes, archives, math

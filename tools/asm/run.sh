@@ -25,14 +25,14 @@ run_x86() {
     echo $?
 }
 for lvl in dev-fast release-safe release-fast; do
-    check "x86 operands $lvl" 0 "$(run_x86 "$ROOT/tests/6771_asm_operands_x86.fi" $lvl)"
+    check "x86 operands $lvl" 0 "$(run_x86 "$ROOT/tests/6793_asm_operands_x86.fi" $lvl)"
     check "a64 operands $lvl" 0 "$(run_a64 "$ROOT/tests/asm_a64/operands.fi" $lvl)"
 done
 "$FIRNC" --target=aarch64-linux -o "$WORK/a64" "$ROOT/tests/asm_a64/locked_register.fi" >"$WORK/log" 2>&1
 check "a64 locked register refused" 1 "$(grep -c "register 'x19' is not allowed" "$WORK/log")"
 "$FIRNC" --unsafe=error --target=aarch64-linux -o "$WORK/a64" "$ROOT/tests/asm_a64/outside_unsafe.fi" >"$WORK/log" 2>&1
 check "a64 asm outside unsafe refused" 1 "$(grep -c "inline assembly is only allowed" "$WORK/log")"
-"$FIRNC" --unsafe=error --unsafe-scope=tests/6771 -o "$WORK/x86" "$ROOT/tests/6771_asm_operands_x86.fi" >"$WORK/log" 2>&1
+"$FIRNC" --unsafe=error --unsafe-scope=tests/6793 -o "$WORK/x86" "$ROOT/tests/6793_asm_operands_x86.fi" >"$WORK/log" 2>&1
 check "x86 operands clean under --unsafe=error" 0 "$(grep -c '^error' "$WORK/log")"
 [ "$fail" -eq 0 ] || { echo "$fail failed"; exit 1; }
 echo "all ok"
