@@ -13,7 +13,7 @@ Goal: Firn runs like Rust without a collector. `firnc --no-gc` links no GC runti
 - `gc class`, `gc fn`, `Gc[T]`, `GcWeak[T]`, `GcVec*`, `GcMap*`, `gcvec_*`, `gcmap_*` are compile errors: `'gc class' needs the garbage collector, which '--no-gc' leaves out` (token position, `help:` line).
 - `--no-gc` implies `--ownership=strict`; any other explicit `--ownership` value is refused (`'--no-gc' requires --ownership=strict`), in either order.
 - The runtime is replaced by `lib/gc/nogc.fi` (`__str_eq`, `__gc_blit`, `__str_copy` that aborts with exit 70). It is only added when a `str` token shows up; programs without `str` carry no runtime at all.
-- No `str` allocation: `a + b` on `str` is the existing error `the operator '+' on str needs the collector runtime` (no `__str_concat` in this runtime). `__str_copy` (used by `io.fmt_string` and the `fmt_*` helpers that return an owned `str`) exists only so `std.io` still type-checks. firnc0 reports a compile error at the call in your code that reaches it (`compiler/src/nogc_reach.rs`, call graph from the root file's functions): `'str' allocation needs the garbage collector, which '--no-gc' leaves out`. firnc1 still aborts at run time (exit 70) there.
+- Owned `str` (r1569): `a + b`, `io.fmt_string`, the `fmt_*` helpers and `pystr` allocate from a small size-class allocator in `lib/gc/nogc.fi` (`__ns_alloc`: 32..4096 byte classes carved from 64 KiB chunks, larger blocks straight from mmap, 16-byte header, spin lock for threads). The ownership pass finds the producers `__own_str_concat2/3/4` exactly as in the GC build and inserts `__gc_free_block` where the value provably dies; a `str` that escapes (stored in a struct, returned, passed on) is not freed and stays allocated until exit. Out of memory exits with code 70.
 - Threads: `thread_start`, `thread_wait`, `thread_lock`, `thread_unlock` come from `lib/gc/nogc_thread.fi` (clone + mmap stack with guard page, futex join, spin lock), pulled in when a `thread_*`/`__thread*` token appears; no state block, no stop-the-world. The program declares `__thread_work(kind, arg)` itself (no default in this mode). `thread_detach`, `thread_count`, `thread_sleep`, `thread_safepoint` and the jobs/pool/chan libraries still need the collector runtime.
 - Memory comes from Vec/Map (`rt.heap_alloc`), `std.str.Bytes`, `std.rc`, `lib/mem/slab.fi` (new, fixed-size objects), arenas. The compiler does not insert frees in this mode (nothing it manages is on a GC heap); frees are explicit (`drop_tree` in `tools/nogc/cases/binary_trees.fi`).
 
@@ -46,8 +46,8 @@ The GC binary_trees is `bench/firn_vs_c/firn/binary_trees.fi` (`gc class`); the 
 
 ## Open
 
-- Owned `str` in no-gc mode: allocation for `+`, `fmt_string`, `pystr` results with compiler-inserted frees (producer registry in `own/fir/registry`, free function over `rt.heap_free`/slab).
+- Frees for escaping owned `str` (returned values, struct fields) need caller-side drop glue; today they leak in `--no-gc`.
 - Thread libraries on the new runtime (`jobs`, `pool`, `chan` use `thread_*` plus collector locks).
 - Edition/manifest option (`gc = off` in `firn.package`).
-- firnc1 twin of the `__str_copy` reachability error (`nogc_reach.rs`).
+- firnc1 has no ownership pass for the runtime allocator yet: `str` allocated through firnc1 `--no-gc` is never freed.
 - Rc/Arc pair with cycle detection is out of scope (`std.rc` leaks cycles on purpose).

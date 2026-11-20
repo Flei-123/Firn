@@ -39,9 +39,174 @@ fn __gc_blit(dst: u64, src: u64, n: u64) {
     }
 }
 
+const NS_SYS_MMAP: i64 = 9
+const NS_SYS_MUNMAP: i64 = 11
+const NS_SYS_SCHED_YIELD: i64 = 24
+const NS_SYS_EXIT_GROUP: i64 = 231
+const NS_PROT_RW: i64 = 3
+const NS_MAP_PRIVATE_ANON: i64 = 34
+const NS_PAGE: u64 = 4096
+const NS_HEADER: u64 = 16
+const NS_CLASSES: u64 = 8
+const NS_MIN_CLASS: u64 = 32
+const NS_MAX_SMALL: u64 = 4096
+const NS_CHUNK: u64 = 65536
+const NS_SPIN_LIMIT: u64 = 64
+const NS_EXIT_OOM: i64 = 70
+
+static mut NS_LOCK: u64 = 0
+static mut NS_HEAD: [u64; 8] = [0; 8]
+static mut NS_CUR: u64 = 0
+static mut NS_END: u64 = 0
+
+fn __ns_map(n: u64) -> u64 {
+    let r: i64 = syscall(NS_SYS_MMAP, 0, n as i64, NS_PROT_RW, NS_MAP_PRIVATE_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    return r as u64
+}
+
+fn __ns_oom() {
+    var msg: [u8; 41] = "firn: --no-gc: out of memory (str alloc)\n"
+    syscall(1, 2, ((&msg[0]) as u64) as i64, 41, 0, 0, 0)
+    syscall(NS_SYS_EXIT_GROUP, NS_EXIT_OOM, 0, 0, 0, 0, 0)
+}
+
+fn __ns_lock() {
+    var spins: u64 = 0
+    var held: u64 = __atomic_swap((&NS_LOCK) as *mut u64, 0, 1)
+    while held != 0 {
+        spins = spins +% 1
+        if spins > NS_SPIN_LIMIT {
+            syscall(NS_SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+        }
+        held = __atomic_swap((&NS_LOCK) as *mut u64, 0, 1)
+    }
+}
+
+fn __ns_unlock() {
+    __atomic_swap((&NS_LOCK) as *mut u64, 1, 0)
+}
+
+fn __ns_class_of(total: u64) -> u64 {
+    var class: u64 = 0
+    var size: u64 = NS_MIN_CLASS
+    while size < total {
+        size = size * 2
+        class = class +% 1
+    }
+    return class
+}
+
+fn __ns_alloc_small(class: u64) -> u64 {
+    let size: u64 = NS_MIN_CLASS << class
+    __ns_lock()
+    let head: u64 = NS_HEAD[class as usize]
+    if head != 0 {
+        NS_HEAD[class as usize] = *(head as *mut u64)
+        __ns_unlock()
+        return head
+    }
+    if NS_CUR +% size > NS_END {
+        let chunk: u64 = __ns_map(NS_CHUNK)
+        if chunk == 0 {
+            __ns_unlock()
+            return 0
+        }
+        NS_CUR = chunk
+        NS_END = chunk +% NS_CHUNK
+    }
+    let b: u64 = NS_CUR
+    NS_CUR = NS_CUR +% size
+    __ns_unlock()
+    return b
+}
+
+fn __ns_alloc(n: u64) -> *mut u8 {
+    let total: u64 = n +% NS_HEADER
+    var b: u64 = 0
+    var tag: u64 = 0
+    if total <= NS_MAX_SMALL {
+        let class: u64 = __ns_class_of(total)
+        b = __ns_alloc_small(class)
+        tag = class
+    } else {
+        let len: u64 = (total +% NS_PAGE -% 1) / NS_PAGE * NS_PAGE
+        b = __ns_map(len)
+        tag = len
+    }
+    if b == 0 {
+        __ns_oom()
+        return 0 as *mut u8
+    }
+    *(b as *mut u64) = tag
+    *((b +% 8) as *mut u64) = n
+    return (b +% NS_HEADER) as *mut u8
+}
+
+fn __gc_free_block(p: *mut u8) {
+    if (p as u64) == 0 {
+        return
+    }
+    let b: u64 = (p as u64) -% NS_HEADER
+    let tag: u64 = *(b as *mut u64)
+    *(b as *mut u64) = 0
+    if tag >= NS_PAGE {
+        syscall(NS_SYS_MUNMAP, b as i64, tag as i64, 0, 0, 0, 0)
+        return
+    }
+    __ns_lock()
+    *(b as *mut u64) = NS_HEAD[tag as usize]
+    NS_HEAD[tag as usize] = b
+    __ns_unlock()
+}
+
+fn __gc_poison_block(p: *mut u8) {
+    __gc_free_block(p)
+}
+
+fn __own_str_join(a: str, b: str, c: str, d: str) -> str {
+    let n: usize = a.n + b.n + c.n + d.n
+    if n == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let p: *mut u8 = __ns_alloc(n as u64)
+    var at: u64 = p as u64
+    __gc_blit(at, a.p as u64, a.n as u64)
+    at = at +% (a.n as u64)
+    __gc_blit(at, b.p as u64, b.n as u64)
+    at = at +% (b.n as u64)
+    __gc_blit(at, c.p as u64, c.n as u64)
+    at = at +% (c.n as u64)
+    __gc_blit(at, d.p as u64, d.n as u64)
+    return str { p: p, n: n }
+}
+
 fn __str_copy(a: str) -> str {
-    var msg: [u8; 47] = "firn: --no-gc: str allocation is not available\n"
-    syscall(1, 2, ((&msg[0]) as u64) as i64, 47, 0, 0, 0)
-    syscall(231, 70, 0, 0, 0, 0, 0)
-    return str { p: 0 as *mut u8, n: 0 }
+    return __own_str_join(a, str { p: 0 as *mut u8, n: 0 }, str { p: 0 as *mut u8, n: 0 }, str { p: 0 as *mut u8, n: 0 })
+}
+
+fn __own_str_concat2(a: str, b: str) -> str {
+    return __own_str_join(a, b, str { p: 0 as *mut u8, n: 0 }, str { p: 0 as *mut u8, n: 0 })
+}
+
+fn __own_str_concat3(a: str, b: str, c: str) -> str {
+    return __own_str_join(a, b, c, str { p: 0 as *mut u8, n: 0 })
+}
+
+fn __own_str_concat4(a: str, b: str, c: str, d: str) -> str {
+    return __own_str_join(a, b, c, d)
+}
+
+fn __str_concat(a: str, b: str) -> str {
+    return __own_str_concat2(a, b)
+}
+
+fn __str_concat3(a: str, b: str, c: str) -> str {
+    return __own_str_concat3(a, b, c)
+}
+
+fn __str_concat4(a: str, b: str, c: str, d: str) -> str {
+    return __own_str_concat4(a, b, c, d)
 }
