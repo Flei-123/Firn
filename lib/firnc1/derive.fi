@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: MPL-2.0
+import rt
+import vec
+import derive_decl
+import derive_emit
+import derive_enum
+
+const NO_DERIVE: i32 = 0
+const EXPANDED: i32 = 1
+const FAILED: i32 = 2
+
+fn dv_flag_of(src: u64, s: usize, e: usize) -> u32 {
+    if derive_decl.dv_eq_lit(src, s, e, "Debug") { return derive_emit.D_DEBUG }
+    if derive_decl.dv_eq_lit(src, s, e, "Eq") { return derive_emit.D_EQ }
+    if derive_decl.dv_eq_lit(src, s, e, "Ord") { return derive_emit.D_ORD }
+    if derive_decl.dv_eq_lit(src, s, e, "Hash") { return derive_emit.D_HASH }
+    if derive_decl.dv_eq_lit(src, s, e, "Clone") { return derive_emit.D_CLONE }
+    if derive_decl.dv_eq_lit(src, s, e, "Default") { return derive_emit.D_DEFAULT }
+    return 0
+}
+
+fn dv_names(dc: *mut derive_decl.Dc, attr: usize, flags: *mut u32, attr_end: *mut usize) -> bool {
+    let src: u64 = (*dc).src
+    let n: usize = (*dc).n
+    let start: usize = attr + 9
+    var close: usize = start
+    while close + 1 < n && !(derive_decl.dv_at(src, close) == 41 && derive_decl.dv_at(src, close + 1) == 93) {
+        close = close + 1
+    }
+    if close + 1 >= n {
+        return derive_decl.dv_fail(dc, attr, 9, "unterminated derive attribute, expected ')]'")
+    }
+    var k: usize = start
+    *flags = 0
+    while k <= close {
+        var e: usize = k
+        while e < close && derive_decl.dv_at(src, e) != 44 { e = e + 1 }
+        let a: usize = derive_decl.dv_trim_start(src, k, e)
+        let b: usize = derive_decl.dv_trim_end(src, a, e)
+        let f: u32 = dv_flag_of(src, a, b)
+        if f == 0 {
+            rt.buf_clear(&(*dc).err)
+            derive_decl.dv_err_put(dc, "unknown derive '")
+            rt.buf_push_bytes(&(*dc).err, src +% a as u64, b - a)
+            derive_decl.dv_err_put(dc, "', known: Debug, Eq, Ord, Hash, Clone, Default")
+            (*dc).err_at = attr
+            (*dc).err_len = close + 2 - attr
+            return false
+        }
+        *flags = *flags | f
+        k = e + 1
+    }
+    *attr_end = close + 2
+    return true
+}
+
+fn dv_generate(dc: *mut derive_decl.Dc, flags: u32) -> bool {
+    let generic: bool = vec_len[usize](&(*dc).gens) > 0
+    if generic && (*dc).is_enum {
+        return derive_decl.dv_fail(dc, 0, 9, "derive on a generic enum needs 'match' inside generic templates (roadmap r1573)")
+    }
+    if (flags & derive_emit.D_DEFAULT) != 0 && (generic || (*dc).is_enum) {
+        return derive_decl.dv_fail(dc, 0, 9, "derive(Default) works on non-generic structs only")
+    }
+    let methods: u32 = flags & (derive_emit.D_DEFAULT ^ 4294967295)
+    if methods != 0 {
+        derive_decl.dv_put(dc, " impl ")
+        derive_emit.dv_self_type(dc)
+        derive_decl.dv_put(dc, " { ")
+        if (*dc).is_enum {
+            derive_enum.dv_enum_methods(dc, flags)
+        } else {
+            derive_emit.dv_struct_methods(dc, flags)
+        }
+        derive_decl.dv_put(dc, "}")
+    }
+    if (flags & derive_emit.D_DEFAULT) != 0 {
+        return derive_emit.dv_s_default(dc)
+    }
+    return true
+}
+
+fn dv_has_import(src: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if derive_decl.dv_starts(src, n, i, "import std.derive") { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn dv_one(dc: *mut derive_decl.Dc, attr: usize, cursor: *mut usize, import_done: *mut bool) -> bool {
+    var flags: u32 = 0
+    var attr_end: usize = 0
+    if !dv_names(dc, attr, &flags, &attr_end) { return false }
+    derive_decl.dv_reset(dc)
+    if !derive_decl.dv_parse(dc, attr, attr_end) { return false }
+    let mark: usize = rt.buf_len(&(*dc).out)
+    rt.buf_push_bytes(&(*dc).out, (*dc).src +% (*cursor) as u64, attr - (*cursor))
+    var i: usize = attr
+    while i < attr_end {
+        rt.buf_push(&(*dc).out, 32 as u8)
+        i = i + 1
+    }
+    derive_decl.dv_put_range(dc, attr_end, (*dc).end)
+    if !(*import_done) {
+        derive_decl.dv_put(dc, " import std.derive; ")
+        *import_done = true
+    }
+    *cursor = (*dc).end
+    if !dv_generate(dc, flags) {
+        if (*dc).err_at == 0 { (*dc).err_at = attr }
+        return false
+    }
+    return true
+}
+
+fn dv_run(dc: *mut derive_decl.Dc, src: u64, n: usize) -> i32 {
+    (*dc).src = src
+    (*dc).n = n
+    var i: usize = 0
+    var cursor: usize = 0
+    var import_done: bool = dv_has_import(src, n)
+    var found: bool = false
+    while i < n {
+        var le: usize = i
+        while le < n && derive_decl.dv_at(src, le) != 10 { le = le + 1 }
+        var lead: usize = i
+        while lead < le && (derive_decl.dv_at(src, lead) == 32 || derive_decl.dv_at(src, lead) == 9) { lead = lead + 1 }
+        if derive_decl.dv_starts(src, le, lead, "#[derive(") {
+            found = true
+            if !dv_one(dc, lead, &cursor, &import_done) { return FAILED }
+        }
+        i = le + 1
+    }
+    if !found { return NO_DERIVE }
+    rt.buf_push_bytes(&(*dc).out, src +% cursor as u64, n - cursor)
+    return EXPANDED
+}
+
+fn dv_line(src: u64, at: usize) -> u32 {
+    var line: u32 = 1
+    var i: usize = 0
+    while i < at {
+        if derive_decl.dv_at(src, i) == 10 { line = line + 1 }
+        i = i + 1
+    }
+    return line
+}
+
+fn dv_col(src: u64, at: usize) -> u32 {
+    var col: u32 = 1
+    var i: usize = 0
+    while i < at {
+        let c: u8 = derive_decl.dv_at(src, i)
+        if c == 10 {
+            col = 1
+        } else if c < 128 || c >= 192 {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    return col
+}

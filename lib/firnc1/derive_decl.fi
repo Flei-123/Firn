@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: MPL-2.0
+import rt
+import vec
+
+const KIND_SELF: u32 = 0
+const KIND_OTHER: u32 = 1
+const KIND_BIND_A: u32 = 2
+const KIND_BIND_B: u32 = 3
+
+struct Val {
+    kind: u32,
+    s: usize,
+    e: usize,
+}
+
+struct Dc {
+    src: u64,
+    n: usize,
+    out: rt.Buf,
+    name_s: usize,
+    name_e: usize,
+    is_enum: bool,
+    gens: Vec[usize],
+    fields: Vec[usize],
+    vars: Vec[usize],
+    vtys: Vec[usize],
+    end: usize,
+    err_at: usize,
+    err_len: usize,
+    err: rt.Buf,
+}
+
+fn dv_new() -> Dc {
+    return Dc {
+        src: 0, n: 0, out: rt.buf_new(), name_s: 0, name_e: 0, is_enum: false,
+        gens: vec_new[usize](), fields: vec_new[usize](), vars: vec_new[usize](), vtys: vec_new[usize](),
+        end: 0, err_at: 0, err_len: 0, err: rt.buf_new(),
+    }
+}
+
+fn dv_release(dc: *mut Dc, keep_out: bool) {
+    vec_free[usize](&(*dc).gens)
+    vec_free[usize](&(*dc).fields)
+    vec_free[usize](&(*dc).vars)
+    vec_free[usize](&(*dc).vtys)
+    rt.buf_free(&(*dc).err)
+    if !keep_out {
+        rt.buf_free(&(*dc).out)
+    }
+}
+
+fn dv_reset(dc: *mut Dc) {
+    vec_clear[usize](&(*dc).gens)
+    vec_clear[usize](&(*dc).fields)
+    vec_clear[usize](&(*dc).vars)
+    vec_clear[usize](&(*dc).vtys)
+}
+
+fn dv_out_ptr(dc: *mut Dc) -> u64 { return rt.buf_ptr(&(*dc).out) }
+
+fn dv_out_len(dc: *mut Dc) -> usize { return rt.buf_len(&(*dc).out) }
+
+fn dv_err_ptr(dc: *mut Dc) -> u64 { return rt.buf_ptr(&(*dc).err) }
+
+fn dv_err_len(dc: *mut Dc) -> usize { return rt.buf_len(&(*dc).err) }
+
+fn dv_at(src: u64, i: usize) -> u8 {
+    unsafe { return *((src +% i as u64) as *mut u8) }
+}
+
+fn dv_put(dc: *mut Dc, s: str) {
+    unsafe { rt.buf_push_bytes(&(*dc).out, s.p as u64, s.n) }
+}
+
+fn dv_put_range(dc: *mut Dc, s: usize, e: usize) {
+    rt.buf_push_bytes(&(*dc).out, (*dc).src +% s as u64, e - s)
+}
+
+fn dv_put_num(dc: *mut Dc, v: usize) {
+    rt.buf_push_dec_u64(&(*dc).out, v as u64)
+}
+
+fn dv_err_put(dc: *mut Dc, s: str) {
+    unsafe { rt.buf_push_bytes(&(*dc).err, s.p as u64, s.n) }
+}
+
+fn dv_fail(dc: *mut Dc, at: usize, len: usize, msg: str) -> bool {
+    rt.buf_clear(&(*dc).err)
+    dv_err_put(dc, msg)
+    (*dc).err_at = at
+    (*dc).err_len = len
+    return false
+}
+
+fn dv_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn dv_is_word(c: u8) -> bool {
+    if c >= 48 && c <= 57 { return true }
+    if c >= 65 && c <= 90 { return true }
+    if c >= 97 && c <= 122 { return true }
+    return c == 95 || c >= 128
+}
+
+fn dv_word_end(src: u64, n: usize, i: usize) -> usize {
+    var j: usize = i
+    while j < n && dv_is_word(dv_at(src, j)) {
+        j = j + 1
+    }
+    return j
+}
+
+fn dv_starts(src: u64, n: usize, i: usize, lit: str) -> bool {
+    if i + lit.n > n { return false }
+    unsafe { return rt.mem_eq(src +% i as u64, lit.p as u64, lit.n) }
+}
+
+fn dv_eq_lit(src: u64, s: usize, e: usize, lit: str) -> bool {
+    if e - s != lit.n { return false }
+    unsafe { return rt.mem_eq(src +% s as u64, lit.p as u64, lit.n) }
+}
+
+fn dv_skip_blank(src: u64, n: usize, i0: usize) -> usize {
+    var i: usize = i0
+    while i < n {
+        let c: u8 = dv_at(src, i)
+        if dv_is_ws(c) {
+            i = i + 1
+        } else if dv_starts(src, n, i, "//") {
+            while i < n && dv_at(src, i) != 10 { i = i + 1 }
+        } else if dv_starts(src, n, i, "#[") {
+            while i < n && dv_at(src, i) != 93 { i = i + 1 }
+            if i < n { i = i + 1 }
+        } else {
+            return i
+        }
+    }
+    return i
+}
+
+fn dv_matching(src: u64, n: usize, open: usize, close: u8) -> usize {
+    var depth: usize = 0
+    var i: usize = open
+    while i < n {
+        if dv_starts(src, n, i, "//") {
+            while i < n && dv_at(src, i) != 10 { i = i + 1 }
+            continue
+        }
+        let c: u8 = dv_at(src, i)
+        if c == 123 || c == 91 || c == 40 {
+            depth = depth + 1
+        } else if c == 125 || c == 93 || c == 41 {
+            depth = depth - 1
+            if depth == 0 {
+                if c == close { return i }
+                return n
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn dv_trim_start(src: u64, s: usize, e: usize) -> usize {
+    var i: usize = s
+    while i < e && dv_is_ws(dv_at(src, i)) { i = i + 1 }
+    return i
+}
+
+fn dv_trim_end(src: u64, s: usize, e: usize) -> usize {
+    var j: usize = e
+    while j > s && dv_is_ws(dv_at(src, j - 1)) { j = j - 1 }
+    return j
+}
+
+fn dv_split(src: u64, s: usize, e: usize, out: *mut Vec[usize]) {
+    var depth: usize = 0
+    var start: usize = s
+    var last: usize = s
+    var i: usize = s
+    while i < e {
+        let c: u8 = dv_at(src, i)
+        if dv_starts(src, e, i, "//") {
+            while i < e && dv_at(src, i) != 10 { i = i + 1 }
+            continue
+        }
+        if c == 40 || c == 91 || c == 123 {
+            depth = depth + 1
+        } else if c == 41 || c == 93 || c == 125 {
+            depth = depth - 1
+        }
+        if depth == 0 && (c == 44 || c == 10) {
+            dv_push_entry(src, start, last, out)
+            start = i + 1
+            last = i + 1
+        } else if !dv_is_ws(c) {
+            last = i + 1
+        }
+        i = i + 1
+    }
+    dv_push_entry(src, start, last, out)
+}
+
+fn dv_push_entry(src: u64, s: usize, e: usize, out: *mut Vec[usize]) {
+    let a: usize = dv_trim_start(src, s, e)
+    let b: usize = dv_trim_end(src, a, e)
+    if a < b {
+        vec_push[usize](out, a)
+        vec_push[usize](out, b)
+    }
+}
+
+fn dv_parse_fields(dc: *mut Dc, s: usize, e: usize) -> bool {
+    var entries: Vec[usize] = vec_new[usize]()
+    dv_split((*dc).src, s, e, &entries)
+    var k: usize = 0
+    var ok: bool = true
+    while k < vec_len[usize](&entries) && ok {
+        let a: usize = vec_at[usize](&entries, k)
+        let b: usize = vec_at[usize](&entries, k + 1)
+        var colon: usize = a
+        while colon < b && dv_at((*dc).src, colon) != 58 { colon = colon + 1 }
+        if colon >= b {
+            ok = dv_fail(dc, s, 1, "derive: cannot read a struct field")
+        } else {
+            let ne: usize = dv_trim_end((*dc).src, a, colon)
+            let ts: usize = dv_trim_start((*dc).src, colon + 1, b)
+            vec_push[usize](&(*dc).fields, a)
+            vec_push[usize](&(*dc).fields, ne)
+            vec_push[usize](&(*dc).fields, ts)
+            vec_push[usize](&(*dc).fields, b)
+        }
+        k = k + 2
+    }
+    vec_free[usize](&entries)
+    return ok
+}
+
+fn dv_parse_variants(dc: *mut Dc, s: usize, e: usize) -> bool {
+    var entries: Vec[usize] = vec_new[usize]()
+    dv_split((*dc).src, s, e, &entries)
+    var k: usize = 0
+    var ok: bool = true
+    while k < vec_len[usize](&entries) && ok {
+        let a: usize = vec_at[usize](&entries, k)
+        let b: usize = vec_at[usize](&entries, k + 1)
+        let we: usize = dv_word_end((*dc).src, b, a)
+        let rest: usize = dv_trim_start((*dc).src, we, b)
+        let first: usize = vec_len[usize](&(*dc).vtys) / 2
+        if we == a || (rest < b && !(dv_at((*dc).src, rest) == 40 && dv_at((*dc).src, b - 1) == 41)) {
+            ok = dv_fail(dc, s, 1, "derive: cannot read an enum variant")
+        } else {
+            if rest < b {
+                dv_split((*dc).src, rest + 1, b - 1, &(*dc).vtys)
+            }
+            vec_push[usize](&(*dc).vars, a)
+            vec_push[usize](&(*dc).vars, we)
+            vec_push[usize](&(*dc).vars, first)
+            vec_push[usize](&(*dc).vars, vec_len[usize](&(*dc).vtys) / 2 - first)
+        }
+        k = k + 2
+    }
+    vec_free[usize](&entries)
+    return ok
+}
+
+fn dv_parse(dc: *mut Dc, attr: usize, attr_end: usize) -> bool {
+    let src: u64 = (*dc).src
+    let n: usize = (*dc).n
+    var at: usize = dv_skip_blank(src, n, attr_end)
+    if dv_starts(src, n, at, "export") && dv_trim_start(src, at + 6, n) > at + 6 {
+        at = dv_skip_blank(src, n, at + 6)
+    }
+    let we: usize = dv_word_end(src, n, at)
+    let is_struct: bool = dv_eq_lit(src, at, we, "struct")
+    (*dc).is_enum = dv_eq_lit(src, at, we, "enum")
+    if !is_struct && !(*dc).is_enum {
+        return dv_fail(dc, attr, 1, "derive attribute must stand before a struct or an enum")
+    }
+    at = dv_skip_blank(src, n, we)
+    (*dc).name_s = at
+    (*dc).name_e = dv_word_end(src, n, at)
+    at = dv_skip_blank(src, n, (*dc).name_e)
+    if at < n && dv_at(src, at) == 91 {
+        let close: usize = dv_matching(src, n, at, 93)
+        if close >= n { return dv_fail(dc, at, 1, "derive: unterminated type parameter list") }
+        var k: usize = at + 1
+        while k < close {
+            let a: usize = dv_trim_start(src, k, close)
+            let b: usize = dv_word_end(src, close, a)
+            vec_push[usize](&(*dc).gens, a)
+            vec_push[usize](&(*dc).gens, b)
+            while k < close && dv_at(src, k) != 44 { k = k + 1 }
+            k = k + 1
+        }
+        at = dv_skip_blank(src, n, close + 1)
+    }
+    if at >= n || dv_at(src, at) != 123 {
+        return dv_fail(dc, at, 1, "derive: expected '{' after the name")
+    }
+    let close: usize = dv_matching(src, n, at, 125)
+    if close >= n { return dv_fail(dc, at, 1, "derive: unterminated declaration") }
+    (*dc).end = close + 1
+    if (*dc).is_enum {
+        return dv_parse_variants(dc, at + 1, close)
+    }
+    return dv_parse_fields(dc, at + 1, close)
+}
