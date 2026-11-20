@@ -119,6 +119,7 @@ mod unroll;
 mod vectorize;
 mod vectorize_emit;
 mod vec2reg;
+mod vec2reg_single;
 mod ivsr;
 mod addrsink;
 mod escape;

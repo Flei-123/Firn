@@ -57,6 +57,8 @@ enum St {
     Zero(u8),
     /// the whole cell holds this `v128`
     Vec(Val),
+    /// the two eight octet halves written so far, low then high
+    Pair(Option<Val>, Option<Val>),
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +73,14 @@ enum Acc {
 
 fn four_octets(t: FTy) -> bool {
     matches!(t, FTy::I32 | FTy::U32 | FTy::F32)
+}
+
+fn eight_octets(t: FTy) -> bool {
+    matches!(t, FTy::I64 | FTy::U64)
+}
+
+fn lane_access(lane: u8, t: FTy) -> bool {
+    four_octets(t) || (eight_octets(t) && lane % 2 == 0) || (t == FTy::V128 && lane == 0)
 }
 
 pub fn run(f: &mut Func) -> usize {
@@ -97,9 +107,12 @@ pub fn run(f: &mut Func) -> usize {
         if promote_cell(f, c, consts.as_ref().unwrap()) {
             total += 1;
             consts = None; // new values: count again for the next cell
+        } else if crate::vec2reg_single::promote(f, c, consts.as_ref().unwrap()) {
+            total += 1;
+            consts = None;
         }
     }
-    total + narrow_lanes(f)
+    total + narrow_lanes(f) + fold_halves(f)
 }
 
 /// `(get_u32(shuffle32(v, l), 0) as i16)` -> `get_u16(v, 2 l)` (`pextrw`,
@@ -143,6 +156,78 @@ fn narrow_lanes(f: &mut Func) -> usize {
         }
     }
     n
+}
+
+fn advance(f: &Func, st: St, a: Acc, is_zero: &dyn Fn(Val) -> bool) -> Option<St> {
+    let int_lane = |t: FTy| matches!(t, FTy::I32 | FTy::U32);
+    let wide = |t: FTy| eight_octets(t);
+    Some(match (a, st) {
+        (Acc::VStore(v), _) => St::Vec(v),
+        (Acc::VLoad, St::Vec(_)) => st,
+        (Acc::VLoad, St::Zero(0xF)) => st,
+        (Acc::VLoad, St::Pair(Some(_), Some(_))) => st,
+        (Acc::VLoad, _) => return None,
+        (Acc::LoadLane(l, t), St::Zero(m)) => {
+            let need = if wide(t) { 3u8 << l } else { 1 << l };
+            if m & need != need {
+                return None;
+            }
+            st
+        }
+        (Acc::LoadLane(_, t), St::Vec(_)) if int_lane(t) || wide(t) => st,
+        (Acc::LoadLane(l, t), St::Pair(lo, hi)) if wide(t) => {
+            let half = if l == 0 { lo } else { hi };
+            if half.map(|h| f.val_ty(h)) != Some(t) {
+                return None;
+            }
+            st
+        }
+        (Acc::LoadLane(..), _) => return None,
+        (Acc::StoreLane(l, v), St::Unknown) if is_zero(v) => St::Zero(zero_mask(f, l, v)),
+        (Acc::StoreLane(l, v), St::Zero(m)) if is_zero(v) => St::Zero(m | zero_mask(f, l, v)),
+        (Acc::StoreLane(l, v), St::Unknown) if wide(f.val_ty(v)) => pair_with(None, None, l, v),
+        (Acc::StoreLane(l, v), St::Pair(lo, hi)) if wide(f.val_ty(v)) => pair_with(lo, hi, l, v),
+        (Acc::StoreLane(..), _) => return None,
+    })
+}
+
+fn zero_mask(f: &Func, lane: u8, v: Val) -> u8 {
+    if eight_octets(f.val_ty(v)) { 3 << lane } else { 1 << lane }
+}
+
+fn pair_with(lo: Option<Val>, hi: Option<Val>, lane: u8, v: Val) -> St {
+    if lane == 0 { St::Pair(Some(v), hi) } else { St::Pair(lo, Some(v)) }
+}
+
+fn fold_halves(f: &mut Func) -> usize {
+    let mut halves: HashMap<Val, (Val, u8)> = HashMap::default();
+    let mut joins: Vec<(Val, Val, Val)> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match (&i.op, i.dst) {
+                (Op::Simd { kind: SimdKind::GetU64, args, imm }, Some(d)) if args.len() == 1 => {
+                    halves.insert(d, (args[0], *imm));
+                }
+                (Op::Simd { kind: SimdKind::FromU64, args, .. }, Some(d)) if args.len() == 2 => {
+                    joins.push((d, args[0], args[1]));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut map: HashMap<Val, Val> = HashMap::default();
+    for (d, lo, hi) in joins {
+        if let (Some(&(x, 0)), Some(&(y, 1))) = (halves.get(&lo), halves.get(&hi)) {
+            if x == y {
+                map.insert(d, x);
+            }
+        }
+    }
+    if map.is_empty() {
+        return 0;
+    }
+    crate::mem2reg::replace_uses(f, &map);
+    map.len()
 }
 
 fn const_of(f: &Func) -> HashMap<Val, i128> {
@@ -192,11 +277,12 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
                 continue;
             }
             let ok = match &i.op {
-                Op::Load { addr } => lane_of.contains_key(addr) && four_octets(i.ty),
+                Op::Load { addr } => {
+                    lane_of.get(addr).map_or(false, |&l| lane_access(l, i.ty))
+                }
                 Op::Store { addr, val } => {
-                    lane_of.contains_key(addr)
-                        && !lane_of.contains_key(val)
-                        && four_octets(f.val_ty(*val))
+                    !lane_of.contains_key(val)
+                        && lane_of.get(addr).map_or(false, |&l| lane_access(l, f.val_ty(*val)))
                 }
                 Op::Simd { kind: SimdKind::Load, args, .. } => {
                     args.len() == 1 && lane_of.get(&args[0]) == Some(&0)
@@ -240,6 +326,10 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
         .enumerate()
         .filter_map(|(k, i)| {
             let a = match &i.op {
+                Op::Load { addr } if i.ty == FTy::V128 && lane_of.contains_key(addr) => Acc::VLoad,
+                Op::Store { addr, val } if f.val_ty(*val) == FTy::V128 && lane_of.contains_key(addr) => {
+                    Acc::VStore(*val)
+                }
                 Op::Load { addr } => Acc::LoadLane(*lane_of.get(addr)?, i.ty),
                 Op::Store { addr, val } => Acc::StoreLane(*lane_of.get(addr)?, *val),
                 Op::Simd { kind: SimdKind::Load, args, .. } if lane_of.contains_key(&args[0]) => {
@@ -254,23 +344,12 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
         })
         .collect();
     let is_zero = |v: Val| consts.get(&v) == Some(&0);
-    let int_lane = |t: FTy| matches!(t, FTy::I32 | FTy::U32);
     {
         let mut st = St::Unknown;
         for (_, a) in &accs {
-            st = match (*a, st) {
-                (Acc::VStore(v), _) => St::Vec(v),
-                (Acc::VLoad, St::Vec(_)) => st,
-                (Acc::VLoad, St::Zero(0xF)) => st,
-                (Acc::VLoad, _) => return false,
-                (Acc::LoadLane(l, _), St::Zero(m)) if m & (1 << l) != 0 => st,
-                (Acc::LoadLane(_, t), St::Vec(_)) if int_lane(t) => st,
-                (Acc::LoadLane(..), _) => return false,
-                (Acc::StoreLane(l, v), St::Unknown) if is_zero(v) => St::Zero(1 << l),
-                (Acc::StoreLane(l, v), St::Zero(m)) if is_zero(v) => St::Zero(m | (1 << l)),
-                // a real lane write into a known vector would need `pinsrd`
-                // (SSE4.1) -- the baseline is SSE2, so such a cell stays
-                (Acc::StoreLane(..), _) => return false,
+            st = match advance(f, st, *a, &is_zero) {
+                Some(next) => next,
+                None => return false,
             };
         }
     }
@@ -290,16 +369,27 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
         let loc = inst.loc;
         match a {
             Acc::VStore(v) => st = St::Vec(*map.get(&v).unwrap_or(&v)),
-            Acc::StoreLane(l, v) => match st {
-                St::Unknown => st = St::Zero(1 << l),
-                St::Zero(m) => st = St::Zero(m | (1 << l)),
-                St::Vec(_) => unreachable!("vec2reg: lane write into a vector passed the dry run ({})", v),
-            },
+            Acc::StoreLane(_, v) => {
+                st = match advance(f, st, a, &|x| consts.get(&x) == Some(&0)) {
+                    Some(next) => next,
+                    None => unreachable!("vec2reg: lane write passed the dry run ({})", v),
+                };
+            }
             Acc::VLoad => {
                 let d = inst.dst.expect("simd.Load has a result");
                 match st {
                     St::Vec(x) => {
                         map.insert(d, x);
+                    }
+                    St::Pair(Some(lo), Some(hi)) => {
+                        let nv = f.new_val_pub(FTy::V128);
+                        out.push(Inst::like(
+                            Some(nv),
+                            FTy::V128,
+                            Op::Simd { kind: SimdKind::FromU64, args: vec![lo, hi], imm: 0 },
+                            loc,
+                        ));
+                        map.insert(d, nv);
                     }
                     _ => {
                         // Zero(0xF): the four lanes are zero
@@ -318,6 +408,16 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
             Acc::LoadLane(l, t) => {
                 let d = inst.dst;
                 match st {
+                    St::Pair(lo, hi) => {
+                        let half = if l == 0 { lo } else { hi };
+                        map.insert(d.expect("load has a result"), half.expect("half passed the dry run"));
+                    }
+                    St::Vec(x) if eight_octets(t) => out.push(Inst::like(
+                        d,
+                        t,
+                        Op::Simd { kind: SimdKind::GetU64, args: vec![x], imm: l / 2 },
+                        loc,
+                    )),
                     St::Vec(x) => {
                         // `pextrd` is SSE4.1; the baseline is SSE2. So lane
                         // `l` is first shuffled to the bottom (`pshufd`) and
