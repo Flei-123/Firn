@@ -13,6 +13,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/time.fi`, `std/log.fi`, `std/args.fi`, `std/cmdline.fi`, `std/env.fi`, `std/process.fi`, `std/shell.fi` | clocks, logging, CLI, spawn
 - `std/hash.fi`, `std/md5.fi`, `std/tar.fi`, `std/extract.fi`, `std/stats.fi`, `std/mathx.fi`, `std/rng.fi` | hashes, archives, math
 - `std/pool.fi`, `std/scope.fi`, `std/rc.fi`, `std/mem.fi` | worker pool, scopes, refcount, memory
+- `mem/slab.fi` | fixed-size object allocator, no GC (`--no-gc`, docs/NOGC.md) | `slab.slab_new(size)`, `slab.slab_alloc(&s)`, `slab.slab_free(&s, p)`, `slab.slab_destroy(&s)`
 - `std/dialog.fi`, `std/clipboard.fi`, `std/toast.fi` | native dialogs, clipboard, notifications (use via `services` in apps)
 - `std/testkit.fi` | assertions for `#[test]`
 - `std/mock.fi` | spies with scripted returns, argument asserts, ordered call log | `mock.spy_call2(mock.spy_from_ctx(ctx), a, b)`, `mock.assert_calls(&spy, 2)`, `mock.assert_log(&log, "a,b")`

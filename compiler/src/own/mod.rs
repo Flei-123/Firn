@@ -97,6 +97,10 @@ fn default_applies() -> bool {
             && !crate::prof::is_kernel())
 }
 
+pub(crate) fn explicit() -> bool {
+    EXPLICIT.load(Ordering::Relaxed)
+}
+
 pub(crate) fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
         1 if default_applies() => Mode::On,

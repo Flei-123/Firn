@@ -329,6 +329,13 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     // command line option.
     // Round 49: HERE the runtime really becomes part of the program — and only
     // then must the state block appear in the assembler (codegen_x86::emit).
+    if crate::gcfree::enabled() {
+        crate::gcfree::scan(&out).map_err(Error::Package)?;
+        if let Some(f) = nogc_runtime(&out) {
+            out.push(f);
+        }
+        return Ok(out);
+    }
     if let Some(f) = gc_runtime(&out) {
         crate::gc::runtime_remember();
         out.push(f);
@@ -365,6 +372,25 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
         }
     }
     None
+}
+
+fn nogc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
+    let mut needs = false;
+    let mut has_allocerror = false;
+    for f in files {
+        let mut dg = Diags::new("<gc-search>", &f.src);
+        let toks = lexer::lex_file_cached(&f.src, f.id, &mut dg);
+        needs |= crate::strtype::source_uses_str(&toks);
+        has_allocerror |= crate::gc::source_has_allocerror(&toks);
+    }
+    if !needs {
+        return None;
+    }
+    Some(SourceFile {
+        id: files.len() as u32,
+        path: PathBuf::from(crate::gcfree::RUNTIME_PATH),
+        src: crate::gcfree::runtime_source(!has_allocerror),
+    })
 }
 
 /// Path of the GC runtime pulled in (the module name stays empty: its names
@@ -449,7 +475,7 @@ fn module_name(f: &SourceFile) -> String {
     }
     // The GC runtime lives in the root namespace: `gc_init()` is called
     // `gc_init()` in every module, without `import` and without a prefix.
-    if f.path == Path::new(crate::gc::RUNTIME_PATH) {
+    if f.path == Path::new(crate::gc::RUNTIME_PATH) || f.path == Path::new(crate::gcfree::RUNTIME_PATH) {
         return String::new();
     }
     // `backend.windows.fi` is module `backend` (see `module_path`).

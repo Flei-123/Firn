@@ -64,6 +64,7 @@ mod fnval;
 mod refparam;
 mod fpool;
 mod gc;
+mod gcfree;
 mod gc_names;
 mod ifexpr;
 mod gc_lower;
@@ -360,6 +361,7 @@ fn usage() -> String {
          --unsafe-scope=<p> enforce --unsafe only in files whose path contains <p> (repeatable; default: all files)\n  \
          --edition=<year>   language edition (default: the newest; unknown ones are refused)\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
+         --no-gc            ownership-only mode: no collector runtime; gc class, Gc[T], GcWeak[T], gc fn, GcVec/GcMap are errors; requires --ownership=strict\n  \
          --moves=<m>        off | vec (Vec and structs holding a Vec are move-only: use after move is an error; default off)\n  \
          --send-check=<m>   off | on (values holding Gc[T] cannot be handed to threads, jobs, pools or channels; default off)\n  \
          --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
@@ -473,6 +475,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err(e);
                 }
             }
+            "--no-gc" => {
+                if own::explicit() && own::mode() != own::Mode::Strict {
+                    return Err(gcfree::ownership_error());
+                }
+                gcfree::set_enabled(true);
+                own::set_mode(own::Mode::Strict);
+            }
             _ if a.starts_with("--unsafe-scope=") => {
                 unsafety::add_scope(&a["--unsafe-scope=".len()..]);
             }
@@ -503,6 +512,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];
                 match own::parse(v) {
+                    Some(m) if gcfree::enabled() && m != own::Mode::Strict => {
+                        return Err(gcfree::ownership_error());
+                    }
                     Some(m) => own::set_mode(m),
                     None => return Err(format!("unknown ownership mode '{}' (allowed: {})", v, own::ALLOWED)),
                 }
