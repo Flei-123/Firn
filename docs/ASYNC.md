@@ -253,5 +253,5 @@ let r: i32 = fut.block_on[i32](&l, total(&l))
   never awaited or taken leaks its cell; passing `&local` into an async fn trips the escape check on purpose
   (the frame outlives the caller: `#[allow_escape]` on the caller); firnc1 does not know `async` (parse error,
   roadmap); the HTTP/WebSocket clients have no `Fut` adapters yet; generic and `impl` async fns are not done.
-* Tests: `tests/6770_async_basic.fi` (parallel timers, three await forms), `tests/6771_async_locals.fi`
+* Tests: `tests/6770_async_basic.fi` (parallel timers, three await forms), `tests/6773_async_locals.fi`
   (locals, `var`, assign form, discard form, early return, no-await async fn), `tests/neg/async_await_{outside,nested,untyped}.fi`.

@@ -30,7 +30,7 @@ Vanilla column = algorithm of ModelBlockRenderer / LightTexture / LevelRenderer 
 Vanilla mode = `set_light(day < 0, tint_r = gamma 0..256)`: `day = -1 - skyDarken256`. CPU raster, GL (terrain + models + web), Vulkan (rebuilt .spv) evaluate the same closed form per fragment on the interpolated levels. `day >= 0` keeps the legacy arithmetic (old goldens identical). mcplay: `MCPLAY_VLIGHT=0` returns to legacy.
 
 ## Tests
-* tests/5710_mc_lightmap.fi: 12 hand-derived lightmap values (python float model), curve darker than linear at level 8, sky darken noon / sunset / midnight / rain, pack round trip.
+* tests/5712_mc_lightmap.fi: 12 hand-derived lightmap values (python float model), curve darker than linear at level 8, sky darken noon / sunset / midnight / rain, pack round trip.
 * tests/5711_mc_flat_light.fi: flat light = front-cell light on all 4 corners, smooth differs.
 * tools/gpu dump + vkmc dump: scenes `vlit_day`, `vlit_dusk`, `vlit_night` GL / VK vs CPU raster (PSNR 37.9 - 38.8 dB, threshold 37.5).
 * Not done: laptop screenshots (cave / outdoors / underwater / night) - no time left in this run.

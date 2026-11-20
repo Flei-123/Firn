@@ -29,7 +29,7 @@ if ! cmp -s "$T/gcnames.fi" lib/firnc1/gcnames.fi; then
     rc=1
 fi
 
-ls tests | grep -E '^[0-9]+_' | sed -E 's/_.*//' | sort | uniq -d > "$T/dups"
+ls tests | grep -E '^[0-9]+_' | grep -vE '\.test$' | sed -E 's/_.*//' | sort | uniq -d > "$T/dups"
 sort tools/hygiene/known_dup_testnums.txt > "$T/known"
 NEW=$(comm -23 "$T/dups" "$T/known")
 if [ -n "$NEW" ]; then
