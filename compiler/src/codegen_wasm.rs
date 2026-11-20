@@ -216,6 +216,9 @@ fn wasm_simd_kind(k: crate::simd::SimdKind) -> bool {
             | K::Sha256Msg2 | K::Pclmul | K::Crc32U8 | K::Crc32U64 | K::CpuFeatures
             | K::Store64 | K::AddF32 | K::SubF32 | K::MulF32 | K::TruncF32I32 | K::CvtI32F32
             | K::CmpLtF32 | K::CmpLeF32 | K::CmpNltF32 | K::CmpGt32
+            | K::DivF32 | K::MinF32 | K::MaxF32 | K::SqrtF32 | K::ShufF32 | K::MoveMaskF32
+            | K::MoveMask8 | K::UnpackLo8 | K::UnpackHi8 | K::MinU8 | K::MaxU8 | K::MulLo32
+            | K::AddSatU8 | K::SubSatU8 | K::CmpEq8 | K::MinI32 | K::MaxI32
     )
 }
 
@@ -2795,6 +2798,66 @@ impl<'a> Fx<'a> {
                     _ => w::I32X4_SUB,
                 };
                 self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::DivF32 | K::MinU8 | K::MaxU8 | K::MulLo32 | K::AddSatU8 | K::SubSatU8 | K::CmpEq8
+            | K::MinI32 | K::MaxI32 => {
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                let op = match kind {
+                    K::DivF32 => w::F32X4_DIV,
+                    K::MinU8 => w::I8X16_MIN_U,
+                    K::MaxU8 => w::I8X16_MAX_U,
+                    K::MulLo32 => w::I32X4_MUL,
+                    K::AddSatU8 => w::I8X16_ADD_SAT_U,
+                    K::SubSatU8 => w::I8X16_SUB_SAT_U,
+                    K::CmpEq8 => w::I8X16_EQ,
+                    K::MinI32 => w::I32X4_MIN_S,
+                    _ => w::I32X4_MAX_S,
+                };
+                self.ins(Ins::SimdOp(op));
+                self.put(i, v);
+            }
+            K::MinF32 | K::MaxF32 => {
+                self.get(arg(1)?, v);
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(if kind == K::MinF32 { w::F32X4_PMIN } else { w::F32X4_PMAX }));
+                self.put(i, v);
+            }
+            K::SqrtF32 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(w::F32X4_SQRT));
+                self.put(i, v);
+            }
+            K::MoveMaskF32 | K::MoveMask8 => {
+                self.get(arg(0)?, v);
+                self.ins(Ins::SimdOp(if kind == K::MoveMaskF32 { w::I32X4_BITMASK } else { w::I8X16_BITMASK }));
+                self.put(i, VT::I32);
+            }
+            K::ShufF32 => {
+                let mut idx = [0u8; 16];
+                for l in 0..4 {
+                    let s = (imm >> (2 * l)) & 3;
+                    let base = if l < 2 { 0 } else { 16 };
+                    for k in 0..4 {
+                        idx[l * 4 + k] = base + s * 4 + k as u8;
+                    }
+                }
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                shuf(self, idx);
+                self.put(i, v);
+            }
+            K::UnpackLo8 | K::UnpackHi8 => {
+                let from: u8 = if kind == K::UnpackLo8 { 0 } else { 8 };
+                let mut idx = [0u8; 16];
+                for k in 0..8 {
+                    idx[2 * k] = from + k as u8;
+                    idx[2 * k + 1] = 16 + from + k as u8;
+                }
+                self.get(arg(0)?, v);
+                self.get(arg(1)?, v);
+                shuf(self, idx);
                 self.put(i, v);
             }
             K::AndNot => {
