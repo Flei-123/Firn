@@ -1,0 +1,834 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import rt
+import vec
+import ast
+import intern
+import types
+import nameidx
+import cvalue
+import cops
+
+export { Run, run_new, run_free, run_call, run_failed, run_pos, run_width, run_msg_ptr, run_msg_len,
+    run_node_int, run_pool, run_tree_types, fail_begin, put_text, put_int }
+
+const NOTHING: u32 = 4294967295
+const MAX_STEPS: u64 = 2000000
+const MAX_DEPTH: i64 = 64
+const MAX_ARRAY_LEN: i64 = 4194304
+
+const F_NEXT: u32 = 0
+const F_RET: u32 = 1
+const F_BREAK: u32 = 2
+const F_CONT: u32 = 3
+
+const U_NEG: u32 = 0
+const U_NOT: u32 = 1
+const U_BITNOT: u32 = 4
+
+const B_LAND: u32 = 16
+const B_LOR: u32 = 17
+
+struct Run {
+    tree: u64,
+    it: u64,
+    tt: u64,
+    cfirst: u64,
+    cvalue: u64,
+    ctype: u64,
+    pool: cvalue.Pool,
+    shapes: cvalue.Shapes,
+    sname: Vec[u32],
+    snode: Vec[u32],
+    sshape: Vec[u32],
+    flimit: Vec[u32],
+    base: usize,
+    steps: u64,
+    err: bool,
+    errpos: u64,
+    errwidth: u32,
+    msg: rt.Buf,
+    ret: u32,
+    in_const: bool,
+}
+
+fn run_new(tree: u64, it: u64, tt: u64, cfirst: u64, cvalue_vec: u64, ctype: u64) -> Run {
+    return Run {
+        tree: tree, it: it, tt: tt, cfirst: cfirst, cvalue: cvalue_vec, ctype: ctype,
+        pool: cvalue.pool_new(), shapes: cvalue.shapes_new(),
+        sname: vec_new[u32](), snode: vec_new[u32](), sshape: vec_new[u32](), flimit: vec_new[u32](),
+        base: 0, steps: 0, err: false, errpos: 0, errwidth: 1, msg: rt.buf_new(),
+        ret: NOTHING, in_const: false,
+    }
+}
+
+fn run_free(z: *mut Run) {
+    cvalue.pool_free(&(*z).pool)
+    cvalue.shapes_free(&(*z).shapes)
+    vec_free[u32](&(*z).sname)
+    vec_free[u32](&(*z).snode)
+    vec_free[u32](&(*z).sshape)
+    vec_free[u32](&(*z).flimit)
+    rt.buf_free(&(*z).msg)
+}
+
+fn run_failed(z: *mut Run) -> bool { return (*z).err }
+fn run_pos(z: *mut Run) -> u64 { return (*z).errpos }
+fn run_width(z: *mut Run) -> u32 { return (*z).errwidth }
+fn run_msg_ptr(z: *mut Run) -> u64 { return rt.buf_ptr(&(*z).msg) }
+fn run_msg_len(z: *mut Run) -> usize { return rt.buf_len(&(*z).msg) }
+fn run_pool(z: *mut Run) -> *mut cvalue.Pool { return &(*z).pool }
+fn run_tree_types(z: *mut Run) -> *mut types.Types { return (*z).tt as *mut types.Types }
+
+fn tree(z: *mut Run) -> *mut ast.Tree { return (*z).tree as *mut ast.Tree }
+fn names(z: *mut Run) -> *mut intern.Interner { return (*z).it as *mut intern.Interner }
+
+fn put_text(z: *mut Run, s: str) {
+    unsafe { rt.buf_push_bytes(&(*z).msg, s.p as u64, s.n) }
+}
+
+fn put_int(z: *mut Run, v: i64) { rt.buf_push_dec_i64(&(*z).msg, v) }
+
+fn put_name(z: *mut Run, nr: u32) {
+    rt.buf_push_bytes(&(*z).msg, intern.intern_ptr(names(z), nr), intern.intern_length(names(z), nr))
+}
+
+fn fail_begin(z: *mut Run, pos: u64, width: u32, prefixed: bool) -> bool {
+    if (*z).err {
+        return false
+    }
+    (*z).err = true
+    (*z).errpos = pos
+    (*z).errwidth = width
+    rt.buf_clear(&(*z).msg)
+    if prefixed {
+        put_text(z, "comptime: ")
+    }
+    return true
+}
+
+fn expr_width(z: *mut Run, e: u32) -> u32 {
+    let w: u32 = ast.expr_len(tree(z), e)
+    if w == 0 {
+        return 1
+    }
+    return w
+}
+
+fn fail_expr(z: *mut Run, e: u32, text: str) {
+    if fail_begin(z, ast.expr_pos(tree(z), e), expr_width(z, e), true) {
+        put_text(z, text)
+    }
+}
+
+fn fail_stmt(z: *mut Run, si: u32, text: str) {
+    if fail_begin(z, ast.stmt_pos(tree(z), si), 1, true) {
+        put_text(z, text)
+    }
+}
+
+fn frame_on(z: *mut Run) {
+    vec_push[u32](&(*z).flimit, vec_len[u32](&(*z).sname) as u32)
+}
+
+fn frame_off(z: *mut Run) {
+    let start: u32 = vec_last[u32](&(*z).flimit)
+    while vec_len[u32](&(*z).sname) > start as usize {
+        vec_pop[u32](&(*z).sname)
+        vec_pop[u32](&(*z).snode)
+        vec_pop[u32](&(*z).sshape)
+    }
+    vec_pop[u32](&(*z).flimit)
+}
+
+fn declare(z: *mut Run, name: u32, node: u32, shape: u32) {
+    vec_push[u32](&(*z).sname, name)
+    vec_push[u32](&(*z).snode, node)
+    vec_push[u32](&(*z).sshape, shape)
+}
+
+fn slot_find(z: *mut Run, name: u32) -> i64 {
+    var i: i64 = vec_len[u32](&(*z).sname) as i64 - 1
+    while i >= (*z).base as i64 {
+        if vec_at[u32](&(*z).sname, i as usize) == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn shape_for(z: *mut Run, t: u32) -> u32 {
+    return cvalue.shape_of(&(*z).shapes, tree(z), names(z), t)
+}
+
+fn node_int(z: *mut Run, node: u32, e: u32) -> i64 {
+    if cvalue.pool_is_arr(&(*z).pool, node) {
+        fail_expr(z, e, "an array cannot be used as a number here")
+        return 0
+    }
+    return cvalue.pool_val(&(*z).pool, node)
+}
+
+fn run_node_int(z: *mut Run, node: u32, e: u32) -> i64 { return node_int(z, node, e) }
+
+fn const_ident(z: *mut Run, e: u32) -> i64 {
+    let name: u32 = ast.e_a(tree(z), e)
+    let i: u32 = nameidx.nameidx_get((*z).cfirst as *mut Vec[u32], name)
+    if i == NOTHING {
+        if fail_begin(z, ast.expr_pos(tree(z), e), expr_width(z, e), true) {
+            put_text(z, "'")
+            put_name(z, name)
+            put_text(z, "' is not known here")
+        }
+        return 0
+    }
+    let kt: u32 = vec_at[u32]((*z).ctype as *mut Vec[u32], i as usize)
+    let kk: u32 = types.ty_kind(run_tree_types(z), kt)
+    if kk == types.K_F64 || kk == types.K_F32 {
+        if fail_begin(z, ast.expr_pos(tree(z), e), expr_width(z, e), true) {
+            put_text(z, "'")
+            put_name(z, name)
+            put_text(z, "' is a floating point constant, and floating point is not yet possible at compile time")
+        }
+        return 0
+    }
+    return vec_at[u64]((*z).cvalue as *mut Vec[u64], i as usize) as i64
+}
+
+fn ident_value(z: *mut Run, e: u32) -> i64 {
+    let slot: i64 = slot_find(z, ast.e_a(tree(z), e))
+    if slot >= 0 {
+        return node_int(z, vec_at[u32](&(*z).snode, slot as usize), e)
+    }
+    return const_ident(z, e)
+}
+
+fn unary(z: *mut Run, e: u32, depth: i64) -> i64 {
+    let b: *mut ast.Tree = tree(z)
+    let op: u32 = ast.e_a(b, e)
+    let v: i64 = expr(z, ast.e_b(b, e), depth)
+    if (*z).err {
+        return 0
+    }
+    if op == U_NEG { return 0 -% v }
+    if op == U_NOT {
+        if v == 0 { return 1 }
+        return 0
+    }
+    if op == U_BITNOT { return 0 -% v -% 1 }
+    fail_expr(z, e, "pointer operations do not exist at compile time")
+    return 0
+}
+
+fn binary(z: *mut Run, e: u32, depth: i64) -> i64 {
+    let b: *mut ast.Tree = tree(z)
+    let op: u32 = ast.e_a(b, e)
+    let left: i64 = expr(z, ast.e_b(b, e), depth)
+    if (*z).err {
+        return 0
+    }
+    if op == B_LAND && left == 0 { return 0 }
+    if op == B_LOR && left != 0 { return 1 }
+    let right: i64 = expr(z, ast.e_c(b, e), depth)
+    if (*z).err {
+        return 0
+    }
+    var code: u32 = cops.ERR_NONE
+    let r: i64 = cops.compute(op, left, right, &code)
+    if code != cops.ERR_NONE {
+        fail_op(z, ast.expr_pos(b, e), expr_width(z, e), code)
+    }
+    return r
+}
+
+fn fail_op(z: *mut Run, pos: u64, width: u32, code: u32) {
+    if !fail_begin(z, pos, width, true) {
+        return
+    }
+    if code == cops.ERR_DIV { put_text(z, "division by zero") }
+    if code == cops.ERR_REM { put_text(z, "remainder on division by zero") }
+    if code == cops.ERR_SHIFT { put_text(z, "shift amount outside 0..127") }
+    if code == cops.ERR_SAT {
+        put_text(z, "'+|'/'-|'/'*|' (saturating arithmetic) is not supported inside                  'comptime' yet -- use it at run time")
+    }
+}
+
+fn cast(z: *mut Run, e: u32, depth: i64) -> i64 {
+    let b: *mut ast.Tree = tree(z)
+    let v: i64 = expr(z, ast.e_a(b, e), depth)
+    if (*z).err {
+        return 0
+    }
+    let shape: u32 = shape_for(z, ast.e_b(b, e))
+    let sk: u32 = cvalue.shape_kind(&(*z).shapes, shape)
+    if sk == cvalue.SH_INT {
+        return cvalue.cut(v, cvalue.shape_type(&(*z).shapes, shape))
+    }
+    if sk == cvalue.SH_BOOL {
+        if v != 0 { return 1 }
+        return 0
+    }
+    return v
+}
+
+fn expr(z: *mut Run, e: u32, depth: i64) -> i64 {
+    let b: *mut ast.Tree = tree(z)
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_INT { return ast.e_number(b, e) as i64 }
+    if k == ast.E_BOOL { return ast.e_a(b, e) as i64 }
+    if k == ast.E_FLOAT || k == ast.E_FLOAT32 {
+        fail_expr(z, e, "floating point is not yet possible at compile time")
+        return 0
+    }
+    if k == ast.E_ID { return ident_value(z, e) }
+    if k == ast.E_UN { return unary(z, e, depth) }
+    if k == ast.E_BIN { return binary(z, e, depth) }
+    if k == ast.E_AS { return cast(z, e, depth) }
+    if k == ast.E_IDX || k == ast.E_CALL {
+        var node: u32 = NOTHING
+        if k == ast.E_IDX {
+            node = read_ref(z, e, depth)
+        } else {
+            node = call_expr(z, e, depth)
+        }
+        if node == NOTHING {
+            return 0
+        }
+        return node_int(z, node, e)
+    }
+    fail_expr(z, e, "only literals, names, operators, conversions, array indexing and calls are allowed here")
+    return 0
+}
+
+fn array_literal(z: *mut Run, e: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let off: u32 = ast.e_b(b, e)
+    let n: u32 = ast.e_c(b, e)
+    var items: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&items)
+    var i: u32 = 0
+    while i < n {
+        let item: u32 = value(z, ast.child_at(b, off + i), depth)
+        if item == NOTHING {
+            return NOTHING
+        }
+        vec_push[u32](&items, item)
+        i = i + 1
+    }
+    let out: u32 = cvalue.pool_arr(&(*z).pool, n)
+    i = 0
+    while i < n {
+        cvalue.pool_set_kid(&(*z).pool, out, i, vec_at[u32](&items, i as usize))
+        i = i + 1
+    }
+    return out
+}
+
+fn array_repeat(z: *mut Run, e: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let count: u32 = ast.e_b(b, e)
+    let n: i64 = expr(z, count, depth)
+    if (*z).err {
+        return NOTHING
+    }
+    if n < 0 || n > MAX_ARRAY_LEN {
+        if fail_begin(z, ast.expr_pos(b, count), expr_width(z, count), true) {
+            put_text(z, "array length ")
+            put_int(z, n)
+            put_text(z, " is not in 0..=4194304")
+        }
+        return NOTHING
+    }
+    let one: u32 = value(z, ast.e_a(b, e), depth)
+    if one == NOTHING {
+        return NOTHING
+    }
+    let out: u32 = cvalue.pool_arr(&(*z).pool, n as u32)
+    var i: u32 = 0
+    while i < n as u32 {
+        var item: u32 = one
+        if i > 0 {
+            item = cvalue.pool_clone(&(*z).pool, one)
+        }
+        cvalue.pool_set_kid(&(*z).pool, out, i, item)
+        i = i + 1
+    }
+    return out
+}
+
+fn index_root(z: *mut Run, e: u32, depth: i64, path: *mut Vec[i64]) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    var exprs: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&exprs)
+    var cur: u32 = e
+    while ast.e_kind(b, cur) == ast.E_IDX {
+        vec_push[u32](&exprs, ast.e_b(b, cur))
+        cur = ast.e_a(b, cur)
+    }
+    var i: usize = vec_len[u32](&exprs)
+    while i > 0 {
+        i = i - 1
+        let v: i64 = expr(z, vec_at[u32](&exprs, i), depth)
+        if (*z).err {
+            return NOTHING
+        }
+        vec_push[i64](path, v)
+    }
+    return cur
+}
+
+fn follow(z: *mut Run, root: u32, path: *mut Vec[i64], count: usize, pos: u64) -> u32 {
+    var cur: u32 = root
+    var i: usize = 0
+    while i < count {
+        let idx: i64 = vec_at[i64](path, i)
+        if !cvalue.pool_is_arr(&(*z).pool, cur) {
+            if fail_begin(z, pos, 1, true) {
+                put_text(z, "only an array can be indexed")
+            }
+            return NOTHING
+        }
+        let n: u32 = cvalue.pool_len(&(*z).pool, cur)
+        if idx < 0 || idx >= n as i64 {
+            if fail_begin(z, pos, 1, true) {
+                put_text(z, "index ")
+                put_int(z, idx)
+                put_text(z, " is out of range for an array of ")
+                put_int(z, n as i64)
+                put_text(z, " elements")
+            }
+            return NOTHING
+        }
+        cur = cvalue.pool_kid(&(*z).pool, cur, idx as u32)
+        i = i + 1
+    }
+    return cur
+}
+
+fn read_ref(z: *mut Run, e: u32, depth: i64) -> u32 {
+    var path: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&path)
+    let root: u32 = index_root(z, e, depth, &path)
+    if (*z).err {
+        return NOTHING
+    }
+    let pos: u64 = ast.expr_pos(tree(z), e)
+    if ast.e_kind(tree(z), root) == ast.E_ID {
+        let slot: i64 = slot_find(z, ast.e_a(tree(z), root))
+        if slot >= 0 {
+            return follow(z, vec_at[u32](&(*z).snode, slot as usize), &path, vec_len[i64](&path), pos)
+        }
+    }
+    let base: u32 = value(z, root, depth)
+    if base == NOTHING {
+        return NOTHING
+    }
+    return follow(z, base, &path, vec_len[i64](&path), pos)
+}
+
+fn value(z: *mut Run, e: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_ALIT { return array_literal(z, e, depth) }
+    if k == ast.E_AWDH { return array_repeat(z, e, depth) }
+    if k == ast.E_TEXT { return value(z, ast.e_a(b, e), depth) }
+    if k == ast.E_ID {
+        let slot: i64 = slot_find(z, ast.e_a(b, e))
+        if slot >= 0 {
+            return cvalue.pool_clone(&(*z).pool, vec_at[u32](&(*z).snode, slot as usize))
+        }
+    }
+    if k == ast.E_IDX {
+        let node: u32 = read_ref(z, e, depth)
+        if node == NOTHING {
+            return NOTHING
+        }
+        return cvalue.pool_clone(&(*z).pool, node)
+    }
+    if k == ast.E_CALL { return call_expr(z, e, depth) }
+    let v: i64 = expr(z, e, depth)
+    if (*z).err {
+        return NOTHING
+    }
+    return cvalue.pool_int(&(*z).pool, v)
+}
+
+fn call_expr(z: *mut Run, e: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let off: u32 = ast.e_b(b, e)
+    let n: u32 = ast.e_c(b, e)
+    var args: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&args)
+    var i: u32 = 0
+    while i < n {
+        let a: u32 = value(z, ast.child_at(b, off + i), depth)
+        if a == NOTHING {
+            return NOTHING
+        }
+        vec_push[u32](&args, a)
+        i = i + 1
+    }
+    return call_value(z, e, &args, depth + 1)
+}
+
+fn call_fail_count(z: *mut Run, e: u32, name: u32, want: u32, have: usize) {
+    if fail_begin(z, ast.expr_pos(tree(z), e), expr_width(z, e), true) {
+        put_text(z, "'")
+        put_name(z, name)
+        put_text(z, "' expects ")
+        put_int(z, want as i64)
+        put_text(z, " arguments, found ")
+        put_int(z, have as i64)
+    }
+}
+
+fn call_fail_name(z: *mut Run, e: u32, name: u32, head: str, tail: str) {
+    if fail_begin(z, ast.expr_pos(tree(z), e), expr_width(z, e), true) {
+        put_text(z, head)
+        put_name(z, name)
+        put_text(z, tail)
+    }
+}
+
+fn call_value(z: *mut Run, e: u32, args: *mut Vec[u32], depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let name: u32 = ast.e_a(b, e)
+    if depth >= MAX_DEPTH {
+        fail_expr(z, e, "more than 64 nested calls")
+        return NOTHING
+    }
+    let fi: i64 = ast.fn_find(b, name)
+    if fi < 0 {
+        call_fail_name(z, e, name, "'", "' is not a function of this program")
+        return NOTHING
+    }
+    let f: usize = fi as usize
+    let plen: u32 = ast.fn_plen(b, f)
+    if plen as usize != vec_len[u32](args) {
+        call_fail_count(z, e, name, plen, vec_len[u32](args))
+        return NOTHING
+    }
+    let callee_const: bool = ast.fn_const(b, f) == 1
+    if (*z).in_const && !callee_const {
+        call_fail_name(z, e, name, "a 'const fn' can only call 'const fn', '", "' is not one")
+        return NOTHING
+    }
+    return run_body(z, f, args, callee_const, depth)
+}
+
+fn run_body(z: *mut Run, f: usize, args: *mut Vec[u32], callee_const: bool, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let mark: u64 = cvalue.pool_mark(&(*z).pool)
+    let saved_base: usize = (*z).base
+    let saved_const: bool = (*z).in_const
+    (*z).base = vec_len[u32](&(*z).sname)
+    (*z).in_const = callee_const
+    frame_on(z)
+    let poff: u32 = ast.fn_poff(b, f)
+    var k: u32 = 0
+    while k < ast.fn_plen(b, f) {
+        let shape: u32 = shape_for(z, ast.param_ty(b, poff + k))
+        let v: u32 = cvalue.pool_clone(&(*z).pool, vec_at[u32](args, k as usize))
+        cvalue.coerce(&(*z).pool, &(*z).shapes, v, shape)
+        declare(z, ast.param_name(b, poff + k), v, shape)
+        k = k + 1
+    }
+    (*z).ret = NOTHING
+    let flow: u32 = block(z, ast.fn_body(b, f), depth)
+    frame_off(z)
+    (*z).base = saved_base
+    (*z).in_const = saved_const
+    if (*z).err {
+        return NOTHING
+    }
+    var result: u32 = NOTHING
+    if flow == F_RET && (*z).ret != NOTHING {
+        result = (*z).ret
+        cvalue.coerce(&(*z).pool, &(*z).shapes, result, shape_for(z, ast.fn_ret(b, f)))
+    } else {
+        result = cvalue.pool_int(&(*z).pool, 0)
+    }
+    return relocate(z, result, mark)
+}
+
+fn relocate(z: *mut Run, node: u32, mark: u64) -> u32 {
+    var saved: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&saved)
+    cvalue.pool_save(&(*z).pool, node, &saved)
+    cvalue.pool_reset(&(*z).pool, mark)
+    var at: usize = 0
+    return cvalue.pool_load(&(*z).pool, &saved, &at)
+}
+
+fn run_call(z: *mut Run, e: u32, ints: *mut Vec[i64]) -> u32 {
+    var args: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&args)
+    var i: usize = 0
+    while i < vec_len[i64](ints) {
+        vec_push[u32](&args, cvalue.pool_int(&(*z).pool, vec_at[i64](ints, i)))
+        i = i + 1
+    }
+    return call_value(z, e, &args, 0)
+}
+
+fn step(z: *mut Run, si: u32) -> bool {
+    (*z).steps = (*z).steps + 1
+    if (*z).steps > MAX_STEPS {
+        fail_stmt(z, si, "more than 2000000 steps — endless loop?")
+        return false
+    }
+    return true
+}
+
+fn block(z: *mut Run, bi: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    frame_on(z)
+    var flow: u32 = F_NEXT
+    let off: u32 = ast.b_off(b, bi)
+    let n: u32 = ast.b_len(b, bi)
+    var i: u32 = 0
+    while i < n {
+        flow = stmt(z, ast.slist_at(b, off + i), depth)
+        if flow != F_NEXT || (*z).err {
+            break
+        }
+        i = i + 1
+    }
+    frame_off(z)
+    return flow
+}
+
+fn let_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let shape: u32 = shape_for(z, ast.s_b(b, si))
+    let v: u32 = value(z, ast.s_c(b, si), depth)
+    if v == NOTHING {
+        return F_RET
+    }
+    cvalue.coerce(&(*z).pool, &(*z).shapes, v, shape)
+    declare(z, ast.s_a(b, si), v, shape)
+    return F_NEXT
+}
+
+fn return_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let w: u32 = ast.s_a(tree(z), si)
+    if w == NOTHING {
+        (*z).ret = cvalue.pool_int(&(*z).pool, 0)
+        return F_RET
+    }
+    let v: u32 = value(z, w, depth)
+    if v == NOTHING {
+        return F_RET
+    }
+    (*z).ret = v
+    return F_RET
+}
+
+fn if_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let cond: i64 = expr(z, ast.s_a(b, si), depth)
+    if (*z).err {
+        return F_RET
+    }
+    if cond != 0 {
+        return block(z, ast.s_b(b, si), depth)
+    }
+    let els: u32 = ast.s_c(b, si)
+    if els != NOTHING {
+        return stmt(z, els, depth)
+    }
+    return F_NEXT
+}
+
+fn while_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    while true {
+        if !step(z, si) {
+            return F_RET
+        }
+        let cond: i64 = expr(z, ast.s_a(b, si), depth)
+        if (*z).err {
+            return F_RET
+        }
+        if cond == 0 {
+            return F_NEXT
+        }
+        let flow: u32 = block(z, ast.s_b(b, si), depth)
+        if flow == F_RET { return F_RET }
+        if flow == F_BREAK { return F_NEXT }
+    }
+    return F_NEXT
+}
+
+fn for_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let from: i64 = expr(z, ast.s_b(b, si), depth)
+    if (*z).err {
+        return F_RET
+    }
+    let to: i64 = expr(z, ast.s_c(b, si), depth)
+    if (*z).err {
+        return F_RET
+    }
+    let inclusive: bool = ast.s_f(b, si) == 1
+    var i: i64 = from
+    while (inclusive && i <= to) || (!inclusive && i < to) {
+        if !step(z, si) {
+            return F_RET
+        }
+        frame_on(z)
+        declare(z, ast.s_a(b, si), cvalue.pool_int(&(*z).pool, i), 0)
+        let flow: u32 = block(z, ast.s_d(b, si), depth)
+        frame_off(z)
+        if flow == F_RET { return F_RET }
+        if flow == F_BREAK { return F_NEXT }
+        if inclusive && i == to { return F_NEXT }
+        i = i + 1
+    }
+    return F_NEXT
+}
+
+fn assign_stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    let b: *mut ast.Tree = tree(z)
+    let a: u32 = ast.s_kind(b, si)
+    if a == ast.S_ZUW {
+        let v: u32 = value(z, ast.s_b(b, si), depth)
+        if v == NOTHING {
+            return F_RET
+        }
+        store_value(z, si, depth, v)
+    } else {
+        var delta: i64 = 1
+        var op: u32 = 0
+        if a == ast.S_ZUWOP {
+            delta = expr(z, ast.s_b(b, si), depth)
+            op = ast.s_c(b, si)
+        } else if ast.s_b(b, si) == 0 {
+            delta = -1
+        }
+        if (*z).err {
+            return F_RET
+        }
+        update_cell(z, si, depth, op, delta)
+    }
+    if (*z).err {
+        return F_RET
+    }
+    return F_NEXT
+}
+
+fn locate(z: *mut Run, si: u32, depth: i64, path: *mut Vec[i64]) -> i64 {
+    let b: *mut ast.Tree = tree(z)
+    let root: u32 = index_root(z, ast.s_a(b, si), depth, path)
+    if (*z).err {
+        return -1
+    }
+    if ast.e_kind(b, root) != ast.E_ID {
+        fail_stmt(z, si, "only assignments to a local variable or an element of one (no field, no pointer)")
+        return -1
+    }
+    let slot: i64 = slot_find(z, ast.e_a(b, root))
+    if slot < 0 {
+        if fail_begin(z, ast.stmt_pos(b, si), 1, true) {
+            put_text(z, "'")
+            put_name(z, ast.e_a(b, root))
+            put_text(z, "' is not a local variable")
+        }
+    }
+    return slot
+}
+
+fn store_value(z: *mut Run, si: u32, depth: i64, v: u32) {
+    var path: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&path)
+    let slot: i64 = locate(z, si, depth, &path)
+    if slot < 0 {
+        return
+    }
+    let count: usize = vec_len[i64](&path)
+    let shape: u32 = cvalue.shape_elem(&(*z).shapes, vec_at[u32](&(*z).sshape, slot as usize), count)
+    cvalue.coerce(&(*z).pool, &(*z).shapes, v, shape)
+    let pos: u64 = ast.stmt_pos(tree(z), si)
+    if count == 0 {
+        vec_set[u32](&(*z).snode, slot as usize, v)
+        return
+    }
+    let parent: u32 = follow(z, vec_at[u32](&(*z).snode, slot as usize), &path, count - 1, pos)
+    if parent == NOTHING {
+        return
+    }
+    let idx: i64 = vec_at[i64](&path, count - 1)
+    if follow_one(z, parent, idx, pos) == NOTHING {
+        return
+    }
+    cvalue.pool_set_kid(&(*z).pool, parent, idx as u32, v)
+}
+
+fn follow_one(z: *mut Run, parent: u32, idx: i64, pos: u64) -> u32 {
+    var one: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&one)
+    vec_push[i64](&one, idx)
+    return follow(z, parent, &one, 1, pos)
+}
+
+fn update_cell(z: *mut Run, si: u32, depth: i64, op: u32, delta: i64) {
+    var path: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&path)
+    let slot: i64 = locate(z, si, depth, &path)
+    if slot < 0 {
+        return
+    }
+    let count: usize = vec_len[i64](&path)
+    let pos: u64 = ast.stmt_pos(tree(z), si)
+    let cell: u32 = follow(z, vec_at[u32](&(*z).snode, slot as usize), &path, count, pos)
+    if cell == NOTHING {
+        return
+    }
+    if cvalue.pool_is_arr(&(*z).pool, cell) {
+        fail_stmt(z, si, "an array cannot be used as a number here")
+        return
+    }
+    var next: i64 = 0
+    if ast.s_kind(tree(z), si) == ast.S_STEP {
+        next = cvalue.pool_val(&(*z).pool, cell) +% delta
+    } else {
+        var code: u32 = cops.ERR_NONE
+        next = cops.compute(op, cvalue.pool_val(&(*z).pool, cell), delta, &code)
+        if code != cops.ERR_NONE {
+            fail_op(z, pos, 1, code)
+            return
+        }
+    }
+    let shape: u32 = cvalue.shape_elem(&(*z).shapes, vec_at[u32](&(*z).sshape, slot as usize), count)
+    cvalue.pool_set_val(&(*z).pool, cell, next)
+    cvalue.coerce(&(*z).pool, &(*z).shapes, cell, shape)
+}
+
+fn stmt(z: *mut Run, si: u32, depth: i64) -> u32 {
+    if !step(z, si) {
+        return F_RET
+    }
+    let b: *mut ast.Tree = tree(z)
+    let a: u32 = ast.s_kind(b, si)
+    if a == ast.S_LET || a == ast.S_VAR { return let_stmt(z, si, depth) }
+    if a == ast.S_ZUW || a == ast.S_ZUWOP || a == ast.S_STEP { return assign_stmt(z, si, depth) }
+    if a == ast.S_EXPR {
+        expr(z, ast.s_a(b, si), depth)
+        if (*z).err { return F_RET }
+        return F_NEXT
+    }
+    if a == ast.S_BLOCK { return block(z, ast.s_a(b, si), depth) }
+    if a == ast.S_RET { return return_stmt(z, si, depth) }
+    if a == ast.S_IF { return if_stmt(z, si, depth) }
+    if a == ast.S_WHILE { return while_stmt(z, si, depth) }
+    if a == ast.S_FOR { return for_stmt(z, si, depth) }
+    if a == ast.S_BREAK { return F_BREAK }
+    if a == ast.S_CONT { return F_CONT }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        fail_stmt(z, si, "'defer' and 'errdefer' are not allowed at compile time")
+        return F_RET
+    }
+    fail_stmt(z, si, "this statement does not exist at compile time")
+    return F_RET
+}

@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import rt
+import vec
+import ast
+import intern
+import types
+
+export { Pool, pool_new, pool_free, pool_int, pool_arr, pool_is_arr, pool_val, pool_set_val,
+    pool_len, pool_kid, pool_set_kid, pool_clone, pool_mark, pool_reset, pool_save, pool_load,
+    Shapes, shapes_new, shapes_free, shape_of, shape_kind, shape_inner, shape_len, shape_type,
+    shape_elem, coerce, cut, SH_ANY, SH_BOOL, SH_INT, SH_ARR }
+
+const NOTHING: u32 = 4294967295
+const SH_ANY: u32 = 0
+const SH_BOOL: u32 = 1
+const SH_INT: u32 = 2
+const SH_ARR: u32 = 3
+const KIND_INT: u32 = 0
+const KIND_ARR: u32 = 1
+
+struct Pool {
+    kind: Vec[u32],
+    val: Vec[i64],
+    off: Vec[u32],
+    len: Vec[u32],
+    kids: Vec[u32],
+}
+
+struct Shapes {
+    kind: Vec[u32],
+    a: Vec[u32],
+    n: Vec[u64],
+    cache: Vec[u32],
+}
+
+fn pool_new() -> Pool {
+    return Pool { kind: vec_new[u32](), val: vec_new[i64](), off: vec_new[u32](),
+        len: vec_new[u32](), kids: vec_new[u32]() }
+}
+
+fn pool_free(p: *mut Pool) {
+    vec_free[u32](&(*p).kind)
+    vec_free[i64](&(*p).val)
+    vec_free[u32](&(*p).off)
+    vec_free[u32](&(*p).len)
+    vec_free[u32](&(*p).kids)
+}
+
+fn pool_push_node(p: *mut Pool, kind: u32, v: i64, off: u32, n: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*p).kind) as u32
+    vec_push[u32](&(*p).kind, kind)
+    vec_push[i64](&(*p).val, v)
+    vec_push[u32](&(*p).off, off)
+    vec_push[u32](&(*p).len, n)
+    return i
+}
+
+fn pool_int(p: *mut Pool, v: i64) -> u32 {
+    return pool_push_node(p, KIND_INT, v, 0, 0)
+}
+
+fn pool_arr(p: *mut Pool, n: u32) -> u32 {
+    let off: u32 = vec_len[u32](&(*p).kids) as u32
+    var i: u32 = 0
+    while i < n {
+        vec_push[u32](&(*p).kids, NOTHING)
+        i = i + 1
+    }
+    return pool_push_node(p, KIND_ARR, 0, off, n)
+}
+
+fn pool_is_arr(p: *mut Pool, node: u32) -> bool {
+    return vec_at[u32](&(*p).kind, node as usize) == KIND_ARR
+}
+
+fn pool_val(p: *mut Pool, node: u32) -> i64 { return vec_at[i64](&(*p).val, node as usize) }
+fn pool_set_val(p: *mut Pool, node: u32, v: i64) { vec_set[i64](&(*p).val, node as usize, v) }
+fn pool_len(p: *mut Pool, node: u32) -> u32 { return vec_at[u32](&(*p).len, node as usize) }
+
+fn pool_kid(p: *mut Pool, node: u32, i: u32) -> u32 {
+    return vec_at[u32](&(*p).kids, (vec_at[u32](&(*p).off, node as usize) + i) as usize)
+}
+
+fn pool_set_kid(p: *mut Pool, node: u32, i: u32, kid: u32) {
+    vec_set[u32](&(*p).kids, (vec_at[u32](&(*p).off, node as usize) + i) as usize, kid)
+}
+
+fn pool_clone(p: *mut Pool, node: u32) -> u32 {
+    if !pool_is_arr(p, node) {
+        return pool_int(p, pool_val(p, node))
+    }
+    let n: u32 = pool_len(p, node)
+    let out: u32 = pool_arr(p, n)
+    var i: u32 = 0
+    while i < n {
+        let k: u32 = pool_clone(p, pool_kid(p, node, i))
+        pool_set_kid(p, out, i, k)
+        i = i + 1
+    }
+    return out
+}
+
+fn pool_mark(p: *mut Pool) -> u64 {
+    return ((vec_len[u32](&(*p).kind) as u64) << 32) | (vec_len[u32](&(*p).kids) as u64)
+}
+
+fn pool_reset(p: *mut Pool, mark: u64) {
+    let nodes: usize = (mark >> 32) as usize
+    let kids: usize = (mark & 4294967295) as usize
+    while vec_len[u32](&(*p).kind) > nodes {
+        vec_pop[u32](&(*p).kind)
+        vec_pop[i64](&(*p).val)
+        vec_pop[u32](&(*p).off)
+        vec_pop[u32](&(*p).len)
+    }
+    while vec_len[u32](&(*p).kids) > kids {
+        vec_pop[u32](&(*p).kids)
+    }
+}
+
+fn pool_save(p: *mut Pool, node: u32, out: *mut Vec[i64]) {
+    if !pool_is_arr(p, node) {
+        vec_push[i64](out, 0)
+        vec_push[i64](out, pool_val(p, node))
+        return
+    }
+    let n: u32 = pool_len(p, node)
+    vec_push[i64](out, 1)
+    vec_push[i64](out, n as i64)
+    var i: u32 = 0
+    while i < n {
+        pool_save(p, pool_kid(p, node, i), out)
+        i = i + 1
+    }
+}
+
+fn pool_load(p: *mut Pool, saved: *mut Vec[i64], at: *mut usize) -> u32 {
+    let kind: i64 = vec_at[i64](saved, *at)
+    let v: i64 = vec_at[i64](saved, *at + 1)
+    *at = *at + 2
+    if kind == 0 {
+        return pool_int(p, v)
+    }
+    let out: u32 = pool_arr(p, v as u32)
+    var i: u32 = 0
+    while i < v as u32 {
+        let k: u32 = pool_load(p, saved, at)
+        pool_set_kid(p, out, i, k)
+        i = i + 1
+    }
+    return out
+}
+
+fn shapes_new() -> Shapes {
+    return Shapes { kind: vec_new[u32](), a: vec_new[u32](), n: vec_new[u64](), cache: vec_new[u32]() }
+}
+
+fn shapes_free(s: *mut Shapes) {
+    vec_free[u32](&(*s).kind)
+    vec_free[u32](&(*s).a)
+    vec_free[u64](&(*s).n)
+    vec_free[u32](&(*s).cache)
+}
+
+fn shape_add(s: *mut Shapes, kind: u32, a: u32, n: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*s).kind) as u32
+    vec_push[u32](&(*s).kind, kind)
+    vec_push[u32](&(*s).a, a)
+    vec_push[u64](&(*s).n, n)
+    return i
+}
+
+fn shape_kind(s: *mut Shapes, i: u32) -> u32 { return vec_at[u32](&(*s).kind, i as usize) }
+fn shape_inner(s: *mut Shapes, i: u32) -> u32 { return vec_at[u32](&(*s).a, i as usize) }
+fn shape_type(s: *mut Shapes, i: u32) -> u32 { return vec_at[u32](&(*s).a, i as usize) }
+fn shape_len(s: *mut Shapes, i: u32) -> u64 { return vec_at[u64](&(*s).n, i as usize) }
+
+fn shape_build(s: *mut Shapes, b: *mut ast.Tree, it: *mut intern.Interner, t: u32) -> u32 {
+    let k: u32 = ast.t_kind(b, t)
+    if k == ast.T_ARR {
+        let inner: u32 = shape_of(s, b, it, ast.t_a(b, t))
+        return shape_add(s, SH_ARR, inner, ast.t_b(b, t))
+    }
+    if k != ast.T_NAME {
+        return shape_add(s, SH_ANY, 0, 0)
+    }
+    let base: i32 = types.base_ty(it, ast.t_a(b, t))
+    if base < 0 {
+        return shape_add(s, SH_ANY, 0, 0)
+    }
+    if base as u32 == types.K_BOOL {
+        return shape_add(s, SH_BOOL, 0, 0)
+    }
+    if base as u32 <= types.K_ISIZE {
+        return shape_add(s, SH_INT, base as u32, 0)
+    }
+    return shape_add(s, SH_ANY, 0, 0)
+}
+
+fn shape_of(s: *mut Shapes, b: *mut ast.Tree, it: *mut intern.Interner, t: u32) -> u32 {
+    if t == NOTHING {
+        return shape_add(s, SH_ANY, 0, 0)
+    }
+    while vec_len[u32](&(*s).cache) <= t as usize {
+        vec_push[u32](&(*s).cache, NOTHING)
+    }
+    let hit: u32 = vec_at[u32](&(*s).cache, t as usize)
+    if hit != NOTHING {
+        return hit
+    }
+    let made: u32 = shape_build(s, b, it, t)
+    vec_set[u32](&(*s).cache, t as usize, made)
+    return made
+}
+
+fn shape_elem(s: *mut Shapes, shape: u32, depth: usize) -> u32 {
+    var cur: u32 = shape
+    var i: usize = 0
+    while i < depth {
+        if shape_kind(s, cur) != SH_ARR {
+            return 0
+        }
+        cur = shape_inner(s, cur)
+        i = i + 1
+    }
+    return cur
+}
+
+fn cut_bits(k: u32) -> i64 {
+    if k == types.K_I8 || k == types.K_U8 { return 8 }
+    if k == types.K_I16 || k == types.K_U16 { return 16 }
+    if k == types.K_I32 || k == types.K_U32 { return 32 }
+    return 64
+}
+
+fn cut_signed(k: u32) -> bool {
+    return k == types.K_I8 || k == types.K_I16 || k == types.K_I32
+}
+
+fn cut(v: i64, k: u32) -> i64 {
+    let bits: i64 = cut_bits(k)
+    if bits >= 64 {
+        return v
+    }
+    let m: i64 = v & ((1 << bits) - 1)
+    if cut_signed(k) && ((m >> (bits - 1)) & 1) != 0 {
+        return m - (1 << bits)
+    }
+    return m
+}
+
+fn coerce(p: *mut Pool, s: *mut Shapes, node: u32, shape: u32) {
+    let sk: u32 = shape_kind(s, shape)
+    if pool_is_arr(p, node) {
+        if sk != SH_ARR {
+            return
+        }
+        let inner: u32 = shape_inner(s, shape)
+        var i: u32 = 0
+        while i < pool_len(p, node) {
+            coerce(p, s, pool_kid(p, node, i), inner)
+            i = i + 1
+        }
+        return
+    }
+    if sk == SH_INT {
+        pool_set_val(p, node, cut(pool_val(p, node), shape_type(s, shape)))
+    }
+    if sk == SH_BOOL {
+        var b: i64 = 0
+        if pool_val(p, node) != 0 { b = 1 }
+        pool_set_val(p, node, b)
+    }
+}

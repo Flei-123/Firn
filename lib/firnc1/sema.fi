@@ -43,6 +43,8 @@ import escape
 import moves
 import borrow
 import constfn
+import construn
+import cencode
 import report
 import unsafety
 import msgfmt
@@ -55,7 +57,7 @@ import opsugar
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_pend, sema_ty, sema_widen32,
     sema_is_seq, sema_hidden_idx, sema_vec_slice, sema_vec_sugar, sema_seq_elem,
-    sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
+    sema_types, sema_ty_count, sema_const_value,
     // ROUND FIRN-ENV (compiler/src/env.rs) -- `const` with a text.
     sema_const_text_len, sema_const_text_ptr,
     sema_mu_set, sema_mu, sema_fe_set, sema_gc_set, sema_if_set,
@@ -141,7 +143,6 @@ struct Sema {
     // `bin/firnc1.fi` (from the declaration or `--profile=`); here it is
     // only enforced.
     kernel: bool,
-    ct_needed: bool, // a constant needs evaluation at compile time
     // ROUND 58 (fnval.rs): the closures of this translation. One entry per
     // closure literal; the lowering reads the record layout off it.
     cl_name: Vec[u32], // the generated function `__closure#N`
@@ -168,6 +169,7 @@ struct Sema {
     dhelp: rt.Buf,
     cur_pos: u64,
     ce_e: u32, ce_code: u32, ce_a: u64, ce_b: u64,
+    ce_msg: rt.Buf, ce_pos: u64, ce_width: u32,
     gr_si: u32, gr_ptr: bool,
 }
 
@@ -186,7 +188,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         t_f32: 0,
         t_i32: 0,
         ret: 0, ctor_hint: 4294967295, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
-        err: 0, addr_depth: 0, kernel: false, ct_needed: false,
+        err: 0, addr_depth: 0, kernel: false,
         cl_name: vec_new[u32](), cl_tid: vec_new[u64](), cl_size: vec_new[u64](),
         cl_coff: vec_new[u32](), cl_clen: vec_new[u32](),
         cc_name: vec_new[u32](), cc_ty: vec_new[u32](),
@@ -198,7 +200,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         mv_ndrop: 0, mv_nmoved: 0, mv_vec: false, send_check: false, borrow_strict: false,
         uns: unsafety.uns_new(),
         pend: report.pend_new(), dmsg: rt.buf_new(), dhelp: rt.buf_new(), cur_pos: 0,
-        ce_e: 0, ce_code: 0, ce_a: 0, ce_b: 0, gr_si: 0, gr_ptr: false,
+        ce_e: 0, ce_code: 0, ce_a: 0, ce_b: 0, ce_msg: rt.buf_new(), ce_pos: 0, ce_width: 1, gr_si: 0, gr_ptr: false,
     }
 }
 
@@ -247,6 +249,7 @@ fn sema_free(s: *mut Sema) {
     vec_free[u32](&(*s).cg_ty)
     vec_free[u32](&(*s).cg_frame)
     rt.buf_free(&(*s).scratch2)
+    rt.buf_free(&(*s).ce_msg)
 }
 
 // ------------------------------------------------- closures (round 58)
@@ -502,7 +505,6 @@ fn has_if(s: *mut Sema) -> bool { return (*s).ifr != 0 }
 
 // The tree behind this run (for `nogc.fi`).
 fn sema_tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
-fn sema_needs_comptime(s: *mut Sema) -> bool { return (*s).ct_needed }
 fn sema_types(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
 fn sema_ty_count(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
 fn sema_ty(s: *mut Sema, i: u32) -> u32 { return vec_at[u32](&(*s).etyp, i as usize) }
@@ -1049,6 +1051,8 @@ fn ce_say_static(s: *mut Sema, code: u32, pos: u64, len: u32, a: u64, c: u64) ->
     return false
 }
 
+const CE_RUN: u32 = 1000
+
 fn ce_fail(s: *mut Sema, e: u32, code: u32, a: u64, c: u64) {
     if (*s).ce_code == 0 {
         (*s).ce_e = e
@@ -1062,10 +1066,27 @@ fn ce_clear(s: *mut Sema) {
     (*s).ce_code = 0
 }
 
+fn ce_fail_run(s: *mut Sema, run: *mut construn.Run) {
+    if (*s).ce_code != 0 {
+        return
+    }
+    rt.buf_clear(&(*s).ce_msg)
+    rt.buf_push_bytes(&(*s).ce_msg, construn.run_msg_ptr(run), construn.run_msg_len(run))
+    (*s).ce_pos = construn.run_pos(run)
+    (*s).ce_width = construn.run_width(run)
+    (*s).ce_code = CE_RUN
+}
+
 fn ce_say(s: *mut Sema) -> bool {
     let code: u32 = (*s).ce_code
     if code == 0 {
         return false
+    }
+    if code == CE_RUN {
+        (*s).ce_code = 0
+        report.pend_add(&(*s).pend, (*s).ce_pos, (*s).ce_width, &(*s).ce_msg)
+        (*s).err = (*s).err + 1
+        return true
     }
     let e: u32 = (*s).ce_e
     let pos: u64 = ast.expr_pos(tree(s), e)
@@ -1909,8 +1930,7 @@ fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
                 }
             }
         } else if a == ast.E_CALL {
-            (*s).ct_needed = true
-            *good = false
+            static_from_call(s, e, t, good)
         } else {
             ce_fail(s, e, 21, 0, 0)
             *good = false
@@ -2285,6 +2305,66 @@ fn const_visit(b: *mut ast.Tree, i: u32, state: *mut Vec[u8], order: *mut Vec[u3
     vec_push[u32](order, i)
 }
 
+fn run_new_for(s: *mut Sema) -> construn.Run {
+    return construn.run_new(tree(s) as u64, names(s) as u64, table(s) as u64,
+        (&(*s).k_first) as u64, (&(*s).k_value) as u64, (&(*s).k_ty) as u64)
+}
+
+fn call_args(s: *mut Sema, e: u32, ints: *mut Vec[i64], good: *mut bool) {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    var i: u32 = 0
+    while i < ast.e_c(b, e) && *good {
+        vec_push[i64](ints, const_eval(s, ast.child_at(b, off + i), good))
+        i = i + 1
+    }
+}
+
+fn const_from_call(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
+    var ints: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&ints)
+    call_args(s, e, &ints, good)
+    if !*good {
+        return 0
+    }
+    var run: construn.Run = run_new_for(s)
+    defer construn.run_free(&run)
+    let node: u32 = construn.run_call(&run, e, &ints)
+    var v: i64 = 0
+    if node != NONE {
+        v = construn.run_node_int(&run, node, e)
+    }
+    if construn.run_failed(&run) {
+        ce_fail_run(s, &run)
+        *good = false
+        return 0
+    }
+    return v
+}
+
+fn static_from_call(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
+    var ints: Vec[i64] = vec_new[i64]()
+    defer vec_free[i64](&ints)
+    call_args(s, e, &ints, good)
+    if !*good {
+        return
+    }
+    var run: construn.Run = run_new_for(s)
+    defer construn.run_free(&run)
+    var bytes: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&bytes)
+    let node: u32 = construn.run_call(&run, e, &ints)
+    if node != NONE {
+        cencode.encode_value(&run, node, t, &bytes, ast.expr_pos(tree(s), e), elen(s, e))
+    }
+    if construn.run_failed(&run) {
+        ce_fail_run(s, &run)
+        *good = false
+        return
+    }
+    rt.buf_push_bytes(&(*s).g_data, rt.buf_ptr(&bytes), rt.buf_len(&bytes))
+}
+
 fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
@@ -2423,14 +2503,10 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
         }
         return wrap(s, v, dst)
     }
-    // A CALL in a constant expression means that `firnc0` runs the
-    // function at compile time (comptime.rs). That is not
-    // ported -- the file is counted separately, not as a deviation.
     if a == ast.E_CALL {
-        (*s).ct_needed = true
-    } else {
-        ce_fail(s, e, 9, 0, 0)
+        return const_from_call(s, e, good)
     }
+    ce_fail(s, e, 9, 0, 0)
     *good = false
     return 0
 }
