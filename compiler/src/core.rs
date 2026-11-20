@@ -490,6 +490,7 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
     // SPEC §2: the inline assembler is kernel business. Rejected under the
     // `app` profile, so nobody nails an application to one architecture.
     crate::prof::hook_asm(ck, b.span);
+    ck.require_unsafe(espan, "inline assembly");
     let mut good = true;
     if let Some(r) = &b.out {
         good &= check_reg(ck, r, b.span, "out");

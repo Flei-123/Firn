@@ -18,8 +18,9 @@ Reported by `firnc0` and `firnc1` (same texts, same positions) when the mode is 
 - indexing a raw pointer: `p[i]`
 
 - a call of an `unsafe fn` (plain call or method call) from safe code
+- an `asm(...)` block (x86-64 and aarch64)
 
-Not covered yet: `transmute`, MMIO, inline assembly, `Gc[T]` internals, `unsafe` as an expression.
+Not covered yet: `transmute`, MMIO, `Gc[T]` internals, `unsafe` as an expression.
 
 ## Modes
 

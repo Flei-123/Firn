@@ -37,8 +37,13 @@ check "calls, mode error fails" 1 "$(build --unsafe=error "$D/calls.fi")"
 check "calls, mode off builds" 0 "$(build "$D/calls.fi")"
 check "wrapped call, mode error" 0 "$(build --unsafe=error "$D/wrapped_call.fi")"
 check "wrapped call, runs" 3 "$("$WORK/out" >/dev/null 2>&1; echo $?)"
+check "asm, mode warn reports" 1 "$(build --unsafe=warn "$D/asm.fi" >/dev/null; grep -c 'warning: inline assembly is only allowed' "$WORK/log")"
+check "asm, mode error fails" 1 "$(build --unsafe=error "$D/asm.fi")"
+check "asm, mode off builds" 0 "$(build "$D/asm.fi")"
+check "asm wrapped, mode error" 0 "$(build --unsafe=error "$D/asm_wrapped.fi")"
+check "asm wrapped, runs" 7 "$("$WORK/out" >/dev/null 2>&1; echo $?)"
 if [ -n "${FIRNC1:-}" ]; then
-    for f in outside calls sites wrapped_call; do
+    for f in outside calls sites wrapped_call asm; do
         "$FIRNC" --unsafe=warn "$D/$f.fi" -o "$WORK/o0" 2>&1 | grep 'warning: ' >"$WORK/w0"
         "$FIRNC1" --unsafe=warn "$D/$f.fi" -o "$WORK/o1" 2>&1 | grep 'warning: ' >"$WORK/w1"
         check "twin warn $f" "$(md5sum <"$WORK/w0")" "$(md5sum <"$WORK/w1")"
