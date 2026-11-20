@@ -404,10 +404,10 @@ justification as a comment (`--deny=undocumented-unsafe`, the default in the
 without this exception.
 
 **Implementation status (r908, 22.10.2026).** The rule above is the target, not
-what `firnc0`/`firnc1` enforce today: there is no `unsafe { }` block yet (it is a
-parse error) and raw pointer dereference, pointer arithmetic and casts are
-accepted everywhere, in every profile and build level (tests `4710`,
-`tools/safety/ub/ub25`). The whole library is written that way. Enforcing the
+what is enforced by default today: `unsafe { }` and `unsafe fn` parse in `firnc0`/`firnc1`,
+but raw pointer dereference, pointer arithmetic and casts are accepted
+everywhere unless `firnc0 --unsafe=warn|error` is given (`docs/UNSAFE.md`; tests `4710`,
+`6750`, `tools/safety/ub/ub25`). The whole library is written that way. Enforcing the
 rule means adding the block and marking every existing site first; until then
 `L3` holds by convention only. `docs/SAFETY.md` N16.
 

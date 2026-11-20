@@ -84,7 +84,7 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 | N13 | `Gc[T]` hidden as integer through a raw pointer (`g as *mut u8 as u64`) or stored in untyped memory (`rt.heap_alloc`) is NOT a root. The direct `g as u64` is rejected (G25) | object is collected while the integer still holds the address | ub24, ub27 (CERR) |
 | N14 | (closed by G17, r903) | | |
 | N15 | (closed by G18, r914) | | |
-| N16 | `unsafe { }` | NOT in stage 0 (parse error). Raw pointer deref and casts are allowed everywhere. SPEC 3.6 now says so (implementation status, r908): the rule is the target | ub25, green pin `4710` |
+| N16 | `unsafe { }` | PARTLY. `unsafe { }` and `unsafe fn` parse in firnc0 and firnc1. `firnc0 --unsafe=off|warn|error` (default off) reports raw pointer deref, casts, arithmetic and indexing outside `unsafe`; `--unsafe-scope=` limits it to files. Not enforced by default, firnc1 does not enforce yet, 4 std modules migrated. See docs/UNSAFE.md | tests 6750, `tools/safety/unsafe/run.sh`, green pin `4710` |
 | N17 | Data races between threads, `Gc[T]` crossing threads | not analysed (no `Send` check) | not tested |
 | N18 | Exclusivity of `inout` across statements and through callees: a callee can turn a reference into a raw pointer | not checked (SPEC 1560, ROADMAP r193) | ub23 |
 | N19 | Lifetime analysis is not a proof: "where the analysis cannot decide, it allows" (SPEC 3.6.1) | escapes through unknown callee chains can pass | docs/ROUND79.md |
@@ -93,6 +93,7 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 
 - `python3 -I tools/safety/fuzz_frontend.py --runs N --seed S [--keep DIR]`: mutates `tests/*.fi` (byte cut, line copy / swap, token insert, truncation) and compiles every mutant with firnc0 (`--emit=asm`) and firnc1. A signal, a timeout or a Rust `panicked at` is a **crash** (exit 1). Different accept / reject between the two compilers is counted as `disagree` (not a failure, only listed). `test.sh` section 149 runs 80 mutants.
 - Measured 12.11.2026 (seed 2, 1200 mutants, firnc0 and firnc1 both built from main `abe6d3aef`): 0 crashes, 0 accept / reject disagreements. The 3 disagreements of 08.11. came from a stale `.firnc1` (built before G22): always rebuild it (`bin/firnc1.fi`) before fuzzing.
+- `bash tools/safety/unsafe_audit.sh [dir ...]`: exact count of unsafe sites per file from the type checker (`--unsafe=warn`). `bash tools/safety/unsafe/run.sh`: mode tests and the migrated-module check.
 - `bash tools/safety/rawptr_audit.sh`: counts raw pointer casts and `(*p)` sites per `lib/*` directory. An approximate size of the N16 job (`unsafe { }` has to mark all of it first), not a proof.
 
 ## Segment rights (r898)

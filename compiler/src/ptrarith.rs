@@ -62,6 +62,7 @@ pub(crate) fn hook_binary(
         ck.type_out_expr(r);
         return Some(Type::Error);
     }
+    ck.require_unsafe(espan, "raw pointer arithmetic");
     // `p - q`: the distance of two pointers.
     if op == BinOp::Sub && ck.probe(r).map(|t| t.is_ptr()).unwrap_or(false) {
         let rt = ck.expr(r, None);

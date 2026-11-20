@@ -128,6 +128,7 @@ pub(crate) struct Checker<'a> {
     pub(crate) scopes: Vec<HashMap<String, VarInfo>>,
     pub(crate) ret: Type,
     pub(crate) depth: u32,
+    pub(crate) unsafe_depth: u32,
     /// Functions marked `#[must_consume]` — their result must not be dropped
     /// as a statement (attrs.rs).
     pub(crate) must_consume_fns: HashSet<String>,
@@ -163,6 +164,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         scopes: Vec::new(),
         ret: Type::Void,
         depth: 0,
+        unsafe_depth: 0,
         must_consume_fns: HashSet::default(),
         capture_frames: Vec::new(),
         drops: HashSet::default(),
@@ -1429,6 +1431,10 @@ constants declared before it, and '+ - * /'"
     // ------------------------------------------------------------ Statements
 
     pub(crate) fn check_block(&mut self, b: &Block, reuse_scope: bool) {
+        let marked = crate::unsafety::is_marked(b.span);
+        if marked {
+            self.unsafe_depth += 1;
+        }
         if !reuse_scope {
             self.scopes.push(HashMap::default());
         }
@@ -1437,6 +1443,36 @@ constants declared before it, and '+ - * /'"
         }
         if !reuse_scope {
             self.scopes.pop();
+        }
+        if marked {
+            self.unsafe_depth -= 1;
+        }
+    }
+
+    fn require_unsafe_index(&mut self, base: &Type, span: Span) {
+        if base.is_ptr() && !crate::gc::is_gc_ptr(base) {
+            self.require_unsafe(span, "indexing a raw pointer");
+        }
+    }
+
+    pub(crate) fn require_unsafe(&mut self, span: Span, what: &str) {
+        if self.unsafe_depth > 0 || !crate::unsafety::in_scope(self.dg.file_name(span.file)) {
+            return;
+        }
+        match crate::unsafety::mode() {
+            crate::unsafety::Mode::Off => {}
+            crate::unsafety::Mode::Warn => {
+                eprintln!(
+                    "{}:{}:{}: warning: {}",
+                    self.dg.file_name(span.file),
+                    span.line,
+                    span.col,
+                    crate::unsafety::site_message(what)
+                );
+            }
+            crate::unsafety::Mode::Error => {
+                self.dg.error(span, crate::unsafety::site_message(what));
+            }
         }
     }
 
@@ -1809,6 +1845,7 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Index(base, idx) => {
                 let (bt, mut m) = self.lvalue(base)?;
+                self.require_unsafe_index(&bt, e.span);
                 let ty = self.index_type(&bt, idx, base.span);
                 // r724: a str / Span is a read-only view
                 let bt_inner = match &bt {
@@ -1823,6 +1860,9 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
                 let t = self.expr(inner, None);
+                if matches!(t, Type::Ptr { .. }) {
+                    self.require_unsafe(e.span, "dereferencing a raw pointer");
+                }
                 let ty = match &t {
                     Type::Ptr { inner: i, .. } => (**i).clone(),
                     Type::Error => Type::Error,
@@ -2359,6 +2399,7 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Index(base, idx) => {
                 let bt = self.expr(base, None);
+                self.require_unsafe_index(&bt, e.span);
                 self.index_type(&bt, idx, base.span)
             }
             ExprKind::Call(name, args, nspan) => {
@@ -2418,6 +2459,9 @@ constants declared before it, and '+ - * /'"
                 let src = self.expr(inner, inner_hint.as_ref());
                 if src.is_error() || dst.is_error() {
                     return dst;
+                }
+                if (src.is_ptr() || dst.is_ptr()) && !crate::gc::is_gc_ptr(&src) {
+                    self.require_unsafe(e.span, "a raw pointer cast");
                 }
                 // HOOK iface: `x as dyn I` — the interface value (iface.rs)
                 if let Some(t) = crate::iface::hook_cast(self, e.span, &src, &dst) {
@@ -2682,6 +2726,9 @@ constants declared before it, and '+ - * /'"
             }
             UnOp::Deref => {
                 let t = self.expr(inner, None);
+                if matches!(t, Type::Ptr { .. }) {
+                    self.require_unsafe(e.span, "dereferencing a raw pointer");
+                }
                 match &t {
                     Type::Ptr { inner: i, .. } => (**i).clone(),
                     Type::Error => Type::Error,
@@ -4146,6 +4193,7 @@ mod tests {
             scopes: Vec::new(),
             ret: Type::Void,
             depth: 0,
+            unsafe_depth: 0,
             must_consume_fns: HashSet::default(),
             capture_frames: Vec::new(),
             drops: HashSet::default(),

@@ -1581,6 +1581,12 @@ impl<'a> Parser<'a> {
             TokKind::KwErrDefer => self.defer_stmt(true),
             TokKind::KwReturn => self.return_stmt(),
             TokKind::LBrace => Stmt::Block(self.block("at the start of a block")),
+            TokKind::Ident(ref w) if w == "unsafe" && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::LBrace)) => {
+                self.bump();
+                let b = self.block("after 'unsafe'");
+                crate::unsafety::mark(b.span);
+                Stmt::Block(b)
+            }
             TokKind::KwFn | TokKind::KwStruct | TokKind::KwConst | TokKind::KwExtern => {
                 self.error_here(format!(
                     "'{}' is only allowed at top level, not inside a function body",
@@ -2445,6 +2451,10 @@ compute it",
     }
 
     fn fn_decl(&mut self, prog: &mut Program) {
+        let is_unsafe = matches!(self.kind(), TokKind::Ident(w) if w == "unsafe");
+        if is_unsafe {
+            self.bump();
+        }
         let start = self.span();
         let is_extern = self.at(&TokKind::KwExtern);
         if is_extern {
@@ -2531,6 +2541,9 @@ compute it",
         }
         let saved_ret = std::mem::replace(&mut self.cur_ret, ret.clone());
         let mut body = self.block("at the start of the function body");
+        if is_unsafe {
+            crate::unsafety::mark(body.span);
+        }
         self.cur_ret = saved_ret;
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
@@ -2919,6 +2932,7 @@ compute it",
                     prog.comptime_blocks.push((b, sp));
                 }
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
+                TokKind::Ident(w) if w == "unsafe" && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn)) => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
                 TokKind::KwStatic => self.static_decl(&mut prog),

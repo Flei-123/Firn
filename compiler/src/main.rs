@@ -152,6 +152,7 @@ mod keyhash;
 mod objcache;
 mod chainsink;
 mod idxsink;
+mod unsafety;
 mod usecount;
 mod promote;
 mod rangecheck;
@@ -352,6 +353,8 @@ fn usage() -> String {
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
+         --unsafe=<m>       off | warn | error (raw pointer deref/cast outside 'unsafe', default off)\n  \
+         --unsafe-scope=<p> enforce --unsafe only in files whose path contains <p> (repeatable; default: all files)\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
          --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
          --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
@@ -462,6 +465,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             _ if a.starts_with("--profile-") && pgo::parse_arg(a).is_some() => {
                 if let Some(Err(e)) = pgo::parse_arg(a) {
                     return Err(e);
+                }
+            }
+            _ if a.starts_with("--unsafe-scope=") => {
+                unsafety::add_scope(&a["--unsafe-scope=".len()..]);
+            }
+            _ if a.starts_with("--unsafe=") => {
+                let v = &a["--unsafe=".len()..];
+                match unsafety::parse(v) {
+                    Some(m) => unsafety::set_mode(m),
+                    None => return Err(format!("unknown unsafe mode '{}' (allowed: {})", v, unsafety::ALLOWED)),
                 }
             }
             _ if a.starts_with("--ownership=") => {
