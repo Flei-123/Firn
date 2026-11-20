@@ -66,6 +66,7 @@ mod refparam;
 mod fpool;
 mod gc;
 mod gcfree;
+mod nogc_reach;
 mod gc_names;
 mod ifexpr;
 mod gc_lower;

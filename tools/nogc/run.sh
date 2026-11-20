@@ -45,6 +45,17 @@ for src in tools/nogc/neg/*.fi; do
   fi
 done
 
+for src in tools/nogc/neg0/*.fi; do
+  name=$(basename "$src" .fi)
+  out=$("$FIRNC" --no-gc --no-cache "$src" -o "$D/neg0_$name" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ] && echo "$out" | grep -q "which '--no-gc' leaves out" && echo "$out" | grep -q -- "--> $src:4:21"; then
+    check "neg0 $name" ok
+  else
+    check "neg0 $name" bad "rc=$rc $(echo "$out" | head -2 | tr '\n' ' ')"
+  fi
+done
+
 for mode in off on check; do
   out=$("$FIRNC" --no-gc --ownership=$mode --no-cache tools/nogc/cases/hello.fi -o "$D/own_$mode" 2>&1)
   rc=$?
