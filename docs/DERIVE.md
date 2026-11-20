@@ -18,11 +18,11 @@ Rules and limits:
 - A field without the method gives `type 'Inner' has no method 'debug'` (derive `Debug` on `Inner` too).
 - Unknown name: `unknown derive 'Debog', known: ...`; wrong target: `derive attribute must stand before a struct or an enum`.
 - Generic structs work (`#[derive(Debug, Eq, Clone)] struct Pair[A, B]`), every instance is checked as usual.
-- Generic enums are still refused by derive: the frozen negative golden `tests/stable/neg/derive_generic_enum.fi` pins that rejection; the generator itself works now (methods and `match` inside generic enums run), lifting the refusal needs an unfreeze of that golden. `Default` works on non-generic structs only.
+- Generic enums work (`#[derive(Debug, Eq, Ord, Hash, Clone, Json)] enum Opt[T] { Some(T), None }`): the `impl Opt[T]` is a method template, every used instance is expanded and checked, so each type argument must support the derived method (`Opt[bool]` fails with `Ord`, `str` has no `debug()` method as a type argument). `Default` works on non-generic structs only. Since 20.11.2026; the refusal golden `tests/stable/neg/derive_generic_enum.fi` was replaced by the positive golden `tests/stable/6796_derive_generic_enum.fi` (additive, see `docs/STABILITY.md`).
 - The derive attribute must start its line and stand on one line.
 - `Debug` allocates through the GC: call `gc_init()` first.
 - Operators `<` `>` work on structs only (operators.rs); on enums call `a.cmp(b)`.
-- firnc1 supports every derive on structs and `Debug`/`Hash`/`Clone` on enums. Enum `Eq`/`Ord` generate a nested `match`; firnc1 cannot resolve outer bindings inside a nested `match` (known firnc1 bug), so such files fail in firnc1 only.
+- firnc1 supports every derive on structs and `Debug`/`Hash`/`Clone` on enums (generic enums too, `tests/6797_derive_generic_enum_basic.fi`). Enum `Eq`/`Ord` generate a nested `match`; firnc1 cannot resolve outer bindings inside a nested `match` (known firnc1 bug), so such files fail in firnc1 only.
 - `Json` writes text through `std.derive`, it does not build a `std.json` tree; reading (`from_json`) is not generated. Not yet: firnc1 `Json`, `PartialEq` aliases, `Vec` fields.
 
 Tests: `tests/6771_derive_core.fi` (firnc0, all derives), `tests/6772_derive_struct_enum_basic.fi` (both compilers), `tests/diff/derive_basic.fi`, `tests/diff/neg_derive_*.fi`, `tests/neg/derive_*.fi`.

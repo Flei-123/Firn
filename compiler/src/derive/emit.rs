@@ -7,9 +7,6 @@ pub fn generate(decl: &Decl, names: &[String]) -> Result<String, String> {
     if has("Default") && (!decl.generics.is_empty() || matches!(decl.body, Body::Enum(_))) {
         return Err("derive(Default) works on non-generic structs only".to_string());
     }
-    if !decl.generics.is_empty() && matches!(decl.body, Body::Enum(_)) {
-        return Err("derive on a generic enum needs 'match' inside generic templates (roadmap r1573)".to_string());
-    }
     let mut methods = String::new();
     let mut frees = String::new();
     for n in names {
