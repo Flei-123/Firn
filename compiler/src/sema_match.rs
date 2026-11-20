@@ -1352,6 +1352,14 @@ fn fits(v: i128, t: &Type) -> bool {
 /// Yields `Err(Diag)` with line/column and the name of the missing variant
 /// when the pattern match leaves a case uncovered. That is a hard error, not
 /// a warning — the caller reports it through `Diags`.
+fn enum_of_type(t: &Type) -> Option<EnumDef> {
+    let Type::Struct(idx) = t else { return None };
+    REG.with(|r| {
+        let reg = r.borrow();
+        reg.by_struct.get(idx).map(|&k| reg.enums[k].clone())
+    })
+}
+
 pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(), Diag> {
     let has_catchall = arms.iter().any(|a| a.pat.is_irrefutable());
     match subject {
@@ -1361,16 +1369,9 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                 return Ok(());
             }
             let mut missing: Vec<String> = Vec::new();
+            let pats: Vec<&Pattern> = arms.iter().map(|a| &a.pat).collect();
             for v in &def.variants {
-                let covered = arms.iter().any(|a| {
-                    a.pat.alternatives().iter().any(|p| match p {
-                        Pattern::Variant { vname, subs, .. } => {
-                            *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
-                        }
-                        _ => false,
-                    })
-                });
-                if !covered {
+                if !crate::match_cover::variant_covered(&pats, v, &enum_of_type) {
                     missing.push(format!("{}::{}", def.name, v.name));
                 }
             }

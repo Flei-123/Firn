@@ -7,6 +7,7 @@
 
 mod abi;
 mod assoc;
+mod match_cover;
 mod layout_attrs;
 mod fx;
 mod parcodegen;

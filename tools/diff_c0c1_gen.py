@@ -985,6 +985,20 @@ ASSOC_NEG = [
 for nm, src in ASSOC_NEG:
     emit("neg_assoc_" + nm, "neg", "", src, prelude=False)
 
+NESTED_EXH_RUN = [
+    ("plain", "enum In { A(i32), N }\nenum Out { I(In), O }\nfn f(o: Out) -> i32 {\n    match o {\n        Out::I(In::A(v)) => { return v }\n        Out::I(In::N) => { return 100 }\n        Out::O => { return 200 }\n    }\n    return 0\n}\nfn g(o: Out) -> i32 {\n    match o {\n        Out::I(In::A(v)) => { return v }\n        Out::I(_) => { return 7 }\n        Out::O => { return 8 }\n    }\n    return 0\n}\nfn main() -> i32 {\n    put(f(Out::I(In::A(5))) as i64)\n    put(f(Out::I(In::N)) as i64)\n    put(f(Out::O) as i64)\n    put(g(Out::I(In::N)) as i64)\n    return 0\n}\n"),
+    ("generic", "enum Opt[T] { Some(T), None }\nenum Out[T] { I(Opt[T]), O }\nfn f(o: Out[i32]) -> i32 {\n    match o {\n        Out::I(Opt::Some(v)) => { return v }\n        Out::I(Opt::None) => { return 1 }\n        Out::O => { return 200 }\n    }\n    return 0\n}\nfn main() -> i32 {\n    put(f(Out[i32]::O) as i64)\n    put(f(Out[i32]::I(Opt[i32]::None)) as i64)\n    return 0\n}\n"),
+]
+for nm, src in NESTED_EXH_RUN:
+    emit("nested_exh_" + nm, "run", "same", src)
+
+NESTED_EXH_NEG = [
+    ("missing_inner", "enum In { A(i32), N }\nenum Out { I(In), O }\nfn f(o: Out) -> i32 {\n    match o {\n        Out::I(In::A(v)) => { return v }\n        Out::O => { return 200 }\n    }\n    return 0\n}\nfn main() -> i32 { return f(Out::O) }\n"),
+    ("literal_bool", "enum Opt[T] { Some(T), None }\nfn f(o: Opt[bool]) -> i32 {\n    match o {\n        Opt::Some(true) => { return 1 }\n        Opt::None => { return 2 }\n    }\n    return 0\n}\nfn main() -> i32 { return f(Opt[bool]::None) }\n"),
+]
+for nm, src in NESTED_EXH_NEG:
+    emit("neg_nested_exh_" + nm, "neg", "", src, prelude=False)
+
 WHERE_NEG = [
     ("unmet", "interface Area { fn area(*self) -> i64 }\nfn total[T](a: T) -> i64 where T: Area {\n    return 1\n}\nfn main() -> i32 {\n    return total[i32](3 as i32) as i32\n}\n"),
     ("unknown_param", "fn total[T](a: T) -> i64 where U: Int {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n"),
