@@ -101,9 +101,9 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 Why `--send-check=on` and `--borrow=on` became the default (measured 20.11.2026, `tools/safety/safety_audit.sh`, `STEP=1`: `examples/`, `bench/`, `tools/*/`, `bin/`, every program of `tests/`, `tests/stable`, `tests/opt`, `tests/diff`, 3143 programs, all imported `lib/` modules):
 - `--moves=vec` became the default (r1543): all 19 library sites in 10 files were fixed, 0 messages remain over the corpus except the intended negative cases. Frozen goldens `4241`, `4712`, `4731` build with `--moves=off` (`tools/stability/moves_off.txt`).
 - `--send-check=on`: **0 findings** over the 3143 programs and in `lib/`; the table covers 10 thread entry points and pointees of raw pointers. firnc1 has the same check and the same default. Opt out: `--send-check=off`.
-- `--borrow=on` (B1, B2, B3): **0 findings** over the 3143 programs and in `lib/`. Opt out: `--borrow=off`. firnc1 does not check B1-B3 (it ignores `--borrow=on|off`), so firnc0 can reject a program firnc1 accepts; the corpus holds none.
+- `--borrow=on` (B1, B2, B3): **0 findings** over the 3143 programs and in `lib/`. Opt out: `--borrow=off`. firnc1 checks B1-B3 only with `--borrow=strict` (it ignores `--borrow=on|off`), so firnc0 can reject a program firnc1 accepts; the corpus holds none.
 - B4 (`--borrow=strict`, `extern fn`): the 3 `lib/` sites (`lib/std/dynlib.fi` `open` and `sym`, `lib/android/imeinject.fi` `inject_poll`) are migrated with `#[allow_escape]` (the callee only reads or fills the buffer during the call). 8 findings remain in Windows probe programs under `tools/` (`input/win_check`, `extfn/linkname`, `extfn/callout`, `desktop/windrop_main`, `desktop/wintray_poke`, `dialog/pilot_main`, `shellthread/demo`), so B4 stays opt-in until they are migrated.
-- firnc1 refuses `--borrow=strict` (the self-hosted parser has already rewritten reference parameters into raw pointers, so B3 cannot be told from a hand-written raw pointer there); port is a roadmap item.
+- firnc1 checks B1-B4 with `--borrow=strict` (`lib/firnc1/borrow.fi`, `escape.fi`; `ast.param_ref` marks reference parameters); `tools/safety/borrow.sh` with `FIRNC1=<binary>` compares both compilers.
 
 ## Tools that watch the front-end and the unchecked corners (08.11.2026)
 
