@@ -1358,6 +1358,9 @@ constants declared before it, and '+ - * /'"
         if crate::sema_generic::is_generic_fn(name) {
             return Some(format!("'{}' is a generic function: write the type arguments, e.g. '{}[i32]'", name, name));
         }
+        if let Some(h) = crate::hints::import_hint(name) {
+            return Some(h);
+        }
         let all = self.value_names();
         crate::diag::nearest(name, all.iter().map(|s| s.as_str()))
             .map(|n| crate::diag::did_you_mean(&n))
@@ -1517,13 +1520,13 @@ constants declared before it, and '+ - * /'"
                     Some(d) => {
                         let got = self.expr(init, Some(d));
                         if !assignable(&got, d) {
-                            self.dg.error(
+                            let want = self.tcx.name_of(d);
+                            let have = self.tcx.name_of(&got);
+                            let hint = crate::hints::mismatch_hint(&want, &have);
+                            self.dg.error_maybe_help(
                                 init.span,
-                                format!(
-                                    "expected type {}, found {}",
-                                    self.tcx.name_of(d),
-                                    self.tcx.name_of(&got)
-                                ),
+                                format!("expected type {}, found {}", want, have),
+                                hint,
                             );
                         }
                         d.clone()

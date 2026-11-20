@@ -30,6 +30,11 @@ t "targets lists the targets"      bash -c "$FI targets | grep -q '^web'"
   t "fmt -c accepts canonical"     "$FI" fmt -c src/main.fi tests/basic.fi
   t "check accepts a good file"    "$FI" check src/main.fi
   printf 'fn main() -> i32 { let x: i32 = "a"; return x }\n' > bad.fi
+  t "check accepts a package dir"  "$FI" check .
+  t "doc prints the API"           bash -c "$FI doc . | grep -q 'fn ' && $FI doc . --search nothing_here | wc -c | grep -qx 0"
+  t "doc --html is searchable"     bash -c "$FI doc . --html | grep -q 'id=\"q\"'"
+  t "doc reads a std module"       bash -c "$FI doc std.args --search parse_argv | grep -q parse_argv"
+  t "add names bundled libs"       bash -c "$FI add std.json | grep -q 'ships with Firn'"
   t "check rejects a type error"   bash -c "! $FI check bad.fi 2> err.txt && grep -q 'expected type i32' err.txt"
   printf 'fn  main()->i32{return 0}\n' > ugly.fi
   t "fmt -c flags a non-canonical file" bash -c "! $FI fmt -c ugly.fi >/dev/null 2>&1"

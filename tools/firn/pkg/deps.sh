@@ -93,8 +93,18 @@ cmd_add() {
     return 0
 }
 
+bundled_lib_path() {
+    local rel=${1//.//}
+    [ -f "$FIRNLIB/$rel.fi" ] || [ -d "$FIRNLIB/$rel" ] || return 1
+    echo "$FIRNLIB/$rel"
+}
+
 cmd_add_registry() {
     local name=${1%%@*} req=*
+    if bundled_lib_path "$name" > /dev/null; then
+        echo "$name ships with Firn (lib/${name//.//}): no 'firn add' needed, write: import $name"
+        return 0
+    fi
     case $1 in *@*) req=${1#*@} ;; esac
     [ -f firn.package ] || die "no ./firn.package here (run inside a project; firn new NAME)"
     case $name in [A-Za-z_]*) ;; *) die "dependency name must start with a letter or _" ;; esac

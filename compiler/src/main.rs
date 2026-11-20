@@ -53,6 +53,7 @@ mod checkmode;
 mod stackguard;
 mod ct;
 mod diag;
+mod hints;
 mod dwarf;
 mod dwarf_info;
 mod lsp;

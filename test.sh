@@ -2453,6 +2453,18 @@ else
     grep -E 'BROKEN|BREAKING' "$WORK/stability151.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 152. tooling: firn new templates (tools/firn/test_templates.sh), diagnostic helps in firnc0 and firnc1 (tools/diag/run.sh), the book examples (tools/book/run.sh) =="
+for T152 in "tools/firn/test_templates.sh" "tools/diag/run.sh" "tools/book/run.sh"; do
+    FIRNC="$FIRNC" bash "$T152" > "$WORK/tooling152.log" 2>&1 && F152RC=0 || F152RC=$?
+    if [ "$F152RC" -eq 0 ]; then
+        ok
+        tail -1 "$WORK/tooling152.log" | sed 's/^/ /'
+    else
+        bad "$T152 failed (see .test-work/tooling152.log)"
+        grep -E 'FAIL|ERROR' "$WORK/tooling152.log" | head -12 | sed 's/^/   /' || true
+    fi
+done
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

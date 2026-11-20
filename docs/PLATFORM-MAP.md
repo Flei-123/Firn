@@ -85,3 +85,6 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `grep -ril "<keyword>" lib docs/LIBS.md | head`
 - `search(query, typ:"lib", projekt:"firn")`
 - Comparison table with gaps vs .NET: JARVIS archive "Firn-Plattform vs .NET/Rust/Go".
+- `tools/firn/templates/` | `firn new cli|lib|web-api|desktop-app|game NAME` | docs/PACKAGES.md, `bash tools/firn/test_templates.sh`
+- `tools/doc/firn_doc.py` | `firn doc` API docs (Markdown/HTML/search) from code | docs/PACKAGES.md
+- `docs/BOOK/` | tutorial and cookbook, examples run as tests | `bash tools/book/run.sh`

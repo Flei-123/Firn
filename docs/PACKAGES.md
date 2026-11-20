@@ -16,6 +16,7 @@ There is no `firn.toml`: `docs/ROUND48.md` section 1 explains why the manifest i
 ## Flow
 
 ```
+firn new cli app                     # template (firn new --list): cli, lib, web-api, desktop-app, game
 firn new app --console               # program: firn.package, src/main.fi, tests/
 firn new gui                         # fUi app: firn.package, fui.app, main.fi, data/ (firn build --target web|android|windows|linux)
 firn new geo --lib                   # library: no start, importable via needs
@@ -103,3 +104,11 @@ Requirements follow Cargo: `1.2.3` and `^1.2.3` (caret; `^0.2.3` = `<0.3.0`, `^0
 The compiler still resolves diamonds as described above (highest wins, same first number). The registry picks the version once, at `firn add` / `firn update`; the result is an ordinary pinned git dependency in `firn.deps`, and `firn.lock` stays as it is.
 
 Tests: `bash tools/firn/test_registry.sh` (23 checks: resolve, yank, tampered hash, build against the pinned version, offline).
+
+## Templates, check, doc
+
+`firn new TEMPLATE NAME` copies `tools/firn/templates/TEMPLATE` (`__NAME__` is replaced by NAME): `cli` (std.args), `lib`, `web-api` (webfw), `game` (headless state/step/render loop), `desktop-app` (fUi via `fui new`). Each has `firn.package`, `src/`, `tests/` and a README; `bash tools/firn/test_templates.sh` creates every template and runs `firn build`, `firn test`, `firn fmt -c` and the program.
+
+`firn check [x.fi...|DIR]` type-checks only. `firn doc [DIR|x.fi|std.mod]` writes the API as Markdown (`--html` one searchable page, `--search TEXT`, `-o FILE`); it reuses the header and export scan of `tools/gen_libs_index.py`. `firn add std.json` says that bundled libs need no `add`.
+
+The book with tested examples is `docs/BOOK/` (`bash tools/book/run.sh`). Diagnostic helps (`= help:` lines) in firnc0 and firnc1: `bash tools/diag/run.sh`.
