@@ -19,8 +19,8 @@ for f in "$ROOT"/tools/safety/moves/*.fi; do
         if echo "$out" | grep -qF -- "$text" && echo "$out" | grep -q -- "--> .*:${pos}$"; then :; else
             echo "FAIL $n: expected '$text' at $pos"; echo "$out" | head -4; fail=$((fail + 1))
         fi
-        if ! "$FIRNC" -o "$W/x" "$f" >/dev/null 2>&1; then
-            echo "FAIL $n: must compile without --moves=vec"; fail=$((fail + 1))
+        if ! "$FIRNC" --moves=off -o "$W/x" "$f" >/dev/null 2>&1; then
+            echo "FAIL $n: must compile with --moves=off"; fail=$((fail + 1))
         fi
         if [ -n "${FIRNC1:-}" ]; then
             out=$("$FIRNC1" --moves=vec -o "$W/x" "$f" 2>&1)

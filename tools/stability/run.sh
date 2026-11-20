@@ -37,10 +37,12 @@ echo "== golden programs =="
 for f in "$STABLE"/*.fi; do
     base=$(basename "$f" .fi)
     hdr=$(head -1 "$f")
+    moves_flag=""
+    grep -qx "$base" tools/stability/moves_off.txt && moves_flag="--moves=off"
     for mode in $MODES; do
         checked=$((checked + 1))
         bin="$WORK/$base.$mode"
-        if ! "$FIRNC" --edition=2026 --opt-level="$mode" -o "$bin" "$f" > "$WORK/cerr" 2>&1; then
+        if ! "$FIRNC" --edition=2026 $moves_flag --opt-level="$mode" -o "$bin" "$f" > "$WORK/cerr" 2>&1; then
             report "$base [$mode]: no longer compiles" "$(cat "$WORK/cerr")"
             continue
         fi

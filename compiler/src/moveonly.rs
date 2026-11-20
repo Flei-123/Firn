@@ -5,7 +5,7 @@ const MOVE_ONLY_PREFIXES: &[&str] = &["Vec__"];
 
 pub(crate) const ALLOWED: &str = "off, vec";
 
-static VEC_MOVES: AtomicBool = AtomicBool::new(false);
+static VEC_MOVES: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn parse(v: &str) -> Option<bool> {
     match v {
