@@ -164,7 +164,7 @@ while IFS= read -r f; do
     else
         [ -z "$first" ] && first="$f (rc=$rc)"
     fi
-done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
+done < <(find tests lib bin bench -name '*.fi' -not -type l -not -path 'tests/stable/*' | sort)
 
 echo "SAME:          $same"
 echo "DIFFERENT:     $different   (known and named: $known)"

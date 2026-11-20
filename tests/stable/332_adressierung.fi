@@ -1,0 +1,179 @@
+// expect_exit: 77
+//
+// ROUND 51 -- address arithmetic in the memory operand (`[base + index*scale + k]`).
+//
+// Since this round the register path folds `shl`/`mul` + `add`/`ptradd` into
+// the memory access. That moves the point in time at which base and index are
+// read -- exactly the class that produced a miscompile in round 40, because
+// the register allocator knew nothing about the extended live range and a
+// `call` in between destroyed the caller-saved registers (docs/ROUND41.md).
+//
+// That is why the cases here check deliberately:
+//   * every scale 1/2/4/8 (u8, u16, u32, u64) reading AND writing,
+//   * the same address read several times (must NOT be folded),
+//   * CALLS in the middle of the chain base -> index -> access, namely
+//     between the address arithmetic and its use,
+//   * base and index that have to survive the call,
+//   * an index that comes out of a call itself,
+//   * an access whose target register can be base or index at the same time
+//     (the result is needed as an index again right afterwards).
+//
+// Every check adds a number of its own; a swapped or shifted access shows up
+// as a wrong sum that way.
+
+import std.rt
+
+// The call that sits between address arithmetic and access. It deliberately
+// clobbers all argument registers and computes, so that a compiler which
+// leaves a value in a caller-saved register loses it here.
+fn disturb(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+    var s: u64 = 0
+    var i: u64 = 0
+    while i < 4 {
+        s = s + a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + i
+        i = i + 1
+    }
+    return s
+}
+
+// --- scale 4: u32 field, reading and writing -------------------------------
+fn u32_field() -> u64 {
+    let p: u64 = rt.heap_alloc(64)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 4) as *mut u32) = (i * 3 + 1) as u32
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        s = s + (*((p + k * 4) as *mut u32)) as u64
+        k = k + 1
+    }
+    rt.heap_free(p, 64)
+    return s // 3*(0+..+15) + 16 = 360 + 16 = 376
+}
+
+// --- scale 8: u64 field, with a CALL between address and access ------------
+//
+// `base` and `idx` have to survive the call. If the live range of the base is
+// moved into the access WITHOUT the allocator knowing about it, this case
+// reads garbage.
+fn u64_field_with_call() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = i * 7 + 2
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        let t: u64 = disturb(k, k + 1, k + 2, k + 3, k + 4, k + 5)
+        // p and k are both still alive here and are only read NOW
+        s = s + (*((p + k * 8) as *mut u64)) + (t & 1)
+        k = k + 1
+    }
+    rt.heap_free(p, 128)
+    return s // 7*(0+..+15) + 32 = 840 + 32 = 872
+}
+
+// --- scale 2 and 1: u16 and u8 field ---------------------------------------
+fn narrow_fields() -> u64 {
+    let p: u64 = rt.heap_alloc(64)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 2) as *mut u16) = (i + 5) as u16
+        *((p + 32 + i) as *mut u8) = (i + 9) as u8
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        s = s + (*((p + k * 2) as *mut u16)) as u64
+        s = s + (*((p + 32 + k) as *mut u8)) as u64
+        k = k + 1
+    }
+    rt.heap_free(p, 64)
+    return s // (120+80) + (120+144) = 200 + 264 = 464
+}
+
+// --- the same address read TWICE: must not be folded ----------------------
+fn duplicate_read() -> u64 {
+    let p: u64 = rt.heap_alloc(32)
+    *((p + 8) as *mut u64) = 11
+    *((p + 16) as *mut u64) = 13
+    let a: u64 = p + 8
+    let x: u64 = *(a as *mut u64)
+    let y: u64 = *(a as *mut u64) // zweiter Leser derselben Adresse
+    let b: u64 = p + 16
+    *(b as *mut u64) = *(b as *mut u64) + 1
+    let z: u64 = *(b as *mut u64)
+    rt.heap_free(p, 32)
+    return x + y + z // 11 + 11 + 14 = 36
+}
+
+// --- the index comes out of a call itself ----------------------------------
+fn index_out_call() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = i * 100
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 8 {
+        let j: u64 = disturb(k, 0, 0, 0, 0, 0) % 16
+        s = s + *((p + j * 8) as *mut u64)
+        k = k + 1
+    }
+    rt.heap_free(p, 128)
+    return s % 1000
+}
+
+// --- the result of an access is immediately an index again (register clash) -
+fn chain() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = (i + 1) % 16
+        i = i + 1
+    }
+    var k: u64 = 3
+    var n: u64 = 0
+    var s: u64 = 0
+    while n < 10 {
+        k = *((p + k * 8) as *mut u64) // Ziel == vorheriger Index
+        s = s + k
+        n = n + 1
+    }
+    rt.heap_free(p, 128)
+    return s // 4+5+..+13 = 85
+}
+
+fn main() -> i32 {
+    if u32_field() != 376 {
+        return 1
+    }
+    if u64_field_with_call() != 872 {
+        return 2
+    }
+    if narrow_fields() != 464 {
+        return 3
+    }
+    if duplicate_read() != 36 {
+        return 4
+    }
+    if chain() != 85 {
+        return 5
+    }
+    // `index_out_call` depends on `disturb` only and has to yield the same value
+    // in all build stages; the value itself is of secondary interest here.
+    let a: u64 = index_out_call()
+    let b: u64 = index_out_call()
+    if a != b {
+        return 6
+    }
+    return 77
+}

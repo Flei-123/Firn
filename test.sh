@@ -2431,6 +2431,24 @@ else
     grep -E 'FAIL' "$WORK/scene3d150.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 151. stability: edition flag and manifest key in both compilers (tools/edition/run.sh), frozen golden corpus, rejected programs and std core API diff (tools/stability/run.sh, docs/STABILITY.md) =="
+FIRNC="$FIRNC" bash tools/edition/run.sh > "$WORK/edition151.log" 2>&1 && F151ERC=0 || F151ERC=$?
+if [ "$F151ERC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/edition151.log" | sed 's/^/ /'
+else
+    bad "tools/edition/run.sh failed (see .test-work/edition151.log)"
+    grep -E 'DIFFERENT' "$WORK/edition151.log" | head -12 | sed 's/^/   /' || true
+fi
+FIRNC="$FIRNC" bash tools/stability/run.sh > "$WORK/stability151.log" 2>&1 && F151RC=0 || F151RC=$?
+if [ "$F151RC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/stability151.log" | sed 's/^/ /'
+else
+    bad "tools/stability/run.sh failed (see .test-work/stability151.log)"
+    grep -E 'BROKEN|BREAKING' "$WORK/stability151.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

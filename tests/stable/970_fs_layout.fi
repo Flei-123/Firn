@@ -1,0 +1,282 @@
+// expect_exit: 42
+// Round 62: the arithmetic of the file system, as an ordinary program.
+//
+// `the osum repository (kernel/fs.fi)` lays inodes, directory entries and the blocks of a
+// file out on a block device of 512 octets. That code only ever runs in
+// QEMU (tools/kernel/run.sh) -- the same arithmetic stands here on a
+// buffer of its own, so that the test suite runs it in all three build
+// stages and with BOTH compilers.
+//
+// What is checked:
+//
+//   * inode number -> block and offset: no two inodes may land on the
+//     same place, and the last one has to stay inside its table,
+//   * directory entries: enter, find, delete, and the freed slot is used
+//     again instead of the directory growing,
+//   * the piece-by-piece copying across block boundaries -- that is the
+//     loop out of `read_at`/`write_at`, and it is the one place where a
+//     file system silently loses octets.
+
+const BS: u64 = 512
+const INODE_SIZE: u64 = 128
+const INODES_PER_BLOCK: u64 = 4
+const INODE_START: u64 = 2
+const INODE_COUNT: u64 = 128
+const INODE_BLOCKS: u64 = 32
+const DIRENT: u64 = 32
+const NAME_LEN: u64 = 24
+const DIRECT: u64 = 12
+
+fn inode_block_of(ino: u64) -> u64 {
+    return INODE_START + (ino - 1) / INODES_PER_BLOCK
+}
+
+fn inode_off(ino: u64) -> u64 {
+    return ((ino - 1) % INODES_PER_BLOCK) * INODE_SIZE
+}
+
+// Where the inode really lies, counted in octets from the start of the
+// device. Two inodes with the same answer would be one inode.
+fn inode_at(ino: u64) -> u64 {
+    return inode_block_of(ino) * BS + inode_off(ino)
+}
+
+// The `index`-th block of a file: twelve direct ones, then through the
+// indirect block.
+fn block_kind(index: u64) -> u64 {
+    if index < DIRECT {
+        return 1 // direct
+    }
+    if index - DIRECT < BS / 8 {
+        return 2 // indirect
+    }
+    return 0 // beyond the end
+}
+
+fn get8(p: u64, i: u64) -> u64 {
+    return __mmio_read8((p + i) as *mut u8) as u64
+}
+
+fn set8(p: u64, i: u64, v: u64) {
+    __mmio_write8((p + i) as *mut u8, v as u8)
+}
+
+fn get64(p: u64) -> u64 {
+    return __mmio_read64(p as *mut u64)
+}
+
+fn put64(p: u64, v: u64) {
+    __mmio_write64(p as *mut u64, v)
+}
+
+// ------------------------------------------------------- the directory
+
+fn name_eq(a: u64, b: u64) -> bool {
+    var i: u64 = 0
+    while i < NAME_LEN {
+        let x: u64 = get8(a, i)
+        let y: u64 = get8(b, i)
+        if x != y {
+            return false
+        }
+        if x == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn dir_find(dir: u64, count: u64, name: u64) -> u64 {
+    var i: u64 = 0
+    while i < count {
+        let ino: u64 = get64(dir + i * DIRENT)
+        if ino != 0 && name_eq(dir + i * DIRENT + 8, name) {
+            return ino
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The first free slot, or `count` -- then the directory grows.
+fn dir_slot(dir: u64, count: u64) -> u64 {
+    var i: u64 = 0
+    while i < count {
+        if get64(dir + i * DIRENT) == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn dir_write(dir: u64, slot: u64, ino: u64, name: u64) {
+    var i: u64 = 0
+    while i < DIRENT {
+        set8(dir + slot * DIRENT, i, 0)
+        i = i + 1
+    }
+    put64(dir + slot * DIRENT, ino)
+    var k: u64 = 0
+    while k < NAME_LEN - 1 && get8(name, k) != 0 {
+        set8(dir + slot * DIRENT + 8, k, get8(name, k))
+        k = k + 1
+    }
+}
+
+// ------------------------------------------ the copying across blocks
+
+// The loop out of `write_at`: an area of any length lands piece by piece
+// in the blocks, and no piece may cross a block boundary.
+fn spread(disk: u64, src: u64, off: u64, len: u64) -> u64 {
+    var n: u64 = 0
+    while n < len {
+        let pos: u64 = off + n
+        let inb: u64 = pos % BS
+        var chunk: u64 = BS - inb
+        if chunk > len - n {
+            chunk = len - n
+        }
+        var k: u64 = 0
+        while k < chunk {
+            set8(disk + (pos / BS) * BS + inb, k, get8(src, n + k))
+            k = k + 1
+        }
+        n = n + chunk
+    }
+    return n
+}
+
+fn gather(disk: u64, dst: u64, off: u64, len: u64) -> u64 {
+    var n: u64 = 0
+    while n < len {
+        let pos: u64 = off + n
+        let inb: u64 = pos % BS
+        var chunk: u64 = BS - inb
+        if chunk > len - n {
+            chunk = len - n
+        }
+        var k: u64 = 0
+        while k < chunk {
+            set8(dst, n + k, get8(disk + (pos / BS) * BS + inb, k))
+            k = k + 1
+        }
+        n = n + chunk
+    }
+    return n
+}
+
+fn main() -> i32 {
+    // 1. the inode table: 128 inodes, four per block, none on top of
+    //    another, and the last one still inside the 32 blocks.
+    if inode_at(1) != INODE_START * BS {
+        return 1
+    }
+    if inode_block_of(4) != INODE_START || inode_off(4) != 3 * INODE_SIZE {
+        return 2
+    }
+    if inode_block_of(5) != INODE_START + 1 || inode_off(5) != 0 {
+        return 3
+    }
+    var ino: u64 = 2
+    while ino <= INODE_COUNT {
+        if inode_at(ino) != inode_at(ino - 1) + INODE_SIZE {
+            return 4
+        }
+        ino = ino + 1
+    }
+    if inode_block_of(INODE_COUNT) >= INODE_START + INODE_BLOCKS {
+        return 5
+    }
+
+    // 2. direct blocks, indirect block, and the end of a file.
+    if block_kind(0) != 1 || block_kind(11) != 1 {
+        return 6
+    }
+    if block_kind(12) != 2 || block_kind(12 + 63) != 2 {
+        return 7
+    }
+    if block_kind(12 + 64) != 0 {
+        return 8
+    }
+
+    // 3. a directory: three names, delete the middle one, the next one
+    //    takes the free slot instead of the directory growing.
+    var dir: [u8; 128] = [0 as u8; 128]
+    var n_a: [u8; 6] = "a.txt\0"
+    var n_b: [u8; 6] = "b.txt\0"
+    var n_c: [u8; 6] = "c.txt\0"
+    var n_d: [u8; 6] = "d.txt\0"
+    let d: u64 = (&dir[0]) as u64
+    dir_write(d, 0, 11, (&n_a[0]) as u64)
+    dir_write(d, 1, 22, (&n_b[0]) as u64)
+    dir_write(d, 2, 33, (&n_c[0]) as u64)
+    if dir_find(d, 3, (&n_b[0]) as u64) != 22 {
+        return 9
+    }
+    if dir_find(d, 3, (&n_d[0]) as u64) != 0 {
+        return 10
+    }
+    if dir_slot(d, 3) != 3 {
+        return 11
+    }
+    put64(d + 1 * DIRENT, 0) // delete b.txt
+    if dir_find(d, 3, (&n_b[0]) as u64) != 0 {
+        return 12
+    }
+    if dir_slot(d, 3) != 1 {
+        return 13
+    }
+    dir_write(d, dir_slot(d, 3), 44, (&n_d[0]) as u64)
+    if dir_find(d, 3, (&n_d[0]) as u64) != 44 {
+        return 14
+    }
+    if dir_find(d, 3, (&n_a[0]) as u64) != 11 {
+        return 15
+    }
+    if dir_find(d, 3, (&n_c[0]) as u64) != 33 {
+        return 16
+    }
+
+    // 4. 1500 octets across four blocks, written at an offset that lies
+    //    in the middle of a block -- and read back unchanged.
+    var disk: [u8; 2560] = [0 as u8; 2560]
+    var src: [u8; 1500] = [0 as u8; 1500]
+    var dst: [u8; 1500] = [0 as u8; 1500]
+    let p_disk: u64 = (&disk[0]) as u64
+    let p_src: u64 = (&src[0]) as u64
+    let p_dst: u64 = (&dst[0]) as u64
+    var i: u64 = 0
+    while i < 1500 {
+        set8(p_src, i, 48 + i % 10)
+        i = i + 1
+    }
+    if spread(p_disk, p_src, 300, 1500) != 1500 {
+        return 17
+    }
+    if gather(p_disk, p_dst, 300, 1500) != 1500 {
+        return 18
+    }
+    i = 0
+    while i < 1500 {
+        if get8(p_dst, i) != get8(p_src, i) {
+            return 19
+        }
+        i = i + 1
+    }
+    // What lies before it stays untouched: 300 octets of zero.
+    i = 0
+    while i < 300 {
+        if get8(p_disk, i) != 0 {
+            return 20
+        }
+        i = i + 1
+    }
+    // And the block boundary really was one: octet 512 of the device is
+    // the 212th of the written area.
+    if get8(p_disk, BS) != get8(p_src, BS - 300) {
+        return 21
+    }
+    return 42
+}

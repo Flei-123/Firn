@@ -1,0 +1,131 @@
+// expect_exit: 0
+// r497: the value array of a `BMap[V]` (octet-sequence keys) and of a `BSet`
+// is a collector root when `V` holds GC pointers (a capturing `gc fn`
+// closure). Before, a collection swept the capture record and the BMap
+// called into freed memory. A BMap of plain scalars registers nothing.
+import std.map
+
+type Thunk = fn() -> u64
+
+gc class Cell { value: u64, next: Gc[Cell] }
+
+fn make(v: u64) -> AllocError!fn() -> u64 {
+    let c: Gc[Cell] = try gc Cell { value: v, next: gc_null[Cell]() }
+    return try gc fn() -> u64 { return c.value }
+}
+
+// Clears dead stack so the conservative scan cannot keep objects alive by
+// accident (same helper as tests/873).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+fn churn(n: u64) -> AllocError!u64 {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        let d: Gc[Cell] = try gc Cell { value: 999999, next: gc_null[Cell]() }
+        s = s + d.value
+        i = i + 1
+    }
+    return s
+}
+
+fn key_of(buf: *mut u8, i: u32) -> usize {
+    // key = "k" + 3 decimal digits
+    *buf = 107 as u8
+    *((buf as u64 + 1) as *mut u8) = (48 + (i / 100) % 10) as u8
+    *((buf as u64 + 2) as *mut u8) = (48 + (i / 10) % 10) as u8
+    *((buf as u64 + 3) as *mut u8) = (48 + i % 10) as u8
+    return 4
+}
+
+fn fill(m: *mut BMap[Thunk]) -> AllocError!bool {
+    var kb: [u8; 8] = [0; 8]
+    var i: u32 = 0
+    while i < 200 {
+        let f: fn() -> u64 = try make(1000 + i as u64)
+        let n: usize = key_of(&kb[0], i)
+        if !bmap_set[Thunk](m, (&kb[0]) as u64, n, f) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn check(m: *mut BMap[Thunk]) -> bool {
+    var kb: [u8; 8] = [0; 8]
+    var i: u32 = 0
+    while i < 200 {
+        let n: usize = key_of(&kb[0], i)
+        let f: fn() -> u64 = bmap_get[Thunk](m, (&kb[0]) as u64, n)
+        if f() != 1000 + i as u64 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run() -> AllocError!i32 {
+    var m: BMap[Thunk] = bmap_new[Thunk]()
+    if !(try fill(&m)) { return 4 }
+    scrub(8)
+    let a: u64 = try churn(5000)
+    gc_collect()
+    scrub(8)
+    let b: u64 = try churn(5000)
+    gc_collect()
+    if a == 0 || b == 0 { return 5 }
+    if !check(&m) { return 6 }
+    bmap_clear[Thunk](&m)
+    if !(try fill(&m)) { return 7 }
+    scrub(8)
+    gc_collect()
+    if !check(&m) { return 8 }
+    bmap_free[Thunk](&m)
+    gc_collect()
+    let before: u64 = gc_roots()
+    var s: BMap[u64] = bmap_new[u64]()
+    var kb: [u8; 8] = [0; 8]
+    var k: u32 = 0
+    while k < 100 {
+        let n: usize = key_of(&kb[0], k)
+        bmap_set[u64](&s, (&kb[0]) as u64, n, k as u64)
+        k = k + 1
+    }
+    if gc_roots() != before { return 9 }
+    bmap_free[u64](&s)
+    var bs: map.BSet = map.bset_new()
+    k = 0
+    while k < 100 {
+        let n: usize = key_of(&kb[0], k)
+        var added: bool = false
+        map.bset_add(&bs, (&kb[0]) as u64, n, &added)
+        k = k + 1
+    }
+    if gc_roots() != before { return 10 }
+    map.bset_free(&bs)
+    var t: BMap[Thunk] = bmap_new[Thunk]()
+    if !(try fill(&t)) { return 11 }
+    if gc_roots() == before { return 12 }
+    bmap_free[Thunk](&t)
+    if gc_roots() != before { return 13 }
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    let r: i32 = run() catch | e | 99
+    return r
+}

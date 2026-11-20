@@ -155,7 +155,7 @@ while IFS= read -r f; do
         different=$((different+1))
         [ -z "$first" ] && first="$f (firnc0: $rref, firnc1: $ra)"
     fi
-done < <(find tests bench -name '*.fi' -not -type l -not -path 'tests/neg/*' -not -path 'tests/lexneg/*' | sort \
+done < <(find tests bench -name '*.fi' -not -type l -not -path 'tests/neg/*' -not -path 'tests/stable/*' -not -path 'tests/lexneg/*' | sort \
     | awk -v k="$SHARD_K" -v n="$SHARD_N" 'NR % n == k')
 
 echo "SAME BEHAVIOUR:     $same"

@@ -1,0 +1,235 @@
+// expect_out: ok
+// Loop idiom: a hand written forward copy loop becomes one block copy
+// (`compiler/src/memcpy_idiom.rs`, x86-64, pass name `memcpy`).
+//
+// The copy is a replacement with an effect on memory, so it is re-counted
+// against a reference loop that the pass must NOT touch (it carries a counter
+// in its body). Covered: lengths 0/1/15/16/17/31/33/100, unaligned start,
+// u8/u32/u64 elements, OVERLAP in both directions (including a distance
+// smaller than the element size), guard bytes around the target, and a loop
+// with a side effect (stays a loop).
+import std.io
+
+fn ld8(p: usize, i: usize) -> u8 {
+    let q: *mut u8 = (p + i) as *mut u8
+    return *q
+}
+
+fn st8(p: usize, i: usize, v: u8) {
+    let q: *mut u8 = (p + i) as *mut u8
+    *q = v
+}
+
+fn ld32(p: usize, i: usize) -> u32 {
+    let q: *mut u32 = (p + i * 4) as *mut u32
+    return *q
+}
+
+fn st32(p: usize, i: usize, v: u32) {
+    let q: *mut u32 = (p + i * 4) as *mut u32
+    *q = v
+}
+
+fn ld64(p: usize, i: usize) -> u64 {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    return *q
+}
+
+fn st64(p: usize, i: usize, v: u64) {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    *q = v
+}
+
+// ---- the loops under test (must become `memcopy`) ------------------------
+fn copy8(dst: usize, src: usize, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st8(dst, i, ld8(src, i))
+        i = i + 1
+    }
+}
+
+fn copy32(dst: usize, src: usize, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st32(dst, i, ld32(src, i))
+        i = i + 1
+    }
+}
+
+fn copy64(dst: usize, src: usize, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st64(dst, i, ld64(src, i))
+        i = i + 1
+    }
+}
+
+// ---- the reference loops (a counter in the body keeps them loops) --------
+fn ref8(dst: usize, src: usize, n: usize) -> usize {
+    var i: usize = 0
+    var count: usize = 0
+    while i < n {
+        st8(dst, i, ld8(src, i))
+        count = count + 1
+        i = i + 1
+    }
+    return count
+}
+
+fn ref32(dst: usize, src: usize, n: usize) -> usize {
+    var i: usize = 0
+    var count: usize = 0
+    while i < n {
+        st32(dst, i, ld32(src, i))
+        count = count + 1
+        i = i + 1
+    }
+    return count
+}
+
+fn ref64(dst: usize, src: usize, n: usize) -> usize {
+    var i: usize = 0
+    var count: usize = 0
+    while i < n {
+        st64(dst, i, ld64(src, i))
+        count = count + 1
+        i = i + 1
+    }
+    return count
+}
+
+fn fill(buf: usize, seed: u64) {
+    var s: u64 = seed
+    var i: usize = 0
+    while i < 1024 {
+        s = s *% 6364136223846793005 +% 1442695040888963407
+        st8(buf, i, ((s >> 33) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn same(a: usize, b: usize) -> bool {
+    var i: usize = 0
+    while i < 1024 {
+        if ld8(a, i) != ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn check(condition: bool, what: str) -> bool {
+    if !condition {
+        io.print("FAIL: ")
+        io.print_line(what)
+        return false
+    }
+    return true
+}
+
+// Runs `kind` (1/4/8) with a byte offset for dst and src into a 1024 byte
+// buffer pair (1024 bytes); copy and reference start from the same bytes.
+fn run_case(kind: usize, doff: usize, soff: usize, n: usize, seed: u64) -> bool {
+    var a: [u8; 1024] = [0; 1024]
+    var b: [u8; 1024] = [0; 1024]
+    let pa: usize = (&a[0]) as usize
+    let pb: usize = (&b[0]) as usize
+    fill(pa, seed)
+    fill(pb, seed)
+    if kind == 1 {
+        copy8(pa + doff, pa + soff, n)
+        ref8(pb + doff, pb + soff, n)
+    }
+    if kind == 4 {
+        copy32(pa + doff, pa + soff, n)
+        ref32(pb + doff, pb + soff, n)
+    }
+    if kind == 8 {
+        copy64(pa + doff, pa + soff, n)
+        ref64(pb + doff, pb + soff, n)
+    }
+    return same(pa, pb)
+}
+
+fn main(start: u64) -> i32 {
+    var ok: bool = true
+    let lens: [usize; 9] = [0, 1, 2, 15, 16, 17, 31, 33, 40]
+    var bad: i64 = 0
+    var k: usize = 0
+    while k < 9 {
+        let n: usize = lens[k]
+        // disjoint: dst in the upper half, src in the lower half, unaligned
+        if !run_case(1, 300, 0, n, start + 1) { bad = bad + 1 }
+        if !run_case(1, 301, 3, n, start + 2) { bad = bad + 1 }
+        if !run_case(4, 260, 1, n, start + 3) { bad = bad + 1 }
+        if !run_case(8, 300, 5, n, start + 4) { bad = bad + 1 }
+        // overlap, dst after src (a[i+1] = a[i] is NOT a memcpy)
+        if !run_case(1, 101, 100, n, start + 5) { bad = bad + 1 }
+        if !run_case(1, 103, 100, n, start + 6) { bad = bad + 1 }
+        if !run_case(4, 104, 100, n, start + 7) { bad = bad + 1 }
+        if !run_case(4, 102, 100, n, start + 8) { bad = bad + 1 }
+        if !run_case(8, 108, 100, n, start + 9) { bad = bad + 1 }
+        if !run_case(8, 104, 100, n, start + 10) { bad = bad + 1 }
+        if !run_case(8, 103, 100, n, start + 11) { bad = bad + 1 }
+        // overlap, dst before src
+        if !run_case(1, 99, 100, n, start + 12) { bad = bad + 1 }
+        if !run_case(4, 96, 100, n, start + 13) { bad = bad + 1 }
+        if !run_case(8, 93, 100, n, start + 14) { bad = bad + 1 }
+        // same buffer, same place
+        if !run_case(8, 64, 64, n, start + 15) { bad = bad + 1 }
+        k = k + 1
+    }
+    ok = check(bad == 0, "copy differs from the reference loop") && ok
+
+    // a[i+1] = a[i] fills everything with a[0] (byte forward semantics)
+    var f: [u8; 64] = [0; 64]
+    let pf: usize = (&f[0]) as usize
+    st8(pf, 0, 77 as u8)
+    copy8(pf + 1, pf, 63)
+    var fb: i64 = 0
+    var i: usize = 0
+    while i < 64 {
+        if f[i] != 77 as u8 {
+            fb = fb + 1
+        }
+        i = i + 1
+    }
+    ok = check(fb == 0, "overlapping byte copy is not a forward fill") && ok
+
+    // guard bytes: exactly n bytes are written
+    var g: [u8; 80] = [5; 80]
+    var s2: [u8; 80] = [9; 80]
+    let pg: usize = (&g[0]) as usize
+    let ps: usize = (&s2[0]) as usize
+    var n2: usize = 33
+    if start == 12345 {
+        n2 = 1
+    }
+    copy8(pg + 10, ps, n2)
+    var gb: i64 = 0
+    i = 0
+    while i < 80 {
+        let want: u8 = if i >= 10 && i < 43 { 9 as u8 } else { 5 as u8 }
+        if g[i] != want {
+            gb = gb + 1
+        }
+        i = i + 1
+    }
+    ok = check(gb == 0, "guard bytes changed or copy short") && ok
+
+    // side effect in the body stays a loop and still counts
+    var h: [u8; 64] = [1; 64]
+    var h2: [u8; 64] = [2; 64]
+    let ph: usize = (&h[0]) as usize
+    let ph2: usize = (&h2[0]) as usize
+    let cnt: usize = ref8(ph, ph2, 64)
+    ok = check(cnt == 64, "side effect loop lost iterations") && ok
+
+    if ok {
+        io.print_line("ok")
+        return 0
+    }
+    return 1
+}

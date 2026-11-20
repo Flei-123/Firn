@@ -8,7 +8,7 @@ COUNT=${2:-8}
 export FIRNLIB="$ROOT/lib"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-find tests bench -name '*.fi' -not -type l -not -path 'tests/lexneg/*' -not -path 'tests/neg/*' | sort > "$T/all.txt"
+find tests bench -name '*.fi' -not -type l -not -path 'tests/lexneg/*' -not -path 'tests/neg/*' -not -path 'tests/stable/*' | sort > "$T/all.txt"
 xargs grep -l '^fn main' < "$T/all.txt" > "$T/mains.txt"
 check_rule() {
     rule=$1; edit=$2; label=$3

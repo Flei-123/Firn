@@ -1,0 +1,224 @@
+// expect_exit: 0
+// tests/2870_simd_g6.fi -- v128 intrinsics, graphics stack way E step G6: sqrt / rcp / rsqrt f32, shufps, movemask,
+// 16/32-bit unpack and pack, min/max i16/i32, cmpeq 8/16, mulhi16. Every lane is compared with a scalar reference on
+// random data (rcp / rsqrt: relative error bound, they are estimates). Runs on x86-64 and (qemu) aarch64.
+import std.rt
+import std.math
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn rnd(seed: u64) -> u64 {
+    return (seed * 1664525 as u64 + 1013904223 as u64) & 0xFFFFFFFF as u64
+}
+
+fn ld(a: u64, i: usize) -> u32 {
+    return *((a + (i * 4) as u64) as *mut u32)
+}
+
+fn st(a: u64, i: usize, v: u32) {
+    *((a + (i * 4) as u64) as *mut u32) = v
+}
+
+fn ldf(a: u64, i: usize) -> f32 {
+    return *((a + (i * 4) as u64) as *mut f32)
+}
+
+fn ld16(a: u64, i: usize) -> i32 {
+    return (*((a + (i * 2) as u64) as *mut i16)) as i32
+}
+
+fn ld32s(a: u64, i: usize) -> i32 {
+    return (*((a + (i * 4) as u64) as *mut i32))
+}
+
+fn ldb(a: u64, i: usize) -> u32 {
+    return (*((a + i as u64) as *mut u8)) as u32
+}
+
+fn sat16(x: i32) -> i32 {
+    if x > 32767 { return 32767 }
+    if x < -32768 { return -32768 }
+    return x
+}
+
+fn satu16(x: i32) -> i32 {
+    if x > 65535 { return 65535 }
+    if x < 0 { return 0 }
+    return x
+}
+
+fn sat8(x: i32) -> i32 {
+    if x > 127 { return 127 }
+    if x < -128 { return -128 }
+    return x
+}
+
+fn mix(s: u64) -> u32 {
+    return ((s ^ ((s * 40503 as u64) << 7 as u64) ^ (s >> 9 as u64)) & 0xFFFFFFFF as u64) as u32
+}
+
+// 16 random 32-bit words in a and b; every third word is made small / equal so that compares hit.
+fn fill(a: u64, b: u64, seed: u64) -> u64 {
+    var s: u64 = seed
+    var i: usize = 0
+    while i < 16 {
+        s = rnd(s)
+        st(a, i, mix(s))
+        s = rnd(s)
+        st(b, i, mix(s))
+        if i % 3 == 0 { st(b, i, ld(a, i)) }
+        if i % 5 == 0 { st(a, i, ld(a, i) & 0x00FF00FF as u32) }
+        i = i + 1
+    }
+    return s
+}
+
+fn main() -> i32 {
+    let a: u64 = rt.heap_alloc(4096)
+    let b: u64 = rt.heap_alloc(4096)
+    let o: u64 = rt.heap_alloc(4096)
+    var seed: u64 = 777 as u64
+    var round: i32 = 0
+    while round < 200 {
+        seed = fill(a, b, seed)
+        let va: v128 = __v128_load(a as *u8)
+        let vb: v128 = __v128_load(b as *u8)
+        // --- unpack 16 / pack 32 / pack 16 / min max / cmpeq / mulhi: 8 x i16 lanes per register
+        __v128_store(o as *mut u8, __v128_unpacklo16(va, vb))
+        __v128_store((o + 16) as *mut u8, __v128_unpackhi16(va, vb))
+        __v128_store((o + 32) as *mut u8, __v128_packs32(va, vb))
+        __v128_store((o + 48) as *mut u8, __v128_packus32(va, vb))
+        __v128_store((o + 64) as *mut u8, __v128_packs16(va, vb))
+        __v128_store((o + 80) as *mut u8, __v128_mini16(va, vb))
+        __v128_store((o + 96) as *mut u8, __v128_maxi16(va, vb))
+        __v128_store((o + 112) as *mut u8, __v128_mini32(va, vb))
+        __v128_store((o + 128) as *mut u8, __v128_maxi32(va, vb))
+        __v128_store((o + 144) as *mut u8, __v128_cmpeq8(va, vb))
+        __v128_store((o + 160) as *mut u8, __v128_cmpeq16(va, vb))
+        __v128_store((o + 176) as *mut u8, __v128_mulhi16(va, vb))
+        var i: usize = 0
+        while i < 4 {
+            // unpacklo16: a0 b0 a1 b1 a2 b2 a3 b3 ; unpackhi16: a4 b4 ...
+            check(ld16(o, 2 * i) == ld16(a, i), 1)
+            check(ld16(o, 2 * i + 1) == ld16(b, i), 2)
+            check(ld16(o + 16, 2 * i) == ld16(a, 4 + i), 3)
+            check(ld16(o + 16, 2 * i + 1) == ld16(b, 4 + i), 4)
+            // packs32: signed 32 -> signed 16, a then b
+            check(ld16(o + 32, i) == sat16(ld32s(a, i)), 5)
+            check(ld16(o + 32, 4 + i) == sat16(ld32s(b, i)), 6)
+            check(ld16(o + 48, i) == satu16(ld32s(a, i)) - (satu16(ld32s(a, i)) >> 15) * 65536, 7)
+            check(ld16(o + 48, 4 + i) == satu16(ld32s(b, i)) - (satu16(ld32s(b, i)) >> 15) * 65536, 8)
+            i = i + 1
+        }
+        i = 0
+        while i < 8 {
+            check((*((o + 64 + i as u64) as *mut i8)) as i32 == sat8(ld16(a, i)), 9)
+            check((*((o + 72 + i as u64) as *mut i8)) as i32 == sat8(ld16(b, i)), 10)
+            i = i + 1
+        }
+        i = 0
+        while i < 8 {
+            let x: i32 = ld16(a, i)
+            let y: i32 = ld16(b, i)
+            var mn: i32 = y
+            if x < y { mn = x }
+            var mx: i32 = x
+            if y > x { mx = y }
+            check(ld16(o + 80, i) == mn, 11)
+            check(ld16(o + 96, i) == mx, 12)
+            var eq: i32 = 0
+            if x == y { eq = -1 }
+            check(ld16(o + 160, i) == eq, 13)
+            check(ld16(o + 176, i) == (x * y) >> 16, 14)
+            i = i + 1
+        }
+        i = 0
+        while i < 4 {
+            let x: i32 = ld32s(a, i)
+            let y: i32 = ld32s(b, i)
+            var mn: i32 = y
+            if x < y { mn = x }
+            var mx: i32 = x
+            if y > x { mx = y }
+            check(ld32s(o + 112, i) == mn, 15)
+            check(ld32s(o + 128, i) == mx, 16)
+            i = i + 1
+        }
+        i = 0
+        while i < 16 {
+            var eq: u32 = 0 as u32
+            if ldb(a, i) == ldb(b, i) { eq = 255 as u32 }
+            check(ldb(o + 144, i) == eq, 17)
+            i = i + 1
+        }
+        // --- movemask: bit i = top bit of byte i / sign of f32 lane i
+        let m8: u32 = __v128_movemask8(va)
+        var want8: u32 = 0 as u32
+        i = 0
+        while i < 16 {
+            if ldb(a, i) >= 128 as u32 { want8 = want8 | (1 as u32 << i as u32) }
+            i = i + 1
+        }
+        check(m8 == want8, 18)
+        let mf: u32 = __v128_movemask_f32(vb)
+        var wantf: u32 = 0 as u32
+        i = 0
+        while i < 4 {
+            if ld(b, i) >= 0x80000000 as u32 { wantf = wantf | (1 as u32 << i as u32) }
+            i = i + 1
+        }
+        check(mf == wantf, 19)
+        // --- shufps: lanes 0,1 from a, lanes 2,3 from b
+        __v128_store(o as *mut u8, __v128_shuf_f32(va, vb, 0x1b))
+        __v128_store((o + 16) as *mut u8, __v128_shuf_f32(va, vb, 0xe4))
+        __v128_store((o + 32) as *mut u8, __v128_shuf_f32(va, vb, 0x00))
+        __v128_store((o + 48) as *mut u8, __v128_shuf_f32(va, vb, 0x55))
+        __v128_store((o + 64) as *mut u8, __v128_shuf_f32(va, vb, 0xb1))
+        __v128_store((o + 80) as *mut u8, __v128_shuf_f32(va, va, 0x4e))
+        i = 0
+        while i < 4 {
+            let s1: usize = ((0x1b as usize) >> (2 * i)) & 3
+            check(ld(o, i) == (if i < 2 { ld(a, s1) } else { ld(b, s1) }), 20)
+            let s2: usize = ((0xe4 as usize) >> (2 * i)) & 3
+            check(ld(o + 16, i) == (if i < 2 { ld(a, s2) } else { ld(b, s2) }), 21)
+            check(ld(o + 32, i) == (if i < 2 { ld(a, 0) } else { ld(b, 0) }), 22)
+            let s4: usize = ((0x55 as usize) >> (2 * i)) & 3
+            check(ld(o + 48, i) == (if i < 2 { ld(a, s4) } else { ld(b, s4) }), 23)
+            let s5: usize = ((0xb1 as usize) >> (2 * i)) & 3
+            check(ld(o + 64, i) == (if i < 2 { ld(a, s5) } else { ld(b, s5) }), 24)
+            let s6: usize = ((0x4e as usize) >> (2 * i)) & 3
+            check(ld(o + 80, i) == ld(a, s6), 25)
+            i = i + 1
+        }
+        // --- sqrt / rcp / rsqrt on positive floats 0.01 .. 1000
+        i = 0
+        while i < 4 {
+            seed = rnd(seed)
+            let u: i32 = ((seed >> 8 as u64) & 0xFFFFF as u64) as i32
+            *((a + (i * 4) as u64) as *mut f32) = ((u + 10) as f32) / (1048.576 as f32)
+            i = i + 1
+        }
+        let vf: v128 = __v128_load(a as *u8)
+        __v128_store(o as *mut u8, __v128_sqrtf32(vf))
+        __v128_store((o + 16) as *mut u8, __v128_rcpf32(vf))
+        __v128_store((o + 32) as *mut u8, __v128_rsqrtf32(vf))
+        i = 0
+        while i < 4 {
+            let x: f32 = ldf(a, i)
+            check(ldf(o, i) == math.sqrt32(x), 26)
+            let r: f32 = ldf(o + 16, i)
+            let e1: f32 = r * x - (1.0 as f32)
+            check(e1 < (0.005 as f32) && e1 > (-0.005 as f32), 27)
+            let q: f32 = ldf(o + 32, i)
+            let e2: f32 = q * q * x - (1.0 as f32)
+            check(e2 < (0.01 as f32) && e2 > (-0.01 as f32), 28)
+            i = i + 1
+        }
+        round = round + 1
+    }
+    return 0
+}
