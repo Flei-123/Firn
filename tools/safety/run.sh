@@ -22,6 +22,15 @@ for f in "$ROOT"/tools/safety/ub/*.fi; do
         rm -f "$W/x"
     done
 done
+for n in ub18_vec_copy_double_free; do
+    if "$FIRNC" --moves=vec --opt-level=dev-fast -o "$W/x" "$ROOT/tools/safety/ub/$n.fi" >/dev/null 2>&1; then
+        timeout 30 "$W/x" >/dev/null 2>&1
+        echo "$n moves $?" >> "$got"
+        rm -f "$W/x"
+    else
+        echo "$n moves CERR" >> "$got"
+    fi
+done
 if [ "${1:-}" = "--update" ]; then
     cp "$got" "$ROOT/tools/safety/expected.txt"
     echo "updated: $(wc -l < "$got") lines"

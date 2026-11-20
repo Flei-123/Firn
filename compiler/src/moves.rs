@@ -71,7 +71,7 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
             }
         }
     }
-    if drops.is_empty() {
+    if drops.is_empty() && !crate::moveonly::enabled() {
         return;
     }
     // 2. the moves
@@ -207,6 +207,14 @@ impl<'a> Walk<'a> {
 
     fn nontrivial_d(&self, t: &Type, depth: u32) -> bool {
         nontrivial_in(self.tcx, self.drops, t, depth)
+            || (crate::moveonly::enabled() && crate::moveonly::is_move_only(self.tcx, t, depth))
+    }
+
+    fn has_drop(&self, e: &Expr) -> bool {
+        match self.ty(e) {
+            Some(t) => nontrivial_in(self.tcx, self.drops, t, 0),
+            None => false,
+        }
     }
 
     fn ty(&self, e: &Expr) -> Option<&'a Type> {
@@ -419,7 +427,9 @@ impl<'a> Walk<'a> {
                     }
                     if self.vars[i].nt {
                         self.vars[i].state = St::Moved(e.span);
-                        self.moved.insert(e.id);
+                        if self.has_drop(e) {
+                            self.moved.insert(e.id);
+                        }
                     }
                 }
             }

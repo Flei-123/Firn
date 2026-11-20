@@ -53,7 +53,7 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_pend, sema_ty, se
     // ROUND FIRN-ENV (compiler/src/env.rs) -- `const` with a text.
     sema_const_text_len, sema_const_text_ptr,
     sema_mu_set, sema_mu, sema_fe_set, sema_gc_set, sema_if_set,
-    sema_kernel_set,
+    sema_kernel_set, sema_mv_vec_set, sema_send_set, sema_has_moves, sema_move_only,
     sema_tree,
     sema_closure_index, sema_closure_tid, sema_closure_size,
     sema_closure_caps, sema_capture_name, sema_capture_ty,
@@ -154,7 +154,7 @@ struct Sema {
     // 1 = this identifier MOVES a variable; per `if` condition bit 0 = the
     // `then` branch leaves, bit 1 = the `else` branch leaves.
     mv_drop: Vec[u8], mv_moved: Vec[u8], mv_leave: Vec[u8],
-    mv_ndrop: u32, mv_nmoved: u32,
+    mv_ndrop: u32, mv_nmoved: u32, mv_vec: bool, send_check: bool,
     pend: report.Pend,
     dmsg: rt.Buf,
     cur_pos: u64,
@@ -186,7 +186,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         scratch2: rt.buf_new(),
         widen: vec_new[u32](),
         mv_drop: vec_new[u8](), mv_moved: vec_new[u8](), mv_leave: vec_new[u8](),
-        mv_ndrop: 0, mv_nmoved: 0,
+        mv_ndrop: 0, mv_nmoved: 0, mv_vec: false, send_check: false,
         pend: report.pend_new(), dmsg: rt.buf_new(), cur_pos: 0,
         ce_e: 0, ce_code: 0, ce_a: 0, ce_b: 0, gr_si: 0, gr_ptr: false,
     }
@@ -543,6 +543,12 @@ fn sema_mv_drop(s: *mut Sema, si: usize) -> bool {
 
 fn sema_has_drops(s: *mut Sema) -> bool { return (*s).mv_ndrop > 0 }
 
+fn sema_mv_vec_set(s: *mut Sema, v: bool) { (*s).mv_vec = v }
+
+fn sema_send_set(s: *mut Sema, v: bool) { (*s).send_check = v }
+
+fn sema_has_moves(s: *mut Sema) -> bool { return (*s).mv_ndrop > 0 || (*s).mv_vec }
+
 fn sema_mv_moved_set(s: *mut Sema, e: u32) {
     if (e as usize) < vec_len[u8](&(*s).mv_moved) {
         if vec_at[u8](&(*s).mv_moved, e as usize) == 0 as u8 {
@@ -606,6 +612,42 @@ fn sema_needs_drop(s: *mut Sema, t: u32) -> bool {
         return false
     }
     return needs_drop_d(s, t, 0)
+}
+
+fn move_only_d(s: *mut Sema, t: u32, depth: u32) -> bool {
+    if depth > 32 {
+        return false
+    }
+    let k: u32 = types.ty_kind(table(s), t)
+    if k == types.K_STRUCT {
+        let si: usize = types.ty_a(table(s), t) as usize
+        var vec_prefix: [u8; 5] = "Vec__"
+        if intern.intern_prefix(names(s), types.st_name(table(s), si), (&vec_prefix[0]) as u64, 5) {
+            return true
+        }
+        var f: u32 = 0
+        while f < types.st_flen(table(s), si) {
+            if move_only_d(s, types.sf_ty(table(s), types.st_foff(table(s), si) + f), depth + 1) {
+                return true
+            }
+            f = f + 1
+        }
+        return false
+    }
+    if k == types.K_ARR {
+        return move_only_d(s, types.ty_a(table(s), t), depth + 1)
+    }
+    return false
+}
+
+fn sema_move_only(s: *mut Sema, t: u32) -> bool {
+    if sema_needs_drop(s, t) {
+        return true
+    }
+    if !(*s).mv_vec {
+        return false
+    }
+    return move_only_d(s, t, 0)
 }
 
 // The interned name `Struct__drop` of the destructor of struct `si`.
@@ -6795,6 +6837,86 @@ fn text_check(s: *mut Sema, e: u32, note: u32) -> u32 {
     return str_ty(s)
 }
 
+static EI_NOT_SEND: [u8; 97] = "'%t' cannot be sent to another thread: a collector object could be changed by two threads at once"
+
+fn name_is(s: *mut Sema, nm: u32, lit: u64, n: usize) -> bool {
+    if intern.intern_length(names(s), nm) != n {
+        return false
+    }
+    return rt.mem_eq(intern.intern_ptr(names(s), nm), lit, n)
+}
+
+fn send_sink_arg(s: *mut Sema, nm: u32) -> u32 {
+    var thread_start: [u8; 12] = "thread_start"
+    var jobs_spawn: [u8; 11] = "jobs__spawn"
+    var jobs_parallel_for: [u8; 18] = "jobs__parallel_for"
+    var pool_submit: [u8; 12] = "pool__submit"
+    var chan_send1: [u8; 16] = "chan__chan_send1"
+    if name_is(s, nm, (&thread_start[0]) as u64, 12) {
+        return 2
+    }
+    if name_is(s, nm, (&jobs_spawn[0]) as u64, 11) {
+        return 3
+    }
+    if name_is(s, nm, (&jobs_parallel_for[0]) as u64, 18) {
+        return 6
+    }
+    if name_is(s, nm, (&pool_submit[0]) as u64, 12) {
+        return 3
+    }
+    if name_is(s, nm, (&chan_send1[0]) as u64, 16) {
+        return 2
+    }
+    return 0
+}
+
+fn not_send_d(s: *mut Sema, t: u32, depth: u32) -> bool {
+    if depth > 32 || !has_gc(s) {
+        return false
+    }
+    if gc.gc_is_gc_ptr(gcp(s), table(s), t) || gc.gc_is_gc_weak(gcp(s), table(s), t) {
+        return true
+    }
+    let k: u32 = types.ty_kind(table(s), t)
+    if k == types.K_STRUCT {
+        let si: usize = types.ty_a(table(s), t) as usize
+        var f: u32 = 0
+        while f < types.st_flen(table(s), si) {
+            if not_send_d(s, types.sf_ty(table(s), types.st_foff(table(s), si) + f), depth + 1) {
+                return true
+            }
+            f = f + 1
+        }
+        return false
+    }
+    if k == types.K_ARR {
+        return not_send_d(s, types.ty_a(table(s), t), depth + 1)
+    }
+    return false
+}
+
+fn send_check(s: *mut Sema) {
+    let b: *mut ast.Tree = tree(s)
+    let count: usize = vec_len[u32](&(*s).etyp)
+    var e: u32 = 0
+    while (e as usize) < count {
+        if ast.e_kind(b, e) == ast.E_CALL && ast.e_number(b, e) == 0 {
+            let idx: u32 = send_sink_arg(s, ast.e_a(b, e))
+            if idx > 0 && idx - 1 < ast.e_c(b, e) {
+                var arg: u32 = ast.child_at(b, ast.e_b(b, e) + idx - 1)
+                while ast.e_kind(b, arg) == ast.E_AS {
+                    arg = ast.e_a(b, arg)
+                }
+                let t: u32 = sema_ty(s, arg)
+                if t != NONE && not_send_d(s, t, 0) {
+                    say(s, ast.expr_pos(b, arg), elen(s, arg), (&EI_NOT_SEND[0]) as u64, 97, (t) as u64, 0, 0, 0)
+                }
+            }
+        }
+        e = e + 1
+    }
+}
+
 fn sema_run(s: *mut Sema) {
     let b: *mut ast.Tree = tree(s)
     // HOOK str (strtype.rs, round 70): the builtin type `str`. It is
@@ -7154,6 +7276,9 @@ fn sema_run(s: *mut Sema) {
     // 8. ROUND OWN-3: the move checker for values with a `drop` (moves.fi,
     //    twin of compiler/src/moves.rs). Silent unless the program declares
     //    a `drop`; it also tells the lowering which names are moved.
+    if (*s).send_check {
+        send_check(s)
+    }
     let mf: usize = moves.moves_check(s as u64, (*s).it)
     var mk: usize = 0
     while mk < mf {

@@ -117,6 +117,8 @@ mod collsugar;
 mod dargs;
 mod lambda;
 mod moves;
+mod moveonly;
+mod sendcheck;
 mod nogc;
 mod prune;
 mod opt;
@@ -358,6 +360,8 @@ fn usage() -> String {
          --unsafe-scope=<p> enforce --unsafe only in files whose path contains <p> (repeatable; default: all files)\n  \
          --edition=<year>   language edition (default: the newest; unknown ones are refused)\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
+         --moves=<m>        off | vec (Vec and structs holding a Vec are move-only: use after move is an error; default off)\n  \
+         --send-check=<m>   off | on (values holding Gc[T] cannot be handed to threads, jobs, pools or channels; default off)\n  \
          --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
          --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -481,6 +485,20 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             _ if a.starts_with("--edition=") => {
                 edition::flag_set(&a["--edition=".len()..])?;
+            }
+            _ if a.starts_with("--moves=") => {
+                let v = &a["--moves=".len()..];
+                match moveonly::parse(v) {
+                    Some(on) => moveonly::set_enabled(on),
+                    None => return Err(format!("unknown moves mode '{}' (allowed: {})", v, moveonly::ALLOWED)),
+                }
+            }
+            _ if a.starts_with("--send-check=") => {
+                let v = &a["--send-check=".len()..];
+                match sendcheck::parse(v) {
+                    Some(on) => sendcheck::set_enabled(on),
+                    None => return Err(format!("unknown send-check mode '{}' (allowed: {})", v, sendcheck::ALLOWED)),
+                }
             }
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];

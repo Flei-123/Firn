@@ -1,7 +1,7 @@
 # Firn memory safety -- what is guaranteed and what is not
 
 State: 12.11.2026, `firnc` at main `e7fee583a` + safety3 (G15 and G21 on x86-64 Linux, aarch64 and Windows in every level, release-fast included; N3/N5/N6/N8/N9/N13 narrowed). Every claim below points to a test.
-Green tests: `tests/47xx_safety_*.fi`, `tests/neg/47xx_safety_*.fi` (4730-4747, 4862-4866: r904/r905/r907, null guard 4733/4736-4739, constant zero divisor neg 4740/4741/4744, positive 4745, constant overflow neg 4746). Counts: 25 guarantees, 14 non-guarantee rows (12 open, none fully closed: N3, N5, N6, N8, N9, N13 narrowed), 38 green safety tests, 28 UB probes.
+Green tests: `tests/47xx_safety_*.fi`, `tests/neg/47xx_safety_*.fi` (4730-4747, 4862-4866: r904/r905/r907, null guard 4733/4736-4739, constant zero divisor neg 4740/4741/4744, positive 4745, constant overflow neg 4746). Counts: 25 guarantees (+2 opt-in checks, section below), 14 non-guarantee rows (12 open; N3, N5, N6, N8, N9, N13 narrowed, N7, N11, N17 narrowed by opt-in flags), 38 green safety tests (+9 opt-in cases), 28 UB probes (+1 with `--moves=vec`).
 Documented undefined behaviour (not green tests): `tools/safety/ub/*.fi`, recorded per build level in
 `tools/safety/expected.txt`, checked with `bash tools/safety/run.sh` (exit 1 on any difference). `test.sh` section 149 runs it (plus `tools/safety/pe.sh`), so a change of behaviour shows up in the suite.
 
@@ -76,18 +76,29 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 | N4 | Raw pointer arithmetic past an object | reads / writes whatever is there | ub22 |
 | N5 | `rt.heap_free` twice, when the first free already gave the block back to the kernel (more than 16 pages, or the size cache was full) | accepted (a second `munmap`); a later access faults. A free of a CACHED block is caught, see G14. A free of a block that was handed out again in between is a free of a live block and not detectable. Opt-in: after `rt.heap_debug_enable()` every free is caught while its address is among the last 4096 frees (`4863`) | ub16 |
 | N6 | Read after `rt.heap_free` | returns 0 today for small blocks (wiped and cached); T for blocks that were `munmap`ed. Opt-in debug heap: always T (`4864`) | ub17 |
-| N7 | Copy of a `Vec` (`var w = v`): both are usable, `Vec[T]` is trivial. Freeing both is caught by G14 when the storage is cached; freeing one and using the other reads freed memory | P on the second free, else nothing | ub18, green pin `4712`, `4731` |
+| N7 | Copy of a `Vec` (`var w = v`): both are usable, `Vec[T]` is trivial. Freeing both is caught by G14 when the storage is cached; freeing one and using the other reads freed memory. Opt-in `--moves=vec`: the copy is a move and the later use of `v` is a compile error (O1) | P on the second free, else nothing (default); C with `--moves=vec` | ub18 (also with `--moves=vec`: CERR), green pin `4712`, `4731` |
 | N8 | `str` view from `rt.buf_str` after `buf_free` or after growth | dangling; today reads 0 / stale memory. Opt-in debug heap: T (`4865`) | ub19, ub20 |
 | N9 | Pointer to a `Vec` element after the `Vec` grew | dangling; today reads stale memory. Opt-in debug heap: T (`4866`) | ub21 |
 | N10 | Two raw pointers to one local; raw pointer plus `inout` of the same place in DIFFERENT statements | accepted, defined by execution order | ub23, green pin `4709` |
-| N11 | `Vec[T]` is a trivial type (ptr/len/cap): copying and passing by value does not move it, no use-after-move | accepted | green pin `4712` |
+| N11 | `Vec[T]` is a trivial type (ptr/len/cap): copying and passing by value does not move it, no use-after-move. Opt-in `--moves=vec` makes `Vec[T]` and every struct / array that holds one move-only (O1) | accepted (default); C with `--moves=vec` | green pin `4712`, `tools/safety/moves/` |
 | N13 | `Gc[T]` hidden as integer through a raw pointer (`g as *mut u8 as u64`) or stored in untyped memory (`rt.heap_alloc`) is NOT a root. The direct `g as u64` is rejected (G25) | object is collected while the integer still holds the address | ub24, ub27 (CERR) |
 | N14 | (closed by G17, r903) | | |
 | N15 | (closed by G18, r914) | | |
 | N16 | `unsafe { }` | PARTLY. `unsafe { }` and `unsafe fn` parse in firnc0 and firnc1. `firnc0 --unsafe=off|warn|error` (default off) reports raw pointer deref, casts, arithmetic and indexing outside `unsafe`; `--unsafe-scope=` limits it to files. Not enforced by default, firnc1 does not enforce yet, 4 std modules migrated. See docs/UNSAFE.md | tests 6750, `tools/safety/unsafe/run.sh`, green pin `4710` |
-| N17 | Data races between threads, `Gc[T]` crossing threads | not analysed (no `Send` check) | not tested |
+| N17 | Data races between threads, `Gc[T]` crossing threads. Opt-in `--send-check=on` rejects `Gc[T]` / `GcWeak[T]` (also inside structs and arrays) as argument of the thread entry points (O2); a raw pointer to a struct that holds a `Gc[T]`, an `inout` argument and every thread API outside the table in `compiler/src/sendcheck.rs` stay unchecked | accepted (default); C with `--send-check=on` for the listed entry points | `tools/safety/send/` |
 | N18 | Exclusivity of `inout` across statements and through callees: a callee can turn a reference into a raw pointer | not checked (SPEC 1560, ROADMAP r193) | ub23 |
 | N19 | Lifetime analysis is not a proof: "where the analysis cannot decide, it allows" (SPEC 3.6.1) | escapes through unknown callee chains can pass | docs/ROUND79.md |
+
+## Opt-in checks (20.11.2026, default off)
+
+| # | Flag | Rule | Proof |
+|---|---|---|---|
+| O1 | `--moves=vec` | `Vec[T]` and every struct / array holding one is move-only: `let w = v`, `f(v)`, `return v`, a struct literal field move the value; the later use is `use of moved value 'v'`; also `moved inside a loop`, `moved in only one branch`, `cannot move a field out of its owner`. Same checker as for types with a `drop` (`moves.rs` / `moves.fi`), no drop calls are generated. firnc0 and firnc1 print the same message at the same line:column | `tools/safety/moves.sh` (6 cases, firnc0 and firnc1 with `FIRNC1`), ub18 with the flag |
+| O2 | `--send-check=on` | `'Gc[T]' cannot be sent to another thread`: the checked argument (casts to `*mut u8` / `u64` are looked through) of `thread_start` (arg 2), `jobs.spawn` (3), `jobs.parallel_for` (6), `pool.submit` (3), `chan.chan_send1` (2) must not be or hold a `Gc[T]` / `GcWeak[T]`. Table in `compiler/src/sendcheck.rs`, twin `send_sink_arg` in `lib/firnc1/sema.fi` | `tools/safety/send.sh` (3 cases, firnc0 and firnc1) |
+
+Why not the default yet (measured 20.11.2026 with firnc0 `--emit=fir-raw` over `tests/*.fi`, `examples/`, `bench/`, `tools/*/*.fi`, 1330 programs):
+- `--moves=vec`: 153 programs report at least one error (130 in `tests/`, 23 in `tools/`); the library files reached by them hold 19 sites in 10 files: `lib/mc/mc_assets.fi`, `lib/regex/regex.fi` (`Regex { ranges: ps.ranges, .. }` moves a field out of a local), `lib/text/diff.fi`, `lib/std/vec.fi`, `lib/std/pycoll.fi`, `lib/print/{model,spool,ippclient}.fi`, `lib/fontsrc/{model,project}.fi`. 336 messages in total (a library site counts once per program that reaches it): 137 `use of moved value`, 102 `cannot move out of memory behind a pointer`, 74 `cannot move a field out of its owner`, 15 `moved inside a loop`, 6 `result thrown away`, 2 `moved in only one branch`. The field and pointer cases need a `take` style helper or `inout` instead of a copy. Vec slices (`tests/4154_vec_slice.fi`, `4200`, `4322`, `4324`, `4707`) are Vec copies by design and conflict with move-only `Vec`: a slice type would have to come first.
+- `--send-check=on`: 0 findings over the same 1330 programs; it can become the default once the table covers the remaining thread APIs and raw pointers to structs with `Gc` fields are looked into (needs the pointee type, 0 measured).
 
 ## Tools that watch the front-end and the unchecked corners (08.11.2026)
 
@@ -117,7 +128,7 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 - Kernel W^X (page tables + PHDRS + `noexecstack`).
 - Stack guarantee for Windows threads created outside `thread_start` (N3 remainder).
 - Use after `heap_free` (reads of cached blocks return 0, no detection) and double free of uncached blocks (N5, N6, N8, N9).
-- Make `Vec` / `Buf` non-trivial (move semantics) or add a `drop` that is checked (N7, N11).
+- Make `Vec` / `Buf` non-trivial by default (N7, N11): `--moves=vec` exists (O1); remaining: 19 library sites, slices, `Buf`.
 - Add `unsafe { }` and enforce it for raw pointer dereference (N16); the whole library has to be marked first (`rawptr_audit.sh` measures the size).
 - Roots for `Gc[T]` stored in raw memory or behind `as *mut u8 as u64`: documented only (N13).
 - Debug heap (`rt.heap_debug_enable()`) is opt-in and x86-64 Linux; making the checks the default for N5/N6/N8/N9 costs one `mmap` per free and 1 page per block, so it stays a switch.
@@ -131,8 +142,8 @@ Cheapest first. None of the remaining N items can be closed by a one-line compil
 | 1 | N3 (foreign Windows threads) | a hook that calls `SetThreadStackGuarantee` in threads created outside `thread_start` (a DLL-style thread-attach callback) | medium | Windows only, needs the PE loader callback table in the linker output |
 | 2 | N13 | reject `Gc[T] as <int>` outside `lib/gc` and add an explicit opt-in cast for identity use (hashing, printing) | medium | breaks existing library code that uses the address as an identity; needs a migration of every use first |
 | 3 | N5, N6, N8, N9 | debug allocator mode: quarantine of freed blocks with `mprotect(PROT_NONE)`, generation tags on `Vec` / `Buf` views | medium to large | costs memory and speed, must be opt-in; the safe fix is ownership of `Vec` / `Buf` (item 4) |
-| 4 | N7, N11 | `Vec[T]` and `Buf` as move types with a checked `drop` | large | every library signature and ~all tests that copy a `Vec` change |
+| 4 | N7, N11 | `Vec[T]` and `Buf` as move types with a checked `drop` | large | O1 exists behind `--moves=vec`; as default 153 programs and 19 library sites change, and slices need their own type |
 | 5 | N10, N18 | exclusivity analysis across statements and through callees (SPEC 1560, ROADMAP r193) | large | a borrow checker; "where the analysis cannot decide, it allows" (N19) stays until then |
 | 6 | N4, N16 | `unsafe { }` block, enforced for raw pointer deref and pointer casts | large | `rawptr_audit.sh`: 1928 files / 7505 casts in `lib/` have to be marked first |
-| 7 | N17 | `Send` / `Sync` style check for values handed to threads | large | needs item 4 and 5 first (what may cross a thread boundary) |
+| 7 | N17 | `Send` / `Sync` style check for values handed to threads | medium | O2 exists behind `--send-check=on` for 5 entry points; open: pointee check, more APIs, `Sync` |
 | - | N19 | inherent: the lifetime analysis is not a proof | - | a stronger analysis only shrinks it |
