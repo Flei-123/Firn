@@ -618,12 +618,19 @@ around 80 states, CSS values a huge set of variants; without both of these it
 becomes unmaintainable. The code generator produces **jump tables** where the
 variants lie densely (`P4`) -- 80 states must not be 80 comparisons.
 
-**Generic enums do not exist.** `enum Name[T] { ... }` is rejected. Generic
-sum types are therefore spelled as generic structs. `Option[T]` is the
-standard case: `struct Option[T] { has: bool, val: T }` (`lib/std/option.fi`),
-and that layout is part of the stable API (fields `has` and `val`, in this
-order). If generic enums are added later, `Option[T]` stays a struct; a new
-name carries any enum-based replacement.
+**Generic enums** (`enum Opt[T] { Some(T), None }`, `enum Res[T, E] { Ok(T), Err(E) }`)
+are monomorphized like generic structs: every used instance `Opt[i32]` becomes
+the plain enum `Opt__i32` (naming scheme `name__T1_T2`, error messages show
+that name). A constructor needs the instance from context: `Opt[i32]::Some(5)`
+names it, `Opt::Some(5)` / `Opt::None` take it from the expected type (declared
+`let`, argument, `return`); without either the compiler reports "cannot infer
+the type arguments". In `match` the base name works: `Opt::Some(x)` against a
+subject of type `Opt[i32]`. Exhaustiveness is checked per instance. Limits:
+`match` inside a generic function body stays refused (T4), methods on generic
+enums and recursive generic enums are not supported yet.
+`Option[T]` stays a struct `{ has: bool, val: T }` (`lib/std/option.fi`); that
+layout is part of the stable API. Generic enums are additive; an enum-based
+replacement would need a new name.
 
 ### 6.4 Compile-time code generation (`G1`-`G4`) -- new in v0.2
 
@@ -1955,8 +1962,8 @@ T2. **An enumeration may not lie by value inside a `struct`.**
     the struct layout is fixed before the enumerations are laid out.
     An enumeration inside an enumeration is allowed, on the other hand (nested
     patterns).
-T3. **No generic enumerations** (`enum Option[T]`). Only functions and structs
-    are generic.
+T3. **Generic enumerations are monomorphized** (section 6.3): no methods on
+    them, no inference of the type arguments from payload values alone.
 T4. **No `match` inside the body of a generic template.** The arm bodies lie
     outside the AST and would not be substituted per instantiation; the compiler
     reports that as an error instead of quietly producing wrong code.
