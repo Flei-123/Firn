@@ -14,6 +14,7 @@ mod fx;
 mod parcodegen;
 mod parfn;
 mod pgo;
+mod derive;
 mod alias;
 mod archsel;
 mod ast;

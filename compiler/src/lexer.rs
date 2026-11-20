@@ -873,6 +873,14 @@ pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token> {
 
 /// Like `lex`, but for a particular source file of the map (module system).
 pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
+    let expanded = match crate::derive::expand(src) {
+        Ok(text) => text,
+        Err(f) => {
+            dg.error(Span { file, line: f.line, col: f.col, len: f.len }, f.msg);
+            None
+        }
+    };
+    let src = expanded.as_deref().unwrap_or(src);
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
