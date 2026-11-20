@@ -18,6 +18,14 @@ kernel **and the Osum browser engine**, x86_64
 > reads from there. Renaming the language is a change to three constants, not a
 > refactoring.
 
+> **Normative status (v1.0 preparation).** Where this text and the compiler
+> disagree, the rule is: the frozen corpus `tests/stable` decides what is
+> promised, and this text is corrected to match it (`docs/V1-BLOCKERS.md` 1
+> lists every known divergence and its resolution). Sections 3.5, 5, 8, 12, 13
+> and 14 describe the implemented language; sections 7 (`atomic[T]`,
+> `#[sendable]`, `Io`), 9.3 and 10.5 contain planned items that are marked as
+> such where they are not built.
+
 ---
 
 ## Change history
@@ -610,6 +618,13 @@ around 80 states, CSS values a huge set of variants; without both of these it
 becomes unmaintainable. The code generator produces **jump tables** where the
 variants lie densely (`P4`) -- 80 states must not be 80 comparisons.
 
+**Generic enums do not exist.** `enum Name[T] { ... }` is rejected. Generic
+sum types are therefore spelled as generic structs. `Option[T]` is the
+standard case: `struct Option[T] { has: bool, val: T }` (`lib/std/option.fi`),
+and that layout is part of the stable API (fields `has` and `val`, in this
+order). If generic enums are added later, `Option[T]` stays a struct; a new
+name carries any enum-based replacement.
+
 ### 6.4 Compile-time code generation (`G1`-`G4`) -- new in v0.2
 
 A browser consists to a considerable extent of *generated* code: Web IDL
@@ -652,6 +667,12 @@ Unicode tables from the UCD, CLDR data.
   implementations: `Io.Threaded`, `Io.SingleThread` (deterministic, satisfies
   `N7`), later `Io.Evented` with stackful coroutines. The price: one stack per
   coroutine, and `Io` has to be passed through.
+* **Status of this section.** `atomic[T]`, `fence`, `#[sendable]`,
+  `#[shareable]` and `Io` are planned and NOT part of the compiler. What exists
+  and is covered by `tests/stable/t3_threads_atomic_lock.fi`: `thread_start`,
+  `thread_wait`, `thread_lock`, `thread_unlock` and `__atomic_add` over raw
+  addresses, the dispatcher `__thread_work(kind, arg)`, thread-local GC heaps,
+  and `lib/chan`. `--send-check=on` rejects handing a `Gc[T]` to a thread.
 * **Structured concurrency** as a library pattern on top of `#[must_consume]`.
 * **A deterministic single-thread mode** for reproducible reftests (`N7`).
 
@@ -1025,19 +1046,19 @@ attack surface at B1 and there is no hardened foreign library.
 
 `FIRN-ANFORDERUNGEN.md` 11 makes clear what is **not** needed:
 
-* **no aarch64 backend**, until Osum targets ARM
-* **no WASM backend** -- WASM *execution* in the browser is an interpreter
-  written in Firn, not a compiler backend. *Round WASM:* a backend exists
-  now all the same, for the OTHER direction -- Firn programs (fUi pages)
+* **aarch64 backend: built** (`compiler/src/regalloc_a64.rs`, `--target=aarch64-linux`,
+  Android). It is stable together with `x86_64-linux` (`docs/STABILITY.md`).
+* **WASM backend: built** for the OTHER direction -- Firn programs (fUi pages)
   running inside somebody else's browser: `--target=wasm32-browser`,
-  `compiler/src/codegen_wasm.rs`, `docs/ROUND-WASM.md`. It changes nothing
-  about the point above; the Firn browser still needs no WASM backend.
+  `compiler/src/codegen_wasm.rs`, `docs/ROUND-WASM.md`. The Firn browser itself
+  still needs no WASM backend.
 * **no JIT**, no code generation at run time
-* **no dynamic libraries**, **no C++ interop**
+* **no C++ interop**; dynamic libraries are reachable through `std.dynlib`
+  (experimental, outside the stable core)
 
-v0.1 had planned aarch64 for v0.5 and WASM for v0.6. Both are struck and without
-a date. The dream "Firn in the browser instead of JavaScript" remains -- but it
-is a *later* goal now and blocks nothing.
+v0.1 had planned aarch64 for v0.5 and WASM for v0.6; both exist now as stated
+above. The dream "Firn in the browser instead of JavaScript" remains a *later*
+goal and blocks nothing.
 
 ---
 
@@ -1207,6 +1228,21 @@ Not allowed: defaults on `extern fn`, `impl I for T` methods, closures and
 function types. See `docs/DEFAULT-ARGS.md`; proof in
 `tests/3910_default_args.fi`, `tests/3950_default_args_methods.fi` and
 `tests/neg/default_args_*.fi`.
+
+### 12.11 Grammar quirks that are final (v1.0 decision)
+
+Verified against both compilers; each row is pinned in `tests/stable`.
+
+| Quirk | Rule | Pinned by |
+|---|---|---|
+| `as` is a postfix operator and binds tighter than every prefix operator | `*p as u64` is `*(p as u64)` and is rejected for a pointer `p`; `-x as i64` is `-(x as i64)`; write `(*p) as u64`, `(&x) as u64`, `(-x) as i64` | `t3_grammar_unary_as`, neg `t3_neg_deref_as_cast`, `t3_neg_address_as_cast` |
+| Negative literals | `-1` is accepted wherever an integer is (let, const, static arrays, match patterns, arguments); `0 - 1` is equivalent | `t3_grammar_negative_literals` |
+| `static` initializers | a numeric constant expression, a number array literal, a byte string for `[u8; N]`, or a struct literal; a `str` static is rejected | `t3_grammar_statics`, neg `t3_neg_static_str` |
+| Literals that do not fit | `let x: i32 = 5000000000` and constant `+ - *` that overflow their type are compile errors in every level | neg `t3_neg_literal_does_not_fit`, `t3_neg_const_overflow_literal` |
+
+Changing the `as` precedence would silently change the meaning of accepted
+programs such as `*a as *mut u8`, so it is a (B) item and is NOT done; the
+parenthesised spellings above are the stable forms.
 
 ### 12.1 The grammar of the v0 subset (EBNF)
 
@@ -2677,8 +2713,10 @@ G11. **`std.dir`** (library) -- `dir.open`, `dir.next` (`d.name`, `d.kind`),
    assembly?
 5. **Conditional moves.** Reject conservatively (the current choice) or use
    run-time flags like Rust's drop flags?
-6. **Package management** (`W1`, a MUST) -- the design is still outstanding.
-7. **Alignment with Osum.** As soon as `firnc` compiles kernel modules, the
+6. **Package management** (`W1`, a MUST) -- manifest (`firn.package`), lock
+   file, local `needs` and editions exist; registry and version resolution do
+   not (`docs/V1-BLOCKERS.md` 6, 7).
+7. **Alignment with Osum.** (partly done: kernel profile builds `kmain.fi`) As soon as `firnc` compiles kernel modules, the
    calling convention has to be checked against the existing Rust code in osum.
 
 ---

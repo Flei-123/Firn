@@ -64,6 +64,30 @@ for f in "$STABLE"/*.fi; do
     done
 done
 
+echo "== level semantics =="
+for f in "$STABLE"/levels/*.fi; do
+    base=$(basename "$f" .fi)
+    spec=$(head -1 "$f")
+    spec=${spec#*expect_levels: }
+    for pair in $spec; do
+        mode=${pair%%=*}
+        want=${pair#*=}
+        flag="--opt-level=$mode"
+        [ "$mode" = dev ] && flag="--no-opt"
+        checked=$((checked + 1))
+        bin="$WORK/$base.$mode"
+        if ! "$FIRNC" --edition=2026 $flag -o "$bin" "$f" > "$WORK/cerr" 2>&1; then
+            report "levels/$base [$mode]: no longer compiles" "$(cat "$WORK/cerr")"
+            continue
+        fi
+        { timeout 20 "$bin" > /dev/null 2>&1; rc=$?; } 2>/dev/null
+        if [ "$rc" != "$want" ]; then
+            report "levels/$base [$mode]: exit code $rc, wanted $want"
+        fi
+        rm -f "$bin"
+    done
+done
+
 echo "== rejected programs =="
 for f in "$STABLE"/neg/*.fi; do
     base=$(basename "$f" .fi)

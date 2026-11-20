@@ -65,9 +65,11 @@ def const_signature(lines, start):
     return collapse(head)
 
 
-def extract(path, module):
+def extract(path, module, only=None):
     lines = path.read_text().split("\n")
     names = set(exported_names(lines))
+    if only is not None:
+        names &= only
     if not names:
         names = {m.group(2) for m in map(DECL.match, lines) if m}
     found = {}
@@ -100,6 +102,9 @@ def main():
             print("missing module: std.%s" % m, file=sys.stderr)
             sys.exit(1)
         out += extract(path, "std." + m)
+    if len(sys.argv) > 3:
+        only = set(Path(sys.argv[3]).read_text().split())
+        out += extract(lib / "std" / "rt.fi", "std.rt", only)
     sys.stdout.write("\n".join(sorted(set(out))) + "\n")
 
 

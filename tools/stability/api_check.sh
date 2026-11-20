@@ -6,7 +6,7 @@ FROZEN=tools/stability/api_std.txt
 NOW=$(mktemp)
 trap 'rm -f "$NOW"' EXIT
 
-python3 -I tools/stability/api_extract.py lib tools/stability/core_modules.txt > "$NOW" || exit 1
+python3 -I tools/stability/api_extract.py lib tools/stability/core_modules.txt tools/stability/rt_stable.txt > "$NOW" || exit 1
 
 if [ "${1:-}" = "--update" ]; then
     cp "$NOW" "$FROZEN"

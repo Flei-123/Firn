@@ -9,7 +9,7 @@ A program that compiles and passes under an edition keeps compiling and keeps it
 - **Syntax**: every construct accepted today in `tests/stable/*.fi` (frozen corpus). New syntax may only be added where the old grammar rejected the text.
 - **Type and move rules**: accepted programs stay accepted. Rejected programs may become accepted (loosening is compatible); `tests/stable/neg/*.fi` pins the rejections that must stay rejections.
 - **Semantics**: integer, float, string, struct, enum, match, generics, interfaces, closures, error unions, ownership and GC rules as written in `SPEC.md`. Where `SPEC.md` and the compiler disagree, the frozen corpus decides until the text is fixed.
-- **Build levels**: `dev-fast`, `release-safe`, `release-fast` mean what `docs/SAFETY.md` says. Checked levels panic on overflow and out-of-range access; `release-fast` wraps and does not check. A program must not depend on the difference.
+- **Build levels**: `dev-fast`, `release-safe`, `release-fast` mean what `docs/SAFETY.md` says. Checked levels panic (exit 101) on overflow, out-of-range shifts, `MIN / -1`, `-MIN` and lossy narrowing casts; `release-fast` wraps by definition (never undefined behavior). `+% -% *%` and `+| -| *|` behave identically in every level. A program must not depend on the difference; `tests/stable/levels` pins both sides.
 - **std core API**: every exported item of the modules in `tools/stability/core_modules.txt` (`std.core vec str map math bytes option io fs json time deque heap base64 hash text num bisect testkit`). The frozen list is `tools/stability/api_std.txt` (name, generics, parameters, return type, struct fields, enum variants).
 - **Manifest format**: keys of `firn.package` (`package version edition start source public needs`) and their meaning.
 - **CLI**: `--edition`, `--opt-level`, `--target`, `--package`, `--emit=exe|asm`, `-o`.
@@ -17,7 +17,7 @@ A program that compiles and passes under an edition keeps compiling and keeps it
 ## What is not stable
 
 - **Experimental libraries**: every module outside the std core list (`net`, `http`, `tls`, `db`, `pg`, `mysql`, `fui`, `photo`, `media`, `pdf`, `docview`, `scene3d`, `gpu`, `webfw`, `mc`, ...) and every `std.*` module not in the list. They may change in any release; breaking changes are noted in the release notes.
-- **`std.rt`**: runtime internals (syscalls, buffers). Use `io`, `fs`, `bytes`, `mem` instead. It is split into stable and internal parts before 1.0 (see `docs/V1-BLOCKERS.md`).
+- **`std.rt` (internal part)**: only the 39 names in `tools/stability/rt_stable.txt` are stable (buffers, heap, raw loads/stores, file helpers, `finish`, `arg_*`); every other `std.rt` export (`run`, `spawn`, `wait_pid`, `env_value`, ...) is runtime internals. Prefer `io`, `fs`, `bytes`, `mem`.
 - **Diagnostics**: error text, notes, ordering and positions of messages. Only the fact of rejection is stable.
 - **Generated code**: assembly, FIR text, symbol names, object layout, compile time, `--emit` targets other than `exe` and `asm`, `--timings`, `--stats`.
 - **Compiler internals**: `firnc1` source, `lib/firnc1`, pass names, `FIRN_*` environment switches, cache layout.
@@ -47,6 +47,7 @@ A program that compiles and passes under an edition keeps compiling and keeps it
 
 - `tests/stable/*.fi`: frozen golden programs with expected exit code or output, compiled with `--edition=2026` in `dev-fast` and `release-fast`. `tests/stable/MANIFEST.sha256` pins file contents; a changed golden fails the gate.
 - `tests/stable/neg/*.fi`: programs that must stay rejected (no crash, no acceptance).
-- `tools/stability/api_check.sh`: extracts the exported API of the std core modules and diffs it against `tools/stability/api_std.txt`. Removed or changed entries are a **breaking change** and fail the gate; new entries are reported and frozen with `--update`.
+- `tests/stable/levels/*.fi`: programs whose first line `// expect_levels: dev=101 dev-fast=101 release-safe=101 release-fast=7` lists the exit code per build level (overflow, shifts, narrowing, wrapping operators).
+- `tools/stability/api_check.sh`: extracts the exported API of the std core modules (and the `std.rt` allow-list `rt_stable.txt`) and diffs it against `tools/stability/api_std.txt`. Removed or changed entries are a **breaking change** and fail the gate; new entries are reported and frozen with `--update`.
 - Adding a golden: `bash tools/stability/freeze.sh` (copies new qualifying tests, never overwrites). Changing or deleting a golden requires a new edition and an entry in this file.
 - Run: `bash tools/stability/run.sh` (or `bash test.sh --stage` of section 151).
