@@ -680,7 +680,7 @@ Unicode tables from the UCD, CLDR data.
   and is covered by `tests/stable/t3_threads_atomic_lock.fi`: `thread_start`,
   `thread_wait`, `thread_lock`, `thread_unlock` and `__atomic_add` over raw
   addresses, the dispatcher `__thread_work(kind, arg)`, thread-local GC heaps,
-  and `lib/chan`. `--send-check=on` rejects handing a `Gc[T]` to a thread.
+  and `lib/chan`. `--send-check=on` (default) rejects handing a `Gc[T]` to a thread.
 * **Structured concurrency** as a library pattern on top of `#[must_consume]`.
 * **A deterministic single-thread mode** for reproducible reftests (`N7`).
 
@@ -1643,7 +1643,7 @@ BORROW1, r193):** inside the body a reference parameter may only be used as
 `p.f` / `p[i]`, as `*p`, and as an argument of a call (as it is, as `&p` or as
 `inout p`); copying it into a variable, a field or an array, returning it,
 casting it or doing arithmetic on it is an error ("cannot be copied, stored or
-returned"). **Opt-in `--borrow=strict` (r1559)** closes the rest of the borrow checker
+returned"). **`--borrow=on` (default, B1-B3) and opt-in `--borrow=strict` (B4, r1559)** closes the rest of the borrow checker
 (ROADMAP r193): (a) a raw pointer taken with `&a` and used after `inout a` went to a call, also across
 loop iterations, and `f(inout a, p)` with `p = &a`; (b) `&c.f` / `&c[i]` / `&*c` of the target of a
 reference parameter `c`, unless handed directly to a reference parameter; (c) the address of a local

@@ -24,7 +24,7 @@ const MAX_POINTER_HOPS: u32 = 2;
 
 pub(crate) const ALLOWED: &str = "off, on";
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn parse(v: &str) -> Option<bool> {
     match v {

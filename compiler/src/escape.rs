@@ -954,7 +954,7 @@ impl<'a> Pass<'a> {
         if is_internal(name) {
             return;
         }
-        if self.report && crate::borrowmode::enabled() && self.opaque.contains(name) {
+        if self.report && crate::borrowmode::strict() && self.opaque.contains(name) {
             for (i, a) in args.iter().enumerate() {
                 let t = self.value(a);
                 self.flow(&t, 0, &Route::Opaque(readable(name), i + 1), sp);

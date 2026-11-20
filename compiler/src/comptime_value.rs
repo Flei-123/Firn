@@ -32,7 +32,7 @@ pub(crate) fn shape_of(t: &TypeExpr) -> Shape {
     }
 }
 
-pub(crate) fn element_shape(shape: &Shape, depth: usize) -> Shape {
+pub(crate) fn elem_shape(shape: &Shape, depth: usize) -> Shape {
     let mut cur = shape;
     for _ in 0..depth {
         match cur {

@@ -43,7 +43,7 @@ use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::Span;
 use crate::types::Type;
 use crate::fx::HashMap;
-use crate::comptime_value::{coerce, element_shape, follow, follow_mut, shape_of, to_int, Shape, Value, MAX_ARRAY_LEN};
+use crate::comptime_value::{coerce, elem_shape, follow, follow_mut, shape_of, to_int, Shape, Value, MAX_ARRAY_LEN};
 
 /// Upper bound of statements executed per `comptime` evaluation.
 const MAX_STEPS: u64 = 2_000_000;
@@ -573,7 +573,7 @@ point is not yet possible at compile time",
         };
         for level in env.iter_mut().rev() {
             if let Some(slot) = level.get_mut(name) {
-                let shape = element_shape(&slot.shape, path.len());
+                let shape = elem_shape(&slot.shape, path.len());
                 let cell = follow_mut(&mut slot.value, &path, span)?;
                 let new = make(cell)?;
                 *cell = coerce(new, &shape);
