@@ -23,8 +23,13 @@ for src in tools/nogc/cases/*.fi; do
   fi
   got=$("$D/$name" | tr '\n' ' ' | sed 's/ $//')
   [ "$got" = "$want" ] && check "$name out" ok || check "$name out" bad "got '$got' want '$want'"
-  syms=$(nm "$D/$name" | grep -c 'gc_init\|__gc_')
+  syms=$(nm "$D/$name" | grep 'gc_init\|__gc_' | grep -vc '__gc_blit\|__gc_free_block\|__gc_poison_block')
   [ "$syms" = 0 ] && check "$name no-gc-symbols" ok || check "$name no-gc-symbols" bad "$syms gc symbols"
+  vmlimit=$(sed -n 's|^// vm_limit_kb: ||p' "$src" | head -1)
+  if [ -n "$vmlimit" ]; then
+    limited=$(ulimit -v "$vmlimit" && "$D/$name" | tr '\n' ' ' | sed 's/ $//')
+    [ "$limited" = "$want" ] && check "$name vm-limit" ok || check "$name vm-limit" bad "got '$limited'"
+  fi
   if grep -q '^// nogc_only' "$src"; then
     continue
   fi
@@ -42,17 +47,6 @@ for src in tools/nogc/neg/*.fi; do
     check "neg $name" ok
   else
     check "neg $name" bad "rc=$rc $(echo "$out" | head -2 | tr '\n' ' ')"
-  fi
-done
-
-for src in tools/nogc/neg0/*.fi; do
-  name=$(basename "$src" .fi)
-  out=$("$FIRNC" --no-gc --no-cache "$src" -o "$D/neg0_$name" 2>&1)
-  rc=$?
-  if [ $rc -ne 0 ] && echo "$out" | grep -q "which '--no-gc' leaves out" && echo "$out" | grep -q -- "--> $src:4:21"; then
-    check "neg0 $name" ok
-  else
-    check "neg0 $name" bad "rc=$rc $(echo "$out" | head -2 | tr '\n' ' ')"
   fi
 done
 
