@@ -347,7 +347,7 @@ pub(crate) fn walk_exprs(b: &Block, f: &mut dyn FnMut(&Expr)) {
 }
 
 /// Calls `f` on every direct sub-expression.
-fn children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+pub(crate) fn children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     match &e.kind {
         ExprKind::Field(b, ..) => f(b),
         ExprKind::Index(b, i) => {

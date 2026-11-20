@@ -86,7 +86,7 @@
 //! order, or a program with two escaping locals would be blamed for
 //! different ones.
 
-use crate::fx::HashMap;
+use crate::fx::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::{Diag, Span};
@@ -170,6 +170,7 @@ enum Route {
     ForeignPtr,
     /// handed to `callee` as argument `n` (1-based), which keeps it
     Call(String, usize),
+    Opaque(String, usize),
     Thread,
 }
 
@@ -182,6 +183,9 @@ impl Route {
                 "through a pointer that does not point into this frame".to_string()
             }
             Route::Call(f, n) => format!("into '{f}', which keeps its argument {n}"),
+            Route::Opaque(f, n) => {
+                format!("into '{f}', whose body is not known here (argument {n})")
+            }
             Route::Thread => "into a new thread".to_string(),
         }
     }
@@ -199,6 +203,11 @@ impl Route {
             Route::Call(f, _) => format!(
                 "give '{f}' storage that outlives this frame -- the GC heap, or the caller's \
                  frame; {tail}"
+            ),
+            Route::Opaque(f, _) => format!(
+                "'--borrow=strict' cannot prove that '{f}' does not keep the pointer: pass a \
+                 value or a reference parameter, or vouch for the call with '#[allow_escape]' on \
+                 '{who}'"
             ),
             Route::Thread => format!(
                 "the thread outlives this frame: hand it storage from the GC heap; {tail}"
@@ -303,6 +312,12 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
     let skip = |i: usize| reach.as_ref().map(|r| !r[i]).unwrap_or(false);
     // --- phase 1: the summaries, to a fixed point ---------------------------
     let mut sums: HashMap<String, Vec<u64>> = HashMap::default();
+    let opaque: HashSet<String> = prog
+        .funcs
+        .iter()
+        .filter(|f| f.extern_info.is_some())
+        .map(|f| f.name.clone())
+        .collect();
     for f in &prog.funcs {
         // Declared twice is an error of the type check; the first entry wins
         // here and the run stays deterministic.
@@ -323,7 +338,7 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
             if f.extern_info.is_some() || is_closure(&f.name) || has_allow_escape(f) {
                 continue;
             }
-            let mut p = Pass::new(&sums, tys, f, false);
+            let mut p = Pass::new(&sums, &opaque, tys, f, false);
             p.run(f);
             if sums.get(&f.name) != Some(&p.found) {
                 fresh.push((f.name.clone(), p.found));
@@ -342,7 +357,7 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
         if skip(fi) || f.extern_info.is_some() || is_closure(&f.name) || has_allow_escape(f) {
             continue;
         }
-        let mut p = Pass::new(&sums, tys, f, true);
+        let mut p = Pass::new(&sums, &opaque, tys, f, true);
         p.run(f);
         out.append(&mut p.out);
     }
@@ -353,6 +368,7 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
 
 struct Pass<'a> {
     sums: &'a HashMap<String, Vec<u64>>,
+    opaque: &'a HashSet<String>,
     tys: &'a [Type],
     /// Name of the function being checked, as it stands in the source.
     who: String,
@@ -386,12 +402,14 @@ enum Root<'a> {
 impl<'a> Pass<'a> {
     fn new(
         sums: &'a HashMap<String, Vec<u64>>,
+        opaque: &'a HashSet<String>,
         tys: &'a [Type],
         f: &FnDecl,
         report: bool,
     ) -> Pass<'a> {
         Pass {
             sums,
+            opaque,
             tys,
             who: readable(&f.name),
             fend: f.body.end,
@@ -935,6 +953,12 @@ impl<'a> Pass<'a> {
         }
         if is_internal(name) {
             return;
+        }
+        if self.report && crate::borrowmode::enabled() && self.opaque.contains(name) {
+            for (i, a) in args.iter().enumerate() {
+                let t = self.value(a);
+                self.flow(&t, 0, &Route::Opaque(readable(name), i + 1), sp);
+            }
         }
         let flows = match self.summary(name) {
             Some(f) => f.clone(),

@@ -2414,6 +2414,7 @@ FIRNC="$FIRNC" bash tools/safety/run.sh > "$WORK/safety149.log" 2>&1 && F149RC=0
 FIRNC="$FIRNC" bash tools/safety/pe.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
 FIRNC="$FIRNC" bash tools/safety/moves.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
 FIRNC="$FIRNC" bash tools/safety/send.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
+FIRNC="$FIRNC" bash tools/safety/borrow.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
 FIRNC="$FIRNC" bash tools/safety/unsafe/run.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
 FIRNC="$FIRNC" python3 -I tools/safety/fuzz_frontend.py --runs 80 --seed 7 >> "$WORK/safety149.log" 2>&1 || F149RC=1
 if [ "$F149RC" -eq 0 ]; then

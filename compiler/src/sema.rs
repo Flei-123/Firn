@@ -233,6 +233,7 @@ impl<'a> Checker<'a> {
         // round OWN-1, SPEC 3.3). Silent unless the program declares a `drop`.
         crate::moves::hook_check(self, prog);
         crate::sendcheck::hook_check(self, prog);
+        crate::borrowcheck::hook_check(self, prog);
         // HOOK refcalls: what a reference parameter may be handed to (refparam.rs, r198/r199).
         crate::refparam::hook_calls(self, prog);
         // HOOK kern: `#[interrupt]` — check the form and forbid calls

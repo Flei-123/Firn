@@ -441,7 +441,7 @@ without any annotation, because the compiler works that property out of the
 callee's body and drives it to a fixed point over the whole program.
 
 **This is not a lifetime system.** Where the analysis cannot decide, it
-allows; every such case is named in `docs/ROUND79.md` 4 instead of being
+allows (`--borrow=strict` rejects the `extern fn` case, E3, see `docs/SAFETY.md` O3); every such case is named in `docs/ROUND79.md` 4 instead of being
 guessed at. A false alarm would cost more than a missed case: it makes
 correct programs unbuildable and teaches everybody to switch the check off.
 
@@ -1642,9 +1642,12 @@ BORROW1, r193):** inside the body a reference parameter may only be used as
 `p.f` / `p[i]`, as `*p`, and as an argument of a call (as it is, as `&p` or as
 `inout p`); copying it into a variable, a field or an array, returning it,
 casting it or doing arithmetic on it is an error ("cannot be copied, stored or
-returned"). **Not yet checked** (the rest of the borrow checker, ROADMAP r193):
-exclusivity across statements, and a callee can still turn the reference it was
-handed into a raw pointer. The self-hosted parser (`lib/firnc1/parser.fi`)
+returned"). **Opt-in `--borrow=strict` (r1559)** closes the rest of the borrow checker
+(ROADMAP r193): (a) a raw pointer taken with `&a` and used after `inout a` went to a call, also across
+loop iterations, and `f(inout a, p)` with `p = &a`; (b) `&c.f` / `&c[i]` / `&*c` of the target of a
+reference parameter `c`, unless handed directly to a reference parameter; (c) the address of a local
+handed to an `extern fn`. Off by default until `lib/` is migrated (`docs/SAFETY.md` O3); firnc1
+refuses the flag. The self-hosted parser (`lib/firnc1/parser.fi`)
 reads reference parameters in all four places and rewrites the body while it
 parses; it does not check the "exactly one" rule or the read-only rule with
 messages (it only counts errors, as everywhere), the negative tests belong to

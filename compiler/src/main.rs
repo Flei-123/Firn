@@ -119,6 +119,8 @@ mod dargs;
 mod lambda;
 mod moves;
 mod moveonly;
+mod borrowcheck;
+mod borrowmode;
 mod sendcheck;
 mod nogc;
 mod prune;
@@ -364,6 +366,7 @@ fn usage() -> String {
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
          --no-gc            ownership-only mode: no collector runtime; gc class, Gc[T], GcWeak[T], gc fn, GcVec/GcMap are errors; requires --ownership=strict\n  \
          --moves=<m>        off | vec (Vec and structs holding a Vec are move-only: use after move is an error; default off)\n  \
+         --borrow=<m>       off | strict (exclusivity of inout across statements, no raw pointer into a reference target, no local address to opaque callees; default off)\n  \
          --send-check=<m>   off | on (values holding Gc[T] cannot be handed to threads, jobs, pools or channels; default off)\n  \
          --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
          --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
@@ -501,6 +504,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 match moveonly::parse(v) {
                     Some(on) => moveonly::set_enabled(on),
                     None => return Err(format!("unknown moves mode '{}' (allowed: {})", v, moveonly::ALLOWED)),
+                }
+            }
+            _ if a.starts_with("--borrow=") => {
+                let v = &a["--borrow=".len()..];
+                match borrowmode::parse(v) {
+                    Some(on) => borrowmode::set_strict(on),
+                    None => return Err(format!("unknown borrow mode '{}' (allowed: {})", v, borrowmode::ALLOWED)),
                 }
             }
             _ if a.starts_with("--send-check=") => {
