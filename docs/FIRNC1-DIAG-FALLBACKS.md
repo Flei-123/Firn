@@ -13,3 +13,5 @@
 | `match_check`: match index out of range | Internal registry invariant. |
 
 Known remaining deviations from firnc0: none for f-strings (`!r`/`!s`, `"a" + f"{n}"`, lexer errors inside an interpolation fragment and closure bodies in `#[no_gc]` match firnc0).
+
+Suggestions (`= help: did you mean 'x'?`) for unknown names, types, struct fields and struct literal fields come from `lib/firnc1/nearest.fi`, the twin of `diag::nearest` (Levenshtein, tolerance a third of the length clamped to 1..3, ties alphabetical, names over 128 bytes skipped). Not ported: the named-argument note (`has no parameter named`), the missing-method note of `impl`, generic function hint.
