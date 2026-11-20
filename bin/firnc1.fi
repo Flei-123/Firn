@@ -46,6 +46,8 @@ import cache
 import cachekey
 import resolvemanifest
 import sha256
+import gcfree
+import nogctext
 
 // ---------------------------------------------------------- module system
 //
@@ -1088,6 +1090,8 @@ fn main(start: u64) -> i32 {
     defer rt.buf_free(&env_notes)
     var env_log: bool = false
     var ownership_ignored: bool = false
+    var no_gc: bool = false
+    var own_not_strict: bool = false
     var moves_vec: bool = true
     var unsafe_mode: u32 = 0
     var unsafe_scope: rt.Buf = rt.buf_new()
@@ -1194,6 +1198,10 @@ fn main(start: u64) -> i32 {
             moves_vec = false
         } else if arg_starts(a, an, (&own_opt[0]) as u64) {
             ownership_ignored = true
+            var own_strict: [u8; 6] = "strict"
+            if an != 18 || !rt.mem_eq(a + 12, (&own_strict[0]) as u64, 6) {
+                own_not_strict = true
+            }
         } else if arg_starts(a, an, (&ea_opt[0]) as u64) {
             if rt.buf_len(&env_allow) > 0 {
                 rt.buf_push(&env_allow, 44 as u8)
@@ -1206,9 +1214,7 @@ fn main(start: u64) -> i32 {
         } else if arg_starts(a, an, (&borrow_opt[0]) as u64) {
             ownership_ignored = ownership_ignored
         } else if arg_is(a, an, (&ng_opt[0]) as u64) {
-            var m_ng: [u8; 105] = "error: firnc1 does not support --no-gc yet\n  note: the Rust bootstrap does (firnc --no-gc, docs/NOGC.md)\n"
-            rt.write_everything(2, (&m_ng[0]) as u64, 105)
-            return 2
+            no_gc = true
         } else if arg_is(a, an, (&lk_opt[0]) as u64) {
             lock_write = true
         } else if arg_is(a, an, (&lkd_opt[0]) as u64) {
@@ -1264,6 +1270,12 @@ fn main(start: u64) -> i32 {
             }
         }
         ai = ai + 1
+    }
+
+    if no_gc && own_not_strict {
+        var m_ngo: [u8; 84] = "error: '--no-gc' requires --ownership=strict\nnote: 'firnc --help' shows the options\n"
+        rt.write_everything(2, (&m_ngo[0]) as u64, 84)
+        return 2
     }
 
     if pak != 0 {
@@ -1379,7 +1391,7 @@ fn main(start: u64) -> i32 {
         }
     }
 
-    var cch: cache.Cache = cache.cache_new(start, cache_off || env_log || tm_on != 0 || unsafe_mode == 1)
+    var cch: cache.Cache = cache.cache_new(start, cache_off || env_log || tm_on != 0 || unsafe_mode == 1 || no_gc)
     defer cache.cache_free(&cch)
     var identity: rt.Buf = rt.buf_new()
     defer rt.buf_free(&identity)
@@ -1508,6 +1520,13 @@ fn main(start: u64) -> i32 {
     let fa_nr: i64 = intern.intern_number(it, (&sfa[0]) as u64, 13) as i64
     var gc_scan: u32 = gc.gc_source_scan(l as u64, it as u64, gc_nr, class_nr,
         ae_nr, fin_nr, fa_nr)
+    if no_gc {
+        let ng_found: u64 = gcfree.gcfree_scan(l, it)
+        if ng_found != gcfree.NOT_FOUND {
+            gcfree.gcfree_report(l, ng_found)
+            return render_lex(l)
+        }
+    }
 
     // --- FIRST PASS: build the queue and collect the generic names. Both
     // have to be settled BEFORE the first file is parsed. The price is
@@ -1597,8 +1616,15 @@ fn main(start: u64) -> i32 {
         // -- lib/dom/dom.fi uses GcVec, the root file does not.
         // Merge R49: bit 16 (a thread dispatcher of its own) counts, like
         // bit 4, ONLY in the root file, so it drops out of the mask.
+        if no_gc {
+            let ng_mod: u64 = gcfree.gcfree_scan(vl, it)
+            if ng_mod != gcfree.NOT_FOUND {
+                gcfree.gcfree_report(vl, ng_mod)
+                return render_lex(vl)
+            }
+        }
         gc_scan = gc_scan | (gc.gc_source_scan(vl as u64, it as u64, gc_nr,
-                class_nr, ae_nr, fin_nr, fa_nr) & 11)
+                class_nr, ae_nr, fin_nr, fa_nr) & 43)
         rt.buf_clear(&mdir)
         dirname(&mdir, rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
         buf_set(&sr.dir, rt.buf_ptr(&mdir), rt.buf_len(&mdir))
@@ -1859,8 +1885,14 @@ fn main(start: u64) -> i32 {
     // `gc class` appears anywhere (round 34; HOOK gc in modules.rs,
     // SPEC 3.5). It lives in the ROOT NAMESPACE: `gc_init()` is called
     // `gc_init()` in every module, without `import` and without a prefix.
-    if gc_scan & 1 != 0 {
-        gc.gc_runtime_set(&gcreg, 1 as usize)
+    var runtime_wanted: bool = gc_scan & 1 != 0
+    if no_gc {
+        runtime_wanted = gc_scan & 32 != 0
+    }
+    if runtime_wanted {
+        if !no_gc {
+            gc.gc_runtime_set(&gcreg, 1 as usize)
+        }
         var gq: rt.Buf = rt.buf_new()
         defer rt.buf_free(&gq)
         if gc_scan & 2 == 0 {
@@ -1870,34 +1902,45 @@ fn main(start: u64) -> i32 {
             var aeo: [u8; 48] = "// AllocError is declared by the program itself\n"
             rt.buf_push_bytes(&gq, (&aeo[0]) as u64, 48)
         }
-        // Round 47: the empty default of the finalizer dispatcher -- only
-        // if the root file does not bring one of its own (bit 4).
-        // Word for word as gc.rs::finalizer_default.
-        if gc_scan & 4 == 0 {
-            var fdt: [u8; 201] = "// Round 47: default of the finalizer dispatcher. The program\n// declares none of its own, so cleanup does nothing.\nfn __gc_finalize(kind: u64, p: *mut u8) {\n    let _unused: u64 = kind + (p as u64)\n}\n"
-            rt.buf_push_bytes(&gq, (&fdt[0]) as u64, 201)
+        if no_gc {
+            nogctext.nogctext_write(&gq)
         } else {
-            var fdo: [u8; 51] = "// __gc_finalize is declared by the program itself\n"
-            rt.buf_push_bytes(&gq, (&fdo[0]) as u64, 51)
+            // Round 47: the empty default of the finalizer dispatcher -- only
+            // if the root file does not bring one of its own (bit 4).
+            // Word for word as gc.rs::finalizer_default.
+            if gc_scan & 4 == 0 {
+                var fdt: [u8; 201] = "// Round 47: default of the finalizer dispatcher. The program\n// declares none of its own, so cleanup does nothing.\nfn __gc_finalize(kind: u64, p: *mut u8) {\n    let _unused: u64 = kind + (p as u64)\n}\n"
+                rt.buf_push_bytes(&gq, (&fdt[0]) as u64, 201)
+            } else {
+                var fdo: [u8; 51] = "// __gc_finalize is declared by the program itself\n"
+                rt.buf_push_bytes(&gq, (&fdo[0]) as u64, 51)
+            }
+            // Round 49 (merge: bit 16): the empty default of the thread
+            // dispatcher -- only if the root file does not bring one of
+            // its own. Word for word as gc.rs::thread_work_default.
+            if gc_scan & 16 == 0 {
+                var fat: [u8; 198] = "// Round 49: default of the thread dispatcher. The program\n// declares none of its own, so a thread does nothing.\nfn __thread_work(kind: u64, arg: u64) -> u64 {\n    return kind + arg - kind - arg\n}\n"
+                rt.buf_push_bytes(&gq, (&fat[0]) as u64, 198)
+            } else {
+                var fao: [u8; 51] = "// __thread_work is declared by the program itself\n"
+                rt.buf_push_bytes(&gq, (&fao[0]) as u64, 51)
+            }
+            // Round 53: add the collections only if they are used (bit 8) --
+            // a program with a `gc class` but without GcVec/GcMap then produces
+            // exactly the same code as before.
+            gctext.gctext_write(&gq, gc_scan & 8 != 0)
         }
-        // Round 49 (merge: bit 16): the empty default of the thread
-        // dispatcher -- only if the root file does not bring one of
-        // its own. Word for word as gc.rs::thread_work_default.
-        if gc_scan & 16 == 0 {
-            var fat: [u8; 198] = "// Round 49: default of the thread dispatcher. The program\n// declares none of its own, so a thread does nothing.\nfn __thread_work(kind: u64, arg: u64) -> u64 {\n    return kind + arg - kind - arg\n}\n"
-            rt.buf_push_bytes(&gq, (&fat[0]) as u64, 198)
-        } else {
-            var fao: [u8; 51] = "// __thread_work is declared by the program itself\n"
-            rt.buf_push_bytes(&gq, (&fao[0]) as u64, 51)
-        }
-        // Round 53: add the collections only if they are used (bit 8) --
-        // a program with a `gc class` but without GcVec/GcMap then produces
-        // exactly the same code as before.
-        gctext.gctext_write(&gq, gc_scan & 8 != 0)
         var gpn: [u8; 12] = "lib/gc/gc.fi"
+        var gpn_ng: [u8; 14] = "lib/gc/nogc.fi"
+        var gpn_ptr: u64 = (&gpn[0]) as u64
+        var gpn_len: usize = 12
+        if no_gc {
+            gpn_ptr = (&gpn_ng[0]) as u64
+            gpn_len = 14
+        }
         var gl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&gq), rt.buf_len(&gq),
             (&KWTXT[0]) as u64, 179,
-            (&gpn[0]) as u64, 12)
+            gpn_ptr, gpn_len)
         lexer.lex_names_set(&gl, it as u64)
         lexer.lex_run(&gl)
         if lexer.lex_error(&gl) > 0 {
@@ -1905,7 +1948,7 @@ fn main(start: u64) -> i32 {
             return 1
         }
         var gp: parser.Parser = parser.par_new_module((&gl) as u64, tree as u64, 4294967295)
-        parser.par_file_set(&gp, ast.file_add(tree, (&gpn[0]) as u64, 12))
+        parser.par_file_set(&gp, ast.file_add(tree, gpn_ptr, gpn_len))
         parser.par_gen_set(&gp, (&g) as u64)
         parser.par_mu_set(&gp, (&mu) as u64)
         parser.par_fe_set(&gp, (&fe) as u64)

@@ -62,6 +62,14 @@ if ! cmp -s "$GCTMP" lib/firnc1/gctext.fi; then
     exit 1
 fi
 rm -f "$GCTMP"
+NGTMP=$(mktemp)
+bash tools/gen_nogctext.sh "$NGTMP" >/dev/null
+if ! cmp -s "$NGTMP" lib/firnc1/nogctext.fi; then
+    rm -f "$NGTMP"
+    echo "lib/firnc1/nogctext.fi does not match lib/gc/nogc.fi -- run tools/gen_nogctext.sh"
+    exit 1
+fi
+rm -f "$NGTMP"
 GCNTMP=$(mktemp)
 bash tools/gen_gcnames.sh "$GCNTMP" >/dev/null
 if ! cmp -s "$GCNTMP" lib/firnc1/gcnames.fi; then

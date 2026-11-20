@@ -55,5 +55,34 @@ done
 out=$("$FIRNC" --no-gc --no-cache tools/nogc/neg/gc_class.fi -o "$D/pos" 2>&1)
 echo "$out" | grep -q 'gc_class.fi:1:1' && check "neg position" ok || check "neg position" bad "$(echo "$out" | head -2 | tr '\n' ' ')"
 
+if [ -n "${FIRNC1:-}" ]; then
+  for src in tools/nogc/cases/*.fi; do
+    name=$(basename "$src" .fi)
+    want=$(sed -n 's|^// expect_out: ||p' "$src" | head -1)
+    if ! "$FIRNC1" --no-gc "$src" -o "$D/c1_$name" >"$D/c1_$name.log" 2>&1; then
+      check "firnc1 $name" bad "compile: $(head -3 "$D/c1_$name.log" | tr '\n' ' ')"
+      continue
+    fi
+    got=$("$D/c1_$name" | tr '\n' ' ' | sed 's/ $//')
+    [ "$got" = "$want" ] && check "firnc1 $name out" ok || check "firnc1 $name out" bad "got '$got' want '$want'"
+    nm "$D/c1_$name" | grep -q 'gc_init' && check "firnc1 $name no-gc-init" bad "gc_init present" || check "firnc1 $name no-gc-init" ok
+  done
+  for src in tools/nogc/neg/*.fi; do
+    name=$(basename "$src" .fi)
+    "$FIRNC" --no-gc --no-cache "$src" -o "$D/n0_$name" >"$D/n0_$name.log" 2>&1
+    "$FIRNC1" --no-gc "$src" -o "$D/n1_$name" >"$D/n1_$name.log" 2>&1
+    cmp -s "$D/n0_$name.log" "$D/n1_$name.log" && check "firnc1 neg $name" ok || check "firnc1 neg $name" bad "text differs from firnc0"
+  done
+  for mode in off on check; do
+    out=$("$FIRNC1" --no-gc --ownership=$mode tools/nogc/cases/hello.fi -o "$D/c1_own_$mode" 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ] && echo "$out" | grep -q "requires --ownership=strict"; then
+      check "firnc1 ownership=$mode refused" ok
+    else
+      check "firnc1 ownership=$mode refused" bad "rc=$rc"
+    fi
+  done
+fi
+
 echo "nogc: $pass passed, $fail failed"
 [ "$fail" = 0 ]
