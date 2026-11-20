@@ -998,6 +998,30 @@ pub(crate) fn infer_fn_value(name: &str, expected: &TypeExpr, at: Span) -> Resul
     Ok(mangled)
 }
 
+pub(crate) fn solve_params(
+    tps: &[TyParam],
+    decls: &[&TypeExpr],
+    strong: &[Option<TypeExpr>],
+    weak: &[Option<TypeExpr>],
+) -> HashMap<String, TypeExpr> {
+    let mut map: HashMap<String, TypeExpr> = HashMap::default();
+    for evidence in [strong, weak] {
+        for (d, t) in decls.iter().zip(evidence.iter()) {
+            if let Some(t) = t {
+                let mut trial = map.clone();
+                if unify_ty(d, t, tps, &mut trial) {
+                    map = trial;
+                }
+            }
+        }
+    }
+    map
+}
+
+pub(crate) fn collect_args(tps: &[TyParam], map: &HashMap<String, TypeExpr>) -> Option<Vec<TypeExpr>> {
+    tps.iter().map(|p| map.get(&p.name).cloned()).collect()
+}
+
 /// r742b -- `apply_g(id, 4)`: the type arguments of the generic function `name`
 /// come from its VALUE arguments. `strong[i]` = the evident type of argument i,
 /// `weak[i]` = a literal default (`4` -> i32); weak types only fill parameters
@@ -1022,23 +1046,8 @@ pub(crate) fn infer_call(
             strong.len()
         ));
     }
-    let mut map: HashMap<String, TypeExpr> = HashMap::default();
-    for (p, t) in tpl.decl.params.iter().zip(strong.iter()) {
-        if let Some(t) = t {
-            let mut trial = map.clone();
-            if unify_ty(&p.ty, t, &tpl.params, &mut trial) {
-                map = trial;
-            }
-        }
-    }
-    for (p, t) in tpl.decl.params.iter().zip(weak.iter()) {
-        if let Some(t) = t {
-            let mut trial = map.clone();
-            if unify_ty(&p.ty, t, &tpl.params, &mut trial) {
-                map = trial;
-            }
-        }
-    }
+    let decls: Vec<&TypeExpr> = tpl.decl.params.iter().map(|p| &p.ty).collect();
+    let map = solve_params(&tpl.params, &decls, strong, weak);
     let mut args: Vec<TypeExpr> = Vec::new();
     for p in &tpl.params {
         match map.get(&p.name) {

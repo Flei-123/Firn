@@ -448,7 +448,16 @@ fn arg_ty(cx: &Cx, e: &Expr) -> (Option<TypeExpr>, Option<TypeExpr>) {
                 _ => (None, None),
             }
         }
-        _ => (expr_ty(cx, e), None),
+        _ => val_ty(cx, e),
+    }
+}
+
+fn infer_enum_ctor(cx: &mut Cx, id: crate::ast::ExprId, at: Span, name: &str, args: &[Expr]) {
+    let tys: Vec<(Option<TypeExpr>, Option<TypeExpr>)> = args.iter().map(|a| arg_ty(cx, a)).collect();
+    let strong: Vec<Option<TypeExpr>> = tys.iter().map(|t| t.0.clone()).collect();
+    let weak: Vec<Option<TypeExpr>> = tys.iter().map(|t| t.1.clone()).collect();
+    if crate::generic_enum::infer_ctor(id, at, name, &strong, &weak) {
+        cx.pending = true;
     }
 }
 
@@ -859,9 +868,10 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
             // r742b: `apply_g(id, 4)` -- a generic callee with a generic fn as a value
             // argument: the type arguments come from the other arguments.
             let mut inferred: Option<Vec<TypeExpr>> = None;
+            let fn_value_arg = args.iter().any(|a| generic_fn_value(cx, a).is_some());
             if crate::sema_generic::is_generic_fn(name)
                 && crate::impls::method_name(name).is_none()
-                && args.iter().any(|a| generic_fn_value(cx, a).is_some())
+                && lookup(cx, name).is_none()
             {
                 let tys: Vec<(Option<TypeExpr>, Option<TypeExpr>)> = args.iter().map(|a| arg_ty(cx, a)).collect();
                 let strong: Vec<Option<TypeExpr>> = tys.iter().map(|t| t.0.clone()).collect();
@@ -875,8 +885,12 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
                         cx.pending = true;
                         inferred = Some(ptys);
                     }
-                    Err(msg) => cx.dg.error(e.span, msg),
+                    Err(msg) if fn_value_arg => cx.dg.error(e.span, msg),
+                    Err(_) => {}
                 }
+            }
+            if inferred.is_none() {
+                infer_enum_ctor(cx, e.id, e.span, name, args);
             }
             let tys: Option<Vec<TypeExpr>> = if inferred.is_some() { inferred } else { match crate::impls::method_name(name) {
                 Some(m) => cx.msigs.get(m).and_then(|v| {

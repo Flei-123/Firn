@@ -80,7 +80,7 @@ pub fn expand_late(prog: &mut Program, dg: &mut Diags) {
     done.extend(prog.structs.iter().map(|s| s.name.clone()));
     let mut queue: Vec<(String, Instantiation)> = sema_generic::instantiations()
         .into_iter()
-        .filter(|(m, i)| !i.is_abstract && !done.contains(m))
+        .filter(|(m, i)| !i.is_abstract && !done.contains(m) && crate::sema_match::enum_by_name(m).is_none())
         .collect();
     queue.reverse();
     let mut next_id = prog.expr_count;

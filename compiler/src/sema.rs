@@ -2441,6 +2441,7 @@ constants declared before it, and '+ - * /'"
                     return t;
                 }
                 crate::generic_enum::set_hint(hint);
+                crate::generic_enum::set_site(e.id);
                 self.call(name, args, *nspan, e.span)
             }
             ExprKind::Syscall(args) => {

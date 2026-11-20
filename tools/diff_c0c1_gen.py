@@ -968,6 +968,20 @@ GENERIC_ENUM_NEG = [
 for nm, src in GENERIC_ENUM_NEG:
     emit("neg_generic_enum_" + nm, "neg", "", src, prelude=False)
 
+INFER_RUN = [
+    ("payload", "enum Opt[T] { Some(T), None }\nenum Pair[A, B] { Both(A, B), Left(A) }\nfn main() -> i32 {\n    let o = Opt::Some(4)\n    match o {\n        Opt::Some(x) => { put(x as i64) }\n        Opt::None => { put(100) }\n    }\n    let big: i64 = 40\n    let q = Opt::Some(big)\n    match q {\n        Opt::Some(x) => { put(x) }\n        Opt::None => { put(100) }\n    }\n    let w: Opt[i64] = Opt::Some(3)\n    match w {\n        Opt::Some(x) => { put(x) }\n        Opt::None => { put(100) }\n    }\n    let p = Pair::Both(1, true)\n    match p {\n        Pair::Both(a, b) => { if b { put(a as i64) } }\n        Pair::Left(a) => { put(100) }\n    }\n    return 0\n}\n"),
+    ("value_args", "fn pick[T](a: T, b: T) -> T {\n    if a > b { return a }\n    return b\n}\nfn first[T](a: T, b: i32) -> T { return a }\nfn id[T](v: T) -> T { return v }\nfn main() -> i32 {\n    let a: i64 = 5\n    put(pick(a, 9))\n    put(pick(2, 3) as i64)\n    put(first(7, 1) as i64)\n    put(id(2 + 3) as i64)\n    return 0\n}\n"),
+]
+for nm, src in INFER_RUN:
+    emit("infer_" + nm, "run", "same", src)
+
+INFER_NEG = [
+    ("enum_partial", "enum Res[T, E] { Ok(T), Err(E) }\nfn main() -> i32 {\n    let s = Res::Err(true)\n    return 0\n}\n"),
+    ("fn_partial", "fn conv[T, U](x: T) -> T { return x }\nfn main() -> i32 {\n    return conv(1)\n}\n"),
+]
+for nm, src in INFER_NEG:
+    emit("neg_infer_" + nm, "neg", "", src, prelude=False)
+
 WHERE_RUN = [
     ("bounds", "interface Area { fn area(*self) -> i64 }\nstruct Sq { s: i64 }\nimpl Area for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nfn total[T, U](a: *T, b: U) -> i64 where T: Area, U: Int {\n    return a.area() + (b as i64)\n}\nfn pick[T](a: T, b: T) -> T where T: Int + Scalar {\n    if a > b { return a }\n    return b\n}\nfn main() -> i32 {\n    let q: Sq = Sq { s: 4 }\n    put(total[Sq, i32](&q, 3 as i32))\n    put(pick[i32](5, 9) as i64)\n    return 0\n}\n"),
 ]

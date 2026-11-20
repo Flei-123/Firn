@@ -933,7 +933,8 @@ pub(crate) fn hook_call(
     }
     if let Some((ename, vname)) = name.split_once("::") {
         let hint = crate::generic_enum::take_hint();
-        return Some(check_ctor(ck, ename, vname, args, nspan, espan, hint));
+        let fallback = crate::generic_enum::take_fallback();
+        return Some(check_ctor(ck, ename, vname, args, nspan, espan, hint, fallback));
     }
     None
 }
@@ -958,8 +959,12 @@ fn check_ctor(
     nspan: Span,
     espan: Span,
     hint: Option<Type>,
+    fallback: Option<String>,
 ) -> Type {
-    let def = match enum_by_name(ename).or_else(|| instance_for_hint(ename, hint)) {
+    let def = match enum_by_name(ename)
+        .or_else(|| instance_for_hint(ename, hint))
+        .or_else(|| fallback.and_then(|n| enum_by_name(&n)))
+    {
         Some(d) => d,
         None => {
             for a in args {
