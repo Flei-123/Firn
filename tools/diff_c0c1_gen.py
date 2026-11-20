@@ -944,6 +944,25 @@ IFACE_DEFAULT_RUN = [
 for nm, src in IFACE_DEFAULT_RUN:
     emit("iface_default_" + nm, "run", "same", src)
 
+GENERIC_ENUM_RUN = [
+    ("option", "enum Opt[T] { Some(T), None }\nfn find(v: i32) -> Opt[i32] {\n    if v > 0 { return Opt::Some(v) }\n    return Opt::None\n}\nfn main() -> i32 {\n    var total: i64 = 0\n    match find(5) {\n        Opt::Some(x) => { total = total + (x as i64) }\n        Opt::None => { total = total + 100 }\n    }\n    match find(0 - 1) {\n        Opt::Some(x) => { total = total + (x as i64) }\n        Opt::None => { total = total + 1000 }\n    }\n    let c: Opt[i64] = Opt[i64]::Some(40)\n    match c {\n        Opt::Some(f) => { total = total + f }\n        Opt::None => { total = total + 1 }\n    }\n    put(total)\n    return 0\n}\n"),
+    ("result", "enum Res[T, E] { Ok(T), Err(E) }\nfn div(a: i32, b: i32) -> Res[i32, bool] {\n    if b == 0 { return Res::Err(true) }\n    return Res::Ok(a / b)\n}\nfn main() -> i32 {\n    match div(10, 2) {\n        Res::Ok(q) => { put(q as i64) }\n        Res::Err(e) => { put(0 - 1) }\n    }\n    match div(1, 0) {\n        Res::Ok(q) => { put(q as i64) }\n        Res::Err(e) => { if e { put(77) } }\n    }\n    return 0\n}\n"),
+    ("struct_payload", "struct Point { x: i32, y: i32 }\nenum Wrap[T] { Item(T), Nothing }\nfn sum(w: Wrap[Point]) -> i32 {\n    match w {\n        Wrap::Item(p) => { return p.x + p.y }\n        Wrap::Nothing => { return 0 - 1 }\n    }\n    return 0\n}\nfn main() -> i32 {\n    let p: Wrap[Point] = Wrap[Point]::Item(Point { x: 3, y: 4 })\n    put(sum(p) as i64)\n    let q: Wrap[Point] = Wrap::Nothing\n    put(sum(q) as i64)\n    return 0\n}\n"),
+    ("nested", "enum Wrap[T] { Item(T), Nothing }\nfn nested(w: Wrap[Wrap[i32]]) -> i32 {\n    match w {\n        Wrap::Item(Wrap::Item(v)) => { return v }\n        Wrap::Item(_) => { return 2 }\n        Wrap::Nothing => { return 3 }\n    }\n    return 0\n}\nfn main() -> i32 {\n    let inner: Wrap[i32] = Wrap::Item(42)\n    let outer: Wrap[Wrap[i32]] = Wrap::Item(inner)\n    put(nested(outer) as i64)\n    let outer2: Wrap[Wrap[i32]] = Wrap::Item(Wrap::Nothing)\n    put(nested(outer2) as i64)\n    return 0\n}\n"),
+]
+for nm, src in GENERIC_ENUM_RUN:
+    emit("generic_enum_" + nm, "run", "same", src)
+
+GENERIC_ENUM_NEG = [
+    ("not_exhaustive", "enum Opt[T] { Some(T), None }\nfn main() -> i32 {\n    let a: Opt[i32] = Opt::None\n    match a {\n        Opt::Some(x) => { return x }\n    }\n    return 0\n}\n"),
+    ("cannot_infer", "enum Opt[T] { Some(T), None }\nfn main() -> i32 {\n    let a = Opt::None\n    return 0\n}\n"),
+    ("arg_count", "enum Opt[T] { Some(T), None }\nfn main() -> i32 {\n    let a: Opt[i32, bool] = Opt::None\n    return 0\n}\n"),
+    ("payload_type", "enum Opt[T] { Some(T), None }\nfn main() -> i32 {\n    let a: Opt[i32] = Opt[i32]::Some(true)\n    return 0\n}\n"),
+    ("unknown_variant", "enum Opt[T] { Some(T), None }\nfn main() -> i32 {\n    let a: Opt[i32] = Opt::None\n    match a {\n        Opt::Some(x) => { return x }\n        Opt::Nothing => { return 1 }\n    }\n    return 0\n}\n"),
+]
+for nm, src in GENERIC_ENUM_NEG:
+    emit("neg_generic_enum_" + nm, "neg", "", src, prelude=False)
+
 IFACE_DEFAULT_NEG = [
     ("no_method", "interface Shape {\n    fn area(*self) -> i64\n    fn bad(*self) -> i64 {\n        return self.nothing()\n    }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
     ("required_missing", "interface Shape {\n    fn area(*self) -> i64\n    fn twice(*self) -> i64 { return self.area() * 2 }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn twice(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
