@@ -840,7 +840,6 @@ NEG = [
     ('type_static_07', 'static G: [u8; 3] = 5\nfn main() -> i32 { return 0 }\n'),
     ('type_static_08', 'static G: Foo = 5\nfn main() -> i32 { return 0 }\n'),
     ('type_static_09', 'static G: i32 = 5\nconst G: i32 = 5\nfn main() -> i32 { return 0 }\n'),
-    ('type_static_10', 'static G: [i32; 2] = [1, foo()]\nfn foo() -> i32 { return 1 }\nfn main() -> i32 { return 0 }\n'),
     ('type_unknown_01', 'struct S { a: Nope }\nfn main() -> i32 { return 0 }\n'),
     ('type_unknown_02', 'fn f(x: Nope) -> i32 { return 0 }\nfn main() -> i32 { return 0 }\n'),
     ('reg_err_01', 'fn f() -> Nope!i32 {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n'),
@@ -914,6 +913,12 @@ NEG = [
 ]
 for nm, src in NEG:
     emit("neg_" + nm, "neg", "", src, prelude=False)
+
+STATIC_RUNTIME_RUN = [
+    ("call_init", "static G: [i32; 2] = [1, foo()]\nfn foo() -> i32 { return 7 }\nfn main() -> i32 {\n    put(G[0] as i64)\n    put(G[1] as i64)\n    return 0\n}\n"),
+]
+for nm, src in STATIC_RUNTIME_RUN:
+    emit("static_runtime_" + nm, "run", "same", src)
 
 IMPL_GENERIC_RUN = [
     ("get_set", "struct Box[T] { value: T, count: i32 }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n    fn set(*mut self, v: T) {\n        (*self).value = v\n        (*self).count = (*self).count + 1\n    }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 7, count: 0 }\n    a.set(a.get() + 2)\n    put(a.get() as i64)\n    put(a.count as i64)\n    var b: Box[u8] = Box[u8] { value: 200 as u8, count: 0 }\n    b.set(b.get() + 5 as u8)\n    put(b.get() as i64)\n    return 0\n}\n"),
