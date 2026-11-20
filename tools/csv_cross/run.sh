@@ -101,11 +101,11 @@ python3 - "$ROOT/lib/std/csv.fi" "$W/badlib/std/csv.fi" "$W/badlib/std/csv2.fi" 
 import sys
 src = open(sys.argv[1]).read()
 # bug 1: a doubled quote inside a quoted field is dropped instead of kept as one quote
-a = "            if c == (*r).quote {\n                rt.buf_push(&(*r).row, c)\n                state = ST_IN_QUOTED"
+a = "                if c == (*r).quote {\n                    rt.buf_push(&(*r).row, c)\n                    state = ST_IN_QUOTED"
 assert a in src
-open(sys.argv[2], "w").write(src.replace(a, "            if c == (*r).quote {\n                state = ST_IN_QUOTED"))
+open(sys.argv[2], "w").write(src.replace(a, "                if c == (*r).quote {\n                    state = ST_IN_QUOTED"))
 # bug 2: the writer does not double a quote character inside a quoted field
-b = "            if c == (*w).quote {\n                rt.buf_push((*w).out, c)\n            }\n"
+b = "                if c == (*w).quote {\n                    rt.buf_push((*w).out, c)\n                }\n"
 assert b in src
 open(sys.argv[3], "w").write(src.replace(b, ""))
 EOF

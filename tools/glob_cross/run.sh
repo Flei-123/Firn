@@ -98,13 +98,13 @@ EOF
         echo "  counter-check '$label': caught ($(tail -1 "$W/bad.out" | sed 's/.*), //'))"
     fi
 }
-counter "hidden names matched by *" "    let sees_hidden: bool = (*c).hidden || (pattern.n > 0 && *pattern.p == G_DOT)" "    let sees_hidden: bool = true"
-counter "a class with a backwards range (Python's text cutting) answered by a plain false" "                return class_has_cut(pat, lo, hi, cp)" "                return false"
-counter "? eats one byte" "    if c == G_QUEST {
-        *used = nl
-        return pi + 1" "    if c == G_QUEST {
-        *used = 1
-        return pi + 1"
+counter "hidden names matched by *" "        let sees_hidden: bool = (*c).hidden || (pattern.n > 0 && *pattern.p == G_DOT)" "        let sees_hidden: bool = true"
+counter "a class with a backwards range (Python's text cutting) answered by a plain false" "                    return class_has_cut(pat, lo, hi, cp)" "                    return false"
+counter "? eats one byte" "        if c == G_QUEST {
+            *used = nl
+            return pi + 1" "        if c == G_QUEST {
+            *used = 1
+            return pi + 1"
 
 echo
 echo "glob_cross: $DISTINCT cases ($GLOBS glob over random trees, the rest fnmatch/escape; x4 build stages), $DIFFS differences"
