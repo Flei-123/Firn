@@ -536,6 +536,9 @@ impl<'a> Parser<'a> {
             }
             TokKind::Ident(name) => {
                 let sp = self.bump();
+                if let Some(t) = crate::assoc::hook_type(self, &name, sp) {
+                    return Some(t);
+                }
                 // Integration: type constructors that the SPEC describes but
                 // stage 0 does NOT implement report a clear error here instead
                 // of a clueless syntax error (SPEC §14 "not contained").

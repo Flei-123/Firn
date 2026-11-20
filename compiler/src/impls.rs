@@ -233,6 +233,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         return;
     }
     let mut defined: crate::fx::HashSet<String> = Default::default();
+    crate::assoc::set_impl_ty(Some(&ty));
     loop {
         while p.eat(&TokKind::Semi) {}
         if p.at(&TokKind::RBrace) || p.at_eof() {
@@ -242,6 +243,15 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             break;
         }
         let before = p.pos;
+        if crate::assoc::at_type_item(p) {
+            if !crate::assoc::impl_item(p, &first, &ty, is_for) {
+                crate::assoc::set_impl_ty(None);
+                p.recovering = false;
+                p.sync_item();
+                return;
+            }
+            continue;
+        }
         if !p.at(&TokKind::KwFn) && !p.at_unsafe_fn() {
             p.error_here(format!(
                 "expected 'fn' in an impl block, found '{}'",
@@ -268,6 +278,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             p.bump();
         }
     }
+    crate::assoc::set_impl_ty(None);
     p.close(TokKind::RBrace, "at the end of the impl block");
     p.recovering = false;
     if is_for {

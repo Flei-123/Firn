@@ -6,6 +6,7 @@
 //! `as` and `ld` get used EXCLUSIVELY as assembler/linker.
 
 mod abi;
+mod assoc;
 mod layout_attrs;
 mod fx;
 mod parcodegen;

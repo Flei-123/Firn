@@ -43,7 +43,10 @@ fn instantiate(p: &mut Parser, template: &FnDecl, name: &str, self_name: &str) -
 fn replace_self(te: &TypeExpr, self_name: &str) -> TypeExpr {
     match te {
         TypeExpr::Named(n, sp) if n == SELF_TYPE => TypeExpr::Named(self_name.to_string(), *sp),
-        TypeExpr::Named(..) => te.clone(),
+        TypeExpr::Named(n, sp) => match crate::assoc::replace_self(n, self_name) {
+            Some(path) => TypeExpr::Named(path, *sp),
+            None => te.clone(),
+        },
         TypeExpr::Ptr { mutable, inner, span } => TypeExpr::Ptr {
             mutable: *mutable,
             inner: Box::new(replace_self(inner, self_name)),

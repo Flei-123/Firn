@@ -969,6 +969,22 @@ WHERE_RUN = [
 for nm, src in WHERE_RUN:
     emit("where_" + nm, "run", "same", src)
 
+ASSOC_RUN = [
+    ("core", "interface Counter {\n    type Item\n    fn next(*mut self) -> Self::Item\n}\nstruct Up { n: i32 }\nstruct Down { n: i64 }\nimpl Counter for Up {\n    type Item = i32\n    fn next(*mut self) -> Self::Item {\n        (*self).n = (*self).n + 1\n        return (*self).n\n    }\n}\nimpl Counter for Down {\n    type Item = i64\n    fn next(*mut self) -> i64 {\n        (*self).n = (*self).n - 1\n        return (*self).n\n    }\n}\nfn two[T: Counter](c: *mut T) -> T::Item {\n    let a: T::Item = c.next()\n    let b: T::Item = c.next()\n    return b\n}\nfn main() -> i32 {\n    var u = Up { n: 0 }\n    var d = Down { n: 10 }\n    put(two[Up](&u) as i64)\n    put(two[Down](&d))\n    return 0\n}\n"),
+    ("vec", "import std.vec\ninterface Source {\n    type Item\n    fn get(*self, i: i32) -> Self::Item\n    fn size(*self) -> i32\n}\nstruct Evens { n: i32 }\nimpl Source for Evens {\n    type Item = i64\n    fn get(*self, i: i32) -> i64 { return (i as i64) * 2 }\n    fn size(*self) -> i32 { return (*self).n }\n}\nfn collect[S: Source](s: *S) -> Vec[S::Item] {\n    var out: Vec[S::Item] = vec_new[S::Item]()\n    var i = 0\n    while i < s.size() {\n        vec_push[S::Item](&out, s.get(i))\n        i = i + 1\n    }\n    return out\n}\nfn main() -> i32 {\n    let e = Evens { n: 4 }\n    var v = collect[Evens](&e)\n    put(vec_len[i64](&v) as i64)\n    put(vec_at[i64](&v, 3))\n    return 0\n}\n"),
+]
+for nm, src in ASSOC_RUN:
+    emit("assoc_" + nm, "run", "same", src)
+
+ASSOC_NEG = [
+    ("missing", "interface Counter {\n    type Item\n    fn next(*mut self) -> Self::Item\n}\nstruct Up { n: i32 }\nimpl Counter for Up {\n    fn next(*mut self) -> i32 { return 1 }\n}\nfn main() -> i32 { return 0 }\n"),
+    ("extra", "interface Counter {\n    fn next(*mut self) -> i32\n}\nstruct Up { n: i32 }\nimpl Counter for Up {\n    type Item = i32\n    fn next(*mut self) -> i32 { return 1 }\n}\nfn main() -> i32 { return 0 }\n"),
+    ("unknown_path", "interface Counter {\n    type Item\n    fn next(*mut self) -> Self::Item\n}\nstruct Up { n: i32 }\nimpl Counter for Up {\n    type Item = i32\n    fn next(*mut self) -> Self::Item { return 1 }\n}\nfn get[T: Counter](c: *mut T) -> T::Missing { return c.next() }\nfn main() -> i32 {\n    var u = Up { n: 0 }\n    let x = get[Up](&u)\n    return 0\n}\n"),
+    ("inherent", "struct Up { n: i32 }\nimpl Up {\n    type Item = i32\n    fn next(*mut self) -> i32 { return 1 }\n}\nfn main() -> i32 { return 0 }\n"),
+]
+for nm, src in ASSOC_NEG:
+    emit("neg_assoc_" + nm, "neg", "", src, prelude=False)
+
 WHERE_NEG = [
     ("unmet", "interface Area { fn area(*self) -> i64 }\nfn total[T](a: T) -> i64 where T: Area {\n    return 1\n}\nfn main() -> i32 {\n    return total[i32](3 as i32) as i32\n}\n"),
     ("unknown_param", "fn total[T](a: T) -> i64 where U: Int {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n"),

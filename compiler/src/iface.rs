@@ -147,6 +147,7 @@ thread_local! {
 
 /// Resets the registry (one per compilation, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
+    crate::assoc::reset();
     REG.with(|r| *r.borrow_mut() = Registry::default());
 }
 
@@ -270,7 +271,7 @@ pub(crate) fn is_base_ty_method(name: &str) -> bool {
 /// Does this type expression mention `Self`?
 fn names_self(te: &TypeExpr) -> bool {
     match te {
-        TypeExpr::Named(n, _) => n == "Self",
+        TypeExpr::Named(n, _) => n == "Self" || crate::assoc::is_self_path(n),
         TypeExpr::Ptr { inner, .. } => names_self(inner),
         TypeExpr::Array { elem, .. } => names_self(elem),
         // Round 58: `Self` may hide in the signature of a function value.
@@ -520,6 +521,7 @@ fn interface_decl(p: &mut Parser) {
         return;
     }
     let mut methods: Vec<Method> = Vec::new();
+    let mut assoc_names: Vec<String> = Vec::new();
     for (parent, psp) in &parents {
         inherit_methods(p, &name, parent, *psp, &mut methods);
     }
@@ -532,6 +534,14 @@ fn interface_decl(p: &mut Parser) {
             break;
         }
         let before = p.pos;
+        if crate::assoc::at_type_item(p) {
+            if !crate::assoc::interface_item(p, &name, &mut assoc_names) {
+                p.recovering = false;
+                p.sync_item();
+                return;
+            }
+            continue;
+        }
         if !p.at(&TokKind::KwFn) {
             p.error_here(format!(
                 "expected 'fn' in an interface, found '{}'",
@@ -588,6 +598,7 @@ fn interface_decl(p: &mut Parser) {
         );
         return;
     }
+    crate::assoc::declare(&name, assoc_names);
     REG.with(|r| {
         r.borrow_mut().ifaces.push(Interface {
             name,
@@ -769,6 +780,9 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
         TypeExpr::Named(n, s) => (n.as_str(), *s),
         _ => return None,
     };
+    if let Some(t) = crate::assoc::hook_resolve_ty(ck, name, span) {
+        return Some(t);
+    }
     let iface = interface_of(name)?;
     if ck.tcx.lookup(name).is_some() {
         return None; // the ordinary resolution finds the struct
@@ -855,6 +869,9 @@ fn signature(ck: &Checker, m: &Method, ptypes: &[Type], rtyp: &Type) -> String {
 fn resolve_with_self(ck: &mut Checker, te: &TypeExpr, slf: &Type) -> Type {
     match te {
         TypeExpr::Named(n, _) if n == "Self" => slf.clone(),
+        TypeExpr::Named(n, sp) if crate::assoc::is_self_path(n) => {
+            crate::assoc::resolve_self_path(ck, n, *sp)
+        }
         TypeExpr::Ptr { mutable, inner, .. } => {
             Type::ptr(resolve_with_self(ck, inner, slf), *mutable)
         }
@@ -1069,6 +1086,8 @@ fn check_impl_am(
     });
     let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
     let mut complete = true;
+    crate::assoc::set_check_ty(ty);
+    crate::assoc::check_impl_items(ck, iface, ty, span);
     for m in &methods {
         // With `Self` the types hang off THIS implementation, not off the
         // interface — which is why they are resolved here and not in step 1.

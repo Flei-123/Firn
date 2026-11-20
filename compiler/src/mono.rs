@@ -385,6 +385,9 @@ fn subst_name(
         if let Some(t) = map.get(n) {
             return Some(with_span(t, sp));
         }
+        if let Some(t) = crate::assoc::subst_path(n, sp, map) {
+            return Some(with_span(&t, sp));
+        }
         // r733: error union `E!T` inside a template (`-> AllocError!T`).
         if let Some(new) = crate::errors::pending_derive(n, |inner| subst_ty(inner, map, queue)) {
             return Some(TypeExpr::Named(new, sp));
