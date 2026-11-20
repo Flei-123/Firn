@@ -1,0 +1,745 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import rt
+import vec
+import intern
+import ast
+import diag
+import sema
+
+export { borrow_check }
+
+const NOTHING: u32 = 4294967295
+const U_ADDR: u32 = 2
+const U_DEREF: u32 = 3
+const U_INOUT: u32 = 5
+const B_ADD: u32 = 0
+const B_SUB: u32 = 1
+
+const K_USE_AFTER_INOUT: u32 = 1
+const K_PTR_AND_INOUT: u32 = 2
+const K_REF_TARGET: u32 = 3
+
+struct State {
+    ptr: Vec[u32],
+    root: Vec[u32],
+    take: Vec[u64],
+    lent: Vec[u64],
+}
+
+struct Bw {
+    sm: u64,
+    it: u64,
+    st: State,
+    f_pos: Vec[u64],
+    f_len: Vec[u32],
+    f_kind: Vec[u32],
+    f_ptr: Vec[u32],
+    f_root: Vec[u32],
+    f_take: Vec[u64],
+    f_lent: Vec[u64],
+    root_out: u32,
+    deref_out: bool,
+    refs: Vec[u32],
+    lent: Vec[u32],
+    fn_name: u32,
+}
+
+fn state_new() -> State {
+    return State { ptr: vec_new[u32](), root: vec_new[u32](), take: vec_new[u64](), lent: vec_new[u64]() }
+}
+
+fn state_free(s: *mut State) {
+    vec_free[u32](&(*s).ptr)
+    vec_free[u32](&(*s).root)
+    vec_free[u64](&(*s).take)
+    vec_free[u64](&(*s).lent)
+}
+
+fn state_clone(s: *mut State) -> State {
+    var c: State = state_new()
+    vec_copy[u32](&(*s).ptr, &c.ptr)
+    vec_copy[u32](&(*s).root, &c.root)
+    vec_copy[u64](&(*s).take, &c.take)
+    vec_copy[u64](&(*s).lent, &c.lent)
+    return c
+}
+
+fn state_replace(dst: *mut State, src: *mut State) {
+    state_free(dst)
+    (*dst) = state_clone(src)
+}
+
+fn state_find(s: *mut State, ptr: u32) -> i64 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).ptr) {
+        if vec_at[u32](&(*s).ptr, i) == ptr {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn state_kill(s: *mut State, ptr: u32) {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).ptr) {
+        if vec_at[u32](&(*s).ptr, i) == ptr {
+            vec_remove[u32](&(*s).ptr, i)
+            vec_remove[u32](&(*s).root, i)
+            vec_remove[u64](&(*s).take, i)
+            vec_remove[u64](&(*s).lent, i)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn state_push(s: *mut State, ptr: u32, root: u32, take: u64, lent: u64) {
+    vec_push[u32](&(*s).ptr, ptr)
+    vec_push[u32](&(*s).root, root)
+    vec_push[u64](&(*s).take, take)
+    vec_push[u64](&(*s).lent, lent)
+}
+
+fn state_merge(s: *mut State, other: *mut State) {
+    var i: usize = 0
+    while i < vec_len[u32](&(*other).ptr) {
+        let p: u32 = vec_at[u32](&(*other).ptr, i)
+        let r: u32 = vec_at[u32](&(*other).root, i)
+        var hit: i64 = -1
+        var k: usize = 0
+        while k < vec_len[u32](&(*s).ptr) {
+            if hit < 0 && vec_at[u32](&(*s).ptr, k) == p && vec_at[u32](&(*s).root, k) == r {
+                hit = k as i64
+            }
+            k = k + 1
+        }
+        if hit >= 0 {
+            if vec_at[u64](&(*s).lent, hit as usize) == 0 {
+                vec_set[u64](&(*s).lent, hit as usize, vec_at[u64](&(*other).lent, i))
+            }
+        } else {
+            state_push(s, p, r, vec_at[u64](&(*other).take, i), vec_at[u64](&(*other).lent, i))
+        }
+        i = i + 1
+    }
+}
+
+fn bw_new(sm: u64, it: u64) -> Bw {
+    return Bw {
+        sm: sm, it: it, st: state_new(),
+        f_pos: vec_new[u64](), f_len: vec_new[u32](), f_kind: vec_new[u32](), f_ptr: vec_new[u32](),
+        f_root: vec_new[u32](), f_take: vec_new[u64](), f_lent: vec_new[u64](),
+        root_out: NOTHING, deref_out: false,
+        refs: vec_new[u32](), lent: vec_new[u32](), fn_name: NOTHING,
+    }
+}
+
+fn bw_free(w: *mut Bw) {
+    state_free(&(*w).st)
+    vec_free[u64](&(*w).f_pos)
+    vec_free[u32](&(*w).f_len)
+    vec_free[u32](&(*w).f_kind)
+    vec_free[u32](&(*w).f_ptr)
+    vec_free[u32](&(*w).f_root)
+    vec_free[u64](&(*w).f_take)
+    vec_free[u64](&(*w).f_lent)
+    vec_free[u32](&(*w).refs)
+    vec_free[u32](&(*w).lent)
+}
+
+fn tree(w: *mut Bw) -> *mut ast.Tree { return sema.sema_tree((*w).sm as *mut sema.Sema) }
+fn names(w: *mut Bw) -> *mut intern.Interner { return (*w).it as *mut intern.Interner }
+
+fn mark_len(b: *mut ast.Tree, e: u32) -> u32 {
+    let n: u32 = ast.expr_len(b, e)
+    if n == 0 {
+        return 1
+    }
+    return n
+}
+
+fn finding(w: *mut Bw, e: u32, kind: u32, ptr: u32, root: u32, take: u64, lent: u64) {
+    let b: *mut ast.Tree = tree(w)
+    vec_push[u64](&(*w).f_pos, ast.expr_pos(b, e))
+    vec_push[u32](&(*w).f_len, mark_len(b, e))
+    vec_push[u32](&(*w).f_kind, kind)
+    vec_push[u32](&(*w).f_ptr, ptr)
+    vec_push[u32](&(*w).f_root, root)
+    vec_push[u64](&(*w).f_take, take)
+    vec_push[u64](&(*w).f_lent, lent)
+}
+
+fn place_root(w: *mut Bw, e: u32) -> bool {
+    let b: *mut ast.Tree = tree(w)
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_ID {
+        (*w).root_out = ast.e_a(b, e)
+        (*w).deref_out = false
+        return true
+    }
+    if k == ast.E_FIELD || k == ast.E_IDX {
+        return place_root(w, ast.e_a(b, e))
+    }
+    if k == ast.E_UN && ast.e_a(b, e) == U_DEREF {
+        if place_root(w, ast.e_b(b, e)) {
+            (*w).deref_out = true
+            return true
+        }
+    }
+    return false
+}
+
+fn derive(w: *mut Bw, e: u32, root: *mut u32, take: *mut u64, lent: *mut u64) -> bool {
+    let b: *mut ast.Tree = tree(w)
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_AS {
+        return derive(w, ast.e_a(b, e), root, take, lent)
+    }
+    if k == ast.E_BIN && (ast.e_a(b, e) == B_ADD || ast.e_a(b, e) == B_SUB) {
+        if derive(w, ast.e_b(b, e), root, take, lent) {
+            return true
+        }
+        return derive(w, ast.e_c(b, e), root, take, lent)
+    }
+    if k == ast.E_UN && (ast.e_a(b, e) == U_ADDR || ast.e_a(b, e) == U_INOUT) {
+        if place_root(w, ast.e_b(b, e)) && !(*w).deref_out {
+            *root = (*w).root_out
+            *take = ast.expr_pos(b, e)
+            *lent = 0
+            return true
+        }
+        return false
+    }
+    if k == ast.E_ID {
+        let i: i64 = state_find(&(*w).st, ast.e_a(b, e))
+        if i >= 0 {
+            *root = vec_at[u32](&(*w).st.root, i as usize)
+            *take = vec_at[u64](&(*w).st.take, i as usize)
+            *lent = vec_at[u64](&(*w).st.lent, i as usize)
+            return true
+        }
+    }
+    return false
+}
+
+fn use_of(w: *mut Bw, e: u32) {
+    let b: *mut ast.Tree = tree(w)
+    let i: i64 = state_find(&(*w).st, ast.e_a(b, e))
+    if i < 0 {
+        return
+    }
+    let lent: u64 = vec_at[u64](&(*w).st.lent, i as usize)
+    if lent == 0 {
+        return
+    }
+    finding(w, e, K_USE_AFTER_INOUT, ast.e_a(b, e), vec_at[u32](&(*w).st.root, i as usize), vec_at[u64](&(*w).st.take, i as usize), lent)
+}
+
+fn call(w: *mut Bw, x: u32) {
+    let b: *mut ast.Tree = tree(w)
+    let off: u32 = ast.e_b(b, x)
+    let cnt: u32 = ast.e_c(b, x)
+    var lent_root: Vec[u32] = vec_new[u32]()
+    var lent_at: Vec[u64] = vec_new[u64]()
+    var k: u32 = 0
+    while k < cnt {
+        let a: u32 = ast.child_at(b, off + k)
+        if ast.e_kind(b, a) == ast.E_UN && ast.e_a(b, a) == U_INOUT {
+            if place_root(w, ast.e_b(b, a)) {
+                vec_push[u32](&lent_root, (*w).root_out)
+                vec_push[u64](&lent_at, ast.expr_pos(b, a))
+            }
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < cnt {
+        let a2: u32 = ast.child_at(b, off + k)
+        if ast.e_kind(b, a2) == ast.E_ID {
+            let i: i64 = state_find(&(*w).st, ast.e_a(b, a2))
+            if i >= 0 {
+                let root: u32 = vec_at[u32](&(*w).st.root, i as usize)
+                var j: usize = 0
+                var hit: i64 = -1
+                while j < vec_len[u32](&lent_root) {
+                    if hit < 0 && vec_at[u32](&lent_root, j) == root {
+                        hit = j as i64
+                    }
+                    j = j + 1
+                }
+                if hit >= 0 {
+                    finding(w, a2, K_PTR_AND_INOUT, ast.e_a(b, a2), root, vec_at[u64](&(*w).st.take, i as usize), vec_at[u64](&lent_at, hit as usize))
+                }
+            }
+        }
+        k = k + 1
+    }
+    var j2: usize = 0
+    while j2 < vec_len[u32](&lent_root) {
+        var e: usize = 0
+        while e < vec_len[u32](&(*w).st.ptr) {
+            if vec_at[u32](&(*w).st.root, e) == vec_at[u32](&lent_root, j2) && vec_at[u64](&(*w).st.lent, e) == 0 {
+                vec_set[u64](&(*w).st.lent, e, vec_at[u64](&lent_at, j2))
+            }
+            e = e + 1
+        }
+        j2 = j2 + 1
+    }
+    vec_free[u32](&lent_root)
+    vec_free[u64](&lent_at)
+}
+
+fn children(w: *mut Bw, x: u32) {
+    let b: *mut ast.Tree = tree(w)
+    let a: u32 = ast.e_kind(b, x)
+    let xa: u32 = ast.e_a(b, x)
+    let xb: u32 = ast.e_b(b, x)
+    let xc: u32 = ast.e_c(b, x)
+    if a == ast.E_CALL || a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var k: u32 = 0
+        while k < xc {
+            expr(w, ast.child_at(b, xb + k))
+            k = k + 1
+        }
+    } else if a == ast.E_SLIT {
+        var m: u32 = 0
+        while m < xc {
+            expr(w, ast.child_at(b, xb + m * 2 + 1))
+            m = m + 1
+        }
+    } else if a == ast.E_IFEX {
+        expr(w, xa)
+        expr(w, xb)
+        expr(w, xc)
+    } else if a == ast.E_UN {
+        expr(w, xb)
+    } else if a == ast.E_BIN {
+        expr(w, xb)
+        expr(w, xc)
+    } else if a == ast.E_FIELD || a == ast.E_AS || a == ast.E_TEXT {
+        expr(w, xa)
+    } else if a == ast.E_IDX || a == ast.E_AWDH {
+        expr(w, xa)
+        expr(w, xb)
+    }
+}
+
+fn expr(w: *mut Bw, x: u32) {
+    let b: *mut ast.Tree = tree(w)
+    let a: u32 = ast.e_kind(b, x)
+    if a == ast.E_LAMBDA {
+        return
+    }
+    if a == ast.E_ID {
+        use_of(w, x)
+        return
+    }
+    if a == ast.E_CALL {
+        lend_args(w, x)
+    }
+    if a == ast.E_UN && (ast.e_a(b, x) == U_ADDR || ast.e_a(b, x) == U_INOUT) {
+        ref_target(w, x)
+    }
+    children(w, x)
+    if a == ast.E_CALL {
+        call(w, x)
+    }
+}
+
+fn lend_args(w: *mut Bw, x: u32) {
+    if vec_len[u32](&(*w).refs) == 0 {
+        return
+    }
+    let b: *mut ast.Tree = tree(w)
+    let callee: i64 = ast.fn_find(b, ast.e_a(b, x))
+    var k: u32 = 0
+    while k < ast.e_c(b, x) {
+        var plain: bool = false
+        if callee >= 0 {
+            plain = k >= ast.fn_plen(b, callee as usize) || ast.param_ref(b, ast.fn_poff(b, callee as usize) + k) == 0
+        }
+        if !plain {
+            vec_push[u32](&(*w).lent, ast.child_at(b, ast.e_b(b, x) + k))
+        }
+        k = k + 1
+    }
+}
+
+fn ref_target(w: *mut Bw, x: u32) {
+    if vec_len[u32](&(*w).refs) == 0 {
+        return
+    }
+    let b: *mut ast.Tree = tree(w)
+    if !place_root(w, ast.e_b(b, x)) || !(*w).deref_out {
+        return
+    }
+    if !vec_contains[u32](&(*w).refs, (*w).root_out) || vec_contains[u32](&(*w).lent, x) {
+        return
+    }
+    finding(w, x, K_REF_TARGET, (*w).root_out, (*w).fn_name, 0, 0)
+}
+
+fn bind(w: *mut Bw, name: u32, value: u32) {
+    var root: u32 = NOTHING
+    var take: u64 = 0
+    var lent: u64 = 0
+    let found: bool = derive(w, value, &root, &take, &lent)
+    state_kill(&(*w).st, name)
+    if found {
+        state_push(&(*w).st, name, root, take, lent)
+    }
+}
+
+fn looped(w: *mut Bw, cond: u32, body: u32) {
+    var before: State = state_clone(&(*w).st)
+    var round: u32 = 0
+    while round < 2 {
+        if cond != NOTHING {
+            expr(w, cond)
+        }
+        block(w, body)
+        round = round + 1
+    }
+    state_merge(&(*w).st, &before)
+    state_free(&before)
+}
+
+fn block(w: *mut Bw, bi: u32) {
+    let b: *mut ast.Tree = tree(w)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        stmt(w, ast.slist_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+}
+
+fn stmt(w: *mut Bw, s: u32) {
+    let b: *mut ast.Tree = tree(w)
+    let a: u32 = ast.s_kind(b, s)
+    if a == ast.S_LET || a == ast.S_VAR {
+        expr(w, ast.s_c(b, s))
+        bind(w, ast.s_a(b, s), ast.s_c(b, s))
+    } else if a == ast.S_ZUW {
+        expr(w, ast.s_b(b, s))
+        let t: u32 = ast.s_a(b, s)
+        if ast.e_kind(b, t) == ast.E_ID {
+            bind(w, ast.e_a(b, t), ast.s_b(b, s))
+        } else {
+            expr(w, t)
+        }
+    } else if a == ast.S_ZUWOP {
+        expr(w, ast.s_a(b, s))
+        expr(w, ast.s_b(b, s))
+    } else if a == ast.S_STEP {
+        expr(w, ast.s_a(b, s))
+    } else if a == ast.S_IF {
+        expr(w, ast.s_a(b, s))
+        var entry: State = state_clone(&(*w).st)
+        block(w, ast.s_b(b, s))
+        var after_then: State = state_clone(&(*w).st)
+        state_replace(&(*w).st, &entry)
+        if ast.s_c(b, s) != NOTHING {
+            stmt(w, ast.s_c(b, s))
+        }
+        state_merge(&(*w).st, &after_then)
+        state_free(&entry)
+        state_free(&after_then)
+    } else if a == ast.S_WHILE {
+        looped(w, ast.s_a(b, s), ast.s_b(b, s))
+    } else if a == ast.S_FOR {
+        expr(w, ast.s_b(b, s))
+        expr(w, ast.s_c(b, s))
+        looped(w, NOTHING, ast.s_d(b, s))
+    } else if a == ast.S_RET {
+        if ast.s_a(b, s) != NOTHING {
+            expr(w, ast.s_a(b, s))
+        }
+    } else if a == ast.S_EXPR {
+        expr(w, ast.s_a(b, s))
+    } else if a == ast.S_BLOCK {
+        block(w, ast.s_a(b, s))
+    } else if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        stmt(w, ast.s_a(b, s))
+    }
+}
+
+fn is_closure(w: *mut Bw, nr: u32) -> bool {
+    var prefix: [u8; 10] = "__closure#"
+    return intern.intern_prefix(names(w), nr, (&prefix[0]) as u64, 10)
+}
+
+fn check_fn(w: *mut Bw, fi: usize) {
+    let b: *mut ast.Tree = tree(w)
+    if ast.fn_extern(b, fi) != 0 || ast.fn_esc(b, fi) != 0 || is_closure(w, ast.fn_name(b, fi)) {
+        return
+    }
+    vec_clear[u32](&(*w).st.ptr)
+    vec_clear[u32](&(*w).st.root)
+    vec_clear[u64](&(*w).st.take)
+    vec_clear[u64](&(*w).st.lent)
+    vec_clear[u32](&(*w).refs)
+    vec_clear[u32](&(*w).lent)
+    (*w).fn_name = ast.fn_name(b, fi)
+    var k: u32 = 0
+    while k < ast.fn_plen(b, fi) {
+        if ast.param_ref(b, ast.fn_poff(b, fi) + k) != 0 {
+            vec_push[u32](&(*w).refs, ast.param_name(b, ast.fn_poff(b, fi) + k))
+        }
+        k = k + 1
+    }
+    block(w, ast.fn_body(b, fi))
+}
+
+fn put_name(w: *mut Bw, out: *mut rt.Buf, nr: u32) {
+    rt.buf_push_bytes(out, intern.intern_ptr(names(w), nr), intern.intern_length(names(w), nr))
+}
+
+fn put_dotted(w: *mut Bw, out: *mut rt.Buf, nr: u32) {
+    let p: u64 = intern.intern_ptr(names(w), nr)
+    let n: usize = intern.intern_length(names(w), nr)
+    var i: usize = 0
+    while i < n {
+        unsafe {
+            if i + 1 < n && *((p + i as u64) as *mut u8) == 95 as u8 && *((p + i as u64 + 1) as *mut u8) == 95 as u8 {
+                rt.buf_push(out, 46 as u8)
+                i = i + 2
+            } else {
+                rt.buf_push(out, *((p + i as u64) as *mut u8))
+                i = i + 1
+            }
+        }
+    }
+}
+
+fn put_text(out: *mut rt.Buf, s: str) {
+    unsafe { rt.buf_push_bytes(out, s.p as u64, s.n) }
+}
+
+fn put_at(out: *mut rt.Buf, pos: u64) {
+    rt.buf_push_dec_u64(out, ast.pos_line(pos) as u64)
+    rt.buf_push(out, 58 as u8)
+    rt.buf_push_dec_u64(out, ast.pos_col(pos) as u64)
+}
+
+fn build_msg(w: *mut Bw, out: *mut rt.Buf, k: usize) {
+    let kind: u32 = vec_at[u32](&(*w).f_kind, k)
+    let ptr: u32 = vec_at[u32](&(*w).f_ptr, k)
+    let root: u32 = vec_at[u32](&(*w).f_root, k)
+    if kind == K_REF_TARGET {
+        put_text(out, "a raw pointer into the target of the reference parameter '")
+        put_name(w, out, ptr)
+        put_text(out, "' cannot be created")
+        return
+    }
+    put_text(out, "the raw pointer '")
+    put_name(w, out, ptr)
+    if kind == K_USE_AFTER_INOUT {
+        put_text(out, "' is used after '")
+        put_name(w, out, root)
+        put_text(out, "' was passed as 'inout'")
+        return
+    }
+    put_text(out, "' points into '")
+    put_name(w, out, root)
+    put_text(out, "', which is also passed as 'inout' in this call")
+}
+
+fn build_note(w: *mut Bw, out: *mut rt.Buf, k: usize) {
+    let kind: u32 = vec_at[u32](&(*w).f_kind, k)
+    let ptr: u32 = vec_at[u32](&(*w).f_ptr, k)
+    let root: u32 = vec_at[u32](&(*w).f_root, k)
+    rt.buf_push(out, 39 as u8)
+    put_name(w, out, ptr)
+    if kind == K_REF_TARGET {
+        put_text(out, "' is a reference: the pointer would outlive the borrow and the caller's exclusivity ends with the call")
+        return
+    }
+    if kind == K_USE_AFTER_INOUT {
+        put_text(out, "' points into '")
+        put_name(w, out, root)
+        put_text(out, "' ('&")
+        put_name(w, out, root)
+        put_text(out, "' at ")
+        put_at(out, vec_at[u64](&(*w).f_take, k))
+        put_text(out, "); 'inout ")
+        put_name(w, out, root)
+        put_text(out, "' at ")
+        put_at(out, vec_at[u64](&(*w).f_lent, k))
+        put_text(out, " lets the callee change or reuse it, so the pointer may be stale")
+        return
+    }
+    put_text(out, "' was taken from '&")
+    put_name(w, out, root)
+    put_text(out, "' at ")
+    put_at(out, vec_at[u64](&(*w).f_take, k))
+    put_text(out, "; 'inout ")
+    put_name(w, out, root)
+    put_text(out, "' at ")
+    put_at(out, vec_at[u64](&(*w).f_lent, k))
+    put_text(out, " must be the only way to reach it")
+}
+
+fn build_help(w: *mut Bw, out: *mut rt.Buf, k: usize) {
+    let kind: u32 = vec_at[u32](&(*w).f_kind, k)
+    let ptr: u32 = vec_at[u32](&(*w).f_ptr, k)
+    let root: u32 = vec_at[u32](&(*w).f_root, k)
+    if kind == K_REF_TARGET {
+        put_text(out, "pass the place on as '&' / 'inout' argument of a function with a reference parameter, or copy the value; '#[allow_escape]' on '")
+        put_dotted(w, out, root)
+        put_text(out, "' vouches for the function")
+        return
+    }
+    if kind == K_USE_AFTER_INOUT {
+        put_text(out, "finish with '")
+        put_name(w, out, ptr)
+        put_text(out, "' before 'inout ")
+        put_name(w, out, root)
+        put_text(out, "', or take the address again after the call")
+        return
+    }
+    put_text(out, "pass only the pointer, or only 'inout', not both")
+}
+
+fn sort_findings(w: *mut Bw) {
+    var i: usize = 1
+    while i < vec_len[u64](&(*w).f_pos) {
+        var j: usize = i
+        while j > 0 && vec_at[u64](&(*w).f_pos, j - 1) > vec_at[u64](&(*w).f_pos, j) {
+            swap_findings(w, j - 1, j)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+fn swap_findings(w: *mut Bw, a: usize, c: usize) {
+    vec_swap[u64](&(*w).f_pos, a, c)
+    vec_swap[u32](&(*w).f_len, a, c)
+    vec_swap[u32](&(*w).f_kind, a, c)
+    vec_swap[u32](&(*w).f_ptr, a, c)
+    vec_swap[u32](&(*w).f_root, a, c)
+    vec_swap[u64](&(*w).f_take, a, c)
+    vec_swap[u64](&(*w).f_lent, a, c)
+}
+
+fn drop_duplicates(w: *mut Bw) {
+    var i: usize = 1
+    while i < vec_len[u64](&(*w).f_pos) {
+        if vec_at[u64](&(*w).f_pos, i) == vec_at[u64](&(*w).f_pos, i - 1) && vec_at[u32](&(*w).f_kind, i) == vec_at[u32](&(*w).f_kind, i - 1) {
+            vec_remove[u64](&(*w).f_pos, i)
+            vec_remove[u32](&(*w).f_len, i)
+            vec_remove[u32](&(*w).f_kind, i)
+            vec_remove[u32](&(*w).f_ptr, i)
+            vec_remove[u32](&(*w).f_root, i)
+            vec_remove[u64](&(*w).f_take, i)
+            vec_remove[u64](&(*w).f_lent, i)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn print_findings(w: *mut Bw) {
+    let b: *mut ast.Tree = tree(w)
+    var d: diag.Diags = diag.diag_new()
+    var files: Vec[u32] = vec_new[u32]()
+    var numbers: Vec[u32] = vec_new[u32]()
+    var sources: Vec[u64] = vec_new[u64]()
+    var lengths: Vec[u64] = vec_new[u64]()
+    var msg: rt.Buf = rt.buf_new()
+    var note: rt.Buf = rt.buf_new()
+    var help: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    var text: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < vec_len[u64](&(*w).f_pos) {
+        let pos: u64 = vec_at[u64](&(*w).f_pos, i)
+        let file: u32 = ast.pos_file(pos)
+        var nr: u32 = NOTHING
+        var k: usize = 0
+        while k < vec_len[u32](&files) {
+            if vec_at[u32](&files, k) == file {
+                nr = vec_at[u32](&numbers, k)
+            }
+            k = k + 1
+        }
+        if nr == NOTHING {
+            var fp: u64 = 0
+            var name_n: usize = 0
+            if (file as usize) < ast.file_count(b) {
+                fp = ast.file_ptr(b, file)
+                name_n = ast.file_length(b, file)
+            }
+            rt.buf_clear(&path)
+            rt.buf_push_bytes(&path, fp, name_n)
+            rt.buf_push(&path, 0 as u8)
+            rt.buf_clear(&text)
+            var sp: u64 = 0
+            var sn: usize = 0
+            if rt.read_file(rt.buf_ptr(&path), &text) {
+                sn = rt.buf_len(&text)
+                sp = rt.heap_alloc(sn + 1)
+                if sp != 0 {
+                    rt.mem_copy(sp, rt.buf_ptr(&text), sn)
+                } else {
+                    sn = 0
+                }
+            }
+            nr = diag.diag_file(&d, fp, name_n, sp, sn)
+            vec_push[u32](&files, file)
+            vec_push[u32](&numbers, nr)
+            vec_push[u64](&sources, sp)
+            vec_push[u64](&lengths, sn as u64)
+        }
+        rt.buf_clear(&msg)
+        rt.buf_clear(&note)
+        rt.buf_clear(&help)
+        build_msg(w, &msg, i)
+        build_note(w, &note, i)
+        build_help(w, &help, i)
+        diag.diag_error_note_help(&d, nr, ast.pos_line(pos), ast.pos_col(pos), vec_at[u32](&(*w).f_len, i),
+            rt.buf_ptr(&msg), rt.buf_len(&msg), rt.buf_ptr(&note), rt.buf_len(&note), rt.buf_ptr(&help), rt.buf_len(&help))
+        i = i + 1
+    }
+    var out: rt.Buf = rt.buf_new()
+    diag.diag_render(&d, &out)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    i = 0
+    while i < vec_len[u64](&sources) {
+        if vec_at[u64](&sources, i) != 0 {
+            rt.heap_free(vec_at[u64](&sources, i), vec_at[u64](&lengths, i) as usize + 1)
+        }
+        i = i + 1
+    }
+    vec_free[u32](&files)
+    vec_free[u32](&numbers)
+    vec_free[u64](&sources)
+    vec_free[u64](&lengths)
+    rt.buf_free(&msg)
+    rt.buf_free(&note)
+    rt.buf_free(&help)
+    rt.buf_free(&path)
+    rt.buf_free(&text)
+    diag.diag_free(&d)
+}
+
+fn borrow_check(sm: u64, it: u64) -> usize {
+    var w: Bw = bw_new(sm, it)
+    let b: *mut ast.Tree = tree(&w)
+    var fi: usize = 0
+    while fi < ast.fn_count(b) {
+        check_fn(&w, fi)
+        fi = fi + 1
+    }
+    sort_findings(&w)
+    drop_duplicates(&w)
+    let n: usize = vec_len[u64](&w.f_pos)
+    if n > 0 {
+        print_findings(&w)
+    }
+    bw_free(&w)
+    return n
+}

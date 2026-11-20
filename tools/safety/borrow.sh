@@ -38,10 +38,33 @@ for f in "$ROOT"/tools/safety/borrow/*.fi; do
     esac
 done
 if [ -n "${FIRNC1:-}" ]; then
-    total=$((total + 1))
-    if ! "$FIRNC1" --borrow=strict -o "$W/x" "$ROOT/tools/safety/borrow/ok_alias_retake.fi" 2>&1 | grep -qF "does not support --borrow=strict"; then
-        echo "FAIL firnc1 must refuse --borrow=strict"; fail=$((fail + 1))
-    fi
+    export FIRNLIB=$ROOT/lib
+    for f in "$ROOT"/tools/safety/borrow/*.fi; do
+        n=$(basename "$f" .fi)
+        hdr=$(head -n 1 "$f")
+        total=$((total + 1))
+        case "$hdr" in
+        *expect_error:*)
+            want=${hdr#*expect_error: }
+            pos=${want%% *}
+            text=${want#* }
+            out=$("$FIRNC1" --borrow=strict -o "$W/x1" "$f" 2>&1)
+            if echo "$out" | grep -qF -- "$text" && echo "$out" | grep -q -- "--> .*:${pos}$"; then :; else
+                echo "FAIL firnc1 $n: expected '$text' at $pos"; echo "$out" | head -4; fail=$((fail + 1))
+            fi
+            ;;
+        *expect_exit:*)
+            want=${hdr#*expect_exit: }
+            if ! "$FIRNC1" --borrow=strict -o "$W/x1" "$f" >"$W/log1" 2>&1; then
+                echo "FAIL firnc1 $n: does not compile"; head -4 "$W/log1"; fail=$((fail + 1)); continue
+            fi
+            timeout 30 "$W/x1" >/dev/null 2>&1
+            rc=$?
+            if [ "$rc" != "$want" ]; then echo "FAIL firnc1 $n: exit $rc, want $want"; fail=$((fail + 1)); fi
+            rm -f "$W/x1"
+            ;;
+        esac
+    done
 fi
 echo "borrow: $((total - fail))/$total"
 [ "$fail" = 0 ]
