@@ -963,6 +963,20 @@ GENERIC_ENUM_NEG = [
 for nm, src in GENERIC_ENUM_NEG:
     emit("neg_generic_enum_" + nm, "neg", "", src, prelude=False)
 
+WHERE_RUN = [
+    ("bounds", "interface Area { fn area(*self) -> i64 }\nstruct Sq { s: i64 }\nimpl Area for Sq {\n    fn area(*self) -> i64 { return (*self).s * (*self).s }\n}\nfn total[T, U](a: *T, b: U) -> i64 where T: Area, U: Int {\n    return a.area() + (b as i64)\n}\nfn pick[T](a: T, b: T) -> T where T: Int + Scalar {\n    if a > b { return a }\n    return b\n}\nfn main() -> i32 {\n    let q: Sq = Sq { s: 4 }\n    put(total[Sq, i32](&q, 3 as i32))\n    put(pick[i32](5, 9) as i64)\n    return 0\n}\n"),
+]
+for nm, src in WHERE_RUN:
+    emit("where_" + nm, "run", "same", src)
+
+WHERE_NEG = [
+    ("unmet", "interface Area { fn area(*self) -> i64 }\nfn total[T](a: T) -> i64 where T: Area {\n    return 1\n}\nfn main() -> i32 {\n    return total[i32](3 as i32) as i32\n}\n"),
+    ("unknown_param", "fn total[T](a: T) -> i64 where U: Int {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+    ("twice", "fn total[T: Int](a: T) -> i64 where T: Int {\n    return 1\n}\nfn main() -> i32 {\n    return 0\n}\n"),
+]
+for nm, src in WHERE_NEG:
+    emit("neg_where_" + nm, "neg", "", src, prelude=False)
+
 IFACE_DEFAULT_NEG = [
     ("no_method", "interface Shape {\n    fn area(*self) -> i64\n    fn bad(*self) -> i64 {\n        return self.nothing()\n    }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn area(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
     ("required_missing", "interface Shape {\n    fn area(*self) -> i64\n    fn twice(*self) -> i64 { return self.area() * 2 }\n}\nstruct Sq { s: i64 }\nimpl Shape for Sq {\n    fn twice(*self) -> i64 { return 1 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),

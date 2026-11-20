@@ -116,6 +116,7 @@ struct Registry {
     /// only under the qualified name.
     kept: crate::fx::HashSet<String>,
     methods: HashMap<String, Vec<String>>,
+    where_clauses: Vec<(String, Bound, Span)>,
     insts: HashMap<String, Instantiation>,
     order: Vec<String>,
     /// nesting depth while parsing a template
@@ -504,13 +505,16 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
+        let mut tparams = tparams;
         REG.with(|r| r.borrow_mut().in_template += 1);
         let decl = self.rest_of_fn(name.clone(), start);
         REG.with(|r| r.borrow_mut().in_template -= 1);
+        let clauses = REG.with(|r| std::mem::take(&mut r.borrow_mut().where_clauses));
         let decl = match decl {
             Some(d) => d,
             None => return,
         };
+        self.apply_where(&mut tparams, clauses);
         let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.fns.contains_key(&name) {
@@ -527,6 +531,52 @@ impl<'a> Parser<'a> {
                 nspan,
                 format!("generic function '{}' is already declared", name),
             );
+        }
+    }
+
+    fn where_clause(&mut self) {
+        if !matches!(self.kind(), TokKind::Ident(n) if n == "where") {
+            return;
+        }
+        self.bump();
+        loop {
+            let (pname, pspan) = match self.ident("for a type parameter in the 'where' clause") {
+                Some(x) => x,
+                None => return,
+            };
+            if !self.expect(TokKind::Colon, "after the type parameter in the 'where' clause") {
+                return;
+            }
+            loop {
+                let (bname, _) = match self.ident("for a bound in the 'where' clause") {
+                    Some(x) => x,
+                    None => return,
+                };
+                REG.with(|r| r.borrow_mut().where_clauses.push((pname.clone(), Bound::parse(&bname), pspan)));
+                if !self.eat(&TokKind::Plus) {
+                    break;
+                }
+            }
+            if !self.eat(&TokKind::Comma) || self.at(&TokKind::LBrace) {
+                break;
+            }
+        }
+    }
+
+    fn apply_where(&mut self, tparams: &mut [TyParam], clauses: Vec<(String, Bound, Span)>) {
+        for (pname, bound, span) in clauses {
+            let param = match tparams.iter_mut().find(|p| p.name == pname) {
+                Some(p) => p,
+                None => {
+                    self.dg.error(span, format!("'where' clause names '{}', which is no type parameter of the function", pname));
+                    continue;
+                }
+            };
+            if param.bounds.contains(&bound) {
+                self.dg.error(span, format!("the bound '{}' appears twice on '{}'", bound.name(), pname));
+            } else {
+                param.bounds.push(bound);
+            }
         }
     }
 
@@ -553,6 +603,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.where_clause();
         if !self.at(&TokKind::LBrace) {
             self.error_here(format!(
                 "expected '{{' at the start of the function body, found '{}'",
