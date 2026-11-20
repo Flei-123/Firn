@@ -1,7 +1,8 @@
 # Async IO (`lib/async`)
 
 One thread waits for many sockets, timers and posted work, and calls a
-function when something is ready. Callback API, no `async`/`await`. Built for
+function when something is ready. Callback API; `async fn` / `.await` on top
+of it (section "async fn and .await" below). Built for
 programs like FleiLauncher: a window that must stay responsive while it
 downloads, talks to a server over TLS and keeps a WebSocket open.
 
@@ -201,3 +202,56 @@ build level; 2122 takes 17 s of the `--no-opt` level).
 * `tests/2867_async_epoll_flags.fi`; `tools/net/epoll.sh` diffs its output against Python `select.epoll` /
   `select.poll` (12 lines, 3 build stages). Loopback TCP only.
 * Capturing closures as callbacks: `async.fnpin` keeps the closure record alive (see docs/CLOSURES.md).
+
+## async fn and .await (r1563, 20.11.2026)
+
+Inventory before this round: `async.loop`, `stream`, `ahttp`, `wsc`, `adns`,
+`post` were callback-only (`fn(.., ud: u64)`); `fnpin` kept capturing closures
+alive; there was no future type. SPEC section 7 had decided against an
+`async` colour; the Boss reversed that for r1563 (additive, no existing
+program changes meaning).
+
+```
+import async.loop
+import async.fut
+
+async fn add_later(l: *mut loop.Loop, a: i32, b: i32, ms: i64) -> i32 {
+    let w: bool = fut.sleep_ms(l, ms).await
+    return a + b
+}
+
+async fn total(l: *mut loop.Loop) -> i32 {
+    let fa: *mut Fut[i32] = add_later(l, 1, 2, 30)     // starts at once
+    let fb: *mut Fut[i32] = add_later(l, 3, 4, 10)     // runs in parallel
+    let x: i32 = fa.await
+    let y = fb.await                                     // type from `fb`
+    return x * 10 + y
+}
+
+let r: i32 = fut.block_on[i32](&l, total(&l))
+```
+
+* `async fn f(..) -> T` is a function returning `*mut Fut[T]` (`lib/async/fut.fi`). The call runs the body
+  up to the first unfinished `.await` and returns the future; later steps run from the loop (timer / watch callbacks).
+* `Fut[T]`: `done`, value, ONE waiter. `fut_new/fut_set/fut_ready/fut_wait/fut_take`, `sleep_ms(l, ms)`,
+  `block_on[T](l, f)` (runs `loop.run_once` until done), `block_on_unit`. `fut_take` / `.await` consume the future.
+  Futures start eagerly, so `let a = f(); let b = g(); a.await; b.await` is the join.
+* Lowering (firnc0, `compiler/src/asyncfn.rs`, at the end of module parsing, before mono/sema; no backend change):
+  the body is cut at the top-level `.await` statements into segments; each segment becomes `fn __af_NAME_sK(fr) -> T`,
+  the frame is a tracked heap struct (`std.gcobj`, scanned by the collector) holding the parameters, the awaited
+  futures and every local that a LATER segment mentions; the driver `__af_NAME_run(ud)` runs the current segment and
+  either completes the future or registers itself as the waiter of the awaited one. Locals are reloaded from the
+  frame at the start of a segment and stored at its end (no renaming of user code; user statements keep their spans).
+* Allowed await positions (top level of the async body): `let|var x[: T] = e.await`, `x = e.await`, `e.await`,
+  `return e.await`. The result type comes from the annotation, or from `e` when it is a call of an `async fn` /
+  `-> *mut Fut[T]` function of the same module, or a variable declared `*mut Fut[T]`; otherwise error with help.
+  A local used after an `.await` needs a type (`let x: T`).
+* Errors: `.await` outside an `async fn`; `.await` inside `if`/`while`/`for`/a sub-expression ("not supported in
+  this position"); async fn without result type, with `&`/`inout`/default parameters.
+* HONEST limits: no `.await` inside control flow or nested expressions yet; no `defer`/`?` across an await; pointers to
+  locals must not live across an await; one waiter per future (no `select`/`race`/`join_all` yet); a future that is
+  never awaited or taken leaks its cell; passing `&local` into an async fn trips the escape check on purpose
+  (the frame outlives the caller: `#[allow_escape]` on the caller); firnc1 does not know `async` (parse error,
+  roadmap); the HTTP/WebSocket clients have no `Fut` adapters yet; generic and `impl` async fns are not done.
+* Tests: `tests/6770_async_basic.fi` (parallel timers, three await forms), `tests/6771_async_locals.fi`
+  (locals, `var`, assign form, discard form, early return, no-await async fn), `tests/neg/async_await_{outside,nested,untyped}.fi`.

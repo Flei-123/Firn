@@ -1,6 +1,6 @@
 # Design note: async/await in Firn
 
-Status: design, not implemented. Date 2026-11-12.
+Status: superseded 2026-11-20 by r1563: `async fn`/`.await` implemented as a state-machine lowering (docs/ASYNC.md). Rest of this note is the older plan. Date 2026-11-12.
 
 ## Decision already taken
 

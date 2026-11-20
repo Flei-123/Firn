@@ -30,7 +30,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `ws/ws.fi` | WebSocket codec + client (ws://, wss://)
 - `tls/tls.fi` (client 1.3/1.2), `tls/tls_server.fi`, `tls/x509.fi`, `tls/trust.fi` | TLS, certs, system roots
 - `net/dns.fi`, `net/dnsd.fi`, `net/addrinfo.fi`, `net/tcp.fi`, `net/udp.fi`, `net/idn.fi`, `net/ip6.fi` | DNS, sockets
-- `async/loop.fi` | event loop (fds, timers) | `async/ahttp.fi` async HTTP, `async/adns.fi`, `async/wsc.fi`
+- `async/loop.fi` | event loop (fds, timers) | `async/ahttp.fi` async HTTP, `async/adns.fi`, `async/wsc.fi` | `async/fut.fi` `Fut[T]` + `block_on` + `sleep_ms` for `async fn`/`.await` (docs/ASYNC.md)
 - `mdns/`, `ssdp/`, `webdav/`, `bluetooth/`, `cast/` | discovery, WebDAV, BT, casting
 
 ## Data (lib/db, lib/parquet)

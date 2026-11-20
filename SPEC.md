@@ -661,7 +661,8 @@ Unicode tables from the UCD, CLDR data.
   and `Arc[T]` style values, not on DOM nodes. That restriction is a consequence
   of the GC decision and it stands here so that it is known when the layout is
   designed, and not first while debugging.
-* **No `async`/`await` as a language colour** (revised 2026-08-14, justified in
+* **`async fn` / `.await` (added 2026-11-20, r1563, docs/ASYNC.md; overrides the next paragraph for this feature).**
+  **No `async`/`await` as a language colour** (revised 2026-08-14, justified in
   detail in `DESIGN_GOALS.md` 1). An `async` marking colours every caller and
   tears the ecosystem apart -- which is why there are two incompatible I/O
   worlds in Rust. Firn adopts **Zig's model from 0.16** instead:

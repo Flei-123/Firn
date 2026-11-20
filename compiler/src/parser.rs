@@ -2453,6 +2453,11 @@ compute it",
         out
     }
 
+    pub(crate) fn at_async_fn(&self) -> bool {
+        matches!(self.kind(), TokKind::Ident(w) if w == "async")
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn))
+    }
+
     pub(crate) fn at_unsafe_fn(&self) -> bool {
         matches!(self.kind(), TokKind::Ident(w) if w == "unsafe")
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::KwFn))
@@ -2466,6 +2471,10 @@ compute it",
     fn fn_decl(&mut self, prog: &mut Program) {
         let is_const = self.at_const_fn();
         if is_const {
+            self.bump();
+        }
+        let is_async = self.at_async_fn();
+        if is_async {
             self.bump();
         }
         let is_unsafe = matches!(self.kind(), TokKind::Ident(w) if w == "unsafe");
@@ -2512,7 +2521,10 @@ compute it",
         } else {
             None
         };
-        let attrs = std::mem::take(&mut self.pending_attrs);
+        let mut attrs = std::mem::take(&mut self.pending_attrs);
+        if is_async {
+            attrs.push(Attr { name: crate::asyncfn::MARKER.to_string(), args: Vec::new(), span: start });
+        }
         // **Round 75** — `extern fn` (SPEC §14.5): a declaration WITHOUT a
         // body, closed with ';' instead of a block. The link name comes
         // from `#[link_name(c_symbol)]` if present, otherwise the bare
@@ -2949,7 +2961,7 @@ compute it",
                     prog.comptime_blocks.push((b, sp));
                 }
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
-                _ if self.at_unsafe_fn() => self.fn_decl(&mut prog),
+                _ if self.at_unsafe_fn() || self.at_async_fn() => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst if self.at_const_fn() => self.fn_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
@@ -3414,7 +3426,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         ref_params: Vec::new(),
         infer_len_ok: false,
     };
-    let prog = p.program();
+    let mut prog = p.program();
+    crate::asyncfn::expand(&mut prog, p.dg);
     if !p.hoist.is_empty() {
         // f"..." at ITEM level (say in a `const`): there is no
         // statement in front of which the text segments could be hoisted.
