@@ -123,6 +123,7 @@ mod opt;
 mod panic_rt;
 mod panic_rt_a64;
 mod lock;
+mod edition;
 mod package;
 mod package_pin;
 mod package_world;
@@ -355,6 +356,7 @@ fn usage() -> String {
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
          --unsafe=<m>       off | warn | error (raw pointer deref/cast outside 'unsafe', default off)\n  \
          --unsafe-scope=<p> enforce --unsafe only in files whose path contains <p> (repeatable; default: all files)\n  \
+         --edition=<year>   language edition (default: the newest; unknown ones are refused)\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
          --gc-runtime=<p>   default | certus (Certus collector rounds: perm realm, step hook, chunk arena, parallel mark)\n  \
          --gc-cards         card-mark checks in the write barrier (implies --gc-runtime=certus)\n  \
@@ -476,6 +478,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     Some(m) => unsafety::set_mode(m),
                     None => return Err(format!("unknown unsafe mode '{}' (allowed: {})", v, unsafety::ALLOWED)),
                 }
+            }
+            _ if a.starts_with("--edition=") => {
+                edition::flag_set(&a["--edition=".len()..])?;
             }
             _ if a.starts_with("--ownership=") => {
                 let v = &a["--ownership=".len()..];
@@ -855,6 +860,9 @@ fn run(opts: &Options) -> i32 {
             (w, p, None)
         }
     };
+    if let Some(root) = world.packages.first() {
+        edition::manifest_set(&root.manifest.edition);
+    }
     let path = &input;
     if let Err(e) = pgo::finish_config(opts.output.as_deref(), path).and_then(|_| pgo::check_target()) {
         eprintln!("error: {}", e);

@@ -24,6 +24,8 @@
 //! ```text
 //! package      demo            # required, exactly once
 //! version      0.1.0           # required, exactly once, num.num.num
+//! edition      2026            # at most once; without it the newest
+//!                              #      edition counts (docs/STABILITY.md)
 //! start        src/main.fi     # at most once, relative to the manifest;
 //!                              #      a library has none
 //! source       src             # 0..n, relative; without it the
@@ -69,6 +71,7 @@ pub struct Dependency {
 pub struct Manifest {
     pub name: String,
     pub version: String,
+    pub edition: String,
     /// Entry point. EMPTY means: the package is a library and cannot be built
     /// with `--package`.
     pub start: String,
@@ -320,6 +323,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
     let mut has_name = false;
     let mut has_version = false;
     let mut has_start = false;
+    let mut has_edition = false;
     let mut nr = 0u32;
     for raw in text.split('\n') {
         nr += 1;
@@ -365,6 +369,17 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                 }
                 m.version = w[1].to_string();
                 has_version = true;
+            }
+            "edition" => {
+                if w.len() != 2 {
+                    return Err(err("'edition' expects exactly one edition"));
+                }
+                if has_edition {
+                    return Err(err("'edition' appears more than once in the manifest"));
+                }
+                crate::edition::check(w[1]).map_err(|msg| err(&msg))?;
+                m.edition = w[1].to_string();
+                has_edition = true;
             }
             "start" => {
                 if w.len() != 2 {
@@ -458,7 +473,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             other => {
                 return Err(err(&format!(
-                    "unknown key '{}' (allowed: package, version, start, source, public, needs)",
+                    "unknown key '{}' (allowed: package, version, edition, start, source, public, needs)",
                     other
                 )));
             }
@@ -493,6 +508,9 @@ pub fn info_text(m: &Manifest, root: &str) -> String {
     let mut s = String::new();
     s.push_str(&format!("package {}\n", m.name));
     s.push_str(&format!("version {}\n", m.version));
+    if !m.edition.is_empty() {
+        s.push_str(&format!("edition {}\n", m.edition));
+    }
     s.push_str(&format!("root {}\n", w));
     if !m.start.is_empty() {
         s.push_str(&format!("start {}\n", join(&w, &m.start)));
@@ -710,5 +728,19 @@ mod tests {
             "package app\nversion 0.2.0\nroot example/app\nstart example/app/src/main.fi\n\
              source example/app/src\npublic app\nneeds geo example/geo\n"
         );
+    }
+
+    #[test]
+    fn edition_key() {
+        let x = m("package demo\nversion 0.1.0\nedition 2026\n");
+        assert_eq!(x.edition, "2026");
+        assert_eq!(m("package demo\nversion 0.1.0\n").edition, "");
+        let e = read("package demo\nversion 0.1.0\nedition 1999\n").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert_eq!(e.msg, "unknown edition '1999' (supported: 2026)");
+        assert!(read("package demo\nversion 0.1.0\nedition\n").is_err());
+        assert!(read("package demo\nversion 0.1.0\nedition 2026\nedition 2026\n").is_err());
+        let info = info_text(&x, "/p");
+        assert!(info.contains("edition 2026\nroot /p\n"));
     }
 }
