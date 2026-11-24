@@ -18,6 +18,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/dialog.fi`, `std/clipboard.fi`, `std/toast.fi` | native dialogs, clipboard, notifications (use via `services` in apps)
 - `std/tostr.fi` | `x.to_str()` on i8..i64, u8..u64, isize, usize, f32, f64, bool (shortest round-trip floats, same text as f-strings) | `import std.tostr`, `let s: str = n.to_str()`
 - `std/parse.fi` | C#-style parsing into error unions `ParseError!T` (Empty, Invalid, Overflow) and `try_*` with an out pointer | `parse.to_i32(s) catch 0`, `parse.try_f64(s, &x)`
+- `std/format.fi` | numbered placeholders `{0}` `{1}` (`{{` `}}` literal braces) for `str` arguments, 0 to 5 arguments | `import std.format`, `format.format2("{0}-{1}", a.to_str(), b.to_str())`
 - `std/testkit.fi` | assertions for `#[test]`
 - `std/derive.fi` | runtime of `#[derive(Debug, Eq, Ord, Hash, Clone, Default)]` (docs/DERIVE.md): interfaces Debug/Hash/Clone for scalars, str helpers | `#[derive(Debug, Eq)] struct P { x: i32 }`, `p.debug()`
 - `std/mock.fi` | spies with scripted returns, argument asserts, ordered call log | `mock.spy_call2(mock.spy_from_ctx(ctx), a, b)`, `mock.assert_calls(&spy, 2)`, `mock.assert_log(&log, "a,b")`

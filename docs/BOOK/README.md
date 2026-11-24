@@ -11,6 +11,7 @@ Every example marked `firn run`, `firn build` or `firn test` is compiled by `bas
 5. [Errors](tutorial/05-errors.md)
 6. [Libraries](tutorial/06-libraries.md)
 7. [Building and testing](tutorial/07-building.md)
+8. [Coming from C#](tutorial/08-from-csharp.md)
 
 ## Cookbook
 
