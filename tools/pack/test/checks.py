@@ -363,6 +363,10 @@ def body(tmp):
     except common.PackError:
         ok(True, "a second icon is refused")
     ok(common.is_pe(patched), "still a PE file")
+    manifest_xml = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"></assembly>\n'
+    with_manifest = win.pe_set_icon(exe, common.read(j("icons", "hello.ico")), manifest_xml)
+    ok(win.pe_manifest(with_manifest) == manifest_xml, "the manifest reads back byte for byte")
+    ok(win.pe_icons(with_manifest) == win.pe_icons(patched), "the icons survive a manifest")
     # each RT_ICON data is the PNG of its size
     # the headers: the new section is last, the image size grew
     pe = struct.unpack_from("<I", patched, 60)[0]

@@ -232,12 +232,11 @@ def pe_set_icon(exe_bytes, ico_bytes, manifest=None):
     tree += dir_node([(1, HIGH | group_name_off)])
     if m:
         tree += dir_node([(1, HIGH | man_name_off)])
+        tree += dir_node([(0x0409, man_data_entry_off)])
     # name dirs: one language (0x0409 English US; 0 would be "neutral" -- both are found)
     for i in range(n):
         tree += dir_node([(0x0409, data_entry_off[i])])
     tree += dir_node([(0x0409, group_data_entry_off)])
-    if m:
-        tree += dir_node([(0x0409, man_data_entry_off)])
     # data layout
     cursor = data_off
     datas = []
@@ -274,9 +273,7 @@ def pe_set_icon(exe_bytes, ico_bytes, manifest=None):
     return bytes(d)
 
 
-def pe_icons(exe_bytes):
-    """Read the icon sizes back: -> list of (w, h) in the group icon, or None."""
-    d = exe_bytes
+def _rsrc_walker(d):
     pe = struct.unpack_from("<I", d, 60)[0]
     coff = pe + 4
     nsec, = struct.unpack_from("<H", d, coff + 2)
@@ -289,7 +286,6 @@ def pe_icons(exe_bytes):
     secs = []
     for i in range(nsec):
         o = sect + 40 * i
-        name = d[o:o + 8].rstrip(b"\0")
         vsz, va, rsz, rptr = struct.unpack_from("<IIII", d, o + 8)
         secs.append((va, max(vsz, rsz), rptr))
 
@@ -306,27 +302,43 @@ def pe_icons(exe_bytes):
 
     def follow(v):
         return base + (v & 0x7FFFFFFF)
-    root = entries(base)
-    ids = dict((rid, v) for rid, v in root)
-    if 14 not in ids or 3 not in ids:
+
+    def first_data(type_id):
+        ids = dict(entries(base))
+        if type_id not in ids:
+            return None
+        name_dir = entries(follow(ids[type_id]))[0][1]
+        data_entry = entries(follow(name_dir))[0][1]
+        rva_, size_, _, _ = struct.unpack_from("<IIII", d, base + data_entry)
+        return d[off_of(rva_):off_of(rva_) + size_]
+
+    def name_ids(type_id):
+        return set(rid for rid, _ in entries(follow(dict(entries(base))[type_id])))
+    return first_data, name_ids
+
+
+def pe_manifest(exe_bytes):
+    """Read the embedded RT_MANIFEST back: -> bytes, or None."""
+    walker = _rsrc_walker(exe_bytes)
+    return walker[0](24) if walker else None
+
+
+def pe_icons(exe_bytes):
+    """Read the icon sizes back: -> list of (w, h) in the group icon, or None."""
+    walker = _rsrc_walker(exe_bytes)
+    if not walker:
         return None
-    sizes = []
-    # RT_GROUP_ICON -> name -> language -> data entry
-    g = entries(follow(ids[14]))[0][1]
-    g = entries(follow(g))[0][1]
-    rva_, size_, _, _ = struct.unpack_from("<IIII", d, base + g)
-    gdata = d[off_of(rva_):off_of(rva_) + size_]
+    first_data, name_ids = walker
+    gdata = first_data(14)
+    if gdata is None or first_data(3) is None:
+        return None
     cnt, = struct.unpack_from("<H", gdata, 4)
-    for i in range(cnt):
-        w, h = gdata[6 + 14 * i], gdata[7 + 14 * i]
-        sizes.append((w or 256, h or 256))
-    # every referenced RT_ICON must exist and look like PNG or a BMP header
-    icon_ids = set(rid for rid, _ in entries(follow(ids[3])))
+    icon_ids = name_ids(3)
     for i in range(cnt):
         iid, = struct.unpack_from("<H", gdata, 6 + 14 * i + 12)
         if iid not in icon_ids:
             return None
-    return sizes
+    return [(gdata[6 + 14 * i] or 256, gdata[7 + 14 * i] or 256) for i in range(cnt)]
 
 
 # --------------------------------------------------------------- NSIS
