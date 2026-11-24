@@ -130,7 +130,10 @@ fn main() -> i32 {
     }
     let first: char = 'h'
     io.print_line(codes)
-    io.print_line(chars.count(text).to_str() + " " + first.char_str() + " " + chars.to_upper(first).char_str() + " " + chars.at(text, 1).char_str())
+    let total: usize = chars.count(text)
+    let upper: char = chars.to_upper(first)
+    let second: char = chars.at(text, 1)
+    io.print_line(total.to_str() + " " + first.char_str() + " " + upper.char_str() + " " + second.char_str())
     return 0
 }
 ```
@@ -143,3 +146,4 @@ fn main() -> i32 {
 - `char` is `u32`, so `c.to_str()` is the number; `c.char_str()` is the text.
 - `for c in s.chars()` does not exist: a `for` loop needs an array variable. Use `chars.iter` and `chars.next`.
 - `chars.count(s)` counts characters, `s.length()` counts bytes.
+- A method needs a named receiver: `let n = chars.count(s)` first, then `n.to_str()`.
