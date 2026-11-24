@@ -10,6 +10,7 @@ mod assoc;
 mod asyncfn;
 mod asyncfn_hoist;
 mod match_cover;
+mod darwin;
 mod layout_attrs;
 mod fx;
 mod parcodegen;
@@ -359,6 +360,7 @@ fn usage() -> String {
                               | x86_64-windows (a PE/COFF .exe, round WINDOWS)\n  \
                               | x86_64-none | aarch64-none (freestanding:\n  \
                               no operating system, ELF object, no syscall)\n  \
+                              | aarch64-macos | x86_64-macos (Mach-O via clang + ld64.lld)\n  \
                               | x86_64-android | aarch64-android (with --pic -c,\n  \
                                 packed by tools/android/build.sh)\n  \
          --win-subsystem=<s> console (default) | windows (no console window)\n  \
@@ -1620,6 +1622,8 @@ fn finish(
     tm: &mut Timings,
 ) -> i32 {
     let mut object = object;
+    let darwin_text = asm.filter(|_| target::macos()).map(darwin::translate);
+    let asm = darwin_text.as_deref().or(asm);
     if let Some(h) = &opts.header {
         let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or(brand::CLI);
         let guard: String = format!("{}_{}_H", brand::ENV_PREFIX, stem)
@@ -1945,6 +1949,9 @@ fn assemble_intern(text: &str, obj: &Path) -> Result<(), i32> {
 
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
+    if target::macos() {
+        return darwin::tools::assemble(asm, obj);
+    }
     if asm_intern::get() {
         return match std::fs::read_to_string(asm) {
             Ok(text) => assemble_intern(&text, obj),
@@ -1999,6 +2006,9 @@ fn check_link(link: &buildcache::LinkInfo) -> Result<(), i32> {
 
 fn link_executable(obj: &Path, out: &Path, link: &buildcache::LinkInfo) -> Result<(), i32> {
     let t = target::active();
+    if target::macos() {
+        return darwin::tools::link(obj, out);
+    }
     // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
     // puts everything into ONE loadable segment. That was free as long as
     // a Firn program had nothing but `.text` and `.rodata`: one segment,

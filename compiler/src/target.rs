@@ -60,6 +60,8 @@ impl Target {
     pub fn name(self) -> &'static str {
         match self {
             Target::X86_64 if windows() => "x86_64-windows",
+            Target::X86_64 if macos() => "x86_64-macos",
+            Target::Aarch64 if macos() => "aarch64-macos",
             Target::X86_64 => "x86_64-linux",
             Target::Aarch64 => "aarch64-linux",
             Target::Wasm32Browser => "wasm32-browser",
@@ -96,6 +98,7 @@ impl Target {
             // and a PE image cannot be built out of ELF objects -- the COFF
             // port of the same binutils does the job (compiler/src/win.rs).
             Target::X86_64 if windows() => "x86_64-w64-mingw32-as",
+            Target::X86_64 | Target::Aarch64 if macos() => "clang",
             Target::X86_64 | Target::X86_64None => "as",
             Target::Aarch64 | Target::Aarch64None => "aarch64-linux-gnu-as",
             Target::Wasm32Browser => "",
@@ -113,6 +116,7 @@ impl Target {
     pub fn linker(self) -> &'static str {
         match self {
             Target::X86_64 if windows() => "x86_64-w64-mingw32-ld",
+            Target::X86_64 | Target::Aarch64 if macos() => "ld64.lld",
             Target::X86_64 | Target::X86_64None => "ld",
             Target::Aarch64 | Target::Aarch64None => "aarch64-linux-gnu-ld",
             Target::Wasm32Browser => "",
@@ -160,6 +164,11 @@ thread_local! {
     /// convention at the outer boundary (win.rs) and the system calls,
     /// which go to the seam written in Firn (win_seam.rs).
     static WINDOWS: Cell<bool> = const { Cell::new(false) };
+    static MACOS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn macos() -> bool {
+    MACOS.with(|m| m.get())
 }
 
 /// Is this a Windows build (`--target=x86_64-windows`)?
@@ -260,6 +269,7 @@ pub fn reloc_rodata() -> &'static str {
 pub fn flag_set(name: &str) -> Result<(), String> {
     let mut on_android = false;
     let mut on_windows = false;
+    let mut on_macos = false;
     let t = match name {
         "x86_64-linux" | "x86-64-linux" | "x86_64" => Target::X86_64,
         "aarch64-linux" | "arm64-linux" | "aarch64" => Target::Aarch64,
@@ -284,9 +294,17 @@ pub fn flag_set(name: &str) -> Result<(), String> {
             on_windows = true;
             Target::X86_64
         }
+        "aarch64-macos" | "arm64-macos" | "aarch64-apple-darwin" => {
+            on_macos = true;
+            Target::Aarch64
+        }
+        "x86_64-macos" | "x86_64-apple-darwin" => {
+            on_macos = true;
+            Target::X86_64
+        }
         other => {
             return Err(format!(
-                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android, x86_64-windows, x86_64-none, aarch64-none)",
+                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android, x86_64-windows, x86_64-none, aarch64-none, aarch64-macos, x86_64-macos)",
                 other
             ))
         }
@@ -294,6 +312,7 @@ pub fn flag_set(name: &str) -> Result<(), String> {
     ACTIVE.with(|a| a.set(t));
     ANDROID.with(|a| a.set(on_android));
     WINDOWS.with(|w| w.set(on_windows));
+    MACOS.with(|m| m.set(on_macos));
     Ok(())
 }
 
@@ -311,6 +330,8 @@ pub fn platform_dir() -> &'static str {
         "@web"
     } else if android() {
         "@android"
+    } else if macos() {
+        "@macos"
     } else if windows() {
         // Round PACK: a window program for Windows needs the Win32 back end
         // and a font from C:\Windows\Fonts, not the X11 pair that "@linux"
@@ -350,6 +371,7 @@ pub(crate) struct State {
     shared: bool,
     android: bool,
     windows: bool,
+    macos: bool,
 }
 
 /// The switches of the calling thread.
@@ -361,6 +383,7 @@ pub(crate) fn state() -> State {
         shared: SHARED.with(|a| a.get()),
         android: ANDROID.with(|a| a.get()),
         windows: WINDOWS.with(|a| a.get()),
+        macos: MACOS.with(|a| a.get()),
     }
 }
 
@@ -372,6 +395,7 @@ pub(crate) fn set_state(s: State) {
     SHARED.with(|a| a.set(s.shared));
     ANDROID.with(|a| a.set(s.android));
     WINDOWS.with(|a| a.set(s.windows));
+    MACOS.with(|a| a.set(s.macos));
 }
 
 /// Reset — only for the module tests, which compile several programs in one
@@ -383,6 +407,7 @@ pub fn reset() {
     SHARED.with(|p| p.set(false));
     ANDROID.with(|a| a.set(false));
     WINDOWS.with(|w| w.set(false));
+    MACOS.with(|w| w.set(false));
 }
 
 #[cfg(test)]
@@ -412,6 +437,22 @@ mod tests {
         flag_set("aarch64-linux").unwrap();
         assert_eq!(active(), Target::Aarch64);
         assert_eq!(align(8), ".balign 8");
+        reset();
+    }
+
+    #[test]
+    fn macos_targets_are_known_and_use_the_llvm_tools() {
+        reset();
+        flag_set("aarch64-macos").unwrap();
+        assert_eq!(active(), Target::Aarch64);
+        assert!(macos());
+        assert_eq!(active().name(), "aarch64-macos");
+        assert_eq!(active().linker(), "ld64.lld");
+        assert_eq!(platform_dir(), "@macos");
+        flag_set("x86_64-macos").unwrap();
+        assert_eq!(active().name(), "x86_64-macos");
+        flag_set("x86_64-linux").unwrap();
+        assert!(!macos());
         reset();
     }
 

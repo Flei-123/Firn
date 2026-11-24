@@ -12,6 +12,7 @@ pub fn set(v: bool) {
 fn default_on() -> bool {
     target::active() == target::Target::X86_64
         && !target::windows()
+        && !target::macos()
         && std::env::var_os("FIRN_USE_AS").is_none()
 }
 
