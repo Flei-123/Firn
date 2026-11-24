@@ -9,6 +9,8 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `int.Parse(s)` | `parse.to_i32(s) catch 0` (`import std.parse`) |
 | `int.TryParse(s, out n)` | `parse.try_i32(s, &n)` |
 | `string.Format("{0} + {1}", a, b)` | `format.format2("{0} + {1}", a.to_str(), b.to_str())` (`import std.format`) |
+| `char c = 'a';` | `let c: char = 'a'` |
+| `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
 | `$"x = {x}"` | `f"x = {x}"` wrapped in `io.fmt_string(...)` |
 
 ## ToString
@@ -109,3 +111,35 @@ firn has 7 apples, 14 pears, 2.50 units
 
 - `f"..."` builds a `Fmt`, not a `str`; `io.fmt_string` turns it into a `str`.
 - Format specs follow Python: `{x:>8}`, `{x:08.3f}`, `{x:x}`.
+
+## Characters
+
+`char` is a second spelling of `u32` (the Unicode scalar value), `'a'` and `'\u{1F600}'` are character literals.
+
+```firn run
+import std.io
+import std.chars
+import std.tostr
+
+fn main() -> i32 {
+    let text: string = "h\u00e9llo \u20ac"
+    var it: chars.CharIter = chars.iter(text)
+    var codes: str = ""
+    while chars.next(&it) {
+        codes = codes + it.cp.to_str() + " "
+    }
+    let first: char = 'h'
+    io.print_line(codes)
+    io.print_line(chars.count(text).to_str() + " " + first.char_str() + " " + chars.to_upper(first).char_str() + " " + chars.at(text, 1).char_str())
+    return 0
+}
+```
+
+```output
+104 233 108 108 111 32 8364 
+7 h H é
+```
+
+- `char` is `u32`, so `c.to_str()` is the number; `c.char_str()` is the text.
+- `for c in s.chars()` does not exist: a `for` loop needs an array variable. Use `chars.iter` and `chars.next`.
+- `chars.count(s)` counts characters, `s.length()` counts bytes.

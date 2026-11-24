@@ -318,6 +318,7 @@ pub fn alias_of(name: &str) -> Option<&'static str> {
         "byte" => "u8",
         "ushort" => "u16",
         "uint" => "u32",
+        "char" => "u32",
         "ulong" => "u64",
         "double" => "f64",
         "float" => "f32",

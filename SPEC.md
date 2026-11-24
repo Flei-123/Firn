@@ -1384,6 +1384,23 @@ brackets a line break has never ended anything and still does not. Proof:
   Java and Go. It was held back in round 70 on purpose, so that it would not
   first mean `f64` and then something else.
 
+  **ROUND 89 (C# comfort): `char` and character literals.** `char` is the
+  last name of the family and means `u32`, the Unicode scalar value: an
+  **alias, not a new type** (`let c: char = 'a'` and `let c: u32 = 97` are the
+  same). A character literal is `'` + ONE character or escape + `'`:
+  `'a'`, `'\u00e9'`, `'é'`, `'\u{1F600}'`, and the escapes `\n \r \t \0 \\ \' \"`.
+  It lexes as an **untyped integer literal** with the scalar value, so the
+  context decides its width (`let b: u8 = 'x'` is 120) and `'a' < 'b'`,
+  `c - '0'`, `c == '\n'` are plain integer operations. Surrogates
+  (U+D800..U+DFFF) and values above U+10FFFF are not accepted; whatever does
+  not close as a one-character literal (`'xy'`, `''`) keeps the lexer error
+  "unknown character" with a hint. Before this round every apostrophe was
+  an error, so no accepted program changes (docs/STABILITY.md).
+  Because `char` is `u32`, `c.to_str()` prints the NUMBER (`std.tostr`);
+  the text is `c.char_str()` or `chars.to_str(c)` (`std.chars`: `iter`/`next`
+  over a `str`, `count`, `at`, `is_digit`, `to_upper`, ...). The reason is
+  the same as for `int`: a distinct primitive type would need its own kind
+  in both compilers; that decision is open (roadmap).
   **ROUND 88: `string` closes the family.** The list is the one of C#, and
   there the text type is called `string`; it was the only name missing, so
   the most obvious line a stranger writes, `let x: string = "test"`, was

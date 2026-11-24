@@ -4709,6 +4709,7 @@ mod tests {
             ("byte", "u8"),
             ("ushort", "u16"),
             ("uint", "u32"),
+            ("char", "u32"),
             ("ulong", "u64"),
             ("double", "f64"),
             // ROUND 71: `float` is given out now, and it means `f32`.

@@ -801,6 +801,18 @@ impl<'a> Lexer<'a> {
         true
     }
 
+    fn char_literal(&mut self) -> bool {
+        let Some((value, consumed)) = crate::charlit::lex_char_literal(&self.chars, self.pos) else {
+            return false;
+        };
+        let (line, col) = (self.line, self.col);
+        for _ in 0..consumed {
+            self.bump();
+        }
+        self.push(TokKind::Int(value as i128), line, col, consumed as u32);
+        true
+    }
+
     fn run(&mut self) {
         loop {
             self.skip_trivia();
@@ -809,6 +821,9 @@ impl<'a> Lexer<'a> {
                 None => break,
             };
             if self.string_literal() {
+                continue;
+            }
+            if c == '\'' && self.char_literal() {
                 continue;
             }
             if c.is_ascii_digit() {
@@ -992,7 +1007,7 @@ pub fn char_hint(c: char) -> Option<String> {
     match c {
         // apostrophe and single typographic quotation marks
         '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some(
-            format!("{} has no character literals -- write a text literal with '\"'", crate::brand::LANG_NAME),
+            "a character literal is one character in single quotes ('x') -- write text with '\"'".to_string(),
         ),
         // double typographic quotation marks, guillemets, backtick
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{00AB}' | '\u{00BB}' | '`' => {

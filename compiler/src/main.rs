@@ -175,6 +175,7 @@ mod usecount;
 mod promote;
 mod rangecheck;
 mod negidx;
+mod charlit;
 mod strings;
 mod strtype;
 mod fmtspec;
