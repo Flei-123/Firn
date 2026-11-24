@@ -19,7 +19,7 @@ cd fleilauncher && bash build.sh && build/fleilauncher
 | Android x86-64 | **tested on the emulator** (`tools/appkit/android_check.sh`, API 35): download, hash refusal, hand-over to the PackageInstaller, the question and its answer, replacement, refusal of a foreign key |
 | Android arm64 | compiles and links (APK builds, receiver symbol exported); **not run** (no arm64 emulator or phone here) |
 | Linux aarch64 | compiles; not run |
-| macOS | **untested stub** (`platform_macos.fi`): Firn has no macOS target yet |
+| macOS | **untested stub** (`platform_macos.fi`): Mach-O target exists (docs/MACOS.md), never run on a Mac |
 | OrientOS | **untested stub** (`platform_osum.fi`): written against the OrientOS tree, never run on it |
 
 Details per platform and the list of what is missing: [section 7](#7-platform-layer).
@@ -275,7 +275,7 @@ with the same signatures exist in:
 | `lib/appkit/platform.fi` | Linux (and any POSIX) | default |
 | `lib/appkit/platform.windows.fi` | Windows | module twin rule for `--target=x86_64-windows` |
 | `lib/@android/appkit/platform.fi` | Android | platform-directory rule for the Android targets |
-| `lib/appkit/platform_macos.fi` | macOS | **untested**; Firn has no macOS target |
+| `lib/appkit/platform_macos.fi` | macOS | **untested**; Firn has a structural macOS target (docs/MACOS.md) |
 | `lib/appkit/platform_osum.fi` | OrientOS | **untested**; written against the OrientOS tree |
 
 `tools/appkit/platforms.py` checks that all five export the same names with

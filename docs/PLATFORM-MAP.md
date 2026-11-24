@@ -64,6 +64,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 ## App platform
 - `appkit/` | config, log, crash, single_instance, update, catalog, texts, appinfo (docs/APPKIT.md) | `appkit/update.fi` signed self-update
 - `services/` | ONE API for file open/save, dir pick, clipboard, dialog, store (docs/services-contract.md) | `services/svcfile.fi`, `svcdir.fi`, `svcclip.fi`, `svcdialog.fi`, `svcstore.fi`
+- `compiler/src/darwin/`, `docs/MACOS.md`, `tools/macos/run.sh` | macOS Mach-O target (aarch64-macos, x86_64-macos), structural only
 - `plat/`, `@linux @windows @android @web`, `android/`, `desktop/` | platform layers; `NAME.<os>.fi` twins pick the OS
 - `i18n/i18n.fi` | catalogs, plurals, date/number formats; `i18n/human.fi`; apps use `appkit/texts.fi` (`tr`, `trn`)
 - `mail/mail.fi` | SMTP/IMAP | `mail.message(from, to, subj, body)`, `mail.send(host, port, &m)`, `mail.send_login`

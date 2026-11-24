@@ -3,10 +3,10 @@ use std::collections::HashSet;
 
 const LOCAL_PREFIX: &str = ".L";
 const DARWIN_LOCAL_PREFIX: &str = "L";
-const SYSCALL_INSTRUCTION: &str = "svc #0";
-const SYSCALL_SEQUENCE: &str = "    str x30, [sp, #-16]!\n    bl __Fmac.syscall\n    ldr x30, [sp], #16";
+const SYSCALL_SEQUENCE_A64: &str = "    str x30, [sp, #-16]!\n    bl __Fmac.syscall\n    ldr x30, [sp], #16";
+const SYSCALL_SEQUENCE_X86: &str = "    call __Fmac.syscall";
 
-const SYMBOLIC_MNEMONICS: &[&str] = &["bl", "b", "adrp", "adr"];
+const SYMBOLIC_MNEMONICS: &[&str] = &["bl", "b", "adrp", "adr", "call", "jmp"];
 
 const RESERVED: &[&str] = &[
     "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv", "lsl",
@@ -61,13 +61,13 @@ fn translate_line(line: &str, symbols: &HashSet<String>) -> Option<String> {
     if t.is_empty() {
         return Some(String::new());
     }
-    if t == SYSCALL_INSTRUCTION {
-        return Some(SYSCALL_SEQUENCE.to_string());
+    if let Some(sequence) = syscall_sequence(t) {
+        return Some(sequence.to_string());
     }
     if t == "_start:" {
-        return Some(super::entry::ENTRY_PROLOGUE.trim_end().to_string());
+        return Some(super::entry::prologue().trim_end().to_string());
     }
-    if t.starts_with(".arch ") || t.starts_with(".section .note") {
+    if t.starts_with(".arch ") || t.starts_with(".file ") || t.starts_with(".loc ") || t.starts_with(".section .note") {
         return None;
     }
     if t.starts_with(".section ") || t == ".text" || t == ".data" {
@@ -79,6 +79,15 @@ fn translate_line(line: &str, symbols: &HashSet<String>) -> Option<String> {
         return Some(String::new());
     }
     let is_instruction = !rest.starts_with('.') && !rest.ends_with(':');
+    if is_instruction {
+        if let Some(lines) = super::x86_abs::rewrite(rest, symbols) {
+            let parts: Vec<String> = lines
+                .iter()
+                .map(|l| rename_tokens(l, symbols, true))
+                .collect();
+            return Some(format!("{}{}", indent, parts.join(&format!("\n{}", indent))));
+        }
+    }
     let prepared = rewrite_relocations(rest);
     let renamed = rename_tokens(&prepared, symbols, is_instruction);
     let renamed = if is_instruction && mnemonic(&renamed) == "adrp" {
@@ -87,6 +96,14 @@ fn translate_line(line: &str, symbols: &HashSet<String>) -> Option<String> {
         renamed
     };
     Some(format!("{}{}", indent, renamed))
+}
+
+fn syscall_sequence(t: &str) -> Option<&'static str> {
+    match t {
+        "svc #0" => Some(SYSCALL_SEQUENCE_A64),
+        "syscall" => Some(SYSCALL_SEQUENCE_X86),
+        _ => None,
+    }
 }
 
 fn map_section(t: &str) -> String {
@@ -283,5 +300,19 @@ mod tests {
         let out = one(".globl _start\n_start:\n    bl main\n");
         assert!(out.contains("__start:"), "{}", out);
         assert!(out.contains("Lfmac_args_copy"), "{}", out);
+    }
+
+    #[test]
+    fn x86_absolute_indexed_memory_goes_through_a_rip_relative_base() {
+        let out = one(".Ltable:\n    mov r9, qword ptr [.Ltable+r8]\n");
+        assert!(out.contains("lea r11, [rip+Ltable]"), "{}", out);
+        assert!(out.contains("mov r9, qword ptr [r11+r8]"), "{}", out);
+        assert!(out.contains("pop r11"), "{}", out);
+    }
+
+    #[test]
+    fn the_x86_syscall_instruction_goes_through_the_stub() {
+        let out = one("    syscall\n");
+        assert!(out.contains("call __Fmac.syscall"), "{}", out);
     }
 }
