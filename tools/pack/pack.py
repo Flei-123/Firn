@@ -12,7 +12,7 @@ Commands
   win-zip         portable zip                      --exe app.exe --out X.zip [--ico F] [--files DIR]
   win-installer   setup.exe (stub + zip payload)    --stub setup-stub.exe --exe app.exe --out X.exe [--ico F]
   win-nsis        NSIS script (+ build if makensis) --exe app.exe --outdir DIR [--ico F]
-  pe-icon         put an .ico into a Windows exe    --exe in.exe --ico F --out out.exe
+  pe-icon         put an .ico (and optional --manifest XML) into a Windows exe    --exe in.exe --ico F --out out.exe
   deb             Debian package                    --exe prog --out X.deb [--icons DIR] [--depends D]
   rpm             RPM package                       --exe prog --out X.rpm [--icons DIR]
   tar             tar.gz with install.sh            --exe prog --out X.tar.gz [--icons DIR]
@@ -66,7 +66,8 @@ def cmd_win_installer(a):
 
 
 def cmd_pe_icon(a):
-    data = win.pe_set_icon(common.read(a.exe), common.read(a.ico))
+    manifest = common.read(a.manifest) if a.manifest else None
+    data = win.pe_set_icon(common.read(a.exe), common.read(a.ico), manifest)
     common.write(a.out, data, 0o755)
     print(a.out)
 
@@ -212,7 +213,7 @@ def main(argv):
 
     p = sub.add_parser("pe-icon")
     p.add_argument("--exe", required=True); p.add_argument("--ico", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", required=True); p.add_argument("--manifest")
     p.set_defaults(fn=cmd_pe_icon)
 
     def exe_arg(p, stub=False):

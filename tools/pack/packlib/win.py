@@ -124,7 +124,7 @@ def parse_ico(data):
     return out
 
 
-def pe_set_icon(exe_bytes, ico_bytes):
+def pe_set_icon(exe_bytes, ico_bytes, manifest=None):
     """Return the PE image with RT_GROUP_ICON/RT_ICON resources for `ico_bytes`.
 
     Firn's PE files carry no resource section, so a new `.rsrc` section is
@@ -197,7 +197,8 @@ def pe_set_icon(exe_bytes, ico_bytes):
         return b
 
     # sizes
-    root_sz = 16 + 8 * 2
+    m = 1 if manifest else 0
+    root_sz = 16 + 8 * (2 + m)
     icon_type_sz = 16 + 8 * n
     group_type_sz = 16 + 8 * 1
     name_dir_sz = 16 + 8          # one language each
@@ -207,6 +208,9 @@ def pe_set_icon(exe_bytes, ico_bytes):
     root_off = off; off += root_sz
     icon_type_off = off; off += icon_type_sz
     group_type_off = off; off += group_type_sz
+    if m:
+        man_type_off = off; off += 16 + 8
+        man_name_off = off; off += name_dir_sz
     icon_name_off = []
     for i in range(n):
         icon_name_off.append(off); off += name_dir_sz
@@ -215,25 +219,36 @@ def pe_set_icon(exe_bytes, ico_bytes):
     for i in range(n):
         data_entry_off.append(off); off += data_entry_sz
     group_data_entry_off = off; off += data_entry_sz
+    if m:
+        man_data_entry_off = off; off += data_entry_sz
     data_off = _align(off, 4)
     tree = bytearray()
     HIGH = 0x80000000
-    tree += dir_node([(3, HIGH | icon_type_off), (14, HIGH | group_type_off)])
+    root_entries = [(3, HIGH | icon_type_off), (14, HIGH | group_type_off)]
+    if m:
+        root_entries.append((24, HIGH | man_type_off))
+    tree += dir_node(root_entries)
     tree += dir_node([(i + 1, HIGH | icon_name_off[i]) for i in range(n)])
     tree += dir_node([(1, HIGH | group_name_off)])
+    if m:
+        tree += dir_node([(1, HIGH | man_name_off)])
     # name dirs: one language (0x0409 English US; 0 would be "neutral" -- both are found)
     for i in range(n):
         tree += dir_node([(0x0409, data_entry_off[i])])
     tree += dir_node([(0x0409, group_data_entry_off)])
+    if m:
+        tree += dir_node([(0x0409, man_data_entry_off)])
     # data layout
     cursor = data_off
     datas = []
-    for blob in blobs + [group_blob]:
+    for blob in blobs + [group_blob] + ([manifest] if m else []):
         datas.append((cursor, blob))
         cursor = _align(cursor + len(blob), 4)
     for i in range(n):
         tree += struct.pack("<IIII", rva + datas[i][0], len(blobs[i]), 0, 0)
     tree += struct.pack("<IIII", rva + datas[n][0], len(group_blob), 0, 0)
+    if m:
+        tree += struct.pack("<IIII", rva + datas[n + 1][0], len(manifest), 0, 0)
     assert len(tree) == off, (len(tree), off)
     tree += b"\0" * (data_off - len(tree))
     for pos, blob in datas:
