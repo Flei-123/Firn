@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.fs
+import appkit.platform
+import appkit.util
+import desktop.autostart
+import pack.winreg
+import pack.selfplan
+import pack.selfsys
+
+export {
+    UN_DONE, UN_QUIT, UN_FAILED, uninstall_files, uninstall_request, cli_is_uninstall, cli_is_stage2,
+    cli_delete_choice, cli_run, DATA_UNSET, DATA_KEEP, DATA_DELETE,
+}
+
+const UN_DONE: u32 = 0
+const UN_QUIT: u32 = 1
+const UN_FAILED: u32 = 2
+const DATA_UNSET: i32 = -1
+const DATA_KEEP: i32 = 0
+const DATA_DELETE: i32 = 1
+const EXE_WAIT_TRIES: u32 = 60
+const EXE_WAIT_MS: u64 = 250
+const CLEAN_RETRIES: u32 = 60
+
+fn leftover_suffix(i: usize) -> str {
+    if i == 0 { return "" }
+    if i == 1 { return ".old" }
+    if i == 2 { return ".new" }
+    if i == 3 { return ".bak" }
+    return ".tmp"
+}
+
+fn remove_program_files(p: *mut selfplan.SelfPlan, wait: bool) -> bool {
+    var tries: u32 = 0
+    while !selfsys.remove_quiet((*p).exe) {
+        tries = tries + 1 as u32
+        if !wait || tries >= EXE_WAIT_TRIES {
+            return false
+        }
+        platform.plat_sleep_ms(EXE_WAIT_MS)
+    }
+    var i: usize = 1
+    while i < 5 {
+        selfsys.remove_quiet((*p).exe + leftover_suffix(i))
+        i = i + 1
+    }
+    return true
+}
+
+fn remove_entries(p: *mut selfplan.SelfPlan) {
+    autostart.autostart_remove((*p).id)
+    selfsys.remove_quiet((*p).start_link)
+    selfsys.remove_quiet((*p).desktop_link)
+    if (*p).icon_file.n > 0 {
+        selfsys.remove_quiet((*p).icon_file)
+    }
+    if (*p).windows {
+        winreg.reg_delete_tree((*p).registry_key)
+        winreg.shell_changed()
+    }
+}
+
+fn remove_folders(p: *mut selfplan.SelfPlan) {
+    selfsys.remove_quiet((*p).state_file)
+    selfsys.remove_quiet((*p).state_dir)
+    if (*p).owns_dir {
+        selfsys.remove_quiet((*p).dir)
+    }
+}
+
+fn has_segment(path: str, seg: str) -> bool {
+    var start: usize = 0
+    var i: usize = 0
+    while i <= path.n {
+        if i == path.n || rt.ld8(path.p as u64, i) == 47 as u8 {
+            if i - start == seg.n && seg.n > 0 && rt.mem_eq(path.p as u64 + start as u64, seg.p as u64, seg.n) {
+                return true
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn under(path: str, root: str) -> bool {
+    return root.n > 0 && path.n > root.n && util.starts_with(path, root) && rt.ld8(path.p as u64, root.n) == 47 as u8
+}
+
+fn remove_data_kind(p: *mut selfplan.SelfPlan, kind: u32, self_exe: str) {
+    var b: rt.Buf = rt.buf_new()
+    if platform.plat_dir(kind, (*p).id, (*p).vendor, &b) && rt.buf_len(&b) > 0 {
+        let dir: str = selfplan.to_slashes(util.buf_to_str_copy(&b))
+        let portable: bool = under(dir, selfsys.parent_of(selfplan.to_slashes(self_exe)))
+        if has_segment(dir, (*p).id) && !portable && fs.exists(dir) {
+            fs.remove_tree(dir) catch false
+        }
+    }
+    rt.buf_free(&b)
+}
+
+fn remove_data(p: *mut selfplan.SelfPlan, self_exe: str) {
+    remove_data_kind(p, platform.DIR_DATA, self_exe)
+    remove_data_kind(p, platform.DIR_CONFIG, self_exe)
+    remove_data_kind(p, platform.DIR_STATE, self_exe)
+    remove_data_kind(p, platform.DIR_CACHE, self_exe)
+    remove_data_kind(p, platform.DIR_LOG, self_exe)
+}
+
+fn uninstall_files(p: *mut selfplan.SelfPlan, delete_data: bool, self_exe: str, wait: bool) -> str {
+    if !remove_program_files(p, wait) {
+        return "cannot remove " + (*p).exe + " (is it running?)"
+    }
+    remove_entries(p)
+    remove_folders(p)
+    if delete_data {
+        remove_data(p, self_exe)
+    }
+    return ""
+}
+
+fn temp_dir() -> str {
+    var t: str = selfsys.env_get("TEMP")
+    if t.n == 0 {
+        t = selfsys.env_get("TMP")
+    }
+    return selfplan.to_slashes(t)
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, v as u64)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn start_stage_two(p: *mut selfplan.SelfPlan, self_exe: str, delete_data: bool) -> str {
+    let tmp: str = temp_dir()
+    if tmp.n == 0 {
+        return "no temp folder to stage the uninstaller"
+    }
+    let copy: str = tmp + "/" + (*p).id + "-uninstall-" + dec(platform.plat_self_pid()) + ".exe"
+    if !platform.plat_file_copy(self_exe, copy) {
+        return "cannot copy the uninstaller to " + copy
+    }
+    var flag: str = ""
+    if delete_data {
+        flag = selfplan.DELETE_DATA_FLAG
+    }
+    if !selfsys.spawn_detached(copy, selfplan.STAGE2_FLAG, flag, "") {
+        return "cannot start the uninstaller copy"
+    }
+    return ""
+}
+
+fn uninstall_request(p: *mut selfplan.SelfPlan, self_exe: str, delete_data: bool, err: *mut str) -> u32 {
+    let inside: bool = selfplan.same_path(self_exe, (*p).exe, (*p).windows)
+    if inside && (*p).windows {
+        *err = start_stage_two(p, self_exe, delete_data)
+        if (*err).n > 0 {
+            return UN_FAILED
+        }
+        return UN_QUIT
+    }
+    *err = uninstall_files(p, delete_data, self_exe, false)
+    if (*err).n > 0 {
+        return UN_FAILED
+    }
+    if inside {
+        return UN_QUIT
+    }
+    return UN_DONE
+}
+
+fn has_arg(flag: str) -> bool {
+    var i: usize = 1
+    while i < platform.plat_argc() {
+        if platform.plat_arg(i) == flag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn cli_is_uninstall() -> bool {
+    return has_arg(selfplan.UNINSTALL_FLAG)
+}
+
+fn cli_is_stage2() -> bool {
+    return has_arg(selfplan.STAGE2_FLAG)
+}
+
+fn cli_delete_choice() -> i32 {
+    if has_arg(selfplan.DELETE_DATA_FLAG) {
+        return DATA_DELETE
+    }
+    if has_arg(selfplan.KEEP_DATA_FLAG) {
+        return DATA_KEEP
+    }
+    return DATA_UNSET
+}
+
+fn schedule_self_removal(self_exe: str) {
+    let bat: str = temp_dir() + "/" + dec(platform.plat_self_pid()) + "-clean.cmd"
+    let copy: str = selfplan.to_backslashes(self_exe)
+    let script: str = "@echo off\r\nset n=0\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\ndel /f /q \"" + copy +
+        "\" >nul 2>&1\r\nif not exist \"" + copy + "\" goto done\r\nset /a n+=1\r\nif %n% lss " +
+        dec(CLEAN_RETRIES as i64) + " goto retry\r\n:done\r\ndel /f /q \"%~f0\" >nul 2>&1\r\n"
+    if selfsys.write_text(bat, script) {
+        selfsys.spawn_hidden("cmd.exe", "/c", selfplan.to_backslashes(bat))
+    }
+}
+
+fn cli_run(p: *mut selfplan.SelfPlan, self_exe: str, delete_data: bool) -> i32 {
+    if cli_is_stage2() {
+        let err: str = uninstall_files(p, delete_data, self_exe, true)
+        if (*p).windows {
+            schedule_self_removal(self_exe)
+        }
+        if err.n > 0 {
+            return 1
+        }
+        return 0
+    }
+    var err2: str = ""
+    if uninstall_request(p, self_exe, delete_data, &err2) == UN_FAILED {
+        return 1
+    }
+    return 0
+}

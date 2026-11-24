@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.fs
+import std.time
+import std.osinfo
+import appkit.platform
+import appkit.util
+import desktop.autostart
+import pack.lnk
+import pack.winreg
+import pack.installed
+import pack.selfplan
+import pack.selfsys
+
+export {
+    InstallOpts, InstallState, opts_default, env_current, install_state, install_run,
+    set_desktop_link, set_autostart, launch_installed, sync_version, installed_version,
+    AFTER_INSTALL_FLAG, started_after_install,
+}
+
+const SHELL_FOLDERS: str = "Software/Microsoft/Windows/CurrentVersion/Explorer/Shell Folders"
+const AFTER_INSTALL_FLAG: str = "--after-install"
+const BYTES_PER_KIB: u64 = 1024 as u64
+const EXEC_MODE: u32 = 493 as u32
+
+struct InstallOpts {
+    start_menu: bool,
+    desktop: bool,
+    autostart: bool,
+    icon_p: u64,
+    icon_n: usize,
+}
+
+struct InstallState {
+    installed: bool,
+    running_installed: bool,
+    version: str,
+    desktop: bool,
+    autostart: bool,
+}
+
+fn opts_default() -> InstallOpts {
+    return InstallOpts { start_menu: true, desktop: false, autostart: false, icon_p: 0 as u64, icon_n: 0 }
+}
+
+fn shell_folder(value: str, fallback: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var r: str = ""
+    if winreg.reg_get_string(SHELL_FOLDERS, value, &b) && rt.buf_len(&b) > 0 {
+        r = selfplan.to_slashes(util.buf_to_str_copy(&b))
+    }
+    rt.buf_free(&b)
+    if r.n > 0 {
+        return r
+    }
+    return fallback
+}
+
+fn env_current() -> selfplan.PlanEnv {
+    var e: selfplan.PlanEnv = selfplan.plan_env_new(osinfo.is_windows())
+    if !e.windows {
+        e.home = selfsys.env_get("HOME")
+        e.data_home = selfsys.env_get("XDG_DATA_HOME")
+        return e
+    }
+    let user_home: str = selfplan.to_slashes(selfsys.env_get("USERPROFILE"))
+    e.local_appdata = selfsys.env_get("LOCALAPPDATA")
+    if e.local_appdata.n == 0 {
+        e.local_appdata = user_home + "/AppData/Local"
+    }
+    let roaming: str = selfplan.to_slashes(selfsys.env_get("APPDATA"))
+    e.programs_dir = shell_folder("Programs", roaming + "/Microsoft/Windows/Start Menu/Programs")
+    e.desktop_dir = shell_folder("Desktop", user_home + "/Desktop")
+    return e
+}
+
+fn started_after_install() -> bool {
+    var i: usize = 1
+    while i < platform.plat_argc() {
+        if platform.plat_arg(i) == AFTER_INSTALL_FLAG {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn installed_version(p: *mut selfplan.SelfPlan) -> str {
+    if (*p).windows {
+        var b: rt.Buf = rt.buf_new()
+        var v: str = ""
+        if winreg.reg_get_string((*p).registry_key, "DisplayVersion", &b) {
+            v = util.buf_to_str_copy(&b)
+        }
+        rt.buf_free(&b)
+        if v.n > 0 {
+            return v
+        }
+    }
+    return selfplan.manifest_field(selfsys.read_text((*p).state_file), "version")
+}
+
+fn install_state(p: *mut selfplan.SelfPlan, self_exe: str) -> InstallState {
+    return InstallState { installed: fs.is_file((*p).exe),
+        running_installed: selfplan.same_path(self_exe, (*p).exe, (*p).windows),
+        version: installed_version(p), desktop: fs.exists((*p).desktop_link),
+        autostart: autostart.autostart_is_enabled((*p).id) }
+}
+
+fn place_exe(p: *mut selfplan.SelfPlan, self_exe: str) -> str {
+    fs.mkdir_all((*p).dir) catch false
+    if !fs.is_dir((*p).dir) {
+        return "cannot create " + (*p).dir
+    }
+    let staged: str = (*p).exe + ".new"
+    if !platform.plat_file_copy(self_exe, staged) {
+        return "cannot copy the program to " + staged
+    }
+    if !selfsys.remove_quiet((*p).exe) {
+        selfsys.remove_quiet(staged)
+        return "cannot replace " + (*p).exe + " (is it running?)"
+    }
+    let moved: bool = fs.rename(staged, (*p).exe) catch false
+    if !moved {
+        return "cannot move " + staged + " to " + (*p).exe
+    }
+    platform.plat_chmod_exec((*p).exe)
+    return ""
+}
+
+fn make_lnk(p: *mut selfplan.SelfPlan, link: str) -> bool {
+    var s: lnk.LnkSpec = lnk.lnk_spec(selfplan.to_backslashes((*p).exe))
+    s.workdir = selfplan.to_backslashes((*p).dir)
+    s.desc = (*p).name
+    s.icon = selfplan.to_backslashes((*p).exe)
+    var out: rt.Buf = rt.buf_new()
+    if !lnk.lnk_build(&out, &s) {
+        rt.buf_free(&out)
+        return false
+    }
+    let ok: bool = selfsys.write_bytes(link, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    return ok
+}
+
+fn desktop_entry(p: *mut selfplan.SelfPlan) -> str {
+    var q: rt.Buf = rt.buf_new()
+    autostart.exec_quote(&q, (*p).exe)
+    let exec: str = util.buf_to_str_copy(&q)
+    rt.buf_free(&q)
+    var icon: str = (*p).id
+    if (*p).icon_file.n > 0 && fs.exists((*p).icon_file) {
+        icon = (*p).icon_file
+    }
+    return "[Desktop Entry]\nType=Application\nName=" + (*p).name + "\nComment=" + (*p).name +
+        "\nExec=" + exec + "\nIcon=" + icon + "\nTerminal=false\nCategories=Utility;\n"
+}
+
+fn make_link(p: *mut selfplan.SelfPlan, link: str) -> bool {
+    if (*p).windows {
+        return make_lnk(p, link)
+    }
+    if !selfsys.write_text(link, desktop_entry(p)) {
+        return false
+    }
+    fs.chmod(link, EXEC_MODE) catch false
+    return true
+}
+
+fn date_text() -> str {
+    let t: time.DateTime = time.civil_from_unix(time.now_unix_ms())
+    var b: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&b, t.year as u64, 4)
+    util.push_dec_pad(&b, t.month as u64, 2)
+    util.push_dec_pad(&b, t.day as u64, 2)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn exe_kib(p: *mut selfplan.SelfPlan) -> u32 {
+    let info: fs.FileInfo = fs.stat((*p).exe) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 as i64 }
+    return ((info.size + BYTES_PER_KIB - 1 as u64) / BYTES_PER_KIB) as u32
+}
+
+fn write_registry(p: *mut selfplan.SelfPlan) -> bool {
+    let key: str = (*p).registry_key
+    let exe_win: str = selfplan.to_backslashes((*p).exe)
+    var ok: bool = winreg.reg_set_string(key, "DisplayName", (*p).name)
+    ok = winreg.reg_set_string(key, "DisplayVersion", (*p).version) && ok
+    ok = winreg.reg_set_string(key, "Publisher", (*p).vendor) && ok
+    ok = winreg.reg_set_string(key, "InstallLocation", selfplan.to_backslashes((*p).dir)) && ok
+    ok = winreg.reg_set_string(key, "DisplayIcon", exe_win) && ok
+    ok = winreg.reg_set_string(key, "UninstallString", (*p).uninstall_command) && ok
+    ok = winreg.reg_set_string(key, "InstallDate", date_text()) && ok
+    ok = winreg.reg_set_dword(key, "EstimatedSize", exe_kib(p)) && ok
+    ok = winreg.reg_set_dword(key, "NoModify", 1 as u32) && ok
+    ok = winreg.reg_set_dword(key, "NoRepair", 1 as u32) && ok
+    return ok
+}
+
+fn set_desktop_link(p: *mut selfplan.SelfPlan, on: bool) -> bool {
+    if !on {
+        return selfsys.remove_quiet((*p).desktop_link)
+    }
+    let ok: bool = make_link(p, (*p).desktop_link)
+    winreg.shell_changed()
+    return ok
+}
+
+fn set_autostart(p: *mut selfplan.SelfPlan, on: bool) -> bool {
+    if on {
+        return autostart.autostart_set((*p).id, (*p).name, (*p).exe, "")
+    }
+    return autostart.autostart_remove((*p).id)
+}
+
+fn write_icon(p: *mut selfplan.SelfPlan, o: *mut InstallOpts) {
+    if (*p).windows || (*o).icon_n == 0 || (*p).icon_file.n == 0 {
+        return
+    }
+    selfsys.write_bytes((*p).icon_file, (*o).icon_p, (*o).icon_n)
+}
+
+fn register(p: *mut selfplan.SelfPlan, o: *mut InstallOpts) -> str {
+    write_icon(p, o)
+    if (*o).start_menu && !make_link(p, (*p).start_link) {
+        return "cannot write the start menu entry " + (*p).start_link
+    }
+    if (*o).desktop && !make_link(p, (*p).desktop_link) {
+        return "cannot write the desktop shortcut " + (*p).desktop_link
+    }
+    if (*p).windows && !write_registry(p) {
+        return "cannot write the Apps & features entry"
+    }
+    if !selfsys.write_text((*p).state_file, selfplan.plan_manifest_text(p)) {
+        return "cannot write " + (*p).state_file
+    }
+    winreg.shell_changed()
+    return ""
+}
+
+fn install_run(p: *mut selfplan.SelfPlan, self_exe: str, o: *mut InstallOpts) -> str {
+    if selfplan.same_path(self_exe, (*p).exe, (*p).windows) {
+        return "already running from the install folder"
+    }
+    var err: str = place_exe(p, self_exe)
+    if err.n == 0 {
+        err = register(p, o)
+    }
+    if err.n > 0 {
+        return err
+    }
+    set_autostart(p, (*o).autostart)
+    return ""
+}
+
+fn launch_installed(p: *mut selfplan.SelfPlan) -> bool {
+    return selfsys.spawn_detached((*p).exe, AFTER_INSTALL_FLAG, "", (*p).dir)
+}
+
+fn sync_version(p: *mut selfplan.SelfPlan, self_exe: str) -> bool {
+    if !selfplan.same_path(self_exe, (*p).exe, (*p).windows) {
+        return false
+    }
+    installed.sync_version((*p).id, (*p).version)
+    if installed_version(p) == (*p).version && fs.exists((*p).state_file) {
+        return true
+    }
+    return selfsys.write_text((*p).state_file, selfplan.plan_manifest_text(p))
+}
