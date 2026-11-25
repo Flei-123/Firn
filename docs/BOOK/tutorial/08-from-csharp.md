@@ -1,16 +1,18 @@
 # 8. Coming from C#
 
+The prelude makes `x.to_str()`, `parse.`, `format.`, `chars.`, `print`, `println` and `format(tpl, a, b, ...)` available without `import` (see `docs/PRELUDE.md`; `--no-prelude` turns it off). Your own names win, and the collector starts itself, so there is no `gc_init()` call.
+
 Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `double`, `float`, `string` are aliases of `i32`, `i64`, `u8`, `f64`, `f32`, `str`. Same type, no cast.
 
 | C# | Firn |
 |---|---|
 | `int x = 5;` | `let x: int = 5` |
-| `x.ToString()` | `x.to_str()` (`import std.tostr`) |
-| `int.Parse(s)` | `int.parse(s) catch 0` (`import std.parse`) |
+| `x.ToString()` | `x.to_str()` |
+| `int.Parse(s)` | `int.parse(s) catch 0` |
 | `int.TryParse(s, out n)` | `int.try_parse(s, &n)` |
 | `new Counter()` | `Counter.start()`, a function in `impl Counter` without `self` |
 | `a.B().C()` | `a.b().c()`, also on results and on `(x + y)` |
-| `string.Format("{0} + {1}", a, b)` | `format.format2("{0} + {1}", a.to_str(), b.to_str())` (`import std.format`) |
+| `string.Format("{0} + {1}", a, b)` | `format("{0} + {1}", a, b)` (long form: `format.format2("{0} + {1}", a.to_str(), b.to_str())`) |
 | `char c = 'a';` | `let c: char = 'a'` |
 | `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
 | `$"x = {x}"` | `f"x = {x}"` wrapped in `io.fmt_string(...)` |
@@ -107,7 +109,7 @@ fn main() -> i32 {
 
 ## Format
 
-Firn has no variadic calls. `format.format0` to `format.format5` take the template and that many `str` arguments; `{0}`, `{1}` count from zero, `{{` and `}}` are literal braces.
+`format(tpl, a, b, ...)` takes up to 8 arguments of any printable type (see the prelude below). The long form `format.format0` to `format.format8` takes the template and that many `str` arguments; `{0}`, `{1}` count from zero, `{{` and `}}` are literal braces.
 
 ```firn run
 import std.io
@@ -186,3 +188,29 @@ fn main() -> i32 {
 - `for c in s.chars()` does not exist: a `for` loop needs an array variable. Use `chars.iter` and `chars.next`.
 - `chars.count(s)` counts characters, `s.length()` counts bytes.
 - A method works on a call result: `chars.count(s).to_str()`.
+
+## No imports needed
+
+`to_str`, `parse.`, `format.`, `chars.`, `print`, `println` and `format(...)` work without `import`. The collector starts itself too.
+
+```firn run
+fn main() -> i32 {
+    let n: int = 42
+    let m: int = parse.to_i32("8") catch 0
+    println(format("{0} + {1} = {2}", n, m, n + m))
+    print("chars: ")
+    let total: usize = chars.count("h\u{e9}llo")
+    println(total.to_str())
+    return 0
+}
+```
+
+```output
+42 + 8 = 50
+chars: 5
+```
+
+- `format(tpl, a, b, ...)` takes up to 8 arguments of any printable type; no `to_str()` needed.
+- Your own names win: a `fn println` or a variable called `parse` in your file switches that entry off.
+- `io.print_line` and the rest of `std.io` still need `import std.io`.
+- `--no-prelude` turns the whole mechanism off. See `docs/PRELUDE.md`.
