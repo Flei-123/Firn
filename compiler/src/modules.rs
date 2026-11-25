@@ -181,6 +181,8 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     }];
     // module name -> path seen first, for the conflict check.
     let mut names: HashMap<String, String> = HashMap::default();
+    let mut tostr_checked = false;
+    loop {
     while !queue.is_empty() {
         let entry = queue.remove(0);
         let path = entry.path;
@@ -324,6 +326,15 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         }
         out.push(SourceFile { id, path, src });
     }
+    if tostr_checked || !crate::prelude::needs_tostr(out.iter().map(|f| f.src.as_str())) {
+        break;
+    }
+    tostr_checked = true;
+    match std_module_path(&["std".to_string(), "tostr".to_string()]) {
+        Some(p) => queue.push(Waiting { path: p, span: Span::none() }),
+        None => break,
+    }
+    }
     // HOOK gc: the collector runtime is pulled in automatically as soon as
     // a `gc class` appears anywhere (gc.rs, SPEC 3.5) — no `import`, no extra
     // command line option.
@@ -341,6 +352,17 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         out.push(f);
     }
     Ok(out)
+}
+
+fn std_module_path(parts: &[String]) -> Option<PathBuf> {
+    let extras = extra_search_paths();
+    for z in &extras {
+        let q = module_path(&z.join(crate::target::platform_dir()), parts);
+        if crate::cachemanifest::exists(&q) {
+            return Some(q);
+        }
+    }
+    extras.iter().map(|z| module_path(z, parts)).find(|q| crate::cachemanifest::exists(q))
 }
 
 /// Steps 3 and 4 of the search: project sources, then dependencies.

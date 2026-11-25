@@ -1,0 +1,240 @@
+import rt
+import derive_decl
+
+static mut PRELUDE_OFF: u32 = 0
+
+const W_TO_STR: usize = 0
+const W_PARSE: usize = 1
+const W_FORMAT: usize = 2
+const W_CHARS: usize = 3
+const W_PRINTLN: usize = 4
+const W_PRINT: usize = 5
+const W_NONE: usize = 6
+const WORDS: usize = 6
+
+const K_DOTTED: usize = 0
+const K_CALLED: usize = 1
+const K_OTHER: usize = 2
+const K_DECLARED: usize = 3
+
+const IM_TOSTR: u32 = 1
+const IM_PARSE: u32 = 2
+const IM_FORMAT: u32 = 4
+const IM_CHARS: u32 = 8
+const IM_IO: u32 = 16
+
+const SCAN_WANTS_TO_STR: u32 = 1
+const SCAN_BLOCKS_TO_STR: u32 = 2
+
+struct Scan {
+    cnt: [u32; 24],
+    method_to_str: bool,
+    declares_to_str_method: bool,
+    imported: u32,
+}
+
+fn pl_disable() {
+    PRELUDE_OFF = 1
+}
+
+fn at(src: u64, i: usize) -> u8 {
+    unsafe { return *((src +% i as u64) as *mut u8) }
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    return c == 95 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_ident_start(c: u8) -> bool {
+    return c == 95 || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn word_index(src: u64, s: usize, e: usize) -> usize {
+    if derive_decl.dv_eq_lit(src, s, e, "to_str") { return W_TO_STR }
+    if derive_decl.dv_eq_lit(src, s, e, "parse") { return W_PARSE }
+    if derive_decl.dv_eq_lit(src, s, e, "format") { return W_FORMAT }
+    if derive_decl.dv_eq_lit(src, s, e, "chars") { return W_CHARS }
+    if derive_decl.dv_eq_lit(src, s, e, "println") { return W_PRINTLN }
+    if derive_decl.dv_eq_lit(src, s, e, "print") { return W_PRINT }
+    return W_NONE
+}
+
+fn next_non_space(src: u64, n: usize, i0: usize) -> u8 {
+    var i: usize = i0
+    while i < n && (at(src, i) == 32 || at(src, i) == 9) { i = i + 1 }
+    if i >= n { return 0 as u8 }
+    return at(src, i)
+}
+
+fn bump(sc: *mut Scan, kind: usize, w: usize) {
+    (*sc).cnt[kind * WORDS + w] = (*sc).cnt[kind * WORDS + w] + 1
+}
+
+fn count(sc: *mut Scan, kind: usize, w: usize) -> u32 {
+    return (*sc).cnt[kind * WORDS + w]
+}
+
+fn is_method_declaration(src: u64, n: usize, i0: usize) -> bool {
+    var i: usize = i0
+    while i < n && (at(src, i) == 32 || at(src, i) == 9) { i = i + 1 }
+    if i >= n || at(src, i) != 40 { return false }
+    i = i + 1
+    while i < n && (at(src, i) == 32 || at(src, i) == 9) { i = i + 1 }
+    if i >= n { return false }
+    return at(src, i) == 42 || derive_decl.dv_starts(src, n, i, "self")
+}
+
+fn note_word(sc: *mut Scan, w: usize, prev_dot: bool, prev_fn: bool, next: u8) {
+    if w == W_NONE { return }
+    if w == W_TO_STR {
+        if prev_dot { (*sc).method_to_str = true }
+        return
+    }
+    if prev_dot { return }
+    if prev_fn {
+        bump(sc, K_DECLARED, w)
+    } else if next == 46 {
+        bump(sc, K_DOTTED, w)
+    } else if next == 40 {
+        bump(sc, K_CALLED, w)
+    } else {
+        bump(sc, K_OTHER, w)
+    }
+}
+
+fn note_import(sc: *mut Scan, src: u64, s: usize, e: usize) {
+    if derive_decl.dv_eq_lit(src, s, e, "tostr") { (*sc).imported = (*sc).imported | IM_TOSTR }
+    if derive_decl.dv_eq_lit(src, s, e, "parse") { (*sc).imported = (*sc).imported | IM_PARSE }
+    if derive_decl.dv_eq_lit(src, s, e, "format") { (*sc).imported = (*sc).imported | IM_FORMAT }
+    if derive_decl.dv_eq_lit(src, s, e, "chars") { (*sc).imported = (*sc).imported | IM_CHARS }
+    if derive_decl.dv_eq_lit(src, s, e, "io") { (*sc).imported = (*sc).imported | IM_IO }
+}
+
+fn read_import_path(sc: *mut Scan, src: u64, n: usize, i0: usize) -> usize {
+    var i: usize = i0
+    while true {
+        while i < n && (at(src, i) == 32 || at(src, i) == 9) { i = i + 1 }
+        let s: usize = i
+        while i < n && is_ident_byte(at(src, i)) { i = i + 1 }
+        if s == i { break }
+        note_import(sc, src, s, i)
+        if i < n && at(src, i) == 46 {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+fn skip_quoted(src: u64, n: usize, i0: usize, quote: u8) -> usize {
+    var i: usize = i0 + 1
+    while i < n && at(src, i) != quote && at(src, i) != 10 {
+        if at(src, i) == 92 { i = i + 1 }
+        i = i + 1
+    }
+    i = i + 1
+    if i > n { return n }
+    return i
+}
+
+fn scan_source(src: u64, n: usize, sc: *mut Scan) {
+    var i: usize = 0
+    var prev_dot: bool = false
+    var prev_fn: bool = false
+    while i < n {
+        let c: u8 = at(src, i)
+        if c == 47 && i + 1 < n && at(src, i + 1) == 47 {
+            while i < n && at(src, i) != 10 { i = i + 1 }
+        } else if c == 47 && i + 1 < n && at(src, i + 1) == 42 {
+            i = i + 2
+            while i + 1 < n && !(at(src, i) == 42 && at(src, i + 1) == 47) { i = i + 1 }
+            i = i + 2
+            if i > n { i = n }
+        } else if c == 34 || c == 39 {
+            i = skip_quoted(src, n, i, c)
+            prev_dot = false
+            prev_fn = false
+        } else if c == 46 {
+            prev_dot = true
+            i = i + 1
+        } else if is_ident_start(c) {
+            let s: usize = i
+            while i < n && is_ident_byte(at(src, i)) { i = i + 1 }
+            if derive_decl.dv_eq_lit(src, s, i, "import") {
+                i = read_import_path(sc, src, n, i)
+                prev_fn = false
+            } else {
+                let w: usize = word_index(src, s, i)
+                if w == W_TO_STR && prev_fn && is_method_declaration(src, n, i) {
+                    (*sc).declares_to_str_method = true
+                }
+                note_word(sc, w, prev_dot, prev_fn, next_non_space(src, n, i))
+                prev_fn = derive_decl.dv_eq_lit(src, s, i, "fn")
+            }
+            prev_dot = false
+        } else {
+            if c > 32 { prev_dot = false }
+            i = i + 1
+        }
+    }
+}
+
+fn scan_new() -> Scan {
+    return Scan { cnt: [0 as u32; 24], method_to_str: false, declares_to_str_method: false, imported: 0 }
+}
+
+fn contains(src: u64, n: usize, first: u8, lit: str) -> bool {
+    var i: usize = 0
+    while i + lit.n <= n {
+        if at(src, i) == first && derive_decl.dv_starts(src, n, i, lit) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn only_dotted(sc: *mut Scan, w: usize) -> bool {
+    return count(sc, K_DOTTED, w) > 0 && count(sc, K_CALLED, w) == 0 && count(sc, K_OTHER, w) == 0 && count(sc, K_DECLARED, w) == 0
+}
+
+fn only_called(sc: *mut Scan, w: usize) -> bool {
+    return count(sc, K_CALLED, w) > 0 && count(sc, K_DOTTED, w) == 0 && count(sc, K_OTHER, w) == 0 && count(sc, K_DECLARED, w) == 0
+}
+
+fn put(out: *mut rt.Buf, s: str) {
+    unsafe { rt.buf_push_bytes(out, s.p as u64, s.n) }
+}
+
+fn pl_run(src: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if PRELUDE_OFF != 0 { return false }
+    if contains(src, n, 112 as u8, "profile kernel") { return false }
+    var sc: Scan = scan_new()
+    scan_source(src, n, &sc)
+    let want_parse: bool = only_dotted(&sc, W_PARSE) && (sc.imported & IM_PARSE) == 0
+    let want_format: bool = only_dotted(&sc, W_FORMAT) && (sc.imported & IM_FORMAT) == 0
+    let want_chars: bool = only_dotted(&sc, W_CHARS) && (sc.imported & IM_CHARS) == 0
+    let want_println: bool = only_called(&sc, W_PRINTLN)
+    let want_print: bool = only_called(&sc, W_PRINT)
+    let want_io: bool = (want_println || want_print) && (sc.imported & IM_IO) == 0
+    if !(want_parse || want_format || want_chars || want_println || want_print) { return false }
+    if want_parse { put(out, "import std.parse; ") }
+    if want_format { put(out, "import std.format; ") }
+    if want_chars { put(out, "import std.chars; ") }
+    if want_io { put(out, "import std.io; ") }
+    rt.buf_push_bytes(out, src, n)
+    if want_println || want_print { rt.buf_push(out, 10 as u8) }
+    if want_println { put(out, "fn println(s: str) { io.print_line(s) }\n") }
+    if want_print { put(out, "fn print(s: str) { io.print(s) }\n") }
+    return true
+}
+
+fn pl_scan_flags(src: u64, n: usize) -> u32 {
+    if PRELUDE_OFF != 0 { return SCAN_BLOCKS_TO_STR }
+    if contains(src, n, 112 as u8, "profile kernel") { return 0 as u32 }
+    if !contains(src, n, 116 as u8, "to_str") { return 0 as u32 }
+    var sc: Scan = scan_new()
+    scan_source(src, n, &sc)
+    if sc.declares_to_str_method || (sc.imported & IM_TOSTR) != 0 { return SCAN_BLOCKS_TO_STR }
+    if sc.method_to_str { return SCAN_WANTS_TO_STR }
+    return 0 as u32
+}

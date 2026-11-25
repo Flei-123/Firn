@@ -135,6 +135,7 @@ mod borrowcheck;
 mod borrowmode;
 mod sendcheck;
 mod nogc;
+mod prelude;
 mod prune;
 mod opt;
 mod panic_rt;
@@ -378,6 +379,7 @@ fn usage() -> String {
          --unsafe-scope=<p> enforce --unsafe only in files whose path contains <p> (repeatable; default: all files)\n  \
          --edition=<year>   language edition (default: the newest; unknown ones are refused)\n  \
          --ownership=<m>    off | on | check | strict (automatic ownership, default on; off = kill switch)\n  \
+         --no-prelude       do not add the implicit imports (to_str, parse., format., chars., print, println)\n  \
          --no-gc            ownership-only mode: no collector runtime; gc class, Gc[T], GcWeak[T], gc fn, GcVec/GcMap are errors; requires --ownership=strict\n  \
          --moves=<m>        off | vec (Vec and structs holding a Vec are move-only: use after move is an error; default off)\n  \
          --borrow=<m>       off | on | strict (on: exclusivity of inout across statements, no raw pointer into a reference target; strict adds: no local address to opaque callees; default on)\n  \
@@ -493,6 +495,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err(e);
                 }
             }
+            "--no-prelude" => prelude::disable(),
             "--no-gc" => {
                 if own::explicit() && own::mode() != own::Mode::Strict {
                     return Err(gcfree::ownership_error());
