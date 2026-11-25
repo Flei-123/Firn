@@ -12,7 +12,7 @@ Implementation: a text pass in the lexer entry, firnc0 `compiler/src/derive/`, f
 | `Hash` | `fn hash(*self) -> u64` | `hash()` (interface `Hash`: ints, bool; `str` directly; no floats) |
 | `Clone` | `fn clone(*self) -> T` | `clone()` (interface `Clone`: ints, floats, bool; `str` copied) |
 | `Json` | `fn to_json(*self) -> str`: structs `{"a":1,"b":"x"}`, enums `"Unit"` or `{"Var":[1,2]}` (firnc0 only) | `to_json()` (interface `Serialize` in `std.derive`: ints, floats, bool; `str` escaped directly) |
-| `Default` | free function `default_Name() -> Name` (impl blocks have no associated functions) | ints, floats, bool, `str`, `Vec[X]`, or a type with its own `default_Type()` |
+| `Default` | `Name.default()` and the free function `default_Name() -> Name` | ints, floats, bool, `str`, `Vec[X]`, or a type with its own `default_Type()` |
 
 Rules and limits:
 - A field without the method gives `type 'Inner' has no method 'debug'` (derive `Debug` on `Inner` too).

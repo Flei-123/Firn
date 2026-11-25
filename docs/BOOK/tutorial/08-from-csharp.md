@@ -6,8 +6,10 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 |---|---|
 | `int x = 5;` | `let x: int = 5` |
 | `x.ToString()` | `x.to_str()` (`import std.tostr`) |
-| `int.Parse(s)` | `parse.to_i32(s) catch 0` (`import std.parse`) |
-| `int.TryParse(s, out n)` | `parse.try_i32(s, &n)` |
+| `int.Parse(s)` | `int.parse(s) catch 0` (`import std.parse`) |
+| `int.TryParse(s, out n)` | `int.try_parse(s, &n)` |
+| `new Counter()` | `Counter.start()`, a function in `impl Counter` without `self` |
+| `a.B().C()` | `a.b().c()`, also on results and on `(x + y)` |
 | `string.Format("{0} + {1}", a, b)` | `format.format2("{0} + {1}", a.to_str(), b.to_str())` (`import std.format`) |
 | `char c = 'a';` | `let c: char = 'a'` |
 | `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
@@ -39,7 +41,7 @@ fn main() -> i32 {
 
 ## Parse and TryParse
 
-Firn has no exceptions. `parse.to_*` returns an error union `ParseError!T`; `catch` gives a fallback, `try` passes the error up.
+Firn has no exceptions. `int.parse` returns an error union `ParseError!i32`; `catch` gives a fallback, `try` passes the error up. The type name before the dot works for `int`, `long`, `uint`, `ulong`, `float`, `double`, `bool` and their short names (`i32`, `i64`, `u32`, `u64`, `f32`, `f64`).
 
 ```firn run
 import std.io
@@ -47,12 +49,12 @@ import std.parse
 import std.tostr
 
 fn main() -> i32 {
-    let a = parse.to_i32("123") catch 0 - 1
-    let b = parse.to_i32("12x") catch 0 - 1
-    let c = parse.to_f64("2.5") catch 0.0
-    let d = parse.to_i32("3000000000") catch |e| 0 - 2
+    let a = int.parse("123") catch 0 - 1
+    let b = int.parse("12x") catch 0 - 1
+    let c = f64.parse("2.5") catch 0.0
+    let d = int.parse("3000000000") catch |e| 0 - 2
     var n: i64 = 0
-    let ok: bool = parse.try_i64("77", &n)
+    let ok: bool = i64.try_parse("77", &n)
     io.print_line(a.to_str() + " " + b.to_str() + " " + c.to_str() + " " + d.to_str() + " " + ok.to_str() + " " + n.to_str())
     return 0
 }
@@ -64,7 +66,44 @@ fn main() -> i32 {
 
 - `ParseError` has `Empty`, `Invalid` and `Overflow`.
 - The whole text must be the number: `" 4"` and `"4 "` fail; call `s.trim()` first.
-- Why `parse.to_i32(s)` and not `int.parse(s)`: a type name is not a value in Firn, so `int.parse` would need static methods on built-in types; the module function says the same.
+- `int.parse(s)` is the function `i32__parse` that `impl i32` in `std.parse` declares; `parse.to_i32(s)` is the same call in module form.
+
+## Functions on a type
+
+An `impl` block may hold functions without a receiver. They are called on the type name, with a dot.
+
+```firn run
+import std.io
+import std.tostr
+
+struct Counter { n: i32 }
+
+impl Counter {
+    fn start() -> Counter { return Counter { n: 0 } }
+    fn next(*self) -> Counter { return Counter { n: (*self).n + 1 } }
+    fn get(*self) -> i32 { return (*self).n }
+}
+
+#[derive(Default)]
+struct Config { width: i32, name: str }
+
+fn main() -> i32 {
+    let c: Counter = Counter.start()
+    io.print_line(Counter.start().next().next().get().to_str() + " " + c.get().to_str())
+    let cfg: Config = Config.default()
+    io.print_line(cfg.width.to_str() + "[" + cfg.name + "]")
+    return 0
+}
+```
+
+```output
+2 0
+0[]
+```
+
+- A method call works on any value: `Counter.start().next().next().get()` needs no `let` in between. A `*self` method on a temporary changes the temporary only.
+- A local variable, `const` or function with the same name as the type wins over the type.
+- `::` is only for enum variants (`Shape::Box(1)`).
 
 ## Format
 
@@ -146,4 +185,4 @@ fn main() -> i32 {
 - `char` is `u32`, so `c.to_str()` is the number; `c.char_str()` is the text.
 - `for c in s.chars()` does not exist: a `for` loop needs an array variable. Use `chars.iter` and `chars.next`.
 - `chars.count(s)` counts characters, `s.length()` counts bytes.
-- A method needs a named receiver: `let n = chars.count(s)` first, then `n.to_str()`.
+- A method works on a call result: `chars.count(s).to_str()`.

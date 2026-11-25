@@ -1401,6 +1401,24 @@ brackets a line break has never ended anything and still does not. Proof:
   over a `str`, `count`, `at`, `is_digit`, `to_upper`, ...). The reason is
   the same as for `int`: a distinct primitive type would need its own kind
   in both compilers; that decision is open (roadmap).
+  **ROUND 90 (C# comfort): method chains and functions on type names.**
+  (1) A method that takes `*self` may be called on any value, not only on a
+  variable: `make(3).sum()`, `(a + b).sum()`, `count(s).to_str()`. The
+  compiler places the value in a hidden stack slot and passes its address,
+  so a change the method makes to `*self` stays in that temporary. This
+  also lifts the operator trap (`(a + b) * c` with `fn mul(*self, ..)`).
+  (2) An `impl` block may declare a function without a receiver: the first
+  parameter is not `self`, `*self`, `*mut self`, `&self` or `inout self`.
+  It is the ordinary function `Type__name` and is called as `Type.name(args)`
+  with a dot, the same spelling as `module.name(args)`; `::` stays for enum
+  variants (`Shape::Box(1)`). `Counter.start()`, `Shape.unit()`,
+  `int.twice(4)` all work, so do the built-in names and aliases
+  (`int`, `i64`, `f64`, `bool`, `long`, ...). A name that is a local, `const`,
+  `static` or function wins over a type name. `std.parse` declares
+  `parse` and `try_parse` on `i32 i64 u32 u64 f32 f64 bool`:
+  `int.parse(s) catch 0`, `f64.parse(s)`, `int.try_parse(s, &n)`.
+  `#[derive(Default)]` adds `T.default()` next to `default_T()`.
+  Both rules only accept text that was an error before (docs/STABILITY.md).
   **ROUND 88: `string` closes the family.** The list is the one of C#, and
   there the text type is called `string`; it was the only name missing, so
   the most obvious line a stranger writes, `let x: string = "test"`, was

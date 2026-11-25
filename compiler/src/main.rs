@@ -28,6 +28,7 @@ mod fbits;
 mod fnaddr;
 mod constcheck;
 mod operators;
+mod typecall;
 mod ptrarith;
 mod wrapcast;
 mod include;

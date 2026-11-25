@@ -320,24 +320,34 @@ pub(crate) fn method(
         p.sync_item();
         return None;
     }
-    let slf = match self_param(p, self_ty, tsp) {
-        Some(x) => x,
-        None => {
-            p.recovering = false;
-            p.sync_item();
-            return None;
-        }
-    };
-    let mut params = vec![slf];
-    let mut ref_params = std::mem::take(&mut p.ref_params);
-    if p.eat(&TokKind::Comma) {
-        // r704: methods may have defaults, except in `impl I for T` (the
-        // signature has to equal the interface).
+    let mut params = Vec::new();
+    let mut ref_params = Vec::new();
+    if !starts_receiver(p) {
         p.allow_defaults = !is_for;
-        let (more, refs) = p.params_ref();
+        let (all, refs) = p.params_ref();
         p.allow_defaults = false;
-        params.extend(more);
+        params.extend(all);
         ref_params.extend(refs);
+    } else {
+        let slf = match self_param(p, self_ty, tsp) {
+            Some(x) => x,
+            None => {
+                p.recovering = false;
+                p.sync_item();
+                return None;
+            }
+        };
+        params.push(slf);
+        ref_params = std::mem::take(&mut p.ref_params);
+        if p.eat(&TokKind::Comma) {
+            // r704: methods may have defaults, except in `impl I for T` (the
+            // signature has to equal the interface).
+            p.allow_defaults = !is_for;
+            let (more, refs) = p.params_ref();
+            p.allow_defaults = false;
+            params.extend(more);
+            ref_params.extend(refs);
+        }
     }
     p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
@@ -380,6 +390,18 @@ pub(crate) fn method(
         attrs,
         extern_info: None, is_const: false,
     })
+}
+
+fn starts_receiver(p: &Parser) -> bool {
+    let at = |i: usize| p.toks.get(p.pos + i).map(|t| &t.kind);
+    let is_self = |k: Option<&TokKind>| matches!(k, Some(TokKind::Ident(n)) if n == "self");
+    match at(0) {
+        Some(TokKind::Ident(n)) if n == "self" => true,
+        Some(TokKind::Ident(n)) if n == "inout" => is_self(at(1)),
+        Some(TokKind::Amp) => is_self(at(1)),
+        Some(TokKind::Star) => is_self(at(1)) || (matches!(at(1), Some(TokKind::KwMut)) && is_self(at(2))),
+        _ => false,
+    }
 }
 
 /// The receiver: `self`, `*self` or `*mut self`.
@@ -624,9 +646,7 @@ pub(crate) fn field_fn(
     }
 }
 
-/// Can the address of this expression be taken?
-/// The same set that `&x` allows and that `lower::lower_addr` masters.
-fn is_slot(e: &Expr) -> bool {
+pub(crate) fn is_slot(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Ident(_) | ExprKind::Field(..) | ExprKind::Index(..) => true,
         ExprKind::Unary(op, _) => matches!(op, UnOp::Deref),
@@ -937,18 +957,6 @@ pub(crate) fn hook_call(
     log_note(recv.id, &full);
     // Adapt the receiver — the only automatism at the call site.
     match sig.params.first() {
-        Some(t) if t.is_ptr() && !is_ptr => {
-            if !is_slot(recv) {
-                ck.dg.error_note(
-                    recv.span,
-                    format!(
-                        "the receiver of '{}' needs an address, this expression has none",
-                        display
-                    ),
-                    "bind it to a variable and call the method on it".to_string(),
-                );
-            }
-        }
         Some(t) if !t.is_ptr() && is_ptr => {
             ck.dg.error_note(
                 recv.span,

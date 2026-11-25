@@ -103,7 +103,7 @@ fn struct_default(decl: &Decl, fields: &[(String, String)]) -> Result<String, St
         items.push(format!("{}: {}", f, expr::default_value(t)?));
     }
     Ok(format!(
-        " fn default_{n}() -> {n} {{ return {n} {{ {i} }} }}",
+        " fn default_{n}() -> {n} {{ return {n} {{ {i} }} }} impl {n} {{ fn default() -> {n} {{ return default_{n}() }} }}",
         n = decl.name,
         i = items.join(", ")
     ))

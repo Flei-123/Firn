@@ -14,6 +14,6 @@ Rules:
 - The right operand has whatever type the method declares (`fn mul(*self, k: i64) -> V2` gives `v * 3`).
 - A struct without the method keeps the old error; a wrong operand type is an ordinary argument error.
 
-Trap: methods take `*self`, so the left operand must be addressable. `(a + b) * c` is rejected ("needs an address"); write `let t = a + b` and then `t * c`.
+Receivers that are not variables work: `(a + b) * c` with `fn mul(*self, k: V) -> V` places `a + b` in a hidden temporary and passes its address, so `let t = a + b` is no longer needed (round 90).
 
-Tests: `tests/diff/op_overload_*.fi`, `tests/diff/neg_op_*.fi`.
+Tests: `tests/6821_method_chain_temps.fi`, `tests/diff/op_overload_*.fi`, `tests/diff/neg_op_*.fi`.

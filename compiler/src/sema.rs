@@ -3075,6 +3075,12 @@ constants declared before it, and '+ - * /'"
         if let Some(real) = self.fmt_target(name, args, espan) {
             return self.call(&real, args, nspan, espan);
         }
+        let is_value = |n: &str| {
+            self.lookup_var(n).is_some() || self.consts.contains_key(n) || self.statics.contains_key(n) || self.fns.contains_key(n)
+        };
+        if let Some(full) = crate::typecall::target(&self.fns, name, args, is_value) {
+            return self.call(&full, &args[1..], nspan, espan);
+        }
         // HOOK impl: `x.m(args)` — method call (impls.rs, round 45)
         if let Some(t) = crate::impls::hook_call(self, name, args, nspan, espan) {
             return t;

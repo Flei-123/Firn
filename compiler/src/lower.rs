@@ -502,6 +502,17 @@ impl<'a> Lower<'a> {
         r
     }
 
+    pub(crate) fn lower_receiver_addr(&mut self, e: &Expr) -> Option<Val> {
+        if crate::impls::is_slot(e) || self.pinned.contains_key(&e.id) {
+            return self.lower_addr(e);
+        }
+        let t = self.ty_of(e);
+        let (size, align) = self.size_align(&t);
+        let slot = self.alloca(size, align);
+        self.write_into(slot, e)?;
+        Some(slot)
+    }
+
     fn lower_addr_inner(&mut self, e: &Expr) -> Option<Val> {
         if let Some(call) = crate::operators::desugar(self, e) {
             return self.lower_addr(&call);
@@ -1450,6 +1461,16 @@ impl<'a> Lower<'a> {
         dest: Option<Val>,
         span: Span,
     ) -> Option<Option<Val>> {
+        let is_value = |n: &str| {
+            self.local_ty(n).is_some()
+                || self.info.consts.contains_key(n)
+                || self.info.statics.contains_key(n)
+                || self.info.const_texts.contains_key(n)
+                || self.info.fns.contains_key(n)
+        };
+        if let Some(full) = crate::typecall::target(&self.info.fns, name, args, is_value) {
+            return self.lower_call(&full, &args[1..], dest, span);
+        }
         // HOOK str: `f"{x}"` — the step is derived from the type of the
         // argument, exactly as in the type check (sema::fmt_target, round 70).
         let fmt_real;
@@ -1691,7 +1712,7 @@ impl<'a> Lower<'a> {
             }
             // HOOK impl: the receiver goes in as an address (impls.rs)
             if i == 0 && receiver_address {
-                let addr = self.lower_addr(a)?;
+                let addr = self.lower_receiver_addr(a)?;
                 vals.push(addr);
                 continue;
             }
