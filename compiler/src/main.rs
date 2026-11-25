@@ -136,6 +136,7 @@ mod borrowmode;
 mod sendcheck;
 mod nogc;
 mod prelude;
+mod prelude_format;
 mod prune;
 mod opt;
 mod panic_rt;

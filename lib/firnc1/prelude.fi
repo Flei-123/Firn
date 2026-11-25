@@ -1,4 +1,5 @@
 import rt
+import vec
 import derive_decl
 
 static mut PRELUDE_OFF: u32 = 0
@@ -23,14 +24,19 @@ const IM_FORMAT: u32 = 4
 const IM_CHARS: u32 = 8
 const IM_IO: u32 = 16
 
+const MAX_FORMAT_ARGS: usize = 8
 const SCAN_WANTS_TO_STR: u32 = 1
 const SCAN_BLOCKS_TO_STR: u32 = 2
 
 struct Scan {
     cnt: [u32; 24],
-    method_to_str: bool,
+    recv_s: Vec[usize],
+    recv_e: Vec[usize],
+    imp_s: Vec[usize],
+    imp_e: Vec[usize],
     declares_to_str_method: bool,
     imported: u32,
+    calls: Vec[usize],
 }
 
 fn pl_disable() {
@@ -86,10 +92,7 @@ fn is_method_declaration(src: u64, n: usize, i0: usize) -> bool {
 
 fn note_word(sc: *mut Scan, w: usize, prev_dot: bool, prev_fn: bool, next: u8) {
     if w == W_NONE { return }
-    if w == W_TO_STR {
-        if prev_dot { (*sc).method_to_str = true }
-        return
-    }
+    if w == W_TO_STR { return }
     if prev_dot { return }
     if prev_fn {
         bump(sc, K_DECLARED, w)
@@ -102,7 +105,48 @@ fn note_word(sc: *mut Scan, w: usize, prev_dot: bool, prev_fn: bool, next: u8) {
     }
 }
 
+fn scan_free(sc: *mut Scan) {
+    vec_free[usize](&(*sc).calls)
+    vec_free[usize](&(*sc).recv_s)
+    vec_free[usize](&(*sc).recv_e)
+    vec_free[usize](&(*sc).imp_s)
+    vec_free[usize](&(*sc).imp_e)
+}
+
+fn note_receiver(sc: *mut Scan, src: u64, start: usize) {
+    var j: usize = start
+    while j > 0 && at(src, j - 1) <= 32 { j = j - 1 }
+    if j > 0 { j = j - 1 }
+    let e: usize = j
+    while j > 0 && is_ident_byte(at(src, j - 1)) { j = j - 1 }
+    vec_push[usize](&(*sc).recv_s, j)
+    vec_push[usize](&(*sc).recv_e, e)
+}
+
+fn calls_to_str_method(sc: *mut Scan, src: u64) -> bool {
+    var r: usize = 0
+    while r < vec_len[usize](&(*sc).recv_s) {
+        let rs: usize = vec_at[usize](&(*sc).recv_s, r)
+        let re: usize = vec_at[usize](&(*sc).recv_e, r)
+        var known: bool = false
+        var m: usize = 0
+        while m < vec_len[usize](&(*sc).imp_s) {
+            let ms: usize = vec_at[usize](&(*sc).imp_s, m)
+            let me: usize = vec_at[usize](&(*sc).imp_e, m)
+            if me - ms == re - rs && re > rs {
+                unsafe { if rt.mem_eq(src +% rs as u64, src +% ms as u64, re - rs) { known = true } }
+            }
+            m = m + 1
+        }
+        if !known { return true }
+        r = r + 1
+    }
+    return false
+}
+
 fn note_import(sc: *mut Scan, src: u64, s: usize, e: usize) {
+    vec_push[usize](&(*sc).imp_s, s)
+    vec_push[usize](&(*sc).imp_e, e)
     if derive_decl.dv_eq_lit(src, s, e, "tostr") { (*sc).imported = (*sc).imported | IM_TOSTR }
     if derive_decl.dv_eq_lit(src, s, e, "parse") { (*sc).imported = (*sc).imported | IM_PARSE }
     if derive_decl.dv_eq_lit(src, s, e, "format") { (*sc).imported = (*sc).imported | IM_FORMAT }
@@ -166,8 +210,12 @@ fn scan_source(src: u64, n: usize, sc: *mut Scan) {
                 prev_fn = false
             } else {
                 let w: usize = word_index(src, s, i)
+                if w == W_TO_STR && prev_dot { note_receiver(sc, src, s) }
                 if w == W_TO_STR && prev_fn && is_method_declaration(src, n, i) {
                     (*sc).declares_to_str_method = true
+                }
+                if w == W_FORMAT && !prev_dot && !prev_fn && next_non_space(src, n, i) == 40 {
+                    vec_push[usize](&(*sc).calls, s)
                 }
                 note_word(sc, w, prev_dot, prev_fn, next_non_space(src, n, i))
                 prev_fn = derive_decl.dv_eq_lit(src, s, i, "fn")
@@ -181,7 +229,7 @@ fn scan_source(src: u64, n: usize, sc: *mut Scan) {
 }
 
 fn scan_new() -> Scan {
-    return Scan { cnt: [0 as u32; 24], method_to_str: false, declares_to_str_method: false, imported: 0 }
+    return Scan { cnt: [0 as u32; 24], recv_s: vec_new[usize](), recv_e: vec_new[usize](), imp_s: vec_new[usize](), imp_e: vec_new[usize](), declares_to_str_method: false, imported: 0, calls: vec_new[usize]() }
 }
 
 fn contains(src: u64, n: usize, first: u8, lit: str) -> bool {
@@ -205,24 +253,140 @@ fn put(out: *mut rt.Buf, s: str) {
     unsafe { rt.buf_push_bytes(out, s.p as u64, s.n) }
 }
 
+fn format_usable(sc: *mut Scan) -> bool {
+    return count(sc, K_DOTTED, W_FORMAT) + count(sc, K_CALLED, W_FORMAT) > 0 && count(sc, K_OTHER, W_FORMAT) == 0 && count(sc, K_DECLARED, W_FORMAT) == 0
+}
+
+fn open_paren(src: u64, n: usize, p: usize) -> usize {
+    var i: usize = p + 6
+    while i < n && (at(src, i) == 32 || at(src, i) == 9) { i = i + 1 }
+    if i < n && at(src, i) == 40 { return i }
+    return n
+}
+
+fn split_args(src: u64, n: usize, open: usize, starts: *mut Vec[usize], ends: *mut Vec[usize]) -> usize {
+    var depth: usize = 0
+    var start: usize = open + 1
+    var i: usize = start
+    while i < n {
+        let c: u8 = at(src, i)
+        if c == 47 && i + 1 < n && at(src, i + 1) == 47 {
+            while i < n && at(src, i) != 10 { i = i + 1 }
+        } else if c == 47 && i + 1 < n && at(src, i + 1) == 42 {
+            i = i + 2
+            while i + 1 < n && !(at(src, i) == 42 && at(src, i + 1) == 47) { i = i + 1 }
+            i = i + 2
+        } else if c == 34 || c == 39 {
+            i = skip_quoted(src, n, i, c)
+        } else if c == 40 || c == 91 || c == 123 {
+            depth = depth + 1
+            i = i + 1
+        } else if c == 41 && depth == 0 {
+            var blank: bool = true
+            var k: usize = start
+            while k < i {
+                if at(src, k) > 32 { blank = false }
+                k = k + 1
+            }
+            if !blank || vec_len[usize](starts) == 0 {
+                vec_push[usize](starts, start)
+                vec_push[usize](ends, i)
+            }
+            return i
+        } else if c == 41 || c == 93 || c == 125 {
+            if depth > 0 { depth = depth - 1 }
+            i = i + 1
+        } else if c == 44 && depth == 0 {
+            vec_push[usize](starts, start)
+            vec_push[usize](ends, i)
+            i = i + 1
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    return n
+}
+
+fn emit_call(src: u64, n: usize, calls: *mut Vec[usize], starts: *mut Vec[usize], ends: *mut Vec[usize], out: *mut rt.Buf) {
+    let na: usize = vec_len[usize](starts)
+    put(out, "format.format")
+    rt.buf_push(out, (48 + na - 1) as u8)
+    rt.buf_push(out, 40 as u8)
+    var k: usize = 0
+    while k < na {
+        if k > 0 {
+            put(out, ",__fmt_show(")
+        }
+        emit(src, n, vec_at[usize](starts, k), vec_at[usize](ends, k), calls, out)
+        if k > 0 {
+            rt.buf_push(out, 41 as u8)
+        }
+        k = k + 1
+    }
+    rt.buf_push(out, 41 as u8)
+}
+
+fn emit(src: u64, n: usize, from: usize, to: usize, calls: *mut Vec[usize], out: *mut rt.Buf) {
+    var pos: usize = from
+    var ci: usize = 0
+    while ci < vec_len[usize](calls) {
+        let p: usize = vec_at[usize](calls, ci)
+        ci = ci + 1
+        if p >= to { break }
+        let open: usize = open_paren(src, n, p)
+        if p >= pos && open < n {
+            var starts: Vec[usize] = vec_new[usize]()
+            var ends: Vec[usize] = vec_new[usize]()
+            let close: usize = split_args(src, n, open, &starts, &ends)
+            let na: usize = vec_len[usize](&starts)
+            if close < to && na > 0 && na <= MAX_FORMAT_ARGS + 1 {
+                rt.buf_push_bytes(out, src +% pos as u64, p - pos)
+                emit_call(src, n, calls, &starts, &ends, out)
+                pos = close + 1
+            }
+            vec_free[usize](&starts)
+            vec_free[usize](&ends)
+        }
+    }
+    rt.buf_push_bytes(out, src +% pos as u64, to - pos)
+}
+
+fn put_show_wrapper(out: *mut rt.Buf) {
+    put(out, "fn __fmt_show[T](x: T) -> str { return io.fmt_string(f")
+    rt.buf_push(out, 34 as u8)
+    put(out, "{x}")
+    rt.buf_push(out, 34 as u8)
+    put(out, ") }\n")
+}
+
 fn pl_run(src: u64, n: usize, out: *mut rt.Buf) -> bool {
     if PRELUDE_OFF != 0 { return false }
     if contains(src, n, 112 as u8, "profile kernel") { return false }
     var sc: Scan = scan_new()
+    defer scan_free(&sc)
     scan_source(src, n, &sc)
+    let format_ok: bool = format_usable(&sc)
     let want_parse: bool = only_dotted(&sc, W_PARSE) && (sc.imported & IM_PARSE) == 0
-    let want_format: bool = only_dotted(&sc, W_FORMAT) && (sc.imported & IM_FORMAT) == 0
+    let want_format: bool = format_ok && (sc.imported & IM_FORMAT) == 0
     let want_chars: bool = only_dotted(&sc, W_CHARS) && (sc.imported & IM_CHARS) == 0
+    let rewrite_calls: bool = format_ok && vec_len[usize](&sc.calls) > 0
     let want_println: bool = only_called(&sc, W_PRINTLN)
     let want_print: bool = only_called(&sc, W_PRINT)
-    let want_io: bool = (want_println || want_print) && (sc.imported & IM_IO) == 0
-    if !(want_parse || want_format || want_chars || want_println || want_print) { return false }
+    let want_wrappers: bool = want_println || want_print || rewrite_calls
+    let want_io: bool = want_wrappers && (sc.imported & IM_IO) == 0
+    if !(want_parse || want_format || want_chars || want_wrappers) { return false }
     if want_parse { put(out, "import std.parse; ") }
     if want_format { put(out, "import std.format; ") }
     if want_chars { put(out, "import std.chars; ") }
     if want_io { put(out, "import std.io; ") }
-    rt.buf_push_bytes(out, src, n)
-    if want_println || want_print { rt.buf_push(out, 10 as u8) }
+    if rewrite_calls {
+        emit(src, n, 0, n, &sc.calls, out)
+    } else {
+        rt.buf_push_bytes(out, src, n)
+    }
+    if want_wrappers { rt.buf_push(out, 10 as u8) }
+    if rewrite_calls { put_show_wrapper(out) }
     if want_println { put(out, "fn println(s: str) { io.print_line(s) }\n") }
     if want_print { put(out, "fn print(s: str) { io.print(s) }\n") }
     return true
@@ -233,8 +397,9 @@ fn pl_scan_flags(src: u64, n: usize) -> u32 {
     if contains(src, n, 112 as u8, "profile kernel") { return 0 as u32 }
     if !contains(src, n, 116 as u8, "to_str") { return 0 as u32 }
     var sc: Scan = scan_new()
+    defer scan_free(&sc)
     scan_source(src, n, &sc)
     if sc.declares_to_str_method || (sc.imported & IM_TOSTR) != 0 { return SCAN_BLOCKS_TO_STR }
-    if sc.method_to_str { return SCAN_WANTS_TO_STR }
+    if calls_to_str_method(&sc, src) { return SCAN_WANTS_TO_STR }
     return 0 as u32
 }

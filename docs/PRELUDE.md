@@ -12,6 +12,7 @@ per file right after `derive` and before the lexer.
 | `parse.to_i32(s) catch 0` | `import std.parse` |
 | `format.format2(..)` | `import std.format` |
 | `chars.count(s)` | `import std.chars` |
+| `format("{0} and {1}", x, y)` | `import std.format`, `import std.io`, each argument after the template goes through a file-local generic `__fmt_show[T]` (f-string formatting, so numbers, `bool`, `str` work directly) and the call becomes `format.format2(..)`; up to 8 arguments |
 | `println(s)` / `print(s)` | `import std.io` and a file-local `fn println(s: str)` / `fn print(s: str)` |
 
 Nothing else is implicit: `io.print_line(..)` still needs `import std.io`.
@@ -31,6 +32,15 @@ Nothing else is implicit: `io.print_line(..)` still needs `import std.io`.
 * Imports are inserted in front of line 1 on the same line, wrappers are appended after the
   last line: line numbers never move.
 
+## Variadic `format`
+
+`format(tpl, a, b, c)` is the typed variadic form for the common case: any number
+(0 to 8) of arguments of any type that an f-string can print. It is a source rewrite
+inside the prelude, not a general `..T` parameter. A user-declared `..T` parameter
+syntax is NOT implemented (open roadmap item). Nested calls work
+(`format("{0}", format("<{0}>", x))`). More than 8 arguments are left untouched and
+fail as an unknown function. `format.format0` to `format.format8` stay available.
+
 ## gc_init
 
 The compiler already writes the call to `gc_init()` into the generated start code
@@ -41,4 +51,4 @@ The compiler already writes the call to `gc_init()` into the generated start cod
 ## Tests
 
 `tests/6820_prelude_basic.fi`, `tests/6821_prelude_own_names.fi`,
-`tests/6822_prelude_method_to_str_own_impl.fi`, `tests/neg/6820_prelude_other_modules_stay_explicit.fi`.
+`tests/6822_prelude_method_to_str_own_impl.fi`, `tests/6825_prelude_format_call.fi`, `tests/6826_prelude_own_format_wins.fi`, `tests/neg/6820_prelude_other_modules_stay_explicit.fi`.
