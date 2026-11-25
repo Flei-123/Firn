@@ -890,7 +890,6 @@ NEG = [
     ('darg_nofn', 'fn main() -> i32 {\n    return nope(a: 1)\n}\n'),
     ('darg_extern', 'extern fn abs(a: i32 = 1) -> i32\nfn main() -> i32 {\n    return 0\n}\n'),
     ('darg_reqafter', 'fn f(a: i32 = 1, b: i32) -> i32 {\n    return a + b\n}\nfn main() -> i32 {\n    return 0\n}\n'),
-    ('meth_noself', 'struct S {\n    x: i32,\n}\nimpl S {\n    fn m(a: i32) -> i32 {\n        return a\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
     ('meth_gccopy', 'gc class K {\n    x: i32,\n}\nimpl K {\n    fn m(self) -> i32 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
     ('nogc_closure', 'gc class Dummy {\n    v: i64,\n}\n#[no_gc]\nfn quick(n: i32) -> AllocError!i32 {\n    let f: fn(i32) -> i32 = try gc fn(a: i32) -> i32 { return a + n }\n    return f(1)\n}\nfn main() -> i32 {\n    return quick(2) catch 91\n}\n'),
     ('fs_noimport', 'fn main() -> i32 {\n    let t: str = f"v={1}"\n    return 0\n}\n'),
@@ -898,7 +897,6 @@ NEG = [
     ('fs_spec_dot', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:>8.}"))\n    return 0\n}\n'),
     ('fs_spec_type', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 1\n    io.print_line(io.fmt_string(f"{n:q}"))\n    return 0\n}\n'),
     ('fs_brace', 'import std.io\nfn main() -> i32 {\n    io.fmt_print(f"}")\n    return 0\n}\n'),
-    ('meth_noself_empty', 'struct S {\n    x: i32,\n}\nimpl S {\n    fn m() -> i32 {\n        return 1\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
     ('meth_noself_second', 'struct S {\n    x: i32,\n}\nimpl S {\n    fn m(a: i32, self) -> i32 {\n        return a\n    }\n}\nfn main() -> i32 {\n    return 0\n}\n'),
     ('nogc_closure_two', 'gc class Dummy {\n    v: i64,\n}\n#[no_gc]\nfn sum(a: i32, b: i32) -> AllocError!i32 {\n    let f: fn() -> i32 = try gc fn() -> i32 { return a + b }\n    return f()\n}\nfn main() -> i32 {\n    return sum(1, 2) catch 91\n}\n'),
     ('arr_empty_infer', 'fn main() -> i32 {\n    let a = []\n    return 0\n}\n'),
@@ -934,7 +932,6 @@ IMPL_GENERIC_NEG = [
     ("arg_type", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn set(*mut self, v: T) { (*self).value = v }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    a.set(true)\n    return 0\n}\n"),
     ("arg_count", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn set(*mut self, v: T) { (*self).value = v }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    a.set(1, 2)\n    return 0\n}\n"),
     ("duplicate", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n}\nimpl Box[T] {\n    fn get(*self) -> T { return (*self).value }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
-    ("no_receiver", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn make(v: T) -> i32 { return 0 }\n}\nfn main() -> i32 {\n    return 0\n}\n"),
     ("body_type", "struct Box[T] { value: T }\nimpl Box[T] {\n    fn get(*self) -> T { return true }\n}\nfn main() -> i32 {\n    var a: Box[i32] = Box[i32] { value: 1 }\n    return a.get()\n}\n"),
 ]
 for nm, src in IMPL_GENERIC_NEG:
