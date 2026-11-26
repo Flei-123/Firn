@@ -10,6 +10,7 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `x.ToString()` | `x.to_str()` |
 | `int.Parse(s)` | `int.parse(s) catch 0` |
 | `int.TryParse(s, out n)` | `int.try_parse(s, &n)` |
+| `new List<int>()` | `Vec[i32].new()` (also `Map[u32, i32].new()`, `Set[u32].new()`) |
 | `new Counter()` | `Counter.start()`, a function in `impl Counter` without `self` |
 | `a.B().C()` | `a.b().c()`, also on results and on `(x + y)` |
 | `string.Format("{0} + {1}", a, b)` | `format("{0} + {1}", a, b)` (long form: `format.format2("{0} + {1}", a.to_str(), b.to_str())`) |
@@ -143,6 +144,8 @@ fn main() -> i32 {
 - A method call works on any value: `Counter.start().next().next().get()` needs no `let` in between. A `*self` method on a temporary changes the temporary only.
 - A local variable, `const` or function with the same name as the type wins over the type.
 - `::` is only for enum variants (`Shape::Box(1)`).
+- Generic types take the same call: `Vec[i32].new()`, `Map[u32, i32].new()`, `Set[u32].new()` (`import std.vec` / `std.map`). A module name in front works too: `geo.Point.origin()`.
+- A wrong name says what is missing: `Counter.star()` gives `type 'Counter' has no function 'star'` with `did you mean 'start'?`.
 
 ## Format
 

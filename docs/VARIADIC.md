@@ -18,3 +18,10 @@ sum()  sum(5)  sum(1, 2, 3)
 * Added to `std.vec`: `vec_with(v, value)` (returns the Vec with `value` appended) and the method `xs.len()` on `Vec[T]`.
 * Errors name the helper: `argument 2 of 'vec_with__i32' has type str, expected i32`.
 * Tests: `tests/6830_variadic_params.fi`, `tests/neg/variadic_wrong_type.fi`.
+
+# Type-name function calls (r1642, r1643)
+
+* `Vec[i32].new()`, `Map[u32, i32].new()`, `Set[u32].new()`: the parser turns `Name[Args].f(..)` on a generic struct into a call of the instance function `Name__Args__f` (a function of `impl Name[T] { fn f() .. }`). `new` is declared in `lib/rt/vec.fi` and `lib/rt/map.fi`. A missing function ends as `unknown function 'Vec__i32__mew'`.
+* `mod.Type.f()` (module-qualified plain types) already worked after K1.
+* `T.missing()` for a struct, enum, alias or primitive type with no such function: `type 'T' has no function 'missing'` at the type name, help `did you mean 'x'?` from the functions of that type (`compiler/src/typecall.rs missing`, `lib/firnc1/sema.fi type_missing`).
+* Tests: `tests/6831_type_function_calls.fi`, `tests/neg/type_missing_function.fi`, `tests/neg/type_missing_function_prim.fi`.
