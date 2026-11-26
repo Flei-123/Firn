@@ -3081,6 +3081,14 @@ constants declared before it, and '+ - * /'"
         if let Some(full) = crate::typecall::target(&self.fns, name, args, is_value) {
             return self.call(&full, &args[1..], nspan, espan);
         }
+        let is_type = |n: &str| self.tcx.lookup(n).is_some() || crate::sema_match::is_enum_name(n);
+        if let Some(m) = crate::typecall::missing(&self.fns, name, args, is_value, is_type) {
+            self.dg.error_maybe_help(m.span, m.message, m.help);
+            for a in &args[1..] {
+                self.type_out_expr(a);
+            }
+            return Type::Error;
+        }
         // HOOK impl: `x.m(args)` — method call (impls.rs, round 45)
         if let Some(t) = crate::impls::hook_call(self, name, args, nspan, espan) {
             return t;

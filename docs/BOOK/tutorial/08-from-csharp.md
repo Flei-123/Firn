@@ -13,6 +13,7 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `new Counter()` | `Counter.start()`, a function in `impl Counter` without `self` |
 | `a.B().C()` | `a.b().c()`, also on results and on `(x + y)` |
 | `string.Format("{0} + {1}", a, b)` | `format("{0} + {1}", a, b)` (long form: `format.format2("{0} + {1}", a.to_str(), b.to_str())`) |
+| `int Sum(params int[] xs)` | `fn sum(xs: ..int) -> int`, called `sum(1, 2, 3)` or `sum()` |
 | `char c = 'a';` | `let c: char = 'a'` |
 | `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
 | `$"x = {x}"` | `f"x = {x}"` wrapped in `io.fmt_string(...)` |
@@ -69,6 +70,42 @@ fn main() -> i32 {
 - `ParseError` has `Empty`, `Invalid` and `Overflow`.
 - The whole text must be the number: `" 4"` and `"4 "` fail; call `s.trim()` first.
 - `int.parse(s)` is the function `i32__parse` that `impl i32` in `std.parse` declares; `parse.to_i32(s)` is the same call in module form.
+
+## params
+
+A last parameter `xs: ..T` collects every extra argument into a `Vec[T]`. The body iterates it with `for` and asks `xs.len()`.
+
+```firn run
+import std.io
+import std.tostr
+
+fn sum(xs: ..int) -> int {
+    var total: int = 0
+    for x in xs {
+        total += x
+    }
+    return total
+}
+
+fn describe(label: str, xs: ..long) -> str {
+    return label + ":" + xs.len().to_str()
+}
+
+fn main() -> i32 {
+    io.print_line(sum().to_str() + " " + sum(5).to_str() + " " + sum(1, 2, 3).to_str() + " " + sum(sum(1, 2), 4).to_str())
+    io.print_line(describe("n") + " " + describe("n", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+    return 0
+}
+```
+
+```output
+0 5 6 7
+n:0 n:10
+```
+
+- Zero arguments are fine; every argument is type-checked against `T`.
+- The call is rewritten in the file that declares the function, so a variadic function is called with its bare name in that file. Across modules pass a `Vec[T]` built with `vec.vec_with`.
+- A `Vec[T]` cannot be spread into the call (`sum(v)` is an error); the parameter itself is a plain `Vec[T]`.
 
 ## Functions on a type
 

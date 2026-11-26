@@ -36,10 +36,10 @@ Nothing else is implicit: `io.print_line(..)` still needs `import std.io`.
 
 `format(tpl, a, b, c)` is the typed variadic form for the common case: any number
 (0 to 8) of arguments of any type that an f-string can print. It is a source rewrite
-inside the prelude, not a general `..T` parameter. A user-declared `..T` parameter
-syntax is NOT implemented (open roadmap item). Nested calls work
-(`format("{0}", format("<{0}>", x))`). More than 8 arguments are left untouched and
-fail as an unknown function. `format.format0` to `format.format8` stay available.
+inside the prelude. The general `..T` parameter is a separate feature
+(`docs/VARIADIC.md`); `format` stays as it is because its arguments have mixed types.
+Nested calls work (`format("{0}", format("<{0}>", x))`). More than 8 arguments are left
+untouched and fail as an unknown function. `format.format0` to `format.format8` stay available.
 
 ## gc_init
 
