@@ -84,6 +84,7 @@ import font.platglyph
 import font.ttf
 import font.gsub
 import font.cbdt
+import font.colr
 import str.ucd_bidi
 import fui.theme
 import fui.bidi
@@ -171,7 +172,8 @@ struct Painter {
     wface_w: [usize; 4],
     back: fontback.FontBackend,
     fb_col: [usize; 3], // 1 per fallback slot that is a colour bitmap face
-    emoji_any: usize, // 1 when a fallback face is a colour bitmap font (CBDT)
+    emoji_any: usize, // 1 when a fallback face is a colour bitmap font (CBDT) or a layered colour font (COLR)
+    colr_any: usize, // 1 when the main face or a fallback face is a layered colour font (COLR v0 + CPAL)
 }
 
 #[no_gc]
@@ -181,7 +183,7 @@ fn painter_new() -> Painter {
         scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
         bt: 0, bx: 0, bcap: 0, bn: 0, blev: 0 as u8, bvn: 0,
         gs: gsub.gsub_new(), gs_fm: 0, fslot: [0 as u64; 4], fb: [0 as u64; 3],
-        wface: [0 as u64; 4], wface_w: [0 as usize; 4], back: fontback.fbk_default(), fb_col: [0 as usize; 3], emoji_any: 0,
+        wface: [0 as u64; 4], wface_w: [0 as usize; 4], back: fontback.fbk_default(), fb_col: [0 as usize; 3], emoji_any: 0, colr_any: 0,
     }
 }
 
@@ -271,7 +273,10 @@ fn painter_raster(z: *mut Painter) -> *mut raster.Raster {
 }
 
 #[no_gc]
-fn painter_set_font(z: *mut Painter, fm: u64) { (*z).fm = fm }
+fn painter_set_font(z: *mut Painter, fm: u64) {
+    (*z).fm = fm
+    colr_refresh(z)
+}
 
 #[no_gc]
 fn painter_font(z: *mut Painter) -> u64 { return (*z).fm }
@@ -336,14 +341,39 @@ fn painter_set_fallback(z: *mut Painter, i: usize, fm: u64) {
             let f: u64 = (*z).fb[k]
             (*z).fb_col[k] = 0
             if f != 0 && fontback.fbk_present(&(*z).back, f) &&
-            cbdt.cbdt_ok(metrics.fontset_font(f)) {
+            (cbdt.cbdt_ok(metrics.fontset_font(f)) || colr.colr_ok(metrics.fontset_font(f))) {
                 any = 1
                 (*z).fb_col[k] = 1
             }
             k = k + 1
         }
         (*z).emoji_any = any
+        colr_refresh(z)
     }
+}
+
+#[no_gc]
+fn colr_face(fm: u64) -> bool {
+    if fm == 0 {
+        return false
+    }
+    return colr.colr_ok(metrics.fontset_font(fm))
+}
+
+#[no_gc]
+fn colr_refresh(z: *mut Painter) {
+    var any: usize = 0
+    if colr_face((*z).fm) {
+        any = 1
+    }
+    var k: usize = 0
+    while k < FB_SLOTS {
+        if (*z).fb_col[k] != 0 && colr_face((*z).fb[k]) {
+            any = 1
+        }
+        k = k + 1
+    }
+    (*z).colr_any = any
 }
 
 fn painter_fallback(z: *mut Painter, i: usize) -> u64 {
@@ -2400,6 +2430,9 @@ const BOLD_PASSES: usize = 3
 fn glyph_into(z: *mut Painter, r: *mut TextRun, f: *mut ttf.Font,
     gid0: u32, pen: f64, base_y: f64, sc: f64) {
     var gid: u32 = gid0
+    if (*z).colr_any != 0 && colr_has_layers(f, gid0) {
+        return
+    }
     if (gid0 & metrics.GID_PLATFORM) != 0 as u32 {
         let pcp: u32 = metrics.fm_cp(gid0)
         if platglyph.pg_compose(&(*z).ra, pcp, (*r).size, metrics.fm_weight(f as u64),
@@ -2868,6 +2901,70 @@ fn emoji_glyph(z: *mut Painter, fm: u64, cp: u32, size: f64, pen: f64,
     }
 }
 
+const COLR_LAYERS: usize = 32
+
+#[no_gc]
+fn colr_has_layers(f: *mut ttf.Font, gid: u32) -> bool {
+    if !colr.colr_ok(f) || (gid & metrics.GID_PLATFORM) != 0 as u32 {
+        return false
+    }
+    var gids: [u32; 32] = [0 as u32; 32]
+    var idx: [u32; 32] = [0 as u32; 32]
+    return colr.colr_layers(f, gid, &gids, &idx) > 0
+}
+
+fn colr_paint_color(f: *mut ttf.Font, index: u32, fg: u32) -> u32 {
+    if index == colr.FOREGROUND {
+        return fg
+    }
+    var abgr: u32 = 0 as u32
+    if !colr.cpal_color(f, 0, index, &abgr) {
+        return fg
+    }
+    let alpha: u32 = (abgr >> 24 as u32) & 255 as u32
+    return (alpha << 24 as u32) | ((abgr & 255 as u32) << 16 as u32) | (abgr & 65280 as u32) | ((abgr >> 16 as u32) & 255 as u32)
+}
+
+fn colr_glyph(z: *mut Painter, r: *mut TextRun, fm: u64, cp: u32, pen: f64, base_y: f64, fg: u32) {
+    let f: *mut ttf.Font = metrics.fontset_font(fm)
+    let gid: u32 = metrics.fm_gid(fm, cp)
+    var gids: [u32; 32] = [0 as u32; 32]
+    var idx: [u32; 32] = [0 as u32; 32]
+    let n: usize = colr.colr_layers(f, gid, &gids, &idx)
+    let size: f64 = (*r).size
+    let sc: f64 = size / metrics.fm_upem(fm)
+    var k: usize = 0
+    while k < n {
+        var wx: f64 = 0.0
+        var wy: f64 = 0.0
+        if raster_window_at(z, pen - size * 0.3, base_y - size * 1.4, size * 2.0, size * 2.0, size, &wx, &wy, true) {
+            let okg: bool = ttf.outline_at(f, gids[k], &(*z).ra, pen, base_y, sc,
+                1.0, 0.0, 0.0, 1.0, 0.0, 0.0, (*z).scratch, SCRATCH, 0)
+            flush_raster(z, wx, wy, colr_paint_color(f, idx[k], fg))
+        }
+        k = k + 1
+    }
+}
+
+fn colr_overlay(z: *mut Painter, r: *mut TextRun, sx: f64, p: u64, nn: usize, base_y: f64, fg: u32) {
+    if (*z).colr_any == 0 {
+        return
+    }
+    var pen: f64 = sx
+    var i: usize = 0
+    while i < nn {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, nn, i, &adv)
+        let nx: u32 = next_cp(p, nn, i, adv)
+        let fm: u64 = fb_pick(z, r, cp)
+        if colr_face(fm) && colr_has_layers(metrics.fontset_font(fm), metrics.fm_gid(fm, cp)) {
+            colr_glyph(z, r, fm, cp, pen, base_y, fg)
+        }
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+}
+
 fn emoji_overlay(z: *mut Painter, r: *mut TextRun, sx: f64, p: u64,
     nn: usize, base_y: f64) {
     if (*z).emoji_any == 0 {
@@ -3063,12 +3160,16 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
             if (*z).emoji_any != 0 {
                 emoji_overlay(z, r, sx, p, nn, base_y)
             }
+            colr_overlay(z, r, sx, p, nn, base_y, col)
             return sx + br
         }
     }
     let e: f64 = paint_run_base(z, r, sx, base_y, br, col, p, nn, vis)
     if !vis && (*z).emoji_any != 0 {
         emoji_overlay(z, r, sx, p, nn, base_y)
+    }
+    if !vis {
+        colr_overlay(z, r, sx, p, nn, base_y, col)
     }
     return e
 }
