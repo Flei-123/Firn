@@ -663,6 +663,7 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
 
 /// Visit `e`, knowing the type the context wants (if any).
 fn want(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) {
+    crate::fmtstr::coerce(cx.rets, &mut cx.next, e, t);
     if value_rewrite(cx, e, t) {
         return;
     }
@@ -831,7 +832,12 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Field(a, _, _) => want(cx, a, None),
         ExprKind::Text(_, a) => want(cx, a, None),
         ExprKind::Named(_, a, _) => want(cx, a, None),
-        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => {
+        ExprKind::Binary(op, a, b) => {
+            crate::fmtstr::coerce_operands(cx.rets, &mut cx.next, *op, a, b);
+            want(cx, a, None);
+            want(cx, b, None);
+        }
+        ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => {
             want(cx, a, None);
             want(cx, b, None);
         }

@@ -17,7 +17,7 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `int Sum(params int[] xs)` | `fn sum(xs: ..int) -> int`, called `sum(1, 2, 3)` or `sum()` |
 | `char c = 'a';` | `let c: char = 'a'` |
 | `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
-| `$"x = {x}"` | `f"x = {x}"` wrapped in `io.fmt_string(...)` |
+| `$"x = {x}"` | `f"x = {x}"`, usable directly as `str` |
 
 ## ToString
 
@@ -183,12 +183,10 @@ b a {braces}
 ## Interpolation
 
 ```firn run
-import std.io
-
 fn main() -> i32 {
     let name: string = "firn"
     let n: int = 7
-    io.print_line(io.fmt_string(f"{name} has {n} apples, {n * 2} pears, {2.5:.2f} units"))
+    println(f"{name} has {n} apples, {n * 2} pears, {2.5:.2f} units")
     return 0
 }
 ```
@@ -197,7 +195,7 @@ fn main() -> i32 {
 firn has 7 apples, 14 pears, 2.50 units
 ```
 
-- `f"..."` builds a `Fmt`, not a `str`; `io.fmt_string` turns it into a `str`.
+- `f"..."` builds a `Fmt`. Where a `str` is expected (`let s: str = f".."`, an argument, `return`, a struct field, `s + f".."`, `==`) it becomes a `str` by itself. `io.fmt_string(f"..")` still works, and functions that take a `Fmt` (`io.fmt_print`) keep getting one.
 - Format specs follow Python: `{x:>8}`, `{x:08.3f}`, `{x:x}`.
 
 ## Characters
@@ -268,7 +266,7 @@ fn main() -> i32 {
 
 ## No imports needed
 
-`to_str`, `parse.`, `format.`, `chars.`, `print`, `println` and `format(...)` work without `import`. The collector starts itself too.
+`to_str`, `parse.`, `format.`, `chars.`, `print`, `println`, `format(...)` and every `std` module (`io.`, `time.`, `math.`, ...) work without `import`. The collector starts itself too.
 
 ```firn run
 fn main() -> i32 {
@@ -278,6 +276,10 @@ fn main() -> i32 {
     print("chars: ")
     let total: usize = chars.count("h\u{e9}llo")
     println(total.to_str())
+    let t0: u64 = time.millis()
+    let label: str = f"abs = {math.abs(0 - 3)}"
+    io.print_line(label)
+    println(f"fast: {time.millis() - t0 < 1000}")
     return 0
 }
 ```
@@ -285,9 +287,13 @@ fn main() -> i32 {
 ```output
 42 + 8 = 50
 chars: 5
+abs = 3
+fast: true
 ```
 
 - `format(tpl, a, b, ...)` takes up to 8 arguments of any printable type; no `to_str()` needed.
 - Your own names win: a `fn println` or a variable called `parse` in your file switches that entry off.
-- `io.print_line` and the rest of `std.io` still need `import std.io`.
+- Every std module works without `import` when you write `name.member`: `io.print_line(..)`, `time.millis()`, `math.abs(x)`, `fs.read_all(..)`.
+- Names inside f-strings count too: `f"took {time.millis() - t0} ms"`.
+- If your file has its own `time` (variable, field, function, parameter) or imports a module of that name, nothing is added.
 - `--no-prelude` turns the whole mechanism off. See `docs/PRELUDE.md`.

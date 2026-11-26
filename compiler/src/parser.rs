@@ -3308,7 +3308,7 @@ impl<'a> Parser<'a> {
             source.push(' ');
         }
         source.extend(raw.iter());
-        let toks = crate::lexer::lex_file(&source, self.file, self.dg);
+        let toks = crate::lexer::lex_fragment(&source, self.file, self.dg);
         in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id)
     }
 

@@ -11,6 +11,10 @@ const WRAPPERS: [(&str, &str); 2] = [
     ("print", "fn print(s: str) { io.print(s) }"),
 ];
 
+pub(crate) fn is_disabled() -> bool {
+    DISABLED.load(Ordering::Relaxed)
+}
+
 pub fn disable() {
     DISABLED.store(true, Ordering::Relaxed);
 }

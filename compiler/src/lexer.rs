@@ -900,6 +900,16 @@ pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
     let src = with_variadic.as_deref().unwrap_or(src);
     let with_prelude = crate::prelude::expand(src);
     let src = with_prelude.as_deref().unwrap_or(src);
+    let with_std_imports = crate::stdimport::expand(src);
+    let src = with_std_imports.as_deref().unwrap_or(src);
+    tokenize(src, file, dg)
+}
+
+pub fn lex_fragment(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
+    tokenize(src, file, dg)
+}
+
+fn tokenize(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
