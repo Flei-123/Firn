@@ -1865,7 +1865,7 @@ constants declared before it, and '+ - * /'"
                 // `let a: Gc[Node]` binds the HANDLE immutably — the object
                 // at the other end stays writable, exactly as with
                 // `let p: *mut T` and `(*p).field = …`.
-                if let Some(bt) = self.probe(base).filter(crate::gc::is_gc_ptr) {
+                if let Some(bt) = self.probe(base).filter(|t| crate::gc::is_gc_ptr(t) || crate::autoderef::is_struct_ptr(t)) {
                     let _ = self.expr(base, None);
                     let ty = self.field_type(&bt, name, *nspan, base.span);
                     self.record(e.id, ty.clone());
@@ -2071,15 +2071,8 @@ constants declared before it, and '+ - * /'"
             },
             Type::Error => Type::Error,
             Type::Ptr { inner, .. } if matches!(**inner, Type::Struct(_)) => {
-                self.dg.error_note(
-                    bspan,
-                    format!(
-                        "field access on the pointer type {}",
-                        self.tcx.name_of(base)
-                    ),
-                    "there is no automatic dereference, write '(*p).field'",
-                );
-                Type::Error
+                self.require_unsafe(bspan, "dereferencing a raw pointer");
+                self.field_type(inner, name, nspan, bspan)
             }
             other => {
                 // Round TUPLES: `.0` on something that is no tuple
@@ -2155,11 +2148,11 @@ constants declared before it, and '+ - * /'"
             return el;
         }
         let it = self.expr(idx, Some(&Type::Usize));
-        if !it.is_error() && it != Type::Usize {
+        if !it.is_error() && !crate::autoderef::is_index_int(&it) {
             self.dg.error_note(
                 idx.span,
                 format!(
-                    "index must be of type usize, found {}",
+                    "index must be an integer of at most 64 bits, found {}",
                     self.tcx.name_of(&it)
                 ),
                 "write e.g. 'a[i as usize]'",
@@ -3422,7 +3415,7 @@ constants declared before it, and '+ - * /'"
                 // HOOK gc: field access through `Gc[T]` (gc.rs)
                 let idx = match bt {
                     Type::Struct(i) => Some(i),
-                    ref t => crate::gc::hook_field_base(t),
+                    ref t => crate::gc::hook_field_base(t).or_else(|| crate::autoderef::struct_of_ptr(t)),
                 };
                 idx.and_then(|i| self.tcx.structs.get(i))
                     .and_then(|s| s.field(name))
@@ -5174,41 +5167,6 @@ mod tests {
         let p = b.e(ExprKind::Unary(UnOp::Deref, Box::new(a)));
         let prog = prog_with(&mut b, p);
         expect_err(prog, "not an assignable expression");
-    }
-
-    #[test]
-    fn index_must_be_usize() {
-        let mut b = B::new();
-        let i0 = b.int(0);
-        let i1 = b.int(1);
-        let i2 = b.int(2);
-        let arr = b.e(ExprKind::ArrayLit(vec![i0, i1, i2]));
-        let base = b.id("a");
-        let iexpr = b.id("i");
-        let ix = b.e(ExprKind::Index(Box::new(base), Box::new(iexpr)));
-        let iinit = b.int(0);
-        let prog = Program {
-            profile: None,
-            imports: Vec::new(),
-            exports: Vec::new(),
-            funcs: vec![main_fn(vec![
-                Stmt::Let {
-                    name: "a".into(),
-                    mutable: false,
-                    ty: Some(TypeExpr::Array { elem: Box::new(named("i32")), len: 3, span: sp() }),
-                    init: arr,
-                    span: sp(),
-                },
-                Stmt::Let { name: "i".into(), mutable: false, ty: Some(named("i32")), init: iinit, span: sp() },
-                Stmt::Return { value: Some(ix), span: sp() },
-            ])],
-            structs: Vec::new(),
-            consts: Vec::new(),
-            statics: Vec::new(),
-            comptime_blocks: Vec::new(),
-            expr_count: b.next,
-        };
-        expect_err(prog, "index must be of type usize");
     }
 }
 

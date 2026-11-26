@@ -608,7 +608,11 @@ impl<'a> Lower<'a> {
                 };
                 let esz = self.info.tcx.size_of(&elem).max(1);
                 let mut iv = self.lower_expr(idx)?;
-                let ift = self.fty_of(idx)?;
+                let mut ift = self.fty_of(idx)?;
+                if ift != FTy::U64 {
+                    iv = self.push(FTy::U64, Op::Cast { src: iv, from: ift });
+                    ift = FTy::U64;
+                }
                 // ROUND 89 -- the checked index (SPEC section 13, item L9).
                 // Only a FIXED SIZE ARRAY gets one: `*T` carries no length,
                 // so there is nothing to compare against and this compiler

@@ -8,6 +8,7 @@
 mod abi;
 mod assoc;
 mod asyncfn;
+mod autoderef;
 mod asyncfn_hoist;
 mod match_cover;
 mod darwin;
