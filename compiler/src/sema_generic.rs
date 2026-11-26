@@ -1116,6 +1116,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if p.at(&TokKind::LBrace) && !p.no_struct_lit {
         return Some(p.struct_lit(mangled, sp));
     }
+    if p.at(&TokKind::Dot) {
+        return type_function_call(p, &name, &mangled, sp);
+    }
     p.error_here(format!(
         "expected '{{' after '{}[..]', found '{}'",
         name,
@@ -1123,6 +1126,24 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     ));
     p.recovering = false;
     None
+}
+
+fn type_function_call(p: &mut Parser, base: &str, mangled: &str, start: Span) -> Option<Expr> {
+    let (Some(TokKind::Ident(method)), Some(TokKind::LParen)) = (
+        p.toks.get(p.pos + 1).map(|t| t.kind.clone()),
+        p.toks.get(p.pos + 2).map(|t| t.kind.clone()),
+    ) else {
+        p.error_here(format!("expected '{{' after '{}[..]', found '{}'", base, p.kind().text()));
+        p.recovering = false;
+        return None;
+    };
+    p.bump();
+    p.bump();
+    p.bump();
+    let (args, end) = p.call_args("after the argument list");
+    let span = Parser::join(start, end);
+    let name = crate::impls::fn_name(mangled, &method);
+    Some(p.mk(span, ExprKind::Call(name, args, start)))
 }
 
 /// r725 -- `opt_none[U]()` for a declared result type `Option[U]` (`None` when the
