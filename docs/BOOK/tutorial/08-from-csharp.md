@@ -120,8 +120,9 @@ struct Counter { n: i32 }
 
 impl Counter {
     fn start() -> Counter { return Counter { n: 0 } }
-    fn next(*self) -> Counter { return Counter { n: (*self).n + 1 } }
-    fn get(*self) -> i32 { return (*self).n }
+    fn next(*self) -> Counter { return Counter { n: self.n + 1 } }
+    fn bump(*self) { self.n += 1 }
+    fn get(*self) -> i32 { return self.n }
 }
 
 #[derive(Default)]
@@ -132,6 +133,10 @@ fn main() -> i32 {
     io.print_line(Counter.start().next().next().get().to_str() + " " + c.get().to_str())
     let cfg: Config = Config.default()
     io.print_line(cfg.width.to_str() + "[" + cfg.name + "]")
+    var d: Counter = Counter.start()
+    d.bump()
+    d.bump()
+    io.print_line(d.get().to_str())
     return 0
 }
 ```
@@ -139,8 +144,10 @@ fn main() -> i32 {
 ```output
 2 0
 0[]
+2
 ```
 
+- `self.n` reads and writes through the pointer, `(*self).n` means the same. It works for every `*T` / `*mut T` to a struct, also outside methods (`p.x = 3`).
 - A method call works on any value: `Counter.start().next().next().get()` needs no `let` in between. A `*self` method on a temporary changes the temporary only.
 - A local variable, `const` or function with the same name as the type wins over the type.
 - `::` is only for enum variants (`Shape::Box(1)`).
@@ -215,6 +222,12 @@ fn main() -> i32 {
     let upper: char = chars.to_upper(first)
     let second: char = chars.at(text, 1)
     io.print_line(total.to_str() + " " + first.char_str() + " " + upper.char_str() + " " + second.char_str())
+    let cs: Vec[u32] = chars.collect(text)
+    var sum: u32 = 0
+    for c in cs {
+        sum += c
+    }
+    io.print_line(sum.to_str())
     return 0
 }
 ```
@@ -222,12 +235,36 @@ fn main() -> i32 {
 ```output
 104 233 108 108 111 32 8364 
 7 h H é
+9060
 ```
 
 - `char` is `u32`, so `c.to_str()` is the number; `c.char_str()` is the text.
-- `for c in s.chars()` does not exist: a `for` loop needs an array variable. Use `chars.iter` and `chars.next`.
+- `for c in s` walks the BYTES (`u8`) of a `str`. For characters: `chars.collect(s)` gives a `Vec[u32]` that `for c in cs` walks, or use `chars.iter` and `chars.next` without a copy.
 - `chars.count(s)` counts characters, `s.length()` counts bytes.
 - A method works on a call result: `chars.count(s).to_str()`.
+
+## Indexes
+
+An array index may have any integer type up to 64 bits, so no `as usize` is needed. A negative value fails the bounds check.
+
+```firn run
+import std.io
+import std.tostr
+
+fn main() -> i32 {
+    var v: [i32; 4] = [0, 0, 0, 0]
+    for i in 0..4 {
+        v[i] = i * 3
+    }
+    let k: u8 = 2
+    io.print_line(v[3].to_str() + " " + v[k].to_str())
+    return 0
+}
+```
+
+```output
+9 6
+```
 
 ## No imports needed
 

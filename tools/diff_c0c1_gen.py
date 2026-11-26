@@ -714,7 +714,7 @@ NEG = [
     ("type_dup_local", "fn main() -> i32 {\n    let a: i32 = 1\n    let a: i32 = 2\n    return a\n}\n"),
     ("type_dup_param", "fn f(a: i32, a: i32) -> i32 { return a }\nfn main() -> i32 {\n    return f(1, 2)\n}\n"),
     ("type_index_non_array", "fn main() -> i32 {\n    let a: i32 = 1\n    return a[0]\n}\n"),
-    ("type_index_signed", "fn main() -> i32 {\n    var a: [i32; 2] = [1, 2]\n    let i: i32 = 0\n    return a[i]\n}\n"),
+    ("type_index_float", "fn main() -> i32 {\n    var a: [i32; 2] = [1, 2]\n    let i: f64 = 0.0\n    return a[i]\n}\n"),
     ("type_array_len_mismatch", "fn main() -> i32 {\n    let a: [i32; 3] = [1, 2]\n    return 0\n}\n"),
     ("type_array_elem_mismatch", "fn main() -> i32 {\n    let a: [i32; 2] = [1, true]\n    return 0\n}\n"),
     ("type_field_on_int", "fn main() -> i32 {\n    let a: i32 = 1\n    return a.x\n}\n"),
@@ -1033,6 +1033,8 @@ for nm, src in IFACE_DEFAULT_NEG:
 
 # sanity programs that MUST be accepted by both (guard against both-reject hiding in neg)
 emit("ok_struct_no_comma", "run", "same", "struct S { a: i32 b: i32 }\nfn main() -> i32 {\n    let s: S = S { a: 1, b: 2 }\n    put((s.a + s.b) as i64)\n    return 0\n}\n")
+emit("ok_ptr_field_auto_deref", "run", "same", "struct C { n: i32 }\nfn bump(p: *mut C) {\n    p.n += 2\n}\nfn main() -> i32 {\n    var c: C = C { n: 1 }\n    bump(&c)\n    let q: *C = &c\n    put((q.n * 10) as i64)\n    return 0\n}\n")
+emit("ok_index_any_integer", "run", "same", "fn main() -> i32 {\n    var a: [i32; 4] = [0, 0, 0, 0]\n    for i in 0..4 {\n        a[i] = i + 1\n    }\n    let k: u8 = 2\n    let m: i64 = 3\n    put((a[k] * 100 + a[m]) as i64)\n    return 0\n}\n")
 emit("ok_empty_main", "run", "same", "fn main() -> i32 {\n    return 0\n}\n", prelude=False)
 
 os.makedirs(out_dir, exist_ok=True)
