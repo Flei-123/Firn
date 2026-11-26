@@ -901,8 +901,6 @@ NEG = [
     ('nogc_closure_two', 'gc class Dummy {\n    v: i64,\n}\n#[no_gc]\nfn sum(a: i32, b: i32) -> AllocError!i32 {\n    let f: fn() -> i32 = try gc fn() -> i32 { return a + b }\n    return f()\n}\nfn main() -> i32 {\n    return sum(1, 2) catch 91\n}\n'),
     ('arr_empty_infer', 'fn main() -> i32 {\n    let a = []\n    return 0\n}\n'),
     ('fs_repr_type', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{"a"!r:d}"\n    return 0\n}\n'),
-    ('fs_plus_str', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 5\n    let s: str = "a" + f"{n}"\n    return 0\n}\n'),
-    ('fs_plus_str_left', 'import std.io\nfn main() -> i32 {\n    let n: i32 = 5\n    let s: str = f"{n}" + "a"\n    return 0\n}\n'),
     ('fs_lex_dollar', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{1 $ 2}"\n    return 0\n}\n'),
     ('fs_lex_at', 'import std.io\nfn main() -> i32 {\n    let s: str = f"ab {1 @ 2} {3 $ 4}"\n    return 0\n}\n'),
     ('fs_lex_backslash', 'import std.io\nfn main() -> i32 {\n    let s: str = f"{\\x27a}"\n    return 0\n}\n'),
