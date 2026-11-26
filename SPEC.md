@@ -505,7 +505,7 @@ never sees a vtable.
 | Macros with a syntax of their own | `comptime` and build scripts are enough (`FIRN-ANFORDERUNGEN.md` 11: "no Turing-complete macro system") |
 | `async`/`await` **as a language colour** | 7 -- replaced by `Io` as a parameter (`DESIGN_GOALS.md` 1) |
 | Overloading function names | it makes error messages and self-hosting harder |
-| Automatic dereferencing | `p.*.field`, not `p.field`. The exception: `Gc[T]` is dereferenced automatically, because `node.*.children.*` would be unreadable -- that is deliberate and it stands here |
+| Automatic dereferencing of anything but a struct pointer | `*p` stays explicit for scalars and for whole values. The exception: a field access `p.field` through `*T` / `*mut T` / `Gc[T]` (`self.n += 1`) dereferences once, because `(*self).n` is noise in every method -- `(*p).field` stays valid and means the same |
 | A preprocessor | `comptime if` replaces `#ifdef` |
 | **JIT / code generation at run time** | `FIRN-ANFORDERUNGEN.md` 11: the JS engine is a bytecode interpreter. Ladybird removed its JIT again in 2024, V8 has a jitless mode |
 | **Dynamic libraries** | linked statically; saves `dlopen` in Osum entirely (`R5`) |
@@ -1721,6 +1721,8 @@ do not push to / clear the Vec inside the body. `firnc1` does NOT know this yet
 (tests carry `// firnc1_skip:`, which `self_compare`/`sema_compare`/`fir_compare`/
 `types_compare` honour). Proof: `tests/3761_for_in_vec_str.fi`,
 `tests/neg/for_in_*.fi`, example `examples/vs_python/lang/for_in_vec.fi`.
+
+**r1646 (field access through a pointer, index with any integer type).** (a) `p.f` with `p: *T` / `*mut T` (a struct) is `(*p).f`, also as an assignment target (`self.n += 1`, `q.n = 3`) and nested (`pp.a.n = 9`); one level only, a `**T` is not followed; the unsafe rule is that of `(*p).f`; a pointer to a non-struct still gives "field access on the non-struct type *i32". The pointer variable may be bound with `let`: the write goes to the target. (b) An array index may have ANY integer type up to 64 bits (`v[i]` with `i: i32` / `u32` / `i64` / `u8`): the value is converted to `usize` (sign-extended for signed types), so a negative index becomes a huge `usize` and the bounds check traps (dev-fast, release-safe); `release-fast` has no check, as for every index. A literal index is still checked at compile time. A non-integer index is an error ("index must be an integer of at most 64 bits"). (`Vec` / `str` indices keep their Python negative-from-the-end rule.) Proof: `tests/6840_auto_deref_field.fi`, `tests/6841_index_any_integer.fi`, `tests/6842_index_negative_traps.fi`, `tests/neg/6840_index_float.fi`, `tests/neg/6841_field_through_int_pointer.fi`.
 
 **r664 (f-strings, stage 0 only).** `{{` and `}}` are literal braces; a text
 literal may stand inside `{ ... }` (`f"{m.get(&r, "name")}"`, braces inside it
