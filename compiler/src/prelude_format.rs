@@ -5,9 +5,9 @@ pub const MAX_ARGS: usize = 8;
 pub const SHOW_WRAPPER: &str = "fn __fmt_show[T](x: T) -> str { return io.fmt_string(f\"{x}\") }";
 const CALLEE: &str = "format";
 
-struct Call {
-    close: usize,
-    args: Vec<(usize, usize)>,
+pub(crate) struct Call {
+    pub(crate) close: usize,
+    pub(crate) args: Vec<(usize, usize)>,
 }
 
 fn open_paren(b: &[u8], from: usize) -> Option<usize> {
@@ -18,7 +18,7 @@ fn open_paren(b: &[u8], from: usize) -> Option<usize> {
     (b.get(i) == Some(&b'(')).then_some(i)
 }
 
-fn split_args(b: &[u8], open: usize) -> Option<Call> {
+pub(crate) fn split_args(b: &[u8], open: usize) -> Option<Call> {
     let mut args = Vec::new();
     let mut depth = 0usize;
     let mut start = open + 1;

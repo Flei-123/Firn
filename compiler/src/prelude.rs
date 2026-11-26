@@ -32,7 +32,7 @@ struct Scan {
     format_calls: Vec<usize>,
 }
 
-fn is_ident_byte(b: u8) -> bool {
+pub(crate) fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphanumeric()
 }
 
@@ -61,14 +61,14 @@ pub(crate) fn skip_quoted(b: &[u8], mut i: usize, quote: u8) -> usize {
     (i + 1).min(b.len())
 }
 
-fn next_non_space(b: &[u8], mut i: usize) -> Option<u8> {
+pub(crate) fn next_non_space(b: &[u8], mut i: usize) -> Option<u8> {
     while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
         i += 1;
     }
     b.get(i).copied()
 }
 
-fn read_import_path(b: &[u8], mut i: usize) -> (Option<String>, usize) {
+pub(crate) fn read_import_path(b: &[u8], mut i: usize) -> (Option<String>, usize) {
     let mut last = None;
     loop {
         while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {

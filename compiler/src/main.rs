@@ -137,6 +137,7 @@ mod sendcheck;
 mod nogc;
 mod prelude;
 mod prelude_format;
+mod variadic;
 mod prune;
 mod opt;
 mod panic_rt;
