@@ -26,12 +26,12 @@ def find_browser():
 
 
 class Browser:
-    def __init__(self, binary, width=1400, height=900):
+    def __init__(self, binary, width=1400, height=900, extra_args=()):
         self.profile = tempfile.mkdtemp(prefix="firn-playground-browser-", dir="/var/tmp")
         port = self.free_port()
         self.process = subprocess.Popen(
             [binary, "--headless=new", "--no-sandbox", "--disable-gpu", f"--window-size={width},{height}",
-             f"--remote-debugging-port={port}", f"--user-data-dir={self.profile}", "about:blank"],
+             f"--remote-debugging-port={port}", f"--user-data-dir={self.profile}", *extra_args, "about:blank"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self.next_id = 0

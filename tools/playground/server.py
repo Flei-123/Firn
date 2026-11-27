@@ -35,6 +35,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def send_body(self, status, content_type, body):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
