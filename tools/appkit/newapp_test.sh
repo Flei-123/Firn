@@ -113,7 +113,7 @@ echo "== 6. one source, every target (firn new, firn build --target)"
 FIRN=$ROOT/tools/firn/firn
 export FIRN_CACHE=$W/firn-cache FIRNC FIRNLIB=${FIRNLIB:-$ROOT/lib}
 mkdir -p "$W/p6"
-if (cd "$W/p6" && "$FIRN" new oneapp >"$W/new6.log" 2>&1); then ok "firn new makes an app"; else bad "firn new" "$(tail -3 "$W/new6.log")"; fi
+if (cd "$W/p6" && "$FIRN" new oneapp --app >"$W/new6.log" 2>&1); then ok "firn new makes an app"; else bad "firn new" "$(tail -3 "$W/new6.log")"; fi
 for f in firn.package fui.app main.fi data/greeting.json .gitignore; do
     [ -f "$W/p6/oneapp/$f" ] && ok "app file $f" || bad "app file $f is missing"
 done

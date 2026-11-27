@@ -18,7 +18,7 @@ There is no `firn.toml`: `docs/ROUND48.md` section 1 explains why the manifest i
 ```
 firn new cli app                     # template (firn new --list): cli, lib, web-api, desktop-app, game
 firn new app --console               # program: firn.package, src/main.fi, tests/
-firn new gui                         # fUi app: firn.package, fui.app, main.fi, data/ (firn build --target web|android|windows|linux)
+firn new gui --app                   # fUi app: firn.package, fui.app, main.fi, data/ (firn build --target web|android|windows|linux)
 firn new geo --lib                   # library: no start, importable via needs
 cd app
 firn add geo ../geo                  # path dependency   -> needs geo ../geo 0.1.0

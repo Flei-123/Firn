@@ -255,6 +255,72 @@ def main():
     else:
         bad("formatting delivers the shape of firnfmt", edits)
 
+    # --- 10. imports and the prelude --------------------------------------
+    mpath = os.path.join(os.path.dirname(os.path.abspath(path)), "sample_modules.fi")
+    muri = "file://" + mpath
+    msrc = open(mpath, encoding="utf-8").read()
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": muri, "languageId": "firn", "version": 1, "text": msrc}})
+    d = s.wait_for("textDocument/publishDiagnostics")
+    if d["params"]["diagnostics"] == []:
+        ok("imports and the prelude raise no false errors")
+    else:
+        bad("imports and the prelude raise no false errors",
+            d["params"]["diagnostics"])
+
+    wrong = msrc.replace('io.print_line("hello")', 'io.print_lines("hello")')
+    s.notify("textDocument/didChange", {
+        "textDocument": {"uri": muri, "version": 2},
+        "contentChanges": [{"text": wrong}]})
+    d = s.wait_for("textDocument/publishDiagnostics")
+    diags = d["params"]["diagnostics"]
+    if diags and "print_lines" in diags[0]["message"] and \
+            diags[0]["range"]["start"]["line"] == find(wrong, "print_lines")[0]:
+        ok("a wrong module member is reported on its line")
+    else:
+        bad("a wrong module member is reported on its line", diags)
+    s.notify("textDocument/didChange", {
+        "textDocument": {"uri": muri, "version": 3},
+        "contentChanges": [{"text": msrc}]})
+    s.wait_for("textDocument/publishDiagnostics")
+
+    l, c = find(msrc, "io.print_line")
+    r = s.request("textDocument/completion", {
+        "textDocument": {"uri": muri},
+        "position": {"line": l, "character": c + len("io.")}})
+    labels = [i["label"] for i in (r.get("result") or {}).get("items", [])]
+    if "print_line" in labels and "fn" not in labels:
+        ok("completion after `io.` lists the members of std.io")
+    else:
+        bad("completion after `io.` lists the members of std.io", labels[:20])
+
+    r = s.request("textDocument/completion", {
+        "textDocument": {"uri": muri},
+        "position": {"line": find(msrc, "println")[0], "character": 4}})
+    labels = [i["label"] for i in (r.get("result") or {}).get("items", [])]
+    if "println" in labels and "Vec" in labels and "fn" in labels:
+        ok("plain completion offers the prelude, names and keywords")
+    else:
+        bad("plain completion offers the prelude, names and keywords", labels[:20])
+
+    r = s.request("textDocument/definition", {
+        "textDocument": {"uri": muri},
+        "position": {"line": l, "character": c + len("io.") + 2}})
+    res = r.get("result")
+    if res and res.get("uri", "").endswith("/std/io.fi"):
+        ok("definition of `io.print_line` jumps into std/io.fi")
+    else:
+        bad("definition of `io.print_line` jumps into std/io.fi", res)
+
+    r = s.request("textDocument/hover", {
+        "textDocument": {"uri": muri},
+        "position": {"line": l, "character": c + len("io.") + 2}})
+    res = r.get("result")
+    if res and "print_line" in res["contents"]["value"]:
+        ok("hover on `io.print_line` shows the signature")
+    else:
+        bad("hover on `io.print_line` shows the signature", res)
+
     s.close()
     print(f"\nLSP: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

@@ -555,8 +555,18 @@ const KEYWORDS: &[&str] = &[
     "for", "in", "import", "export", "enum", "match", "error", "try", "catch",
 ];
 
+const PRELUDE: &[(&str, &str, i64)] = &[
+    ("println", "fn println(text)", 3),
+    ("print", "fn print(text)", 3),
+    ("format", "fn format(template, args..)", 3),
+    ("Vec", "growable array: Vec[T]", 22),
+    ("Map", "hash map: Map[K, V]", 22),
+    ("Set", "hash set: Set[T]", 22),
+];
+
 struct Server {
     docs: HashMap<String, String>,
+    dirty: std::collections::BTreeSet<String>,
     out: std::io::Stdout,
 }
 
@@ -577,7 +587,28 @@ fn uri_to_path(uri: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    let decoded = String::from_utf8_lossy(&out).to_string();
+    let bytes = decoded.as_bytes();
+    if bytes.len() > 2 && bytes[0] == b'/' && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
+        return decoded[1..].to_string();
+    }
+    decoded
+}
+
+fn hover_card(value: &str, line: u32, col: u32, len: u32) -> Json {
+    obj(vec![
+        (
+            "contents",
+            obj(vec![("kind", text("plaintext")), ("value", text(value))]),
+        ),
+        ("range", range(line, col, len)),
+    ])
+}
+
+fn path_to_uri(path: &std::path::Path) -> String {
+    let raw = path.display().to_string().replace('\\', "/");
+    let prefix = if raw.starts_with('/') { "file://" } else { "file:///" };
+    format!("{}{}", prefix, raw.replace(' ', "%20"))
 }
 
 fn position(line: u32, col: u32) -> Json {
@@ -616,8 +647,40 @@ impl Server {
             Some(s) => s.clone(),
             None => return,
         };
-        let a = analyse(&uri_to_path(uri), &src);
-        let list: Vec<Json> = a
+        let path = uri_to_path(uri);
+        let list: Vec<Json> = match crate::lsp_check::check_buffer(&path, &src) {
+            Some(findings) => findings
+                .iter()
+                .map(|f| {
+                    obj(vec![
+                        ("range", range(f.line.max(1), f.col.max(1), f.len.max(1))),
+                        ("severity", num(f.severity)),
+                        ("source", text("firnc")),
+                        ("message", text(&f.message)),
+                    ])
+                })
+                .collect(),
+            None => self.fallback_diagnostics(&path, &src),
+        };
+        self.send(&obj(vec![
+            ("jsonrpc", text("2.0")),
+            ("method", text("textDocument/publishDiagnostics")),
+            (
+                "params",
+                obj(vec![("uri", text(uri)), ("diagnostics", Json::Arr(list))]),
+            ),
+        ]));
+    }
+
+    fn flush_dirty(&mut self) {
+        let pending: Vec<String> = std::mem::take(&mut self.dirty).into_iter().collect();
+        for uri in pending {
+            self.publish(&uri);
+        }
+    }
+
+    fn fallback_diagnostics(&self, path: &str, src: &str) -> Vec<Json> {
+        analyse(path, src)
             .diagnostics
             .iter()
             .map(|(sp, msg, help)| {
@@ -632,15 +695,7 @@ impl Server {
                     ("message", text(&full)),
                 ])
             })
-            .collect();
-        self.send(&obj(vec![
-            ("jsonrpc", text("2.0")),
-            ("method", text("textDocument/publishDiagnostics")),
-            (
-                "params",
-                obj(vec![("uri", text(uri)), ("diagnostics", Json::Arr(list))]),
-            ),
-        ]));
+            .collect()
     }
 
     fn handle(&mut self, msg: &Json) -> bool {
@@ -686,7 +741,7 @@ impl Server {
                 let txt = msg.path(&["params", "textDocument", "text"]).map(|u| u.text().to_string());
                 if let (Some(u), Some(t)) = (uri, txt) {
                     self.docs.insert(u.clone(), t);
-                    self.publish(&u);
+                    self.dirty.insert(u);
                 }
             }
             "textDocument/didChange" => {
@@ -700,11 +755,12 @@ impl Server {
                 };
                 if let (Some(u), Some(t)) = (uri, txt) {
                     self.docs.insert(u.clone(), t);
-                    self.publish(&u);
+                    self.dirty.insert(u);
                 }
             }
             "textDocument/didClose" => {
                 if let Some(u) = msg.path(&["params", "textDocument", "uri"]) {
+                    self.dirty.remove(u.text());
                     self.docs.remove(u.text());
                 }
             }
@@ -768,6 +824,14 @@ impl Server {
             None => return Json::Null,
         };
         let a = analyse(&uri_to_path(&uri), &src);
+        if let Some((file, m)) =
+            crate::lsp_modules::locate_member(&uri_to_path(&uri), &src, &a.symbols, line, ch, &name)
+        {
+            return obj(vec![
+                ("uri", text(&path_to_uri(&file))),
+                ("range", range(m.line, m.col, m.name.chars().count() as u32)),
+            ]);
+        }
         match resolve(&a, &name, at_line) {
             Some(s) => obj(vec![
                 ("uri", text(&uri)),
@@ -787,6 +851,16 @@ impl Server {
             None => return Json::Null,
         };
         let a = analyse(&uri_to_path(&uri), &src);
+        if let Some((_, m)) =
+            crate::lsp_modules::locate_member(&uri_to_path(&uri), &src, &a.symbols, line, ch, &name)
+        {
+            return hover_card(&format!("{}: {}", m.kind, m.detail), at_line, col, len);
+        }
+        if resolve(&a, &name, at_line).is_none() {
+            if let Some((_, detail, _)) = PRELUDE.iter().find(|(n, _, _)| *n == name) {
+                return hover_card(&format!("prelude: {}", detail), at_line, col, len);
+            }
+        }
         match resolve(&a, &name, at_line) {
             Some(s) => obj(vec![
                 (
@@ -809,6 +883,9 @@ impl Server {
         };
         let a = analyse(&uri_to_path(&uri), &src);
         let at = line + 1;
+        if let Some(members) = self.qualified_completion(&uri, &src, &a, line, ch) {
+            return members;
+        }
         let mut items: Vec<Json> = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         for s in &a.symbols {
@@ -843,11 +920,41 @@ impl Server {
                 ("detail", text("keyword")),
             ]));
         }
-        let _ = ch;
+        for (name, detail, kind) in PRELUDE {
+            if !seen.iter().any(|n| n == name) {
+                items.push(obj(vec![
+                    ("label", text(name)),
+                    ("kind", num(*kind)),
+                    ("detail", text(detail)),
+                ]));
+            }
+        }
         obj(vec![
             ("isIncomplete", Json::Bool(false)),
             ("items", Json::Arr(items)),
         ])
+    }
+
+    fn qualified_completion(&self, uri: &str, src: &str, a: &Analysis, line: u32, ch: u32) -> Option<Json> {
+        let line_text = src.lines().nth(line as usize)?;
+        let alias = crate::lsp_modules::qualifier_before(line_text, ch as usize)?;
+        let (_, members) = crate::lsp_modules::members_for_alias(&uri_to_path(uri), &a.symbols, &alias)?;
+        let items: Vec<Json> = members
+            .iter()
+            .map(|m| {
+                let kind = match m.kind {
+                    "function" => 3,
+                    "struct" => 22,
+                    _ => 21,
+                };
+                obj(vec![
+                    ("label", text(&m.name)),
+                    ("kind", num(kind)),
+                    ("detail", text(&m.detail)),
+                ])
+            })
+            .collect();
+        Some(obj(vec![("isIncomplete", Json::Bool(false)), ("items", Json::Arr(items))]))
     }
 
     fn rename(&mut self, msg: &Json) -> Json {
@@ -943,24 +1050,21 @@ fn run_formatter(src: &str) -> Option<String> {
     None
 }
 
-/// The main loop: read a message, answer it. Ends with `exit`.
-pub fn serve() -> i32 {
-    let mut server = Server { docs: HashMap::default(), out: std::io::stdout() };
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn read_messages(sender: std::sync::mpsc::Sender<Json>) {
     let mut input = std::io::stdin();
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        // A message: `Content-Length: N\r\n\r\n` plus N octets.
         let head_end = loop {
             if let Some(p) = find(&buffer, b"\r\n\r\n") {
                 break p;
             }
-            let n = match input.read(&mut chunk) {
-                Ok(0) => return 0,
-                Ok(n) => n,
-                Err(_) => return 1,
-            };
-            buffer.extend_from_slice(&chunk[..n]);
+            match input.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
         };
         let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
         let mut len = 0usize;
@@ -971,19 +1075,44 @@ pub fn serve() -> i32 {
         }
         let body_at = head_end + 4;
         while buffer.len() < body_at + len {
-            let n = match input.read(&mut chunk) {
-                Ok(0) => return 0,
-                Ok(n) => n,
-                Err(_) => return 1,
-            };
-            buffer.extend_from_slice(&chunk[..n]);
+            match input.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
         }
         let body = String::from_utf8_lossy(&buffer[body_at..body_at + len]).to_string();
         buffer.drain(..body_at + len);
         if let Some(msg) = parse_json(&body) {
-            if !server.handle(&msg) {
-                return 0;
+            if sender.send(msg).is_err() {
+                return;
             }
+        }
+    }
+}
+
+/// The main loop: read a message, answer it. Ends with `exit`.
+pub fn serve() -> i32 {
+    let mut server = Server {
+        docs: HashMap::default(),
+        dirty: std::collections::BTreeSet::new(),
+        out: std::io::stdout(),
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || read_messages(sender));
+    loop {
+        let received = if server.dirty.is_empty() {
+            receiver.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            receiver.recv_timeout(DEBOUNCE)
+        };
+        match received {
+            Ok(msg) => {
+                if !server.handle(&msg) {
+                    return 0;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => server.flush_dirty(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return 0,
         }
     }
 }

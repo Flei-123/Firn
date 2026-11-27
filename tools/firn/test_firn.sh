@@ -20,7 +20,7 @@ cd "$W"
 t "new --console makes a program"  "$FI" new demo --console
 t "new refuses an existing dir"    bash -c "! $FI new demo --console"
 t "new --lib"                      "$FI" new tool --lib
-t "new makes an app"               bash -c "$FI new gui && test -f gui/fui.app && test -f gui/main.fi"
+t "new makes an app"               bash -c "$FI new gui --app && test -f gui/fui.app && test -f gui/main.fi"
 t "build --target rejects unknown" bash -c "cd gui && ! $FI build --target nowhere 2> err.txt && grep -q 'unknown target' err.txt"
 t "targets lists the targets"      bash -c "$FI targets | grep -q '^web'"
 ( cd demo

@@ -22,7 +22,7 @@ Findings:
 ## 2. One command per target (E2)
 
 ```
-firn new myapp                       # fUi app: firn.package, fui.app, main.fi, data/
+firn new myapp --app                 # fUi app: firn.package, fui.app, main.fi, data/
 cd myapp
 firn build --target web              # dist/web/index.html + myapp.wasm + firn.js + fonts + data
 firn build --target android          # dist/android/myapp-x86_64.apk (signed; --abi arm64|x86_64|both)
@@ -33,7 +33,7 @@ firn targets                         # which targets this machine can build
 ```
 
 - `firn` is the front door; the work is done by the existing `fui` CLI (`tools/fui/cli`): one file per target in `tools/fui/cli/targets/`. New there: `windows.sh`; `linux` is an alias of `native`.
-- `firn new NAME` makes the fUi app (template `counter`, others: `--template blank|settings|files`); `firn new NAME --console` keeps the old print program, `--lib` the library.
+- `firn new NAME --app` makes the fUi app (template `counter`, others: `--template blank|settings|files`); `firn new NAME` (or `--console`) makes the console program, `--lib` the library.
 - The app only imports `fui.app`, `fui.appshot`, `fui.kitdata`; assets are read by name (`kitdata.load`), never by path.
 - Test: `bash tools/appkit/newapp_test.sh` (section 6) and `bash tools/firn/test_firn.sh`.
 

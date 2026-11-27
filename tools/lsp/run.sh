@@ -21,7 +21,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-FIRNC="$ROOT/compiler/target/release/firnc"
+FIRNC="${FIRNC:-$ROOT/compiler/target/release/firnc}"
 export FIRNLIB="$ROOT/lib"
 
 if [ ! -x "$FIRNC" ]; then
