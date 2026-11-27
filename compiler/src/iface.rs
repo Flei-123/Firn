@@ -263,7 +263,10 @@ pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
 /// and find nothing.
 pub(crate) fn is_base_ty_method(name: &str) -> bool {
     match name.split_once(crate::impls::SEP) {
-        Some((header, rest)) => !rest.is_empty() && base_ty_of_name(header).is_some(),
+        Some((header, rest)) => {
+            !rest.is_empty()
+                && (base_ty_of_name(header).is_some() || header == crate::strtype::NAME)
+        }
         None => false,
     }
 }

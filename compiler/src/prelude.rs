@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::method_modules::METHOD_MODULES;
 use crate::prelude_format;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -289,12 +290,58 @@ pub fn needs_tostr<'a>(sources: impl Iterator<Item = &'a str>) -> bool {
     wanted
 }
 
+pub fn needed_method_modules<'a>(sources: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
+    let mut wanted = vec![false; METHOD_MODULES.len()];
+    if DISABLED.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    for src in sources {
+        if src.contains(KERNEL_MARK) {
+            continue;
+        }
+        mark_method_calls(src.as_bytes(), &mut wanted);
+    }
+    METHOD_MODULES.iter().zip(wanted).filter(|(_, w)| *w).map(|((m, _), _)| *m).collect()
+}
+
+fn mark_method_calls(b: &[u8], wanted: &mut [bool]) {
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'.' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < b.len() && is_ident_byte(b[end]) {
+            end += 1;
+        }
+        if end > start && b.get(end) == Some(&b'(') {
+            let name = &b[start..end];
+            for (k, (_, names)) in METHOD_MODULES.iter().enumerate() {
+                if names.iter().any(|n| n.as_bytes() == name) {
+                    wanted[k] = true;
+                }
+            }
+        }
+        i = end.max(i + 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn added(src: &str) -> String {
         expand(src).map(|t| t.replace(src, "")).unwrap_or_default()
+    }
+
+    #[test]
+    fn method_calls_select_modules() {
+        assert_eq!(needed_method_modules(["fn f() { let a = x.to_upper() }"].into_iter()), vec!["strmethods"]);
+        assert_eq!(needed_method_modules(["fn f() { let a = x.sqrt() + s.trim() }"].into_iter()), vec!["nummethods", "strmethods"]);
+        assert!(needed_method_modules(["fn f() { let a = sqrt(x) }"].into_iter()).is_empty());
+        assert!(needed_method_modules(["profile kernel\nfn f() { x.sqrt() }"].into_iter()).is_empty());
     }
 
     #[test]

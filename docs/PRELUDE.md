@@ -33,6 +33,38 @@ argument, `return`, struct field, assignment, `+`, `==`, `!=`) the compiler wrap
 `io.fmt_string(..)`. Where a `Fmt` is expected nothing changes. Code in `compiler/src/fmtstr.rs`
 (called from the lambda pass `want`) and `lib/firnc1/fmtstr.fi` (called from `sema.fi expr`).
 
+## Methods on values
+
+`std.strmethods` and `std.nummethods` hold the everyday C# methods as `impl` blocks on `str` (through
+the view struct `StrMethods`) and on `i32`, `i64`, `usize`, `f64`. The loader adds the module
+(`modules.rs resolve`, `bin/firnc1.fi implicit_import`) when a user file (not a file below `$FIRNLIB`)
+contains `.name(` for a name in the generated table (`compiler/src/method_modules.rs`,
+`lib/firnc1/method_modules.fi`, written by `tools/methodmods/gen.sh` from the `fn name(self` lines of
+the two modules). A new method in one of these modules needs `sh tools/methodmods/gen.sh`.
+
+| You write | Result |
+|---|---|
+| `s.to_upper()`, `s.to_lower()`, `s.replace(a, b)` | new `str` |
+| `s.split(sep)`, `s.split_whitespace()` | `Vec[str]` |
+| `sep.join(parts)` | `str` (parts is a `Vec[str]`) |
+| `s.substring(start, count)` | byte offsets, clamped, no copy |
+| `s.index_of(part)`, `s.last_index_of(part)` | `i64`, -1 when missing |
+| `s.pad_left(w)`, `s.pad_right(w, fill)` | fill is a `u8`, default space |
+| `s.repeat(n)`, `s.char_count()` | `char_count` counts code points, `length()` counts bytes |
+| `s.trim()`, `s.contains(p)`, `s.starts_with(p)`, `s.ends_with(p)`, `s.is_empty()` | from `std.str` |
+| `x.abs()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`, `x.pow(n)` | numbers |
+| `x.sqrt()`, `x.sin()`, `x.cos()`, `x.floor()`, `x.ceil()`, `x.round()`, `x.to_int()` | `f64` |
+
+Method resolution on a string tries `str__name`, then the string views (`str.Span`, `StrMethods`). A
+function of the module `str` whose first parameter is a pointer to another struct (`replace(out:
+*mut Bytes, ..)`) does not count as a method of a string, so `s.replace(a, b)` reaches the view method.
+A `Span` (result of `trim()`) reaches the same views. `impl str { .. }` in an imported module works in
+both compilers (the method keeps the name `str__name`, like `impl i64`).
+
+`--no-prelude` and `profile kernel` switch the loading off; `import std.strmethods` always works. A program
+that defines its own `impl i32 { fn abs(*self) }` while using `x.abs()` somewhere must not trigger the
+module (rename its method) -- the loader does not look for that.
+
 ## Rules
 
 * Loaded only when used. A file that does not use these names is not touched and

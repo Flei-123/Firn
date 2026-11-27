@@ -18,6 +18,21 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `char c = 'a';` | `let c: char = 'a'` |
 | `foreach (char c in s)` | `chars.iter(s)` + `while chars.next(&it)` (`import std.chars`) |
 | `$"x = {x}"` | `f"x = {x}"`, usable directly as `str` |
+| `s.Trim()` | `s.trim()` |
+| `s.ToUpper()` / `s.ToLower()` | `s.to_upper()` / `s.to_lower()` |
+| `s.Contains(p)` / `s.StartsWith(p)` / `s.EndsWith(p)` | `s.contains(p)` / `s.starts_with(p)` / `s.ends_with(p)` |
+| `s.Replace(a, b)` | `s.replace(a, b)` |
+| `s.Split(' ')` | `s.split(" ")`, a `Vec[str]` |
+| `string.Join(",", parts)` | `",".join(parts)` |
+| `s.Substring(i, n)` | `s.substring(i, n)` (byte offsets) |
+| `s.IndexOf(p)` | `s.index_of(p)`, -1 when missing |
+| `s.PadLeft(8)` / `s.PadRight(8)` | `s.pad_left(8)` / `s.pad_right(8)` |
+| `s.Length` | `s.length()` counts bytes, `s.char_count()` counts characters |
+| `string.IsNullOrEmpty(s)` | `s.is_empty()` |
+| `Math.Abs(x)`, `Math.Min(a, b)`, `Math.Max(a, b)`, `Math.Clamp(x, lo, hi)` | `x.abs()`, `a.min(b)`, `a.max(b)`, `x.clamp(lo, hi)` |
+| `Math.Sqrt(x)`, `Math.Floor(x)`, `Math.Round(x)` | `x.sqrt()`, `x.floor()`, `x.round()` |
+| `File.ReadAllText(p)` | `fs.read_text(p) catch ""` |
+| `File.WriteAllText(p, s)` | `fs.write_text(p, s) catch 0` |
 
 ## ToString
 
@@ -288,3 +303,32 @@ fast: true
 - Names inside f-strings count too: `f"took {time.millis() - t0} ms"`.
 - If your file has its own `time` (variable, field, function, parameter) or imports a module of that name, nothing is added.
 - `--no-prelude` turns the whole mechanism off. See `docs/PRELUDE.md`.
+
+## Strings, numbers and files
+
+```firn run
+fn main() -> i32 {
+    let s: str = "  Hello World  "
+    let words: Vec[str] = s.trim().split(" ")
+    println(f"{words.len()} words, upper: {s.trim().to_upper()}")
+    println(",".join(words))
+    println(s.trim().replace("o", "0").pad_left(13))
+    let x: f64 = 2.0
+    println(f"sqrt = {x.sqrt():.3f}, max = {x.max(7.5)}")
+    let n: int = 0 - 12
+    println(f"abs = {n.abs()}, clamp = {n.clamp(0, 10)}")
+    return 0
+}
+```
+
+```output
+2 words, upper: HELLO WORLD
+Hello,World
+  Hell0 W0rld
+sqrt = 1.414, max = 7.5
+abs = 12, clamp = 0
+```
+
+- `length()` counts bytes, `char_count()` counts code points. `substring` and `index_of` use byte offsets.
+- The methods live in `std.strmethods` and `std.nummethods`; using `.name(` loads them. See `docs/PRELUDE.md`.
+- Files: `fs.read_text(path) catch ""`, `fs.write_text(path, s)`, `fs.append_text(path, s)`, `fs.read_bytes(path)`. A complete program: `examples/measure_rms.fi`.

@@ -131,6 +131,7 @@ mod collsugar;
 mod dargs;
 mod lambda;
 mod fmtstr;
+mod method_modules;
 mod std_modules;
 mod stdimport;
 mod moves;

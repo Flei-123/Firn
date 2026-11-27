@@ -326,13 +326,23 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         }
         out.push(SourceFile { id, path, src });
     }
-    if tostr_checked || !crate::prelude::needs_tostr(out.iter().map(|f| f.src.as_str())) {
+    if tostr_checked {
         break;
     }
     tostr_checked = true;
-    match std_module_path(&["std".to_string(), "tostr".to_string()]) {
-        Some(p) => queue.push(Waiting { path: p, span: Span::none() }),
-        None => break,
+    let mut implicit: Vec<&str> = Vec::new();
+    if crate::prelude::needs_tostr(out.iter().map(|f| f.src.as_str())) {
+        implicit.push("tostr");
+    }
+    let user_sources = out.iter().filter(|f| !is_library_file(&f.path)).map(|f| f.src.as_str());
+    implicit.extend(crate::prelude::needed_method_modules(user_sources));
+    for module in implicit {
+        if let Some(p) = std_module_path(&["std".to_string(), module.to_string()]) {
+            queue.push(Waiting { path: p, span: Span::none() });
+        }
+    }
+    if queue.is_empty() {
+        break;
     }
     }
     // HOOK gc: the collector runtime is pulled in automatically as soon as
@@ -352,6 +362,14 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         out.push(f);
     }
     Ok(out)
+}
+
+fn is_library_file(path: &Path) -> bool {
+    let file = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    extra_search_paths().iter().any(|dir| {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        file.starts_with(dir)
+    })
 }
 
 fn std_module_path(parts: &[String]) -> Option<PathBuf> {

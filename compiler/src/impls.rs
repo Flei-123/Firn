@@ -590,10 +590,7 @@ pub(crate) fn target_of(
     recv: &Type,
 ) -> Option<(String, bool)> {
     let (prefixes, is_ptr) = receiver_prefixes(tcx, recv)?;
-    let found = prefixes
-        .iter()
-        .map(|p| fn_name(p, method))
-        .find(|f| fns.contains_key(f));
+    let found = pick_method(fns, &prefixes, method, recv);
     // r744: the sugar `s[a:b:c]` on a `str`/`Span` is the library function
     // `pystr.slice_step_flags(s, a, b, c, flags)` (a new GC string)
     let full = match found {
@@ -676,7 +673,10 @@ fn receiver_prefixes(tcx: &TypeCtx, t: &Type) -> Option<(Vec<String>, bool)> {
         Type::Ptr { inner, .. } => (**inner).clone(),
         other => other.clone(),
     };
-    if crate::strtype::is_str(&bare) {
+    if crate::strtype::is_str_like(&bare) {
+        if !crate::strtype::is_str(&bare) {
+            out.push(crate::strtype::NAME.to_string());
+        }
         for v in crate::strtype::view_names(tcx) {
             if !out.contains(&v) {
                 out.push(v);
@@ -684,6 +684,44 @@ fn receiver_prefixes(tcx: &TypeCtx, t: &Type) -> Option<(Vec<String>, bool)> {
         }
     }
     Some((out, is_ptr))
+}
+
+/// First function of the candidate prefixes that can take the receiver. On a
+/// `str`, a function of the module `str` whose first parameter is a pointer
+/// to another struct (`replace(out: *mut Bytes, ..)`) is not a method of the
+/// string; the search goes on, and only when nothing fits does the first
+/// existing name stay, so that the old messages do not change.
+fn pick_method(
+    fns: &HashMap<String, FnSig>,
+    prefixes: &[String],
+    method: &str,
+    recv: &Type,
+) -> Option<String> {
+    let existing: Vec<String> = prefixes
+        .iter()
+        .map(|p| fn_name(p, method))
+        .filter(|f| fns.contains_key(f))
+        .collect();
+    let bare = match recv {
+        Type::Ptr { inner, .. } => (**inner).clone(),
+        other => other.clone(),
+    };
+    if crate::strtype::is_str_like(&bare) {
+        if let Some(fit) = existing.iter().find(|f| first_param_fits_str(&fns[*f])) {
+            return Some(fit.clone());
+        }
+    }
+    existing.into_iter().next()
+}
+
+fn first_param_fits_str(sig: &FnSig) -> bool {
+    match sig.params.first() {
+        Some(Type::Ptr { inner, .. }) => match &**inner {
+            Type::Struct(_) => crate::strtype::is_str_like(inner),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// Edit distance (Levenshtein), two rows — the material for "did you mean".
@@ -862,10 +900,7 @@ pub(crate) fn hook_call(
     // even when the function is found under `str__Span__…`.
     let prefix = prefixes[0].clone();
     let sname = prefix.clone();
-    let mut hit = prefixes
-        .iter()
-        .map(|p| fn_name(p, &method))
-        .find(|full| ck.fns.contains_key(full));
+    let mut hit = pick_method(&ck.fns, &prefixes, &method, &et);
     // r744: `s[a:b:c]` on a str/Span -> `pystr.slice_step_flags` (see `target_of`)
     if hit.is_none()
         && method == crate::parser::SLICE_STEP

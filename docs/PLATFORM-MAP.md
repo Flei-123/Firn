@@ -18,6 +18,9 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/dialog.fi`, `std/clipboard.fi`, `std/toast.fi` | native dialogs, clipboard, notifications (use via `services` in apps)
 - `std/chars.fi` | `char` (= u32) helpers: `chars.iter`/`next` over a str, `chars.collect` (Vec of chars for `for c in cs`), `count`, `at`, `to_str`, `is_digit`, `to_upper`, `c.char_str()` | `import std.chars`
 - `std/tostr.fi` | `x.to_str()` on i8..i64, u8..u64, isize, usize, f32, f64, bool (shortest round-trip floats, same text as f-strings) | `import std.tostr`, `let s: str = n.to_str()`
+- `std/strmethods.fi` | C# style string methods on `str` and views: `to_upper`, `to_lower`, `replace`, `split`, `join`, `substring`, `index_of`, `repeat`, `pad_left`, `pad_right`, `char_count` (with `std.str`: `trim`, `contains`, `starts_with`, `ends_with`, `is_empty`, `length`) | loaded without import when `.name(` is used (docs/PRELUDE.md), `s.to_upper()`
+- `std/nummethods.fi` | `abs`, `min`, `max`, `clamp`, `pow` on i32, i64, usize, f64; `sqrt`, `sin`, `cos`, `tan`, `floor`, `ceil`, `round`, `trunc`, `to_int` on f64 | loaded without import, `x.sqrt()`
+- `std/fs.fi` | also `fs.read_text(path)`, `fs.read_bytes(path)`, `fs.write_text(path, s)`, `fs.append_text(path, s)` (File.ReadAllText and friends, `FsError!` unions) | `fs.read_text(p) catch ""`
 - `std/parse.fi` | C#-style parsing into error unions `ParseError!T` (Empty, Invalid, Overflow) and `try_*` with an out pointer | `int.parse(s) catch 0`, `f64.parse(s)`, `int.try_parse(s, &n)`, `parse.to_i32(s) catch 0`, `parse.try_f64(s, &x)`
 - `std/format.fi` | numbered placeholders `{0}` `{1}` (`{{` `}}` literal braces) for `str` arguments, 0 to 5 arguments | `import std.format`, `format.format2("{0}-{1}", a.to_str(), b.to_str())`
 - `std/testkit.fi` | assertions for `#[test]`
