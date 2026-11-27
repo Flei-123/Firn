@@ -24,12 +24,16 @@ def stage():
     shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
     os.makedirs(os.path.join(RUNTIME_DIR, "bin"), mode=0o755)
     shutil.copy2(config.FIRNC, os.path.join(RUNTIME_DIR, "bin", "firnc"))
-    shutil.copytree(config.FIRNLIB, os.path.join(RUNTIME_DIR, "lib"), symlinks=False, ignore_dangling_symlinks=True)
+    shutil.copytree(config.FIRNLIB, os.path.join(RUNTIME_DIR, "lib"), symlinks=True)
     for base, dirs, names in os.walk(RUNTIME_DIR):
         for entry in dirs:
-            os.chmod(os.path.join(base, entry), 0o755)
+            path = os.path.join(base, entry)
+            if not os.path.islink(path):
+                os.chmod(path, 0o755)
         for entry in names:
-            os.chmod(os.path.join(base, entry), 0o755 if base.endswith("bin") else 0o644)
+            path = os.path.join(base, entry)
+            if not os.path.islink(path):
+                os.chmod(path, 0o755 if base.endswith("bin") else 0o644)
     os.chmod(RUNTIME_DIR, 0o755)
     with open(stamp_path, "w") as handle:
         handle.write(stamp)

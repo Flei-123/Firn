@@ -110,6 +110,20 @@ def test_static(port):
     check("unknown path 404", call(port, "/nope")[0] == 404)
 
 
+def test_staged_symlinks(port, runtime_dir):
+    for name in ("rt.fi", "vec.fi", "map.fi"):
+        path = os.path.join(runtime_dir, "lib", "std", name)
+        check(f"staged std/{name} resolves", os.path.islink(path) and os.path.isfile(os.path.realpath(path)), path)
+    source = (
+        "import std.vec\n"
+        "fn sum(xs: ..int) -> int {\n    var t: int = 0\n    for x in xs { t += x }\n    return t\n}\n"
+        "fn main() {\n    var v: Vec[int] = Vec[int].new()\n    v.push(4)\n    v.push(5)\n"
+        '    println(f"{sum(1, 2, 3)} {v.len()}")\n}\n'
+    )
+    status, result = run(port, source)
+    check("import std.vec and variadic sum run", result["ok"] and result["stdout"].strip() == "6 2", result)
+
+
 def test_generated_data():
     result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "gen_completions.py"), "--check"])
     check("completions.json is up to date", result.returncode == 0)
@@ -123,6 +137,7 @@ def main():
     try:
         for step in (test_basics, test_check_endpoint, test_examples, test_static, test_isolation, test_limits):
             step(port)
+        test_staged_symlinks(port, runtime_dir)
     finally:
         server.terminate()
         server.wait()
