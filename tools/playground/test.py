@@ -1,32 +1,16 @@
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
+
+from testserver import call, free_port, start_server
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 RUN_TIMEOUT_S = 3
 FAILURES = []
-
-
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def call(port, path, payload=None, raw=None):
-    data = raw if raw is not None else (json.dumps(payload).encode() if payload is not None else None)
-    try:
-        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data), timeout=60) as reply:
-            return reply.status, reply.read()
-    except urllib.error.HTTPError as failure:
-        return failure.code, failure.read()
 
 
 def run(port, source):
@@ -38,13 +22,6 @@ def check(name, condition, detail=""):
     print(("PASS " if condition else "FAIL ") + name + ("" if condition else f"  {detail}"))
     if not condition:
         FAILURES.append(name)
-
-
-def start_server(port, runtime_dir):
-    env = dict(os.environ, PLAYGROUND_PORT=str(port), PLAYGROUND_RUN_TIMEOUT=str(RUN_TIMEOUT_S), PLAYGROUND_RUNTIME=runtime_dir)
-    process = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")], env=env, cwd=HERE, stdout=subprocess.PIPE)
-    process.stdout.readline()
-    return process
 
 
 def test_basics(port):
@@ -97,20 +74,54 @@ def test_examples(port):
         check(f"example {item['id']} runs", result["ok"] and result["stdout"].strip() != "", result)
 
 
+def check_source(port, source):
+    status, body = call(port, "/api/check", {"source": source})
+    return status, json.loads(body)
+
+
+def test_check_endpoint(port):
+    status, result = check_source(port, 'fn main() {\n    println("ok")\n}\n')
+    check("check accepts valid source", status == 200 and result["ok"] and result["diagnostics"] == [], result)
+    status, result = check_source(port, 'fn main() {\n    let x: int = "a"\n    printn(x)\n}\n')
+    found = {(item["line"], item["col"], item["length"]) for item in result["diagnostics"]}
+    check("check reports position and length", not result["ok"] and found == {(2, 18, 3), (3, 5, 6)}, result)
+    check("check keeps the hint", any("parse it with std.num" in item["hint"] for item in result["diagnostics"]), result)
+    status, result = check_source(port, 'fn main() {\n    let a: int = 1\n    println(f"{a +}")\n}\n')
+    check("check reports parse error", [(item["line"], item["col"]) for item in result["diagnostics"]] == [(3, 19)], result)
+    status, result = check_source(port, "   ")
+    check("check rejects empty source", not result["ok"] and result["message"], result)
+    status, result = run(port, 'fn main() {\n    let x: int = "a"\n}\n')
+    check("run diagnostics carry the length", result["diagnostics"][0]["length"] == 3, result)
+    leftovers = [name for name in os.listdir("/tmp") if name.startswith("firn-playground-")]
+    check("check leaves no sandbox directory", not leftovers, leftovers)
+    status, _ = call(port, "/api/check", raw=b"not json")
+    check("check bad json is 400", status == 400, status)
+
+
 def test_static(port):
     status, body = call(port, "/")
     check("index served", status == 200 and b"Firn Playground" in body)
     check("script served", call(port, "/app.js")[0] == 200)
+    for name in ("tokenizer.js", "editing.js", "completion.js", "problems.js", "statusbar.js", "tooltip.js", "metrics.js", "textedit.js", "popup.js", "livecheck.js", "highlight.js"):
+        check(f"{name} served", call(port, "/" + name)[0] == 200)
+    status, body = call(port, "/completions.json")
+    check("completion data served", status == 200 and "modules" in json.loads(body), status)
     check("traversal blocked", call(port, "/../server.py")[0] == 404 and call(port, "/..%2fserver.py")[0] == 404)
     check("unknown path 404", call(port, "/nope")[0] == 404)
 
 
+def test_generated_data():
+    result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "gen_completions.py"), "--check"])
+    check("completions.json is up to date", result.returncode == 0)
+
+
 def main():
+    test_generated_data()
     port = free_port()
     runtime_dir = tempfile.mkdtemp(prefix="firn-playground-test-", dir="/var/tmp")
-    server = start_server(port, runtime_dir)
+    server = start_server(port, runtime_dir, RUN_TIMEOUT_S)
     try:
-        for step in (test_basics, test_examples, test_static, test_isolation, test_limits):
+        for step in (test_basics, test_check_endpoint, test_examples, test_static, test_isolation, test_limits):
             step(port)
     finally:
         server.terminate()

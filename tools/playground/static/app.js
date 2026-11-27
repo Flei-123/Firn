@@ -1,22 +1,51 @@
 import { highlightSource } from "/highlight.js";
+import { kindBefore } from "/tokenizer.js";
+import { editFor } from "/editing.js";
+import { applyEdit, replaceAll, editorState, keyInfo } from "/textedit.js";
+import { symbolsOf, contextAt, suggest } from "/completion.js";
+import { createPopup } from "/popup.js";
+import { createMetrics } from "/metrics.js";
+import { createLiveCheck } from "/livecheck.js";
+import { createStatusBar } from "/statusbar.js";
+import { createTooltip } from "/tooltip.js";
+import { normalize, shiftProblems, problemAt, errorLineSet } from "/problems.js";
 
 const sourceBox = document.getElementById("source");
 const highlightBox = document.getElementById("highlight");
 const gutter = document.getElementById("gutter");
+const codeHost = document.querySelector(".code");
 const output = document.getElementById("output");
 const runButton = document.getElementById("run");
 const statusBox = document.getElementById("status");
 const metaBox = document.getElementById("meta");
 const examplesBox = document.getElementById("examples");
 const STORAGE_KEY = "firn-playground-source";
-const INDENT = "    ";
+const SILENT_KINDS = new Set(["comment", "str", "esc", "spec", "attr"]);
+const CLOSE_POPUP_KEYS = new Set(["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
+const LINE_HEIGHT = 20;
 
-let errorLines = new Set();
+let problems = [];
+let renderedText = "";
+let completionData = null;
+let suppressCompletion = false;
+
+const metrics = createMetrics(codeHost);
+const popup = createPopup(sourceBox, codeHost, metrics, acceptCompletion);
+const tooltip = createTooltip();
+const statusBar = createStatusBar(jumpToProblem);
+const liveCheck = createLiveCheck(() => sourceBox.value, showLiveResult, statusBar.busy);
+
+function caretPosition() {
+  const before = sourceBox.value.slice(0, sourceBox.selectionStart);
+  return { line: before.split("\n").length, col: before.length - (before.lastIndexOf("\n") + 1) + 1 };
+}
 
 function render() {
-  const lines = sourceBox.value.split("\n");
-  highlightBox.innerHTML = highlightSource(sourceBox.value, errorLines);
-  gutter.innerHTML = lines.map((_, index) => `<div class="${errorLines.has(index + 1) ? "err" : ""}">${index + 1}</div>`).join("");
+  const errors = errorLineSet(problems);
+  highlightBox.innerHTML = highlightSource(sourceBox.value, problems);
+  gutter.innerHTML = sourceBox.value.split("\n").map((_, index) => `<div class="${errors.has(index + 1) ? "err" : ""}">${index + 1}</div>`).join("");
+  statusBar.update(problems, caretPosition().line);
+  renderedText = sourceBox.value;
   syncScroll();
 }
 
@@ -26,41 +55,101 @@ function syncScroll() {
   gutter.scrollTop = sourceBox.scrollTop;
 }
 
-function setSource(text) {
-  sourceBox.value = text;
-  errorLines = new Set();
+function setProblems(diagnostics) {
+  problems = normalize(diagnostics);
   render();
-  localStorage.setItem(STORAGE_KEY, text);
 }
 
-function insertAtCursor(text) {
-  const { selectionStart: start, selectionEnd: end, value } = sourceBox;
-  sourceBox.value = value.slice(0, start) + text + value.slice(end);
-  sourceBox.selectionStart = sourceBox.selectionEnd = start + text.length;
+function setSource(text) {
+  problems = [];
+  if (sourceBox.value === "") sourceBox.value = text;
+  else replaceAll(sourceBox, text);
+  render();
+  localStorage.setItem(STORAGE_KEY, sourceBox.value);
+  liveCheck.schedule();
+}
+
+function showLiveResult(result) {
+  if (result === null) return;
+  setProblems(result.diagnostics);
+}
+
+function updateCompletions(explicit) {
+  if (!completionData || sourceBox.selectionStart !== sourceBox.selectionEnd) return popup.hide();
+  const caret = sourceBox.selectionStart;
+  if (SILENT_KINDS.has(kindBefore(sourceBox.value, caret))) return popup.hide();
+  const context = contextAt(sourceBox.value, caret);
+  const items = suggest(context, completionData, symbolsOf(sourceBox.value), explicit);
+  if (items.length === 1 && items[0].label === context.prefix) return popup.hide();
+  popup.show(items);
+}
+
+function acceptCompletion(item) {
+  const caret = sourceBox.selectionStart;
+  const prefix = contextAt(sourceBox.value, caret).prefix;
+  const end = caret - prefix.length + item.label.length;
+  suppressCompletion = true;
+  applyEdit(sourceBox, { from: caret - prefix.length, to: caret, text: item.label, start: end, end });
+  suppressCompletion = false;
+  popup.hide();
+  sourceBox.focus();
+}
+
+function handlePopupKey(event) {
+  if (!popup.isOpen()) return false;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") popup.move(event.key === "ArrowDown" ? 1 : -1);
+  else if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey) acceptCompletion(popup.current());
+  else if (event.key === "Escape") popup.hide();
+  else return false;
+  event.preventDefault();
+  return true;
 }
 
 function onKeyDown(event) {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+  if (event.isComposing) return;
+  const info = keyInfo(event);
+  if (info.ctrl && info.key === "Enter") {
     event.preventDefault();
     run();
-  } else if (event.key === "Tab") {
-    event.preventDefault();
-    insertAtCursor(INDENT);
-    onInput();
-  } else if (event.key === "Enter") {
-    event.preventDefault();
-    const before = sourceBox.value.slice(0, sourceBox.selectionStart);
-    const line = before.slice(before.lastIndexOf("\n") + 1);
-    const indent = line.match(/^ */)[0] + (line.trimEnd().endsWith("{") ? INDENT : "");
-    insertAtCursor("\n" + indent);
-    onInput();
+    return;
   }
+  if (handlePopupKey(event)) return;
+  if (info.ctrl && info.key === " ") {
+    event.preventDefault();
+    updateCompletions(true);
+    return;
+  }
+  if (CLOSE_POPUP_KEYS.has(event.key)) popup.hide();
+  const edit = editFor(editorState(sourceBox), info);
+  if (!edit) return;
+  event.preventDefault();
+  if (edit.move) popup.hide();
+  applyEdit(sourceBox, edit);
 }
 
-function onInput() {
-  errorLines = new Set();
+function onInput(event) {
+  problems = shiftProblems(problems, renderedText, sourceBox.value);
+  tooltip.hide();
   render();
   localStorage.setItem(STORAGE_KEY, sourceBox.value);
+  liveCheck.schedule();
+  const type = (event && event.inputType) || "";
+  if (suppressCompletion || type.startsWith("history") || type === "insertFromPaste") popup.hide();
+  else updateCompletions(false);
+}
+
+function onMouseMove(event) {
+  const cell = metrics.cellAt(sourceBox, event.clientX, event.clientY);
+  const found = problemAt(problems, sourceBox.value.split("\n"), cell.line, cell.col);
+  if (found) tooltip.show(found, event.clientX, event.clientY);
+  else tooltip.hide();
+}
+
+function onCaretMoved() {
+  if (popup.isOpen() && sourceBox.selectionStart !== popup.anchor()) popup.hide();
+  const { line, col } = caretPosition();
+  statusBar.caret(line, col);
+  statusBar.update(problems, line);
 }
 
 function element(tag, className, text) {
@@ -75,13 +164,19 @@ function addBlock(label, text, className) {
   output.append(element("pre", className, text));
 }
 
-function jumpToLine(line) {
+function jumpToLine(line, col = 1, length = 0) {
   const lines = sourceBox.value.split("\n");
-  const offset = lines.slice(0, line - 1).reduce((total, current) => total + current.length + 1, 0);
+  const offset = lines.slice(0, line - 1).reduce((total, current) => total + current.length + 1, 0) + Math.max(0, col - 1);
   sourceBox.focus();
-  sourceBox.setSelectionRange(offset, offset + (lines[line - 1] || "").length);
-  sourceBox.scrollTop = Math.max(0, (line - 4) * 20);
+  sourceBox.setSelectionRange(offset, offset + length);
+  sourceBox.scrollTop = Math.max(0, (line - 4) * LINE_HEIGHT);
   syncScroll();
+  onCaretMoved();
+}
+
+function jumpToProblem(problem) {
+  statusBar.closeList();
+  jumpToLine(problem.line, problem.col, 0);
 }
 
 function addDiagnostics(result) {
@@ -91,7 +186,7 @@ function addDiagnostics(result) {
     const button = element("button", "diag");
     const where = element("b", "", `line ${item.line}:${item.col}`);
     button.append(where, document.createTextNode(`  ${item.message}`));
-    button.addEventListener("click", () => jumpToLine(item.line));
+    button.addEventListener("click", () => jumpToLine(item.line, item.col));
     output.append(button);
   }
   addBlock("Full compiler output", result.compiler_output, "fail");
@@ -106,8 +201,7 @@ function describeRun(result) {
 
 function showResult(result) {
   output.replaceChildren();
-  errorLines = new Set(result.diagnostics.filter((item) => item.line !== null && item.severity === "error").map((item) => item.line));
-  render();
+  setProblems(result.diagnostics);
   if (result.error) {
     addBlock("Error", result.error, "fail");
     return;
@@ -129,6 +223,7 @@ function showResult(result) {
 }
 
 async function run() {
+  liveCheck.cancel();
   runButton.disabled = true;
   statusBox.textContent = "running...";
   metaBox.textContent = "";
@@ -142,6 +237,10 @@ async function run() {
   } finally {
     runButton.disabled = false;
   }
+}
+
+async function loadCompletions() {
+  completionData = await (await fetch("/completions.json")).json();
 }
 
 async function loadExamples() {
@@ -159,6 +258,12 @@ async function loadExamples() {
 
 sourceBox.addEventListener("input", onInput);
 sourceBox.addEventListener("keydown", onKeyDown);
-sourceBox.addEventListener("scroll", syncScroll);
+sourceBox.addEventListener("scroll", () => { syncScroll(); popup.hide(); tooltip.hide(); });
+sourceBox.addEventListener("blur", () => popup.hide());
+sourceBox.addEventListener("mousedown", () => popup.hide());
+sourceBox.addEventListener("mousemove", onMouseMove);
+sourceBox.addEventListener("mouseleave", () => tooltip.hide());
+document.addEventListener("selectionchange", () => { if (document.activeElement === sourceBox) onCaretMoved(); });
 runButton.addEventListener("click", run);
+loadCompletions();
 loadExamples();

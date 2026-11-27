@@ -123,6 +123,19 @@ def compile_command(work_dir):
     return bwrap_prefix(work_dir, extra)
 
 
+def check_command(work_dir):
+    inner = limited(
+        ["/usr/bin/sh", "-c", 'exec /firn/bin/firnc "$@" > /dev/null', "check", f"/work/{SOURCE_NAME}", "--emit=fir-raw"],
+        config.COMPILE_ADDRESS_SPACE, config.CHECK_TIMEOUT_S,
+    )
+    extra = [
+        "--ro-bind", f"{runtime.RUNTIME_DIR}/lib", "/firn/lib",
+        "--ro-bind", f"{runtime.RUNTIME_DIR}/bin/firnc", "/firn/bin/firnc",
+        "--setenv", "FIRNLIB", "/firn/lib",
+    ] + inner
+    return bwrap_prefix(work_dir, extra)
+
+
 def run_command(work_dir):
     inner = limited(["/work/program"], config.RUN_ADDRESS_SPACE, config.RUN_TIMEOUT_S + 2)
     return bwrap_prefix(work_dir, inner)
@@ -138,18 +151,38 @@ def validate_source(source):
     return None
 
 
+def stage_source(source):
+    work_dir = tempfile.mkdtemp(prefix="firn-playground-")
+    os.chmod(work_dir, 0o777)
+    path = os.path.join(work_dir, SOURCE_NAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(source)
+    os.chmod(path, 0o644)
+    return work_dir
+
+
 def execute(source):
     problem = validate_source(source)
     if problem:
         return {"ok": False, "stage": "input", "diagnostics": [], "compiler_output": problem}
-    work_dir = tempfile.mkdtemp(prefix="firn-playground-")
+    work_dir = stage_source(source)
     try:
-        os.chmod(work_dir, 0o777)
-        path = os.path.join(work_dir, SOURCE_NAME)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(source)
-        os.chmod(path, 0o644)
         return compile_and_run(work_dir)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def check(source):
+    problem = validate_source(source)
+    if problem:
+        return {"ok": False, "diagnostics": [], "message": problem}
+    work_dir = stage_source(source)
+    try:
+        built = run_confined(check_command(work_dir), config.CHECK_TIMEOUT_S, config.MAX_OUTPUT_BYTES)
+        log = built["stderr"] + built["stdout"]
+        if built["timed_out"]:
+            return {"ok": False, "diagnostics": [], "message": "compiler timed out"}
+        return {"ok": built["code"] == 0, "diagnostics": parse_diagnostics(log, SOURCE_NAME), "compile_ms": built["ms"]}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

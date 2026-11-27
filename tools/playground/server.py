@@ -9,13 +9,15 @@ import sandbox
 
 STATIC_DIR = os.path.join(config.HERE, "static")
 EXAMPLES_DIR = os.path.join(config.HERE, "examples")
-CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json"}
 EXAMPLE_ORDER = ("hello", "vec", "strings", "fstring", "tuple", "timer")
 EXAMPLE_TITLES = {
     "hello": "Hello", "vec": "Vec", "strings": "Strings", "fstring": "f-String",
     "tuple": "Tuple", "timer": "Timer / millis",
 }
 JOBS = threading.BoundedSemaphore(config.MAX_PARALLEL_JOBS)
+CHECK_JOBS = threading.BoundedSemaphore(config.MAX_PARALLEL_CHECKS)
+ENDPOINTS = {"/api/run": (JOBS, sandbox.execute), "/api/check": (CHECK_JOBS, sandbox.check)}
 
 
 def load_examples():
@@ -57,8 +59,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body(200, CONTENT_TYPES[extension], handle.read())
 
     def do_POST(self):
-        if self.path != "/api/run":
+        endpoint = ENDPOINTS.get(self.path)
+        if endpoint is None:
             return self.send_json(404, {"error": "not found"})
+        slots, handler = endpoint
         length = int(self.headers.get("Content-Length") or 0)
         if length > config.MAX_SOURCE_BYTES * 2:
             return self.send_json(413, {"error": "request too large"})
@@ -66,12 +70,12 @@ class Handler(BaseHTTPRequestHandler):
             source = json.loads(self.rfile.read(length)).get("source")
         except (ValueError, AttributeError):
             return self.send_json(400, {"error": "invalid json"})
-        if not JOBS.acquire(timeout=5):
+        if not slots.acquire(timeout=5):
             return self.send_json(503, {"error": "busy, try again"})
         try:
-            self.send_json(200, sandbox.execute(source))
+            self.send_json(200, handler(source))
         finally:
-            JOBS.release()
+            slots.release()
 
 
 def main():
