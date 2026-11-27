@@ -8,6 +8,8 @@ import { createMetrics } from "/metrics.js";
 import { createLiveCheck } from "/livecheck.js";
 import { createStatusBar } from "/statusbar.js";
 import { createTooltip } from "/tooltip.js";
+import { createTerminal } from "/terminal.js";
+import { startSession } from "/session.js";
 import { normalize, shiftProblems, problemAt, errorLineSet } from "/problems.js";
 
 const sourceBox = document.getElementById("source");
@@ -16,6 +18,7 @@ const gutter = document.getElementById("gutter");
 const codeHost = document.querySelector(".code");
 const output = document.getElementById("output");
 const runButton = document.getElementById("run");
+const runLabel = document.getElementById("run-label");
 const statusBox = document.getElementById("status");
 const metaBox = document.getElementById("meta");
 const examplesBox = document.getElementById("examples");
@@ -192,51 +195,101 @@ function addDiagnostics(result) {
   addBlock("Full compiler output", result.compiler_output, "fail");
 }
 
-function describeRun(result) {
-  if (result.timed_out) return ["Stopped: time limit reached", "fail"];
-  if (result.truncated) return ["Stopped: output limit reached", "fail"];
-  if (result.exit_code === 0) return ["Exit code 0", "pass"];
-  return [`Exit code ${result.exit_code}`, "fail"];
+const EXIT_MESSAGES = {
+  stopped: "Stopped",
+  timeout: (limits) => `Stopped: time limit of ${limits.total_s} s reached`,
+  idle: (limits) => `Stopped: no input for ${limits.idle_s} s`,
+  output_limit: (limits) => `Stopped: output limit of ${limits.output_kib} KiB reached`,
+  disconnected: () => "Disconnected",
+  signal: () => "Program was killed by the system",
+};
+const DEFAULT_LIMITS = { total_s: 60, idle_s: 30, output_kib: 64 };
+
+let activeSession = null;
+let runCounter = 0;
+let sessionLimits = DEFAULT_LIMITS;
+
+const terminal = createTerminal(output, {
+  line: (text) => activeSession && activeSession.send(text),
+  eof: () => activeSession && activeSession.eof(),
+  interrupt: () => activeSession && activeSession.stop(),
+});
+
+function describeExit(result) {
+  const message = EXIT_MESSAGES[result.reason];
+  if (message) return [typeof message === "function" ? message(sessionLimits) : message, "fail"];
+  if (result.code === 0) return ["Process exited with code 0", "pass"];
+  return [`Process exited with code ${result.code}`, "fail"];
 }
 
-function showResult(result) {
+function setRunning(running) {
+  runLabel.textContent = running ? "\u25A0 Stop" : "\u25B6 Run";
+  runButton.dataset.running = running ? "1" : "";
+  if (!running) statusBox.textContent = "";
+}
+
+function showFailure(result) {
   output.replaceChildren();
   setProblems(result.diagnostics);
-  if (result.error) {
-    addBlock("Error", result.error, "fail");
-    return;
-  }
-  if (result.stage === "input") {
-    addBlock("Error", result.compiler_output, "fail");
-    return;
-  }
   if (result.stage === "compile") {
     addDiagnostics(result);
     metaBox.textContent = `compile ${result.compile_ms} ms`;
-    return;
+  } else {
+    addBlock("Error", result.compiler_output, "fail");
   }
-  addBlock("Output", result.stdout || "(no output)", result.stdout ? "" : "hint");
-  if (result.stderr) addBlock("stderr", result.stderr, "stderr");
-  const [text, className] = describeRun(result);
-  output.append(element("div", className, text));
-  metaBox.textContent = `compile ${result.compile_ms} ms | run ${result.run_ms} ms`;
+  setRunning(false);
 }
 
-async function run() {
+function showError(message) {
+  output.replaceChildren();
+  addBlock("Error", message, "fail");
+  setRunning(false);
+}
+
+function sessionHandlers(runId) {
+  const current = (action) => (data) => { if (runId === runCounter) action(data); };
+  return {
+    status: current(() => { statusBox.textContent = "compiling..."; }),
+    started: current((data) => {
+      sessionLimits = data.limits || DEFAULT_LIMITS;
+      metaBox.textContent = `compile ${data.compile_ms} ms`;
+      statusBox.textContent = "running...";
+      setProblems([]);
+      terminal.start();
+    }),
+    out: current((text) => terminal.write("out", text)),
+    err: current((text) => terminal.write("err", text)),
+    exit: current((data) => {
+      const [text, className] = describeExit(data);
+      terminal.finish(text, className);
+      metaBox.textContent = `compile ${data.compile_ms} ms | run ${data.run_ms} ms`;
+      setRunning(false);
+      activeSession = null;
+    }),
+    failed: current((data) => { activeSession = null; showFailure(data); }),
+    error: current((message) => { activeSession = null; showError(message); }),
+  };
+}
+
+function stopSession() {
+  if (!activeSession) return;
+  activeSession.stop();
+}
+
+function run() {
   liveCheck.cancel();
-  runButton.disabled = true;
-  statusBox.textContent = "running...";
+  if (activeSession) activeSession.stop();
+  if (activeSession) activeSession.close();
+  runCounter += 1;
+  output.replaceChildren(element("p", "hint", "Compiling..."));
   metaBox.textContent = "";
-  try {
-    const response = await fetch("/api/run", { method: "POST", body: JSON.stringify({ source: sourceBox.value }) });
-    showResult(await response.json());
-    statusBox.textContent = "";
-  } catch (failure) {
-    showResult({ error: String(failure), diagnostics: [] });
-    statusBox.textContent = "failed";
-  } finally {
-    runButton.disabled = false;
-  }
+  setRunning(true);
+  activeSession = startSession(sourceBox.value, sessionHandlers(runCounter));
+}
+
+function onRunClick() {
+  if (runButton.dataset.running) stopSession();
+  else run();
 }
 
 async function loadCompletions() {
@@ -264,6 +317,13 @@ sourceBox.addEventListener("mousedown", () => popup.hide());
 sourceBox.addEventListener("mousemove", onMouseMove);
 sourceBox.addEventListener("mouseleave", () => tooltip.hide());
 document.addEventListener("selectionchange", () => { if (document.activeElement === sourceBox) onCaretMoved(); });
-runButton.addEventListener("click", run);
+runButton.addEventListener("click", onRunClick);
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && event.target !== sourceBox) {
+    event.preventDefault();
+    run();
+  }
+});
+window.addEventListener("pagehide", () => { if (activeSession) activeSession.stop(); });
 loadCompletions();
 loadExamples();

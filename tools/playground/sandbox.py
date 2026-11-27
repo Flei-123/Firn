@@ -136,8 +136,9 @@ def check_command(work_dir):
     return bwrap_prefix(work_dir, extra)
 
 
-def run_command(work_dir):
-    inner = limited(["/work/program"], config.RUN_ADDRESS_SPACE, config.RUN_TIMEOUT_S + 2)
+def run_command(work_dir, cpu_seconds=None):
+    cpu = config.RUN_TIMEOUT_S + 2 if cpu_seconds is None else cpu_seconds
+    inner = limited(["/work/program"], config.RUN_ADDRESS_SPACE, cpu)
     return bwrap_prefix(work_dir, inner)
 
 
@@ -187,18 +188,25 @@ def check(source):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def compile_and_run(work_dir):
+def compile_program(work_dir):
     built = run_confined(compile_command(work_dir), config.COMPILE_TIMEOUT_S, config.MAX_OUTPUT_BYTES)
     log = built["stderr"] + built["stdout"]
     if built["timed_out"]:
-        return {"ok": False, "stage": "compile", "diagnostics": [], "compiler_output": "compiler timed out", "compile_ms": built["ms"]}
+        return built, log, {"ok": False, "stage": "compile", "diagnostics": [], "compiler_output": "compiler timed out", "compile_ms": built["ms"]}
     program = os.path.join(work_dir, "program")
     if built["code"] != 0 or not os.path.exists(program):
-        return {
+        return built, log, {
             "ok": False, "stage": "compile", "compiler_output": log, "compile_ms": built["ms"],
             "diagnostics": parse_diagnostics(log, SOURCE_NAME),
         }
     os.chmod(program, 0o755)
+    return built, log, None
+
+
+def compile_and_run(work_dir):
+    built, log, failure = compile_program(work_dir)
+    if failure:
+        return failure
     ran = run_confined(run_command(work_dir), config.RUN_TIMEOUT_S, config.MAX_OUTPUT_BYTES)
     return {
         "ok": ran["code"] == 0 and not ran["timed_out"] and not ran["truncated"],

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 
+import terminal_browser_test
 from testserver import call, free_port, start_server
 
 try:
@@ -278,6 +279,7 @@ def main():
         page = Page(browser, f"http://127.0.0.1:{port}")
         for step in (test_auto_close, test_blocks, test_undo, test_completion, test_highlight, test_live_check, test_run_shortcut):
             step(page)
+        terminal_browser_test.run_all(page, check)
         shot = os.environ.get("PLAYGROUND_SHOT")
         if shot:
             page.fresh()

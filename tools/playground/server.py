@@ -6,14 +6,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import config
 import runtime
 import sandbox
+import session_http
 
 STATIC_DIR = os.path.join(config.HERE, "static")
 EXAMPLES_DIR = os.path.join(config.HERE, "examples")
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json"}
-EXAMPLE_ORDER = ("hello", "vec", "strings", "fstring", "tuple", "timer")
+EXAMPLE_ORDER = ("hello", "vec", "strings", "fstring", "tuple", "timer", "input")
 EXAMPLE_TITLES = {
     "hello": "Hello", "vec": "Vec", "strings": "Strings", "fstring": "f-String",
-    "tuple": "Tuple", "timer": "Timer / millis",
+    "tuple": "Tuple", "timer": "Timer / millis", "input": "Input (stdin)",
 }
 JOBS = threading.BoundedSemaphore(config.MAX_PARALLEL_JOBS)
 CHECK_JOBS = threading.BoundedSemaphore(config.MAX_PARALLEL_CHECKS)
@@ -48,6 +49,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path.startswith(session_http.CREATE_PATH + "/"):
+            return session_http.dispatch(self, "GET")
         if path == "/api/examples":
             return self.send_json(200, load_examples())
         name = "index.html" if path == "/" else path.lstrip("/")
@@ -59,6 +62,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body(200, CONTENT_TYPES[extension], handle.read())
 
     def do_POST(self):
+        if self.path.split("?", 1)[0].startswith(session_http.CREATE_PATH):
+            return session_http.dispatch(self, "POST")
         endpoint = ENDPOINTS.get(self.path)
         if endpoint is None:
             return self.send_json(404, {"error": "not found"})

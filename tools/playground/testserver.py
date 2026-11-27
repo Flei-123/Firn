@@ -24,8 +24,14 @@ def call(port, path, payload=None, raw=None):
         return failure.code, failure.read()
 
 
+SESSION_ENV = {
+    "PLAYGROUND_SESSION_TIMEOUT": "6", "PLAYGROUND_SESSION_IDLE": "3", "PLAYGROUND_SESSION_ABANDON": "1",
+    "PLAYGROUND_HEARTBEAT": "0.3",
+}
+
+
 def start_server(port, runtime_dir, run_timeout_s):
-    env = dict(os.environ, PLAYGROUND_PORT=str(port), PLAYGROUND_RUN_TIMEOUT=str(run_timeout_s), PLAYGROUND_RUNTIME=runtime_dir)
+    env = dict(os.environ, PLAYGROUND_PORT=str(port), PLAYGROUND_RUN_TIMEOUT=str(run_timeout_s), PLAYGROUND_RUNTIME=runtime_dir, **SESSION_ENV)
     process = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")], env=env, cwd=HERE, stdout=subprocess.PIPE)
     process.stdout.readline()
     return process

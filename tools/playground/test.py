@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 
+import session_test
 from testserver import call, free_port, start_server
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -68,7 +69,7 @@ def test_isolation(port):
 def test_examples(port):
     status, body = call(port, "/api/examples")
     examples = json.loads(body)
-    check("six examples", [item["id"] for item in examples] == ["hello", "vec", "strings", "fstring", "tuple", "timer"], examples)
+    check("seven examples", [item["id"] for item in examples] == ["hello", "vec", "strings", "fstring", "tuple", "timer", "input"], examples)
     for item in examples:
         status, result = run(port, item["source"])
         check(f"example {item['id']} runs", result["ok"] and result["stdout"].strip() != "", result)
@@ -102,7 +103,7 @@ def test_static(port):
     status, body = call(port, "/")
     check("index served", status == 200 and b"Firn Playground" in body)
     check("script served", call(port, "/app.js")[0] == 200)
-    for name in ("tokenizer.js", "editing.js", "completion.js", "problems.js", "statusbar.js", "tooltip.js", "metrics.js", "textedit.js", "popup.js", "livecheck.js", "highlight.js"):
+    for name in ("terminal.js", "session.js", "tokenizer.js", "editing.js", "completion.js", "problems.js", "statusbar.js", "tooltip.js", "metrics.js", "textedit.js", "popup.js", "livecheck.js", "highlight.js"):
         check(f"{name} served", call(port, "/" + name)[0] == 200)
     status, body = call(port, "/completions.json")
     check("completion data served", status == 200 and "modules" in json.loads(body), status)
@@ -138,6 +139,7 @@ def main():
         for step in (test_basics, test_check_endpoint, test_examples, test_static, test_isolation, test_limits):
             step(port)
         test_staged_symlinks(port, runtime_dir)
+        session_test.run_all(port, check)
     finally:
         server.terminate()
         server.wait()
