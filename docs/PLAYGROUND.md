@@ -8,7 +8,11 @@ Browser page to try Firn without installing anything: editor with syntax highlig
 
 Listens on `127.0.0.1:8123` only. Settings by environment: `PLAYGROUND_HOST`, `PLAYGROUND_PORT`, `PLAYGROUND_FIRNC`, `PLAYGROUND_FIRNLIB`, `PLAYGROUND_RUN_TIMEOUT` (default 10 s), `PLAYGROUND_COMPILE_TIMEOUT` (20 s), `PLAYGROUND_JOBS` (4 parallel), `PLAYGROUND_RUNTIME`.
 
-Do not expose it publicly without a reverse proxy that adds rate limiting.
+## Service
+
+Production runs as systemd unit `firn-playground` (`tools/playground/firn-playground.service`, installed to `/etc/systemd/system/`, enabled at boot) on `0.0.0.0:8110` from the copy in `/root/jarvis/data/firn-playground` (`app/` = `tools/playground/`, `firnc`, `lib`). After compiler, lib or playground changes: copy again, `systemctl restart firn-playground`.
+
+Public access goes through the reverse proxy (`playground.fleitec.com` -> `192.168.1.54:8110`); the proxy should add rate limiting.
 
 ## How it works
 
