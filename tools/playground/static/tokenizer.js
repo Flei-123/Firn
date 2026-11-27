@@ -9,6 +9,9 @@ export const TYPES = new Set([
   "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize", "f32", "f64",
   "Vec", "Map", "Set", "Self",
 ]);
+export const CONTROL = new Set([
+  "var", "if", "else", "while", "for", "in", "match", "return", "break", "continue", "defer", "errdefer", "try", "catch", "import",
+]);
 const DECLARATIONS = new Set(["struct", "enum", "error", "interface", "type", "impl"]);
 
 const TOKEN = new RegExp([
@@ -66,16 +69,17 @@ function isCallAhead(line, from) {
 
 function classifyWord(word, line, end, previous) {
   const member = previous === ".";
+  if (!member && CONTROL.has(word)) return "ctl";
   if (!member && KEYWORDS.has(word)) return "kw";
   if (!member && LITERALS.has(word)) return "lit";
   if (previous === "fn") return "fn";
   if (DECLARATIONS.has(previous)) return "type";
   if (isCallAhead(line, end)) return "call";
-  if (member) return "";
+  if (member) return "var";
   if (TYPES.has(word)) return "type";
   if (/^[A-Z][A-Z0-9_]+$/.test(word)) return "const";
   if (/^[A-Z]/.test(word)) return "type";
-  return "";
+  return "var";
 }
 
 function scanString(line, start, tokens, interpolate, state) {
