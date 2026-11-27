@@ -1,8 +1,10 @@
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -38,8 +40,8 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
-def start_server(port):
-    env = dict(os.environ, PLAYGROUND_PORT=str(port), PLAYGROUND_RUN_TIMEOUT=str(RUN_TIMEOUT_S))
+def start_server(port, runtime_dir):
+    env = dict(os.environ, PLAYGROUND_PORT=str(port), PLAYGROUND_RUN_TIMEOUT=str(RUN_TIMEOUT_S), PLAYGROUND_RUNTIME=runtime_dir)
     process = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")], env=env, cwd=HERE, stdout=subprocess.PIPE)
     process.stdout.readline()
     return process
@@ -105,13 +107,15 @@ def test_static(port):
 
 def main():
     port = free_port()
-    server = start_server(port)
+    runtime_dir = tempfile.mkdtemp(prefix="firn-playground-test-", dir="/var/tmp")
+    server = start_server(port, runtime_dir)
     try:
         for step in (test_basics, test_examples, test_static, test_isolation, test_limits):
             step(port)
     finally:
         server.terminate()
         server.wait()
+        shutil.rmtree(runtime_dir, ignore_errors=True)
     leftovers = [name for name in os.listdir("/tmp") if name.startswith("firn-playground-")]
     check("no sandbox leftovers in /tmp", not leftovers, leftovers)
     print(f"{len(FAILURES)} failed")
