@@ -1,7 +1,7 @@
 Firn for Windows (x86-64): compiler, formatter, VS Code extension.
 
 1. Unzip.
-2. Right click install.ps1 -> Run with PowerShell (or: powershell -ExecutionPolicy Bypass -File install.ps1).
+2. Double-click INSTALL.cmd.
 3. Open a new terminal: firn new hello ; cd hello ; firn run
 4. VS Code: open the folder, open a .fi file, press F5.
 

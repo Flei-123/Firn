@@ -13,7 +13,7 @@ Open a file, write, press F5, see errors live, get completion. Extension: `edito
 ## Windows (5 steps)
 
 1. Get `firn-windows-x86_64.zip` (built by `bash tools/windows/ide/build_kit.sh OUT_DIR`) and unzip it.
-2. Run `install.ps1` (PowerShell). It copies `bin`, `lib` to `%LOCALAPPDATA%\firn`, sets `PATH` and `FIRNLIB`, and runs `code --install-extension`.
+2. Double-click `INSTALL.cmd` (runs `install.ps1`). It copies `bin`, `lib` to `%LOCALAPPDATA%\firn`, sets `PATH` and `FIRNLIB`, and runs `code --install-extension`.
 3. Open a new terminal: `firn new hello`, `cd hello`, `code .`.
 4. Open `src\main.fi`, press **F5**.
 5. Check: `firn doctor` prints the tool locations.

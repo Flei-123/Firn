@@ -16,7 +16,7 @@ mkdir -p "$KIT/bin" "$KIT/licenses" "$OUT"
 cp "$WIN_FIRNC" "$KIT/bin/firnc.exe"
 FIRNLIB="$ROOT/lib" "$FIRNC" --target=x86_64-windows --opt-level=release-safe "$ROOT/tools/fmt/firnfmt.fi" -o "$KIT/bin/firnfmt.exe"
 cp "$ROOT"/tools/windows/ide/{firn.cmd,firn.ps1} "$KIT/bin/"
-cp "$ROOT"/tools/windows/ide/{install.ps1,README.txt} "$KIT/"
+cp "$ROOT"/tools/windows/ide/{INSTALL.cmd,install.ps1,README.txt} "$KIT/"
 cp -r "$ROOT/lib" "$KIT/lib"
 cp "$ROOT/LICENSE" "$KIT/licenses/FIRN-LICENSE.txt"
 
