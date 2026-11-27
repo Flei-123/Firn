@@ -765,6 +765,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 
 fn main() {
     brand_compat::apply_env_aliases();
+    #[cfg(windows)]
+    let _ = target::flag_set("x86_64-windows");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         print!("{}", usage());

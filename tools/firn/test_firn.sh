@@ -25,7 +25,7 @@ t "build --target rejects unknown" bash -c "cd gui && ! $FI build --target nowhe
 t "targets lists the targets"      bash -c "$FI targets | grep -q '^web'"
 ( cd demo
   t "build DIR (--package)"        "$FI" build . 
-  t "built program runs"           bash -c "./demo | grep -q 'hello from demo'"
+  t "built program runs"           bash -c "./demo | grep -qx 'hi'"
   t "test runs the TAP suite"      bash -c "$FI test | grep -q 'passed 1, failed 0'"
   t "fmt -c accepts canonical"     "$FI" fmt -c src/main.fi tests/basic.fi
   t "check accepts a good file"    "$FI" check src/main.fi

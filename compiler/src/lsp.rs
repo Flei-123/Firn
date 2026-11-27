@@ -1026,8 +1026,14 @@ impl Server {
 
 /// Calls `firnfmt` (built next to the compiler binary or in the project).
 fn run_formatter(src: &str) -> Option<String> {
+    let beside_compiler = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(format!("firnfmt{}", std::env::consts::EXE_SUFFIX))))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let candidates = [
         std::env::var("FIRNFMT").unwrap_or_default(),
+        beside_compiler,
         "./.firnfmt".to_string(),
         "tools/fmt/.firnfmt".to_string(),
     ];
