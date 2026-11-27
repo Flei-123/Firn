@@ -7,7 +7,7 @@ const TO_STR_FN: &str = "io__fmt_string";
 const BUILDER_TYPE: &str = "Fmt";
 
 pub(crate) fn wants_str(t: Option<&TypeExpr>) -> bool {
-    matches!(t, Some(TypeExpr::Named(n, _)) if n == STR_TYPE)
+    matches!(t, Some(TypeExpr::Named(n, _)) if n == STR_TYPE || n == crate::strtype::NAME_ALIAS)
 }
 
 fn is_builder_type(t: &TypeExpr) -> bool {
