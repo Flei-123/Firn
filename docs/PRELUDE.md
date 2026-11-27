@@ -110,7 +110,7 @@ A replacement shorter than the name is padded with spaces, so columns of later t
 | Form | Rule |
 |---|---|
 | `x.Name(..)` | method or module function, becomes `x.snake(..)` |
-| `Name(..)` | only for table entries marked `bare`: `Println`, `Print`, `ReadLine` (`io.read_line`), `Sleep` (`time.sleep_ms`), `Millis` (`time.millis`) |
+| `Name(..)` | only for table entries marked `bare`: `Println`, `Print`, `ReadLn` (`readln`), `ReadLine` (`io.read_line`), `Sleep` (`time.sleep_ms`), `Millis` (`time.millis`) |
 | `x.Length`, `x.Count` | property form, becomes `x.length()` (string) and `x.len()` (Vec/Map/Set); `x.Count()` also works |
 
 Aliases: `ToString`=`to_str`, `Add`/`Push`=`push`, `Pop`, `Insert`, `Clear`, `Sort`, `Reverse`, `Extend`,
@@ -126,8 +126,8 @@ Rules:
 * Your own name wins. A table name is left alone in the whole file when the file declares it
   (`fn Add`, `impl .. { fn Add(..) }`) or uses it any other way (field `Count: i32`, variant `Add(i32)`,
   variable). A call behind a type path (`Op.Add(..)`) is never renamed.
-* The decision is per file. A PascalCase method defined in another file and called here is renamed
-  and then fails as an unknown method; call it through a name that is not in the table.
+* The decision is per file, so a file that imports a module other than `std.*` is not touched at all:
+  the names of that module (`calc.Add`, a type `alias_base.Count`) must stay as written.
 * An unknown PascalCase name keeps its spelling in the error. `did you mean` also tries the
   snake_case form of a PascalCase name (`DoubleIt` suggests `double_it`).
 * Implicit module loading (`to_str`, `strmethods`, `nummethods`) sees the renamed code.

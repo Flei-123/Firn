@@ -67,6 +67,7 @@ mod hints;
 mod dwarf;
 mod dwarf_info;
 mod lsp;
+mod lsp_alias;
 mod lsp_check;
 mod lsp_modules;
 mod errors;

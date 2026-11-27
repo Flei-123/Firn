@@ -24,6 +24,7 @@ struct Site {
 struct Scan {
     sites: Vec<Site>,
     owned: Vec<bool>,
+    user_import: bool,
 }
 
 pub(crate) fn alias_index(name: &str) -> Option<usize> {
@@ -79,6 +80,19 @@ fn note_identifier(scan: &mut Scan, w: &Walk, b: &[u8], start: usize, end: usize
     match form {
         Some(form) => scan.sites.push(Site { start, end, alias, form }),
         None => scan.owned[alias] = true,
+    }
+}
+
+fn note_import(scan: &mut Scan, b: &[u8], mut i: usize) {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && is_ident_byte(b[i]) {
+        i += 1;
+    }
+    if i > start && &b[start..i] != b"std" {
+        scan.user_import = true;
     }
 }
 
@@ -161,6 +175,9 @@ fn scan_range(scan: &mut Scan, b: &[u8], from: usize, end: usize) {
             while i < end && is_ident_byte(b[i]) {
                 i += 1;
             }
+            if &b[start..i] == b"import" {
+                note_import(scan, b, i);
+            }
             note_identifier(scan, &w, b, start, i, next_non_space(b, i));
             w.prev_fn = &b[start..i] == b"fn";
             w.last_type_like = b[start].is_ascii_uppercase() && !w.prev_dot;
@@ -195,8 +212,11 @@ pub fn expand(src: &str) -> Option<String> {
         return None;
     }
     let b = src.as_bytes();
-    let mut scan = Scan { sites: Vec::new(), owned: vec![false; ALIASES.len()] };
+    let mut scan = Scan { sites: Vec::new(), owned: vec![false; ALIASES.len()], user_import: false };
     scan_range(&mut scan, b, 0, b.len());
+    if scan.user_import {
+        return None;
+    }
     let sites: Vec<&Site> = scan.sites.iter().filter(|s| !scan.owned[s.alias]).collect();
     if sites.is_empty() {
         return None;
@@ -260,6 +280,14 @@ mod tests {
     fn fstring_interpolation_and_comments() {
         assert_eq!(run("println(f\"{x.ToString()}\")"), "println(f\"{x.to_str  ()}\")");
         assert_eq!(run("// x.ToString()\n\"x.ToString()\""), "// x.ToString()\n\"x.ToString()\"");
+    }
+
+    #[test]
+    fn files_importing_user_modules_are_untouched() {
+        let own = "import calc\nfn main() { let a = calc.Add(1, 2)\nlet b = x.ToString() }";
+        assert_eq!(run(own), own);
+        let std_only = "import std.io\nfn main() { let b = x.ToString() }";
+        assert_eq!(run(std_only), "import std.io\nfn main() { let b = x.to_str  () }");
     }
 
     #[test]

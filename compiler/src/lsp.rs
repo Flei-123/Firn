@@ -858,6 +858,9 @@ impl Server {
             return hover_card(&format!("{}: {}", m.kind, m.detail), at_line, col, len);
         }
         if resolve(&a, &name, at_line).is_none() {
+            if let Some(alias) = crate::lsp_alias::hover_text(&name) {
+                return hover_card(&alias, at_line, col, len);
+            }
             if let Some((_, detail, _)) = PRELUDE.iter().find(|(n, _, _)| *n == name) {
                 return hover_card(&format!("prelude: {}", detail), at_line, col, len);
             }
@@ -921,6 +924,15 @@ impl Server {
                 ("detail", text("keyword")),
             ]));
         }
+        for item in crate::lsp_alias::global_items() {
+            if !seen.iter().any(|n| n == item.label) {
+                items.push(obj(vec![
+                    ("label", text(item.label)),
+                    ("kind", num(3)),
+                    ("detail", text(&item.detail)),
+                ]));
+            }
+        }
         for (name, detail, kind) in PRELUDE {
             if !seen.iter().any(|n| n == name) {
                 items.push(obj(vec![
@@ -940,7 +952,7 @@ impl Server {
         let line_text = src.lines().nth(line as usize)?;
         let alias = crate::lsp_modules::qualifier_before(line_text, ch as usize)?;
         let (_, members) = crate::lsp_modules::members_for_alias(&uri_to_path(uri), &a.symbols, &alias)?;
-        let items: Vec<Json> = members
+        let mut items: Vec<Json> = members
             .iter()
             .map(|m| {
                 let kind = match m.kind {
@@ -955,6 +967,15 @@ impl Server {
                 ])
             })
             .collect();
+        for item in crate::lsp_alias::member_items(members.iter().map(|m| m.name.as_str())) {
+            if !members.iter().any(|m| m.name == item.label) {
+                items.push(obj(vec![
+                    ("label", text(item.label)),
+                    ("kind", num(2)),
+                    ("detail", text(&item.detail)),
+                ]));
+            }
+        }
         Some(obj(vec![("isIncomplete", Json::Bool(false)), ("items", Json::Arr(items))]))
     }
 
