@@ -82,6 +82,7 @@ Format: `area | entry file | purpose | call`. Import path = file path without `l
 - `std/pool.fi` | IO worker pool; `chan/` channels; `async/` event loop
 
 ## Toolchain and quality
+- Playground `tools/playground/` (docs/PLAYGROUND.md): browser editor + Run, sandboxed compile/run server on 127.0.0.1:8123 | `bash tools/playground/run.sh`, test `bash tools/playground/test.sh`
 - `cbind/` + `tools/cbind/firn_bindgen.fi` | C header import (`firn-bindgen`): preprocessor, C declaration parser, SysV layout, Firn externs/structs/consts, C glue for inline/macros (docs/CBIND.md) | `firn-bindgen --lib z /usr/include/zlib.h`
 - `tools/firn/firn` (new/add/fetch/update/build/search/publish/yank, SemVer registry index; docs/PACKAGES.md), `lib/toolchain/` (installer), `tools/pin/` (PIN-POLICY.md)
 - Test: `firnc --test`, `lib/test/runner.fi`, `tools/testrunner/`; gate `bash test.sh --stage N` (tools/teststages/README.md)
