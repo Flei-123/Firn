@@ -732,7 +732,7 @@ impl<'a> Checker<'a> {
                 let params_ok = sig.params.is_empty()
                     || (sig.params.len() == 1
                         && matches!(sig.params[0], Type::U64 | Type::Usize));
-                let bad = !params_ok || sig.ret != Type::I32;
+                let bad = !params_ok || !matches!(sig.ret, Type::I32 | Type::Void);
                 if bad {
                     let span = prog
                         .funcs

@@ -25,13 +25,12 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 import std.io
 import std.tostr
 
-fn main() -> i32 {
+fn main() {
     let n: int = 42
     let big: ulong = 18446744073709551615
     let ratio: double = 0.1 + 0.2
     let flag: bool = true
     io.print_line(n.to_str() + " " + big.to_str() + " " + ratio.to_str() + " " + flag.to_str())
-    return 0
 }
 ```
 
@@ -52,7 +51,7 @@ import std.io
 import std.parse
 import std.tostr
 
-fn main() -> i32 {
+fn main() {
     let a = int.parse("123") catch 0 - 1
     let b = int.parse("12x") catch 0 - 1
     let c = f64.parse("2.5") catch 0.0
@@ -60,7 +59,6 @@ fn main() -> i32 {
     var n: i64 = 0
     let ok: bool = i64.try_parse("77", &n)
     io.print_line(a.to_str() + " " + b.to_str() + " " + c.to_str() + " " + d.to_str() + " " + ok.to_str() + " " + n.to_str())
-    return 0
 }
 ```
 
@@ -92,10 +90,9 @@ fn describe(label: str, xs: ..long) -> str {
     return label + ":" + xs.len().to_str()
 }
 
-fn main() -> i32 {
+fn main() {
     io.print_line(sum().to_str() + " " + sum(5).to_str() + " " + sum(1, 2, 3).to_str() + " " + sum(sum(1, 2), 4).to_str())
     io.print_line(describe("n") + " " + describe("n", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
-    return 0
 }
 ```
 
@@ -128,7 +125,7 @@ impl Counter {
 #[derive(Default)]
 struct Config { width: i32, name: str }
 
-fn main() -> i32 {
+fn main() {
     let c: Counter = Counter.start()
     io.print_line(Counter.start().next().next().get().to_str() + " " + c.get().to_str())
     let cfg: Config = Config.default()
@@ -137,7 +134,6 @@ fn main() -> i32 {
     d.bump()
     d.bump()
     io.print_line(d.get().to_str())
-    return 0
 }
 ```
 
@@ -163,13 +159,12 @@ import std.io
 import std.format
 import std.tostr
 
-fn main() -> i32 {
+fn main() {
     let x: int = 3
     let y: int = 4
     let z: int = x + y
     io.print_line(format.format3("z = {0} + {1} = {2}", x.to_str(), y.to_str(), z.to_str()))
     io.print_line(format.format2("{1} {0} {{braces}}", "a", "b"))
-    return 0
 }
 ```
 
@@ -183,11 +178,10 @@ b a {braces}
 ## Interpolation
 
 ```firn run
-fn main() -> i32 {
+fn main() {
     let name: string = "firn"
     let n: int = 7
     println(f"{name} has {n} apples, {n * 2} pears, {2.5:.2f} units")
-    return 0
 }
 ```
 
@@ -207,7 +201,7 @@ import std.io
 import std.chars
 import std.tostr
 
-fn main() -> i32 {
+fn main() {
     let text: string = "h\u00e9llo \u20ac"
     var it: chars.CharIter = chars.iter(text)
     var codes: str = ""
@@ -226,7 +220,6 @@ fn main() -> i32 {
         sum += c
     }
     io.print_line(sum.to_str())
-    return 0
 }
 ```
 
@@ -249,14 +242,13 @@ An array index may have any integer type up to 64 bits, so no `as usize` is need
 import std.io
 import std.tostr
 
-fn main() -> i32 {
+fn main() {
     var v: [i32; 4] = [0, 0, 0, 0]
     for i in 0..4 {
         v[i] = i * 3
     }
     let k: u8 = 2
     io.print_line(v[3].to_str() + " " + v[k].to_str())
-    return 0
 }
 ```
 
@@ -269,7 +261,7 @@ fn main() -> i32 {
 `to_str`, `parse.`, `format.`, `chars.`, `print`, `println`, `format(...)` and every `std` module (`io.`, `time.`, `math.`, ...) work without `import`. The collector starts itself too.
 
 ```firn run
-fn main() -> i32 {
+fn main() {
     let n: int = 42
     let m: int = parse.to_i32("8") catch 0
     println(format("{0} + {1} = {2}", n, m, n + m))
@@ -280,7 +272,6 @@ fn main() -> i32 {
     let label: str = f"abs = {math.abs(0 - 3)}"
     io.print_line(label)
     println(f"fast: {time.millis() - t0 < 1000}")
-    return 0
 }
 ```
 

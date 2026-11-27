@@ -1901,7 +1901,11 @@ specification and the code do not drift apart.
    covers, and any form of dynamic loading -- `extern fn` here means a NAME
    the linker resolves at link time, nothing more.
 8. **The return value of the program.** `fn main() -> i32`; `_start` calls
-   `main` and passes the result to `exit` (exit code = value & 0xFF).
+   `main` and passes the result to `exit` (exit code = value & 0xFF). Since
+   27.11.2026 `fn main()` and `fn main(start: u64)` may omit the return type: the
+   function is lowered with an `i32` result, every bare `return` and the end of
+   the body yield 0 (`return <value>` is still an error there). Any other return
+   type or parameter list is rejected as before.
 9. ~~**At most 6 function parameters.**~~ **Struck in round 2** (module `kern`):
    arguments from the seventh INTEGER word on are placed at `[rsp+8k]` before
    the `call`, the 16 byte alignment is preserved; the callee reads them at

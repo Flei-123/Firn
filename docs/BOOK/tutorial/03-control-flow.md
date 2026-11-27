@@ -12,7 +12,7 @@ fn classify(n: i32) -> str {
     return "positive"
 }
 
-fn main() -> i32 {
+fn main() {
     var sum: i32 = 0
     for i in 1 as i32..6 as i32 {
         sum = sum + i
@@ -25,7 +25,6 @@ fn main() -> i32 {
     io.print_line(classify(0 - 4))
     io.print_line(classify(0))
     io.print_line(classify(9))
-    return 0
 }
 ```
 

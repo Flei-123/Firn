@@ -1035,6 +1035,14 @@ emit("ok_ptr_field_auto_deref", "run", "same", "struct C { n: i32 }\nfn bump(p: 
 emit("ok_index_any_integer", "run", "same", "fn main() -> i32 {\n    var a: [i32; 4] = [0, 0, 0, 0]\n    for i in 0..4 {\n        a[i] = i + 1\n    }\n    let k: u8 = 2\n    let m: i64 = 3\n    put((a[k] * 100 + a[m]) as i64)\n    return 0\n}\n")
 emit("ok_empty_main", "run", "same", "fn main() -> i32 {\n    return 0\n}\n", prelude=False)
 
+emit("ok_main_no_return_type", "run", "same", "fn main() {\n    put(7)\n}\n")
+emit("ok_main_start_no_return_type", "run", "same", "fn main(start: u64) {\n    put(8)\n    if start == 0 {\n        return\n    }\n    put(9)\n}\n")
+emit("ok_main_bare_return_defer", "run", "same", "fn note(v: i64) {\n    put(v)\n}\nfn main() {\n    defer note(2)\n    note(1)\n    return\n}\n")
+emit("neg_main_returns_str", "neg", "", "fn main() -> str {\n    return \"x\"\n}\n", prelude=False)
+emit("neg_main_two_params", "neg", "", "fn main(a: u64, b: u64) {\n}\n", prelude=False)
+emit("neg_main_i32_param_no_return_type", "neg", "", "fn main(a: i32) {\n}\n", prelude=False)
+emit("neg_main_void_returns_value", "neg", "", "fn main() {\n    return 1\n}\n", prelude=False)
+
 os.makedirs(out_dir, exist_ok=True)
 for f in os.listdir(out_dir):
     if f.endswith(".fi"):

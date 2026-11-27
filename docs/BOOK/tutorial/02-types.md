@@ -3,7 +3,7 @@
 ```firn run
 import std.io
 
-fn main() -> i32 {
+fn main() {
     let answer: i32 = 42
     var count: i64 = 0
     count = count + 8
@@ -12,7 +12,6 @@ fn main() -> i32 {
     let flag: bool = true
     let wide: i64 = answer as i64 + count
     io.print_line(io.fmt_string(f"{name} {answer} {count} {wide} {ratio} {flag}"))
-    return 0
 }
 ```
 

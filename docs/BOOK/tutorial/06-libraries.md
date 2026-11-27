@@ -5,7 +5,7 @@ import std.io
 import std.args
 import std.vec
 
-fn main() -> i32 {
+fn main() {
     var items: Vec[i32] = vec.vec_new[i32]()
     vec.vec_push[i32](&items, 10)
     vec.vec_push[i32](&items, 20)
@@ -15,7 +15,6 @@ fn main() -> i32 {
     var parsed: args.Result = args.parse_words(&cmd, "--name firn")
     io.print_line(args.get(&parsed, "name"))
     vec.vec_free[i32](&items)
-    return 0
 }
 ```
 

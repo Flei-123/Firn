@@ -22,13 +22,12 @@ fn area(s: Shape) -> i32 {
     }
 }
 
-fn main() -> i32 {
+fn main() {
     let p: Point = Point { x: 3, y: 4 }
     io.print_line(io.fmt_string(f"{p.x} {p.y}"))
     io.print_line(io.fmt_string(f"{area(Shape::Circle(2))}"))
     io.print_line(io.fmt_string(f"{area(Shape::Rect(3, 5))}"))
     io.print_line(io.fmt_string(f"{area(Shape::Empty)}"))
-    return 0
 }
 ```
 

@@ -1967,6 +1967,10 @@ impl<'a> Lower<'a> {
     /// longer replace it.
     pub(crate) fn ret_term(&mut self, v: Option<Val>) {
         self.lower_defers_to(0, false);
+        let v = match (v, self.f.ret) {
+            (None, ret) if ret != FTy::Void => Some(self.constant(ret, 0)),
+            (v, _) => v,
+        };
         self.set_term(Term::Ret(v));
     }
 
@@ -2657,6 +2661,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                     .unwrap_or(abi::Word::Int),
             )
         }
+    } else if d.name == "main" && sig.ret == Type::Void {
+        FTy::I32
     } else {
         match scalar_fty(&sig.ret) {
             Some(f) => f,

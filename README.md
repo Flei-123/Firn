@@ -53,9 +53,8 @@ Hello world:
 ```firn
 import std.io
 
-fn main() -> i32 {
+fn main() {
     io.print_line("Hello, Firn")
-    return 0
 }
 ```
 

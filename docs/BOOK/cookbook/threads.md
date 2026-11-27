@@ -7,13 +7,12 @@ fn __thread_work(kind: u64, arg: u64) -> u64 {
     return arg * 2
 }
 
-fn main() -> i32 {
+fn main() {
     let first: u64 = thread_start(1, 21)
     let second: u64 = thread_start(1, 50)
     let a: u64 = thread_wait(first)
     let b: u64 = thread_wait(second)
     io.print_line(io.fmt_string(f"{a} {b}"))
-    return 0
 }
 ```
 

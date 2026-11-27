@@ -20,12 +20,11 @@ fn double_twice(n: i32) -> ParseError!i32 {
     return try check(first)
 }
 
-fn main() -> i32 {
+fn main() {
     let a = check(21) catch 0 - 1
     let b = check(0) catch 0 - 1
     let c = double_twice(30) catch 0 - 1
     io.print_line(io.fmt_string(f"{a} {b} {c}"))
-    return 0
 }
 ```
 
