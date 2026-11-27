@@ -236,7 +236,8 @@ fn expand_methods(
     next_id: &mut u32,
 ) {
     for (method, tpl) in sema_generic::method_templates(&inst.base) {
-        let map = match bind_params(dg, fnames, &tpl.params, inst, "generic impl") {
+        let mut probe = Diags::new("", "");
+        let map = match bind_params(&mut probe, fnames, &tpl.params, inst, "generic impl") {
             Some(m) => m,
             None => continue,
         };

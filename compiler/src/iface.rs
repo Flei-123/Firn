@@ -398,7 +398,7 @@ pub(crate) fn bound_check(
     // An interface is implemented by a NAMED type. A pointer or a field
     // has no name under which an implementation could stand.
     let ty_name = match arg {
-        TypeExpr::Named(n, _) => n.clone(),
+        TypeExpr::Named(n, _) => crate::types::canon_name(n).to_string(),
         _ => {
             dg.error_note(
                 span,

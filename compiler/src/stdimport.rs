@@ -4,6 +4,7 @@ use crate::std_modules::STD_MODULES;
 
 const KERNEL_MARK: &str = "profile kernel";
 const MODULE_COUNT: usize = STD_MODULES.len();
+const TYPE_MODULES: [(&str, &str); 3] = [("Vec", "vec"), ("Map", "map"), ("Set", "map")];
 
 #[derive(Clone, Copy, Default)]
 struct Usage {
@@ -11,6 +12,8 @@ struct Usage {
     other: u32,
     declared: u32,
     imported: bool,
+    types_used: u8,
+    types_declared: u8,
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -112,10 +115,25 @@ fn is_fstring_quote(b: &[u8], i: usize) -> bool {
     i >= 1 && b[i - 1] == b'f' && (i < 2 || !is_ident_byte(b[i - 2]))
 }
 
+fn note_type(b: &[u8], word: &str, after: usize, end: usize, declaration: bool, usage: &mut [Usage]) {
+    let Some(bit) = TYPE_MODULES.iter().position(|(name, _)| *name == word) else {
+        return;
+    };
+    let Some(m) = module_index(TYPE_MODULES[bit].1) else {
+        return;
+    };
+    if declaration {
+        usage[m].types_declared |= 1 << bit;
+    } else if b.get(skip_spaces(b, after, end)) == Some(&b'[') {
+        usage[m].types_used |= 1 << bit;
+    }
+}
+
 fn scan_range(b: &[u8], from: usize, end: usize, usage: &mut [Usage]) {
     let mut i = from;
     let mut prev_dot = false;
     let mut prev_fn = false;
+    let mut prev_decl = false;
     while i < end {
         let c = b[i];
         if c == b'/' && i + 1 < end && b[i + 1] == b'/' {
@@ -142,7 +160,12 @@ fn scan_range(b: &[u8], from: usize, end: usize, usage: &mut [Usage]) {
             if word == "import" {
                 i = read_import(b, i, end, usage);
                 prev_fn = false;
+                prev_decl = false;
             } else {
+                if !prev_dot {
+                    note_type(b, word, i, end, prev_decl, usage);
+                }
+                prev_decl = matches!(word, "struct" | "enum" | "interface" | "type");
                 if let (false, Some(m)) = (prev_dot, module_index(word)) {
                     if prev_fn {
                         usage[m].declared += 1;
@@ -172,7 +195,9 @@ pub fn expand(src: &str) -> Option<String> {
     scan_range(src.as_bytes(), 0, src.len(), &mut usage);
     let mut out = String::new();
     for (name, u) in STD_MODULES.iter().zip(usage.iter()) {
-        if u.dotted > 0 && u.other == 0 && u.declared == 0 && !u.imported {
+        let dotted_use = u.dotted > 0 && u.other == 0 && u.declared == 0;
+        let type_use = u.types_used & !u.types_declared != 0;
+        if (dotted_use || type_use) && !u.imported {
             out.push_str("import std.");
             out.push_str(name);
             out.push_str("; ");
@@ -228,6 +253,16 @@ mod tests {
         assert_eq!(added("fn main() -> i32 { // io.x\n let s = \"io.x\"\n return 0 }"), "");
         assert_eq!(added("fn main() -> i32 { let s = f\"{time.millis()}\"\n return 0 }"), "import std.time; ");
         assert_eq!(added("fn main() -> i32 { let s = f\"{{time.x}} {n:>5}\"\n return 0 }"), "");
+    }
+
+    #[test]
+    fn collection_types_import_their_module() {
+        assert_eq!(added("fn main() -> i32 { var v = Vec[int].new()\n return 0 }"), "import std.vec; ");
+        assert_eq!(added("fn main() -> i32 { var m: Map[u32, int] = Map[u32, int].new()\n return 0 }"), "import std.map; ");
+        assert_eq!(added("fn main() -> i32 { var s = Set [u32].new()\n return 0 }"), "import std.map; ");
+        assert_eq!(added("import std.vec\nfn main() -> i32 { var v = Vec[int].new()\n return 0 }"), "");
+        assert_eq!(added("struct Set[K] { n: K }\nfn main() -> i32 { var s = Set[u32] { n: 1 }\n return 0 }"), "");
+        assert_eq!(added("fn main() -> i32 { let n = Vec\n return 0 }"), "");
     }
 
     #[test]

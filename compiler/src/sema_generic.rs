@@ -387,6 +387,13 @@ pub(crate) fn type_tag(te: &TypeExpr) -> String {
 }
 
 /// `name__T1_T2` (contract).
+fn canonical_arg(arg: TypeExpr) -> TypeExpr {
+    match arg {
+        TypeExpr::Named(n, sp) => TypeExpr::Named(crate::types::canon_name(&n).to_string(), sp),
+        other => other,
+    }
+}
+
 pub(crate) fn mangle(base: &str, args: &[TypeExpr]) -> String {
     let mut s = String::from(base);
     s.push_str("__");
@@ -738,6 +745,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
+        let args: Vec<TypeExpr> = args.into_iter().map(canonical_arg).collect();
         let mangled = mangle(base, &args);
         let is_abstract = REG.with(|r| r.borrow().in_template > 0);
         record_inst(

@@ -10,7 +10,19 @@ Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `do
 | `x.ToString()` | `x.to_str()` |
 | `int.Parse(s)` | `int.parse(s) catch 0` |
 | `int.TryParse(s, out n)` | `int.try_parse(s, &n)` |
-| `new List<int>()` | `Vec[i32].new()` (also `Map[u32, i32].new()`, `Set[u32].new()`) |
+| `new List<int>()` | `Vec[int].new()` (no import) |
+| `list.Add(1)` | `v.push(1)` |
+| `list.Count` | `v.len()` |
+| `list[i]` / `list[i] = x` | `v.get(i)` / `v.set(i, x)` (also `v[i]`) |
+| `list.Insert(i, x)` / `list.RemoveAt(i)` | `v.insert(i, x)` / `v.remove_at(i)` |
+| `list.Contains(x)` / `list.IndexOf(x)` | `v.contains(x)` / `v.index_of(x)` (`len` when missing) |
+| `list.Clear()` / `list.Reverse()` / `list.Sort()` | `v.clear()` / `v.reverse()` / `v.sort()` |
+| `list.AddRange(other)` | `v.extend(other)` |
+| `new Dictionary<uint, int>()` | `Map[u32, int].new()` |
+| `d[k] = x` / `d.ContainsKey(k)` / `d.Remove(k)` | `d.set(k, x)` / `d.has(k)` / `d.remove(k)` |
+| `d[k]` / `d.GetValueOrDefault(k, x)` | `d.get(k)` (0 when missing) / `d.get_or(k, x)` |
+| `d.Keys` / `d.Values` | `d.keys()` / `d.values()`, both a new `Vec` |
+| `new HashSet<uint>()` | `Set[u32].new()`, then `s.add(k)` (`true` if new), `s.has(k)`, `s.remove(k)` |
 | `new Counter()` | `Counter.start()`, a function in `impl Counter` without `self` |
 | `a.B().C()` | `a.b().c()`, also on results and on `(x + y)` |
 | `string.Format("{0} + {1}", a, b)` | `format("{0} + {1}", a, b)` (long form: `format.format2("{0} + {1}", a.to_str(), b.to_str())`) |
@@ -270,6 +282,38 @@ fn main() {
 ```output
 9 6
 ```
+
+## Collections
+
+`Vec`, `Map` and `Set` need no `import`, and their methods take the receiver by themselves (no `&v`).
+
+```firn run
+fn main() -> i32 {
+    var v = Vec[int].new()
+    v.push(3)
+    v.push(1)
+    v.push(2)
+    v.sort()
+    println(f"{v.get(0)} {v.last()} {v.len()} {v.contains(2)}")
+    var ages = Map[u32, int].new()
+    ages.set(1, 30)
+    ages.set(2, 41)
+    println(f"{ages.get(2)} {ages.get_or(9, 0 - 1)} {ages.has(1)} {ages.keys().len()}")
+    var seen = Set[u32].new()
+    println(f"{seen.add(7)} {seen.add(7)} {seen.len()}")
+    return 0
+}
+```
+
+```output
+1 3 3 true
+41 -1 true 2
+true false 1
+```
+
+- Out of range, `get`, `first`, `last` and `pop` return `0`; `index_of` returns `len`. Check `is_empty()` or `contains(x)` first.
+- `sort`, `get`, `contains`... exist only when the element type fits (`sort` needs an `Ord` type, `get` a scalar). A `Vec` of structs has `push`, `set`, `insert`, `extend`, `reverse`, `clear`, `len`, `is_empty` and `v[i]`.
+- The function forms (`vec_push[i32](&v, 1)`, `map_set[..]`) stay valid.
 
 ## No imports needed
 

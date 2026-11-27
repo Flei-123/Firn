@@ -715,6 +715,7 @@ NEG = [
     ("type_dup_param", "fn f(a: i32, a: i32) -> i32 { return a }\nfn main() -> i32 {\n    return f(1, 2)\n}\n"),
     ("type_index_non_array", "fn main() -> i32 {\n    let a: i32 = 1\n    return a[0]\n}\n"),
     ("type_index_float", "fn main() -> i32 {\n    var a: [i32; 2] = [1, 2]\n    let i: f64 = 0.0\n    return a[i]\n}\n"),
+    ("type_vec_sort_needs_ord", "struct P { x: i32 }\nfn main() -> i32 {\n    var v: Vec[P] = Vec[P].new()\n    v.sort()\n    return 0\n}\n"),
     ("type_array_len_mismatch", "fn main() -> i32 {\n    let a: [i32; 3] = [1, 2]\n    return 0\n}\n"),
     ("type_array_elem_mismatch", "fn main() -> i32 {\n    let a: [i32; 2] = [1, true]\n    return 0\n}\n"),
     ("type_field_on_int", "fn main() -> i32 {\n    let a: i32 = 1\n    return a.x\n}\n"),
@@ -1033,6 +1034,10 @@ for nm, src in IFACE_DEFAULT_NEG:
 emit("ok_struct_no_comma", "run", "same", "struct S { a: i32 b: i32 }\nfn main() -> i32 {\n    let s: S = S { a: 1, b: 2 }\n    put((s.a + s.b) as i64)\n    return 0\n}\n")
 emit("ok_ptr_field_auto_deref", "run", "same", "struct C { n: i32 }\nfn bump(p: *mut C) {\n    p.n += 2\n}\nfn main() -> i32 {\n    var c: C = C { n: 1 }\n    bump(&c)\n    let q: *C = &c\n    put((q.n * 10) as i64)\n    return 0\n}\n")
 emit("ok_index_any_integer", "run", "same", "fn main() -> i32 {\n    var a: [i32; 4] = [0, 0, 0, 0]\n    for i in 0..4 {\n        a[i] = i + 1\n    }\n    let k: u8 = 2\n    let m: i64 = 3\n    put((a[k] * 100 + a[m]) as i64)\n    return 0\n}\n")
+emit("ok_vec_methods", "run", "same", "fn main() -> i32 {\n    var v = Vec[int].new()\n    v.push(3)\n    v.push(1)\n    v.push(2)\n    v.sort()\n    v.insert(1, 9)\n    let removed: int = v.remove_at(1)\n    v.reverse()\n    put((v.get(0) * 100 + v.last() * 10 + v.len() as int + removed) as i64)\n    return 0\n}\n")
+emit("ok_map_set_methods", "run", "same", "fn main() -> i32 {\n    var m = Map[u32, int].new()\n    m.set(1, 10)\n    m.set(2, 20)\n    m.remove(1)\n    var s = Set[u32].new()\n    let fresh: bool = s.add(5)\n    put((m.get(2) + m.keys().len() as int + m.values().len() as int + s.len() as int + (fresh as int)) as i64)\n    return 0\n}\n")
+emit("ok_vec_struct_methods", "run", "same", "struct P { x: i32 }\nfn main() -> i32 {\n    var v: Vec[P] = Vec[P].new()\n    v.push(P { x: 4 })\n    v.push(P { x: 6 })\n    v.reverse()\n    put((v[0].x * 10 + v.len() as i32) as i64)\n    return 0\n}\n")
+emit("ok_vec_alias_arg", "run", "same", "fn total(v: Vec[i32]) -> i32 {\n    return v.get(0) + v.get(1)\n}\nfn main() -> i32 {\n    var v: Vec[int] = Vec[int].new()\n    v.push(4)\n    v.push(5)\n    put(total(v) as i64)\n    return 0\n}\n")
 emit("ok_empty_main", "run", "same", "fn main() -> i32 {\n    return 0\n}\n", prelude=False)
 
 emit("ok_main_no_return_type", "run", "same", "fn main() {\n    put(7)\n}\n")
