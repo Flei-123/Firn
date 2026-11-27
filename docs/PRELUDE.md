@@ -14,6 +14,7 @@ per file right after `derive` and before the lexer.
 | `chars.count(s)` | `import std.chars` |
 | `format("{0} and {1}", x, y)` | `import std.format`, `import std.io`, each argument after the template goes through a file-local generic `__fmt_show[T]` (f-string formatting, so numbers, `bool`, `str` work directly) and the call becomes `format.format2(..)`; up to 8 arguments |
 | `println(s)` / `print(s)` | `import std.io` and a file-local `fn println(s: str)` / `fn print(s: str)` |
+| `readln()` | `import std.io` and a file-local `fn readln() -> str` (`io.read_line()`: one line without the line break, empty at end of input) |
 
 ## Every std module
 

@@ -7,9 +7,10 @@ static DISABLED: AtomicBool = AtomicBool::new(false);
 
 const KERNEL_MARK: &str = "profile kernel";
 const MODULE_NAMES: [(&str, &str); 3] = [("parse", "std.parse"), ("format", "std.format"), ("chars", "std.chars")];
-const WRAPPERS: [(&str, &str); 2] = [
+const WRAPPERS: [(&str, &str); 3] = [
     ("println", "fn println(s: str) { io.print_line(s) }"),
     ("print", "fn print(s: str) { io.print(s) }"),
+    ("readln", "fn readln() -> str { return io.read_line() }"),
 ];
 
 pub(crate) fn is_disabled() -> bool {
@@ -217,7 +218,7 @@ fn bare_only_called(usage: &Usage) -> bool {
 }
 
 fn quick_reject(src: &str) -> bool {
-    !(src.contains("to_str") || src.contains("parse") || src.contains("format") || src.contains("chars") || src.contains("print"))
+    !(src.contains("to_str") || src.contains("parse") || src.contains("format") || src.contains("chars") || src.contains("print") || src.contains("readln"))
 }
 
 pub fn expand(src: &str) -> Option<String> {

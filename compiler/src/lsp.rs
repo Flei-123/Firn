@@ -558,6 +558,7 @@ const KEYWORDS: &[&str] = &[
 const PRELUDE: &[(&str, &str, i64)] = &[
     ("println", "fn println(text)", 3),
     ("print", "fn print(text)", 3),
+    ("readln", "fn readln() -> str", 3),
     ("format", "fn format(template, args..)", 3),
     ("Vec", "growable array: Vec[T]", 22),
     ("Map", "hash map: Map[K, V]", 22),

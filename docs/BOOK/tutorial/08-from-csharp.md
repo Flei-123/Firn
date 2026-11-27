@@ -1,6 +1,6 @@
 # 8. Coming from C#
 
-The prelude makes `x.to_str()`, `parse.`, `format.`, `chars.`, `print`, `println` and `format(tpl, a, b, ...)` available without `import` (see `docs/PRELUDE.md`; `--no-prelude` turns it off). Your own names win, and the collector starts itself, so there is no `gc_init()` call.
+The prelude makes `x.to_str()`, `parse.`, `format.`, `chars.`, `print`, `println`, `readln()` (one line from stdin) and `format(tpl, a, b, ...)` available without `import` (see `docs/PRELUDE.md`; `--no-prelude` turns it off). Your own names win, and the collector starts itself, so there is no `gc_init()` call.
 
 Firn takes the C# names where they are free of traps: `int`, `long`, `byte`, `double`, `float`, `string` are aliases of `i32`, `i64`, `u8`, `f64`, `f32`, `str`. Same type, no cast.
 
