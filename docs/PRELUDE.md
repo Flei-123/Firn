@@ -97,7 +97,46 @@ The compiler already writes the call to `gc_init()` into the generated start cod
 `gc_init()` stays valid (idempotent). Proof: `tests/6823_gc_init_automatic.fi`,
 `tests/6824_gc_init_explicit_still_valid.fi`.
 
+## C#-style aliases
+
+snake_case stays the standard. In addition a PascalCase call is renamed to the existing snake_case
+name, so `x.ToString()`, `list.Add(1)`, `s.Trim().Split(" ")`, `Println(..)`, `ReadLine()` work.
+The pass is a source rewrite in both compilers (`compiler/src/csalias.rs`, `lib/firnc1/csalias.fi`),
+it runs first after `derive`, and its table is generated: `tools/csalias/table.txt` (explicit
+entries) plus the PascalCase form of every name in `method_modules.rs`, written by
+`sh tools/csalias/gen.sh` into `compiler/src/csalias_table.rs` and `lib/firnc1/csalias_table.fi`.
+A replacement shorter than the name is padded with spaces, so columns of later tokens stay.
+
+| Form | Rule |
+|---|---|
+| `x.Name(..)` | method or module function, becomes `x.snake(..)` |
+| `Name(..)` | only for table entries marked `bare`: `Println`, `Print`, `ReadLine` (`io.read_line`), `Sleep` (`time.sleep_ms`), `Millis` (`time.millis`) |
+| `x.Length`, `x.Count` | property form, becomes `x.length()` (string) and `x.len()` (Vec/Map/Set); `x.Count()` also works |
+
+Aliases: `ToString`=`to_str`, `Add`/`Push`=`push`, `Pop`, `Insert`, `Clear`, `Sort`, `Reverse`, `Extend`,
+`RemoveAt`=`remove_at`, `IndexOf`=`index_of`, `IsEmpty`=`is_empty`, `Contains`, `Substring`, `Trim`,
+`TrimStart`=`trim_left`, `TrimEnd`=`trim_right`, `Split`, `Replace`, `Join`, `ToUpper`=`to_upper`,
+`ToLower`=`to_lower`, `StartsWith`=`starts_with`, `EndsWith`=`ends_with`, `Parse`=`parse`,
+`TryParse`=`try_parse`, `Keys`, `Values`, `GetOr`=`get_or`, `ReadAllText`=`read_text`,
+`WriteAllText`=`write_text`, `AppendAllText`=`append_text`, and every PascalCase form of a method of
+`std.strmethods`/`std.nummethods` (`Sqrt`, `Abs`, `Min`, `Max`, `Pow`, `Floor`, ...).
+
+Rules:
+
+* Your own name wins. A table name is left alone in the whole file when the file declares it
+  (`fn Add`, `impl .. { fn Add(..) }`) or uses it any other way (field `Count: i32`, variant `Add(i32)`,
+  variable). A call behind a type path (`Op.Add(..)`) is never renamed.
+* The decision is per file. A PascalCase method defined in another file and called here is renamed
+  and then fails as an unknown method; call it through a name that is not in the table.
+* An unknown PascalCase name keeps its spelling in the error. `did you mean` also tries the
+  snake_case form of a PascalCase name (`DoubleIt` suggests `double_it`).
+* Implicit module loading (`to_str`, `strmethods`, `nummethods`) sees the renamed code.
+* Not covered: static C# receivers (`Console.WriteLine`, `Math.Sqrt`, `File.ReadAllText`), `Set.Add`
+  (the Set method is `add`), `int.Parse`.
+* `--no-prelude` and `profile kernel` switch it off.
+
 ## Tests
 
 `tests/6820_prelude_basic.fi`, `tests/6821_prelude_own_names.fi`,
 `tests/6822_prelude_method_to_str_own_impl.fi`, `tests/6825_prelude_format_call.fi`, `tests/6826_prelude_own_format_wins.fi`, `tests/6830_std_auto_import.fi`, `tests/6831_std_auto_import_own_names.fi`, `tests/6832_std_auto_import_fstring.fi`, `tests/6833_fstring_as_str.fi`, `tests/neg/6830_std_auto_import_unknown_name.fi`, `tests/neg/6831_std_auto_import_shadowed.fi`.
+`tests/6880_csharp_aliases.fi`, `tests/6881_csharp_aliases_own_names.fi`, `tests/neg/6882_csharp_alias_hint_function.fi`, `tests/neg/6883_csharp_alias_unknown_method.fi`.

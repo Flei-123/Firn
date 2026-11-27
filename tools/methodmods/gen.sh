@@ -42,3 +42,4 @@ count=$(echo $modules | wc -w)
     echo "    return 0 as u32"
     echo "}"
 } > "$fi_out"
+sh "$root/tools/csalias/gen.sh"

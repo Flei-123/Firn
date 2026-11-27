@@ -349,26 +349,63 @@ pub fn tolerance(name: &str) -> usize {
 /// The candidate closest to `name`, or `None`. Ties go to the one that
 /// comes first alphabetically, so that the answer does not depend on the
 /// order of a hash table.
-pub fn nearest<'a, I: IntoIterator<Item = &'a str>>(name: &str, candidates: I) -> Option<String> {
+fn closest<'a>(name: &str, candidates: &[&'a str], skip_same: bool) -> Option<(usize, &'a str)> {
     let limit = tolerance(name);
-    let mut best: Option<(usize, String)> = None;
-    for c in candidates {
-        if c == name {
+    let mut best: Option<(usize, &'a str)> = None;
+    for &c in candidates {
+        if skip_same && c == name {
             continue;
         }
         let d = distance(name, c);
         if d > limit {
             continue;
         }
-        let better = match &best {
+        let better = match best {
             None => true,
-            Some((bd, bn)) => d < *bd || (d == *bd && c < bn.as_str()),
+            Some((bd, bn)) => d < bd || (d == bd && c < bn),
         };
         if better {
-            best = Some((d, c.to_string()));
+            best = Some((d, c));
         }
     }
-    best.map(|(_, n)| n)
+    best
+}
+
+const FOLD_MAX_LEN: usize = 64;
+
+fn snake_form(name: &str) -> Option<String> {
+    if name.len() > FOLD_MAX_LEN || !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// The candidate closest to `name`, or `None`. A `PascalCase` name is also
+/// tried in its `snake_case` form (the C# aliases of docs/PRELUDE.md), and
+/// that form wins only when it is strictly closer. Ties go to the one that
+/// comes first alphabetically, so that the answer does not depend on the
+/// order of a hash table.
+pub fn nearest<'a, I: IntoIterator<Item = &'a str>>(name: &str, candidates: I) -> Option<String> {
+    let all: Vec<&str> = candidates.into_iter().collect();
+    let direct = closest(name, &all, true);
+    let folded = snake_form(name).and_then(|f| closest(&f, &all, false));
+    match (direct, folded) {
+        (Some((d, n)), Some((fd, fname))) => Some(if fd < d { fname } else { n }),
+        (Some((_, n)), None) | (None, Some((_, n))) => Some(n),
+        (None, None) => None,
+    }
+    .map(str::to_string)
 }
 
 /// `did you mean 'x'?` -- the wording of a suggestion, in ONE place, so that

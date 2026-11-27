@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MPL-2.0
+export { cs_run, cs_scan_flags, cs_method_flags }
+import rt
+import vec
+import derive_decl
+import prelude
+import csalias_table
+
+const MAX_ALIASES: usize = 128
+const FORM_DOTTED: u32 = 0
+const FORM_BARE: u32 = 1
+const FORM_PROP: u32 = 2
+const FLAG_BARE: u32 = 1
+const FLAG_PROP: u32 = 2
+
+struct CsScan {
+    starts: Vec[usize],
+    ends: Vec[usize],
+    aliases: Vec[usize],
+    forms: Vec[u32],
+    owned: [u32; 128],
+}
+
+fn cs_scan_new() -> CsScan {
+    return CsScan { starts: vec_new[usize](), ends: vec_new[usize](), aliases: vec_new[usize](), forms: vec_new[u32](), owned: [0 as u32; 128] }
+}
+
+fn cs_scan_free(sc: *mut CsScan) {
+    vec_free[usize](&(*sc).starts)
+    vec_free[usize](&(*sc).ends)
+    vec_free[usize](&(*sc).aliases)
+    vec_free[u32](&(*sc).forms)
+}
+
+fn is_upper(c: u8) -> bool {
+    return c >= 65 && c <= 90
+}
+
+fn is_fstring_quote(src: u64, i: usize) -> bool {
+    if i < 1 || prelude.at(src, i - 1) != 102 { return false }
+    return i < 2 || !prelude.is_ident_byte(prelude.at(src, i - 2))
+}
+
+fn classify(prev_dot: bool, prev_fn: bool, receiver_is_type: bool, flags: u32, next: u8) -> i32 {
+    if prev_dot && !receiver_is_type && next == 40 { return FORM_DOTTED as i32 }
+    if prev_dot && !receiver_is_type && (flags & FLAG_PROP) != 0 { return FORM_PROP as i32 }
+    if !prev_dot && !prev_fn && (flags & FLAG_BARE) != 0 && next == 40 { return FORM_BARE as i32 }
+    return 0 - 1
+}
+
+fn note_identifier(sc: *mut CsScan, src: u64, s: usize, e: usize, n: usize, prev_dot: bool, prev_fn: bool, receiver_is_type: bool) {
+    if !is_upper(prelude.at(src, s)) { return }
+    let alias: i32 = csalias_table.cs_index(src, s, e)
+    if alias < 0 { return }
+    let next: u8 = prelude.next_non_space(src, n, e)
+    let form: i32 = classify(prev_dot, prev_fn, receiver_is_type, csalias_table.cs_flags(alias), next)
+    if alias as usize >= MAX_ALIASES { return }
+    if form < 0 {
+        (*sc).owned[alias as usize] = 1
+        return
+    }
+    vec_push[usize](&(*sc).starts, s)
+    vec_push[usize](&(*sc).ends, e)
+    vec_push[usize](&(*sc).aliases, alias as usize)
+    vec_push[u32](&(*sc).forms, form as u32)
+}
+
+fn expression_end(src: u64, n: usize, open: usize, end: usize) -> usize {
+    var depth: i32 = 1
+    var k: usize = open + 1
+    while k < end && depth > 0 {
+        let c: u8 = prelude.at(src, k)
+        if c == 34 {
+            k = prelude.skip_quoted(src, n, k, 34 as u8)
+        } else {
+            if c == 123 { depth = depth + 1 }
+            if c == 125 { depth = depth - 1 }
+            k = k + 1
+        }
+    }
+    return k
+}
+
+fn spec_start(src: u64, from: usize, to: usize) -> usize {
+    var i: usize = from
+    while i < to {
+        if prelude.at(src, i) == 58 {
+            if i + 1 < to && prelude.at(src, i + 1) == 58 {
+                i = i + 2
+            } else {
+                return i
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return to
+}
+
+fn scan_interpolation(sc: *mut CsScan, src: u64, n: usize, quote: usize, end: usize) -> usize {
+    var j: usize = quote + 1
+    while j < end && prelude.at(src, j) != 34 && prelude.at(src, j) != 10 {
+        let c: u8 = prelude.at(src, j)
+        if c == 92 {
+            j = j + 2
+        } else if c == 123 && j + 1 < n && prelude.at(src, j + 1) == 123 {
+            j = j + 2
+        } else if c == 123 {
+            let close: usize = expression_end(src, n, j, end)
+            var stop: usize = j + 1
+            if close > j + 2 { stop = close - 1 }
+            scan_range(sc, src, n, j + 1, spec_start(src, j + 1, stop))
+            j = close
+        } else {
+            j = j + 1
+        }
+    }
+    if j + 1 > end { return end }
+    return j + 1
+}
+
+fn scan_range(sc: *mut CsScan, src: u64, n: usize, from: usize, end: usize) {
+    var i: usize = from
+    var prev_dot: bool = false
+    var prev_fn: bool = false
+    var last_ident: bool = false
+    var last_type_like: bool = false
+    var receiver_is_type: bool = false
+    while i < end {
+        let c: u8 = prelude.at(src, i)
+        if c == 47 && i + 1 < end && prelude.at(src, i + 1) == 47 {
+            while i < n && prelude.at(src, i) != 10 { i = i + 1 }
+        } else if c == 47 && i + 1 < end && prelude.at(src, i + 1) == 42 {
+            i = i + 2
+            while i + 1 < n && !(prelude.at(src, i) == 42 && prelude.at(src, i + 1) == 47) { i = i + 1 }
+            i = i + 2
+            if i > n { i = n }
+        } else if c == 34 && is_fstring_quote(src, i) {
+            i = scan_interpolation(sc, src, n, i, end)
+            prev_dot = false
+            prev_fn = false
+            last_ident = false
+        } else if c == 34 || c == 39 {
+            i = prelude.skip_quoted(src, n, i, c)
+            prev_dot = false
+            prev_fn = false
+            last_ident = false
+        } else if c == 46 {
+            receiver_is_type = last_ident && last_type_like
+            prev_dot = true
+            last_ident = false
+            i = i + 1
+        } else if prelude.is_ident_start(c) {
+            let s: usize = i
+            while i < end && prelude.is_ident_byte(prelude.at(src, i)) { i = i + 1 }
+            note_identifier(sc, src, s, i, n, prev_dot, prev_fn, receiver_is_type)
+            prev_fn = derive_decl.dv_eq_lit(src, s, i, "fn")
+            last_type_like = is_upper(prelude.at(src, s)) && !prev_dot
+            prev_dot = false
+            last_ident = true
+        } else {
+            if c > 32 {
+                prev_dot = false
+                last_ident = false
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn put_replacement(out: *mut rt.Buf, alias: i32, form: u32, width: usize) {
+    var written: usize = 0
+    if form == FORM_BARE {
+        let prefix: str = csalias_table.cs_prefix(alias)
+        prelude.put(out, prefix)
+        written = written + prefix.n
+    }
+    let target: str = csalias_table.cs_target(alias)
+    prelude.put(out, target)
+    written = written + target.n
+    if form == FORM_PROP {
+        prelude.put(out, "()")
+        written = written + 2
+    }
+    while written < width {
+        prelude.put(out, " ")
+        written = written + 1
+    }
+}
+
+fn cs_run(src: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if prelude.pl_off() { return false }
+    if prelude.contains(src, n, 112 as u8, "profile kernel") { return false }
+    var sc: CsScan = cs_scan_new()
+    defer cs_scan_free(&sc)
+    scan_range(&sc, src, n, 0, n)
+    var last: usize = 0
+    var any: bool = false
+    var k: usize = 0
+    while k < vec_len[usize](&sc.starts) {
+        let alias: usize = vec_at[usize](&sc.aliases, k)
+        if sc.owned[alias] == 0 {
+            let s: usize = vec_at[usize](&sc.starts, k)
+            let e: usize = vec_at[usize](&sc.ends, k)
+            unsafe { rt.buf_push_bytes(out, src +% last as u64, s - last) }
+            put_replacement(out, alias as i32, vec_at[u32](&sc.forms, k), e - s)
+            last = e
+            any = true
+        }
+        k = k + 1
+    }
+    if !any { return false }
+    unsafe { rt.buf_push_bytes(out, src +% last as u64, n - last) }
+    return true
+}
+
+fn cs_scan_flags(src: u64, n: usize) -> u32 {
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    if cs_run(src, n, &out) { return prelude.pl_scan_flags(rt.buf_ptr(&out), rt.buf_len(&out)) }
+    return prelude.pl_scan_flags(src, n)
+}
+
+fn cs_method_flags(src: u64, n: usize) -> u32 {
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    if cs_run(src, n, &out) { return prelude.pl_method_flags(rt.buf_ptr(&out), rt.buf_len(&out)) }
+    return prelude.pl_method_flags(src, n)
+}

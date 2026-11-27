@@ -896,6 +896,8 @@ pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
         }
     };
     let src = expanded.as_deref().unwrap_or(src);
+    let with_aliases = crate::csalias::expand(src);
+    let src = with_aliases.as_deref().unwrap_or(src);
     let with_variadic = crate::variadic::expand(src);
     let src = with_variadic.as_deref().unwrap_or(src);
     let with_prelude = crate::prelude::expand(src);

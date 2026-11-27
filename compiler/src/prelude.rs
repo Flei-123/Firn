@@ -279,6 +279,8 @@ pub fn needs_tostr<'a>(sources: impl Iterator<Item = &'a str>) -> bool {
     }
     let mut wanted = false;
     for src in sources {
+        let aliased = crate::csalias::expand(src);
+        let src = aliased.as_deref().unwrap_or(src);
         if src.contains(KERNEL_MARK) || !src.contains("to_str") {
             continue;
         }
@@ -300,7 +302,8 @@ pub fn needed_method_modules<'a>(sources: impl Iterator<Item = &'a str>) -> Vec<
         if src.contains(KERNEL_MARK) {
             continue;
         }
-        mark_method_calls(src.as_bytes(), &mut wanted);
+        let aliased = crate::csalias::expand(src);
+        mark_method_calls(aliased.as_deref().unwrap_or(src).as_bytes(), &mut wanted);
     }
     METHOD_MODULES.iter().zip(wanted).filter(|(_, w)| *w).map(|((m, _), _)| *m).collect()
 }
